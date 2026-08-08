@@ -390,10 +390,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         command:
           'napi build --release --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/darwin-arm64',
       });
+      expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
       expect(targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
       expect(targets['napi-x64-linux']?.options).toMatchObject({
         command:
           'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/linux-x64-gnu',
+        env: { TARGET_CC: 'clang', TARGET_CXX: 'clang++' },
       });
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');

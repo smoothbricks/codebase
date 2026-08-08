@@ -553,6 +553,10 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
       options: {
         cwd: projectRoot,
         command: `napi build --release --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple}${crossFlag} ${commonCommand} --output-dir ${outputDirectory}`,
+        // @napi-rs recognizes Clang and supplies its downloaded GNU sysroot
+        // and toolchain flags. This keeps sccache enabled while avoiding the
+        // old bundled GCC, which rejects sccache's diagnostics-color flag.
+        ...(convention.useNapiCross ? { env: { TARGET_CC: 'clang', TARGET_CXX: 'clang++' } } : {}),
       },
     };
   }
