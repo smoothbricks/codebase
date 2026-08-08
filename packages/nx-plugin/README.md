@@ -32,6 +32,10 @@ Concrete targets come from concrete files:
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`; workspaces with
   `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
+- Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
+  triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
+  GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
+  the workspace's sccache wrapper.
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.
