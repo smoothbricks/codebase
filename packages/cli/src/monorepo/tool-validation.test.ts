@@ -19,7 +19,7 @@ const registryVersions: Record<string, string[]> = {
   'eslint-stdout': ['1.1.1', '1.1.2'],
   nx: ['23.1.0'],
   prettier: ['3.6.1'],
-  ttsc: ['0.19.3'],
+  ttsc: ['0.25.0'],
   typescript: ['6.0.3'],
   // alias package is not fetched from registry under this name when using fallback
   '@typescript/native': ['7.0.2'],
@@ -50,6 +50,9 @@ describe('tool configuration validation', () => {
         devDependencies: {
           '@smoothbricks/cli': 'workspace:*',
         },
+        patchedDependencies: {
+          'ttsc@0.19.3': 'patches/ttsc@0.19.3.patch',
+        },
       });
       const devenvPath = join(root, 'tooling/direnv/devenv.nix');
       await mkdir(dirname(devenvPath), { recursive: true });
@@ -76,10 +79,10 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
       expect(rootPackage.devDependencies.nx).toBe('23.1.0');
-      expect(rootPackage.devDependencies.ttsc).toBe('0.19.3');
+      expect(rootPackage.devDependencies.ttsc).toBe('0.25.0');
       expect(rootPackage.devDependencies.typescript).toBe('^6.0.3');
       expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
-      expect(rootPackage.patchedDependencies['ttsc@0.19.3']).toBe('patches/ttsc@0.19.3.patch');
+      expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBeUndefined();
       expect(rootPackage.workspaces).toContain('tooling');
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe('workspace:*');
@@ -91,7 +94,7 @@ describe('tool configuration validation', () => {
     }
   });
 
-  it('accepts newer dependency versions above the policy floor', async () => {
+  it('accepts newer dependencies after removing even an empty obsolete ttsc patch key', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {
       await writeJson(join(root, 'package.json'), {
@@ -108,12 +111,12 @@ describe('tool configuration validation', () => {
           'eslint-stdout': await currentEslintStdoutRange(),
           nx: '24.0.0',
           prettier: '^3.7.0',
-          ttsc: '0.19.3',
+          ttsc: '0.25.0',
           typescript: '^6.0.0',
           '@typescript/native': 'npm:typescript@^7.0.2',
         },
         patchedDependencies: {
-          'ttsc@0.19.3': 'patches/ttsc@0.19.3.patch',
+          'ttsc@0.19.3': '',
         },
       });
       await writeJson(join(root, 'tooling/package.json'), {
@@ -143,7 +146,11 @@ describe('tool configuration validation', () => {
 `,
       );
 
+      expect(await validateToolConfig(root)).toBe(1);
+      await applyToolConfigDefaults(root);
       expect(await validateToolConfig(root)).toBe(0);
+      const rootPackage = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+      expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBeUndefined();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -210,7 +217,7 @@ describe('tool configuration validation', () => {
           eslint: '^10.0.0',
           nx: '24.0.0',
           prettier: '^3.7.0',
-          ttsc: '0.19.3',
+          ttsc: '0.25.0',
           typescript: '^6.0.0',
         },
       });
@@ -224,7 +231,7 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['eslint-stdout']).toBe(await currentEslintStdoutRange());
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe(await currentNxPluginRange());
       expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
-      expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBe('patches/ttsc@0.19.3.patch');
+      expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBeUndefined();
       expect(toolingPackage.name).toBe('@fixture/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe(await currentCliRange());
     } finally {

@@ -129,6 +129,7 @@ function listWorkspacePackageJsonPaths(root: string, workspacePatterns: string[]
   const paths: string[] = [];
   for (const pattern of workspacePatterns) {
     if (!pattern.endsWith('/*')) {
+      paths.push(join(root, pattern, 'package.json'));
       continue;
     }
     const parent = join(root, pattern.slice(0, -2));
