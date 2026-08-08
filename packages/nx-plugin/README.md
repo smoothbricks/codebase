@@ -4,10 +4,10 @@ Local Nx plugin for workspace-standard package setup and missing inferred target
 
 ## Target Ownership
 
-Official `@nx/js/typescript` owns TypeScript library inference. A package `tsconfig.lib.json` becomes the tool-output
-target `tsc-js`; this plugin must not duplicate or rename that target.
+Official `@nx/js/typescript` inference is disabled because it cannot run the workspace's source transformers. A package
+with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typecheck` targets from this plugin.
 
-`@smoothbricks/nx-plugin` owns only inferred targets Nx does not provide here:
+`@smoothbricks/nx-plugin` also owns inferred targets Nx does not provide here:
 
 - `typecheck-tests` and `typecheck-tests:watch` from `tsconfig.test.json`
 - `test:watch` from explicit `test` commands for Bun and Vitest packages
@@ -21,16 +21,19 @@ aggregates.
 
 Concrete targets come from concrete files:
 
-- `typecheck-tests` is inferred from `tsconfig.test.json` and runs `tsc --noEmit -p tsconfig.test.json`.
+- `tsc-js` emits transformed JavaScript through a temporary JS-only `ttsc` config, then emits declarations and
+  declaration maps from the original project with native `tsc`. Direct project references and every cached output lane
+  are preserved.
+- `typecheck` is inferred from `tsconfig.lib.json` and runs native `tsc -p tsconfig.lib.json --noEmit`.
+- `typecheck-tests` is inferred from `tsconfig.test.json` and runs `tsc -p tsconfig.test.json --noEmit`.
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`; workspaces with
   `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
-- `build` is inferred only when the project has at least one concrete build target to run, such as `tsc-js` from the
-  official TypeScript plugin, a package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on
-  output-family wildcard targets: `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`,
-  `*-bun`, and `*-wasm`.
+- `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
+  package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
+  `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.
 
 Do not use colon-style Nx target names such as `build:wasm` or `lint:fix`. Nx CLI syntax already uses colons for
 `project:target:configuration`, so colon target names are hard to read, easy to confuse with configurations, and awkward

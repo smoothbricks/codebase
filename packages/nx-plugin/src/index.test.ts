@@ -58,7 +58,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('overrides inferred TypeScript compiler commands with ttsc', async () => {
+  it('splits transformed JavaScript emit from native declarations and typechecking', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write(
@@ -70,8 +70,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
 
-      expect(targets['tsc-js']?.options).toMatchObject({
-        command: 'ttsc -p tsconfig.lib.json --emit',
+      expect(targets['tsc-js']?.executor).toBe('@smoothbricks/nx-plugin:typescript-emit');
+      expect(targets['tsc-js']?.options).toEqual({
+        tsConfig: 'tsconfig.lib.json',
         cwd: 'packages/example',
       });
       const toolchainInputs = [
@@ -86,9 +87,13 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         ...toolchainInputs,
         '{projectRoot}/tsconfig.lib.json',
       ]);
-      expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}']);
+      expect(targets['tsc-js']?.outputs).toEqual([
+        '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
+        '{projectRoot}/dist/**/*.tsbuildinfo',
+        '{projectRoot}/dist/.tsbuildinfo',
+      ]);
       expect(targets.typecheck?.options).toMatchObject({
-        command: 'ttsc -p tsconfig.lib.json --noEmit',
+        command: 'tsc -p tsconfig.lib.json --noEmit',
         cwd: 'packages/example',
       });
       expect(targets.typecheck?.inputs).toEqual([
@@ -107,7 +112,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['typecheck-tests']?.cache).toBe(true);
       expect(targets['typecheck-tests']?.dependsOn).toEqual(['typecheck']);
       expect(targets['typecheck-tests']?.options).toMatchObject({
-        command: 'ttsc -p tsconfig.test.json --noEmit',
+        command: 'tsc -p tsconfig.test.json --noEmit',
         cwd: 'packages/example',
       });
       expect(targets['typecheck-tests']?.inputs).toEqual([
@@ -120,7 +125,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['typecheck-tests:watch']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests:watch']?.continuous).toBe(true);
       expect(targets['typecheck-tests:watch']?.options).toMatchObject({
-        command: 'ttsc -p tsconfig.test.json --noEmit --watch',
+        command: 'tsc -p tsconfig.test.json --noEmit --watch',
         cwd: 'packages/example',
       });
 
