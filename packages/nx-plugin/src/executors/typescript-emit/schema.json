@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "TypeScript emit executor",
+  "description": "Emit transformer-generated JavaScript with ttsc and declarations with native tsc",
+  "type": "object",
+  "properties": {
+    "cwd": {
+      "type": "string",
+      "description": "Working directory, relative to the workspace root"
+    },
+    "tsConfig": {
+      "type": "string",
+      "description": "TypeScript project config, relative to cwd"
+    }
+  },
+  "required": ["cwd", "tsConfig"],
+  "additionalProperties": false
+}
