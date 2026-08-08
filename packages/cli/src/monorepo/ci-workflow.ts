@@ -8,7 +8,6 @@ export enum CiWorkflowStepKind {
   SetNxShas = 'set-nx-shas',
   RestoreNxCache = 'restore-nx-cache',
   Build = 'build',
-  SupplementalLinuxTargets = 'supplemental-linux-targets',
   Lint = 'lint',
   UnitTests = 'unit-tests',
   ManagedFilesCheck = 'managed-files-check',
@@ -42,7 +41,6 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     { kind: CiWorkflowStepKind.SetNxShas, name: '🧭 Set Nx SHAs' },
     { kind: CiWorkflowStepKind.RestoreNxCache, name: '🧠 Restore Nx cache' },
     { kind: CiWorkflowStepKind.Build, name: '🔨 Build' },
-    { kind: CiWorkflowStepKind.SupplementalLinuxTargets, name: '🐧 Build supplemental Linux targets' },
     { kind: CiWorkflowStepKind.Lint, name: '🔍 Lint' },
     { kind: CiWorkflowStepKind.UnitTests, name: '🧪 Unit Tests' },
     { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check managed-file drift' },
@@ -133,14 +131,6 @@ function commentLinesForStep(step: CiWorkflowStep): string[] {
   if (step.kind === CiWorkflowStepKind.SetNxShas) {
     return [`      # Step ${step.number}`, '      # Sets the base and head SHAs required for the nx affected commands'];
   }
-  if (step.kind === CiWorkflowStepKind.SupplementalLinuxTargets) {
-    return [
-      `      # Step ${step.number}`,
-      '      # Aggregate build covers the host N-API binary. Run every supplemental',
-      '      # Linux target here as well so release-only cross compilers are exercised',
-      '      # before Publish.',
-    ];
-  }
   if (step.kind === CiWorkflowStepKind.SaveNxCache) {
     return [
       `      # Step ${step.number}`,
@@ -179,8 +169,6 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return [`      - name: ${step.name}`, '        id: nx-cache', '        uses: ./.github/actions/cache-nx'];
     case CiWorkflowStepKind.Build:
       return nxSmartStep(step, 'build', 'Build');
-    case CiWorkflowStepKind.SupplementalLinuxTargets:
-      return [`      - name: ${step.name}`, '        run: smoo github-ci nx-run-many --targets "*-linux"'];
     case CiWorkflowStepKind.Lint:
       return nxSmartStep(step, 'lint', 'Lint');
     case CiWorkflowStepKind.UnitTests:
