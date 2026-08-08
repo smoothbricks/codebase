@@ -1,9 +1,10 @@
-import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import { type PackageJson, parseNxProjectJsonText, parseStringArrayText } from '../lib/json.js';
+// Nx package exports are CLI-oriented; this is the module the CLI uses for graph + daemon IPC.
+import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
+import type { PackageJson } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { renderCiWorkflowYaml } from './ci-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
@@ -255,8 +256,8 @@ const managedFiles: ManagedFile[] = [
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-export function applyManagedFiles(root: string, mode: 'update' | 'check' | 'diff'): FileResult[] {
-  const context = getManagedFileContext(root);
+export async function applyManagedFiles(root: string, mode: 'update' | 'check' | 'diff'): Promise<FileResult[]> {
+  const context = await getManagedFileContext(root);
   return managedFiles.map((file) => applyManagedFile(root, file, mode, context));
 }
 
@@ -330,14 +331,16 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
   return renderTemplate(context, content);
 }
 
-function getManagedFileContext(root: string): ManagedFileContext {
+async function getManagedFileContext(root: string): Promise<ManagedFileContext> {
   const packageJson = readPackageJson(join(root, 'package.json'));
   const repoName = packageJson?.name ?? 'monorepo';
   const ciPushBranches = getCiPushBranches(packageJson?.json);
   const ciRunsOn = getCiRunsOn(packageJson?.json);
-  const stagingDeploy = getDeployTargetInfo(root, 'staging');
-  const productionDeploy = getDeployTargetInfo(root, 'production');
-  const platformTargetGlobs = platformTargetGlobsForTest(readResolvedNxTargetNames(root));
+  // In-process Nx API → daemon socket (no second Node/`nx` CLI process).
+  const nxProjects = await loadNxGraphProjects(root);
+  const stagingDeploy = deployTargetInfoFromProjects(nxProjects, 'staging');
+  const productionDeploy = deployTargetInfoFromProjects(nxProjects, 'production');
+  const platformTargetGlobs = platformTargetGlobsForTest(targetNamesFromProjects(nxProjects));
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
     ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
     : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
@@ -363,32 +366,88 @@ export function platformTargetGlobsForTest(targetNames: Iterable<string>): strin
   });
 }
 
-function readResolvedNxTargetNames(root: string): string[] {
-  const output = execFileSync('nx', ['show', 'projects', '--json'], {
-    cwd: root,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'inherit'],
-  });
-  const projects = parseStringArrayText(output);
-  if (!projects) {
-    return [];
+/** Resolved Nx project node as returned under `graph.nodes` / project-graph.json. */
+export type NxGraphProjectNode = {
+  data?: { targets?: Record<string, NxGraphTarget> };
+  targets?: Record<string, NxGraphTarget>;
+};
+
+type NxGraphTarget = {
+  command?: string;
+  options?: { command?: string };
+  configurations?: Record<string, { command?: string; options?: { command?: string } }>;
+};
+
+/**
+ * Load resolved project nodes via Nx's programmatic API.
+ *
+ * `createProjectGraphAsync` is what the CLI uses: with the daemon up it speaks the
+ * daemon unix socket instead of rebuilding the graph in a fresh Node process.
+ * Spawning `nx graph` / `nx show` only added CLI boot + plugin-worker overhead on
+ * top of that. smoo runs under Bun; Bun can import this CJS module directly.
+ */
+async function loadNxGraphProjects(root: string): Promise<Record<string, NxGraphProjectNode>> {
+  const prevCwd = process.cwd();
+  process.chdir(root);
+  try {
+    const graph = (await createProjectGraphAsync()) as {
+      nodes: Record<string, { data?: { targets?: Record<string, NxGraphTarget> } }>;
+    };
+    const out: Record<string, NxGraphProjectNode> = {};
+    for (const [name, node] of Object.entries(graph.nodes)) {
+      out[name] = { data: { targets: node.data?.targets ?? {} } };
+    }
+    return out;
+  } finally {
+    process.chdir(prevCwd);
   }
+}
+
+function targetsOfProject(node: NxGraphProjectNode): Record<string, NxGraphTarget> {
+  return node.data?.targets ?? node.targets ?? {};
+}
+
+/** Test seam: collect target names from a graph.nodes map. */
+export function targetNamesFromProjects(nodes: Record<string, NxGraphProjectNode>): string[] {
   const targetNames = new Set<string>();
-  for (const project of projects) {
-    const projectOutput = execFileSync('nx', ['show', 'project', project, '--json'], {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'inherit'],
-    });
-    const projectJson = parseNxProjectJsonText(projectOutput);
-    const targets = projectJson?.targets;
-    if (targets) {
-      for (const targetName of Object.keys(targets)) {
-        targetNames.add(targetName);
-      }
+  for (const node of Object.values(nodes)) {
+    for (const name of Object.keys(targetsOfProject(node))) {
+      targetNames.add(name);
     }
   }
   return [...targetNames];
+}
+
+/** Test seam: deploy configuration presence/provider from graph nodes. */
+export function deployTargetInfoFromProjects(
+  nodes: Record<string, NxGraphProjectNode>,
+  configuration: string,
+): DeployTargetInfo {
+  let exists = false;
+  let provider: DeployTargetInfo['provider'];
+  for (const node of Object.values(nodes)) {
+    const info = deployTargetInfoFromTargets(targetsOfProject(node), configuration);
+    if (!info.exists) {
+      continue;
+    }
+    exists = true;
+    provider ??= info.provider;
+  }
+  return { exists, provider };
+}
+
+function deployTargetInfoFromTargets(targets: Record<string, NxGraphTarget>, configuration: string): DeployTargetInfo {
+  const deploy = targets.deploy;
+  if (!deploy) {
+    return { exists: false };
+  }
+  const config = deploy.configurations?.[configuration];
+  if (!config) {
+    return { exists: false };
+  }
+  const commandValue = config.command ?? config.options?.command ?? deploy.options?.command ?? deploy.command;
+  const command = typeof commandValue === 'string' ? commandValue : '';
+  return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
 }
 
 function renderTemplate(context: ManagedFileContext, template: string): string {
@@ -396,46 +455,6 @@ function renderTemplate(context: ManagedFileContext, template: string): string {
     .replaceAll('{{REPO_NAME}}', context.repoName)
     .replaceAll('__SMOO_CI_PUSH_BRANCHES__', renderYamlFlowList(context.ciPushBranches))
     .replaceAll('{{NODE_MODULES_CACHE_KEY}}', context.nodeModulesCacheKey);
-}
-
-function getDeployTargetInfo(root: string, configuration: string): DeployTargetInfo {
-  const output = execFileSync('nx', ['show', 'projects', '--withTarget', 'deploy', '--json'], {
-    cwd: root,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'inherit'],
-  });
-  const projects = parseStringArrayText(output);
-  if (!projects) {
-    return { exists: false };
-  }
-  let exists = false;
-  let provider: DeployTargetInfo['provider'];
-  for (const project of projects) {
-    const target = nxDeployTarget(root, project, configuration);
-    if (!target.exists) {
-      continue;
-    }
-    exists = true;
-    provider ??= target.provider;
-  }
-  return { exists, provider };
-}
-
-function nxDeployTarget(root: string, project: string, configuration: string): DeployTargetInfo {
-  const output = execFileSync('nx', ['show', 'project', project, '--json'], {
-    cwd: root,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'inherit'],
-  });
-  const projectJson = parseNxProjectJsonText(output);
-  const deploy = projectJson?.targets?.deploy;
-  const config = deploy?.configurations?.[configuration];
-  if (!config) {
-    return { exists: false };
-  }
-  const commandValue = config.command ?? config.options?.command ?? deploy?.options?.command;
-  const command = typeof commandValue === 'string' ? commandValue : '';
-  return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
 }
 
 function getCiRunsOn(packageJson: PackageJson | null | undefined): string | string[] {
@@ -475,8 +494,8 @@ export function printResults(results: FileResult[]): void {
   }
 }
 
-export function validateManagedFiles(root: string): number {
-  const results = applyManagedFiles(root, 'check');
+export async function validateManagedFiles(root: string): Promise<number> {
+  const results = await applyManagedFiles(root, 'check');
   printResults(results);
   const failures = results.filter((result) => result.action === 'drifted').length;
   if (failures > 0) {
@@ -495,8 +514,8 @@ export function validateManagedFiles(root: string): number {
  * Under GitHub Actions the drifted-file count is published as the step output
  * `drifted`, so downstream steps gate declaratively instead of parsing logs.
  */
-export function warnOnManagedFileDrift(root: string): void {
-  const results = applyManagedFiles(root, 'check');
+export async function warnOnManagedFileDrift(root: string): Promise<void> {
+  const results = await applyManagedFiles(root, 'check');
   printResults(results);
   const drifted = results.filter((result) => result.action === 'drifted');
   if (process.env.GITHUB_OUTPUT) {

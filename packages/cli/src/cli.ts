@@ -66,11 +66,11 @@ function buildProgram(): Command {
     .option('--warn', 'report drift as warnings (GitHub annotations) instead of failing')
     .action(async (options: { warn?: boolean }) => {
       const { checkManagedFiles } = await import('./monorepo/index.js');
-      checkManagedFiles(await findRepoRoot(), { warn: options.warn });
+      await checkManagedFiles(await findRepoRoot(), { warn: options.warn });
     });
   monorepo.command('diff').action(async () => {
     const { diffManagedFiles } = await import('./monorepo/index.js');
-    diffManagedFiles(await findRepoRoot());
+    await diffManagedFiles(await findRepoRoot());
   });
   monorepo
     .command('validate-commit-msg <commitMsgFile>')
