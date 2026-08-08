@@ -237,7 +237,10 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
 
   if (targets['typecheck-tests']) {
     if (hasLibTsconfig) {
-      targets['typecheck-tests'].dependsOn = ['typecheck'];
+      // Test configs may resolve the package's own `./index.js` through dist.
+      // Rebuild that current-project declaration output after clean, not only
+      // dependency-project outputs reached through typecheck.
+      targets['typecheck-tests'].dependsOn = ['tsc-js', 'typecheck'];
     } else if (targets.build) {
       targets['typecheck-tests'].dependsOn = ['build'];
     }

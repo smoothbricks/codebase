@@ -110,7 +110,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(targets['typecheck-tests']?.executor).toBe('nx:run-commands');
       expect(targets['typecheck-tests']?.cache).toBe(true);
-      expect(targets['typecheck-tests']?.dependsOn).toEqual(['typecheck']);
+      expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck']);
       expect(targets['typecheck-tests']?.options).toMatchObject({
         command: 'tsc -p tsconfig.test.json --noEmit',
         cwd: 'packages/example',
@@ -140,6 +140,22 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.lint?.executor).toBeUndefined();
       expect(targets.lint?.cache).toBe(true);
       expect(targets.lint?.dependsOn).toEqual(['typecheck-tests']);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('rebuilds current library declarations before test typechecking after clean', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/example/package.json', '{"name":"example"}\n');
+      await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
+      await workspace.write('packages/example/tsconfig.test.json', '{}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/example/package.json');
+
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      expect(targets['typecheck-tests']?.dependsOn).toEqual(['tsc-js', 'typecheck']);
     } finally {
       await workspace.cleanup();
     }
