@@ -258,9 +258,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test']?.inputs).toEqual([
         '{projectRoot}/**/*.rs',
         '{projectRoot}/**/Cargo.toml',
-        '{projectRoot}/Cargo.lock',
-        '{projectRoot}/.cargo/config.toml',
-        '!{projectRoot}/target/**',
+        '{projectRoot}/**/Cargo.lock',
+        '{projectRoot}/**/.cargo/config.toml',
+        '!{projectRoot}/**/target/**',
       ]);
       expect(targets['cargo-lint']?.options).toMatchObject({
         commands: ['cargo fmt --all --check', 'cargo clippy --workspace --all-targets -- -D warnings'],
@@ -274,6 +274,67 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo mutants --workspace' });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo bench --workspace' });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('infers a cached Cargo Wasm build directly from crate metadata', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/git-do/package.json', '{"name":"git-do"}\n');
+      await workspace.write(
+        'packages/git-do/crates/git-do/Cargo.toml',
+        [
+          '[package]',
+          'name = "git-do"',
+          '',
+          '[lib]',
+          'name = "gitoxide_engine"',
+          'crate-type = ["cdylib", "rlib"]',
+          '',
+          '[package.metadata.smoothbricks.wasm-bindgen]',
+          'targets = ["nodejs", "web"]',
+          'out-dir = "generated/wasm"',
+          '',
+        ].join('\n'),
+      );
+      await workspace.write('packages/git-do/tsconfig.lib.json', '{"compilerOptions":{"outDir":"dist"}}\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/git-do/package.json');
+
+      expect(targets['cargo-wasm']).toMatchObject({
+        executor: 'nx:run-commands',
+        cache: true,
+        dependsOn: ['^build'],
+        inputs: [
+          '{projectRoot}/**/*.rs',
+          '{projectRoot}/**/Cargo.toml',
+          '{projectRoot}/**/Cargo.lock',
+          '{projectRoot}/**/.cargo/config.toml',
+          '!{projectRoot}/**/target/**',
+          '{projectRoot}/package.json',
+          '{workspaceRoot}/bun.lock',
+        ],
+        outputs: ['{projectRoot}/generated/wasm'],
+        options: {
+          commands: [
+            'cargo build --release --target wasm32-unknown-unknown --target-dir crates/git-do/target/cargo-wasm --manifest-path crates/git-do/Cargo.toml',
+            'wasm-bindgen --target nodejs --out-dir generated/wasm/node crates/git-do/target/cargo-wasm/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
+            'wasm-bindgen --target web --out-dir generated/wasm/web crates/git-do/target/cargo-wasm/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
+          ],
+          cwd: 'packages/git-do',
+          parallel: false,
+        },
+      });
+      expect(targets['tsc-js']?.dependsOn).toEqual(['^tsc-js', 'cargo-wasm']);
+      expect(targets.typecheck?.dependsOn).toEqual(['^tsc-js', 'cargo-wasm']);
+      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      // A nested crate manifest is enough for output inference, but not for
+      // workspace-wide cargo-test/lint policy.
+      expect(targets['cargo-test']).toBeUndefined();
+      expect(targets['cargo-lint']).toBeUndefined();
     } finally {
       await workspace.cleanup();
     }
@@ -372,7 +433,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       await workspace.write(
         'packages/columine/crates/columine-wasm/Cargo.toml',
-        '[package]\nname = "columine-wasm"\n\n[lib]\ncrate-type = ["cdylib", "rlib"]\n',
+        '[package]\nname = "columine-wasm"\n\n[lib]\ncrate-type = ["cdylib", "rlib"]\n\n[package.metadata.smoothbricks.wasm-bindgen]\ntargets = ["web"]\n',
       );
 
       const targets = await inferProjectTargets(workspace, 'packages/columine/package.json');
