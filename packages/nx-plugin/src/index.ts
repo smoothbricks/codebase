@@ -1,8 +1,13 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 
-import type { CreateNodesResultV2, CreateNodesV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
+import {
+  type CreateNodesResultV2,
+  type CreateNodesV2,
+  readJsonFile,
+  type TargetConfiguration,
+} from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
@@ -19,11 +24,9 @@ const TYPESCRIPT_TOOLCHAIN_INPUTS = [
 // Cargo workspace inference: a package.json sitting next to a Cargo.toml that
 // declares [workspace] gets direct cargo-test/test targets, cargo-lint feeding
 // the lint aggregate, mutation (cargo-mutants), and bench. Rust output targets
-// (cargo-wasm, cargo-napi, ...) are never inferred from crate metadata such as
-// cdylib crate-types — a native N-API cdylib is not a wasm build. Packages
-// declare output targets in package.json nx.targets, and those *-wasm/*-napi/
-// *-native output-family names feed the aggregate build and clean targets.
-// Explicit nx.targets entries always win over inference.
+// are not guessed from crate metadata: N-API targets require package.json napi
+// metadata plus the conventional crates/<binaryName>-napi workspace member.
+// Other output families remain explicit package targets.
 const CARGO_WORKSPACE_PATTERN = /^\s*\[workspace\]/m;
 //#endregion
 const CARGO_INPUTS = [
@@ -33,6 +36,41 @@ const CARGO_INPUTS = [
   '{projectRoot}/.cargo/config.toml',
   '!{projectRoot}/target/**',
 ];
+const NAPI_INPUTS = [...CARGO_INPUTS, '{projectRoot}/package.json', '{workspaceRoot}/bun.lock'];
+
+interface NapiTargetConvention {
+  architecture: string;
+  outputName: string;
+  targetFamily: 'linux' | 'macos';
+  useNapiCross: boolean;
+}
+
+const NAPI_TARGET_CONVENTIONS: Readonly<Record<string, NapiTargetConvention>> = {
+  'aarch64-apple-darwin': {
+    architecture: 'arm64',
+    outputName: 'darwin-arm64',
+    targetFamily: 'macos',
+    useNapiCross: false,
+  },
+  'x86_64-apple-darwin': {
+    architecture: 'x64',
+    outputName: 'darwin-x64',
+    targetFamily: 'macos',
+    useNapiCross: false,
+  },
+  'aarch64-unknown-linux-gnu': {
+    architecture: 'arm64',
+    outputName: 'linux-arm64-gnu',
+    targetFamily: 'linux',
+    useNapiCross: true,
+  },
+  'x86_64-unknown-linux-gnu': {
+    architecture: 'x64',
+    outputName: 'linux-x64-gnu',
+    targetFamily: 'linux',
+    useNapiCross: true,
+  },
+};
 
 function createCargoTestTarget(projectRoot: string): TargetConfiguration {
   return {
@@ -90,6 +128,7 @@ export default { createNodesV2 };
 
 interface PackageJson {
   name?: string;
+  napi?: Record<string, unknown>;
   scripts?: Record<string, unknown>;
   nx?: {
     name?: string;
@@ -103,9 +142,14 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const packageJson = await readPackageJson(join(workspaceRoot, packageJsonPath));
   const targets: Record<string, TargetConfiguration> = {};
   const validationTargets: string[] = [];
-  const hasLibTsconfig = existsSync(join(absoluteProjectRoot, 'tsconfig.lib.json'));
+  const libTsconfigPath = join(absoluteProjectRoot, 'tsconfig.lib.json');
+  const hasLibTsconfig = existsSync(libTsconfigPath);
+  const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
+  const isCargoWorkspace =
+    existsSync(cargoTomlPath) && CARGO_WORKSPACE_PATTERN.test(await readFile(cargoTomlPath, 'utf-8'));
+  const napiConfig = resolveNapiConfig(packageJson, packageJsonPath, absoluteProjectRoot, isCargoWorkspace);
   const packageLocalBuildOutputs = classifyPackageLocalBuildOutputs(packageJson);
-  const hasOrdinaryBuildOutputTarget = hasLibTsconfig || packageLocalBuildOutputs.ordinary;
+  const hasOrdinaryBuildOutputTarget = hasLibTsconfig || napiConfig !== null || packageLocalBuildOutputs.ordinary;
   const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
 
   if (hasLibTsconfig) {
@@ -117,10 +161,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       executor: '@smoothbricks/nx-plugin:typescript-emit',
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
-      outputs: [
-        '{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}',
-        '{projectRoot}/dist/**/*.tsbuildinfo',
-      ],
+      outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
       dependsOn: ['^tsc-js'],
       options: {
         tsConfig: 'tsconfig.lib.json',
@@ -177,10 +218,19 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     validationTargets.push('typecheck');
   }
 
+  if (napiConfig) {
+    Object.assign(targets, createNapiTargets(projectRoot, napiConfig));
+    if (
+      !('napi-test' in (packageJson.nx?.targets ?? {})) &&
+      existsSync(join(absoluteProjectRoot, 'src/native.test.ts'))
+    ) {
+      targets['napi-test'] = createNapiTestTarget(projectRoot);
+    }
+  }
+
   // Member crates get their targets from the workspace-root package.json,
   // never per-crate — one Nx project per Cargo workspace.
-  const cargoTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
-  if (existsSync(cargoTomlPath) && CARGO_WORKSPACE_PATTERN.test(await readFile(cargoTomlPath, 'utf-8'))) {
+  if (isCargoWorkspace) {
     const declared = packageJson.nx?.targets ?? {};
     if (!('cargo-test' in declared)) {
       targets['cargo-test'] = createCargoTestTarget(projectRoot);
@@ -198,7 +248,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       };
     }
     validationTargets.push('cargo-lint');
-    if (!('test' in declared) && typeof packageJson.scripts?.test !== 'string') {
+    if (!targets.test && !('test' in declared) && typeof packageJson.scripts?.test !== 'string') {
       // Execute Cargo directly: workspace targetDefaults may replace test.dependsOn.
       targets.test = createCargoTestTarget(projectRoot);
     }
@@ -264,6 +314,120 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   };
 }
 
+interface ResolvedNapiConfig {
+  binaryName: string;
+  cargoPackage: string;
+  manifestPath: string;
+  targets: string[];
+}
+
+function inferTypescriptOutputs(tsconfigPath: string, packageJsonPath: string): string[] {
+  const tsconfig: unknown = readJsonFile(tsconfigPath);
+  const compilerOptions = isRecord(tsconfig) && isRecord(tsconfig.compilerOptions) ? tsconfig.compilerOptions : null;
+  const outDir = compilerOptions?.outDir;
+  if (typeof outDir !== 'string' || outDir.length === 0) {
+    return ['{projectRoot}/dist/**/*.{js,cjs,mjs,jsx,d.ts,d.cts,d.mts}{,.map}', '{projectRoot}/dist/**/*.tsbuildinfo'];
+  }
+
+  const normalized = posix.normalize(outDir.replaceAll('\\', '/'));
+  if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.startsWith('/')) {
+    throw new Error(`${packageJsonPath}: tsconfig.lib.json compilerOptions.outDir must stay inside the project`);
+  }
+  return [`{projectRoot}/${normalized}`];
+}
+
+function resolveNapiConfig(
+  packageJson: PackageJson,
+  packageJsonPath: string,
+  absoluteProjectRoot: string,
+  isCargoWorkspace: boolean,
+): ResolvedNapiConfig | null {
+  if (!packageJson.napi) {
+    return null;
+  }
+  if (!isCargoWorkspace) {
+    throw new Error(`${packageJsonPath}: napi target inference requires a Cargo workspace beside package.json`);
+  }
+
+  const binaryName = packageJson.napi.binaryName;
+  if (typeof binaryName !== 'string' || !/^[A-Za-z0-9_-]+$/.test(binaryName)) {
+    throw new Error(`${packageJsonPath}: napi.binaryName must contain only letters, numbers, hyphens, or underscores`);
+  }
+  const rawTargets = packageJson.napi.targets;
+  if (
+    !Array.isArray(rawTargets) ||
+    rawTargets.length === 0 ||
+    !rawTargets.every((target) => typeof target === 'string')
+  ) {
+    throw new Error(`${packageJsonPath}: napi.targets must be a non-empty array of target triples`);
+  }
+  const targets = [...new Set(rawTargets as string[])];
+  for (const target of targets) {
+    if (!NAPI_TARGET_CONVENTIONS[target]) {
+      throw new Error(`${packageJsonPath}: unsupported inferred napi target ${target}`);
+    }
+  }
+
+  const cargoPackage = `${binaryName}-napi`;
+  const manifestPath = `crates/${cargoPackage}/Cargo.toml`;
+  if (!existsSync(join(absoluteProjectRoot, manifestPath))) {
+    throw new Error(`${packageJsonPath}: inferred N-API crate is missing at ${manifestPath}`);
+  }
+  return { binaryName, cargoPackage, manifestPath, targets };
+}
+
+function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Record<string, TargetConfiguration> {
+  const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage}`;
+  const targets: Record<string, TargetConfiguration> = {
+    'cargo-napi': {
+      executor: 'nx:run-commands',
+      cache: true,
+      dependsOn: ['^build'],
+      inputs: NAPI_INPUTS,
+      outputs: ['{projectRoot}/dist/native/host'],
+      options: {
+        cwd: projectRoot,
+        command: `napi build --release --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir dist/native/host`,
+      },
+    },
+  };
+
+  for (const triple of config.targets) {
+    const convention = NAPI_TARGET_CONVENTIONS[triple];
+    if (!convention) {
+      throw new Error(`Missing N-API target convention for ${triple}`);
+    }
+    const targetName = `napi-${convention.architecture}-${convention.targetFamily}`;
+    const outputDirectory = `dist/native/${convention.outputName}`;
+    const crossFlag = convention.useNapiCross ? ' --use-napi-cross' : '';
+    targets[targetName] = {
+      executor: 'nx:run-commands',
+      cache: true,
+      inputs: NAPI_INPUTS,
+      outputs: [`{projectRoot}/${outputDirectory}`],
+      options: {
+        cwd: projectRoot,
+        command: `napi build --release --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple}${crossFlag} ${commonCommand} --output-dir ${outputDirectory}`,
+      },
+    };
+  }
+  return targets;
+}
+
+function createNapiTestTarget(projectRoot: string): TargetConfiguration {
+  return {
+    executor: '@smoothbricks/nx-plugin:bounded-exec',
+    cache: true,
+    dependsOn: ['cargo-test', 'cargo-napi', 'tsc-js', '^build', 'build'],
+    options: {
+      command: 'bun test --timeout=30000 src/native.test.ts',
+      cwd: projectRoot,
+      timeoutMs: 120000,
+      killAfterMs: 10000,
+    },
+  };
+}
+
 async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
   const parsed: unknown = JSON.parse(await readFile(packageJsonPath, 'utf-8'));
   if (!isRecord(parsed)) {
@@ -272,6 +436,7 @@ async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
   const rawNx = isRecord(parsed.nx) ? parsed.nx : undefined;
   return {
     ...(typeof parsed.name === 'string' ? { name: parsed.name } : {}),
+    ...(isRecord(parsed.napi) ? { napi: parsed.napi } : {}),
     ...(isRecord(parsed.scripts) ? { scripts: parsed.scripts } : {}),
     ...(rawNx
       ? {

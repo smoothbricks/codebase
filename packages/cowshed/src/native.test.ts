@@ -67,7 +67,7 @@ describe('Cowshed Node-API bindings', () => {
   });
 
   it('loads the built addon and preserves its error contract under Node', async () => {
-    const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'index.js')).href;
+    const moduleUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'index.js')).href;
     const script = `
       import { coordinatorEndpoint, CowshedError } from ${JSON.stringify(moduleUrl)};
       try {
