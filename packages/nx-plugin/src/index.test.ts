@@ -410,6 +410,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           killAfterMs: 10000,
         },
       });
+      await workspace.write('packages/cowshed/bunfig.napi-test.toml', '[test]\n');
+      const targetsWithDedicatedBunfig = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
+      expect(targetsWithDedicatedBunfig['napi-test']?.options?.command).toBe(
+        'bun --config=bunfig.napi-test.toml test --timeout=30000 src/native.test.ts',
+      );
     } finally {
       await workspace.cleanup();
     }
