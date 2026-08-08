@@ -777,12 +777,17 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 🧪 Test and build selected macOS and iOS release outputs',
+    '      - name: 🍎 Build selected macOS and iOS release outputs',
     '        run:',
     `          smoo release build-platform-outputs --bump "${githubExpression(
       'inputs.bump',
     )}" --ref "${githubExpression('github.sha')}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --output`,
     `          "${githubExpression('runner.temp')}/macos-platform-outputs"`,
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🧪 Unit test macOS and iOS packages',
+    '        run:',
+    `          smoo github-ci nx-run-many --targets test --projects-with-targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}"`,
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 📤 Upload macOS platform outputs',

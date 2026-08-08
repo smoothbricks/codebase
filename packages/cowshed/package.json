@@ -1,7 +1,6 @@
 {
   "name": "@smoothbricks/cowshed",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -31,9 +30,6 @@
   },
   "nx": {
     "name": "cowshed",
-    "tags": [
-      "ci:skip:test"
-    ],
     "targets": {
       "cargo-napi": {
         "executor": "nx:run-commands",

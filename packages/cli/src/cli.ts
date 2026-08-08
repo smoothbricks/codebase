@@ -348,10 +348,17 @@ function buildProgram(): Command {
     .command('nx-run-many')
     .requiredOption('--targets <targets>')
     .option('--projects <projects>')
+    .option('--projects-with-targets <targets>', 'select projects owning any comma-separated target or target glob')
     .option('--configuration <configuration>')
     .option('--collect-outputs <directory>')
     .action(
-      async (options: { targets: string; projects?: string; configuration?: string; collectOutputs?: string }) => {
+      async (options: {
+        targets: string;
+        projects?: string;
+        projectsWithTargets?: string;
+        configuration?: string;
+        collectOutputs?: string;
+      }) => {
         const { githubCiNxRunMany } = await import('./github-ci/index.js');
         await githubCiNxRunMany(await findRepoRoot(), options);
       },
