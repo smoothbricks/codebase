@@ -23,19 +23,14 @@ describe('CI workflow definition', () => {
     const steps = defineCiWorkflow({ deploy: true, pushBranches: ['main'] });
     const rendered = renderCiWorkflowYaml({ deploy: true, pushBranches: ['main'] });
 
-    expect(steps.map((step) => [step.kind, step.number])).toContainEqual([CiWorkflowStepKind.Deploy, 12]);
-    expect(steps.map((step) => [step.kind, step.number])).toContainEqual([
-      CiWorkflowStepKind.SupplementalLinuxTargets,
-      7,
-    ]);
-    expect(rendered).toContain('smoo github-ci nx-run-many --targets "*-linux"');
+    expect(steps.map((step) => [step.kind, step.number])).toContainEqual([CiWorkflowStepKind.Deploy, 11]);
     expect(rendered).toContain('- name: 🚀 Deploy Staging');
     expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
     expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
     expect(rendered).toContain(
-      'smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step 12',
+      'smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step 11',
     );
-    expect(rendered).toContain("# Step 13\n      # Nx's database cache needs artifact files");
+    expect(rendered).toContain("# Step 12\n      # Nx's database cache needs artifact files");
     expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
     expect(rendered).toContain('id: setup');
     expect(rendered).not.toContain('Setup Nix/devenv (fork)');
