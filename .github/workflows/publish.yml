@@ -217,7 +217,7 @@ jobs:
         run: nx build cli
 
       # Step 5
-      - name: 🍎 Build selected macOS and iOS release outputs
+      - name: 🧪 Test and build selected macOS and iOS release outputs
         run:
           smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" --targets
           "*-macos,*-ios" --output "${{ runner.temp }}/macos-platform-outputs"
