@@ -60,8 +60,6 @@ import {
 } from './orchestration.js';
 import { type RetagUnpublishedTagUpdate, retagUnpublished } from './retag-unpublished.js';
 
-const PLATFORM_OUTPUT_PREREQUISITE_TARGET = 'test';
-
 export interface ReleaseVersionOptions {
   bump: string;
   dryRun?: boolean;
@@ -227,7 +225,6 @@ export async function releaseCollectPlatformOutputs(
     projects: releasePackageProjects(currentPackages),
     collectOutputs: join(outputRoot, 'current'),
     allowEmptyProjects: true,
-    prerequisiteTarget: PLATFORM_OUTPUT_PREREQUISITE_TARGET,
   });
 
   console.log(`Repair platform outputs: planning from ${releaseRef}.`);
@@ -969,7 +966,6 @@ function releaseRepairOutputsShell(
         targets: targetGlobs,
         projects: releasePackageProjects(target.npmPackages),
         collectOutputs: join(outputRoot, target.sha),
-        prerequisiteTarget: PLATFORM_OUTPUT_PREREQUISITE_TARGET,
       }),
   };
 }

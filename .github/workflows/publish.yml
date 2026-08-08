@@ -217,12 +217,16 @@ jobs:
         run: nx build cli
 
       # Step 5
-      - name: 🧪 Test and build selected macOS and iOS release outputs
+      - name: 🍎 Build selected macOS and iOS release outputs
         run:
           smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" --targets
           "*-macos,*-ios" --output "${{ runner.temp }}/macos-platform-outputs"
 
       # Step 6
+      - name: 🧪 Unit test macOS and iOS packages
+        run: smoo github-ci nx-run-many --targets test --projects-with-targets "*-macos,*-ios"
+
+      # Step 7
       - name: 📤 Upload macOS platform outputs
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -234,7 +238,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 7
+      # Step 8
       - name: 🧹 Cleanup and cache Nix/devenv
         # success() is default; always() still saves GH Nix cache after a red job.
         if: always()
