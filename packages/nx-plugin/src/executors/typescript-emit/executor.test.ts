@@ -6,12 +6,6 @@ import { join } from 'node:path';
 
 import { type CompilerInvocation, runTypeScriptEmit } from './executor.js';
 
-interface OverlayConfig {
-  extends?: unknown;
-  compilerOptions?: unknown;
-  references?: unknown;
-}
-
 describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
   it('runs transformed JavaScript and native declaration lanes with project references preserved', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-'));
@@ -23,7 +17,7 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
     );
 
     const invocations: CompilerInvocation[] = [];
-    let overlay: OverlayConfig | undefined;
+    let overlayContents = '';
     let overlayPath = '';
     try {
       const result = await runTypeScriptEmit(
@@ -33,7 +27,7 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
           invocations.push(invocation);
           if (invocation.command === 'ttsc') {
             overlayPath = invocation.args[1] ?? '';
-            overlay = JSON.parse(await readFile(overlayPath, 'utf8')) as OverlayConfig;
+            overlayContents = await readFile(overlayPath, 'utf8');
           }
           return true;
         },
@@ -47,17 +41,23 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
         cwd: projectRoot,
       });
       expect(overlayPath).toMatch(/\/\.ttsc-js-\d+-[0-9a-f-]+\.json$/);
-      expect(overlay).toEqual({
-        extends: './tsconfig.lib.json',
-        compilerOptions: {
-          composite: false,
-          declaration: false,
-          declarationMap: false,
-          emitDeclarationOnly: false,
-          incremental: false,
-        },
-        references: [{ path: '../dependency/tsconfig.lib.json' }],
-      });
+      expect(overlayContents).toBe(
+        `${JSON.stringify(
+          {
+            extends: './tsconfig.lib.json',
+            compilerOptions: {
+              composite: false,
+              declaration: false,
+              declarationMap: false,
+              emitDeclarationOnly: false,
+              incremental: false,
+            },
+            references: [{ path: '../dependency/tsconfig.lib.json' }],
+          },
+          null,
+          2,
+        )}\n`,
+      );
       expect(invocations[1]).toEqual({
         command: 'tsc',
         args: [

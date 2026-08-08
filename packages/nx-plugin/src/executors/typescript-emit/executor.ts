@@ -85,8 +85,8 @@ async function runCompiler(invocation: CompilerInvocation): Promise<boolean> {
     windowsHide: true,
   });
   try {
-    const [code, signal] = (await once(child, 'exit')) as [number | null, NodeJS.Signals | null];
-    return code === 0 && signal === null;
+    await once(child, 'exit');
+    return child.exitCode === 0 && child.signalCode === null;
   } catch (error) {
     console.error(`${invocation.command}: ${error instanceof Error ? error.message : String(error)}`);
     return false;
