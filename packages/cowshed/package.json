@@ -31,6 +31,12 @@
   "nx": {
     "name": "cowshed",
     "targets": {
+      "tsc-js": {
+        "outputs": [
+          "{projectRoot}/dist/{index,native,types}.{js,d.ts}{,.map}",
+          "{projectRoot}/dist/tsconfig.lib.tsbuildinfo"
+        ]
+      },
       "cargo-napi": {
         "executor": "nx:run-commands",
         "cache": true,
