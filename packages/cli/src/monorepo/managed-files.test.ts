@@ -10,6 +10,7 @@ import {
   INLINE_LOCAL_BEGIN,
   INLINE_LOCAL_END,
   LOCAL_SECTION_MARKER,
+  managedFileTargetsForTest,
   type NxGraphProjectNode,
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
@@ -218,6 +219,19 @@ describe('nx graph project helpers', () => {
       provider: 'cloudflare',
     });
     expect(deployTargetInfoFromProjects(sampleNodes, 'preview')).toEqual({ exists: false });
+  });
+});
+
+describe('managed raw files', () => {
+  it('manages the devenv wrapper as an executable byte-exact copy', async () => {
+    expect(managedFileTargetsForTest).toContainEqual({ target: 'tooling/devenv', executable: true });
+
+    const [source, generated] = await Promise.all([
+      readFile(join(REPO_ROOT, 'packages', 'cli', 'managed', 'raw', 'tooling', 'devenv'), 'utf8'),
+      readFile(join(REPO_ROOT, 'tooling', 'devenv'), 'utf8'),
+    ]);
+
+    expect(generated).toBe(source);
   });
 });
 
