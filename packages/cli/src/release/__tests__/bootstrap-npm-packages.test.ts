@@ -4,6 +4,7 @@ import {
   bootstrapNpmPackages,
   NPM_BOOTSTRAP_DIST_TAG,
   NPM_BOOTSTRAP_VERSION,
+  NPM_BOOTSTRAP_VISIBILITY_TIMEOUT_MS,
 } from '../bootstrap-npm-packages.js';
 import type { ReleasePackageInfo } from '../core.js';
 
@@ -70,6 +71,45 @@ describe('bootstrap npm packages', () => {
     expect(shell.prompts).toEqual([]);
   });
 
+  it('uploads every placeholder before polling all pending packages with backoff', async () => {
+    const shell = new RecordingBootstrapShell({
+      packages: [stable, missing],
+      existing: [],
+      visibleAfterChecks: { [stable.name]: 2, [missing.name]: 3 },
+    });
+
+    await bootstrapNpmPackages(shell, { dryRun: false, skipLogin: true, packages: [], otp: '111222' });
+
+    expect(shell.events).toEqual([
+      `publish:${stable.name}`,
+      `publish:${missing.name}`,
+      `view:${stable.name}:${NPM_BOOTSTRAP_VERSION}`,
+      `view:${missing.name}:${NPM_BOOTSTRAP_VERSION}`,
+      'wait:1000',
+      `view:${stable.name}:${NPM_BOOTSTRAP_VERSION}`,
+      `view:${missing.name}:${NPM_BOOTSTRAP_VERSION}`,
+      'wait:2000',
+      `view:${missing.name}:${NPM_BOOTSTRAP_VERSION}`,
+    ]);
+  });
+
+  it('times out after bounded backoff without suggesting another bootstrap', async () => {
+    const shell = new RecordingBootstrapShell({
+      packages: [missing],
+      existing: [],
+      visibleAfterChecks: { [missing.name]: Number.POSITIVE_INFINITY },
+    });
+
+    await expect(
+      bootstrapNpmPackages(shell, { dryRun: false, skipLogin: true, packages: [], otp: '111222' }),
+    ).rejects.toThrow('Retry smoo release trust-publisher later; do not bootstrap again.');
+
+    const waited = shell.events
+      .filter((event) => event.startsWith('wait:'))
+      .reduce((total, event) => total + Number(event.slice('wait:'.length)), 0);
+    expect(waited).toBe(NPM_BOOTSTRAP_VISIBILITY_TIMEOUT_MS);
+  });
+
   it('rejects unknown package selections before npm login', async () => {
     const shell = new RecordingBootstrapShell({ packages: [stable], existing: [] });
 
@@ -82,6 +122,7 @@ describe('bootstrap npm packages', () => {
 });
 
 class RecordingBootstrapShell implements BootstrapNpmPackagesShell<ReleasePackageInfo> {
+  readonly events: string[] = [];
   readonly logs: string[] = [];
   readonly published: Array<{ name: string; otp: string }> = [];
   readonly prompts: string[] = [];
@@ -89,11 +130,19 @@ class RecordingBootstrapShell implements BootstrapNpmPackagesShell<ReleasePackag
   private readonly packages: ReleasePackageInfo[];
   private readonly existing: Set<string>;
   private readonly otps: string[];
+  private readonly visibilityChecks = new Map<string, number>();
+  private readonly visibleAfterChecks: Readonly<Record<string, number>>;
 
-  constructor(options: { packages: ReleasePackageInfo[]; existing: string[]; otps?: string[] }) {
+  constructor(options: {
+    packages: ReleasePackageInfo[];
+    existing: string[];
+    otps?: string[];
+    visibleAfterChecks?: Record<string, number>;
+  }) {
     this.packages = options.packages;
     this.existing = new Set(options.existing);
     this.otps = [...(options.otps ?? [])];
+    this.visibleAfterChecks = options.visibleAfterChecks ?? {};
   }
 
   listReleasePackages(): ReleasePackageInfo[] {
@@ -104,11 +153,19 @@ class RecordingBootstrapShell implements BootstrapNpmPackagesShell<ReleasePackag
     return this.existing.has(name);
   }
 
+  async packageVersionExists(name: string, version: string): Promise<boolean> {
+    this.events.push(`view:${name}:${version}`);
+    const checks = (this.visibilityChecks.get(name) ?? 0) + 1;
+    this.visibilityChecks.set(name, checks);
+    return checks >= (this.visibleAfterChecks[name] ?? 1);
+  }
+
   async login(): Promise<void> {
     this.logins += 1;
   }
 
   async publishPlaceholder(pkg: ReleasePackageInfo, env?: Record<string, string>): Promise<void> {
+    this.events.push(`publish:${pkg.name}`);
     this.published.push({ name: pkg.name, otp: env?.NPM_CONFIG_OTP ?? '' });
   }
 
@@ -119,6 +176,10 @@ class RecordingBootstrapShell implements BootstrapNpmPackagesShell<ReleasePackag
       throw new Error(`unexpected OTP prompt for ${packageName}`);
     }
     return otp;
+  }
+
+  async wait(milliseconds: number): Promise<void> {
+    this.events.push(`wait:${milliseconds}`);
   }
 
   log(message: string): void {

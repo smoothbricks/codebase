@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 import { $ } from 'bun';
 import typia from 'typia';
 import { githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
@@ -251,9 +252,11 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
           {
             listReleasePackages: () => listReleasePackages(root),
             packageExists: (name) => npmPackageExists(root, name),
+            packageVersionExists: (name, version) => npmPublishedVersionExists(root, name, version),
             login: () => runLatestNpm(root, ['login', '--auth-type=web']),
             publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
             promptOtp: (packageName) => promptForNpmOtp(packageName),
+            wait: delay,
             log: (message) => console.log(message),
           },
           bootstrapOptions,
@@ -460,9 +463,11 @@ export async function releaseBootstrapNpmPackages(
     {
       listReleasePackages: () => listReleasePackages(root),
       packageExists: (name) => npmPackageExists(root, name),
+      packageVersionExists: (name, version) => npmPublishedVersionExists(root, name, version),
       login: () => runLatestNpm(root, ['login', '--auth-type=web']),
       publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
       promptOtp: (packageName) => promptForNpmOtp(packageName),
+      wait: delay,
       log: (message) => console.log(message),
     },
     {
@@ -1504,6 +1509,19 @@ async function npmVersionExists(root: string, name: string, version: string): Pr
 async function npmPackageExists(root: string, name: string): Promise<boolean> {
   const result = await $`bun pm view ${name} name`.cwd(root).quiet().nothrow();
   return result.exitCode === 0;
+}
+
+async function npmPublishedVersionExists(root: string, name: string, version: string): Promise<boolean> {
+  const spec = `${name}@${version}`;
+  const args = ['view', spec, 'version', '--json'];
+  const result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
+  if (result.exitCode === 0) {
+    return true;
+  }
+  if (/\bE404\b|404 Not Found/i.test(`${result.stdout}\n${result.stderr}`)) {
+    return false;
+  }
+  throw new Error(npmCommandFailedMessage(args, result.exitCode, result.stdout, result.stderr));
 }
 
 async function assertCleanGitTree(root: string): Promise<void> {
