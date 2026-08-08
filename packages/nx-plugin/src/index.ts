@@ -181,9 +181,9 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
 
   if (hasLibTsconfig) {
-    // Dependency packages may publish bundled or platform-specific entries that raw tsc
-    // does not produce. Build every dependency's complete output family before resolving
-    // its package exports from this project's compiler lanes.
+    // Dependency packages may publish bundled entries that raw tsc does not produce.
+    // Build every JavaScript output lane before resolving package exports, without pulling
+    // unrelated Wasm, N-API, native, or web outputs onto the compiler critical path.
     //
     // ttsc transforms the source program before declaration emit, so typia's
     // generated implementation identifiers are not valid declaration inputs.
@@ -194,7 +194,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
       outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
-      dependsOn: ['^build', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
+      dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
         tsConfig: 'tsconfig.lib.json',
         cwd: projectRoot,
@@ -205,7 +205,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       cache: true,
       inputs: ['production', '^production', ...TYPESCRIPT_TOOLCHAIN_INPUTS, '{projectRoot}/tsconfig.lib.json'],
       outputs: [],
-      dependsOn: ['^build', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
+      dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
         command: 'tsc -p tsconfig.lib.json --noEmit',
         cwd: projectRoot,

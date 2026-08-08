@@ -36,6 +36,30 @@ Concrete targets come from concrete files:
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.
 
+### Dependency output lanes
+
+Compiler targets depend on `^*-js`, not `^build`. The caret asks Nx for every matching JavaScript output target on
+project dependencies; it does not directly select their Wasm, N-API, native, web, or aggregate `build` targets. This
+keeps a declaration or JavaScript compile from paying for unrelated platform artifacts merely because a dependency
+package publishes them.
+
+The selected JavaScript target retains its own `dependsOn` edges. A platform artifact that is genuinely required to
+produce that JavaScript therefore still participates transitively:
+
+```text
+consumer:tsc-js
+└─ dependency:bundle-js
+   └─ dependency:cargo-wasm
+```
+
+A wildcard without a caret selects the current project instead. For example, a workspace may add `*-wasm` to its
+`tsc-js` target default when the current package's generated Wasm module must exist during compilation. The plugin makes
+this local relationship explicit for inferred `tsc-js` targets that also have inferred `cargo-wasm`. Package-managed
+JavaScript targets with another platform prerequisite must likewise declare that local edge themselves.
+
+N-API binaries are not prerequisites of TypeScript declaration emission, so compiler targets do not pull them in by
+default. Aggregate `build` remains the package-completeness boundary and includes every published local output family.
+
 Do not use colon-style Nx target names such as `build:wasm` or `lint:fix`. Nx CLI syntax already uses colons for
 `project:target:configuration`, so colon target names are hard to read, easy to confuse with configurations, and awkward
 to expose through package scripts. Package scripts may still use names like `build:wasm`; they should delegate to a real
