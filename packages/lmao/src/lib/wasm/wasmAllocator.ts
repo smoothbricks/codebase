@@ -429,10 +429,12 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
     const { fileURLToPath } = await import('node:url');
     const { dirname, join } = await import('node:path');
 
-    // __dirname equivalent for ESM
+    // Source imports live under src/; published modules live under dist/ts/.
     const currentFile = fileURLToPath(import.meta.url);
     const currentDir = dirname(currentFile);
-    const wasmPath = join(currentDir, '../../../dist', WASM_ARTIFACT_NAME);
+    const wasmPath = import.meta.url.includes('/dist/ts/')
+      ? join(currentDir, '../../../', WASM_ARTIFACT_NAME)
+      : join(currentDir, '../../../dist', WASM_ARTIFACT_NAME);
 
     const buffer = await readFile(wasmPath);
     // Create a proper ArrayBuffer from the Node.js Buffer
@@ -442,7 +444,10 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
   }
 
   // Browser: fetch from relative path
-  const response = await fetch(new URL(`../../../dist/${WASM_ARTIFACT_NAME}`, import.meta.url));
+  const wasmPath = import.meta.url.includes('/dist/ts/')
+    ? `../../../${WASM_ARTIFACT_NAME}`
+    : `../../../dist/${WASM_ARTIFACT_NAME}`;
+  const response = await fetch(new URL(wasmPath, import.meta.url));
   return response.arrayBuffer();
 }
 
