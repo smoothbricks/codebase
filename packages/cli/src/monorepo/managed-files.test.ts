@@ -5,13 +5,16 @@ import { join } from 'node:path';
 import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import fc from 'fast-check';
 import {
+  deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
   INLINE_LOCAL_BEGIN,
   INLINE_LOCAL_END,
   LOCAL_SECTION_MARKER,
+  type NxGraphProjectNode,
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
   splitLocalSectionForTest,
+  targetNamesFromProjects,
 } from './managed-files.js';
 
 const MANAGED = '# managed content\npath merge=driver\n';
@@ -169,6 +172,52 @@ describe('managed publish platform discovery', () => {
 
   it('returns no platform families for ordinary Nx targets', () => {
     expect(platformTargetGlobsForTest(['build', 'lint', 'test', 'typecheck'])).toEqual([]);
+  });
+});
+
+describe('nx graph project helpers', () => {
+  const sampleNodes: Record<string, NxGraphProjectNode> = {
+    lib: {
+      data: {
+        targets: {
+          build: {},
+          'bundle-linux': {},
+          lint: {},
+        },
+      },
+    },
+    app: {
+      data: {
+        targets: {
+          deploy: {
+            options: { command: 'echo no' },
+            configurations: {
+              staging: { command: 'wrangler deploy --env staging' },
+              production: { options: { command: 'wrangler deploy --env production' } },
+            },
+          },
+          'package-macos': {},
+        },
+      },
+    },
+  };
+
+  it('collects target names from graph nodes without project names', () => {
+    expect(targetNamesFromProjects(sampleNodes).sort()).toEqual(
+      ['build', 'bundle-linux', 'deploy', 'lint', 'package-macos'].sort(),
+    );
+  });
+
+  it('detects deploy configurations and cloudflare provider from graph nodes', () => {
+    expect(deployTargetInfoFromProjects(sampleNodes, 'staging')).toEqual({
+      exists: true,
+      provider: 'cloudflare',
+    });
+    expect(deployTargetInfoFromProjects(sampleNodes, 'production')).toEqual({
+      exists: true,
+      provider: 'cloudflare',
+    });
+    expect(deployTargetInfoFromProjects(sampleNodes, 'preview')).toEqual({ exists: false });
   });
 });
 
