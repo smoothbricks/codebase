@@ -5,6 +5,11 @@
       "schema": "./src/executors/bounded-exec/schema.json",
       "description": "Run a command with bounded timeout and force-kill behavior"
     },
+    "typescript-emit": {
+      "implementation": "./dist/executors/typescript-emit/executor.js",
+      "schema": "./src/executors/typescript-emit/schema.json",
+      "description": "Emit transformed JavaScript with ttsc and declarations with native tsc"
+    },
     "clean-outputs": {
       "implementation": "./dist/executors/clean-outputs/executor.js",
       "schema": "./src/executors/clean-outputs/schema.json",
