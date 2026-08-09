@@ -486,7 +486,7 @@ function deployProductionStep(step: PublishWorkflowStep, options: PublishWorkflo
     "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_environment == 'production' && inputs.dry_run !=",
     "          'true' }}",
     ...deployEnvLines(options),
-    '        run: smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
+    '        run: smoo github-ci nx-deploy --environment production --mode run-many --verify --name "Deploy Production"',
   ];
 }
 
@@ -940,7 +940,7 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       "          ${{ needs.linux-release-candidate.outputs.mode != 'none' && inputs.deploy_environment == 'production' &&",
       "          inputs.dry_run != 'true' }}",
       ...deployEnvLines(options),
-      '        run: smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
+      '        run: smoo github-ci nx-deploy --environment production --mode run-many --verify --name "Deploy Production"',
     );
   }
   lines.push(

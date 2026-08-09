@@ -24,12 +24,12 @@ describe('CI workflow definition', () => {
     const rendered = renderCiWorkflowYaml({ deploy: true, pushBranches: ['main'] });
 
     expect(steps.map((step) => [step.kind, step.number])).toContainEqual([CiWorkflowStepKind.Deploy, 11]);
-    expect(rendered).toContain('- name: 🚀 Deploy Staging');
+    expect(rendered.match(/- name: 🚀 Deploy Environment/g)).toHaveLength(1);
     expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
     expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
-    expect(rendered).toContain(
-      'smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step 11',
-    );
+    expect(rendered).toContain('smoo github-ci nx-deploy --mode run-many --name "Deploy Environment" --step 11');
+    expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    expect(rendered).toContain("github.ref == 'refs/heads/private'");
     expect(rendered).toContain("# Step 12\n      # Nx's database cache needs artifact files");
     expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
     expect(rendered).toContain('id: setup');
@@ -45,6 +45,12 @@ describe('CI workflow definition', () => {
 
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
     expect(rendered).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
+    expect(rendered).toContain('GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}');
+    expect(rendered).toContain('GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}');
+    expect(rendered).toContain('GITHUB_APP_PRIVATE_KEY_PEM: ${{ secrets.GITHUB_APP_PRIVATE_KEY_PEM }}');
+    expect(rendered).toContain('OAUTH_STATE_SIGNING_KEY: ${{ secrets.OAUTH_STATE_SIGNING_KEY }}');
+    expect(rendered).toContain('MAIL_CAPTURE_CONTROL_TOKEN: ${{ secrets.MAIL_CAPTURE_CONTROL_TOKEN }}');
+    expect(rendered).toContain('TOKEN_ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}');
   });
 
   it('uses the same architecture-scoped key to restore and save the Nx cache', async () => {
