@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import typia from 'typia';
 import { cliPackageVersion, isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
@@ -67,22 +67,24 @@ const rootDevDependencies: RequiredDependency[] = [
 
 const cliPackageName = '@smoothbricks/cli';
 
-const requiredDevenvPackages = [
-  'bun',
-  'git',
-  'git-format-staged',
-  'jq',
-  'alejandra',
-  'coreutils',
-  'gnutar',
-  'go',
-  'sccache',
-];
+const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar', 'go'];
 // Any explicit nodejs provider is fine — the pinned major is the repo's choice
 // (Lambda parity, org convergence, …). Whether the pins in package.json agree
 // with the runtime is validated against the live PATH (validateRootRuntimeVersions),
 // never against a version template here.
 const nodePackagePattern = /(^|\s)nodejs(_\d+|_latest)?(\s|#|$)/m;
+const requiredRustDevenvPackages = ['sccache'];
+const linuxCompilerPackage = 'pkgs.stdenv.cc';
+const ignoredNativeManifestDirectories = new Set([
+  '.devenv',
+  '.direnv',
+  '.git',
+  '.nx',
+  'dist',
+  'node_modules',
+  'target',
+  'vendor',
+]);
 
 const obsoleteTtscPatchedDependencyKey = 'ttsc@0.19.3';
 
@@ -211,11 +213,18 @@ export function applyDevenvPackageDefaults(root: string): void {
     changed = next !== content || changed;
     content = next;
   }
-  for (const name of requiredDevenvPackages) {
+  const compilesRust = workspaceCompilesRust(root);
+  const requiredPackages = [...requiredDevenvPackages, ...(compilesRust ? requiredRustDevenvPackages : [])];
+  for (const name of requiredPackages) {
     if (hasNixPackage(content, name)) {
       continue;
     }
     const next = addNixPackage(content, name, nixPackageComment(name));
+    changed = next !== content || changed;
+    content = next;
+  }
+  if (compilesRust && !hasLinuxCompilerPackage(content)) {
+    const next = addLinuxCompilerPackage(content);
     changed = next !== content || changed;
     content = next;
   }
@@ -326,11 +335,19 @@ export function validateDevenvPackages(root: string): number {
     );
     failures++;
   }
-  for (const name of requiredDevenvPackages) {
+  const compilesRust = workspaceCompilesRust(root);
+  const requiredPackages = [...requiredDevenvPackages, ...(compilesRust ? requiredRustDevenvPackages : [])];
+  for (const name of requiredPackages) {
     if (!hasNixPackage(content, name)) {
       console.error(`tooling/direnv/devenv.nix packages must include ${name}`);
       failures++;
     }
+  }
+  if (compilesRust && !hasLinuxCompilerPackage(content)) {
+    console.error(
+      'tooling/direnv/devenv.nix packages must include pkgs.stdenv.cc in a Linux-only package block for Rust builds',
+    );
+    failures++;
   }
   return failures;
 }
@@ -340,7 +357,9 @@ function addNixPackage(content: string, name: string, comment: string): string {
   if (hasNixPackage(content, name)) {
     return content;
   }
-  const packagesStart = content.indexOf('  packages = with pkgs; [');
+  const directPackagesStart = content.indexOf('  packages = with pkgs; [');
+  const groupedPackagesStart = content.indexOf('    (with pkgs; [');
+  const packagesStart = directPackagesStart === -1 ? groupedPackagesStart : directPackagesStart;
   if (packagesStart === -1) {
     return content;
   }
@@ -350,6 +369,60 @@ function addNixPackage(content: string, name: string, comment: string): string {
 
 function hasNixPackage(content: string, name: string): boolean {
   return new RegExp(`(^|\\s)${escapeRegex(name)}(\\s|#|$)`, 'm').test(content);
+}
+
+function workspaceCompilesRust(root: string): boolean {
+  return containsCargoManifest(root);
+}
+
+function containsCargoManifest(directory: string): boolean {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name === 'Cargo.toml') {
+      return true;
+    }
+    if (
+      entry.isDirectory() &&
+      entry.name.startsWith('.') === false &&
+      ignoredNativeManifestDirectories.has(entry.name) === false &&
+      containsCargoManifest(join(directory, entry.name))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasLinuxCompilerPackage(content: string): boolean {
+  const linuxPackages = /\+\+\s+lib\.optionals\s+pkgs\.stdenv\.isLinux\s+\[([\s\S]*?)\]/g;
+  return [...content.matchAll(linuxPackages)].some((match) => hasNixPackage(match[1] ?? '', linuxCompilerPackage));
+}
+
+function addLinuxCompilerPackage(content: string): string {
+  if (hasLinuxCompilerPackage(content)) {
+    return content;
+  }
+  const directStart = content.indexOf('  packages = with pkgs; [');
+  if (directStart !== -1) {
+    const listEnd = content.indexOf('\n  ];', directStart);
+    if (listEnd === -1) {
+      return content;
+    }
+    const listBody = content.slice(directStart + '  packages = with pkgs; ['.length, listEnd);
+    const replacement = `  packages =\n    (with pkgs; [${listBody}\n    ])\n    ++ lib.optionals pkgs.stdenv.isLinux [\n      ${linuxCompilerPackage}\n    ];`;
+    return `${content.slice(0, directStart)}${replacement}${content.slice(listEnd + '\n  ];'.length)}`;
+  }
+
+  const packagesStart = content.indexOf('  packages =');
+  const nextOption = content.indexOf('\n\n  ', packagesStart);
+  if (packagesStart === -1 || nextOption === -1) {
+    return content;
+  }
+  const terminator = content.lastIndexOf(';', nextOption);
+  if (terminator < packagesStart) {
+    return content;
+  }
+  const linuxPackages = `\n    ++ lib.optionals pkgs.stdenv.isLinux [\n      ${linuxCompilerPackage}\n    ]`;
+  return `${content.slice(0, terminator)}${linuxPackages}${content.slice(terminator)}`;
 }
 
 function nixPackageComment(name: string): string {
