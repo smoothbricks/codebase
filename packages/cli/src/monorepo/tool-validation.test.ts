@@ -92,13 +92,13 @@ describe('tool configuration validation', () => {
       expect(devenv).toContain('coreutils');
       expect(devenv).toContain('git-format-staged');
       expect(devenv).toContain('go # Builds ttsc source plugins');
-      expect(devenv).toContain('sccache # Rust compiler wrapper and cache');
+      expect(devenv).not.toContain('sccache');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('requires compiler helpers used by managed TypeScript and Rust builds', async () => {
+  it('requires Go for managed TypeScript source-plugin builds without forcing Rust tools', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {
       const devenvPath = join(root, 'tooling/direnv/devenv.nix');
@@ -123,12 +123,56 @@ describe('tool configuration validation', () => {
 `,
       );
 
-      expect(validateDevenvPackages(root)).toBe(2);
+      expect(validateDevenvPackages(root)).toBe(1);
       applyDevenvPackageDefaults(root);
       expect(validateDevenvPackages(root)).toBe(0);
       const devenv = await readFile(devenvPath, 'utf8');
       expect(devenv).toContain('go # Builds ttsc source plugins');
+      expect(devenv).not.toContain('sccache');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('requires Rust compiler helpers only when the workspace contains Cargo manifests', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
+    try {
+      const crateRoot = join(root, 'packages/native');
+      await mkdir(crateRoot, { recursive: true });
+      await writeFile(join(crateRoot, 'Cargo.toml'), '[package]\nname = "native"\nversion = "0.0.0"\n');
+      const devenvPath = join(root, 'tooling/direnv/devenv.nix');
+      await mkdir(dirname(devenvPath), { recursive: true });
+      await writeFile(
+        devenvPath,
+        `{
+  pkgs,
+  lib,
+  ...
+}: {
+  packages = with pkgs; [
+    nodejs_latest
+    bun
+    git
+    git-format-staged
+    jq
+    alejandra
+    coreutils
+    gnutar
+    go
+    stdenv.cc.cc.lib
+  ];
+}
+`,
+      );
+
+      expect(validateDevenvPackages(root)).toBe(2);
+      applyDevenvPackageDefaults(root);
+      expect(validateDevenvPackages(root)).toBe(0);
+      const devenv = await readFile(devenvPath, 'utf8');
       expect(devenv).toContain('sccache # Rust compiler wrapper and cache');
+      expect(devenv).toContain('++ lib.optionals pkgs.stdenv.isLinux [');
+      expect(devenv).toContain('pkgs.stdenv.cc');
+      expect(devenv).toContain('stdenv.cc.cc.lib');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -182,7 +226,6 @@ describe('tool configuration validation', () => {
     coreutils
     gnutar
     go
-    sccache
   ];
 }
 `,
