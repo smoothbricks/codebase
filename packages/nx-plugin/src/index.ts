@@ -104,7 +104,8 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
     options: {
       command: 'cargo test --workspace',
       cwd: projectRoot,
-      timeoutMs: 600000,
+      // Cold macOS Cargo workspaces can exceed ten minutes while still making progress.
+      timeoutMs: 1200000,
       killAfterMs: 10000,
     },
     configurations: {

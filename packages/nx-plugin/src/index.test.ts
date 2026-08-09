@@ -254,6 +254,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test']?.options).toMatchObject({
         command: 'cargo test --workspace',
         cwd: 'packages/ferris',
+        timeoutMs: 1_200_000,
       });
       expect(targets['cargo-test']?.inputs).toEqual([
         '{projectRoot}/**/*.rs',
