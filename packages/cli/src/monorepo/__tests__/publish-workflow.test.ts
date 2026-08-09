@@ -159,15 +159,17 @@ describe('publish workflow definition', () => {
     expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
       `smoo release build-platform-outputs --bump "\${{ inputs.bump }}" --ref "\${{ github.sha }}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(
         ',',
-      )}" --output "\${{ runner.temp }}/macos-platform-outputs"`,
+      )}" --output "\${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
     );
+    expect(macosPlatform).toContain('id: platform-outputs');
+    expect(macosPlatform).toContain("if: steps.platform-outputs.outputs.projects != ''");
     expect(macosPlatform).toContain(
-      `run: smoo github-ci nx-run-many --targets test --projects-with-targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}"`,
+      'run: smoo github-ci nx-run-many --targets test --projects "${{ steps.platform-outputs.outputs.projects }}"',
     );
     expect(macosPlatform.indexOf('- name: 🍎 Build selected macOS and iOS release outputs')).toBeLessThan(
-      macosPlatform.indexOf('- name: 🧪 Unit test macOS and iOS packages'),
+      macosPlatform.indexOf('- name: 🧪 Unit test selected macOS and iOS packages'),
     );
-    expect(macosPlatform.indexOf('- name: 🧪 Unit test macOS and iOS packages')).toBeLessThan(
+    expect(macosPlatform.indexOf('- name: 🧪 Unit test selected macOS and iOS packages')).toBeLessThan(
       macosPlatform.indexOf('- name: 📤 Upload macOS platform outputs'),
     );
     expect(finalJob).not.toContain('smoo release version');

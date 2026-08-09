@@ -175,7 +175,8 @@ function buildProgram(): Command {
     .requiredOption('--targets <targets>', 'comma-separated Nx platform target names or globs')
     .requiredOption('--output <path>', 'output directory for current and repair artifacts')
     .option('--ref <ref>', 'fixed release graph ref to inspect')
-    .action(async (options: { bump: string; output: string; ref?: string; targets: string }) => {
+    .option('--github-output <path>', 'append selected current platform projects to a GitHub Actions output file')
+    .action(async (options: { bump: string; githubOutput?: string; output: string; ref?: string; targets: string }) => {
       // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
       const { releaseCollectPlatformOutputs } = await import('./release/index.js');
       await releaseCollectPlatformOutputs(await findRepoRoot(), options);
