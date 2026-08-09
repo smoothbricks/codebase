@@ -216,6 +216,21 @@ describe('nx graph project helpers', () => {
     });
     expect(deployTargetInfoFromProjects(sampleProjects, 'preview')).toEqual({ exists: false });
   });
+
+  it('recognizes convention-driven deploy-environment targets without per-environment configurations', () => {
+    const projects: NxProjects = {
+      app: {
+        targets: {
+          deploy: {
+            options: { command: 'smoo wrangler deploy-environment --environment {args.environment}' },
+          },
+        },
+      },
+    };
+
+    expect(deployTargetInfoFromProjects(projects, 'staging')).toEqual({ exists: true, provider: 'cloudflare' });
+    expect(deployTargetInfoFromProjects(projects, 'production')).toEqual({ exists: true, provider: 'cloudflare' });
+  });
 });
 
 describe('managed raw files', () => {

@@ -47,7 +47,7 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
   ];
   if (options.deploy) {
-    steps.push({ kind: CiWorkflowStepKind.Deploy, name: '🚀 Deploy Staging' });
+    steps.push({ kind: CiWorkflowStepKind.Deploy, name: '🚀 Deploy Environment' });
   }
   steps.push(
     { kind: CiWorkflowStepKind.SaveNxCache, name: '💾 Save Nx cache' },
@@ -75,7 +75,7 @@ permissions:
   # actions:write lets the drift step dispatch the managed-files workflow.
   actions: write
   contents: read
-  statuses: write
+${options.deploy ? '  deployments: write\n' : ''}  statuses: write
 
 defaults:
   run:
@@ -197,11 +197,15 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
     case CiWorkflowStepKind.Deploy:
       return [
         `      - name: ${step.name}`,
-        '        if:',
-        "          ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}',",
-        '          github.event.repository.default_branch) }}',
+        '        if: >-',
+        '          ${{',
+        "            (github.event_name == 'pull_request' &&",
+        '              contains(fromJSON(\'["opened","reopened","synchronize"]\'), github.event.action) &&',
+        '              github.event.pull_request.head.repo.full_name == github.repository) ||',
+        "            (github.event_name == 'push' && github.ref == 'refs/heads/private')",
+        '          }}',
         ...deployEnvLines(options),
-        `        run: smoo github-ci nx-deploy --configuration staging --mode affected --name "Deploy Staging" --step ${step.number}`,
+        `        run: smoo github-ci nx-deploy --mode run-many --name "Deploy Environment" --step ${step.number}`,
       ];
     case CiWorkflowStepKind.SaveNxCache:
       return [
@@ -251,6 +255,12 @@ function deployEnvLines(options: CiWorkflowDefinitionOptions): string[] {
     '        env:',
     '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',
     '          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
+    '          GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}',
+    '          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}',
+    '          GITHUB_APP_PRIVATE_KEY_PEM: ${{ secrets.GITHUB_APP_PRIVATE_KEY_PEM }}',
+    '          OAUTH_STATE_SIGNING_KEY: ${{ secrets.OAUTH_STATE_SIGNING_KEY }}',
+    '          MAIL_CAPTURE_CONTROL_TOKEN: ${{ secrets.MAIL_CAPTURE_CONTROL_TOKEN }}',
+    '          TOKEN_ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}',
   ];
 }
 
