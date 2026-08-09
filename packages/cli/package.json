@@ -47,6 +47,13 @@
       "development": "./src/wrangler/prepare-env.ts",
       "import": "./dist/wrangler/prepare-env.js",
       "default": "./dist/wrangler/prepare-env.js"
+    },
+    "./wrangler/environment": {
+      "types": "./dist/wrangler/environment.d.ts",
+      "bun": "./src/wrangler/environment.ts",
+      "development": "./src/wrangler/environment.ts",
+      "import": "./dist/wrangler/environment.js",
+      "default": "./dist/wrangler/environment.js"
     }
   },
   "sideEffects": [
