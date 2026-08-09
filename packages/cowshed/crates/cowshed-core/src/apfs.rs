@@ -1992,6 +1992,77 @@ mod tests {
         ))
     }
 
+    #[cfg(target_os = "macos")]
+    struct RealImageCleanup<'a> {
+        backend: &'a MacOsApfsBackend<SystemCommandRunner>,
+        image: PathBuf,
+        format: ImageFormat,
+        attachment: Option<AttachedImage>,
+        armed: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl<'a> RealImageCleanup<'a> {
+        fn new(
+            backend: &'a MacOsApfsBackend<SystemCommandRunner>,
+            image: PathBuf,
+            format: ImageFormat,
+        ) -> Self {
+            Self {
+                backend,
+                image,
+                format,
+                attachment: None,
+                armed: true,
+            }
+        }
+
+        fn track(&mut self, attachment: AttachedImage) -> &AttachedImage {
+            assert!(
+                self.attachment.is_none(),
+                "only one real image attachment may be tracked"
+            );
+            self.attachment.insert(attachment)
+        }
+
+        fn finish(mut self) -> Result<(), ApfsError> {
+            if let Some(attachment) = self.attachment.as_ref() {
+                self.backend.detach(attachment, false)?;
+                self.attachment = None;
+            }
+            let result = self.backend.delete_image(&self.image, self.format);
+            if result.is_ok() {
+                self.armed = false;
+            }
+            result
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for RealImageCleanup<'_> {
+        fn drop(&mut self) {
+            let detached = self
+                .attachment
+                .take()
+                .is_none_or(|attachment| self.backend.detach(&attachment, true).is_ok());
+            if detached && self.armed {
+                let _ = self.backend.delete_image(&self.image, self.format);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_real_image_test(result: Result<(), ApfsError>, cleanup: RealImageCleanup<'_>) {
+        match (result, cleanup.finish()) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) => panic!("real APFS scenario failed: {error}"),
+            (Ok(()), Err(error)) => panic!("real APFS cleanup failed: {error}"),
+            (Err(primary), Err(cleanup)) => {
+                panic!("real APFS scenario failed: {primary}; cleanup failed: {cleanup}")
+            }
+        }
+    }
+
     #[test]
     fn system_runner_reports_output_spawn_errors_and_signal_status() {
         let output = SystemCommandRunner
@@ -3929,11 +4000,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "creates and attaches a real macOS sparse APFS image"]
     fn real_sparse_attach_resolves_and_verifies_the_synthesized_volume() {
         let stem = temp_path("real-sparse-resolution", "stem").with_extension("");
         let image = stem.with_extension(ImageFormat::Sparse.extension());
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let mut cleanup = RealImageCleanup::new(&backend, image, ImageFormat::Sparse);
         let result = (|| -> Result<(), ApfsError> {
             let created = backend.create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
@@ -3941,26 +4012,25 @@ mod tests {
                 volume_name: "cowshed-apfs-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
-                owner_uid: 502,
-                owner_gid: 20,
+                owner_uid: unsafe { libc::getuid() },
+                owner_gid: unsafe { libc::getgid() },
             })?;
             let attachment = backend.attach_verified(&created.path, created.format)?;
+            let attachment = cleanup.track(attachment);
             assert!(attachment.volume_device().starts_with("/dev/disk"));
             assert_ne!(attachment.whole_device(), attachment.volume_device());
-            backend.detach(&attachment, false)?;
             Ok(())
         })();
-        let _ = fs::remove_file(image);
-        result.unwrap();
+        finish_real_image_test(result, cleanup);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "creates and attaches a real macOS ASIF APFS image"]
     fn real_asif_attach_normalizes_bare_devices_and_verifies_the_volume() {
         let stem = temp_path("real-asif-resolution", "stem").with_extension("");
         let image = stem.with_extension(ImageFormat::Asif.extension());
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let mut cleanup = RealImageCleanup::new(&backend, image, ImageFormat::Asif);
         let result = (|| -> Result<(), ApfsError> {
             let created = backend.create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
@@ -3968,17 +4038,16 @@ mod tests {
                 volume_name: "cowshed-asif-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
-                owner_uid: 502,
-                owner_gid: 20,
+                owner_uid: unsafe { libc::getuid() },
+                owner_gid: unsafe { libc::getgid() },
             })?;
             let attachment = backend.attach_verified(&created.path, created.format)?;
+            let attachment = cleanup.track(attachment);
             assert!(attachment.whole_device().starts_with("/dev/disk"));
             assert!(attachment.volume_device().starts_with("/dev/disk"));
-            backend.detach(&attachment, false)?;
             Ok(())
         })();
-        let _ = fs::remove_file(image);
-        result.unwrap();
+        finish_real_image_test(result, cleanup);
     }
 
     #[test]
