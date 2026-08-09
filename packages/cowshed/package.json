@@ -41,7 +41,7 @@
         "cache": false,
         "options": {
           "cwd": "packages/cowshed",
-          "command": "COWSHED_INTEGRATION=1 cargo test -p cowshed-core --test apfs_integration -- --ignored --nocapture"
+          "command": "cargo test -p cowshed-core --test apfs_integration -- --nocapture"
         }
       },
       "benchmark-apfs": {
@@ -49,7 +49,7 @@
         "cache": false,
         "options": {
           "cwd": "packages/cowshed",
-          "command": "COWSHED_BENCH=1 cargo test --release -p cowshed-core --test apfs_benchmark -- --ignored --nocapture"
+          "command": "cargo run --release -p cowshed-core --bin apfs-benchmark"
         }
       }
     },
