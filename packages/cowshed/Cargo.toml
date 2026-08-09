@@ -22,3 +22,10 @@ napi-build = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+
+# The full lane links 27 test executables from a cold target directory. They do
+# not consume debug symbols or incremental state, so emitting either only adds
+# compile, link, and artifact-cache work.
+[profile.test]
+debug = 0
+incremental = false
