@@ -8,10 +8,14 @@ import type { ProjectTargets } from '../nx/index.js';
 import {
   expandNxTargetDependencyRuns,
   expandNxTargetRuns,
+  githubCiNxDeploy,
   githubCiNxRunMany,
   nxRunManyArgs,
   nxSmartArgs,
+  publishGithubDeployment,
   readGitHeadSha,
+  resolveDeploymentEnvironment,
+  selectEnvironmentDeployProjects,
 } from './index.js';
 import {
   applyCollectedOutputs,
@@ -533,3 +537,170 @@ async function withNxRunManyFixture(
     await rm(temp, { recursive: true, force: true });
   }
 }
+
+describe('event-aware environment deployment', () => {
+  it('resolves same-repository PR, private push, release, and explicit production environments', () => {
+    expect(
+      resolveDeploymentEnvironment(
+        undefined,
+        { GITHUB_EVENT_NAME: 'pull_request' },
+        {
+          action: 'synchronize',
+          repository: { full_name: 'owner/repo' },
+          pull_request: { number: 123, head: { repo: { full_name: 'owner/repo' } } },
+        },
+      ),
+    ).toBe('pr123');
+    expect(
+      resolveDeploymentEnvironment(undefined, { GITHUB_EVENT_NAME: 'push', GITHUB_REF_NAME: 'private' }, undefined),
+    ).toBe('staging');
+    expect(resolveDeploymentEnvironment(undefined, { GITHUB_EVENT_NAME: 'release' }, undefined)).toBe('production');
+    expect(resolveDeploymentEnvironment('production', {}, undefined)).toBe('production');
+    expect(() =>
+      resolveDeploymentEnvironment(
+        undefined,
+        { GITHUB_EVENT_NAME: 'pull_request' },
+        {
+          action: 'opened',
+          repository: { full_name: 'owner/repo' },
+          pull_request: { number: 123, head: { repo: { full_name: 'fork/repo' } } },
+        },
+      ),
+    ).toThrow(/same-repository/);
+  });
+
+  it('selects only deploy targets owned by the environment convention', async () => {
+    const definitions: Record<string, unknown> = {
+      'conloca-app': {
+        targets: {
+          deploy: { options: { command: 'smoo wrangler deploy-environment --environment {args.environment}' } },
+        },
+      },
+      'conloca-app-backend': {
+        targets: { deploy: { command: 'smoo wrangler deploy-environment --environment {args.environment}' } },
+      },
+      'conloca-oauth-redirect': {
+        targets: { deploy: { options: { command: 'wrangler deploy --config wrangler.toml' } } },
+      },
+      'conloca-website': {
+        targets: { deploy: { options: { command: 'bun scripts/deploy-website.ts' } } },
+      },
+    };
+
+    await expect(
+      selectEnvironmentDeployProjects(Object.keys(definitions), async (project) => definitions[project]),
+    ).resolves.toEqual(['conloca-app', 'conloca-app-backend']);
+  });
+
+  it('publishes GitHub deployment JSON through a real stdin process seam', async () => {
+    const calls: Array<{ args: string[]; input: unknown }> = [];
+    await publishGithubDeployment(
+      'pr123',
+      'https://app.pr123.conloca.com',
+      { GITHUB_REPOSITORY: 'owner/repo', GITHUB_SHA: 'abc123' },
+      {
+        run: async (args, input) => {
+          calls.push({ args, input: JSON.parse(input) });
+          return {
+            exitCode: 0,
+            stdout: calls.length === 1 ? JSON.stringify({ id: 42 }) : '',
+            stderr: '',
+          };
+        },
+      },
+    );
+
+    expect(calls).toEqual([
+      {
+        args: [
+          'api',
+          '--method',
+          'POST',
+          '-H',
+          'Accept: application/vnd.github+json',
+          '/repos/owner/repo/deployments',
+          '--input',
+          '-',
+        ],
+        input: {
+          ref: 'abc123',
+          environment: 'pr123',
+          auto_merge: false,
+          required_contexts: [],
+          transient_environment: true,
+          production_environment: false,
+        },
+      },
+      {
+        args: [
+          'api',
+          '--method',
+          'POST',
+          '-H',
+          'Accept: application/vnd.github+json',
+          '/repos/owner/repo/deployments/42/statuses',
+          '--input',
+          '-',
+        ],
+        input: {
+          state: 'success',
+          environment: 'pr123',
+          environment_url: 'https://app.pr123.conloca.com',
+          auto_inactive: false,
+        },
+      },
+    ]);
+  });
+
+  it('deploys app/backend, follows with e2e-deployed, and publishes PR metadata', async () => {
+    const nxCalls: string[][] = [];
+    const listCalls: Array<[string, string]> = [];
+    const summaries: string[] = [];
+    const deployments: Array<[string, string]> = [];
+
+    await githubCiNxDeploy(
+      '/repo',
+      { mode: 'run-many', name: 'Deploy Environment' },
+      {
+        processEnv: {
+          GITHUB_EVENT_NAME: 'pull_request',
+          GITHUB_STEP_SUMMARY: '/summary',
+        },
+        setStatus: async () => {},
+        eventPayload: {
+          action: 'opened',
+          repository: { full_name: 'owner/repo' },
+          pull_request: { number: 123, head: { repo: { full_name: 'owner/repo' } } },
+        },
+        listProjects: async (_root, target, mode) => {
+          listCalls.push([target, mode]);
+          return target === 'deploy' ? ['conloca-app', 'conloca-app-backend'] : ['conloca-e2e'];
+        },
+        runNx: async (args) => {
+          nxCalls.push(args);
+          return 0;
+        },
+        appendSummary: async (_path, content) => {
+          summaries.push(content);
+        },
+        publishDeployment: async (environment, url) => {
+          deployments.push([environment, url]);
+        },
+      },
+    );
+
+    expect(listCalls).toEqual([
+      ['deploy', 'run-many'],
+      ['e2e-deployed', 'run-many'],
+    ]);
+    expect(nxCalls).toHaveLength(2);
+    expect(nxCalls[0]).toContain('--projects=conloca-app,conloca-app-backend');
+    expect(nxCalls[0]).toContain('--exclude=tag:permanent-deploy-target');
+    expect(nxCalls[0]).toContain('--environment=pr123');
+    expect(nxCalls[1]).toContain('-t');
+    expect(nxCalls[1]).toContain('e2e-deployed');
+    expect(nxCalls[1]).toContain('--environment=pr123');
+    expect(summaries).toEqual(['## pr123 deployment\n\n[View deployment](https://app.pr123.conloca.com)\n']);
+    expect(deployments).toEqual([['pr123', 'https://app.pr123.conloca.com']]);
+  });
+});

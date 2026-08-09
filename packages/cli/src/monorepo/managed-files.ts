@@ -6,6 +6,7 @@ import type { NxTargetConfig, PackageJson } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import { renderCiWorkflowYaml } from './ci-workflow.js';
+import { renderPrPreviewCleanupWorkflowYaml } from './pr-preview-cleanup-workflow.js';
 import { renderPublishWorkflowYaml } from './publish-workflow.js';
 
 type ManagedKind = 'raw' | 'template' | 'generated';
@@ -24,6 +25,7 @@ interface ManagedFile {
   target: string;
   executable?: boolean;
   releasePackagesOnly?: boolean;
+  cloudflareDeployOnly?: boolean;
 }
 
 /** Split a managed target's content into the managed part and the repo-owned tail. */
@@ -213,6 +215,12 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'generated',
+    source: 'pr-preview-cleanup-workflow',
+    target: '.github/workflows/pr-preview-cleanup.yml',
+    cloudflareDeployOnly: true,
+  },
+  {
+    kind: 'generated',
     source: 'publish-workflow',
     target: '.github/workflows/publish.yml',
     releasePackagesOnly: true,
@@ -272,6 +280,9 @@ function applyManagedFile(
   if (file.releasePackagesOnly === true && !context.hasReleasePackages && !context.hasProductionDeployTargets) {
     return { target: file.target, action: 'skipped' };
   }
+  if (file.cloudflareDeployOnly === true && context.stagingDeployProvider !== 'cloudflare') {
+    return { target: file.target, action: 'skipped' };
+  }
   const target = resolve(root, file.target);
   const content = getManagedContent(file, context);
   if (existsSync(target)) {
@@ -321,6 +332,9 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         platformTargetGlobs: context.platformTargetGlobs,
         runsOn: context.ciRunsOn,
       });
+    }
+    if (file.source === 'pr-preview-cleanup-workflow') {
+      return renderPrPreviewCleanupWorkflowYaml({ runsOn: context.ciRunsOn });
     }
     throw new Error(`Unknown generated managed file source ${file.source}`);
   }
@@ -388,11 +402,16 @@ function deployTargetInfoFromTargets(targets: Record<string, NxTargetConfig>, co
   if (!deploy) {
     return { exists: false };
   }
+  const baseCommandValue = deploy.options?.command ?? deploy.command;
+  const baseCommand = typeof baseCommandValue === 'string' ? baseCommandValue : '';
+  if (baseCommand.includes('smoo wrangler deploy-environment')) {
+    return { exists: true, provider: 'cloudflare' };
+  }
   const config = deploy.configurations?.[configuration];
   if (!config) {
     return { exists: false };
   }
-  const commandValue = config.command ?? config.options?.command ?? deploy.options?.command ?? deploy.command;
+  const commandValue = config.command ?? config.options?.command ?? baseCommand;
   const command = typeof commandValue === 'string' ? commandValue : '';
   return { exists: true, provider: command.includes('wrangler ') ? 'cloudflare' : undefined };
 }

@@ -2,7 +2,9 @@ import { Command, CommanderError } from 'commander';
 import { variants } from './generate/index.js';
 import { cliPackageVersion } from './lib/cli-package.js';
 import { findRepoRoot } from './lib/run.js';
+import { ensureChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
+import { cleanupPullRequest, deployEnvironment } from './wrangler/deploy-environment.js';
 import { scaffold } from './wrangler/scaffold.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
@@ -373,14 +375,14 @@ function buildProgram(): Command {
     });
   githubCi
     .command('nx-deploy')
-    .requiredOption('--configuration <configuration>')
+    .option('--environment <environment>', 'explicit staging, production, or prN override')
     .option('--mode <mode>', 'auto, affected, or run-many', 'run-many')
     .option('--name <name>')
     .option('--step <step>')
     .option('--verify', 'run build, lint, and test before deploy')
     .action(
       async (options: {
-        configuration: string;
+        environment?: string;
         mode?: 'auto' | 'affected' | 'run-many';
         name?: string;
         step?: string;
@@ -403,6 +405,15 @@ function buildProgram(): Command {
       }
     });
 
+  const playwright = program.command('playwright').description('Manage Playwright browsers');
+  const playwrightEnsure = playwright.command('ensure').description('Ensure a Playwright browser is available');
+  playwrightEnsure
+    .command('chromium')
+    .description('Ensure Chromium is available for browser tests')
+    .action(async () => {
+      await ensureChromium();
+    });
+
   const wrangler = program.command('wrangler').description('Cloudflare wrangler project helpers');
   wrangler
     .command('scaffold <project>')
@@ -410,6 +421,18 @@ function buildProgram(): Command {
     .option('--force', 'overwrite an existing scripts/prepare-env.ts')
     .action(async (project: string, options: { force?: boolean }) => {
       scaffold(await findRepoRoot(), project, { force: options.force });
+    });
+  wrangler
+    .command('deploy-environment')
+    .requiredOption('--environment <environment>', 'staging, production, or prN')
+    .action(async (options: { environment: string }) => {
+      await deployEnvironment(process.cwd(), options.environment);
+    });
+  wrangler
+    .command('cleanup-pr')
+    .requiredOption('--pr <number>', 'pull-request number')
+    .action(async (options: { pr: string }) => {
+      await cleanupPullRequest(process.cwd(), Number(options.pr));
     });
 
   return program;

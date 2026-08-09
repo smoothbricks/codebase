@@ -261,7 +261,7 @@ describe('publish workflow definition', () => {
     expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
     expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
     expect(rendered).toContain(
-      'smoo github-ci nx-deploy --configuration production --mode run-many --verify --name "Deploy Production"',
+      'smoo github-ci nx-deploy --environment production --mode run-many --verify --name "Deploy Production"',
     );
   });
 
