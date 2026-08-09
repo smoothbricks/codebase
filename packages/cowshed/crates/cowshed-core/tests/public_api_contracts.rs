@@ -833,20 +833,66 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             &["ResultBody"],
         ),
     ];
-    for (name, source, expected) in cases {
+    for (name, source, _) in &cases {
         fs::write(bins.join(format!("{name}.rs")), source).expect("compile-fail source");
-        let output = Command::new(env!("CARGO"))
-            .args(["check", "--quiet", "--offline", "--bin", name])
-            .current_dir(&root)
-            .env("CARGO_TARGET_DIR", root.join("target"))
-            .output()
-            .expect("run cargo check");
-        assert!(!output.status.success(), "{name} unexpectedly compiled");
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    }
+    // Keep dependency artifacts in Cargo's target tree and check every negative
+    // binary in one process. The fixtures remain isolated while Cargo can reuse
+    // cowshed-core and schedule the independent rustc checks concurrently.
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "check",
+            "--quiet",
+            "--offline",
+            "--bins",
+            "--keep-going",
+            "--message-format=json",
+        ])
+        .current_dir(&root)
+        .env(
+            "CARGO_TARGET_DIR",
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-compile-fail"),
+        )
+        .output()
+        .expect("run cargo check");
+    assert!(
+        !output.status.success(),
+        "negative fixtures unexpectedly compiled"
+    );
+
+    let mut diagnostics = std::collections::HashMap::<String, String>::new();
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message["reason"].as_str() != Some("compiler-message") {
+            continue;
+        }
+        let Some(name) = message
+            .pointer("/target/name")
+            .and_then(|name| name.as_str())
+        else {
+            continue;
+        };
+        diagnostics
+            .entry(name.to_owned())
+            .or_default()
+            .push_str(&String::from_utf8_lossy(line));
+    }
+    for (name, _, expected) in cases {
+        let diagnostic = diagnostics
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(
+            !diagnostic.is_empty(),
+            "{name} did not emit a compile failure:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         for expected in expected {
             assert!(
-                stderr.contains(expected),
-                "{name} did not fail on {expected}:\n{stderr}"
+                diagnostic.contains(expected),
+                "{name} did not fail on {expected}:\n{diagnostic}"
             );
         }
     }
