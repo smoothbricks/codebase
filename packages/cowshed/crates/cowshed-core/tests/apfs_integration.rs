@@ -22,46 +22,6 @@ use cowshed_core::storage::lifecycle::{
     Revision, Substrate,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RequiredFormats {
-    Auto,
-    Asif,
-    Sparse,
-    Both,
-}
-
-impl RequiredFormats {
-    fn from_env() -> Result<Self, String> {
-        match std::env::var("COWSHED_APFS_REQUIRED")
-            .unwrap_or_else(|_| "auto".to_owned())
-            .as_str()
-        {
-            "auto" => Ok(Self::Auto),
-            "asif" => Ok(Self::Asif),
-            "sparse" => Ok(Self::Sparse),
-            "both" => Ok(Self::Both),
-            value => Err(format!(
-                "COWSHED_APFS_REQUIRED must be auto|asif|sparse|both, got {value}"
-            )),
-        }
-    }
-
-    fn requires(self, format: ImageFormat) -> bool {
-        matches!(
-            (self, format),
-            (Self::Asif, ImageFormat::Asif) | (Self::Sparse, ImageFormat::Sparse) | (Self::Both, _)
-        )
-    }
-
-    fn formats(self) -> &'static [ImageFormat] {
-        match self {
-            Self::Asif => &[ImageFormat::Asif],
-            Self::Sparse => &[ImageFormat::Sparse],
-            Self::Auto | Self::Both => &[ImageFormat::Sparse, ImageFormat::Asif],
-        }
-    }
-}
-
 struct IntegrationRoot {
     path: PathBuf,
 }
@@ -105,7 +65,9 @@ struct AttachmentCleanup<'a> {
 impl AttachmentCleanup<'_> {
     fn finish(mut self) -> Result<(), ApfsStorageError> {
         let result = self.host.detach_all_reverse();
-        self.armed = false;
+        if result.is_ok() {
+            self.armed = false;
+        }
         result
     }
 }
@@ -147,34 +109,27 @@ impl Drop for ChurnGuard {
 }
 
 #[test]
-#[ignore = "explicit real APFS target: nx integration-apfs cowshed"]
 fn real_apfs_substrate_lifecycle() {
-    assert_eq!(
-        std::env::var("COWSHED_INTEGRATION").as_deref(),
-        Ok("1"),
-        "invoke the explicit integration-apfs Nx target"
-    );
-    let required = RequiredFormats::from_env().expect("capability selection");
+    let formats = [ImageFormat::Sparse, ImageFormat::Asif];
     let mut completed = Vec::new();
-    for &format in required.formats() {
+    for format in formats {
         match run_format(format) {
             Ok(evidence) => {
                 eprintln!("APFS {format:?}: {evidence}");
                 completed.push(format);
-            }
-            Err(error) if !required.requires(format) => {
-                eprintln!("APFS {format:?} unavailable in auto mode: {error}");
             }
             Err(error) => panic!("required APFS {format:?} capability failed: {error}"),
         }
     }
     assert!(
         !completed.is_empty(),
-        "auto mode requires at least one working APFS image format"
+        "at least one APFS image format must complete"
     );
-    if required == RequiredFormats::Both {
-        assert_eq!(completed.len(), 2, "both selected formats must complete");
-    }
+    assert_eq!(
+        completed.len(),
+        formats.len(),
+        "both APFS image formats must complete"
+    );
 }
 
 fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {

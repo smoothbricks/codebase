@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "apfs-benchmark"
+path = "src/bin/apfs_benchmark.rs"
+test = false
+bench = false
+
 [dependencies]
 arrow-array = "56"
 arrow-buffer = "56"
