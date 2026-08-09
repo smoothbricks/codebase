@@ -315,7 +315,7 @@ export async function readGitHeadSha(root: string): Promise<string> {
   return decode((await $`git rev-parse HEAD`.cwd(root).quiet()).stdout).trim();
 }
 
-export async function githubCiNxRunMany(root: string, options: NxRunManyOptions): Promise<void> {
+export async function githubCiNxRunMany(root: string, options: NxRunManyOptions): Promise<ExpandedNxTargetRuns> {
   const expanded = expandNxTargetRuns(await readProjectTargets(root), options);
   if (expanded.unmatchedGlobs.length > 0) {
     console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
@@ -328,6 +328,7 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
     const sourceSha = await readGitHeadSha(root);
     await collectNxOutputs(root, options.collectOutputs, expandNxTargetDependencyRuns(expanded.runs), sourceSha);
   }
+  return expanded;
 }
 
 export async function githubCiApplyOutputs(
