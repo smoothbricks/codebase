@@ -80,6 +80,7 @@ export interface ReleaseRepairPendingOptions {
 
 export interface ReleasePlatformOutputsOptions {
   bump: string;
+  githubOutput?: string;
   output: string;
   ref?: string;
   targets: string;
@@ -221,7 +222,7 @@ export async function releaseCollectPlatformOutputs(
       : `Release platform outputs: building current outputs for ${packageSummary(currentPackages)}.`,
   );
   const outputRoot = resolve(root, options.output);
-  await githubCiNxRunMany(root, {
+  const currentRuns = await githubCiNxRunMany(root, {
     targets: options.targets,
     projects: releasePackageProjects(currentPackages),
     collectOutputs: join(outputRoot, 'current'),
@@ -236,6 +237,12 @@ export async function releaseCollectPlatformOutputs(
     targets,
     restoreRef,
   );
+  if (options.githubOutput) {
+    const projects = [
+      ...new Set(currentRuns.runs.flatMap((run) => run.projects.map((project) => project.project))),
+    ].sort((left, right) => left.localeCompare(right));
+    await appendFile(options.githubOutput, `projects=${projects.join(',')}\n`);
+  }
 }
 
 export async function releaseTrustPublisher(root: string, options: ReleaseTrustPublisherOptions): Promise<void> {
@@ -966,12 +973,13 @@ function releaseRepairOutputsShell(
 ): ReleaseRepairOutputsShell<ReleasePackage> {
   return {
     ...releaseTargetCheckoutShell(root),
-    collectRepairTargetOutputs: (target) =>
-      githubCiNxRunMany(root, {
+    collectRepairTargetOutputs: async (target) => {
+      await githubCiNxRunMany(root, {
         targets: targetGlobs,
         projects: releasePackageProjects(target.npmPackages),
         collectOutputs: join(outputRoot, target.sha),
-      }),
+      });
+    },
   };
 }
 

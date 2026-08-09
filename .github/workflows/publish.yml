@@ -218,13 +218,15 @@ jobs:
 
       # Step 5
       - name: 🍎 Build selected macOS and iOS release outputs
+        id: platform-outputs
         run:
           smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" --targets
-          "*-macos,*-ios" --output "${{ runner.temp }}/macos-platform-outputs"
+          "*-macos,*-ios" --output "${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"
 
       # Step 6
-      - name: 🧪 Unit test macOS and iOS packages
-        run: smoo github-ci nx-run-many --targets test --projects-with-targets "*-macos,*-ios"
+      - name: 🧪 Unit test selected macOS and iOS packages
+        if: steps.platform-outputs.outputs.projects != ''
+        run: smoo github-ci nx-run-many --targets test --projects "${{ steps.platform-outputs.outputs.projects }}"
 
       # Step 7
       - name: 📤 Upload macOS platform outputs

@@ -166,11 +166,12 @@ describe('collected Nx outputs', () => {
 
   it('collects an empty artifact when selected projects have no matching target', async () => {
     await withNxRunManyFixture(async ({ root, artifact }) => {
-      await githubCiNxRunMany(root, {
+      const expanded = await githubCiNxRunMany(root, {
         targets: '*-linux',
         projects: 'app',
         collectOutputs: artifact,
       });
+      expect(expanded.runs).toEqual([]);
 
       const sourceSha = await readGitHeadSha(root);
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
@@ -186,10 +187,11 @@ describe('collected Nx outputs', () => {
       await writeFile(join(root, 'packages/app/test-target.ts'), "await Bun.write('test-ran.txt', 'tested');\n");
       await writeFile(join(root, 'packages/app/build-target.ts'), "throw new Error('build must not run here');\n");
 
-      await githubCiNxRunMany(root, {
+      const expanded = await githubCiNxRunMany(root, {
         targets: 'test',
         projectsWithTargets: '*-macos,*-ios',
       });
+      expect(expanded.runs.map((run) => run.projects.map((project) => project.project))).toEqual([['app']]);
 
       await expect(readFile(join(root, 'test-ran.txt'), 'utf8')).resolves.toBe('tested');
       await expect(readFile(join(root, 'build-ran.txt'), 'utf8')).rejects.toThrow();
