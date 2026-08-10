@@ -316,6 +316,7 @@ ${renderRunsOnLine(options.runsOn)}
 
       # Step 4
       - name: Deployment E2E
+        # prettier-ignore
         run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --name "Deployment E2E" --step 4
 
       # Step 5
