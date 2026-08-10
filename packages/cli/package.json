@@ -48,12 +48,12 @@
       "import": "./dist/wrangler/prepare-env.js",
       "default": "./dist/wrangler/prepare-env.js"
     },
-    "./wrangler/environment": {
-      "types": "./dist/wrangler/environment.d.ts",
-      "bun": "./src/wrangler/environment.ts",
-      "development": "./src/wrangler/environment.ts",
-      "import": "./dist/wrangler/environment.js",
-      "default": "./dist/wrangler/environment.js"
+    "./wrangler/stage": {
+      "types": "./dist/wrangler/stage.d.ts",
+      "bun": "./src/wrangler/stage.ts",
+      "development": "./src/wrangler/stage.ts",
+      "import": "./dist/wrangler/stage.js",
+      "default": "./dist/wrangler/stage.js"
     }
   },
   "sideEffects": [

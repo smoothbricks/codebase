@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 import {
   derivePullRequestWranglerConfig,
-  environmentDomain,
-  environmentResourceName,
   planPullRequestResources,
-  pullRequestEnvironment,
+  pullRequestStage,
   rateLimitNamespaceId,
-} from './environment.js';
+  stageDomain,
+  stageResourceName,
+} from './stage.js';
 
 const APP_FIXTURE = `name = "conloca-app"
 compatibility_date = "2026-05-06"
@@ -103,21 +103,21 @@ const DERIVED_IDS = new Map([
   ['kv-mail-staging-id', 'kv-mail-pr123-id'],
 ]);
 
-describe('Wrangler environment convention', () => {
+describe('Wrangler deployment stage convention', () => {
   it('validates pull-request numbers and derives generic names', () => {
-    expect(pullRequestEnvironment(123)).toBe('pr123');
-    expect(() => pullRequestEnvironment(0)).toThrow(/1 through 999999999/);
-    expect(() => pullRequestEnvironment(1.5)).toThrow(/integer/);
-    expect(() => pullRequestEnvironment(1_000_000_000)).toThrow(/1 through 999999999/);
-    expect(environmentDomain('pr123', 'conloca.com')).toBe('pr123.conloca.com');
-    expect(environmentDomain('production', 'conloca.com')).toBe('conloca.com');
-    expect(environmentResourceName('conloca-app', 'staging')).toBe('conloca-app-staging');
-    expect(environmentResourceName('conloca-app', 'production')).toBe('conloca-app');
+    expect(pullRequestStage(123)).toBe('pr123');
+    expect(() => pullRequestStage(0)).toThrow(/1 through 999999999/);
+    expect(() => pullRequestStage(1.5)).toThrow(/integer/);
+    expect(() => pullRequestStage(1_000_000_000)).toThrow(/1 through 999999999/);
+    expect(stageDomain('pr123', 'conloca.com')).toBe('pr123.conloca.com');
+    expect(stageDomain('production', 'conloca.com')).toBe('conloca.com');
+    expect(stageResourceName('conloca-app', 'staging')).toBe('conloca-app-staging');
+    expect(stageResourceName('conloca-app', 'production')).toBe('conloca-app');
   });
 
   it('derives the app staging block without changing inherited/static semantics', () => {
     const derived = derivePullRequestWranglerConfig(APP_FIXTURE, {
-      environment: 'pr123',
+      stage: 'pr123',
       accountId: 'account-1',
       kvNamespaceIds: new Map<string, string>(),
     });
@@ -141,7 +141,7 @@ describe('Wrangler environment convention', () => {
     expect(plan.r2Buckets).toEqual([{ binding: 'MEDIA', bucketName: 'conloca-media-pr123' }]);
 
     const derived = derivePullRequestWranglerConfig(BACKEND_FIXTURE, {
-      environment: 'pr123',
+      stage: 'pr123',
       accountId: 'account-1',
       kvNamespaceIds: DERIVED_IDS,
     });

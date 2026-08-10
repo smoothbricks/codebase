@@ -4,19 +4,19 @@ import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import typia from 'typia';
 import { type CloudflareClient, CloudflareRestClient } from './cloudflare.js';
-import {
-  type ConfiguredEnvironmentResourcePlan,
-  derivePullRequestWranglerConfig,
-  type EnvironmentToken,
-  environmentResourceName,
-  hasExactEnvironmentSegment,
-  isPullRequestEnvironment,
-  parseEnvironmentToken,
-  planConfiguredEnvironmentResources,
-  planPullRequestResources,
-  pullRequestEnvironment,
-} from './environment.js';
 import { parseDevVarsExample } from './prepare-env.js';
+import {
+  type ConfiguredStageResourcePlan,
+  type DeploymentStage,
+  derivePullRequestWranglerConfig,
+  hasExactStageSegment,
+  isPullRequestStage,
+  parseDeploymentStage,
+  planConfiguredStageResources,
+  planPullRequestResources,
+  pullRequestStage,
+  stageResourceName,
+} from './stage.js';
 
 export interface ProcessResult {
   exitCode: number;
@@ -56,8 +56,8 @@ export interface WranglerCommandDependencies {
   processEnv?: NodeJS.ProcessEnv;
 }
 
-export interface DeployEnvironmentResult {
-  environment: EnvironmentToken;
+export interface DeployStageResult {
+  stage: DeploymentStage;
   workerName: string;
   action: 'deployed' | 'activated' | 'remote-cache-hit';
   versionTag?: string;
@@ -65,12 +65,12 @@ export interface DeployEnvironmentResult {
 
 const isUnknownRecord = typia.createIs<Record<string, unknown>>();
 
-export async function deployEnvironment(
+export async function deployStage(
   cwd: string,
-  environmentValue: string,
+  stageValue: string,
   dependencies: WranglerCommandDependencies = {},
-): Promise<DeployEnvironmentResult> {
-  const environment = parseEnvironmentToken(environmentValue);
+): Promise<DeployStageResult> {
+  const stage = parseDeploymentStage(stageValue);
   const processEnv = dependencies.processEnv ?? process.env;
   const accountId = processEnv.CLOUDFLARE_ACCOUNT_ID;
   const apiToken = processEnv.CLOUDFLARE_API_TOKEN;
@@ -92,12 +92,12 @@ export async function deployEnvironment(
   let temporaryConfigPath: string | undefined;
   let temporarySecretsPath: string | undefined;
   try {
-    if (isPullRequestEnvironment(environment)) {
-      const staging = planConfiguredEnvironmentResources(committedToml, 'staging');
+    if (isPullRequestStage(stage)) {
+      const staging = planConfiguredStageResources(committedToml, 'staging');
       if (!staging.workerName.endsWith('-staging')) {
         throw new Error('[env.staging].name must end with the exact suffix -staging.');
       }
-      const workerName = environmentResourceName(staging.workerName.slice(0, -'-staging'.length), environment);
+      const workerName = stageResourceName(staging.workerName.slice(0, -'-staging'.length), stage);
       const firstDeployment = !(await cloudflare.listWorkerScripts()).some((script) => script.id === workerName);
       if (firstDeployment && missingSecrets.length > 0) {
         throw new Error(
@@ -105,7 +105,7 @@ export async function deployEnvironment(
         );
       }
       const liveNamespaces = await cloudflare.listKvNamespaces();
-      const plan = planPullRequestResources(committedToml, environment, liveNamespaces);
+      const plan = planPullRequestResources(committedToml, stage, liveNamespaces);
       const derivedIds = new Map<string, string>();
       const byTitle = new Map(liveNamespaces.map((namespace) => [namespace.title, namespace]));
       for (const namespace of plan.kvNamespaces) {
@@ -122,7 +122,7 @@ export async function deployEnvironment(
         derivedIds.set(namespace.stagingId, live.id);
       }
       const derivedToml = derivePullRequestWranglerConfig(committedToml, {
-        environment,
+        stage: stage,
         accountId,
         kvNamespaceIds: derivedIds,
       });
@@ -132,10 +132,10 @@ export async function deployEnvironment(
     }
 
     const toml = configPath === committedConfigPath ? committedToml : await readFile(configPath, 'utf8');
-    const plan = planConfiguredEnvironmentResources(toml, environment);
-    const workerExists = await reconcileEnvironmentResources(plan, cloudflare);
+    const plan = planConfiguredStageResources(toml, stage);
+    const workerExists = await reconcileStageResources(plan, cloudflare);
     const versionTag = nxTaskVersionTag(processEnv);
-    const commandContext = { cwd, configPath, environment, workerName: plan.workerName };
+    const commandContext = { cwd, configPath, stage, workerName: plan.workerName };
 
     if (versionTag && workerExists) {
       const versions = await wranglerJson(runner, ['versions', 'list', '--name', plan.workerName, '--json'], cwd);
@@ -146,7 +146,7 @@ export async function deployEnvironment(
       );
       const versionId = findVersionIdByTag(versions, versionTag);
       if (versionId && isFullCurrentDeployment(deployments, versionId)) {
-        return { environment, workerName: plan.workerName, action: 'remote-cache-hit', versionTag };
+        return { stage, workerName: plan.workerName, action: 'remote-cache-hit', versionTag };
       }
       if (versionId) {
         await wrangler(
@@ -161,16 +161,16 @@ export async function deployEnvironment(
             '--config',
             configPath,
             '--env',
-            environment,
+            stage,
             '--yes',
           ],
           cwd,
         );
-        return { environment, workerName: plan.workerName, action: 'activated', versionTag };
+        return { stage, workerName: plan.workerName, action: 'activated', versionTag };
       }
     }
 
-    const deployArgs = ['deploy', '--config', commandContext.configPath, '--env', commandContext.environment];
+    const deployArgs = ['deploy', '--config', commandContext.configPath, '--env', commandContext.stage];
     if (versionTag) deployArgs.push('--tag', versionTag);
     if (Object.keys(secretValues).length > 0) {
       temporarySecretsPath = join(cwd, `.wrangler-secrets.smoo-${process.pid}-${randomUUID()}.json`);
@@ -179,7 +179,7 @@ export async function deployEnvironment(
     }
     await wrangler(runner, deployArgs, cwd);
     return {
-      environment,
+      stage,
       workerName: commandContext.workerName,
       action: 'deployed',
       ...(versionTag ? { versionTag } : {}),
@@ -194,7 +194,7 @@ export async function deployEnvironment(
   }
 }
 export interface CleanupResult {
-  environment: `pr${number}`;
+  stage: `pr${number}`;
   deleted: {
     workers: number;
     routes: number;
@@ -211,7 +211,7 @@ export async function cleanupPullRequest(
   prNumber: number,
   dependencies: WranglerCommandDependencies = {},
 ): Promise<CleanupResult> {
-  const environment = pullRequestEnvironment(prNumber);
+  const stage = pullRequestStage(prNumber);
   const processEnv = dependencies.processEnv ?? process.env;
   const cloudflare =
     dependencies.cloudflare ??
@@ -231,36 +231,36 @@ export async function cleanupPullRequest(
   };
 
   for (const domain of await cloudflare.listWorkerDomains()) {
-    if (!hasExactEnvironmentSegment(domain.hostname, environment)) continue;
+    if (!hasExactStageSegment(domain.hostname, stage)) continue;
     await cloudflare.deleteWorkerDomain(domain.id);
     deleted.domains += 1;
   }
 
   for (const zone of await cloudflare.listZones()) {
     for (const route of await cloudflare.listWorkerRoutes(zone.id)) {
-      if (!hasExactEnvironmentSegment(route.pattern, environment)) continue;
+      if (!hasExactStageSegment(route.pattern, stage)) continue;
       await cloudflare.deleteWorkerRoute(zone.id, route.id);
       deleted.routes += 1;
     }
     for (const record of await cloudflare.listDnsRecords(zone.id)) {
-      if (!hasExactEnvironmentSegment(record.name, environment)) continue;
+      if (!hasExactStageSegment(record.name, stage)) continue;
       await cloudflare.deleteDnsRecord(zone.id, record.id);
       deleted.dnsRecords += 1;
     }
   }
 
   for (const script of await cloudflare.listWorkerScripts()) {
-    if (!hasExactEnvironmentSegment(script.id, environment)) continue;
+    if (!hasExactStageSegment(script.id, stage)) continue;
     await cloudflare.deleteWorkerScript(script.id);
     deleted.workers += 1;
   }
   for (const namespace of await cloudflare.listKvNamespaces()) {
-    if (!hasExactEnvironmentSegment(namespace.title, environment)) continue;
+    if (!hasExactStageSegment(namespace.title, stage)) continue;
     await cloudflare.deleteKvNamespace(namespace.id);
     deleted.kvNamespaces += 1;
   }
   for (const bucket of await cloudflare.listR2Buckets()) {
-    if (!hasExactEnvironmentSegment(bucket.name, environment)) continue;
+    if (!hasExactStageSegment(bucket.name, stage)) continue;
     for (const key of await cloudflare.listR2Objects(bucket.name)) {
       await cloudflare.deleteR2Object(bucket.name, key);
       deleted.r2Objects += 1;
@@ -268,11 +268,11 @@ export async function cleanupPullRequest(
     await cloudflare.deleteR2Bucket(bucket.name);
     deleted.r2Buckets += 1;
   }
-  return { environment, deleted };
+  return { stage, deleted };
 }
 
-async function reconcileEnvironmentResources(
-  plan: ConfiguredEnvironmentResourcePlan,
+async function reconcileStageResources(
+  plan: ConfiguredStageResourcePlan,
   cloudflare: CloudflareClient,
 ): Promise<boolean> {
   const namespaces = await cloudflare.listKvNamespaces();
@@ -364,7 +364,7 @@ export function nxTaskVersionTag(environment: NodeJS.ProcessEnv): string | undef
     environment.NX_TASK_TARGET_PROJECT !== undefined ||
     environment.NX_TASK_TARGET_TARGET !== undefined;
   if (!underNx) return undefined;
-  if (!hash) throw new Error('NX_TASK_HASH is required when deploy-environment runs under Nx.');
+  if (!hash) throw new Error('NX_TASK_HASH is required when deploy-stage runs under Nx.');
   if (/^(?:0|[1-9][0-9]*)$/.test(hash)) {
     return `nx-${hash}`;
   }
