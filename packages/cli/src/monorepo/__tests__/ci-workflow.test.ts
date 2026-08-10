@@ -67,17 +67,10 @@ describe('CI workflow definition', () => {
 
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
     expect(rendered).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
-    for (const appSecret of [
-      'GITHUB_CLIENT_SECRET',
-      'GITHUB_APP_PRIVATE_KEY',
-      'GITHUB_APP_PRIVATE_KEY_PEM',
-      'OAUTH_STATE_SIGNING_KEY',
-      'MAIL_CAPTURE_CONTROL_TOKEN',
-      'TOKEN_ENCRYPTION_KEY',
-      'E2E_CONTROL_TOKEN',
-    ]) {
-      expect(rendered).not.toContain(appSecret);
-    }
+    expect(rendered.match(/^\s+[A-Z][A-Z0-9_]+: \${{ secrets\.[A-Z][A-Z0-9_]+ }}$/gm)).toEqual([
+      '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',
+      '          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
+    ]);
   });
 
   it('renders deployment E2E as a dependent job with an independent stage input', () => {
@@ -93,7 +86,6 @@ describe('CI workflow definition', () => {
       'smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "${{ needs.main.outputs.deployment-stage }}" --name "Deployment E2E" --step 4',
     );
     expect(rendered.match(/name: Deployment E2E/g)).toHaveLength(2);
-    expect(rendered).not.toContain('E2E_CONTROL_TOKEN');
   });
 
   it('omits optional browser and deployment-E2E lanes when disabled', () => {

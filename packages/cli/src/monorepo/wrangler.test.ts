@@ -89,11 +89,11 @@ describe('applyWranglerDefaults', () => {
   it('preserves a human-authored .dev.vars.example and does not log a creation', async () => {
     const root = await createWorkspace([{ dir: 'api', name: '@acme/api', toml: 'name = "svc"\n' }]);
     const examplePath = join(root, 'packages/api/.dev.vars.example');
-    await writeFile(examplePath, 'GITHUB_CLIENT_SECRET=\n');
+    await writeFile(examplePath, 'EXISTING_SECRET=\n');
     const logs = captureConsoleLogs();
     try {
       applyWranglerDefaults(root);
-      expect(await readFile(examplePath, 'utf8')).toBe('GITHUB_CLIENT_SECRET=\n');
+      expect(await readFile(examplePath, 'utf8')).toBe('EXISTING_SECRET=\n');
       expect(logs.some((line) => line.startsWith('created') && line.includes('.dev.vars.example'))).toBe(false);
     } finally {
       console.log = originalConsoleLog;

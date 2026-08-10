@@ -186,7 +186,7 @@ describe('deploy-stage remote version fallback', () => {
 
   it('uploads a missing tag with a temporary config and secure secrets file, then removes both', async () => {
     const root = await fixtureRoot();
-    await writeFile(join(root, '.dev.vars.example'), 'OAUTH_STATE_SIGNING_KEY=""\nTOKEN_ENCRYPTION_KEY=""\n');
+    await writeFile(join(root, '.dev.vars.example'), 'FIXTURE_SECRET=""\nFIXTURE_TOKEN=""\n');
     const runner = new FakeRunner([], { versions: [{ version_id: 'version-2', percentage: 100 }] });
 
     const result = await deployStage(root, 'pr123', {
@@ -196,8 +196,8 @@ describe('deploy-stage remote version fallback', () => {
         CLOUDFLARE_API_TOKEN: 'token',
         NX_TASK_HASH: HASH,
         NX_TASK_TARGET_PROJECT: 'fixture',
-        OAUTH_STATE_SIGNING_KEY: 'shared-secret',
-        TOKEN_ENCRYPTION_KEY: 'encryption-secret',
+        FIXTURE_SECRET: 'shared-secret',
+        FIXTURE_TOKEN: 'encryption-secret',
       },
     });
 
@@ -207,8 +207,8 @@ describe('deploy-stage remote version fallback', () => {
     expect(runner.calls.at(-1)).toContain(`nx-${HASH}`);
     expect(runner.secretsMode).toBe(0o600);
     expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({
-      OAUTH_STATE_SIGNING_KEY: 'shared-secret',
-      TOKEN_ENCRYPTION_KEY: 'encryption-secret',
+      FIXTURE_SECRET: 'shared-secret',
+      FIXTURE_TOKEN: 'encryption-secret',
     });
     expect(existsSync(requiredTestValue(runner.configPathSeen, 'config path'))).toBe(false);
     expect(existsSync(requiredTestValue(runner.secretsPathSeen, 'secrets path'))).toBe(false);
@@ -216,7 +216,7 @@ describe('deploy-stage remote version fallback', () => {
 
   it('passes only present manifest values for fixed stages and preserves absent remote secrets', async () => {
     const root = await fixtureRoot();
-    await writeFile(join(root, '.dev.vars.example'), 'OAUTH_STATE_SIGNING_KEY=""\nTOKEN_ENCRYPTION_KEY=""\n');
+    await writeFile(join(root, '.dev.vars.example'), 'FIXTURE_SECRET=""\nFIXTURE_TOKEN=""\n');
     const runner = new FakeRunner([], {});
     const cloudflare = new FakeCloudflare();
 
@@ -226,20 +226,20 @@ describe('deploy-stage remote version fallback', () => {
       processEnv: {
         CLOUDFLARE_ACCOUNT_ID: 'account-1',
         CLOUDFLARE_API_TOKEN: 'token',
-        OAUTH_STATE_SIGNING_KEY: 'shared-secret',
+        FIXTURE_SECRET: 'shared-secret',
       },
     });
 
     expect(result.action).toBe('deployed');
     expect(JSON.parse(requiredTestValue(runner.secretsJson, 'secrets JSON'))).toEqual({
-      OAUTH_STATE_SIGNING_KEY: 'shared-secret',
+      FIXTURE_SECRET: 'shared-secret',
     });
     expect(existsSync(requiredTestValue(runner.secretsPathSeen, 'secrets path'))).toBe(false);
   });
 
   it('rejects a first PR Worker with missing manifest secrets before mutating Cloudflare', async () => {
     const root = await fixtureRoot();
-    await writeFile(join(root, '.dev.vars.example'), 'OAUTH_STATE_SIGNING_KEY=""\n');
+    await writeFile(join(root, '.dev.vars.example'), 'FIXTURE_SECRET=""\n');
     const cloudflare = new FakeCloudflare();
     cloudflare.scripts = [];
 
@@ -253,7 +253,7 @@ describe('deploy-stage remote version fallback', () => {
           NX_TASK_TARGET_PROJECT: 'fixture',
         },
       }),
-    ).rejects.toThrow(/OAUTH_STATE_SIGNING_KEY/);
+    ).rejects.toThrow(/FIXTURE_SECRET/);
     expect(cloudflare.mutations).toEqual([]);
   });
 
