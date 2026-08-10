@@ -294,7 +294,6 @@ function renderYamlList(values: string[], spaces: number): string {
 function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
   if (!options.e2eDeployment) return '';
   return `
-
   e2e-deployment:
     name: Deployment E2E
     needs: main
