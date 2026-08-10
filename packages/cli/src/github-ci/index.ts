@@ -159,6 +159,7 @@ export function nxSmartArgs(
   mode: 'affected' | 'run-many',
   configuration?: string,
   stage?: string,
+  streamOutput = false,
 ): string[] {
   const args = [mode, '-t', target];
   if (configuration) {
@@ -167,19 +168,30 @@ export function nxSmartArgs(
   if (stage) {
     args.push(`--stage=${stage}`);
   }
+  if (streamOutput) {
+    args.push('--outputStyle=stream-without-prefixes');
+  }
   args.push(`--exclude=tag:ci:skip:${target}`, `--parallel=${NX_PARALLEL}`);
   return args;
 }
 
 export async function githubCiNxSmart(
   root: string,
-  options: { target: string; name?: string; step?: string; mode?: NxSmartMode; configuration?: string; stage?: string },
+  options: {
+    target: string;
+    name?: string;
+    step?: string;
+    mode?: NxSmartMode;
+    configuration?: string;
+    stage?: string;
+    streamOutput?: boolean;
+  },
 ): Promise<void> {
   const name = options.name ?? options.target;
   const step = options.step ?? '';
   await createGithubStatus(name, step);
   const mode = resolveNxSmartMode(options.mode ?? 'auto');
-  const nxArgs = nxSmartArgs(options.target, mode, options.configuration, options.stage);
+  const nxArgs = nxSmartArgs(options.target, mode, options.configuration, options.stage, options.streamOutput);
   const status = await runStatus('nx', nxArgs, root);
   await updateGithubStatus(name, status === 0 ? 'success' : 'failure', step);
   if (status !== 0) {

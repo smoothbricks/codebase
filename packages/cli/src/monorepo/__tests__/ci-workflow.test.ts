@@ -77,7 +77,7 @@ describe('CI workflow definition', () => {
     const rendered = renderCiWorkflowYaml(options({ deploy: true, e2eDeployment: true, runsOn: [...nixosRunsOn] }));
 
     expect(rendered).toContain('deployment-stage: ${{ steps.deploy.outputs.stage }}');
-    expect(rendered).toContain('  e2e-deployment:\n    name: Deployment E2E\n    needs: main');
+    expect(rendered).toContain('  e2e-deployment:\n    name: E2E Tests (Deployed Stage)\n    needs: main');
     expect(rendered).not.toContain('\n\n\n  e2e-deployment:');
     expect(rendered).toContain(
       "if: ${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}",
@@ -88,9 +88,9 @@ describe('CI workflow definition', () => {
     );
     expect(rendered).toContain('# prettier-ignore\n        run: smoo github-ci nx-smart --target e2e-deployment');
     expect(rendered).toContain(
-      'smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "${{ needs.main.outputs.deployment-stage }}" --name "Deployment E2E" --step 4',
+      'smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "${{ needs.main.outputs.deployment-stage }}" --stream-output --name "E2E Tests (Deployed Stage)" --step 4',
     );
-    expect(rendered.match(/name: Deployment E2E/g)).toHaveLength(2);
+    expect(rendered.match(/name: E2E Tests \(Deployed Stage\)/g)).toHaveLength(2);
   });
 
   it('omits optional browser and deployment-E2E lanes when disabled', () => {

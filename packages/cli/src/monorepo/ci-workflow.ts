@@ -295,7 +295,7 @@ function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
   if (!options.e2eDeployment) return '';
   return `
   e2e-deployment:
-    name: Deployment E2E
+    name: E2E Tests (Deployed Stage)
     needs: main
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 15
@@ -317,9 +317,9 @@ ${renderRunsOnLine(options.runsOn)}
         uses: ./.github/actions/setup-devenv
 
       # Step 4
-      - name: Deployment E2E
+      - name: E2E Tests (Deployed Stage)
         # prettier-ignore
-        run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --name "Deployment E2E" --step 4
+        run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --stream-output --name "E2E Tests (Deployed Stage)" --step 4
 
       # Step 5
       - name: 🧹 Cleanup and cache Nix/devenv
