@@ -573,7 +573,7 @@ describe('event-aware stage deployment', () => {
     ).toThrow(/same-repository/);
   });
 
-  it('selects only deploy targets owned by the stage convention', async () => {
+  it('selects stage-derived deploy targets plus staging-only infrastructure on staging', async () => {
     const definitions: Record<string, unknown> = {
       'conloca-app': {
         targets: {
@@ -583,17 +583,34 @@ describe('event-aware stage deployment', () => {
       'conloca-app-backend': {
         targets: { deploy: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
       },
+      'conloca-e2e-mail-capture': {
+        tags: ['staging-deploy-target'],
+        targets: { deploy: { options: { command: 'bun scripts/deploy.ts --stage={args.stage}' } } },
+      },
       'conloca-oauth-redirect': {
+        tags: ['permanent-deploy-target'],
         targets: { deploy: { options: { command: 'wrangler deploy --config wrangler.toml' } } },
       },
       'conloca-website': {
         targets: { deploy: { options: { command: 'bun scripts/deploy-website.ts' } } },
       },
     };
+    const candidates = Object.keys(definitions);
+    const loadProject = async (project: string) => definitions[project];
 
-    await expect(
-      selectStageDeployProjects(Object.keys(definitions), async (project) => definitions[project]),
-    ).resolves.toEqual(['conloca-app', 'conloca-app-backend']);
+    await expect(selectStageDeployProjects(candidates, 'staging', loadProject)).resolves.toEqual([
+      'conloca-app',
+      'conloca-app-backend',
+      'conloca-e2e-mail-capture',
+    ]);
+    await expect(selectStageDeployProjects(candidates, 'pr123', loadProject)).resolves.toEqual([
+      'conloca-app',
+      'conloca-app-backend',
+    ]);
+    await expect(selectStageDeployProjects(candidates, 'production', loadProject)).resolves.toEqual([
+      'conloca-app',
+      'conloca-app-backend',
+    ]);
   });
 
   it('publishes GitHub deployment JSON through a real stdin process seam', async () => {
@@ -658,7 +675,7 @@ describe('event-aware stage deployment', () => {
 
   it('deploys app/backend, publishes PR metadata, and emits the resolved stage', async () => {
     const nxCalls: string[][] = [];
-    const listCalls: Array<[string, string]> = [];
+    const listCalls: Array<[string, string, string]> = [];
     const summaries: string[] = [];
     const deployments: Array<[string, string]> = [];
     const outputs: string[] = [];
@@ -678,8 +695,8 @@ describe('event-aware stage deployment', () => {
           repository: { full_name: 'owner/repo' },
           pull_request: { number: 123, head: { repo: { full_name: 'owner/repo' } } },
         },
-        listProjects: async (_root, target, mode) => {
-          listCalls.push([target, mode]);
+        listProjects: async (_root, target, mode, stage) => {
+          listCalls.push([target, mode, stage]);
           return ['conloca-app', 'conloca-app-backend'];
         },
         runNx: async (args) => {
@@ -698,10 +715,10 @@ describe('event-aware stage deployment', () => {
       },
     );
 
-    expect(listCalls).toEqual([['deploy', 'run-many']]);
+    expect(listCalls).toEqual([['deploy', 'run-many', 'pr123']]);
     expect(nxCalls).toHaveLength(1);
     expect(nxCalls[0]).toContain('--projects=conloca-app,conloca-app-backend');
-    expect(nxCalls[0]).toContain('--exclude=tag:permanent-deploy-target');
+    expect(nxCalls[0]).toContain('--exclude=tag:permanent-deploy-target,tag:staging-deploy-target');
     expect(nxCalls[0]).toContain('--stage=pr123');
     expect(nxCalls[0]).not.toContain('e2e-deployment');
     expect(summaries).toEqual(['## pr123 deployment\n\n[View deployment](https://app.pr123.conloca.com)\n']);
