@@ -27,6 +27,7 @@ export interface GithubActionsEventPayload {
 }
 
 interface NxProjectDeployTarget {
+  tags?: unknown;
   targets?: {
     deploy?: {
       command?: unknown;
@@ -404,7 +405,12 @@ export interface GithubCiNxDeployOptions {
 }
 
 export interface GithubCiNxDeployDependencies {
-  listProjects?: (root: string, target: string, mode: 'affected' | 'run-many') => Promise<string[]>;
+  listProjects?: (
+    root: string,
+    target: string,
+    mode: 'affected' | 'run-many',
+    stage: DeploymentStage,
+  ) => Promise<string[]>;
   runNx?: (args: string[], root: string) => Promise<number>;
   appendSummary?: (summaryPath: string, content: string) => Promise<void>;
   appendOutput?: (outputPath: string, content: string) => Promise<void>;
@@ -432,7 +438,7 @@ export async function githubCiNxDeploy(
   const mode = resolveNxSmartMode(options.mode ?? 'run-many');
   const listProjects = dependencies.listProjects ?? listNxProjectsWithTarget;
   const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => runStatus('nx', args, commandRoot));
-  const projects = await listProjects(root, 'deploy', mode);
+  const projects = await listProjects(root, 'deploy', mode, stage);
   if (projects.length === 0) {
     console.log(`No ${mode} deploy projects; skipping ${stage}.`);
     await setStatus('success');
@@ -447,7 +453,7 @@ export async function githubCiNxDeploy(
       '-t',
       target,
       `--projects=${projectList}`,
-      '--exclude=tag:permanent-deploy-target',
+      `--exclude=${deployExclusions(stage)}`,
       `--parallel=${NX_PARALLEL}`,
     ];
     if (target === 'deploy') {
@@ -565,20 +571,27 @@ function readGithubActionsEvent(environment: NodeJS.ProcessEnv): GithubActionsEv
   }
 }
 
+function deployExclusions(stage: DeploymentStage): string {
+  const tags = ['tag:permanent-deploy-target'];
+  if (stage !== 'staging') tags.push('tag:staging-deploy-target');
+  return tags.join(',');
+}
+
 async function listNxProjectsWithTarget(
   root: string,
   target: string,
   mode: 'affected' | 'run-many',
+  stage: DeploymentStage,
 ): Promise<string[]> {
   const listArgs = ['show', 'projects'];
   if (mode === 'affected') listArgs.push('--affected');
   listArgs.push('--withTarget', target);
-  if (target === 'deploy') listArgs.push('--exclude=tag:permanent-deploy-target');
+  if (target === 'deploy') listArgs.push(`--exclude=${deployExclusions(stage)}`);
   listArgs.push('--json');
   const result = await $`nx ${listArgs}`.cwd(root).quiet();
   const candidates = nxProjectList(decode(result.stdout)).sort((left, right) => left.localeCompare(right));
   if (target !== 'deploy') return candidates;
-  return selectStageDeployProjects(candidates, async (project) => {
+  return selectStageDeployProjects(candidates, stage, async (project) => {
     const projectResult = await $`nx show project ${project} --json`.cwd(root).quiet();
     const parsed = parseNxProjectDeployTarget(decode(projectResult.stdout));
     if (!parsed) throw new Error(`nx show project ${project} returned invalid JSON.`);
@@ -588,6 +601,7 @@ async function listNxProjectsWithTarget(
 
 export async function selectStageDeployProjects(
   candidates: string[],
+  stage: DeploymentStage,
   loadProject: (project: string) => Promise<unknown>,
 ): Promise<string[]> {
   const selected: string[] = [];
@@ -596,7 +610,12 @@ export async function selectStageDeployProjects(
     if (!isNxProjectDeployTarget(definition)) continue;
     const deploy = definition.targets?.deploy;
     const commandValue = deploy?.options?.command ?? deploy?.command;
-    if (typeof commandValue === 'string' && commandValue.includes('smoo wrangler deploy-stage')) {
+    const tags = Array.isArray(definition.tags)
+      ? definition.tags.filter((tag): tag is string => typeof tag === 'string')
+      : [];
+    const isStageDerived = typeof commandValue === 'string' && commandValue.includes('smoo wrangler deploy-stage');
+    const isStagingOnly = tags.includes('staging-deploy-target');
+    if (isStageDerived || (stage === 'staging' && isStagingOnly)) {
       selected.push(project);
     }
   }
