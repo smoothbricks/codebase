@@ -300,6 +300,8 @@ function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 15
     if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
+    env:
+      GH_TOKEN: \${{ github.token }}
     steps:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
