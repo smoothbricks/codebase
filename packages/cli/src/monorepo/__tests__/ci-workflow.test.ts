@@ -83,6 +83,9 @@ describe('CI workflow definition', () => {
       "if: ${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}",
     );
     expect(rendered).toContain('timeout-minutes: 15');
+    expect(rendered).toContain(
+      "if: ${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}\n    env:\n      GH_TOKEN: ${{ github.token }}\n    steps:",
+    );
     expect(rendered).toContain('# prettier-ignore\n        run: smoo github-ci nx-smart --target e2e-deployment');
     expect(rendered).toContain(
       'smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "${{ needs.main.outputs.deployment-stage }}" --name "Deployment E2E" --step 4',
