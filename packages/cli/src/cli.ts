@@ -336,6 +336,7 @@ function buildProgram(): Command {
     .option('--mode <mode>', 'auto, affected, or run-many', 'auto')
     .option('--configuration <configuration>')
     .option('--stage <stage>')
+    .option('--stream-output', 'stream Nx task output without prefixes')
     .action(
       async (options: {
         target: string;
@@ -344,6 +345,7 @@ function buildProgram(): Command {
         mode?: 'auto' | 'affected' | 'run-many';
         configuration?: string;
         stage?: string;
+        streamOutput?: boolean;
       }) => {
         const { githubCiNxSmart } = await import('./github-ci/index.js');
         await githubCiNxSmart(await findRepoRoot(), options);

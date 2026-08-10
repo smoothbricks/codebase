@@ -134,12 +134,13 @@ describe('GitHub CI Nx target expansion', () => {
     ).toEqual(['native:package-linux', 'native:compile-linux', 'native:build']);
   });
 
-  it('adds optional stage before the generic target skip tag only to nx-smart', () => {
-    expect(nxSmartArgs('e2e-deployment', 'run-many', undefined, 'pr123')).toEqual([
+  it('adds optional stage and streaming before the generic target skip tag only to nx-smart', () => {
+    expect(nxSmartArgs('e2e-deployment', 'run-many', undefined, 'pr123', true)).toEqual([
       'run-many',
       '-t',
       'e2e-deployment',
       '--stage=pr123',
+      '--outputStyle=stream-without-prefixes',
       '--exclude=tag:ci:skip:e2e-deployment',
       '--parallel=100%',
     ]);
