@@ -78,6 +78,7 @@ describe('CI workflow definition', () => {
 
     expect(rendered).toContain('deployment-stage: ${{ steps.deploy.outputs.stage }}');
     expect(rendered).toContain('  e2e-deployment:\n    name: Deployment E2E\n    needs: main');
+    expect(rendered).not.toContain('\n\n\n  e2e-deployment:');
     expect(rendered).toContain(
       "if: ${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}",
     );
