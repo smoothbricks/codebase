@@ -60,7 +60,8 @@ export interface CloudflareClient {
 interface CloudflareEnvelope {
   success: boolean;
   result?: unknown;
-  errors?: Array<{ code?: number; message?: string }>;
+  errors?: Array<{ code?: number; message?: string }> | null;
+  messages?: Array<{ code?: number; message?: string }> | null;
   result_info?: {
     page?: number;
     total_pages?: number;
@@ -92,13 +93,15 @@ export class CloudflareApiError extends Error {
   }
 }
 
+type CloudflareFetcher = (input: string, init?: RequestInit) => Promise<Response>;
+
 export class CloudflareRestClient implements CloudflareClient {
   private readonly accountPath: string;
 
   constructor(
     accountId: string,
     private readonly apiToken: string,
-    private readonly fetcher: typeof fetch = fetch,
+    private readonly fetcher: CloudflareFetcher = fetch,
   ) {
     if (!accountId || !apiToken) {
       throw new Error('CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required.');
