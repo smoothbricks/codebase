@@ -18,7 +18,7 @@ const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
 export type PublishWorkflowCondition = 'version-mode-not-none' | 'deploy-production' | 'failure' | 'always';
 export type PublishWorkflowNxTarget = 'build' | 'lint' | 'test';
-export type PublishWorkflowDeployEnvironment = 'none' | 'production';
+export type PublishWorkflowDeployStage = 'none' | 'production';
 
 export enum PublishWorkflowStepKind {
   Checkout = 'checkout',
@@ -62,7 +62,7 @@ export interface PublishWorkflowDefinitionOptions {
 
 export interface PublishWorkflowInputs {
   bump: PublishWorkflowBump;
-  deployEnvironment: PublishWorkflowDeployEnvironment;
+  deployStage: PublishWorkflowDeployStage;
   dryRun: boolean;
 }
 
@@ -263,7 +263,7 @@ function shouldRunStep(
     return version.mode !== 'none';
   }
   if (step.condition === 'deploy-production') {
-    return version.mode !== 'none' && inputs.deployEnvironment === 'production' && !inputs.dryRun;
+    return version.mode !== 'none' && inputs.deployStage === 'production' && !inputs.dryRun;
   }
   if (step.condition === 'failure') {
     return failed;
@@ -291,7 +291,7 @@ function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions):
   const deployInput =
     options.deploy === true
       ? `
-      deploy_environment:
+      deploy_stage:
         type: choice
         description: Deploy live systems after a successful publish.
         options: [none, production]
@@ -483,10 +483,10 @@ function deployProductionStep(step: PublishWorkflowStep, options: PublishWorkflo
   return [
     `      - name: ${step.name}`,
     '        if:',
-    "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_environment == 'production' && inputs.dry_run !=",
+    "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_stage == 'production' && inputs.dry_run !=",
     "          'true' }}",
     ...deployEnvLines(options),
-    '        run: smoo github-ci nx-deploy --environment production --mode run-many --verify --name "Deploy Production"',
+    '        run: smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
   ];
 }
 
@@ -534,7 +534,7 @@ function renderPlatformPublishWorkflowYaml(options: PublishWorkflowDefinitionOpt
   const deployInput =
     options.deploy === true
       ? `
-      deploy_environment:
+      deploy_stage:
         type: choice
         description: Deploy live systems after a successful publish.
         options: [none, production]
@@ -940,10 +940,10 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       `      # Step ${stepNumber++}`,
       '      - name: 🚀 Deploy production',
       '        if:',
-      "          ${{ needs.linux-release-candidate.outputs.mode != 'none' && inputs.deploy_environment == 'production' &&",
+      "          ${{ needs.linux-release-candidate.outputs.mode != 'none' && inputs.deploy_stage == 'production' &&",
       "          inputs.dry_run != 'true' }}",
       ...deployEnvLines(options),
-      '        run: smoo github-ci nx-deploy --environment production --mode run-many --verify --name "Deploy Production"',
+      '        run: smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
     );
   }
   lines.push(

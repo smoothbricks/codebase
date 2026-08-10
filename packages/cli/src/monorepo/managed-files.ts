@@ -105,13 +105,15 @@ function reinsertInlineLocalBlocks(content: string, blocks: InlineLocalBlock[]):
   if (blocks.length === 0) return content;
   const lines = content.split('\n');
   for (const block of blocks) {
-    const index = lines.indexOf(block.anchor);
-    if (index === -1) {
+    const matches = lines.flatMap((line, index) => (line === block.anchor ? [index] : []));
+    if (matches.length !== 1) {
+      const reason = matches.length === 0 ? 'no line' : `${matches.length} lines`;
       throw new Error(
-        `${INLINE_LOCAL_BEGIN} block anchored on "${block.anchor}" no longer matches any line in the updated ` +
+        `${INLINE_LOCAL_BEGIN} block anchored on "${block.anchor}" matches ${reason} in the updated ` +
           'template — reconcile the repo-owned block manually',
       );
     }
+    const index = matches[0] as number;
     const markerIndent = block.markerIndent ?? '';
     lines.splice(
       index + 1,
@@ -136,6 +138,8 @@ interface ManagedFileContext {
   hasReleasePackages: boolean;
   hasStagingDeployTargets: boolean;
   hasProductionDeployTargets: boolean;
+  hasBrowserTestTargets: boolean;
+  hasE2eDeploymentTargets: boolean;
   stagingDeployProvider?: 'cloudflare';
   productionDeployProvider?: 'cloudflare';
   ciPushBranches: string[];
@@ -320,6 +324,8 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
       return renderCiWorkflowYaml({
         deploy: context.hasStagingDeployTargets,
         deployProvider: context.stagingDeployProvider,
+        browserTests: context.hasBrowserTestTargets,
+        e2eDeployment: context.hasStagingDeployTargets && context.hasE2eDeploymentTargets,
         pushBranches: context.ciPushBranches,
         runsOn: context.ciRunsOn,
       });
@@ -356,7 +362,8 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
   const nxProjects = await loadNxProjects(root);
   const stagingDeploy = deployTargetInfoFromProjects(nxProjects, 'staging');
   const productionDeploy = deployTargetInfoFromProjects(nxProjects, 'production');
-  const platformTargetGlobs = platformTargetGlobsForTest(targetNamesFromProjects(nxProjects));
+  const targetNames = targetNamesFromProjects(nxProjects);
+  const platformTargetGlobs = platformTargetGlobsForTest(targetNames);
   const nodeModulesCacheKey = existsSync(join(root, 'bun.lock'))
     ? `$${"{{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}"}`
     : `$${"{{ hashFiles('bun.lockb', 'package.json', 'packages/*/package.json') }}"}`;
@@ -364,6 +371,8 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     hasReleasePackages: listReleasePackages(root, packageJson).length > 0,
     hasStagingDeployTargets: stagingDeploy.exists,
     hasProductionDeployTargets: productionDeploy.exists,
+    hasBrowserTestTargets: hasExactTargetForTest(targetNames, 'test-browser'),
+    hasE2eDeploymentTargets: hasExactTargetForTest(targetNames, 'e2e-deployment'),
     stagingDeployProvider: stagingDeploy.provider,
     productionDeployProvider: productionDeploy.provider,
     ciPushBranches,
@@ -372,6 +381,10 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     repoName,
     platformTargetGlobs,
   };
+}
+
+export function hasExactTargetForTest(targetNames: Iterable<string>, target: string): boolean {
+  return [...targetNames].includes(target);
 }
 
 export function platformTargetGlobsForTest(targetNames: Iterable<string>): string[] {
@@ -404,7 +417,7 @@ function deployTargetInfoFromTargets(targets: Record<string, NxTargetConfig>, co
   }
   const baseCommandValue = deploy.options?.command ?? deploy.command;
   const baseCommand = typeof baseCommandValue === 'string' ? baseCommandValue : '';
-  if (baseCommand.includes('smoo wrangler deploy-environment')) {
+  if (baseCommand.includes('smoo wrangler deploy-stage')) {
     return { exists: true, provider: 'cloudflare' };
   }
   const config = deploy.configurations?.[configuration];
