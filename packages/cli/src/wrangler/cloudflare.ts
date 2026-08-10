@@ -1,5 +1,5 @@
 import typia from 'typia';
-import type { LiveKvNamespace } from './environment.js';
+import type { LiveKvNamespace } from './stage.js';
 
 export interface R2Bucket {
   name: string;

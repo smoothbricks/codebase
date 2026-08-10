@@ -232,7 +232,7 @@ describe('publish workflow definition', () => {
     );
     expect(rendered).not.toContain('GITHUB_SHA:');
     expect(finalJob).toContain("needs.linux-release-candidate.outputs.mode != 'none'");
-    expect(finalJob).toContain("inputs.deploy_environment == 'production'");
+    expect(finalJob).toContain("inputs.deploy_stage == 'production'");
     expect(finalJob).toContain("inputs.dry_run != 'true'");
     expect(finalJob).toContain('smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"');
     expect(finalJob).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
@@ -250,7 +250,7 @@ describe('publish workflow definition', () => {
   it('omits production deploy controls when no production deploy target exists', () => {
     const rendered = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
 
-    expect(rendered).not.toContain('deploy_environment');
+    expect(rendered).not.toContain('deploy_stage');
     expect(rendered).not.toContain('Deploy production');
     expect(rendered).not.toContain('nx-deploy');
   });
@@ -258,12 +258,12 @@ describe('publish workflow definition', () => {
   it('renders production deploy controls for repos with production deploy targets', () => {
     const rendered = renderPublishWorkflowYaml({ deploy: true, repoName: '@smoothbricks/codebase' });
 
-    expect(rendered).toContain('deploy_environment:');
+    expect(rendered).toContain('deploy_stage:');
     expect(rendered).toContain('- name: 🚀 Deploy production');
     expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
     expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
     expect(rendered).toContain(
-      'smoo github-ci nx-deploy --environment production --mode run-many --verify --name "Deploy Production"',
+      'smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
     );
   });
 
@@ -284,7 +284,7 @@ describe('publish workflow definition', () => {
       repairs: [],
       current: [],
       bump: 'auto',
-      deployEnvironment: 'production',
+      deployStage: 'production',
       dryRun: false,
       version: { mode: 'new', projects: ['app'] },
     }).run();
@@ -293,7 +293,7 @@ describe('publish workflow definition', () => {
       repairs: [],
       current: [],
       bump: 'auto',
-      deployEnvironment: 'production',
+      deployStage: 'production',
       dryRun: true,
       version: { mode: 'new', projects: ['app'] },
     }).run();
@@ -422,7 +422,7 @@ interface WorkflowScenarioConfig {
   repairs: ReleaseGap[];
   current: ReleaseGap[];
   bump: PublishWorkflowBump;
-  deployEnvironment?: 'none' | 'production';
+  deployStage?: 'none' | 'production';
   dryRun: boolean;
   version: PublishWorkflowVersionOutputs;
 }
@@ -448,7 +448,7 @@ function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promi
     async run() {
       const state = new WorkflowScenarioState(config);
       await runPublishWorkflow(definePublishWorkflow({ deploy: config.deploy, repoName: config.repoName }), {
-        inputs: { bump: config.bump, deployEnvironment: config.deployEnvironment ?? 'none', dryRun: config.dryRun },
+        inputs: { bump: config.bump, deployStage: config.deployStage ?? 'none', dryRun: config.dryRun },
         callbacks: state.callbacks(),
       });
       return state.outcome();

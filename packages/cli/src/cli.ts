@@ -4,7 +4,7 @@ import { cliPackageVersion } from './lib/cli-package.js';
 import { findRepoRoot } from './lib/run.js';
 import { ensureChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
-import { cleanupPullRequest, deployEnvironment } from './wrangler/deploy-environment.js';
+import { cleanupPullRequest, deployStage } from './wrangler/deploy-stage.js';
 import { scaffold } from './wrangler/scaffold.js';
 
 export async function runCli(argv = process.argv.slice(2)): Promise<void> {
@@ -335,6 +335,7 @@ function buildProgram(): Command {
     .option('--step <step>')
     .option('--mode <mode>', 'auto, affected, or run-many', 'auto')
     .option('--configuration <configuration>')
+    .option('--stage <stage>')
     .action(
       async (options: {
         target: string;
@@ -342,6 +343,7 @@ function buildProgram(): Command {
         step?: string;
         mode?: 'auto' | 'affected' | 'run-many';
         configuration?: string;
+        stage?: string;
       }) => {
         const { githubCiNxSmart } = await import('./github-ci/index.js');
         await githubCiNxSmart(await findRepoRoot(), options);
@@ -376,14 +378,14 @@ function buildProgram(): Command {
     });
   githubCi
     .command('nx-deploy')
-    .option('--environment <environment>', 'explicit staging, production, or prN override')
+    .option('--stage <stage>', 'explicit staging, production, or prN override')
     .option('--mode <mode>', 'auto, affected, or run-many', 'run-many')
     .option('--name <name>')
     .option('--step <step>')
     .option('--verify', 'run build, lint, and test before deploy')
     .action(
       async (options: {
-        environment?: string;
+        stage?: string;
         mode?: 'auto' | 'affected' | 'run-many';
         name?: string;
         step?: string;
@@ -424,10 +426,10 @@ function buildProgram(): Command {
       scaffold(await findRepoRoot(), project, { force: options.force });
     });
   wrangler
-    .command('deploy-environment')
-    .requiredOption('--environment <environment>', 'staging, production, or prN')
-    .action(async (options: { environment: string }) => {
-      await deployEnvironment(process.cwd(), options.environment);
+    .command('deploy-stage')
+    .requiredOption('--stage <stage>', 'staging, production, or prN')
+    .action(async (options: { stage: string }) => {
+      await deployStage(process.cwd(), options.stage);
     });
   wrangler
     .command('cleanup-pr')

@@ -8,6 +8,7 @@ export enum CiWorkflowStepKind {
   SetNxShas = 'set-nx-shas',
   RestoreNxCache = 'restore-nx-cache',
   Build = 'build',
+  BrowserTests = 'browser-tests',
   Lint = 'lint',
   UnitTests = 'unit-tests',
   ManagedFilesCheck = 'managed-files-check',
@@ -26,6 +27,8 @@ export interface CiWorkflowStep {
 
 export interface CiWorkflowDefinitionOptions {
   deploy: boolean;
+  browserTests: boolean;
+  e2eDeployment: boolean;
   deployProvider?: 'cloudflare';
   pushBranches: string[];
   /** Default ubuntu-latest when omitted. */
@@ -41,15 +44,20 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
     { kind: CiWorkflowStepKind.SetNxShas, name: '🧭 Set Nx SHAs' },
     { kind: CiWorkflowStepKind.RestoreNxCache, name: '🧠 Restore Nx cache' },
     { kind: CiWorkflowStepKind.Build, name: '🔨 Build' },
-    { kind: CiWorkflowStepKind.Lint, name: '🔍 Lint' },
-    { kind: CiWorkflowStepKind.UnitTests, name: '🧪 Unit Tests' },
-    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check managed-file drift' },
-    { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
   ];
   if (options.deploy) {
-    steps.push({ kind: CiWorkflowStepKind.Deploy, name: '🚀 Deploy Environment' });
+    steps.push({ kind: CiWorkflowStepKind.Deploy, name: '🚀 Deploy Stage' });
   }
   steps.push(
+    { kind: CiWorkflowStepKind.Lint, name: '🔍 Lint' },
+    { kind: CiWorkflowStepKind.UnitTests, name: '🧪 Unit Tests' },
+  );
+  if (options.browserTests) {
+    steps.push({ kind: CiWorkflowStepKind.BrowserTests, name: '🌐 Browser Tests' });
+  }
+  steps.push(
+    { kind: CiWorkflowStepKind.ManagedFilesCheck, name: '🩺 Check managed-file drift' },
+    { kind: CiWorkflowStepKind.ManagedFilesDispatch, name: '🔁 Dispatch managed-file drift healing' },
     { kind: CiWorkflowStepKind.SaveNxCache, name: '💾 Save Nx cache' },
     { kind: CiWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs' },
     { kind: CiWorkflowStepKind.SaveNixDevenv, name: '🧹 Cleanup and cache Nix/devenv' },
@@ -59,7 +67,7 @@ export function defineCiWorkflow(options: CiWorkflowDefinitionOptions): CiWorkfl
 
 export function renderCiWorkflowYaml(options: CiWorkflowDefinitionOptions): string {
   const steps = defineCiWorkflow(options);
-  return `${renderCiWorkflowHeader(options)}${renderCiWorkflowSteps(steps, options)}`;
+  return `${renderCiWorkflowHeader(options)}${renderCiWorkflowSteps(steps, options)}${renderE2eDeploymentJob(options)}`;
 }
 
 function renderCiWorkflowHeader(options: CiWorkflowDefinitionOptions): string {
@@ -77,6 +85,10 @@ permissions:
   contents: read
 ${options.deploy ? '  deployments: write\n' : ''}  statuses: write
 
+concurrency:
+  group: \${{ github.workflow }}-\${{ github.ref }}
+  cancel-in-progress: true
+
 defaults:
   run:
     working-directory: tooling/direnv
@@ -86,7 +98,13 @@ jobs:
     name: Validate
 ${renderRunsOnLine(options.runsOn)}
     timeout-minutes: 45
-    env:
+${
+  options.e2eDeployment
+    ? `    outputs:
+      deployment-stage: ${githubExpression('steps.deploy.outputs.stage')}
+`
+    : ''
+}    env:
       NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       GH_TOKEN: ${githubExpression('github.token')}
     steps:
@@ -169,6 +187,8 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return [`      - name: ${step.name}`, '        id: nx-cache', '        uses: ./.github/actions/cache-nx'];
     case CiWorkflowStepKind.Build:
       return nxSmartStep(step, 'build', 'Build');
+    case CiWorkflowStepKind.BrowserTests:
+      return nxSmartStep(step, 'test-browser', 'Browser Tests');
     case CiWorkflowStepKind.Lint:
       return nxSmartStep(step, 'lint', 'Lint');
     case CiWorkflowStepKind.UnitTests:
@@ -197,6 +217,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
     case CiWorkflowStepKind.Deploy:
       return [
         `      - name: ${step.name}`,
+        '        id: deploy',
         '        if: >-',
         '          ${{',
         "            (github.event_name == 'pull_request' &&",
@@ -205,7 +226,7 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         "            (github.event_name == 'push' && github.ref == 'refs/heads/private')",
         '          }}',
         ...deployEnvLines(options),
-        `        run: smoo github-ci nx-deploy --mode run-many --name "Deploy Environment" --step ${step.number}`,
+        `        run: smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step ${step.number}`,
       ];
     case CiWorkflowStepKind.SaveNxCache:
       return [
@@ -255,12 +276,6 @@ function deployEnvLines(options: CiWorkflowDefinitionOptions): string[] {
     '        env:',
     '          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',
     '          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
-    '          GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}',
-    '          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}',
-    '          GITHUB_APP_PRIVATE_KEY_PEM: ${{ secrets.GITHUB_APP_PRIVATE_KEY_PEM }}',
-    '          OAUTH_STATE_SIGNING_KEY: ${{ secrets.OAUTH_STATE_SIGNING_KEY }}',
-    '          MAIL_CAPTURE_CONTROL_TOKEN: ${{ secrets.MAIL_CAPTURE_CONTROL_TOKEN }}',
-    '          TOKEN_ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}',
   ];
 }
 
@@ -274,4 +289,42 @@ function nxSmartStep(step: CiWorkflowStep, target: string, name: string): string
 function renderYamlList(values: string[], spaces: number): string {
   const indent = ' '.repeat(spaces);
   return values.map((value) => `${indent}- ${value}`).join('\n');
+}
+
+function renderE2eDeploymentJob(options: CiWorkflowDefinitionOptions): string {
+  if (!options.e2eDeployment) return '';
+  return `
+
+  e2e-deployment:
+    name: Deployment E2E
+    needs: main
+${renderRunsOnLine(options.runsOn)}
+    timeout-minutes: 15
+    if: \${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}
+    steps:
+      # Step 1: GitHub adds "Set up job" automatically
+      # Step 2
+      - name: 📥 Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          filter: blob:none
+          fetch-depth: 0
+
+      # Step 3. Composite action internals do not affect top-level job step anchors.
+      - name: 🧱 Setup Nix/devenv
+        id: setup
+        uses: ./.github/actions/setup-devenv
+
+      # Step 4
+      - name: Deployment E2E
+        run: smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "\${{ needs.main.outputs.deployment-stage }}" --name "Deployment E2E" --step 4
+
+      # Step 5
+      - name: 🧹 Cleanup and cache Nix/devenv
+        if: always()
+        uses: ./.github/actions/save-nix-devenv
+        with:
+          nix-cache-hit: \${{ steps.setup.outputs.nix-cache-hit }}
+          devenv-cache-hit: \${{ steps.setup.outputs.devenv-cache-hit }}
+`;
 }

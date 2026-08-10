@@ -9,6 +9,7 @@ import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
   deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
+  hasExactTargetForTest,
   INLINE_LOCAL_BEGIN,
   INLINE_LOCAL_END,
   LOCAL_SECTION_MARKER,
@@ -128,7 +129,14 @@ describe('managed-file inline local blocks', () => {
   it("reinserting refuses when the anchor no longer appears — never silently drops the repo's customization", () => {
     const fresh = ['a:', '  - one', 'b:'].join('\n'); // '  - two' is gone
     expect(() => reinsertInlineLocalBlocksForTest(fresh, [{ anchor: '  - two', lines: '  - repo-owned' }])).toThrow(
-      /no longer matches/,
+      /matches no line/,
+    );
+  });
+
+  it('reinserting refuses an ambiguous multiply occurring anchor', () => {
+    const fresh = ['anchor', 'middle', 'anchor'].join('\n');
+    expect(() => reinsertInlineLocalBlocksForTest(fresh, [{ anchor: 'anchor', lines: 'repo-owned' }])).toThrow(
+      /matches 2 lines/,
     );
   });
 
@@ -136,8 +144,7 @@ describe('managed-file inline local blocks', () => {
     // Lines that can serve as anchors: non-empty, not a marker, and each drawn
     // from a small alphabet so uniqueness is checkable — the round-trip only
     // holds when an anchor line occurs exactly once in the managed section
-    // (reinsert finds the FIRST occurrence by design, same as the real file
-    // shape: comments/patterns are unique in practice).
+    // because ambiguous anchors are rejected rather than selecting one.
     const linePool = fc.constantFrom('alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta');
     fc.assert(
       fc.property(
@@ -205,6 +212,20 @@ describe('nx graph project helpers', () => {
     );
   });
 
+  it('detects browser and deployment E2E targets by exact name only', () => {
+    const exact = targetNamesFromProjects({
+      app: { targets: { 'test-browser': {}, 'e2e-deployment': {} } },
+    });
+    const nearMisses = targetNamesFromProjects({
+      app: { targets: { 'test-browser-extra': {}, 'e2e-deployments': {}, 'pre-e2e-deployment': {} } },
+    });
+
+    expect(hasExactTargetForTest(exact, 'test-browser')).toBe(true);
+    expect(hasExactTargetForTest(exact, 'e2e-deployment')).toBe(true);
+    expect(hasExactTargetForTest(nearMisses, 'test-browser')).toBe(false);
+    expect(hasExactTargetForTest(nearMisses, 'e2e-deployment')).toBe(false);
+  });
+
   it('detects deploy configurations and cloudflare provider from graph nodes', () => {
     expect(deployTargetInfoFromProjects(sampleProjects, 'staging')).toEqual({
       exists: true,
@@ -217,12 +238,12 @@ describe('nx graph project helpers', () => {
     expect(deployTargetInfoFromProjects(sampleProjects, 'preview')).toEqual({ exists: false });
   });
 
-  it('recognizes convention-driven deploy-environment targets without per-environment configurations', () => {
+  it('recognizes convention-driven deploy-stage targets without per-stage configurations', () => {
     const projects: NxProjects = {
       app: {
         targets: {
           deploy: {
-            options: { command: 'smoo wrangler deploy-environment --environment {args.environment}' },
+            options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' },
           },
         },
       },
