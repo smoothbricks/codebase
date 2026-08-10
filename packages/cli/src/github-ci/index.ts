@@ -7,12 +7,7 @@ import typia from 'typia';
 import { parseStringArrayText } from '../lib/json.js';
 import { decode, run, runStatus } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
-import {
-  type EnvironmentToken,
-  isPullRequestEnvironment,
-  parseEnvironmentToken,
-  pullRequestEnvironment,
-} from '../wrangler/environment.js';
+import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
 import type { NxTargetRun } from './outputs.js';
 
 export interface GithubActionsEventPayload {
@@ -159,10 +154,18 @@ async function addReferencesFrom(roots: Set<string>, path: string, cwd: string):
   }
 }
 
-export function nxSmartArgs(target: string, mode: 'affected' | 'run-many', configuration?: string): string[] {
+export function nxSmartArgs(
+  target: string,
+  mode: 'affected' | 'run-many',
+  configuration?: string,
+  stage?: string,
+): string[] {
   const args = [mode, '-t', target];
   if (configuration) {
     args.push(`--configuration=${configuration}`);
+  }
+  if (stage) {
+    args.push(`--stage=${stage}`);
   }
   args.push(`--exclude=tag:ci:skip:${target}`, `--parallel=${NX_PARALLEL}`);
   return args;
@@ -170,13 +173,13 @@ export function nxSmartArgs(target: string, mode: 'affected' | 'run-many', confi
 
 export async function githubCiNxSmart(
   root: string,
-  options: { target: string; name?: string; step?: string; mode?: NxSmartMode; configuration?: string },
+  options: { target: string; name?: string; step?: string; mode?: NxSmartMode; configuration?: string; stage?: string },
 ): Promise<void> {
   const name = options.name ?? options.target;
   const step = options.step ?? '';
   await createGithubStatus(name, step);
   const mode = resolveNxSmartMode(options.mode ?? 'auto');
-  const nxArgs = nxSmartArgs(options.target, mode, options.configuration);
+  const nxArgs = nxSmartArgs(options.target, mode, options.configuration, options.stage);
   const status = await runStatus('nx', nxArgs, root);
   await updateGithubStatus(name, status === 0 ? 'success' : 'failure', step);
   if (status !== 0) {
@@ -381,7 +384,7 @@ function commaSeparatedValues(value: string): string[] {
 }
 
 export interface GithubCiNxDeployOptions {
-  environment?: string;
+  stage?: string;
   mode?: NxSmartMode;
   name?: string;
   step?: string;
@@ -392,7 +395,8 @@ export interface GithubCiNxDeployDependencies {
   listProjects?: (root: string, target: string, mode: 'affected' | 'run-many') => Promise<string[]>;
   runNx?: (args: string[], root: string) => Promise<number>;
   appendSummary?: (summaryPath: string, content: string) => Promise<void>;
-  publishDeployment?: (environment: `pr${number}`, url: string) => Promise<void>;
+  appendOutput?: (outputPath: string, content: string) => Promise<void>;
+  publishDeployment?: (stage: `pr${number}`, url: string) => Promise<void>;
   setStatus?: (state: 'pending' | 'success' | 'failure') => Promise<void>;
   processEnv?: NodeJS.ProcessEnv;
   eventPayload?: GithubActionsEventPayload;
@@ -405,8 +409,8 @@ export async function githubCiNxDeploy(
 ): Promise<void> {
   const processEnv = dependencies.processEnv ?? process.env;
   const eventPayload = dependencies.eventPayload ?? readGithubActionsEvent(processEnv);
-  const environment = resolveDeploymentEnvironment(options.environment, processEnv, eventPayload);
-  const name = options.name ?? 'Deploy Environment';
+  const stage = resolveDeploymentStage(options.stage, processEnv, eventPayload);
+  const name = options.name ?? 'Deploy Stage';
   const step = options.step ?? '';
   const setStatus =
     dependencies.setStatus ??
@@ -418,7 +422,7 @@ export async function githubCiNxDeploy(
   const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => runStatus('nx', args, commandRoot));
   const projects = await listProjects(root, 'deploy', mode);
   if (projects.length === 0) {
-    console.log(`No ${mode} deploy projects; skipping ${environment}.`);
+    console.log(`No ${mode} deploy projects; skipping ${stage}.`);
     await setStatus('success');
     return;
   }
@@ -435,7 +439,7 @@ export async function githubCiNxDeploy(
       `--parallel=${NX_PARALLEL}`,
     ];
     if (target === 'deploy') {
-      nxArgs.push(`--environment=${environment}`);
+      nxArgs.push(`--stage=${stage}`);
     }
     const status = await runNx(nxArgs, root);
     if (status !== 0) {
@@ -444,37 +448,39 @@ export async function githubCiNxDeploy(
     }
   }
 
-  if (isPullRequestEnvironment(environment)) {
-    const url = `https://app.${environment}.conloca.com`;
+  if (isPullRequestStage(stage)) {
+    const url = `https://app.${stage}.conloca.com`;
     const summaryPath = processEnv.GITHUB_STEP_SUMMARY;
     if (summaryPath) {
       const appendSummary = dependencies.appendSummary ?? appendFile;
-      await appendSummary(summaryPath, `## ${environment} deployment\n\n[View deployment](${url})\n`);
+      await appendSummary(
+        summaryPath,
+        `## ${stage} deployment
+
+[View deployment](${url})
+`,
+      );
     }
     const publishDeployment =
       dependencies.publishDeployment ??
       ((token: `pr${number}`, deploymentUrl: string) => publishGithubDeployment(token, deploymentUrl, processEnv));
-    await publishDeployment(environment, url);
-  }
-  if (environment !== 'production') {
-    const e2eProjects = await listProjects(root, 'e2e-deployed', 'run-many');
-    if (e2eProjects.length > 0) {
-      const nxArgs = [
-        'run-many',
-        '-t',
-        'e2e-deployed',
-        `--projects=${e2eProjects.join(',')}`,
-        `--parallel=${NX_PARALLEL}`,
-        `--environment=${environment}`,
-      ];
-      const status = await runNx(nxArgs, root);
-      if (status !== 0) {
-        await setStatus('failure');
-        throw new Error(`nx ${nxArgs.join(' ')} failed with exit code ${status}`);
-      }
-    }
+    await publishDeployment(stage, url);
   }
 
+  const outputPath = processEnv.GITHUB_OUTPUT;
+  if (outputPath) {
+    try {
+      const appendOutput = dependencies.appendOutput ?? appendFile;
+      await appendOutput(
+        outputPath,
+        `stage=${stage}
+`,
+      );
+    } catch (error) {
+      await setStatus('failure');
+      throw error;
+    }
+  }
   await setStatus('success');
 }
 
@@ -509,12 +515,12 @@ function eventDefaultBranch(): string | undefined {
   }
 }
 
-export function resolveDeploymentEnvironment(
+export function resolveDeploymentStage(
   explicit: string | undefined,
   environment: NodeJS.ProcessEnv,
   event: GithubActionsEventPayload | undefined,
-): EnvironmentToken {
-  if (explicit !== undefined) return parseEnvironmentToken(explicit);
+): DeploymentStage {
+  if (explicit !== undefined) return parseDeploymentStage(explicit);
   if (environment.GITHUB_EVENT_NAME === 'pull_request') {
     if (!event?.action || !['opened', 'reopened', 'synchronize'].includes(event.action)) {
       throw new Error('Pull-request deployment runs only for opened, reopened, or synchronize events.');
@@ -526,7 +532,7 @@ export function resolveDeploymentEnvironment(
     }
     const number = event.pull_request?.number;
     if (number === undefined) throw new Error('GitHub pull_request event is missing its PR number.');
-    return pullRequestEnvironment(number);
+    return pullRequestStage(number);
   }
   if (environment.GITHUB_EVENT_NAME === 'push' && environment.GITHUB_REF_NAME === 'private') {
     return 'staging';
@@ -534,7 +540,7 @@ export function resolveDeploymentEnvironment(
   if (environment.GITHUB_EVENT_NAME === 'release') {
     return 'production';
   }
-  throw new Error('Cannot resolve a deployment environment from this GitHub event; pass --environment explicitly.');
+  throw new Error('Cannot resolve a deployment stage from this GitHub event; pass --stage explicitly.');
 }
 
 function readGithubActionsEvent(environment: NodeJS.ProcessEnv): GithubActionsEventPayload | undefined {
@@ -560,7 +566,7 @@ async function listNxProjectsWithTarget(
   const result = await $`nx ${listArgs}`.cwd(root).quiet();
   const candidates = nxProjectList(decode(result.stdout)).sort((left, right) => left.localeCompare(right));
   if (target !== 'deploy') return candidates;
-  return selectEnvironmentDeployProjects(candidates, async (project) => {
+  return selectStageDeployProjects(candidates, async (project) => {
     const projectResult = await $`nx show project ${project} --json`.cwd(root).quiet();
     const parsed = parseNxProjectDeployTarget(decode(projectResult.stdout));
     if (!parsed) throw new Error(`nx show project ${project} returned invalid JSON.`);
@@ -568,7 +574,7 @@ async function listNxProjectsWithTarget(
   });
 }
 
-export async function selectEnvironmentDeployProjects(
+export async function selectStageDeployProjects(
   candidates: string[],
   loadProject: (project: string) => Promise<unknown>,
 ): Promise<string[]> {
@@ -578,7 +584,7 @@ export async function selectEnvironmentDeployProjects(
     if (!isNxProjectDeployTarget(definition)) continue;
     const deploy = definition.targets?.deploy;
     const commandValue = deploy?.options?.command ?? deploy?.command;
-    if (typeof commandValue === 'string' && commandValue.includes('smoo wrangler deploy-environment')) {
+    if (typeof commandValue === 'string' && commandValue.includes('smoo wrangler deploy-stage')) {
       selected.push(project);
     }
   }

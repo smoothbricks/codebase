@@ -14,8 +14,8 @@ import {
   nxSmartArgs,
   publishGithubDeployment,
   readGitHeadSha,
-  resolveDeploymentEnvironment,
-  selectEnvironmentDeployProjects,
+  resolveDeploymentStage,
+  selectStageDeployProjects,
 } from './index.js';
 import {
   applyCollectedOutputs,
@@ -134,12 +134,13 @@ describe('GitHub CI Nx target expansion', () => {
     ).toEqual(['native:package-linux', 'native:compile-linux', 'native:build']);
   });
 
-  it('adds the generic target skip tag only to nx-smart', () => {
-    expect(nxSmartArgs('test', 'affected')).toEqual([
-      'affected',
+  it('adds optional stage before the generic target skip tag only to nx-smart', () => {
+    expect(nxSmartArgs('e2e-deployment', 'run-many', undefined, 'pr123')).toEqual([
+      'run-many',
       '-t',
-      'test',
-      '--exclude=tag:ci:skip:test',
+      'e2e-deployment',
+      '--stage=pr123',
+      '--exclude=tag:ci:skip:e2e-deployment',
       '--parallel=100%',
     ]);
     expect(nxRunManyArgs({ target: 'test', projects: projects.slice(0, 1) })).not.toContain(
@@ -540,10 +541,10 @@ async function withNxRunManyFixture(
   }
 }
 
-describe('event-aware environment deployment', () => {
-  it('resolves same-repository PR, private push, release, and explicit production environments', () => {
+describe('event-aware stage deployment', () => {
+  it('resolves same-repository PR, private push, release, and explicit production stages', () => {
     expect(
-      resolveDeploymentEnvironment(
+      resolveDeploymentStage(
         undefined,
         { GITHUB_EVENT_NAME: 'pull_request' },
         {
@@ -554,12 +555,12 @@ describe('event-aware environment deployment', () => {
       ),
     ).toBe('pr123');
     expect(
-      resolveDeploymentEnvironment(undefined, { GITHUB_EVENT_NAME: 'push', GITHUB_REF_NAME: 'private' }, undefined),
+      resolveDeploymentStage(undefined, { GITHUB_EVENT_NAME: 'push', GITHUB_REF_NAME: 'private' }, undefined),
     ).toBe('staging');
-    expect(resolveDeploymentEnvironment(undefined, { GITHUB_EVENT_NAME: 'release' }, undefined)).toBe('production');
-    expect(resolveDeploymentEnvironment('production', {}, undefined)).toBe('production');
+    expect(resolveDeploymentStage(undefined, { GITHUB_EVENT_NAME: 'release' }, undefined)).toBe('production');
+    expect(resolveDeploymentStage('production', {}, undefined)).toBe('production');
     expect(() =>
-      resolveDeploymentEnvironment(
+      resolveDeploymentStage(
         undefined,
         { GITHUB_EVENT_NAME: 'pull_request' },
         {
@@ -571,15 +572,15 @@ describe('event-aware environment deployment', () => {
     ).toThrow(/same-repository/);
   });
 
-  it('selects only deploy targets owned by the environment convention', async () => {
+  it('selects only deploy targets owned by the stage convention', async () => {
     const definitions: Record<string, unknown> = {
       'conloca-app': {
         targets: {
-          deploy: { options: { command: 'smoo wrangler deploy-environment --environment {args.environment}' } },
+          deploy: { options: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
         },
       },
       'conloca-app-backend': {
-        targets: { deploy: { command: 'smoo wrangler deploy-environment --environment {args.environment}' } },
+        targets: { deploy: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
       },
       'conloca-oauth-redirect': {
         targets: { deploy: { options: { command: 'wrangler deploy --config wrangler.toml' } } },
@@ -590,7 +591,7 @@ describe('event-aware environment deployment', () => {
     };
 
     await expect(
-      selectEnvironmentDeployProjects(Object.keys(definitions), async (project) => definitions[project]),
+      selectStageDeployProjects(Object.keys(definitions), async (project) => definitions[project]),
     ).resolves.toEqual(['conloca-app', 'conloca-app-backend']);
   });
 
@@ -654,19 +655,21 @@ describe('event-aware environment deployment', () => {
     ]);
   });
 
-  it('deploys app/backend, follows with e2e-deployed, and publishes PR metadata', async () => {
+  it('deploys app/backend, publishes PR metadata, and emits the resolved stage', async () => {
     const nxCalls: string[][] = [];
     const listCalls: Array<[string, string]> = [];
     const summaries: string[] = [];
     const deployments: Array<[string, string]> = [];
+    const outputs: string[] = [];
 
     await githubCiNxDeploy(
       '/repo',
-      { mode: 'run-many', name: 'Deploy Environment' },
+      { mode: 'run-many', name: 'Deploy Stage' },
       {
         processEnv: {
           GITHUB_EVENT_NAME: 'pull_request',
           GITHUB_STEP_SUMMARY: '/summary',
+          GITHUB_OUTPUT: '/output',
         },
         setStatus: async () => {},
         eventPayload: {
@@ -676,7 +679,7 @@ describe('event-aware environment deployment', () => {
         },
         listProjects: async (_root, target, mode) => {
           listCalls.push([target, mode]);
-          return target === 'deploy' ? ['conloca-app', 'conloca-app-backend'] : ['conloca-e2e'];
+          return ['conloca-app', 'conloca-app-backend'];
         },
         runNx: async (args) => {
           nxCalls.push(args);
@@ -685,24 +688,90 @@ describe('event-aware environment deployment', () => {
         appendSummary: async (_path, content) => {
           summaries.push(content);
         },
-        publishDeployment: async (environment, url) => {
-          deployments.push([environment, url]);
+        appendOutput: async (_path, content) => {
+          outputs.push(content);
+        },
+        publishDeployment: async (stage, url) => {
+          deployments.push([stage, url]);
         },
       },
     );
 
-    expect(listCalls).toEqual([
-      ['deploy', 'run-many'],
-      ['e2e-deployed', 'run-many'],
-    ]);
-    expect(nxCalls).toHaveLength(2);
+    expect(listCalls).toEqual([['deploy', 'run-many']]);
+    expect(nxCalls).toHaveLength(1);
     expect(nxCalls[0]).toContain('--projects=conloca-app,conloca-app-backend');
     expect(nxCalls[0]).toContain('--exclude=tag:permanent-deploy-target');
-    expect(nxCalls[0]).toContain('--environment=pr123');
-    expect(nxCalls[1]).toContain('-t');
-    expect(nxCalls[1]).toContain('e2e-deployed');
-    expect(nxCalls[1]).toContain('--environment=pr123');
+    expect(nxCalls[0]).toContain('--stage=pr123');
+    expect(nxCalls[0]).not.toContain('e2e-deployment');
     expect(summaries).toEqual(['## pr123 deployment\n\n[View deployment](https://app.pr123.conloca.com)\n']);
     expect(deployments).toEqual([['pr123', 'https://app.pr123.conloca.com']]);
+    expect(outputs).toEqual(['stage=pr123\n']);
+  });
+
+  it('emits no stage when no deploy project exists', async () => {
+    const outputs: string[] = [];
+    const statuses: string[] = [];
+
+    await githubCiNxDeploy(
+      '/repo',
+      { stage: 'staging' },
+      {
+        processEnv: { GITHUB_OUTPUT: '/output' },
+        listProjects: async () => [],
+        appendOutput: async (_path, content) => {
+          outputs.push(content);
+        },
+        setStatus: async (status) => {
+          statuses.push(status);
+        },
+      },
+    );
+
+    expect(outputs).toEqual([]);
+    expect(statuses).toEqual(['pending', 'success']);
+  });
+
+  it('emits no stage after deployment or output failure', async () => {
+    const deploymentOutputs: string[] = [];
+    const deploymentStatuses: string[] = [];
+    await expect(
+      githubCiNxDeploy(
+        '/repo',
+        { stage: 'staging' },
+        {
+          processEnv: { GITHUB_OUTPUT: '/output' },
+          listProjects: async () => ['app'],
+          runNx: async () => 1,
+          appendOutput: async (_path, content) => {
+            deploymentOutputs.push(content);
+          },
+          setStatus: async (status) => {
+            deploymentStatuses.push(status);
+          },
+        },
+      ),
+    ).rejects.toThrow(/failed with exit code 1/);
+    expect(deploymentOutputs).toEqual([]);
+    expect(deploymentStatuses).toEqual(['pending', 'failure']);
+
+    const outputStatuses: string[] = [];
+    await expect(
+      githubCiNxDeploy(
+        '/repo',
+        { stage: 'staging' },
+        {
+          processEnv: { GITHUB_OUTPUT: '/output' },
+          listProjects: async () => ['app'],
+          runNx: async () => 0,
+          appendOutput: async () => {
+            throw new Error('output unavailable');
+          },
+          setStatus: async (status) => {
+            outputStatuses.push(status);
+          },
+        },
+      ),
+    ).rejects.toThrow('output unavailable');
+    expect(outputStatuses).toEqual(['pending', 'failure']);
   });
 });

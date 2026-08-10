@@ -12,8 +12,8 @@ import type {
   WorkerRoute,
   WorkerScript,
 } from './cloudflare.js';
-import { cleanupPullRequest, deployEnvironment, type ProcessResult, type ProcessRunner } from './deploy-environment.js';
-import type { LiveKvNamespace } from './environment.js';
+import { cleanupPullRequest, deployStage, type ProcessResult, type ProcessRunner } from './deploy-stage.js';
+import type { LiveKvNamespace } from './stage.js';
 
 const HASH = '16577780061662788004';
 const FIXTURE = `[env.staging]
@@ -154,14 +154,14 @@ class FakeCloudflare implements CloudflareClient {
   }
 }
 
-describe('deploy-environment remote version fallback', () => {
+describe('deploy-stage remote version fallback', () => {
   it('returns a remote cache hit for the active tagged 100% version', async () => {
     const root = await fixtureRoot();
     const runner = new FakeRunner([{ id: 'version-1', annotations: { 'workers/tag': `nx-${HASH}` } }], {
       versions: [{ version_id: 'version-1', percentage: 100 }],
     });
 
-    const result = await deployEnvironment(root, 'pr123', dependencies(runner, new FakeCloudflare()));
+    const result = await deployStage(root, 'pr123', dependencies(runner, new FakeCloudflare()));
 
     expect(result.action).toBe('remote-cache-hit');
     expect(runner.calls.map((args) => args.slice(0, 2))).toEqual([
@@ -176,7 +176,7 @@ describe('deploy-environment remote version fallback', () => {
       versions: [{ version_id: 'version-2', percentage: 100 }],
     });
 
-    const result = await deployEnvironment(root, 'pr123', dependencies(runner, new FakeCloudflare()));
+    const result = await deployStage(root, 'pr123', dependencies(runner, new FakeCloudflare()));
 
     expect(result.action).toBe('activated');
     expect(runner.calls.at(-1)?.slice(0, 3)).toEqual(['versions', 'deploy', '--version-tag']);
@@ -189,7 +189,7 @@ describe('deploy-environment remote version fallback', () => {
     await writeFile(join(root, '.dev.vars.example'), 'OAUTH_STATE_SIGNING_KEY=""\nTOKEN_ENCRYPTION_KEY=""\n');
     const runner = new FakeRunner([], { versions: [{ version_id: 'version-2', percentage: 100 }] });
 
-    const result = await deployEnvironment(root, 'pr123', {
+    const result = await deployStage(root, 'pr123', {
       ...dependencies(runner, new FakeCloudflare()),
       processEnv: {
         CLOUDFLARE_ACCOUNT_ID: 'account-1',
@@ -214,13 +214,13 @@ describe('deploy-environment remote version fallback', () => {
     expect(existsSync(requiredTestValue(runner.secretsPathSeen, 'secrets path'))).toBe(false);
   });
 
-  it('passes only present manifest values for fixed environments and preserves absent remote secrets', async () => {
+  it('passes only present manifest values for fixed stages and preserves absent remote secrets', async () => {
     const root = await fixtureRoot();
     await writeFile(join(root, '.dev.vars.example'), 'OAUTH_STATE_SIGNING_KEY=""\nTOKEN_ENCRYPTION_KEY=""\n');
     const runner = new FakeRunner([], {});
     const cloudflare = new FakeCloudflare();
 
-    const result = await deployEnvironment(root, 'staging', {
+    const result = await deployStage(root, 'staging', {
       runner,
       cloudflare,
       processEnv: {
@@ -244,7 +244,7 @@ describe('deploy-environment remote version fallback', () => {
     cloudflare.scripts = [];
 
     await expect(
-      deployEnvironment(root, 'pr123', {
+      deployStage(root, 'pr123', {
         ...dependencies(new FakeRunner([], {}), cloudflare),
         processEnv: {
           CLOUDFLARE_ACCOUNT_ID: 'account-1',
@@ -268,7 +268,7 @@ describe('deploy-environment remote version fallback', () => {
       throw new Error('record already exists');
     };
 
-    const result = await deployEnvironment(root, 'pr123', dependencies(new FakeRunner([], {}), cloudflare));
+    const result = await deployStage(root, 'pr123', dependencies(new FakeRunner([], {}), cloudflare));
 
     expect(result.action).toBe('deployed');
     expect(createAttempts).toBe(1);
@@ -276,7 +276,7 @@ describe('deploy-environment remote version fallback', () => {
   });
 });
 
-describe('cleanup-pr exact environment matching', () => {
+describe('cleanup-pr exact stage matching', () => {
   it('rejects an invalid PR before touching the client', async () => {
     const cloudflare = new FakeCloudflare();
     let calls = 0;

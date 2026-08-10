@@ -3,58 +3,109 @@
 import { describe, expect, it } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { CiWorkflowStepKind, defineCiWorkflow, renderCiWorkflowYaml } from '../ci-workflow.js';
+import {
+  type CiWorkflowDefinitionOptions,
+  CiWorkflowStepKind,
+  defineCiWorkflow,
+  renderCiWorkflowYaml,
+} from '../ci-workflow.js';
 
 const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
 
+function options(overrides: Partial<CiWorkflowDefinitionOptions> = {}): CiWorkflowDefinitionOptions {
+  return {
+    deploy: false,
+    browserTests: false,
+    e2eDeployment: false,
+    pushBranches: ['main'],
+    ...overrides,
+  };
+}
+
 describe('CI workflow definition', () => {
   it('renders the checked-in local CI workflow copy', async () => {
-    const rendered = renderCiWorkflowYaml({
-      deploy: false,
-      pushBranches: ['main'],
-      runsOn: [...nixosRunsOn],
-    });
+    const rendered = renderCiWorkflowYaml(options({ runsOn: [...nixosRunsOn] }));
     const packageRoot = join(import.meta.dir, '..', '..', '..');
 
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/ci.yml'), 'utf8')).resolves.toBe(rendered);
   });
 
-  it('inserts deploy after tests and renumbers following deeplink steps', () => {
-    const steps = defineCiWorkflow({ deploy: true, pushBranches: ['main'] });
-    const rendered = renderCiWorkflowYaml({ deploy: true, pushBranches: ['main'] });
+  it('deploys immediately after build and renumbers following steps', () => {
+    const definition = options({ deploy: true, browserTests: true });
+    const steps = defineCiWorkflow(definition);
+    const rendered = renderCiWorkflowYaml(definition);
 
-    expect(steps.map((step) => [step.kind, step.number])).toContainEqual([CiWorkflowStepKind.Deploy, 11]);
-    expect(rendered.match(/- name: 🚀 Deploy Environment/g)).toHaveLength(1);
-    expect(rendered).not.toContain('CLOUDFLARE_API_TOKEN');
-    expect(rendered).not.toContain('CLOUDFLARE_ACCOUNT_ID');
-    expect(rendered).toContain('smoo github-ci nx-deploy --mode run-many --name "Deploy Environment" --step 11');
+    expect(steps.map((step) => [step.kind, step.number])).toEqual([
+      [CiWorkflowStepKind.Checkout, 2],
+      [CiWorkflowStepKind.SetupDevenv, 3],
+      [CiWorkflowStepKind.SetNxShas, 4],
+      [CiWorkflowStepKind.RestoreNxCache, 5],
+      [CiWorkflowStepKind.Build, 6],
+      [CiWorkflowStepKind.Deploy, 7],
+      [CiWorkflowStepKind.Lint, 8],
+      [CiWorkflowStepKind.UnitTests, 9],
+      [CiWorkflowStepKind.BrowserTests, 10],
+      [CiWorkflowStepKind.ManagedFilesCheck, 11],
+      [CiWorkflowStepKind.ManagedFilesDispatch, 12],
+      [CiWorkflowStepKind.SaveNxCache, 13],
+      [CiWorkflowStepKind.UploadTraceDbs, 14],
+      [CiWorkflowStepKind.SaveNixDevenv, 15],
+    ]);
+    expect(rendered.match(/- name: 🚀 Deploy Stage/g)).toHaveLength(1);
+    expect(rendered).toContain('id: deploy');
+    expect(rendered).toContain('smoo github-ci nx-deploy --mode run-many --name "Deploy Stage" --step 7');
+    expect(rendered).toContain('smoo github-ci nx-smart --target test-browser --name "Browser Tests" --step 10');
+    expect(rendered).toContain('group: ${{ github.workflow }}-${{ github.ref }}');
+    expect(rendered).toContain('cancel-in-progress: true');
     expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
     expect(rendered).toContain("github.ref == 'refs/heads/private'");
-    expect(rendered).toContain("# Step 12\n      # Nx's database cache needs artifact files");
-    expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
-    expect(rendered).toContain('id: setup');
-    expect(rendered).not.toContain('Setup Nix/devenv (fork)');
-    expect(rendered).not.toContain('Setup Nix/devenv (nixos)');
-    expect(rendered).not.toContain('github-actions-bootstrap.sh');
-    expect(rendered).toContain('uses: ./.github/actions/save-nix-devenv');
-    expect(rendered).toContain('runs-on: ubuntu-latest');
+    expect(rendered).toContain("# Step 13\n      # Nx's database cache needs artifact files");
   });
 
-  it('adds Cloudflare credentials for Wrangler-backed deploys', () => {
-    const rendered = renderCiWorkflowYaml({ deploy: true, deployProvider: 'cloudflare', pushBranches: ['main'] });
+  it('adds only generic Cloudflare credentials for Wrangler-backed deploys', () => {
+    const rendered = renderCiWorkflowYaml(options({ deploy: true, deployProvider: 'cloudflare' }));
 
     expect(rendered).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
     expect(rendered).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
-    expect(rendered).toContain('GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}');
-    expect(rendered).toContain('GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}');
-    expect(rendered).toContain('GITHUB_APP_PRIVATE_KEY_PEM: ${{ secrets.GITHUB_APP_PRIVATE_KEY_PEM }}');
-    expect(rendered).toContain('OAUTH_STATE_SIGNING_KEY: ${{ secrets.OAUTH_STATE_SIGNING_KEY }}');
-    expect(rendered).toContain('MAIL_CAPTURE_CONTROL_TOKEN: ${{ secrets.MAIL_CAPTURE_CONTROL_TOKEN }}');
-    expect(rendered).toContain('TOKEN_ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}');
+    for (const appSecret of [
+      'GITHUB_CLIENT_SECRET',
+      'GITHUB_APP_PRIVATE_KEY',
+      'GITHUB_APP_PRIVATE_KEY_PEM',
+      'OAUTH_STATE_SIGNING_KEY',
+      'MAIL_CAPTURE_CONTROL_TOKEN',
+      'TOKEN_ENCRYPTION_KEY',
+      'E2E_CONTROL_TOKEN',
+    ]) {
+      expect(rendered).not.toContain(appSecret);
+    }
+  });
+
+  it('renders deployment E2E as a dependent job with an independent stage input', () => {
+    const rendered = renderCiWorkflowYaml(options({ deploy: true, e2eDeployment: true, runsOn: [...nixosRunsOn] }));
+
+    expect(rendered).toContain('deployment-stage: ${{ steps.deploy.outputs.stage }}');
+    expect(rendered).toContain('  e2e-deployment:\n    name: Deployment E2E\n    needs: main');
+    expect(rendered).toContain(
+      "if: ${{ needs.main.result == 'success' && needs.main.outputs.deployment-stage != '' }}",
+    );
+    expect(rendered).toContain('timeout-minutes: 15');
+    expect(rendered).toContain(
+      'smoo github-ci nx-smart --target e2e-deployment --mode run-many --stage "${{ needs.main.outputs.deployment-stage }}" --name "Deployment E2E" --step 4',
+    );
+    expect(rendered.match(/name: Deployment E2E/g)).toHaveLength(2);
+    expect(rendered).not.toContain('E2E_CONTROL_TOKEN');
+  });
+
+  it('omits optional browser and deployment-E2E lanes when disabled', () => {
+    const rendered = renderCiWorkflowYaml(options({ deploy: true }));
+
+    expect(rendered).not.toContain('--target test-browser');
+    expect(rendered).not.toContain('  e2e-deployment:');
+    expect(rendered).not.toContain('deployment-stage:');
   });
 
   it('uses the same architecture-scoped key to restore and save the Nx cache', async () => {
-    const rendered = renderCiWorkflowYaml({ deploy: false, pushBranches: ['main'] });
+    const rendered = renderCiWorkflowYaml(options());
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     const restoreAction = await readFile(join(packageRoot, '..', '..', '.github/actions/cache-nx/action.yml'), 'utf8');
     const restoreKey = restoreAction.match(/^\s*key: (.+)$/m)?.[1];
@@ -64,26 +115,13 @@ describe('CI workflow definition', () => {
     expect(saveKey).toBe(restoreKey);
   });
 
-  it('nixos config: fork PRs on ubuntu; one setup-devenv (composite owns host path)', () => {
-    const rendered = renderCiWorkflowYaml({
-      deploy: false,
-      pushBranches: ['main'],
-      runsOn: [...nixosRunsOn],
-    });
+  it('nixos config gates both jobs away from private runners for fork PRs', () => {
+    const rendered = renderCiWorkflowYaml(options({ deploy: true, e2eDeployment: true, runsOn: [...nixosRunsOn] }));
+    const runnerExpression =
+      "runs-on:\n      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&\n      fromJSON('[\"nixos-latest-x64\",\"self-hosted\"]') || 'ubuntu-latest' }}";
 
-    expect(rendered).toContain(
-      "runs-on:\n      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&\n      fromJSON('[\"nixos-latest-x64\",\"self-hosted\"]') || 'ubuntu-latest' }}",
-    );
+    expect(rendered.match(new RegExp(runnerExpression.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'))).toHaveLength(2);
     expect(rendered).toContain('uses: ./.github/actions/setup-devenv');
-    expect(rendered).toContain('id: setup');
-    expect(rendered).not.toContain('Setup Nix/devenv (fork)');
-    expect(rendered).not.toContain('Setup Nix/devenv (nixos)');
     expect(rendered).not.toContain('github-actions-bootstrap.sh');
-    expect(rendered).not.toContain('determinate-nix-action');
-    expect(rendered).toContain('if: always()');
-    expect(rendered).toContain('uses: ./.github/actions/save-nix-devenv');
-    // workflow yaml does not embed composite internals
-    expect(rendered).not.toContain('cache-node-modules');
-    expect(rendered).not.toContain('cache-ttsc-plugins');
   });
 });
