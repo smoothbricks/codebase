@@ -613,7 +613,9 @@ export async function selectStageDeployProjects(
     const tags = Array.isArray(definition.tags)
       ? definition.tags.filter((tag): tag is string => typeof tag === 'string')
       : [];
-    const isStageDerived = typeof commandValue === 'string' && commandValue.includes('smoo wrangler deploy-stage');
+    const isStageDerived =
+      tags.includes('stage-deploy-target') ||
+      (typeof commandValue === 'string' && commandValue.includes('smoo wrangler deploy-stage'));
     const isStagingOnly = tags.includes('staging-deploy-target');
     if (isStageDerived || (stage === 'staging' && isStagingOnly)) {
       selected.push(project);

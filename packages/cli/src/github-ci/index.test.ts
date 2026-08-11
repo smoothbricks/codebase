@@ -581,7 +581,8 @@ describe('event-aware stage deployment', () => {
         },
       },
       'conloca-app-backend': {
-        targets: { deploy: { command: 'smoo wrangler deploy-stage --stage {args.stage}' } },
+        tags: ['stage-deploy-target'],
+        targets: { deploy: { command: 'bun scripts/deploy-backend.ts --stage={args.stage}' } },
       },
       'conloca-e2e-mail-capture': {
         tags: ['staging-deploy-target'],
