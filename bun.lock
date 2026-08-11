@@ -46,7 +46,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.10.16-next.0",
+      "version": "0.10.16",
       "bin": {
         "smoo": "./bin/smoo",
       },
