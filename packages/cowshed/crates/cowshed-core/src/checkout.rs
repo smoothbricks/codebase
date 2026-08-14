@@ -215,6 +215,7 @@ mod tests {
                     forked_from: None,
                     captured_at: "2026-07-13T00:00:00Z".to_owned(),
                     stale: false,
+                    git_worktree: false,
                 }),
             },
         )

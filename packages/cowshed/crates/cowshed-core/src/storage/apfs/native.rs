@@ -3233,6 +3233,7 @@ where
                     forked_from: identity.forked_from.clone(),
                     captured_at: identity.created_at.clone(),
                     stale: false,
+                    git_worktree: identity.git_worktree,
                 })
             }
             MetadataPolicy::Preserve | MetadataPolicy::PendingFence => {

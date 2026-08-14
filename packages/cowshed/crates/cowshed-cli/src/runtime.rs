@@ -568,6 +568,7 @@ where
                     browse: args.browse,
                     slot: args.slot,
                     register: args.register,
+                    git_worktree: args.git_worktree,
                 };
             let info = service.create(&args.name, options).await?;
             service.reconcile_gateway().await?;
