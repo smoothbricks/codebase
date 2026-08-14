@@ -539,6 +539,7 @@ pub struct ProjectPaths {
     pub store_root: PathBuf,
     pub project_root: PathBuf,
     pub repository_binding: PathBuf,
+    pub checkout_layout: PathBuf,
     pub policy: PathBuf,
     pub sessions: PathBuf,
     pub checkpoints: PathBuf,
@@ -557,6 +558,7 @@ impl ProjectPaths {
 
         Ok(Self {
             repository_binding: checked_join(&project_root, ["repository.json"])?,
+            checkout_layout: checked_join(&project_root, ["checkout-layout.json"])?,
             policy: checked_join(&project_root, ["policy.json"])?,
             sessions: checked_join(&project_root, ["sessions"])?,
             checkpoints: checked_join(&project_root, ["checkpoints"])?,

@@ -148,22 +148,30 @@ impl InventorySource for NativeInventorySource {
                 .join("gateway")
                 .join(UNRESOLVED_CHECKOUT_PATH)
         });
+        let checkout_layout =
+            layout
+                .checkout_layout()
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: layout.project().project_root.clone(),
+                    message: error.to_string(),
+                })?;
         let config = ApfsSubstrateConfig::new(
             storage.store(),
             storage.caches(),
             checkout_path,
+            checkout_layout,
             ApfsCaseSensitivity::Sensitive,
         );
         let captured = SystemKernelMountSource.mounts()?;
         let host = MacOsApfsExecutionHost::with_mount_source(
             SystemCommandRunner,
-            config,
+            config.clone(),
             CapturedKernelMountSource {
                 mounts: captured.clone(),
             },
         )?;
         let storage_facts = host.list(repo)?;
-        let mount_paths = expected_mount_paths(&layout, &storage_facts)?;
+        let mount_paths = expected_mount_paths(&config, &layout, &storage_facts)?;
         reject_ambiguous_native_mounts(&captured, &mount_paths)?;
         let mounts = host.mounts(repo)?;
         Ok(ProjectInventoryFacts {
@@ -698,19 +706,26 @@ fn authoritative_checkout_path(
 }
 
 fn expected_mount_paths(
+    config: &ApfsSubstrateConfig,
     layout: &StorageLayout,
     storage: &[StorageFact],
 ) -> Result<BTreeMap<String, PathBuf>, GatewayInventoryError> {
     let mut paths = BTreeMap::new();
     for fact in storage {
-        // Uniform mount namespace: main's expected path comes from the layout like any other
-        // workspace's, not from its metadata snapshot's adopted checkout.
-        let mount = layout
-            .workspace_mount(fact.workspace.name())
-            .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                path: layout.project().mount_root.clone(),
-                message: error.to_string(),
-            })?;
+        // Main's expected path follows the project's checkout layout — the checkout itself under
+        // direct mount, the uniform `mnt/` path under the symlink layout. Every other workspace
+        // mounts under `mnt/` either way.
+        let mount =
+            if fact.workspace.name().is_main() && config.checkout_layout.mounts_at_checkout() {
+                config.checkout_path.clone()
+            } else {
+                layout
+                    .workspace_mount(fact.workspace.name())
+                    .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                        path: layout.project().mount_root.clone(),
+                        message: error.to_string(),
+                    })?
+            };
         paths.insert(fact.volume_key.clone(), mount);
     }
     Ok(paths)

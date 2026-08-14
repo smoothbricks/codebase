@@ -1245,6 +1245,7 @@ struct NativeProjectRuntimeHost {
     descriptor: ProjectDescriptor,
     git: crate::git::GitRepository,
     layout: crate::storage::StorageLayout,
+    substrate_config: crate::storage::apfs::ApfsSubstrateConfig,
     substrate: NativeSubstrate,
     commitments: super::supervisor::CommitmentPublisherHandle,
     supervisors:
@@ -1501,10 +1502,14 @@ impl NativeProjectRuntimeHost {
         let layout = crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
             .map_err(native_integrity_error)?;
         let binding = load_or_validate_binding(&layout, candidate, &git).await?;
+        // Every resolver that answers "where does main mount" reads this one value, so it is
+        // resolved once here, from durable project state, and never inferred per call site.
+        let checkout_layout = layout.checkout_layout().map_err(native_integrity_error)?;
         let config = crate::storage::apfs::ApfsSubstrateConfig::new(
             bootstrap.roots().store(),
             bootstrap.roots().caches(),
             &git_root,
+            checkout_layout,
             crate::apfs::ApfsCaseSensitivity::Sensitive,
         );
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
@@ -1577,7 +1582,7 @@ impl NativeProjectRuntimeHost {
             host.activate_restored_metadata(&publication.image)
                 .map_err(native_storage_error)?;
         }
-        let substrate = crate::storage::apfs::ApfsSubstrate::new(config, host);
+        let substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
         for retirement in retired {
             // The retirement commitment is durable before any best-effort trash reclamation.
             let _ = substrate.reclaim(retirement).await;
@@ -1592,6 +1597,7 @@ impl NativeProjectRuntimeHost {
             descriptor,
             git,
             layout,
+            substrate_config: config,
             substrate,
             commitments,
             supervisors: std::collections::BTreeMap::new(),
@@ -1748,8 +1754,11 @@ impl NativeProjectRuntimeHost {
     }
 
     fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
-        // Main is not special in the mount namespace. The adopted checkout path reaches this same
-        // directory through a symlink, but the mount itself lives where every workspace's does.
+        // Main's mount follows the project's checkout layout; every other workspace mounts under
+        // `mnt/` in both layouts.
+        if workspace.is_main() && self.substrate_config.checkout_layout.mounts_at_checkout() {
+            return Ok(self.substrate_config.checkout_path.clone());
+        }
         self.layout
             .workspace_mount(workspace)
             .map_err(native_integrity_error)
@@ -2534,10 +2543,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?;
         let binding = self.descriptor.binding.clone();
         let binding_path = self.layout.project().repository_binding.clone();
+        // The layout is recorded in the same staged step as the binding, before publication takes
+        // the checkout path over. Every resolver reads it back from here; leaving it to be
+        // inferred later would mean inferring it from a tree publication is midway through
+        // rearranging.
+        let layout_record = self.layout.clone();
+        let checkout_layout = self.substrate_config.checkout_layout;
         let receipt = self
             .substrate
             .execute_adopt_staged(plan, move |_stage| async move {
                 crate::storage::lifecycle::dispatch_blocking(move || {
+                    layout_record.record_checkout_layout(checkout_layout)?;
                     crate::metadata::write_json(&binding_path, &binding)
                 })
                 .await

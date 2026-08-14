@@ -14,8 +14,8 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
-    ApfsSubstrateConfig, IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy,
-    PublicationError, RestoreStage, RetireExecutionError, volume_key,
+    ApfsSubstrateConfig, CheckoutLayout, IncarnationSource, LockMode, MarkerExpectation,
+    MetadataPolicy, PublicationError, RestoreStage, RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -458,6 +458,16 @@ impl ApfsExecutionHost for FakeHost {
         }
         Ok(())
     }
+    fn vacate_adopted_checkout(
+        &self,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), PublicationError> {
+        self.record("atomic-adopt-checkout-vacate");
+        self.record_path(source_checkout);
+        self.record_path(pre_cowshed_checkout);
+        Ok(())
+    }
     fn link_adopted_checkout(
         &self,
         canonical_mount: &Path,
@@ -866,11 +876,20 @@ fn workspace(name: &str, format: ImageFormat, revision: u64) -> LifecycleWorkspa
 }
 
 fn substrate(host: FakeHost, lane: CountingLane) -> ApfsSubstrate<FakeHost, CountingLane> {
+    substrate_with_layout(host, lane, CheckoutLayout::Symlink)
+}
+
+fn substrate_with_layout(
+    host: FakeHost,
+    lane: CountingLane,
+    checkout_layout: CheckoutLayout,
+) -> ApfsSubstrate<FakeHost, CountingLane> {
     ApfsSubstrate::with_lane_and_incarnations(
         ApfsSubstrateConfig::new(
             "/store",
             "/store/caches",
             "/project",
+            checkout_layout,
             ApfsCaseSensitivity::Insensitive,
         ),
         host,
@@ -996,6 +1015,53 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
     );
 }
 
+/// The two layouts publish the same durable state and differ only in when the checkout path can
+/// change hands. Under the symlink layout the mountpoint is cowshed's own, so main is mounted
+/// before the symlink appears. Under direct mount the mountpoint *is* the checkout path and
+/// cannot exist until the swap creates it, so the swap comes first and the attach follows it.
+#[tokio::test]
+async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
+    let host = FakeHost::default();
+    let lane = CountingLane::default();
+    let substrate = substrate_with_layout(host.clone(), lane.clone(), CheckoutLayout::DirectMount);
+    let plan = substrate
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
+        .expect("adopt plan");
+
+    substrate
+        .execute_adopt_staged(plan, |_stage| async { Ok::<(), &'static str>(()) })
+        .await
+        .expect("adopt");
+
+    let events = host.events();
+    let tail: Vec<_> = events
+        .iter()
+        .skip_while(|event| event.as_str() != "detach:false")
+        .cloned()
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            "detach:false",
+            // The image is published on its own: there is no mountpoint to create under the store,
+            // because main's mountpoint is the user's checkout path.
+            "atomic-publish-image",
+            // The swap plants the mountpoint and the self-healing stub at the checkout path...
+            "atomic-adopt-checkout-vacate",
+            // ...and only then can anything be attached there.
+            "attach-no-mount+fsck:Sparse",
+            "mount:Sparse",
+            "validate-marker",
+            "retain-mounted",
+        ]
+    );
+    assert!(
+        !events.contains(&"atomic-adopt-mountpoint+publish".to_owned())
+            && !events.contains(&"atomic-adopt-checkout-swap".to_owned()),
+        "direct mount must not build a mountpoint under the store or plant a symlink"
+    );
+}
+
 #[tokio::test]
 async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     let host = FakeHost::default();
@@ -1113,6 +1179,7 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
                 "/store",
                 "/store/caches",
                 checkout_path,
+                CheckoutLayout::Symlink,
                 ApfsCaseSensitivity::Insensitive,
             ),
             host.clone(),
