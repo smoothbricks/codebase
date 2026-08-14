@@ -140,15 +140,56 @@ side. `cowshed mv <ws> <new-name>` retires the old identity and republishes unde
 path, and recorded metadata move together — and `cowshed mv main <new-checkout-path>` moves the project's checkout.
 There is no separate verb per layout and no flag on `ensure`: one front door, symmetric with `rm`.
 
-Under the symlink layout, moving the checkout retargets and moves the symlink and remounts under the renamed mount path.
-Under direct mount, a mountpoint cannot be moved by `mv`, so the operation is the full unmount → rename and republish at
-the new path → remount, using the publication transaction above and keeping its gaplessness invariant. Refusals are
-self-guiding as everywhere else: a dirty tree, an in-flight job, or an occupied destination fails before mutation and
-prints the `next:` command that clears it.
+The second argument means what the first one decides. `main` is not a renameable workspace — its name is fixed by the
+project layout — so `mv main` can only be the checkout move and its destination is a path, while every other source names
+a workspace whose destination is a new workspace name. The source disambiguates before either destination is validated,
+so a path is never rejected for failing the workspace-name charset and a workspace name is never resolved against the
+filesystem.
+
+The checkout path is written down in three places, and no two of them can be derived from the third: the in-image marker
+at main's mount root, the `infoSnapshot.projectRoot` in the sidecar beside main's canonical image, and the layout record
+that says whether the checkout *is* the mountpoint. Every move carries all three.
+
+**Symlink layout.** Main stays mounted at `mnt/<owner>/<repo>/main` throughout. The checkout path is only a symlink into
+it and nothing about the mount depends on where that symlink sits, so there is no unmount and no remount — the move is
+the relink alone. Gaplessness therefore costs nothing: the destination link is created before the source link is
+removed, and the tree answers to at least one name at every instant. A crash between the two steps leaves both names,
+which is an extra alias rather than a lost checkout.
+
+**Direct mount.** The checkout path *is* the mountpoint, and a mountpoint cannot be renamed while it is mounted. This is
+the real transaction: detach → rename the (now stub-carrying) mountpoint directory → rebind the substrate onto the new
+path → re-attach. The rename is inverted on failure, so a refused move is indistinguishable from one never attempted.
+Past the rename there is no way back worth taking: the record and the tree both name the destination, so a failure to
+re-attach leaves a detached project at the right path, which `ensure` mounts.
+
+The record moves **before** the tree, in both layouts. Under direct mount the source path stops existing the instant the
+rename lands, so a record still naming it would have nothing left to resolve, whereas a record naming the destination
+becomes true as the rename completes. Recording ahead of the move is what makes the crash window recoverable in the
+forward direction instead of the dead one.
+
+Rebinding the substrate is a rebuild, not a mutation. The substrate config is shared by value — the substrate holds it
+behind a reference every clone shares, and the execution host holds its own copy — so editing it in place would let an
+outstanding clone observe a mount point derived from the new checkout path against a host still validating against the
+old one. Config, host, and substrate are rebuilt together and swapped at once, under the project actor's exclusive
+ownership, at the one moment nothing is mounted.
+
+Refusals are self-guiding as everywhere else and fire before any mutation: for the workspace rename, a dirty tree or an
+in-flight job; for the checkout move, a relative destination, one that is occupied, one whose parent does not exist, and
+one that overlaps cowshed storage or the current checkout. A dirty tree is *not* a refusal for the checkout move — the
+working tree is carried across untouched rather than republished, so there is nothing for a fence to protect.
 
 A user who moves a symlinked checkout by hand has not broken anything: `cowshed doctor` accepts a checkout path that
 resolves to the workspace's volume root wherever it now sits, and `cowshed ensure` converges the recorded path onto the
 observed one. `mv` is the sanctioned front door; convergence is the safety net under it.
+
+Convergence needs an observation the controller cannot make for itself. `current_dir(2)` resolves symlinks, so it
+reports main's mount rather than the name the user reached it by, and under the symlink layout it can never witness
+where the checkout actually lives. The CLI therefore carries its invocation directory into `ensure`, and convergence
+fires only when that observation is unambiguous: the path sits inside main's mount, the checkout root above it resolves
+to that mount, that root lies outside cowshed's own storage — so the mount path is never mistaken for the user's
+checkout — and it differs from what is recorded. The layout is recorded from the same observation: a checkout that is a
+symlink is the symlink layout by construction, and one that is the mountpoint is direct mount. An `ensure` with no
+observation converges nothing rather than guessing.
 
 ## `cowshed new <name>` — create a session workspace
 
@@ -200,8 +241,12 @@ The URL is the canonical mount, never the recorded checkout path, and the two di
 layouts"): under direct mount they are the same directory, and under the symlink layout the checkout path is a symlink
 into `~/.cowshed/mnt/<owner>/<repo>/main`. Recording the symlink would put a path outside the workspace's read grants
 into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate owns,
-the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every attached
-workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label.
+the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
+workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
+workspace that was detached while main moved has no volume to write into; `ensure` re-runs the same idempotent
+configuration when the workspace is next used, so the repair rides the front door a workspace already passes through
+rather than needing a verb of its own. Under the symlink layout main's mount never moves, and both paths are the
+idempotent no-op the remote configuration is built to be.
 
 A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote main had, network
 URLs included, so mint **strips them all** before configuring its own. That is the "no remote URL ever exists inside a
@@ -506,6 +551,14 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
    `HOME`. A verify command that needs more than that needs it wired into the workspace, not leaked from the caller's
    shell; the check runs where the work was done, and a check that only passes in the coordinator's environment has not
    validated the workspace.
+
+   Write checks as **bare commands** — `just verify`, `cargo test --workspace`. The sandbox `PATH` already *is* the
+   project's pinned toolchain, resolved to store paths, so wrapping a check in `devenv shell --` or a direnv
+   re-evaluation asks for exactly the two things the sandbox deliberately withholds: the caller's `HOME` and a fresh
+   evaluation. The wrapper fails where the command inside it would have passed. This is also what makes coordinator and
+   worker verdicts identical rather than merely similar: `cowshed exec <ws> -- <cmd>` and `land --check <cmd>` are the
+   same sandboxed exec, so a worker that fixes its own failures before hand-off has already run the check the
+   coordinator will run.
 3. **Fast-forward the target branch under its repository lock**: **fetch** the workspace's branch from its mount into
    the host — a workspace is a standalone repository whose commits the host has never seen, so without this the merge
    resolves an object that does not exist and fails as "not something we can merge" — then revalidate the source
