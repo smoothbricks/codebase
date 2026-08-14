@@ -289,18 +289,56 @@ mod tests {
         directory
     }
 
+    /// Fold the frontmatter into `(key, value)` pairs the way a YAML reader
+    /// does. The repository's markdown formatter rewraps long plain scalars onto
+    /// indented continuation lines, so asserting on line layout would test the
+    /// formatter rather than the contract a harness actually reads.
+    fn frontmatter(document: &str) -> Vec<(String, String)> {
+        let body = document
+            .strip_prefix("---\n")
+            .expect("frontmatter opens on the first line");
+        let (frontmatter, _) = body.split_once("\n---\n").expect("frontmatter closes");
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for line in frontmatter.lines() {
+            let key_here = (!line.starts_with(char::is_whitespace))
+                .then(|| {
+                    line.split_once(": ")
+                        .map(|(key, value)| (key, value.trim()))
+                        .or_else(|| line.strip_suffix(':').map(|key| (key, "")))
+                })
+                .flatten();
+            match key_here {
+                Some((key, value)) => {
+                    pairs.push((key.to_owned(), value.to_owned()));
+                }
+                None => {
+                    let (_, value) = pairs.last_mut().expect("a continuation follows a key");
+                    if !value.is_empty() {
+                        value.push(' ');
+                    }
+                    value.push_str(line.trim());
+                }
+            }
+        }
+        pairs
+    }
+
     #[test]
     fn shipped_skill_carries_the_frontmatter_a_harness_indexes() {
-        let mut lines = SKILL_MD.lines();
-        assert_eq!(lines.next(), Some("---"));
-        assert_eq!(lines.next(), Some(&format!("name: {SKILL_NAME}")[..]));
-        assert!(
-            lines
-                .next()
-                .is_some_and(|line| line.starts_with("description: ")),
-            "description must follow name so the harness can index the skill"
+        let pairs = frontmatter(SKILL_MD);
+
+        let keys: Vec<&str> = pairs.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["name", "description"],
+            "a harness indexes exactly name and description"
         );
-        assert!(lines.any(|line| line == "---"), "frontmatter must close");
+        assert_eq!(pairs[0].1, SKILL_NAME);
+        assert!(
+            pairs[1].1.len() > 40 && !pairs[1].1.contains('\n'),
+            "the description folds to one non-trivial line: {:?}",
+            pairs[1].1
+        );
     }
 
     #[test]
