@@ -518,7 +518,10 @@ impl ProjectActor {
         workspace_response(&snapshot)
     }
 
-    async fn coordinator_move_checkout(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+    async fn coordinator_move_checkout(
+        &mut self,
+        request: RouterRequest,
+    ) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
         let params: MoveCheckoutParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
@@ -1828,7 +1831,10 @@ impl NativeProjectRuntimeHost {
     ///
     /// The marker is read through main's mount, so this is only usable while main is mounted; the
     /// sidecar half is store-side and always reachable.
-    fn checkout_record(&self, workspace: &NativeWorkspace) -> Result<crate::checkout::CheckoutRecord> {
+    fn checkout_record(
+        &self,
+        workspace: &NativeWorkspace,
+    ) -> Result<crate::checkout::CheckoutRecord> {
         Ok(crate::checkout::CheckoutRecord {
             mount_point: self.workspace_mount_path(&main_name())?,
             image: self
@@ -2075,10 +2081,7 @@ impl NativeProjectRuntimeHost {
             // Nothing moved; put main back exactly where the caller found it.
             let _ = self
                 .substrate
-                .ensure_mounted(
-                    &current.derived.workspace,
-                    MountIntent { browse: false },
-                )
+                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
                 .await;
             let _ = self.ensure_supervisor(&main_name()).await;
             return Err(error);
@@ -3217,7 +3220,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let main = main_name();
         let source = self.substrate_config.checkout_path.clone();
         let layout = self.substrate_config.checkout_layout;
-        self.validate_move_destination(&source, &destination).await?;
+        self.validate_move_destination(&source, &destination)
+            .await?;
 
         let current = self.current(&main).await?;
         let mount_point = self.workspace_mount_path(&main)?;
@@ -3246,7 +3250,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         .map_err(native_integrity_error)?;
 
         let moved = if layout.mounts_at_checkout() {
-            self.move_direct_mount(&current, &source, &destination).await
+            self.move_direct_mount(&current, &source, &destination)
+                .await
         } else {
             let move_source = source.clone();
             let move_destination = destination.clone();
@@ -3265,7 +3270,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 )
             })
             .await
-            .map_err(|error| CowshedError::internal(format!("checkout link task failed: {error}")))?
+            .map_err(|error| {
+                CowshedError::internal(format!("checkout link task failed: {error}"))
+            })?
         };
         if let Err(error) = moved {
             // The tree never moved, so the only thing to undo is the record.
@@ -3286,10 +3293,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             // path, which `cowshed ensure` mounts. Rolling back would move the tree a second time
             // to reach a state that is strictly further from where the user asked to be.
             self.substrate
-                .ensure_mounted(
-                    &current.derived.workspace,
-                    MountIntent { browse: false },
-                )
+                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
                 .await
                 .map_err(native_storage_error)?;
         }

@@ -53,9 +53,7 @@ impl CheckoutRecord {
             .info_snapshot
             .as_ref()
             .map(|info| info.project_root.clone());
-        if marker.project_root == project_root
-            && snapshot_root.as_deref() == Some(project_root)
-        {
+        if marker.project_root == project_root && snapshot_root.as_deref() == Some(project_root) {
             return Ok(false);
         }
         marker.project_root = project_root.to_owned();

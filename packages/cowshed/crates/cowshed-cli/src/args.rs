@@ -1526,7 +1526,9 @@ mod tests {
 
     #[test]
     fn mv_reads_its_destination_according_to_its_source() {
-        let Command::Move(args) = parse_args(["mv", "raven", "kestrel"]).expect("rename").command
+        let Command::Move(args) = parse_args(["mv", "raven", "kestrel"])
+            .expect("rename")
+            .command
         else {
             panic!("mv <ws> <name> parses as a rename");
         };
