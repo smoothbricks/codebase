@@ -1350,6 +1350,23 @@ impl Coordinator {
         .await
     }
 
+    pub async fn rename(&self, source: &str, destination: &str) -> Result<WorkspaceRef> {
+        let source = WorkspaceName::session(source).map_err(|error| {
+            CowshedError::usage(
+                error.to_string(),
+                "use a valid non-main source workspace name",
+            )
+        })?;
+        let destination = WorkspaceName::session(destination).map_err(|error| {
+            CowshedError::usage(error.to_string(), "use a valid non-main destination name")
+        })?;
+        self.workspace_result(
+            "coordinator.rename",
+            json!({ "repoId": self.project.repo_id, "source": source, "destination": destination }),
+        )
+        .await
+    }
+
     pub async fn fork(&self, source: &str, destination: &str) -> Result<WorkspaceRef> {
         let source = WorkspaceName::new(source).map_err(|error| {
             CowshedError::usage(error.to_string(), "use a valid source workspace name")

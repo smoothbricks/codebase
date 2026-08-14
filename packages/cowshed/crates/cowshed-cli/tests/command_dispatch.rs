@@ -91,6 +91,11 @@ impl CliService for FakeService {
         Ok(workspace(destination, WorkspaceState::Attached))
     }
 
+    async fn rename(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo> {
+        self.events.push(format!("rename:{source}:{destination}"));
+        Ok(workspace(destination, WorkspaceState::Attached))
+    }
+
     async fn checkpoint(&mut self, name: &str, options: CheckpointOptions) -> Result<String> {
         self.events.push(format!(
             "checkpoint:{name}:{:?}:{}",
@@ -492,6 +497,12 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
     let (_, stdout, stderr) = run(&mut service, ["fork", "raven", "falcon"]).await;
     assert_eq!(stdout, b"/mnt/falcon\n");
     assert_eq!(stderr, b"next: cowshed exec falcon -- <cmd>\n");
+
+    // mv reports the destination's mount, like every verb that lands a workspace somewhere.
+    let (_, stdout, stderr) = run(&mut service, ["mv", "raven", "kestrel"]).await;
+    assert_eq!(stdout, b"/mnt/kestrel\n");
+    assert_eq!(stderr, b"next: cowshed exec kestrel -- <cmd>\n");
+    assert!(service.events.contains(&"rename:raven:kestrel".to_owned()));
 
     let (_, stdout, stderr) = run(
         &mut service,
@@ -990,6 +1001,10 @@ impl CliService for SerializedCreateService {
         unreachable!()
     }
     async fn fork(&mut self, _: &str, _: &str) -> Result<WorkspaceInfo> {
+        unreachable!()
+    }
+
+    async fn rename(&mut self, _: &str, _: &str) -> Result<WorkspaceInfo> {
         unreachable!()
     }
     async fn checkpoint(&mut self, _: &str, _: CheckpointOptions) -> Result<String> {
