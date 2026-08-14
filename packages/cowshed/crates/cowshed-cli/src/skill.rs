@@ -64,9 +64,27 @@ const CLAUDE: Harness = Harness {
     skills: ".claude/skills",
 };
 
+const CODEX: Harness = Harness {
+    name: "codex",
+    root: ".codex",
+    skills: ".codex/skills",
+};
+
 /// Harnesses that keep skills in the user's home directory.
+///
+/// omp is the one harness whose skills directory is not `<root>/skills`: it
+/// reserves `~/.omp/agent/managed-skills` for skills its own auto-learn writes
+/// and keeps user-authored ones under `~/.omp/agent/skills`, which its native
+/// provider loads at the highest precedence. Installing into the managed
+/// directory would put this skill where the agent believes it may rewrite it.
 pub const GLOBAL_HARNESSES: &[Harness] = &[
     CLAUDE,
+    CODEX,
+    Harness {
+        name: "omp",
+        root: ".omp",
+        skills: ".omp/agent/skills",
+    },
     Harness {
         name: "cursor",
         root: ".cursor",
@@ -93,6 +111,12 @@ pub const GLOBAL_HARNESSES: &[Harness] = &[
 /// `.github/skills`, which only ever exists per repository.
 pub const PROJECT_HARNESSES: &[Harness] = &[
     CLAUDE,
+    CODEX,
+    Harness {
+        name: "omp",
+        root: ".omp",
+        skills: ".omp/skills",
+    },
     Harness {
         name: "cursor",
         root: ".cursor",
@@ -372,6 +396,61 @@ mod tests {
         assert_eq!(names, ["goose"]);
     }
 
+    /// Each harness's directory is its published discovery path, so these are
+    /// pinned literally: a silent change here installs where nothing looks.
+    #[test]
+    fn every_harness_targets_its_published_discovery_path() {
+        let base = Path::new("/home/agent");
+        let global: Vec<(&str, String)> = GLOBAL_HARNESSES
+            .iter()
+            .map(|harness| (harness.name, harness.skill_file(base).display().to_string()))
+            .collect();
+
+        assert_eq!(
+            global,
+            [
+                ("claude", "/home/agent/.claude/skills/cowshed/SKILL.md"),
+                ("codex", "/home/agent/.codex/skills/cowshed/SKILL.md"),
+                // Not .omp/agent/managed-skills: that directory is reserved for
+                // skills omp's auto-learn writes and may rewrite.
+                ("omp", "/home/agent/.omp/agent/skills/cowshed/SKILL.md"),
+                ("cursor", "/home/agent/.cursor/skills/cowshed/SKILL.md"),
+                ("opencode", "/home/agent/.opencode/skills/cowshed/SKILL.md"),
+                ("goose", "/home/agent/.config/goose/skills/cowshed/SKILL.md"),
+                ("amp", "/home/agent/.amp/skills/cowshed/SKILL.md"),
+            ]
+            .map(|(name, path)| (name, path.to_owned()))
+        );
+
+        let project = Path::new("/repo");
+        let codex = harness_named(Scope::Project, "codex").expect("codex is a project harness");
+        assert_eq!(
+            codex.skill_file(project).display().to_string(),
+            "/repo/.codex/skills/cowshed/SKILL.md"
+        );
+        let omp = harness_named(Scope::Project, "omp").expect("omp is a project harness");
+        assert_eq!(
+            omp.skill_file(project).display().to_string(),
+            "/repo/.omp/skills/cowshed/SKILL.md",
+            "omp nests user skills under agent/ only in the home directory"
+        );
+    }
+
+    /// Detection probes the configuration directory, which for omp is `.omp`
+    /// even though its skills live two levels deeper.
+    #[test]
+    fn omp_and_codex_are_detected_from_their_configuration_directories() {
+        let base = Path::new("/home/agent");
+        let present = |path: &Path| {
+            path == Path::new("/home/agent/.codex") || path == Path::new("/home/agent/.omp")
+        };
+
+        let planned = plan(base, Scope::Global, &[], &present);
+
+        let names: Vec<&str> = planned.iter().map(|harness| harness.name).collect();
+        assert_eq!(names, ["codex", "omp"]);
+    }
+
     #[test]
     fn scopes_expose_only_the_harnesses_that_can_hold_skills_there() {
         assert!(
@@ -386,6 +465,10 @@ mod tests {
             harness_named(Scope::Project, "goose").is_none(),
             "goose keeps skills under the home config directory only"
         );
+        for name in ["codex", "omp"] {
+            assert!(harness_named(Scope::Global, name).is_some());
+            assert!(harness_named(Scope::Project, name).is_some());
+        }
         assert!(harness_named(Scope::Global, "nonesuch").is_none());
     }
 
