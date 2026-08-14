@@ -2245,6 +2245,7 @@ impl NativeProjectRuntimeHost {
         crate::api::dto::EnsureReport {
             workspace: workspace.derived.workspace.name().clone(),
             go_env: mount.join(".cowshed/cache/go/env"),
+            sccache_server_uds: crate::sandbox::sccache_server_socket(&self.home),
             workspace_token: mount.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH),
             port_block: workspace.metadata.grants.port_block,
             mount,

@@ -499,6 +499,10 @@ pub struct EnsureReport {
     pub mount: PathBuf,
     pub action: EnsureAction,
     pub go_env: PathBuf,
+    /// Host-level sccache server socket (`SCCACHE_SERVER_UDS`), identical for
+    /// every workspace on the host; carried per report so envrc emission needs
+    /// no ambient environment.
+    pub sccache_server_uds: PathBuf,
     pub workspace_token: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_block: Option<PortBlock>,
@@ -2176,6 +2180,21 @@ pub struct GatewayStatus {
     pub active_workspaces: u64,
 }
 
+/// Health of the host-owned sccache LaunchAgent.
+///
+/// `installed` is launchd's verdict (the job is loaded); `running` is the
+/// socket's (a connect on the server unix socket was accepted). Both are
+/// reported because the interesting failures are exactly the disagreements:
+/// installed-but-unresponsive (crash-looping agent) and answering-but-
+/// uninstalled (foreign server bound on the path).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SccacheStatus {
+    pub installed: bool,
+    pub running: bool,
+    pub socket: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuditDecision {
@@ -2259,6 +2278,7 @@ result_bodies!(
     LandReport,
     GrantSet,
     GatewayStatus,
+    SccacheStatus,
     MirrorInfo,
     AuditEvent,
     SkillInstallReport,

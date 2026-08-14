@@ -12,7 +12,7 @@ use std::io;
 use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
-use crate::{args, gateway_service, output, runtime, skill};
+use crate::{args, gateway_service, output, runtime, sccache_service, skill};
 
 /// Run one CLI invocation. `arguments` excludes argv[0].
 ///
@@ -80,6 +80,20 @@ async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
     }
     if let args::Command::Gateway(action) = &parsed.command {
         return match gateway_service::dispatch(*action, parsed.global.json, &mut output).await {
+            Ok(exit_code) => exit_code,
+            Err(error) => {
+                let exit_code = i32::from(error.exit_code());
+                if let Err(write_error) = write_error(&mut output, error, json, None) {
+                    eprintln!("cowshed: failed to write command result: {write_error}");
+                    1
+                } else {
+                    exit_code
+                }
+            }
+        };
+    }
+    if let args::Command::Sccache(action) = &parsed.command {
+        return match sccache_service::dispatch(*action, parsed.global.json, &mut output).await {
             Ok(exit_code) => exit_code,
             Err(error) => {
                 let exit_code = i32::from(error.exit_code());
