@@ -88,7 +88,7 @@ them there; they always contain an endpoint URL, never credentials.
     Host-global settings live in the host-owned `~/.cargo/config.toml` (never on the cache volume — see relocation
     below); per-workspace ones live in the in-image `.cargo/config.toml`. Endpoint plus the registry authentication
     mechanism carry the token; the URL never contains it (05_gateway.md).
-  - No git remote/proxy config is written: workspace git speaks only local filesystem remotes (the `host` remote and
+  - No git remote/proxy config is written: workspace git speaks only local filesystem remotes (the `main` remote and
     gateway-owned bare mirrors — 05_gateway.md), so there is nothing to route through the gateway and no credential
     helper inside the image.
   - **Go env file** at `.cowshed/cache/go/env` (the `go env -w` format), reached via a `GOENV` export (below). Go is the
