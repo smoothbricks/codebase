@@ -119,3 +119,115 @@ fn child_argv_cannot_enable_cli_json_mode() {
             .contains("conflict")
     );
 }
+
+/// A scratch HOME per test, following the crate's temp-directory convention.
+fn scratch_home(label: &str) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "cowshed-cli-skill-home-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
+#[test]
+fn skill_install_splits_tsv_stdout_from_guidance_and_hints_exactly_once() {
+    let home = scratch_home("streams");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+        .args(["skill", "install"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let installed = home.join(".claude/skills/cowshed/SKILL.md");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout,
+        format!("claude\twritten\t{}\n", installed.display()),
+        "stdout carries only the machine answer"
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cowshed: installed the cowshed skill"));
+    assert_eq!(
+        stderr.matches("next: ").count(),
+        1,
+        "exactly one next: prefix, never a doubled one"
+    );
+    assert!(!stderr.contains("next: next:"));
+
+    assert!(
+        std::fs::read_to_string(&installed)
+            .unwrap()
+            .starts_with("---\nname: cowshed\n"),
+        "the installed file is the shipped skill, frontmatter first"
+    );
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn skill_install_is_idempotent_and_reports_unchanged() {
+    let home = scratch_home("idempotent");
+
+    let first = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+        .args(["skill", "install"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let second = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+        .args(["--json", "skill", "install"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    assert!(String::from_utf8(first.stdout).unwrap().contains("written"));
+    assert_eq!(second.status.code(), Some(0));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("one JSON envelope on stdout");
+    assert_eq!(
+        envelope,
+        json!({
+            "ok": true,
+            "result": {
+                "skill": "cowshed",
+                "installs": [{
+                    "harness": "claude",
+                    "path": home.join(".claude/skills/cowshed/SKILL.md").to_str().unwrap(),
+                    "status": "unchanged",
+                }],
+            },
+        })
+    );
+    assert!(
+        String::from_utf8(second.stderr).unwrap().is_empty(),
+        "--json keeps stderr clear of guidance"
+    );
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn skill_install_rejects_an_unknown_harness_before_writing_anything() {
+    let home = scratch_home("unknown-harness");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cowshed"))
+        .args(["skill", "install", "--harness", "nonesuch"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("unknown harness `nonesuch`")
+    );
+    assert!(
+        !home.join(".claude").exists(),
+        "a usage error must not create harness directories"
+    );
+    std::fs::remove_dir_all(&home).unwrap();
+}

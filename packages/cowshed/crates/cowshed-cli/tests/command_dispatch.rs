@@ -1039,3 +1039,67 @@ async fn concurrent_invocations_serialize_same_name_create() {
     drop(sender);
     actor.await.unwrap();
 }
+
+#[test]
+fn skill_install_parses_repeated_harnesses_once_and_scopes_them_by_project() {
+    use cowshed_cli::args::{Command, SkillCommand};
+
+    let global = parse_args([
+        "skill",
+        "install",
+        "--harness",
+        "cursor",
+        "--harness",
+        "cursor",
+    ])
+    .expect("global scope accepts cursor");
+    match global.command {
+        Command::Skill(args) => {
+            assert_eq!(args.action, SkillCommand::Install);
+            assert_eq!(args.harnesses, ["cursor"], "a repeated harness is deduped");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(global.global.project.is_none());
+
+    let project = parse_args([
+        "skill",
+        "install",
+        "--harness",
+        "copilot",
+        "--project",
+        "/repo",
+    ])
+    .expect("project scope accepts copilot");
+    match project.command {
+        Command::Skill(args) => assert_eq!(args.harnesses, ["copilot"]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(project.global.project, Some(PathBuf::from("/repo")));
+
+    // Scope decides which names exist, and --project may appear after --harness.
+    assert!(
+        parse_args(["skill", "install", "--harness", "copilot"]).is_err(),
+        "copilot has no home-directory skill directory"
+    );
+    assert!(
+        parse_args([
+            "skill",
+            "install",
+            "--harness",
+            "goose",
+            "--project",
+            "/repo"
+        ])
+        .is_err(),
+        "goose keeps skills under the home config directory only"
+    );
+}
+
+#[test]
+fn skill_requires_a_known_action_and_takes_no_positional_arguments() {
+    assert!(parse_args(["skill"]).is_err());
+    assert!(parse_args(["skill", "uninstall"]).is_err());
+    assert!(parse_args(["skill", "install", "extra"]).is_err());
+    assert!(parse_args(["skill", "install", "--nonesuch"]).is_err());
+}
