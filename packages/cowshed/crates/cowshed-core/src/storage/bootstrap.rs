@@ -1398,12 +1398,24 @@ fn valid_apfs_volume_identifier(identifier: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+/// Whether a newly created volume is still detached, or was mounted at the
+/// default `/Volumes/<name>` by the system before the attestation ran.
+///
+/// The caller unmounts the latter before mounting the volume at its private
+/// mountpoint, so provisioning converges to the same state on either host.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreatedMountState {
+    Unmounted,
+    AutoMounted,
+}
+
 fn attest_created_apfs_info(
     bytes: &[u8],
     expected_identifier: &str,
     expected_container: &str,
     expected_name: &str,
-) -> Result<(), BootstrapExecutionError> {
+) -> Result<CreatedMountState, BootstrapExecutionError> {
     let value = Value::from_reader(std::io::Cursor::new(bytes))
         .map_err(|error| BootstrapExecutionError::CreatedVolumeAttestation(error.to_string()))?;
     let dictionary = value.as_dictionary().ok_or_else(|| {
@@ -1424,11 +1436,23 @@ fn attest_created_apfs_info(
             )));
         }
     }
-    if !matches!(dictionary.get("MountPoint"), Some(Value::String(value)) if value.is_empty()) {
-        return Err(BootstrapExecutionError::CreatedVolumeAttestation(
-            "new APFS volume is not authoritatively unmounted".to_owned(),
-        ));
-    }
+    let mount_state = match dictionary.get("MountPoint") {
+        None => CreatedMountState::Unmounted,
+        Some(Value::String(value)) if value.is_empty() => CreatedMountState::Unmounted,
+        // Some macOS releases mount a freshly created APFS volume at its default
+        // location regardless of `-nomount`; both cowshed volumes on a macOS 26
+        // host are observed there immediately after `diskutil apfs addVolume`.
+        // Only that exact default is tolerated — any other mountpoint means the
+        // volume is not the pristine object this attestation is vouching for.
+        Some(Value::String(value)) if *value == format!("/Volumes/{expected_name}") => {
+            CreatedMountState::AutoMounted
+        }
+        Some(other) => {
+            return Err(BootstrapExecutionError::CreatedVolumeAttestation(format!(
+                "new APFS volume is mounted at an unexpected location: {other:?}"
+            )));
+        }
+    };
     if !matches!(dictionary.get("APFSSnapshot"), Some(Value::Boolean(false))) {
         return Err(BootstrapExecutionError::CreatedVolumeAttestation(
             "new APFS object is not an ordinary volume".to_owned(),
@@ -1446,7 +1470,7 @@ fn attest_created_apfs_info(
             }
         }
     }
-    Ok(())
+    Ok(mount_state)
 }
 
 #[derive(Debug, Error)]
