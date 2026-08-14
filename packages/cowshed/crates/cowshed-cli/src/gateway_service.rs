@@ -834,12 +834,21 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// `cowshed gateway start` both installs the launch agent and starts it, so it
+/// is the correct guidance whether or not the agent exists yet. A raw
+/// `launchctl kickstart` fails with "service not found" on a host where the
+/// agent was never installed, which is exactly the state this hint is reached
+/// from most often.
+const GATEWAY_START_HINT: &str = "cowshed gateway start";
+
+/// Restarting an already-installed agent, for guidance that follows a
+/// successful install.
 fn kickstart_hint(uid: u32) -> String {
     format!("launchctl kickstart -k gui/{uid}/dev.cowshed.gateway")
 }
 
-fn gateway_absent(uid: u32) -> CowshedError {
-    CowshedError::environment_missing("cowshed gateway is not available", kickstart_hint(uid))
+fn gateway_absent(_uid: u32) -> CowshedError {
+    CowshedError::environment_missing("cowshed gateway is not available", GATEWAY_START_HINT)
 }
 
 fn inventory_error(error: impl std::fmt::Display) -> CowshedError {
@@ -859,4 +868,32 @@ fn launchd_error(error: impl std::fmt::Display) -> CowshedError {
 
 fn output_error(error: io::Error) -> CowshedError {
     CowshedError::internal(format!("could not write command output: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guidance for an unavailable gateway has to work on a host where the
+    /// launch agent was never installed, which is where it is reached from
+    /// first. `launchctl kickstart` fails there with "service not found".
+    #[test]
+    fn absent_gateway_guidance_installs_rather_than_kickstarts() {
+        let error = gateway_absent(501);
+
+        assert_eq!(error.hint, GATEWAY_START_HINT);
+        assert_eq!(error.hint, "cowshed gateway start");
+        assert!(!error.hint.contains("launchctl"));
+        assert_eq!(error.code.as_str(), "environment-missing");
+    }
+
+    /// The restart form stays available for guidance issued after a successful
+    /// install, where the service does exist.
+    #[test]
+    fn kickstart_guidance_targets_the_per_user_domain() {
+        assert_eq!(
+            kickstart_hint(501),
+            "launchctl kickstart -k gui/501/dev.cowshed.gateway"
+        );
+    }
 }

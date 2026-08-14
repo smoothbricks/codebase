@@ -505,9 +505,26 @@ where
         Command::Adopt(args) => {
             let options = adopt_options(args)?;
             let info = service.adopt(options).await?;
-            service.reconcile_gateway().await?;
+            // Adoption is the durable state change and it has already happened:
+            // the tree is copied and the image is mounted. A gateway that is not
+            // installed or running is a separate, recoverable condition, and
+            // reporting it as the command's failure reads as "adoption failed"
+            // and invites a destructive retry. Report the mount, then the
+            // gateway, and let `doctor` be the health verdict.
+            let gateway = service.reconcile_gateway().await;
             emit_mount(output, json, &info)?;
-            output.hint("cowshed new <name>").map_err(output_error)?;
+            match gateway {
+                Ok(()) => output.hint("cowshed new <name>").map_err(output_error)?,
+                Err(error) => {
+                    output
+                        .guidance(&format!(
+                            "adopted; the gateway is not ready yet: {}",
+                            error.message
+                        ))
+                        .map_err(output_error)?;
+                    output.hint(&error.hint).map_err(output_error)?;
+                }
+            }
             Ok(success())
         }
         Command::New(args) => {

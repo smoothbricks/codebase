@@ -202,7 +202,7 @@ async fn unchanged_revision_is_idempotent() {
 }
 
 #[tokio::test]
-async fn absent_gateway_is_exit_five_with_deterministic_kickstart_hint() {
+async fn absent_gateway_is_exit_five_and_guides_the_install() {
     let repo = RepoId::parse("acme/widget").expect("repo");
     let control = FakeControl {
         status: Mutex::new(Some(Err("not found".to_owned()))),
@@ -212,10 +212,11 @@ async fn absent_gateway_is_exit_five_with_deterministic_kickstart_hint() {
         .await
         .expect_err("gateway absence fails");
     assert_eq!(error.exit_code(), 5);
-    assert_eq!(
-        error.hint,
-        "launchctl kickstart -k gui/501/dev.cowshed.gateway"
-    );
+    // `cowshed gateway start` installs the launch agent as well as starting it,
+    // so it is correct on a host where the agent was never installed — which is
+    // where this error is reached from first. `launchctl kickstart` fails there
+    // with "service not found".
+    assert_eq!(error.hint, "cowshed gateway start");
 }
 
 struct FakeInventory {

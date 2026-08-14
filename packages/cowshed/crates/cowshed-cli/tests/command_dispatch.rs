@@ -28,6 +28,7 @@ struct FakeService {
     child_exit: ExitStatus,
     fail_list: Option<CowshedError>,
     fail_push: Option<CowshedError>,
+    fail_reconcile_gateway: Option<CowshedError>,
     adopt_options: Option<AdoptOptions>,
     push_options: Option<PushOptions>,
     rebase_options: Option<RebaseOptions>,
@@ -50,6 +51,7 @@ impl Default for FakeService {
             child_exit: ExitStatus::Exited { code: 0 },
             fail_list: None,
             fail_push: None,
+            fail_reconcile_gateway: None,
             adopt_options: None,
             push_options: None,
             rebase_options: None,
@@ -66,6 +68,13 @@ impl Default for FakeService {
 
 #[async_trait]
 impl CliService for FakeService {
+    async fn reconcile_gateway(&mut self) -> Result<()> {
+        match self.fail_reconcile_gateway.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo> {
         self.adopt_options = Some(options.clone());
         self.events.push(format!("adopt:{:?}", options.path));
@@ -443,6 +452,32 @@ async fn adopt_delegates_explicit_identity_and_quarantine_with_exact_output() {
     assert_eq!(error.code, ErrorCode::Usage);
     assert!(error.message.contains("repository identity"));
     assert!(output.into_inner().0.is_empty());
+}
+
+/// Adoption is the durable state change; a gateway that is not ready is a
+/// separate recoverable condition. Reporting it as the command's failure reads
+/// as "adoption failed" and invites a destructive retry.
+#[tokio::test]
+async fn adopt_reports_the_mount_even_when_the_gateway_is_not_ready() {
+    let mut service = FakeService::default();
+    service.fail_reconcile_gateway = Some(CowshedError::environment_missing(
+        "cowshed gateway is not available",
+        "cowshed gateway start",
+    ));
+
+    let (exit, stdout, stderr) = run(&mut service, ["adopt", "/repo"]).await;
+
+    assert_eq!(exit, 0, "adoption succeeded");
+    assert_eq!(
+        stdout, b"/mnt/main\n",
+        "the mount is still the machine answer"
+    );
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(
+        stderr.contains("adopted; the gateway is not ready yet"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("next: cowshed gateway start"), "{stderr}");
 }
 
 #[tokio::test]
