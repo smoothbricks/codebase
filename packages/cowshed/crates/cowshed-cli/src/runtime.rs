@@ -1,4 +1,6 @@
-use crate::args::{AdoptArgs, Cli, Command, ExecArgs, StdinSource as CliStdinSource};
+use crate::args::{
+    AdoptArgs, Cli, Command, ExecArgs, MoveDestination, StdinSource as CliStdinSource,
+};
 use crate::gateway_service;
 use crate::output::Output;
 use async_trait::async_trait;
@@ -55,6 +57,7 @@ pub trait CliService: Send {
     async fn create(&mut self, name: &str, options: CreateOptions) -> Result<WorkspaceInfo>;
     async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
     async fn rename(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
+    async fn move_checkout(&mut self, destination: &Path) -> Result<WorkspaceInfo>;
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
     async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
     async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport>;
@@ -241,6 +244,14 @@ impl CliService for ActorBridge {
             .into_info())
     }
 
+    async fn move_checkout(&mut self, destination: &Path) -> Result<WorkspaceInfo> {
+        Ok(self
+            .coordinator()?
+            .move_checkout(destination)
+            .await?
+            .into_info())
+    }
+
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String> {
         self.coordinator()?
             .worker(workspace)
@@ -262,9 +273,9 @@ impl CliService for ActorBridge {
     async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport> {
         self.coordinator()?
             .project()
-            .workspace_at(path)
+            .workspace_at(path.clone())
             .await?
-            .ensure()
+            .ensure_observed_at(Some(&path))
             .await
     }
 
@@ -567,12 +578,17 @@ where
             Ok(success())
         }
         Command::Move(args) => {
-            let info = service.rename(&args.source, &args.destination).await?;
+            let info = match &args.destination {
+                MoveDestination::Workspace(name) => service.rename(&args.source, name).await?,
+                MoveDestination::Checkout(path) => service.move_checkout(path).await?,
+            };
             service.reconcile_gateway().await?;
             emit_mount(output, json, &info)?;
-            output
-                .hint(&format!("cowshed exec {} -- <cmd>", args.destination))
-                .map_err(output_error)?;
+            let hint = match &args.destination {
+                MoveDestination::Workspace(name) => format!("cowshed exec {name} -- <cmd>"),
+                MoveDestination::Checkout(path) => format!("cd {}", path.display()),
+            };
+            output.hint(&hint).map_err(output_error)?;
             Ok(success())
         }
         Command::Fork(args) => {
