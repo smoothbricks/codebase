@@ -90,19 +90,29 @@ adopt is an explicit transaction with defined crash points, not a best-effort sc
    tool config files (03_caches.md). The main sidecar contains `portBlock` only on macOS; Linux omits it and creates its
    per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree against the
    source before publication.
-5. Publish: move the original tree aside (`<root>.pre-cowshed`), create `~/.cowshed/mnt/<owner>/<repo>/main` as the
-   mountpoint with the self-healing stub `.envrc` inside it, rename the staged image and each sibling sidecar into place
-   without changing the format extension, `fsync` the parent directories around each rename, attach, then create the
-   symlink at the original checkout path pointing at that mountpoint. The symlink is created last, so it never resolves
-   to an unmounted directory.
+5. Publish, building every durable artifact before the user's tree is touched: create
+   `~/.cowshed/mnt/<owner>/<repo>/main` as the mountpoint with the self-healing stub `.envrc` inside it, rename the
+   staged image and each sibling sidecar into place without changing the format extension, `fsync` the parent
+   directories around each rename, and attach. Only then does the checkout path change hands: build the symlink to the
+   mountpoint under a staging sibling, exchange it with the original directory in one atomic
+   `renameatx_np(RENAME_SWAP)`, and rename the displaced original to `<root>.pre-cowshed`.
+
+   The swap carries the guarantee: the checkout path transitions directly from real directory to valid symlink, so there
+   is no instant at which it is absent and none at which it dangles — the mount is already live when the symlink first
+   appears. Ordering the mount before the handoff is what "symlink last" protects; performing the handoff as a swap
+   rather than a move-aside followed by a link is what removes the window in which the user's familiar path would not
+   exist at all.
+
 6. Print the mount path on stdout.
 
-Every step is idempotent to re-run. `cowshed doctor`/`cowshed gc` recognize each crash point — staged image present,
-tree moved but unattached, marker unpublished — and resume or roll back. `<root>.pre-cowshed` is retained until the user
-deletes it; cowshed never auto-deletes it.
+Every step is idempotent to re-run. `cowshed doctor`/`cowshed gc` recognize each crash point and resume or roll back.
+Because the durable half completes first, the resumable state is _mount and image published, checkout still the original
+directory, swap pending_ — recovery needs nothing from the user's tree to finish it, and `<root>.pre-cowshed` does not
+exist yet. `<root>.pre-cowshed` is retained until the user deletes it; cowshed never auto-deletes it.
 
-Adopting is reversible: `cowshed rm main --restore` detaches, removes the symlink at the original checkout path, and
-moves `<root>.pre-cowshed` back to it.
+Adopting is reversible, and reverses the same way: `cowshed rm main --restore` detaches, swaps the retained
+`<root>.pre-cowshed` tree back against the symlink at the checkout path, and unlinks the displaced symlink. The checkout
+path is never absent during the restore either.
 
 ## `cowshed new <name>` — create a session workspace
 

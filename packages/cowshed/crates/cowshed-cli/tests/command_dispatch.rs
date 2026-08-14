@@ -459,11 +459,13 @@ async fn adopt_delegates_explicit_identity_and_quarantine_with_exact_output() {
 /// as "adoption failed" and invites a destructive retry.
 #[tokio::test]
 async fn adopt_reports_the_mount_even_when_the_gateway_is_not_ready() {
-    let mut service = FakeService::default();
-    service.fail_reconcile_gateway = Some(CowshedError::environment_missing(
-        "cowshed gateway is not available",
-        "cowshed gateway start",
-    ));
+    let mut service = FakeService {
+        fail_reconcile_gateway: Some(CowshedError::environment_missing(
+            "cowshed gateway is not available",
+            "cowshed gateway start",
+        )),
+        ..Default::default()
+    };
 
     let (exit, stdout, stderr) = run(&mut service, ["adopt", "/repo"]).await;
 
