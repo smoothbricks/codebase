@@ -1645,7 +1645,7 @@ impl NativeProjectRuntimeHost {
                         ));
                     }
                     if let Some(info) = metadata.info_snapshot.as_ref()
-                        && info.project_root != project_root
+                        && !names_one_root(&info.project_root, &project_root)
                     {
                         return Err(crate::storage::apfs::ApfsStorageError::MarkerMismatch(
                             format!(
@@ -3913,7 +3913,7 @@ async fn repo_id_from_workspace_marker(project_root: &Path) -> Result<Option<Rep
     let Some(marker) = marker else {
         return Ok(None);
     };
-    if marker.project_root != project_root
+    if !names_one_root(&marker.project_root, project_root)
         || !marker.workspace.is_main()
         || marker.role != crate::metadata::WorkspaceRole::Main
     {
@@ -3923,6 +3923,25 @@ async fn repo_id_from_workspace_marker(project_root: &Path) -> Result<Option<Rep
         ));
     }
     Ok(Some(marker.repo_id))
+}
+
+/// Do a recorded project root and an observed one name the same directory?
+///
+/// Recorded metadata holds the adopted checkout path, while the controller and Git report the
+/// physical root — since main mounts under `mnt/<owner>/<repo>/main` and the checkout is a symlink
+/// into it, those two strings legitimately differ for the same workspace. They still describe one
+/// directory, so a disagreement is only real when the paths do not resolve to the same place.
+fn names_one_root(recorded: &Path, observed: &Path) -> bool {
+    if recorded == observed {
+        return true;
+    }
+    let (Ok(recorded), Ok(observed)) = (
+        std::fs::canonicalize(recorded),
+        std::fs::canonicalize(observed),
+    ) else {
+        return false;
+    };
+    recorded == observed
 }
 
 #[cfg(target_os = "macos")]
