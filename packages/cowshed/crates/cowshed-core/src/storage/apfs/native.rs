@@ -1354,7 +1354,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         metadata: &DetachedWorkspaceMetadata,
     ) -> Result<PathBuf, ApfsStorageError> {
         if metadata.workspace.is_main() {
-            Ok(self.config.main_mount.clone())
+            Ok(self.config.checkout_path.clone())
         } else {
             layout(&self.config, &metadata.repo_id)?
                 .workspace_mount(&metadata.workspace)
@@ -2626,7 +2626,7 @@ where
         pre_cowshed_checkout: &Path,
     ) -> Result<(), ApfsStorageError> {
         if !workspace.name().is_main()
-            || source_checkout != self.config.main_mount
+            || source_checkout != self.config.checkout_path
             || pre_cowshed_checkout != pre_cowshed_path(source_checkout)
         {
             return Err(ApfsStorageError::InvalidPlan(
@@ -3439,7 +3439,7 @@ where
             .into_iter()
             .filter_map(|fact| {
                 let expected = if fact.workspace.name().is_main() {
-                    Ok(self.config.main_mount.clone())
+                    Ok(self.config.checkout_path.clone())
                 } else {
                     layout(&self.config, fact.workspace.repo()).and_then(|layout| {
                         layout
@@ -3717,19 +3717,19 @@ where
                         continue;
                     }
                     if metadata.workspace.is_main() {
-                        let pre_cowshed = pre_cowshed_path(&config.main_mount);
+                        let pre_cowshed = pre_cowshed_path(&config.checkout_path);
                         if staged.exists() {
                             self.recovery_companion(&staged, "staged main publication image")?;
                         }
                         if staged.exists() {
                             if !canonical.exists() && pre_cowshed.exists() {
-                                self.ensure_adopt_mountpoint(&config.main_mount)?;
+                                self.ensure_adopt_mountpoint(&config.checkout_path)?;
                                 self.publish_image(&staged, &canonical)?;
                             }
                             continue;
                         }
                         if pre_cowshed.exists() {
-                            self.ensure_adopt_mountpoint(&config.main_mount)?;
+                            self.ensure_adopt_mountpoint(&config.checkout_path)?;
                         }
                     } else if staged.exists() {
                         self.recovery_companion(&staged, "staged session publication image")?;

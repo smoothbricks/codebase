@@ -136,20 +136,20 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
     let root = IntegrationRoot::new(format)?;
     let store = root.path.join("store");
     let caches = store.join("caches");
-    let main_mount = root.path.join("main-mount");
+    let checkout_path = root.path.join("main-mount");
     fs::create_dir_all(&store)?;
     fs::create_dir_all(&caches)?;
-    fs::create_dir_all(&main_mount)?;
+    fs::create_dir_all(&checkout_path)?;
     let config = ApfsSubstrateConfig::new(
         &store,
         &caches,
-        &main_mount,
+        &checkout_path,
         ApfsCaseSensitivity::Insensitive,
     )
     .with_capacity("1g")?;
     let identity = || -> Result<OperationIdentity, Box<dyn Error>> {
         Ok(OperationIdentity {
-            project_root: main_mount.clone(),
+            project_root: checkout_path.clone(),
             base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             created_at: "2026-07-13T00:00:00Z".to_owned(),
             branch: Some("main".to_owned()),
@@ -180,8 +180,8 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             repo: repo.clone(),
             format,
             topology_revision: Revision::new(0),
-            source_checkout: main_mount.clone(),
-            pre_cowshed_checkout: PathBuf::from(format!("{}.pre-cowshed", main_mount.display())),
+            source_checkout: checkout_path.clone(),
+            pre_cowshed_checkout: PathBuf::from(format!("{}.pre-cowshed", checkout_path.display())),
             identity: identity()?,
         })?;
         let main = substrate
@@ -201,20 +201,20 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
                 .ensure_mounted(&main, MountIntent { browse: false })
                 .await
                 .map_err(|error| std::io::Error::other(format!("ensure main: {error}")))?,
-            main_mount
+            checkout_path
         );
-        let mounted_root = fs::metadata(&main_mount)?;
+        let mounted_root = fs::metadata(&checkout_path)?;
         assert_eq!(mounted_root.uid(), unsafe { libc::getuid() });
         assert_eq!(mounted_root.gid(), unsafe { libc::getgid() });
 
-        let payload = main_mount.join("payload.txt");
+        let payload = checkout_path.join("payload.txt");
         fs::write(&payload, b"checkpoint baseline\n")?;
-        let stream = main_mount.join("stream.bin");
+        let stream = checkout_path.join("stream.bin");
         write_stream(&stream, 128)?;
         let churn_stop = Arc::new(AtomicBool::new(false));
         let churn = ChurnGuard {
             handle: Some(spawn_churn(
-                main_mount.join("churn.bin"),
+                checkout_path.join("churn.bin"),
                 Arc::clone(&churn_stop),
             )),
             stop: churn_stop,
