@@ -149,8 +149,8 @@
           "typecheck-tests"
         ],
         "options": {
-          "command": "bun test --timeout=30000 src/cli-trampoline.test.ts",
-          "cwd": "{projectRoot}",
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 cli-trampoline.test.ts",
+          "cwd": "{projectRoot}/src",
           "timeoutMs": 120000,
           "killAfterMs": 10000
         }
