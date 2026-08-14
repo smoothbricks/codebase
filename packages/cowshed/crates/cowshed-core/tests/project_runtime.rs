@@ -453,7 +453,34 @@ impl ProjectRuntimeHost for FakeHost {
         self.create(destination, CreateOptions::default()).await
     }
 
-    async fn ensure(&mut self, workspace: WorkspaceName) -> Result<EnsureReport> {
+    async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
+        // The checkout path is the descriptor's project root, and main's mount is derived from it,
+        // so the returned mount is what witnesses that the move reached the host at all.
+        if destination == self.descriptor.git_root {
+            return Err(CowshedError::usage(
+                "the checkout is already there",
+                "choose a different destination path",
+            ));
+        }
+        self.descriptor.git_root = destination;
+        let main = WorkspaceName::new("main").expect("main");
+        let current = self.workspace(&main)?;
+        Ok(self.snapshot(current))
+    }
+
+    async fn ensure(
+        &mut self,
+        workspace: WorkspaceName,
+        observed: Option<PathBuf>,
+    ) -> Result<EnsureReport> {
+        // Convergence, in miniature: an observed main checkout that differs from the recorded one
+        // replaces it. Sessions never converge — only main's checkout has a recorded path.
+        if let Some(observed) = observed
+            && workspace.is_main()
+            && observed != self.descriptor.git_root
+        {
+            self.descriptor.git_root = observed;
+        }
         let current = self.workspace(&workspace)?;
         let mount = self.snapshot(current).info.mount;
         Ok(EnsureReport {
@@ -1450,6 +1477,79 @@ async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_e
     .await
     .expect_err("detached workspace must not resolve");
     assert_eq!(error.code, ErrorCode::NotFound);
+}
+
+/// `mv main` and `ensure` are the two ways the project's checkout path changes, and both are
+/// routed rather than inferred: the coordinator carries a destination path, and ensure carries the
+/// caller's observation. Main's mount is derived from the recorded checkout, so the mount each call
+/// reports back is the witness that the new path actually landed in the host.
+#[tokio::test]
+async fn moving_the_checkout_and_ensuring_from_an_alias_both_move_the_recorded_path() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    let adopted = adopt(&router, &repo).await;
+    assert_eq!(
+        adopted["info"]["mount"].as_str().expect("mount"),
+        root.join("checkout").to_string_lossy()
+    );
+
+    let moved_to = root.join("moved");
+    let moved = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.moveCheckout",
+        json!({ "repoId": repo, "destination": moved_to }),
+    )
+    .await
+    .expect("move checkout");
+    assert_eq!(moved["info"]["workspace"], "main");
+    assert_eq!(
+        moved["info"]["mount"].as_str().expect("mount"),
+        moved_to.to_string_lossy()
+    );
+
+    // A second move to the same place has nothing to do, which is only observable because the
+    // first one really moved the record rather than reporting that it had.
+    assert!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.moveCheckout",
+            json!({ "repoId": repo, "destination": moved_to }),
+        )
+        .await
+        .is_err()
+    );
+
+    // Ensure converges onto the checkout the caller observed, which is how a hand-moved checkout
+    // gets its record repaired without a `mv`.
+    let observed = root.join("alias");
+    let ensured = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.ensure",
+        json!({ "repoId": repo, "workspace": "main", "observedPath": observed }),
+    )
+    .await
+    .expect("ensure with an observation");
+    assert_eq!(
+        ensured["mount"].as_str().expect("mount"),
+        observed.to_string_lossy()
+    );
+
+    // An ensure with no observation offers nothing to converge onto and must leave the record be.
+    let ensured = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.ensure",
+        json!({ "repoId": repo, "workspace": "main" }),
+    )
+    .await
+    .expect("ensure without an observation");
+    assert_eq!(
+        ensured["mount"].as_str().expect("mount"),
+        observed.to_string_lossy()
+    );
 }
 
 #[tokio::test]
