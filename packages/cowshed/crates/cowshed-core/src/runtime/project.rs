@@ -2758,8 +2758,13 @@ impl NativeProjectRuntimeHost {
                     .collect(),
             },
             // Multi-user Nix is a requirement, and evaluation inside a workspace is the point of
-            // a workspace: without the daemon the client cannot build or substitute at all.
-            allowed_unix_sockets: crate::sandbox::nix_daemon_socket().into_iter().collect(),
+            // a workspace: without the daemon the client cannot build or substitute at all. The
+            // sccache server socket rides along so rustc-wrapper clients reach the host-owned
+            // daemon instead of spawning a wrong-boundary server in-sandbox.
+            allowed_unix_sockets: crate::sandbox::nix_daemon_socket()
+                .into_iter()
+                .chain([crate::sandbox::sccache_server_socket(&self.home)])
+                .collect(),
             additional_denies: vec![
                 self.layout.project().project_root.clone(),
                 self.telemetry_root.clone(),
@@ -5409,8 +5414,11 @@ fn supervisor_sandbox(
         },
         // The supervisor is the trusted tier of the same workspace; it gets the same daemon reach
         // as the children it launches, or an in-workspace evaluation would depend on which tier ran
-        // it.
-        allowed_unix_sockets: crate::sandbox::nix_daemon_socket().into_iter().collect(),
+        // it. The sccache server socket rides along for the same reason.
+        allowed_unix_sockets: crate::sandbox::nix_daemon_socket()
+            .into_iter()
+            .chain([crate::sandbox::sccache_server_socket(home)])
+            .collect(),
         additional_denies: vec![
             layout.project().project_root.clone(),
             telemetry_root.to_path_buf(),
