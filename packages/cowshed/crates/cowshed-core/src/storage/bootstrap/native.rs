@@ -889,6 +889,29 @@ impl ApfsProvisionIo for SystemApfsProvisionIo {
     }
 }
 
+/// Return a freshly attested volume to the detached state.
+///
+/// `-nomount` is passed on creation, but some macOS releases mount the new
+/// volume at `/Volumes/<name>` anyway. Mounting it a second time at the private
+/// mountpoint would leave the browsable default mount in place, so the default
+/// mount is dropped first and provisioning proceeds identically on either host.
+#[cfg(target_os = "macos")]
+fn detach_auto_mounted_volume<S>(
+    session: &mut S,
+    state: super::CreatedMountState,
+    exact_identifier: &str,
+) -> Result<(), HostError>
+where
+    S: PrivilegedCommandSession,
+{
+    if state == super::CreatedMountState::Unmounted {
+        return Ok(());
+    }
+    let unmount = HostCommand::new(DISKUTIL, ["unmount", exact_identifier]);
+    run_privileged_command(session, &unmount)?;
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn provision_apfs_volumes_with<S>(
     container: &str,
@@ -924,13 +947,14 @@ where
                 let info =
                     HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
                 let output = run_privileged_command(&mut session, &info)?;
-                super::attest_created_apfs_info(
+                let mount_state = super::attest_created_apfs_info(
                     &output.stdout,
                     &exact_identifier,
                     container,
                     volume.name(),
                 )
                 .map_err(|error| HostError::new(error.to_string()))?;
+                detach_auto_mounted_volume(&mut session, mount_state, &exact_identifier)?;
                 let mountpoint = path_argument(volume.mountpoint())?;
                 let mount = HostCommand::new(
                     DISKUTIL,
@@ -951,13 +975,14 @@ where
                 let info =
                     HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
                 let output = run_privileged_command(&mut session, &info)?;
-                super::attest_created_apfs_info(
+                let mount_state = super::attest_created_apfs_info(
                     &output.stdout,
                     exact_identifier,
                     container,
                     volume.name(),
                 )
                 .map_err(|error| HostError::new(error.to_string()))?;
+                detach_auto_mounted_volume(&mut session, mount_state, exact_identifier)?;
                 let mountpoint = path_argument(volume.mountpoint())?;
                 let mount = HostCommand::new(
                     DISKUTIL,
@@ -2941,6 +2966,254 @@ mod tests {
         assert!(canonical_attestation < marker);
         assert!(matches!(events.first(), Some(ProvisionEvent::Acquire)));
         assert!(matches!(events.last(), Some(ProvisionEvent::Free)));
+    }
+
+    /// The macOS 26 arm: `diskutil apfs addVolume -nomount` returns a volume
+    /// already mounted at `/Volumes/<name>`. The plist shape here is the one
+    /// this host's `diskutil info -plist cowshed.store` actually reports.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_auto_mounted_new_volume_is_detached_before_its_private_mount() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outputs = VecDeque::from([
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: b"Created new APFS Volume disk3s8\n".to_vec(),
+                stderr: Vec::new(),
+            }),
+            // The system mounted it at the default location despite -nomount.
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s8",
+                    "disk3",
+                    APFS_STORE_VOLUME,
+                    "/Volumes/cowshed.store",
+                ),
+                stderr: Vec::new(),
+            }),
+            // unmount
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            // mount at the private mountpoint
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s8",
+                    "disk3",
+                    APFS_STORE_VOLUME,
+                    "/Users/alice/.cowshed",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+        ]);
+        let volumes = [ApfsVolumeProvision {
+            name: APFS_STORE_VOLUME,
+            mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+            role: VolumeRole::Store,
+            kind: ApfsProvisionKind::Create,
+        }];
+        let acquire_events = Rc::clone(&events);
+        provision_apfs_volumes_with(
+            "disk3",
+            &volumes,
+            501,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs,
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+            },
+        )
+        .unwrap();
+
+        let events = events.borrow();
+        let commands: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commands[0].as_slice(),
+            [
+                "apfs",
+                "addVolume",
+                "disk3",
+                "APFS",
+                APFS_STORE_VOLUME,
+                "-nomount"
+            ],
+            "-nomount is still requested; the unmount is a fallback, not a replacement"
+        );
+        assert_eq!(commands[1].as_slice(), ["info", "-plist", "disk3s8"]);
+        assert_eq!(
+            commands[2].as_slice(),
+            ["unmount", "disk3s8"],
+            "the default mount is dropped before the private mount"
+        );
+        assert_eq!(
+            commands[3].as_slice(),
+            [
+                "mount",
+                "-nobrowse",
+                "-mountPoint",
+                "/Users/alice/.cowshed",
+                "disk3s8",
+            ]
+        );
+    }
+
+    /// A volume recorded as detached can be auto-mounted by the system between
+    /// discovery and the recovery attestation. That is the shape most likely to
+    /// strand an existing installation, so it converges the same way.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_detached_volume_found_auto_mounted_is_detached_before_recovery() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outputs = VecDeque::from([
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s9",
+                    "disk3",
+                    APFS_CACHES_VOLUME,
+                    "/Volumes/cowshed.caches",
+                ),
+                stderr: Vec::new(),
+            }),
+            // unmount, then mount at the private mountpoint
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                stdout: provision_info(
+                    "disk3s9",
+                    "disk3",
+                    APFS_CACHES_VOLUME,
+                    "/Users/alice/.cowshed/caches",
+                ),
+                stderr: Vec::new(),
+            }),
+            Ok(HostCommandOutput {
+                success: true,
+                ..HostCommandOutput::default()
+            }),
+        ]);
+        let volumes = [ApfsVolumeProvision {
+            name: APFS_CACHES_VOLUME,
+            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            role: VolumeRole::Caches,
+            kind: ApfsProvisionKind::RecoverDetached {
+                exact_identifier: "disk3s9".to_owned(),
+            },
+        }];
+        let acquire_events = Rc::clone(&events);
+        provision_apfs_volumes_with(
+            "disk3",
+            &volumes,
+            502,
+            80,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs,
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+            },
+        )
+        .unwrap();
+
+        let events = events.borrow();
+        let diskutil: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { program, args } if program == DISKUTIL => {
+                    Some(args.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(diskutil[0].as_slice(), ["info", "-plist", "disk3s9"]);
+        assert_eq!(diskutil[1].as_slice(), ["unmount", "disk3s9"]);
+        assert_eq!(
+            diskutil[2].as_slice(),
+            [
+                "mount",
+                "-nobrowse",
+                "-mountPoint",
+                "/Users/alice/.cowshed/caches",
+                "disk3s9",
+            ]
+        );
+        assert!(
+            !diskutil
+                .iter()
+                .any(|args| args.first().is_some_and(|arg| arg == "apfs")),
+            "recovery must never recreate the volume"
+        );
+    }
+
+    /// The pre-26 arm and the fail-closed boundary.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn created_volume_attestation_admits_only_detached_or_the_default_mount() {
+        let attest = |mountpoint: &str| {
+            super::super::attest_created_apfs_info(
+                &provision_info("disk3s8", "disk3", APFS_STORE_VOLUME, mountpoint),
+                "disk3s8",
+                "disk3",
+                APFS_STORE_VOLUME,
+            )
+        };
+
+        assert_eq!(
+            attest("").unwrap(),
+            super::super::CreatedMountState::Unmounted
+        );
+        assert_eq!(
+            attest("/Volumes/cowshed.store").unwrap(),
+            super::super::CreatedMountState::AutoMounted
+        );
+
+        // A volume mounted anywhere else is not the pristine object being
+        // vouched for, and must not be silently unmounted and repurposed.
+        let foreign = attest("/Users/alice/somewhere").unwrap_err();
+        assert!(
+            foreign.to_string().contains("unexpected location"),
+            "{foreign}"
+        );
+        // The default mount of a *different* volume name is equally foreign.
+        let mismatched = attest("/Volumes/cowshed.caches").unwrap_err();
+        assert!(
+            mismatched.to_string().contains("unexpected location"),
+            "{mismatched}"
+        );
     }
 
     #[cfg(target_os = "macos")]
