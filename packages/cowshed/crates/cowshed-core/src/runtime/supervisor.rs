@@ -856,6 +856,11 @@ struct PrintedDevenvEnvironment {
 struct PrintedDevenvVariable {
     #[serde(rename = "type")]
     kind: String,
+    /// devenv 2.2.x emits `{"type": "unknown"}` with NO value field for
+    /// shell-special variables (BASHOPTS, BASHPID, ...). Only `exported`
+    /// entries are consumed below, so a missing value defaults to Null and
+    /// non-exported kinds skip before it is ever read.
+    #[serde(default)]
     value: serde_json::Value,
 }
 
