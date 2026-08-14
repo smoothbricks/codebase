@@ -169,7 +169,9 @@ describe('tool configuration validation', () => {
       applyDevenvPackageDefaults(root);
       expect(validateDevenvPackages(root)).toBe(0);
       const devenv = await readFile(devenvPath, 'utf8');
-      expect(devenv).toContain('sccache # Rust compiler wrapper and cache');
+      expect(devenv).toContain(
+        'sccache # Rust compiler cache; client of the host-owned daemon (cowshed sccache start)',
+      );
       expect(devenv).toContain('++ lib.optionals pkgs.stdenv.isLinux [');
       expect(devenv).toContain('pkgs.stdenv.cc');
       expect(devenv).toContain('stdenv.cc.cc.lib');
