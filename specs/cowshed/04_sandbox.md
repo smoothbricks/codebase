@@ -456,6 +456,13 @@ anywhere, and therefore nothing that a workspace's toolchain could be said to ha
 the one that matters here: a workspace can evaluate an edited `devenv.nix` and the resulting tools still will not be on
 its `PATH`, because the controller's `PATH` is what is being filtered.
 
+A third thing had to be true and was not: `sandbox_path` admits the per-user profile roots
+(`/etc/profiles`, `/etc/static/profiles`) to `PATH`, but the Seatbelt profile granted neither, so every
+nix-installed tool on them was unrunnable — the exact breakage the `PATH` admission was added to fix. The broad
+`file-read-data` allow is not enough: resolving a path for exec needs `file-read*` on its roots. Both spellings are
+granted, for the same reason `/var/select` and `/private/var/select` both are — `/etc` is a symlink to `/private/etc`,
+and a rule naming only the pretty form silently never matches.
+
 The fix follows the mechanism that already exists rather than adding one. devenv materializes its evaluation as
 `.devenv/profile`, a symlink into `/nix/store`, inside the project directory — which in a workspace is in-image and
 per-workspace already, keyed and isolated with everything else in the volume. So the workspace's own
@@ -467,6 +474,15 @@ symlink. On land, main's own next evaluation picks the change up for future mint
 
 The bare-command check contract (02_workspaces.md) is unaffected and stays the default: the point of the workspace
 profile is that `just verify` resolves the *edited* toolchain without a wrapper, not that wrappers become useful.
+
+**Residual: `devenv` itself writes to a hardcoded `/tmp`.** It ignores `TMPDIR` and creates `/tmp/devenv-<hash>`, which
+the closed baseline denies — the workspace's writable temp is its own `exec_temp_dir`, which is what `TMPDIR` points at.
+So evaluating *through the `devenv` CLI* inside the sandbox still fails on that write, while `nix` itself and an
+already-materialized profile work. This is deliberately not papered over: granting write on `/private/tmp` would hand
+every workspace a world-shared directory, which is precisely the per-workspace-temp invariant this baseline exists to
+hold. The fix belongs upstream in devenv (honour `TMPDIR`) or in a wrapper that sets a short per-workspace temp path;
+until then, in-sandbox evaluation runs through `nix` and the profile is materialized by the direnv/devenv integration
+outside the closed baseline.
 
 On macOS, port collisions between workspaces are handled by the per-workspace port block, not left to the user:
 `devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base), so two workspaces running the
