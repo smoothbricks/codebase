@@ -1,0 +1,103 @@
+/// <reference types="bun" />
+/// <reference types="node" />
+
+import { afterEach, describe, expect, it } from 'bun:test';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { packageRootFromModule, runCli } from './cli-trampoline.js';
+
+const fixtureRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(fixtureRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+describe('cowshed CLI trampoline', () => {
+  it('prefers the packaged host binary over the workspace release binary', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    const workspace = join(root, 'target', 'release', 'cowshed');
+    await Promise.all([fixtureFile(packaged), fixtureFile(workspace)]);
+    const spawns: Array<{ executable: string; argv: readonly string[] }> = [];
+
+    const exitCode = await runCli(['ls', '--all'], {
+      packageRoot: root,
+      platform: 'darwin',
+      arch: 'arm64',
+      async spawnBinary(executable, argv) {
+        spawns.push({ executable, argv });
+        return 17;
+      },
+      async runNapi() {
+        throw new Error('Node-API fallback must not run');
+      },
+    });
+
+    expect(exitCode).toBe(17);
+    expect(spawns).toEqual([{ executable: packaged, argv: ['ls', '--all'] }]);
+  });
+
+  it('uses target/release for a bun-linked workspace when no packaged binary exists', async () => {
+    const root = await fixtureRoot();
+    const workspace = join(root, 'target', 'release', 'cowshed');
+    await fixtureFile(workspace);
+    const spawns: string[] = [];
+
+    const exitCode = await runCli(['doctor'], {
+      packageRoot: root,
+      platform: 'linux',
+      arch: 'x64',
+      async spawnBinary(executable) {
+        spawns.push(executable);
+        return 0;
+      },
+      async runNapi() {
+        throw new Error('Node-API fallback must not run');
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(spawns).toEqual([workspace]);
+  });
+
+  it('uses the Node-API runner only when neither native binary exists', async () => {
+    const root = await fixtureRoot();
+    const napiCalls: readonly string[][] = [];
+
+    const exitCode = await runCli(['path', 'main'], {
+      packageRoot: root,
+      platform: 'darwin',
+      arch: 'x64',
+      async spawnBinary() {
+        throw new Error('native spawn must not run');
+      },
+      async runNapi(argv) {
+        (napiCalls as string[][]).push([...argv]);
+        return 9;
+      },
+    });
+
+    expect(exitCode).toBe(9);
+    expect(napiCalls).toEqual([['path', 'main']]);
+  });
+
+  it('finds the package root from source and compiled module locations', async () => {
+    const root = await fixtureRoot();
+
+    expect(packageRootFromModule(pathToFileURL(join(root, 'src', 'cli.ts')).href)).toBe(root);
+    expect(packageRootFromModule(pathToFileURL(join(root, 'dist', 'ts', 'cli.js')).href)).toBe(root);
+  });
+});
+
+async function fixtureRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'cowshed-cli-trampoline-'));
+  fixtureRoots.push(root);
+  return root;
+}
+
+async function fixtureFile(path: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, 'fixture');
+}
