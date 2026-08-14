@@ -14,5 +14,6 @@
     {
       "path": "../statebus-core/tsconfig.lib.json"
     }
-  ]
+  ],
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"]
 }

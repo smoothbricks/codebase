@@ -3,9 +3,10 @@
 `@smoothbricks/cli` provides `smoo`, the SmoothBricks monorepo automation CLI. It is the control plane for shared CI,
 release, Git hook, package metadata, and publish validation conventions across SmoothBricks-style repositories.
 
-The tool is intentionally convention-over-configuration. SmoothBricks repos use [Nx], [Bun], [Nix], [devenv], and
-[direnv], so `smoo` assumes those pieces exist instead of adding another local config file. Repos should be made correct
-by running the mutating initialization path, then kept correct by the read-only validation path.
+The tool is intentionally convention-over-configuration. SmoothBricks repos use [Nx], [Bun], [Nix], and [devenv]
+(activated natively, or through [direnv] in repos that have not migrated), so `smoo` assumes those pieces exist instead
+of adding another local config file. Repos should be made correct by running the mutating initialization path, then kept
+correct by the read-only validation path.
 
 ## Install
 
@@ -265,6 +266,33 @@ look like configurations, and it prevents a clean split between concrete tool-ou
 Use tool-output names for concrete targets, such as `tsc-js`, `tsdown-js`, and `cargo-wasm`. Use `build` and `lint` only
 as aggregate targets. Package scripts may still use developer-friendly colon names, for example `build:wasm`, but those
 scripts should delegate to unambiguous Nx targets such as `nx run pkg:cargo-wasm`.
+
+## Package Structure
+
+Workspace packages keep all TypeScript sources — and especially all test files — under a single root: `src/`.
+
+```
+packages/<name>/
+  src/
+    foo.ts
+    foo.test.ts          # unit tests: colocated with the module they defend
+    __tests__/           # cross-module/integration TS tests, still under src/
+  crates/*/tests/        # Rust integration tests (cargo-owned convention, unaffected)
+  scripts/               # non-shipped tooling; never *.test.ts
+  dist/, target/         # generated output, never scanned
+```
+
+The test-location rule is not tidiness; it is what makes the generated tooling provably cover every test. The convention
+is one _root_, not one path: `tsconfig.test.json` includes are generated as `src/**` patterns, and the bounded
+`bun test` targets run with `cwd <package>/src` — both because `bun test <arg>` treats the argument as a filter over a
+scan rooted at the cwd (scanning from the package root would walk a Rust package's entire cargo `target/` tree, tens of
+seconds per run), and because a second test root would have to be threaded through every one of those consumers forever.
+A test file outside `src/` is therefore neither typechecked nor executed, silently. `smoo monorepo validate` fails on
+any `*.test.ts` / `*.spec.ts(x)` outside `src/` so that gap cannot reappear.
+
+Within the single root, separation still exists where it matters: unit tests sit next to their modules, integration
+tests live in `src/__tests__/`, and Rust crates keep cargo's own `tests/` directories, which the rule deliberately
+ignores.
 
 ## Managed Files
 

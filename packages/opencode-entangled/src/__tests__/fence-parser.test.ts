@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { parseFences } from '../src/fence-parser.js';
+import { parseFences } from '../fence-parser.js';
 
 describe('parseFences', () => {
   it('extracts block with #name and file= attribute', () => {

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { BlockIndex } from '../src/block-index.js';
-import { FileDB } from '../src/filedb.js';
-import { createTangleStitchHook, type HookInput, type RunCommandResult } from '../src/hooks/tangle-stitch.js';
+import { BlockIndex } from '../block-index.js';
+import { FileDB } from '../filedb.js';
+import { createTangleStitchHook, type HookInput, type RunCommandResult } from '../hooks/tangle-stitch.js';
 
 function md(...lines: string[]): string {
   return lines.join('\n');

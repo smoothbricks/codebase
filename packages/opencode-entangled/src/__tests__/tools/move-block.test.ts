@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { BlockIndex } from '../../src/block-index.js';
-import type { FileIO, RunCommand } from '../../src/tools/absorb.js';
-import { createMoveBlockTool } from '../../src/tools/move-block.js';
+import { BlockIndex } from '../../block-index.js';
+import type { FileIO, RunCommand } from '../../tools/absorb.js';
+import { createMoveBlockTool } from '../../tools/move-block.js';
 
 function createMockIO(files: Map<string, string>): FileIO {
   return {
