@@ -13,6 +13,10 @@ use cowshed_core::api::{SkillInstall, SkillInstallReport, SkillInstallStatus};
 use crate::args::{GlobalOptions, SkillArgs, SkillCommand};
 use crate::output::Output;
 
+mod generated;
+
+pub use generated::GENERATED_HARNESSES;
+
 /// The skill's directory name, and therefore how a harness refers to it.
 pub const SKILL_NAME: &str = "cowshed";
 
@@ -58,88 +62,96 @@ pub enum Scope {
     Project,
 }
 
-const CLAUDE: Harness = Harness {
-    name: "claude",
-    root: ".claude",
-    skills: ".claude/skills",
-};
-
-const CODEX: Harness = Harness {
-    name: "codex",
-    root: ".codex",
-    skills: ".codex/skills",
-};
-
-/// Harnesses that keep skills in the user's home directory.
+/// One harness's directories, independent of install scope.
 ///
-/// omp is the one harness whose skills directory is not `<root>/skills`: it
-/// reserves `~/.omp/agent/managed-skills` for skills its own auto-learn writes
-/// and keeps user-authored ones under `~/.omp/agent/skills`, which its native
-/// provider loads at the highest precedence. Installing into the managed
-/// directory would put this skill where the agent believes it may rewrite it.
-pub const GLOBAL_HARNESSES: &[Harness] = &[
-    CLAUDE,
-    CODEX,
-    Harness {
-        name: "omp",
-        root: ".omp",
-        skills: ".omp/agent/skills",
-    },
-    Harness {
-        name: "cursor",
-        root: ".cursor",
-        skills: ".cursor/skills",
-    },
-    Harness {
-        name: "opencode",
-        root: ".opencode",
-        skills: ".opencode/skills",
-    },
-    Harness {
-        name: "goose",
-        root: ".config/goose",
-        skills: ".config/goose/skills",
-    },
-    Harness {
-        name: "amp",
-        root: ".amp",
-        skills: ".amp/skills",
-    },
-];
+/// This is the shape the generated upstream snapshot emits and the shape a
+/// verified override supplies, so the two compose by name without translation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HarnessEntry {
+    pub name: &'static str,
+    /// Configuration directory, relative to the home directory. Its existence
+    /// is what marks the harness as installed.
+    pub global_root: &'static str,
+    /// Skills directory, relative to the home directory.
+    pub global_skills: &'static str,
+    /// Skills directory, relative to a repository root.
+    pub project_skills: &'static str,
+}
 
-/// Harnesses that keep skills inside the repository. Copilot and VS Code read
-/// `.github/skills`, which only ever exists per repository.
-pub const PROJECT_HARNESSES: &[Harness] = &[
-    CLAUDE,
-    CODEX,
-    Harness {
+/// A harness whose directories were verified against the harness itself on a
+/// real host, overriding the upstream snapshot by name.
+///
+/// `reason` is required: an override is a claim that upstream is wrong or silent
+/// for this harness, and that claim has to carry its evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedHarness {
+    pub entry: HarnessEntry,
+    pub reason: &'static str,
+}
+
+/// Hand-verified harnesses. These OVERRIDE `GENERATED_HARNESSES` by name.
+///
+/// Deliberately minimal: an override that merely restates upstream is the drift
+/// this snapshot exists to remove. `claude-code` and `codex` are absent here
+/// because the snapshot already matches what this host shows.
+pub const VERIFIED_HARNESSES: &[VerifiedHarness] = &[VerifiedHarness {
+    entry: HarnessEntry {
         name: "omp",
-        root: ".omp",
-        skills: ".omp/skills",
+        global_root: ".omp",
+        global_skills: ".omp/agent/skills",
+        project_skills: ".omp/skills",
     },
-    Harness {
-        name: "cursor",
-        root: ".cursor",
-        skills: ".cursor/skills",
-    },
-    Harness {
-        name: "opencode",
-        root: ".opencode",
-        skills: ".opencode/skills",
-    },
-    Harness {
-        name: "copilot",
-        root: ".github",
-        skills: ".github/skills",
-    },
-];
+    reason: "absent upstream; omp's own binary states that user-authored skills \
+             live under ~/.omp/agent/skills and .omp/skills, and reserves \
+             ~/.omp/agent/managed-skills for skills its auto-learn may rewrite",
+}];
+
+/// The harness installed to when detection finds nothing, so that an install is
+/// never a silent no-op.
+const FALLBACK_HARNESS: &str = "claude-code";
+
+/// Verified entries first, then every generated entry they do not override.
+#[must_use]
+pub fn harness_entries() -> Vec<&'static HarnessEntry> {
+    let mut entries: Vec<&'static HarnessEntry> = VERIFIED_HARNESSES
+        .iter()
+        .map(|verified| &verified.entry)
+        .collect();
+    let overridden: Vec<&str> = entries.iter().map(|entry| entry.name).collect();
+    entries.extend(
+        GENERATED_HARNESSES
+            .iter()
+            .filter(|generated| !overridden.contains(&generated.name)),
+    );
+    entries
+}
+
+impl HarnessEntry {
+    fn in_scope(&self, scope: Scope) -> Harness {
+        let skills = match scope {
+            Scope::Global => self.global_skills,
+            Scope::Project => self.project_skills,
+        };
+        let root = match scope {
+            Scope::Global => self.global_root,
+            // A repository-relative skills directory always sits under the
+            // harness's own dotted directory, so its first segment is the probe.
+            Scope::Project => skills.split('/').next().unwrap_or(skills),
+        };
+        Harness {
+            name: self.name,
+            root,
+            skills,
+        }
+    }
+}
 
 #[must_use]
-pub fn harnesses(scope: Scope) -> &'static [Harness] {
-    match scope {
-        Scope::Global => GLOBAL_HARNESSES,
-        Scope::Project => PROJECT_HARNESSES,
-    }
+pub fn harnesses(scope: Scope) -> Vec<Harness> {
+    harness_entries()
+        .into_iter()
+        .map(|entry| entry.in_scope(scope))
+        .collect()
 }
 
 /// Resolve a `--harness` value within a scope. Returns `None` for an unknown
@@ -152,14 +164,49 @@ pub fn harness_named(scope: Scope, name: &str) -> Option<Harness> {
         .find(|harness| harness.name == name)
 }
 
-/// The accepted `--harness` values for a scope, for usage messages.
+/// A sample of accepted `--harness` values, for usage messages.
+///
+/// The snapshot carries dozens of harnesses, so a usage error names a few and
+/// reports the total rather than printing an unreadable wall of names.
 #[must_use]
 pub fn harness_names(scope: Scope) -> String {
-    harnesses(scope)
+    const SAMPLE: usize = 8;
+    let all = harnesses(scope);
+    let sample = all
         .iter()
+        .take(SAMPLE)
         .map(|harness| harness.name)
         .collect::<Vec<_>>()
-        .join("|")
+        .join("|");
+    if all.len() > SAMPLE {
+        format!("{sample}| and {} more", all.len() - SAMPLE)
+    } else {
+        sample
+    }
+}
+
+/// Harness names related to `name`, for correcting a near miss.
+///
+/// Substring matching in both directions is what turns the common rename
+/// mistakes — `copilot` for `github-copilot`, `claude` for `claude-code` — into
+/// a usable suggestion instead of an alphabetical sample of dozens of names.
+#[must_use]
+pub fn harness_suggestions(scope: Scope, name: &str) -> Vec<&'static str> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let lowered = name.to_ascii_lowercase();
+    harnesses(scope)
+        .into_iter()
+        .filter(|harness| {
+            // Only a substantial harness name may match by being contained in
+            // the input, or short names match everything: `pi` is inside
+            // `copilot` and would drown the real suggestion.
+            harness.name.contains(lowered.as_str())
+                || (harness.name.len() >= 4 && lowered.contains(harness.name))
+        })
+        .map(|harness| harness.name)
+        .collect()
 }
 
 /// Choose install targets without touching the filesystem.
@@ -185,7 +232,7 @@ pub fn plan(
         .filter(|harness| exists(&harness.root(base)))
         .collect();
     if detected.is_empty() {
-        vec![CLAUDE]
+        harness_named(scope, FALLBACK_HARNESS).into_iter().collect()
     } else {
         detected
     }
@@ -304,6 +351,11 @@ mod tests {
         false
     }
 
+    /// The fallback harness, resolved through the composed table.
+    fn fallback() -> Harness {
+        harness_named(Scope::Global, FALLBACK_HARNESS).expect("the fallback harness exists")
+    }
+
     /// A fresh directory per test, following the crate's temp-dir convention.
     fn scratch(label: &str) -> PathBuf {
         let directory =
@@ -375,15 +427,15 @@ mod tests {
         let planned = plan(base, Scope::Global, &[], &present);
 
         let names: Vec<&str> = planned.iter().map(|harness| harness.name).collect();
-        assert_eq!(names, ["claude", "cursor"]);
+        assert_eq!(names, ["claude-code", "cursor"]);
     }
 
     #[test]
-    fn an_undetected_host_still_installs_for_claude_rather_than_nowhere() {
+    fn an_undetected_host_still_installs_for_the_fallback_rather_than_nowhere() {
         let planned = plan(Path::new("/home/agent"), Scope::Global, &[], &never);
 
         let names: Vec<&str> = planned.iter().map(|harness| harness.name).collect();
-        assert_eq!(names, ["claude"]);
+        assert_eq!(names, [FALLBACK_HARNESS]);
     }
 
     #[test]
@@ -396,43 +448,130 @@ mod tests {
         assert_eq!(names, ["goose"]);
     }
 
-    /// Each harness's directory is its published discovery path, so these are
-    /// pinned literally: a silent change here installs where nothing looks.
+    /// Spot-checks, not the whole table: the snapshot is refreshed from
+    /// upstream, so pinning every entry would turn a routine refresh into a test
+    /// rewrite. These four cover the shapes that break silently.
     #[test]
-    fn every_harness_targets_its_published_discovery_path() {
+    fn representative_harnesses_target_their_published_discovery_paths() {
         let base = Path::new("/home/agent");
-        let global: Vec<(&str, String)> = GLOBAL_HARNESSES
-            .iter()
-            .map(|harness| (harness.name, harness.skill_file(base).display().to_string()))
-            .collect();
+        let global = |name: &str| {
+            harness_named(Scope::Global, name)
+                .unwrap_or_else(|| panic!("{name} is a global harness"))
+                .skill_file(base)
+                .display()
+                .to_string()
+        };
 
         assert_eq!(
-            global,
-            [
-                ("claude", "/home/agent/.claude/skills/cowshed/SKILL.md"),
-                ("codex", "/home/agent/.codex/skills/cowshed/SKILL.md"),
-                // Not .omp/agent/managed-skills: that directory is reserved for
-                // skills omp's auto-learn writes and may rewrite.
-                ("omp", "/home/agent/.omp/agent/skills/cowshed/SKILL.md"),
-                ("cursor", "/home/agent/.cursor/skills/cowshed/SKILL.md"),
-                ("opencode", "/home/agent/.opencode/skills/cowshed/SKILL.md"),
-                ("goose", "/home/agent/.config/goose/skills/cowshed/SKILL.md"),
-                ("amp", "/home/agent/.amp/skills/cowshed/SKILL.md"),
-            ]
-            .map(|(name, path)| (name, path.to_owned()))
+            global("claude-code"),
+            "/home/agent/.claude/skills/cowshed/SKILL.md"
+        );
+        assert_eq!(
+            global("codex"),
+            "/home/agent/.codex/skills/cowshed/SKILL.md"
+        );
+        // The verified override: not .omp/agent/managed-skills, which omp's
+        // auto-learn owns and may rewrite.
+        assert_eq!(
+            global("omp"),
+            "/home/agent/.omp/agent/skills/cowshed/SKILL.md"
+        );
+        // amp is the shape that breaks naive derivation: its probe directory is
+        // not the parent of its skills directory.
+        let amp = harness_named(Scope::Global, "amp").expect("amp is a global harness");
+        assert_eq!(
+            amp.skill_file(base).display().to_string(),
+            "/home/agent/.config/agents/skills/cowshed/SKILL.md"
+        );
+        assert_eq!(
+            amp.root(base).display().to_string(),
+            "/home/agent/.config/amp"
         );
 
         let project = Path::new("/repo");
-        let codex = harness_named(Scope::Project, "codex").expect("codex is a project harness");
-        assert_eq!(
-            codex.skill_file(project).display().to_string(),
-            "/repo/.codex/skills/cowshed/SKILL.md"
-        );
         let omp = harness_named(Scope::Project, "omp").expect("omp is a project harness");
         assert_eq!(
             omp.skill_file(project).display().to_string(),
             "/repo/.omp/skills/cowshed/SKILL.md",
             "omp nests user skills under agent/ only in the home directory"
+        );
+        assert_eq!(
+            omp.root(project).display().to_string(),
+            "/repo/.omp",
+            "a project probe is the first segment of the skills directory"
+        );
+    }
+
+    #[test]
+    fn a_near_miss_harness_name_suggests_the_real_one() {
+        assert_eq!(
+            harness_suggestions(Scope::Global, "copilot"),
+            ["github-copilot"],
+            "a short name inside the input must not drown the real suggestion"
+        );
+        assert_eq!(
+            harness_suggestions(Scope::Global, "claude"),
+            ["claude-code"]
+        );
+        assert!(harness_suggestions(Scope::Global, "zzz").is_empty());
+        assert!(harness_suggestions(Scope::Global, "").is_empty());
+    }
+
+    #[test]
+    fn the_generated_snapshot_parses_into_usable_entries() {
+        assert!(
+            GENERATED_HARNESSES.len() >= 40,
+            "a snapshot this small means the generator stopped parsing upstream"
+        );
+
+        let mut names: Vec<&str> = GENERATED_HARNESSES.iter().map(|entry| entry.name).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(names.len(), unique, "snapshot names must be unique");
+
+        for entry in GENERATED_HARNESSES {
+            for path in [entry.global_root, entry.global_skills, entry.project_skills] {
+                assert!(!path.is_empty(), "{} has an empty path", entry.name);
+                assert!(
+                    !path.starts_with('/') && !path.split('/').any(|part| part == ".."),
+                    "{} escapes its install base via {path}",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verified_entries_override_the_snapshot_and_appear_exactly_once() {
+        let entries = harness_entries();
+
+        for verified in VERIFIED_HARNESSES {
+            let matching: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.name == verified.entry.name)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{} must appear once, not once per source",
+                verified.entry.name
+            );
+            assert_eq!(
+                **matching[0], verified.entry,
+                "the verified entry must win over the snapshot"
+            );
+            assert!(
+                !verified.reason.is_empty(),
+                "an override must carry its evidence"
+            );
+        }
+
+        // omp is currently the only override precisely because it is absent
+        // upstream; if upstream adds it, this is the reminder to re-verify.
+        assert!(
+            !GENERATED_HARNESSES.iter().any(|entry| entry.name == "omp"),
+            "upstream now ships omp: re-verify the override against its binary"
         );
     }
 
@@ -448,34 +587,44 @@ mod tests {
         let planned = plan(base, Scope::Global, &[], &present);
 
         let names: Vec<&str> = planned.iter().map(|harness| harness.name).collect();
-        assert_eq!(names, ["codex", "omp"]);
+        assert_eq!(
+            names,
+            ["omp", "codex"],
+            "verified entries lead the composed table, then the snapshot in name order"
+        );
     }
 
     #[test]
-    fn scopes_expose_only_the_harnesses_that_can_hold_skills_there() {
-        assert!(
-            harness_named(Scope::Project, "copilot").is_some(),
-            "copilot reads .github/skills, which is per repository"
-        );
-        assert!(
-            harness_named(Scope::Global, "copilot").is_none(),
-            "copilot has no home-directory skill directory"
-        );
-        assert!(
-            harness_named(Scope::Project, "goose").is_none(),
-            "goose keeps skills under the home config directory only"
-        );
-        for name in ["codex", "omp"] {
-            assert!(harness_named(Scope::Global, name).is_some());
-            assert!(harness_named(Scope::Project, name).is_some());
+    fn a_harness_is_addressable_in_both_scopes_and_unknown_names_are_rejected() {
+        // Every harness in the snapshot carries both a home and a repository
+        // directory, so a name is valid in either scope; only the resolved path
+        // differs. Scope no longer gates which names exist.
+        for name in ["claude-code", "codex", "omp", "github-copilot", "goose"] {
+            assert!(
+                harness_named(Scope::Global, name).is_some(),
+                "{name} should resolve globally"
+            );
+            assert!(
+                harness_named(Scope::Project, name).is_some(),
+                "{name} should resolve per repository"
+            );
         }
         assert!(harness_named(Scope::Global, "nonesuch").is_none());
+        assert!(harness_named(Scope::Project, "nonesuch").is_none());
+
+        // The usage sample stays readable even though the table is large.
+        let names = harness_names(Scope::Global);
+        assert!(names.contains("more"), "{names}");
+        assert!(
+            names.len() < 200,
+            "usage sample is too long to read: {names}"
+        );
     }
 
     #[test]
     fn install_writes_once_then_reports_unchanged_without_rewriting() {
         let base = scratch("idempotent");
-        let planned = vec![CLAUDE];
+        let planned = vec![fallback()];
 
         let first = install(&base, &planned).expect("first install");
         assert_eq!(first.installs[0].status, SkillInstallStatus::Written);
@@ -503,9 +652,9 @@ mod tests {
     #[test]
     fn a_drifted_skill_is_restored_to_the_shipped_bytes() {
         let base = scratch("drift");
-        let planned = vec![CLAUDE];
-        let path = CLAUDE.skill_file(&base);
-        std::fs::create_dir_all(CLAUDE.destination(&base)).expect("mkdir");
+        let planned = vec![fallback()];
+        let path = fallback().skill_file(&base);
+        std::fs::create_dir_all(fallback().destination(&base)).expect("mkdir");
         std::fs::write(&path, "stale").expect("seed");
 
         let report = install(&base, &planned).expect("install");

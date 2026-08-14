@@ -146,7 +146,7 @@ fn skill_install_splits_tsv_stdout_from_guidance_and_hints_exactly_once() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(
         stdout,
-        format!("claude\twritten\t{}\n", installed.display()),
+        format!("claude-code\twritten\t{}\n", installed.display()),
         "stdout carries only the machine answer"
     );
 
@@ -194,7 +194,7 @@ fn skill_install_is_idempotent_and_reports_unchanged() {
             "result": {
                 "skill": "cowshed",
                 "installs": [{
-                    "harness": "claude",
+                    "harness": "claude-code",
                     "path": home.join(".claude/skills/cowshed/SKILL.md").to_str().unwrap(),
                     "status": "unchanged",
                 }],

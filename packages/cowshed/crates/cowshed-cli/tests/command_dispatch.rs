@@ -1041,10 +1041,10 @@ async fn concurrent_invocations_serialize_same_name_create() {
 }
 
 #[test]
-fn skill_install_parses_repeated_harnesses_once_and_scopes_them_by_project() {
+fn skill_install_parses_repeated_harnesses_once_and_validates_names() {
     use cowshed_cli::args::{Command, SkillCommand};
 
-    let global = parse_args([
+    let parsed = parse_args([
         "skill",
         "install",
         "--harness",
@@ -1052,48 +1052,37 @@ fn skill_install_parses_repeated_harnesses_once_and_scopes_them_by_project() {
         "--harness",
         "cursor",
     ])
-    .expect("global scope accepts cursor");
-    match global.command {
+    .expect("cursor is a known harness");
+    match parsed.command {
         Command::Skill(args) => {
             assert_eq!(args.action, SkillCommand::Install);
             assert_eq!(args.harnesses, ["cursor"], "a repeated harness is deduped");
         }
         other => panic!("{other:?}"),
     }
-    assert!(global.global.project.is_none());
+    assert!(parsed.global.project.is_none());
 
     let project = parse_args([
         "skill",
         "install",
         "--harness",
-        "copilot",
+        "github-copilot",
         "--project",
         "/repo",
     ])
-    .expect("project scope accepts copilot");
+    .expect("github-copilot is a known harness");
     match project.command {
-        Command::Skill(args) => assert_eq!(args.harnesses, ["copilot"]),
+        Command::Skill(args) => assert_eq!(args.harnesses, ["github-copilot"]),
         other => panic!("{other:?}"),
     }
     assert_eq!(project.global.project, Some(PathBuf::from("/repo")));
 
-    // Scope decides which names exist, and --project may appear after --harness.
+    // Names come from the generated snapshot, which uses upstream's spelling.
     assert!(
         parse_args(["skill", "install", "--harness", "copilot"]).is_err(),
-        "copilot has no home-directory skill directory"
+        "the harness is spelled github-copilot"
     );
-    assert!(
-        parse_args([
-            "skill",
-            "install",
-            "--harness",
-            "goose",
-            "--project",
-            "/repo"
-        ])
-        .is_err(),
-        "goose keeps skills under the home config directory only"
-    );
+    assert!(parse_args(["skill", "install", "--harness", "nonesuch"]).is_err());
 }
 
 #[test]
