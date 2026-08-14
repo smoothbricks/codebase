@@ -55,6 +55,11 @@ impl MainRemote {
     }
 }
 
+/// Where a linked-worktree registration is taken out before its pointer is moved to the mount
+/// root. Inside the image, so it is on the workspace's own volume and gone before the mount is
+/// published; under `.cowshed/` because that subtree is already cowshed's and not the repository's.
+const WORKTREE_STAGING: &str = ".cowshed/worktree-staging";
+
 /// The name of the remote main registers for a workspace under `--register`.
 pub fn workspace_remote_name(workspace: &str) -> String {
     format!("cowshed/{workspace}")
@@ -477,6 +482,207 @@ impl GitRepository {
         ensure_git_success("remove workspace remote", output)
     }
 
+    /// Turn this freshly cloned image into a registered linked worktree of the repository at
+    /// `main_mount`, then create the session branch — `cowshed new --git-worktree`.
+    ///
+    /// `self.root` is the workspace mount; `main_mount` is main's *canonical mount*, never the
+    /// recorded checkout path, for the same reason the `main` remote uses it: a registration
+    /// recorded through the checkout symlink breaks the moment the checkout moves, and
+    /// `git worktree repair` would then have two plausible paths and no way to choose.
+    ///
+    /// The cloned `.git` **directory** is discarded first. It is a complete copy of main's
+    /// repository, and a linked worktree carrying one would mean two registrations claiming a
+    /// single worktree id.
+    ///
+    /// `git worktree add` insists on creating the path it registers, and the tree is already here
+    /// from the clone, so the registration is taken out through a staging directory inside the
+    /// mount and the pointer file is then relocated onto the mount root. The staging directory's
+    /// name is the worktree id git derives, which is why it is the workspace name rather than
+    /// anything mount-derived: `--slot` mounts do not carry the name, and retirement has to find
+    /// the registration from the name alone.
+    pub async fn adopt_as_linked_worktree(
+        &self,
+        name: &str,
+        main_mount: &Path,
+        start: Option<&str>,
+    ) -> Result<()> {
+        if !main_mount.is_absolute() {
+            return Err(CowshedError::usage(
+                "linked worktree repository must be an absolute local path",
+                "retry from a resolved repository root",
+            ));
+        }
+        let main = Self::from_root(main_mount);
+        let branch = format!("cowshed/{name}");
+        let branch_ref = format!("refs/heads/{branch}");
+        // The branch is created in main's ref namespace, so the collision to check is main's, not
+        // this image's — the image is about to stop having a ref namespace of its own.
+        let exists = main
+            .run(["show-ref", "--verify", "--quiet", branch_ref.as_str()])
+            .await?;
+        if exists.status.success() {
+            return Err(CowshedError::conflict(
+                format!("branch {branch} already exists in main's repository"),
+                format!("remove or rename {branch}, then retry: cowshed new {name} --git-worktree"),
+            ));
+        }
+        if exists.status.code() != Some(1) {
+            return Err(git_internal("check workspace branch", &exists));
+        }
+        let admin = main.worktree_admin_dir(name).await?;
+        if admin.exists() {
+            return Err(CowshedError::conflict(
+                format!("main already registers a linked worktree named {name}"),
+                format!("cowshed rm {name}"),
+            ));
+        }
+
+        let head = main.head_oid().await?;
+        let mount = self.root.clone();
+        let staging = mount.join(WORKTREE_STAGING);
+        let staged = staging.join(name);
+        let dot_git = mount.join(".git");
+        tokio::task::spawn_blocking({
+            let dot_git = dot_git.clone();
+            let staging = staging.clone();
+            move || -> std::io::Result<()> {
+                if dot_git.is_dir() {
+                    fs::remove_dir_all(&dot_git)?;
+                } else if dot_git.exists() {
+                    fs::remove_file(&dot_git)?;
+                }
+                if staging.exists() {
+                    fs::remove_dir_all(&staging)?;
+                }
+                fs::create_dir_all(&staging)
+            }
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("prepare worktree staging: {error}")))?
+        .map_err(|error| {
+            CowshedError::internal(format!(
+                "prepare worktree staging at {}: {error}",
+                staging.display()
+            ))
+        })?;
+
+        let output = main
+            .run([
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--no-checkout"),
+                OsStr::new("--detach"),
+                staged.as_os_str(),
+                OsStr::new(head.as_str()),
+            ])
+            .await?;
+        ensure_git_success("register linked worktree", output)?;
+        if !admin.is_dir() {
+            return Err(CowshedError::integrity(
+                format!("git registered the linked worktree for {name} under another id"),
+                "cowshed doctor --json",
+            ));
+        }
+
+        tokio::task::spawn_blocking({
+            let staged = staged.clone();
+            let staging = staging.clone();
+            move || -> std::io::Result<()> {
+                fs::rename(staged.join(".git"), &dot_git)?;
+                fs::remove_dir_all(&staging)
+            }
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("relocate worktree pointer: {error}")))?
+        .map_err(|error| {
+            CowshedError::internal(format!(
+                "relocate worktree pointer onto {}: {error}",
+                mount.display()
+            ))
+        })?;
+
+        // Reconcile the other direction: the admin directory still records the staging path.
+        main.repair_linked_worktree(&mount).await?;
+
+        // `--no-checkout` left the index empty, so every file the clone brought would read as
+        // deleted. A mixed reset refills the index from HEAD without touching the tree, which
+        // leaves main's uncommitted edits showing as modified — exactly what a standalone clone of
+        // the same image shows.
+        let reset = self.run(["reset", "-q"]).await?;
+        ensure_git_success("populate linked worktree index", reset)?;
+
+        let mut args = vec![
+            OsString::from("switch"),
+            OsString::from("-c"),
+            OsString::from(branch),
+        ];
+        if let Some(start) = start {
+            args.push(OsString::from("--"));
+            args.push(OsString::from(start));
+        }
+        let output = self.run(args).await?;
+        ensure_git_success("create workspace branch", output)?;
+        Ok(())
+    }
+
+    /// Point this repository's registration for `mount` back at the mount, both directions.
+    ///
+    /// The primitive git provides for exactly this two-way pointer fixup, and the one `cowshed mv`
+    /// runs after moving either end.
+    pub async fn repair_linked_worktree(&self, mount: &Path) -> Result<()> {
+        let output = self
+            .run([
+                OsStr::new("worktree"),
+                OsStr::new("repair"),
+                mount.as_os_str(),
+            ])
+            .await?;
+        ensure_git_success("repair linked worktree registration", output)
+    }
+
+    /// Drop `workspace`'s linked-worktree registration from this repository, which is main's.
+    /// Absent is success: retirement is idempotent and `gc` re-runs it from the same revalidated
+    /// metadata that authorizes the rest of cleanup.
+    ///
+    /// Removing the admin directory *is* the unregistration, and the two commands that look more
+    /// obvious are both wrong here. `git worktree remove` deletes the working tree at the
+    /// registered path — the workspace's own files, which retirement trashes as an image and `gc`
+    /// may find already gone — and refuses outright on dirty state that `--force` retirement has
+    /// already accepted. `git worktree prune` unregisters *every* worktree whose path is missing,
+    /// and a merely detached cowshed workspace looks exactly like that; the registration to drop
+    /// is the one named by revalidated metadata, never the one that happens to look absent.
+    pub async fn unregister_linked_worktree(&self, workspace: &str) -> Result<()> {
+        let admin = self.worktree_admin_dir(workspace).await?;
+        if !admin.exists() {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || fs::remove_dir_all(admin))
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("unregister linked worktree: {error}"))
+            })?
+            .map_err(|error| CowshedError::internal(format!("unregister linked worktree: {error}")))
+    }
+
+    /// Where this repository keeps the administrative state for the linked worktree `id`.
+    ///
+    /// Resolved through git rather than assembled as `.git/worktrees/<id>`, so it stays correct
+    /// for a repository whose git directory is not where the naive spelling would put it.
+    async fn worktree_admin_dir(&self, id: &str) -> Result<PathBuf> {
+        let output = self
+            .run([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                &format!("worktrees/{id}"),
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("resolve linked worktree state", &output));
+        }
+        parse_one_path(&output.stdout, "linked worktree state")
+    }
+
     async fn remote_names(&self) -> Result<Vec<String>> {
         let output = self.run(["remote"]).await?;
         if !output.status.success() {
@@ -846,6 +1052,203 @@ mod tests {
         assert_eq!(remotes[0].name, MAIN_REMOTE);
         assert_eq!(Path::new(&remotes[0].url), root);
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// Clone main's tree the way the substrate does — files and all, `.git` included — so the
+    /// mint step under test starts from exactly what a CoW clone hands it.
+    fn clone_image(main: &Path) -> PathBuf {
+        let mount = main.with_extension("workspace");
+        let status = Command::new("/bin/cp")
+            .args(["-R".as_ref(), main.as_os_str(), mount.as_os_str()])
+            .status()
+            .expect("clone image");
+        assert!(status.success());
+        mount
+    }
+
+    fn git_stdout(root: &Path, args: &[&str]) -> String {
+        let output = Command::new(GIT)
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8(output.stdout).expect("git output is utf-8")
+    }
+
+    /// The whole mint sequence, witnessed by what main and the workspace actually hold: one
+    /// registration, no second repository, the branch in main's namespace, and no remote at all.
+    #[tokio::test]
+    async fn adopting_a_clone_as_a_linked_worktree_leaves_one_registration_and_no_remote() {
+        let main = repository();
+        // Uncommitted work in main is carried by the clone, and must read as modified rather than
+        // as the wholesale deletion an empty index would report.
+        fs::write(main.join("README"), "test\nlocal edit\n").expect("dirty main");
+        let mount = clone_image(&main);
+
+        GitRepository::from_root(&mount)
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect("adopt as linked worktree");
+
+        let workspace = GitRepository::from_root(&mount);
+        assert_eq!(
+            workspace
+                .current_branch()
+                .await
+                .expect("read branch")
+                .as_deref(),
+            Some("cowshed/raven")
+        );
+        // A linked worktree carries a pointer file, never a second copy of the repository.
+        assert!(mount.join(".git").is_file());
+        assert!(!mount.join(".cowshed/worktree-staging").exists());
+        // Nothing to fetch from when the object store is shared.
+        assert!(workspace.remotes().await.expect("read remotes").is_empty());
+        // The branch is in main's ref namespace immediately, with no fetch.
+        assert!(
+            git_stdout(&main, &["branch", "--list", "cowshed/raven"]).contains("cowshed/raven")
+        );
+        // Registered under the workspace name, pointing at the mount, and reconciled both ways.
+        let resolved = mount.canonicalize().expect("resolve mount");
+        let listed = git_stdout(&main, &["worktree", "list"]);
+        assert!(
+            listed.contains(resolved.to_str().expect("utf-8 mount")),
+            "{listed}"
+        );
+        assert_eq!(
+            PathBuf::from(
+                fs::read_to_string(main.join(".git/worktrees/raven/gitdir"))
+                    .expect("admin gitdir")
+                    .trim()
+            ),
+            resolved.join(".git")
+        );
+        // The index came from HEAD, so main's uncommitted edit reads as a modification.
+        assert_eq!(
+            git_stdout(&mount, &["status", "--short"]).trim(),
+            "M README"
+        );
+
+        GitRepository::from_root(&main)
+            .unregister_linked_worktree("raven")
+            .await
+            .expect("unregister");
+        assert!(!main.join(".git/worktrees/raven").exists());
+        // Absent is success, so an interrupted retire can be finished by `gc`.
+        GitRepository::from_root(&main)
+            .unregister_linked_worktree("raven")
+            .await
+            .expect("second unregister is a no-op");
+
+        fs::remove_dir_all(main).expect("remove fixture");
+        fs::remove_dir_all(mount).expect("remove clone");
+    }
+
+    /// Unregistering one workspace must leave every other registration alone — including one whose
+    /// path is missing, which is what a merely detached workspace looks like and what a bare
+    /// `git worktree prune` would silently take with it.
+    #[tokio::test]
+    async fn unregistering_one_worktree_spares_a_detached_sibling() {
+        let main = repository();
+        let raven = clone_image(&main);
+        let detached = main.with_extension("detached");
+        fs::create_dir_all(&detached).expect("sibling mount");
+
+        GitRepository::from_root(&raven)
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect("adopt raven");
+        GitRepository::from_root(&detached)
+            .adopt_as_linked_worktree("heron", &main, None)
+            .await
+            .expect("adopt heron");
+        // Detaching a workspace removes its volume from the filesystem; the registration stays.
+        fs::remove_dir_all(&detached).expect("detach heron");
+
+        GitRepository::from_root(&main)
+            .unregister_linked_worktree("raven")
+            .await
+            .expect("unregister raven");
+
+        assert!(!main.join(".git/worktrees/raven").exists());
+        assert!(
+            main.join(".git/worktrees/heron").exists(),
+            "a detached workspace's registration must survive another workspace's retirement"
+        );
+        fs::remove_dir_all(main).expect("remove fixture");
+        fs::remove_dir_all(raven).expect("remove clone");
+    }
+
+    /// `cowshed mv` moves main under direct mount, invalidating every gitdir pointer at once. The
+    /// repair runs from main's new path and has to fix both directions.
+    #[tokio::test]
+    async fn repair_reconciles_both_pointers_after_main_moves() {
+        let main = repository();
+        let mount = clone_image(&main);
+        GitRepository::from_root(&mount)
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect("adopt as linked worktree");
+
+        let moved = main.with_extension("moved");
+        fs::rename(&main, &moved).expect("move main");
+        assert!(
+            GitRepository::from_root(&mount).head_oid().await.is_err(),
+            "a stale pointer must fail loudly rather than resolve somewhere else"
+        );
+
+        GitRepository::from_root(&moved)
+            .repair_linked_worktree(&mount)
+            .await
+            .expect("repair after main moved");
+
+        assert_eq!(
+            fs::read_to_string(mount.join(".git"))
+                .expect("pointer file")
+                .trim(),
+            format!(
+                "gitdir: {}",
+                moved
+                    .canonicalize()
+                    .expect("resolve main")
+                    .join(".git/worktrees/raven")
+                    .display()
+            )
+        );
+        GitRepository::from_root(&mount)
+            .head_oid()
+            .await
+            .expect("workspace git works again");
+        fs::remove_dir_all(moved).expect("remove fixture");
+        fs::remove_dir_all(mount).expect("remove clone");
+    }
+
+    /// A branch main already holds is main's, and the registration id is the workspace name, so
+    /// both collisions have to be refused rather than silently renamed by git.
+    #[tokio::test]
+    async fn adoption_refuses_a_branch_or_registration_main_already_holds() {
+        let main = repository();
+        let mount = clone_image(&main);
+        let status = Command::new(GIT)
+            .arg("-C")
+            .arg(&main)
+            .args(["branch", "cowshed/raven"])
+            .status()
+            .expect("create colliding branch");
+        assert!(status.success());
+
+        let error = GitRepository::from_root(&mount)
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect_err("colliding branch must refuse");
+        assert_eq!(error.code.as_str(), "conflict");
+        // Refused before anything was discarded: the image is still a repository.
+        assert!(mount.join(".git").is_dir());
+
+        fs::remove_dir_all(main).expect("remove fixture");
+        fs::remove_dir_all(mount).expect("remove clone");
     }
 
     /// The three cases of `configure_main_remote`, witnessed by what the config actually holds

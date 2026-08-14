@@ -117,6 +117,7 @@ impl Default for WorkspaceSupervisorConfig {
                 grants: crate::sandbox::SandboxGrants::default(),
                 allowed_unix_sockets: Vec::new(),
                 additional_denies: Vec::new(),
+                git_worktree_repository: None,
             },
             artifacts: ArtifactConfig::default(),
             term_grace: Duration::from_secs(2),

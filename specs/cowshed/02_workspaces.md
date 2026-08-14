@@ -302,10 +302,29 @@ gains three steps between attach and publication:
    and `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already
    present from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto
    the mount root, and reconciles both directions with `git -C <main-canonical-mount> worktree repair <mount>`, which is
-   the primitive git provides for exactly this two-way pointer fixup.
-3. `git switch -c cowshed/<name>` as usual. The branch is created in main's ref namespace, so it is visible from main
-   immediately — with no fetch, and no `main` remote, which a git-worktree workspace does not get: there is nothing to
-   fetch from when the object store is already shared.
+   the primitive git provides for exactly this two-way pointer fixup. `git worktree add` insists on creating the path
+   it registers, so the registration is taken out through a staging directory inside the image and the pointer file is
+   moved up to the mount root afterwards; the staging directory's name is the worktree id git derives from it, which is
+   why it is the workspace name and not anything mount-derived — a `--slot` mount does not carry the name, and
+   retirement has to find the registration from the name alone.
+3. Refill the index from `HEAD` with a mixed reset, then `git switch -c cowshed/<name>` as usual. `--no-checkout` leaves
+   the index empty, and an empty index against a full tree reads as the wholesale deletion of every file; the reset
+   restores the reading a standalone clone gives — main's uncommitted edits present and modified. The branch is created
+   in main's ref namespace, so it is visible from main immediately — with no fetch, and no `main` remote, which a
+   git-worktree workspace does not get: there is nothing to fetch from when the object store is already shared. For the
+   same reason `cowshed rebase` defaults to replaying onto `main` itself rather than onto a remote-tracking ref, and
+   fetches nothing first.
+
+A workspace's mode is not only requested, it is **inherited**. `cowshed fork`, `cowshed new --from`, and the fork half
+of `cowshed mv` all clone an image whose only git state is a pointer file naming the *source's* registration, so a clone
+of a git-worktree workspace is re-registered under its own id and is a git-worktree workspace too. There is no image
+to be standalone from. `--register` is refused alongside `--git-worktree` rather than quietly ignored: a reverse remote
+exists so main can fetch a workspace's branch, and main already holds that branch.
+
+Main's config is shared along with its objects, so the network remotes in it are visible from inside a git-worktree
+workspace — cowshed cannot strip them without editing the user's own repository, and does not. The invariant that holds
+is the enforced one: the sandbox has no egress those URLs could reach, and cowshed still never *writes* a remote URL
+into a repository a workspace can see.
 
 **Main must be mounted**, at mint and at every subsequent attach and exec. The gitdir lives outside the workspace's
 volume, so with main detached the workspace has files and no repository — `git status` fails, and so does everything
@@ -315,8 +334,12 @@ usable with main detached, unmounted, or being restored, and a git-worktree work
 
 It is also a hole in the isolation, stated plainly. The sandbox needs read and write into
 `<main-canonical-mount>/.git/worktrees/<ws>` and into main's object store — a committing agent writes objects into the
-user's own repository. Grants carry that hole explicitly (04_sandbox.md); it is not implied by the baseline, and a
-workspace that did not ask for `--git-worktree` never has it.
+user's own repository. The profile carries that hole as a distinct, controller-owned carve-back on
+`<main-canonical-mount>/.git` and nothing wider, emitted after every deny that would otherwise close it (04_sandbox.md).
+It cannot be an ordinary read/write grant: grants are refused outright when they intersect a protected path, and main's
+mount is one under both layouts — inside cowshed's store under the symlink layout, and the denied project root under
+direct mount. Main's working tree stays as unreachable as any other workspace's, and a workspace that did not ask for
+`--git-worktree` never has any of it.
 
 **Checkpoint and restore refuse** on a git-worktree workspace, exit 4, with `next:` hints. The image is not
 self-contained: a checkpoint clone would capture a tree whose history lives in a repository it does not include, so the
@@ -326,11 +349,20 @@ another workspace may now hold. The hints name the two honest substitutes: commi
 or `cowshed new` a standalone workspace when checkpointing is what is actually wanted. Cowshed refuses rather than
 checkpointing something that cannot be restored.
 
-`cowshed rm` prunes the registration as part of retirement, in the same host-side-state-first step that drops a reverse
-remote: remove the worktree registration from main's repository, then prune, then trash the image. A registration
-orphaned by an interrupted retire is removed idempotently by `cowshed gc` from revalidated retirement metadata — never
-from the mere observation that a registered worktree's path is not mounted, which is also what a detached workspace
-looks like.
+`cowshed rm` drops the registration as part of retirement, in the same host-side-state-first step that drops a reverse
+remote: remove the worktree registration from main's repository, then trash the image. Unregistering is the removal of
+that worktree's administrative directory and nothing else, because both commands that look more obvious are wrong here.
+`git worktree remove` deletes the working tree at the registered path — the workspace's own files, which retirement
+trashes as an image and `gc` may find already gone — and refuses on dirty state that `rm --force` has already accepted.
+`git worktree prune` unregisters *every* worktree whose path is missing, and a merely detached cowshed workspace looks
+exactly like that. A registration orphaned by an interrupted retire is removed idempotently by `cowshed gc` from
+revalidated retirement metadata, before the image that carries that metadata is deleted — never from the mere
+observation that a registered worktree's path is not mounted.
+
+The mode is recorded store-side, in the workspace's detached sidecar, for the same reason: every decision it drives —
+refusing checkpoint, requiring main mounted, pruning the registration at retirement — has to be made while the workspace
+is detached and its mount can say nothing. A sidecar written before the mode existed has no such field and describes a
+standalone workspace, which is the correct answer rather than a gap.
 
 `cowshed mv` repairs registrations. Moving main under direct mount moves the gitdir every git-worktree workspace points
 at, and moving a workspace moves the path main's registration records; both directions are repaired inside the same

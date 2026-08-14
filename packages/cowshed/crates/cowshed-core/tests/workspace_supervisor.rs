@@ -349,6 +349,7 @@ fn config() -> WorkspaceSupervisorConfig {
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
             additional_denies: Vec::new(),
+            git_worktree_repository: None,
         },
         artifacts: ArtifactConfig {
             combined_output_quota_bytes: 1024,
