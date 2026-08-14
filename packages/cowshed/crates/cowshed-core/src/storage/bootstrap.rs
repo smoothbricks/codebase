@@ -22,7 +22,23 @@ const DISKUTIL: &str = "/usr/sbin/diskutil";
 const ZFS: &str = "/usr/sbin/zfs";
 const MARKER_VERSION: u32 = 1;
 
-/// The only substrate override accepted from `.cowshed.toml`.
+/// Repository-owned settings accepted from `.cowshed.toml`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CowshedConfig {
+    substrate: Option<SubstrateConfig>,
+    devenv: Option<DevenvConfig>,
+}
+
+impl CowshedConfig {
+    pub fn substrate(&self) -> Option<&SubstrateConfig> {
+        self.substrate.as_ref()
+    }
+
+    pub fn devenv(&self) -> Option<&DevenvConfig> {
+        self.devenv.as_ref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubstrateConfig {
     pool: String,
@@ -34,15 +50,43 @@ impl SubstrateConfig {
     }
 }
 
-/// Parse only `[substrate] kind = "zfs"` and `pool = "..."`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DevenvConfig {
+    dir: PathBuf,
+}
+
+impl DevenvConfig {
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigSection {
+    Substrate,
+    Devenv,
+}
+
+impl ConfigSection {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Substrate => "substrate",
+            Self::Devenv => "devenv",
+        }
+    }
+}
+
+/// Parse the complete repository-owned cowshed configuration.
 ///
-/// Unrelated sections are deliberately ignored. Unknown keys, duplicate keys, and incomplete or
-/// unsupported substrate sections are rejected rather than guessed around.
-pub fn parse_substrate_config(input: &str) -> Result<Option<SubstrateConfig>, ConfigError> {
-    let mut in_substrate = false;
+/// Only `[substrate]` and `[devenv]` are accepted. Keeping this parser narrow means a typo never
+/// silently disables either storage selection or workspace toolchain evaluation.
+pub fn parse_cowshed_config(input: &str) -> Result<CowshedConfig, ConfigError> {
+    let mut current = None;
     let mut saw_substrate = false;
+    let mut saw_devenv = false;
     let mut kind = None;
     let mut pool = None;
+    let mut devenv_dir = None;
 
     for (index, original) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -56,49 +100,105 @@ pub fn parse_substrate_config(input: &str) -> Result<Option<SubstrateConfig>, Co
                 .and_then(|value| value.strip_suffix(']'))
                 .ok_or(ConfigError::MalformedLine { line: line_number })?
                 .trim();
-            in_substrate = section == "substrate";
-            if in_substrate {
-                if saw_substrate {
-                    return Err(ConfigError::DuplicateSection);
-                }
-                saw_substrate = true;
+            let section = match section {
+                "substrate" => ConfigSection::Substrate,
+                "devenv" => ConfigSection::Devenv,
+                other => return Err(ConfigError::UnknownSection(other.to_owned())),
+            };
+            let seen = match section {
+                ConfigSection::Substrate => &mut saw_substrate,
+                ConfigSection::Devenv => &mut saw_devenv,
+            };
+            if *seen {
+                return Err(ConfigError::DuplicateSection(section.name()));
             }
-            continue;
-        }
-        if !in_substrate {
+            *seen = true;
+            current = Some(section);
             continue;
         }
 
+        let section = current.ok_or(ConfigError::MalformedLine { line: line_number })?;
         let (key, value) = line
             .split_once('=')
             .ok_or(ConfigError::MalformedLine { line: line_number })?;
         let key = key.trim();
-        let value = parse_toml_string(value.trim(), line_number)?;
-        match key {
-            "kind" => {
+        let value = parse_toml_string(value.trim(), section, line_number)?;
+        match (section, key) {
+            (ConfigSection::Substrate, "kind") => {
                 if kind.replace(value).is_some() {
-                    return Err(ConfigError::DuplicateKey("kind"));
+                    return Err(ConfigError::DuplicateKey {
+                        section: section.name(),
+                        key: "kind",
+                    });
                 }
             }
-            "pool" => {
+            (ConfigSection::Substrate, "pool") => {
                 if pool.replace(value).is_some() {
-                    return Err(ConfigError::DuplicateKey("pool"));
+                    return Err(ConfigError::DuplicateKey {
+                        section: section.name(),
+                        key: "pool",
+                    });
                 }
             }
-            other => return Err(ConfigError::UnknownKey(other.to_owned())),
+            (ConfigSection::Devenv, "dir") => {
+                if devenv_dir.replace(value).is_some() {
+                    return Err(ConfigError::DuplicateKey {
+                        section: section.name(),
+                        key: "dir",
+                    });
+                }
+            }
+            (_, other) => {
+                return Err(ConfigError::UnknownKey {
+                    section: section.name(),
+                    key: other.to_owned(),
+                });
+            }
         }
     }
 
-    if !saw_substrate {
-        return Ok(None);
+    let substrate = if saw_substrate {
+        let kind = kind.ok_or(ConfigError::MissingKey {
+            section: "substrate",
+            key: "kind",
+        })?;
+        if kind != "zfs" {
+            return Err(ConfigError::UnsupportedKind(kind));
+        }
+        let pool = pool.ok_or(ConfigError::MissingKey {
+            section: "substrate",
+            key: "pool",
+        })?;
+        validate_pool_name(&pool).map_err(ConfigError::InvalidPool)?;
+        Some(SubstrateConfig { pool })
+    } else {
+        None
+    };
+    let devenv = if saw_devenv {
+        let dir = devenv_dir.ok_or(ConfigError::MissingKey {
+            section: "devenv",
+            key: "dir",
+        })?;
+        Some(DevenvConfig {
+            dir: validate_devenv_dir(&dir)?,
+        })
+    } else {
+        None
+    };
+    Ok(CowshedConfig { substrate, devenv })
+}
+
+fn validate_devenv_dir(value: &str) -> Result<PathBuf, ConfigError> {
+    let path = PathBuf::from(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ConfigError::InvalidDevenvDir(value.to_owned()));
     }
-    let kind = kind.ok_or(ConfigError::MissingKey("kind"))?;
-    if kind != "zfs" {
-        return Err(ConfigError::UnsupportedKind(kind));
-    }
-    let pool = pool.ok_or(ConfigError::MissingKey("pool"))?;
-    validate_pool_name(&pool).map_err(ConfigError::InvalidPool)?;
-    Ok(Some(SubstrateConfig { pool }))
+    Ok(path)
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -115,28 +215,45 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn parse_toml_string(value: &str, line: usize) -> Result<String, ConfigError> {
-    serde_json::from_str(value).map_err(|_| ConfigError::ExpectedQuotedString { line })
+fn parse_toml_string(
+    value: &str,
+    section: ConfigSection,
+    line: usize,
+) -> Result<String, ConfigError> {
+    serde_json::from_str(value).map_err(|_| ConfigError::ExpectedQuotedString {
+        section: section.name(),
+        line,
+    })
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ConfigError {
     #[error("malformed configuration at line {line}")]
     MalformedLine { line: usize },
-    #[error("the [substrate] section is duplicated")]
-    DuplicateSection,
-    #[error("the [substrate] key {0:?} is duplicated")]
-    DuplicateKey(&'static str),
-    #[error("unknown [substrate] key {0:?}")]
-    UnknownKey(String),
-    #[error("missing [substrate] key {0:?}")]
-    MissingKey(&'static str),
+    #[error("the [{0}] section is duplicated")]
+    DuplicateSection(&'static str),
+    #[error("the [{section}] key {key:?} is duplicated")]
+    DuplicateKey {
+        section: &'static str,
+        key: &'static str,
+    },
+    #[error("unknown configuration section [{0}]")]
+    UnknownSection(String),
+    #[error("unknown [{section}] key {key:?}")]
+    UnknownKey { section: &'static str, key: String },
+    #[error("missing [{section}] key {key:?}")]
+    MissingKey {
+        section: &'static str,
+        key: &'static str,
+    },
     #[error("unsupported substrate kind {0:?}; only explicit zfs is accepted")]
     UnsupportedKind(String),
-    #[error("[substrate] value at line {line} must be a quoted string")]
-    ExpectedQuotedString { line: usize },
+    #[error("[{section}] value at line {line} must be a quoted string")]
+    ExpectedQuotedString { section: &'static str, line: usize },
     #[error("invalid ZFS pool: {0}")]
     InvalidPool(PoolNameError),
+    #[error("[devenv] dir must be a non-empty relative path without `..`: {0:?}")]
+    InvalidDevenvDir(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

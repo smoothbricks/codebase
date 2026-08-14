@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
     ArtifactSeal, ArtifactSink, ArtifactWrite, CheckpointBarrier, CommitmentDraft, CommitmentSink,
-    OutputStream, ProcessEvent, ProcessExit, ProcessSignal, ProcessSpawnRequest, RunningProcess,
-    SessionToken, SpawnSink, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
-    WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+    DevenvCommandOutput, OutputStream, ProcessEvent, ProcessExit, ProcessSignal,
+    ProcessSpawnRequest, RunningProcess, SessionToken, SpawnSink, WorkspaceAuthoritySnapshot,
+    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
 
 #[derive(Debug)]
@@ -44,6 +44,8 @@ struct FakeSpawner {
     fail_next: bool,
     backpressure: bool,
     order: mpsc::UnboundedSender<OrderObservation>,
+    devenv_requests: mpsc::UnboundedSender<PathBuf>,
+    devenv_outputs: VecDeque<DevenvCommandOutput>,
 }
 
 #[async_trait]
@@ -76,6 +78,18 @@ impl SpawnSink for FakeSpawner {
             backpressure: self.backpressure,
             writes: 0,
         }))
+    }
+
+    async fn print_devenv_env(
+        &mut self,
+        devenv_dir: &std::path::Path,
+    ) -> Result<DevenvCommandOutput> {
+        self.devenv_requests
+            .send(devenv_dir.to_owned())
+            .expect("devenv request observer");
+        self.devenv_outputs.pop_front().ok_or_else(|| {
+            CowshedError::internal("test did not provide a devenv print-dev-env output")
+        })
     }
 }
 
@@ -321,6 +335,7 @@ struct Harness {
     artifacts: mpsc::UnboundedReceiver<ArtifactObservation>,
     commitments: mpsc::UnboundedReceiver<ControllerCommitment>,
     order: mpsc::UnboundedReceiver<OrderObservation>,
+    devenv_requests: mpsc::UnboundedReceiver<PathBuf>,
 }
 
 fn authority() -> WorkspaceAuthoritySnapshot {
@@ -336,6 +351,7 @@ fn authority() -> WorkspaceAuthoritySnapshot {
 
 fn config() -> WorkspaceSupervisorConfig {
     let workspace_root = PathBuf::from("/tmp/cowshed-supervisor-test-workspace");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
     WorkspaceSupervisorConfig {
         authority: authority(),
         workspace_root: workspace_root.clone(),
@@ -372,11 +388,30 @@ fn harness_with_config(
     fail_next: bool,
     backpressure: bool,
 ) -> Harness {
+    harness_with_devenv_outputs(
+        supervisor_config,
+        start_id,
+        quota,
+        fail_next,
+        backpressure,
+        VecDeque::new(),
+    )
+}
+
+fn harness_with_devenv_outputs(
+    supervisor_config: WorkspaceSupervisorConfig,
+    start_id: u64,
+    quota: u64,
+    fail_next: bool,
+    backpressure: bool,
+    devenv_outputs: VecDeque<DevenvCommandOutput>,
+) -> Harness {
     let (spawn_tx, spawned) = mpsc::unbounded_channel();
     let (process_tx, process) = mpsc::unbounded_channel();
     let (artifact_tx, artifacts) = mpsc::unbounded_channel();
     let (commitment_tx, commitments) = mpsc::unbounded_channel();
     let (order_tx, order) = mpsc::unbounded_channel();
+    let (devenv_tx, devenv_requests) = mpsc::unbounded_channel();
     let handle = WorkspaceSupervisor::start_with_sinks(
         supervisor_config,
         Box::new(FakeSpawner {
@@ -385,6 +420,8 @@ fn harness_with_config(
             fail_next,
             backpressure,
             order: order_tx.clone(),
+            devenv_requests: devenv_tx,
+            devenv_outputs,
         }),
         Box::new(FakeArtifactSink {
             next: JobId::new(start_id).unwrap(),
@@ -407,6 +444,7 @@ fn harness_with_config(
         artifacts,
         commitments,
         order,
+        devenv_requests,
     }
 }
 
@@ -423,6 +461,41 @@ fn request(stdin: StdinSource) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
     }
+}
+
+fn isolated_config(label: &str) -> (WorkspaceSupervisorConfig, PathBuf) {
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "cowshed-supervisor-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+    let workspace_root = root.join("workspace");
+    std::fs::create_dir_all(&workspace_root).expect("isolated workspace");
+    let mut supervisor_config = config();
+    supervisor_config.workspace_root = workspace_root.clone();
+    supervisor_config.sandbox.workspace_mount = workspace_root;
+    supervisor_config.sandbox.home = root.join("home");
+    supervisor_config.sandbox.exec_temp_dir = root.join("tmp");
+    (supervisor_config, root)
+}
+
+fn printed_devenv_output(variables: serde_json::Value) -> DevenvCommandOutput {
+    DevenvCommandOutput {
+        status: 0,
+        stdout: serde_json::to_vec(&serde_json::json!({ "variables": variables })).unwrap(),
+        stderr: Vec::new(),
+    }
+}
+
+fn write_devenv_snapshot(devenv_dir: &std::path::Path, vars: serde_json::Value) {
+    let path = devenv_dir.join(".devenv/cowshed-env.json");
+    std::fs::create_dir_all(path.parent().unwrap()).expect("snapshot directory");
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "vars": vars })).unwrap(),
+    )
+    .expect("snapshot");
 }
 
 fn stream(bytes: Vec<u8>) -> StreamInfo {
@@ -484,6 +557,196 @@ async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: Process
 
 async fn open_named(handle: &WorkspaceSupervisorHandle, name: &str) -> SessionToken {
     handle.open_session(Some(name.into())).await.unwrap()
+}
+
+#[tokio::test]
+async fn stale_devenv_snapshot_refreshes_once_and_merges_before_spawn() {
+    let (supervisor_config, root) = isolated_config("devenv-stale");
+    let mount = supervisor_config.workspace_root.clone();
+    let devenv_dir = mount.join("tooling/devenv");
+    std::fs::create_dir_all(&devenv_dir).expect("devenv dir");
+    std::fs::write(mount.join("devenv.nix"), "{}").expect("root devenv");
+    std::fs::write(
+        mount.join(".cowshed.toml"),
+        "[devenv]\ndir = \"tooling/devenv\"\n",
+    )
+    .expect("config");
+    std::fs::write(devenv_dir.join("devenv.nix"), "{ version = 1; }").expect("devenv.nix");
+    write_devenv_snapshot(
+        &devenv_dir,
+        serde_json::json!({
+            "ONLY_DEVENV": "old",
+            "PATH": "/old/untrusted/bin"
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(devenv_dir.join("devenv.nix"), "{ version = 2; }").expect("changed devenv.nix");
+
+    let output = printed_devenv_output(serde_json::json!({
+        "ONLY_DEVENV": { "type": "exported", "value": "updated" },
+        "CONFLICT": { "type": "exported", "value": "snapshot" },
+        "PATH": { "type": "exported", "value": "/new/untrusted/bin" },
+        "NOT_EXPORTED": { "type": "var", "value": "private" }
+    }));
+    let mut h = harness_with_devenv_outputs(
+        supervisor_config,
+        1,
+        1024,
+        false,
+        false,
+        VecDeque::from([output]),
+    );
+    let mut exec = request(StdinSource::Empty);
+    exec.env.insert("CONFLICT".into(), "controller".into());
+    let job = h.handle.exec(None, exec).await.unwrap();
+    assert_eq!(h.devenv_requests.recv().await.unwrap(), devenv_dir);
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        spawned.request.devenv_dir.as_deref(),
+        Some(devenv_dir.as_path())
+    );
+    assert_eq!(
+        spawned.request.env.get("ONLY_DEVENV").map(String::as_str),
+        Some("updated")
+    );
+    assert_eq!(
+        spawned.request.env.get("CONFLICT").map(String::as_str),
+        Some("controller")
+    );
+    assert!(!spawned.request.env.contains_key("PATH"));
+    assert!(!spawned.request.env.contains_key("NOT_EXPORTED"));
+    let snapshot: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(devenv_dir.join(".devenv/cowshed-env.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["vars"]["ONLY_DEVENV"], "updated");
+    assert_eq!(snapshot["vars"]["PATH"], "/new/untrusted/bin");
+    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    h.handle.wait(job).await.unwrap();
+
+    let mut exec = request(StdinSource::Empty);
+    exec.env.insert("CONFLICT".into(), "controller".into());
+    let second = h.handle.exec(None, exec).await.unwrap();
+    let second_spawn = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        second_spawn
+            .request
+            .env
+            .get("ONLY_DEVENV")
+            .map(String::as_str),
+        Some("updated")
+    );
+    assert!(matches!(
+        h.devenv_requests.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    complete(&second_spawn, b"", b"", ProcessExit::Exited(0)).await;
+    h.handle.wait(second).await.unwrap();
+
+    drop(h);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn fresh_devenv_snapshot_spawns_without_source_stats_or_devenv_invocation() {
+    let (supervisor_config, root) = isolated_config("devenv-fresh");
+    let mount = supervisor_config.workspace_root.clone();
+    let devenv_dir = mount.join("tooling/devenv");
+    std::fs::create_dir_all(&devenv_dir).expect("devenv dir");
+    std::fs::write(
+        mount.join(".cowshed.toml"),
+        "[devenv]\ndir = \"tooling/devenv\"\n",
+    )
+    .expect("config");
+    std::fs::write(devenv_dir.join("devenv.nix"), "{}").expect("devenv.nix");
+    std::thread::sleep(Duration::from_millis(20));
+    write_devenv_snapshot(&devenv_dir, serde_json::json!({ "FROM_SNAPSHOT": "ready" }));
+
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let job = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        spawned.request.env.get("FROM_SNAPSHOT").map(String::as_str),
+        Some("ready")
+    );
+    assert!(matches!(
+        h.devenv_requests.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    h.handle.wait(job).await.unwrap();
+
+    drop(h);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn configured_missing_devenv_and_failed_refresh_are_fail_closed() {
+    let (missing_config, missing_root) = isolated_config("devenv-missing");
+    let missing_mount = missing_config.workspace_root.clone();
+    std::fs::write(
+        missing_mount.join(".cowshed.toml"),
+        "[devenv]\ndir = \"tooling/devenv\"\n",
+    )
+    .expect("config");
+    let mut missing = harness_with_config(missing_config, 1, 1024, false, false);
+    let error = missing
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+    assert!(error.message.contains("tooling/devenv"));
+    assert!(error.message.contains("devenv.nix"));
+    assert!(matches!(
+        missing.devenv_requests.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        missing.spawned.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    drop(missing);
+    std::fs::remove_dir_all(missing_root).ok();
+
+    let (failed_config, failed_root) = isolated_config("devenv-failed");
+    let failed_mount = failed_config.workspace_root.clone();
+    std::fs::write(failed_mount.join("devenv.nix"), "{}").expect("devenv.nix");
+    let mut failed = harness_with_devenv_outputs(
+        failed_config,
+        1,
+        1024,
+        false,
+        false,
+        VecDeque::from([DevenvCommandOutput {
+            status: 42,
+            stdout: Vec::new(),
+            stderr: b"evaluation exploded".to_vec(),
+        }]),
+    );
+    let error = failed
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+    assert!(error.message.contains("evaluation exploded"));
+    assert_eq!(failed.devenv_requests.recv().await.unwrap(), failed_mount);
+    assert!(matches!(
+        failed.spawned.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        failed.artifacts.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    drop(failed);
+    std::fs::remove_dir_all(failed_root).ok();
 }
 
 #[tokio::test]
