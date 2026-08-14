@@ -350,6 +350,19 @@ fn main_mount(fixture: &Fixture) -> PathBuf {
         .expect("main mount")
 }
 
+/// Plant the in-image marker a mounted volume must carry for cowshed to recognize it as this
+/// workspace's. Mount identity is the marker, not the volume label: labels are human-facing and
+/// a hand-renamed volume must still be recognized.
+fn plant_mount_marker(fixture: &Fixture, mount: &Path) {
+    plant_foreign_mount_marker(fixture, mount, &workspace(ImageFormat::Sparse));
+}
+
+fn plant_foreign_mount_marker(fixture: &Fixture, mount: &Path, workspace: &LifecycleWorkspace) {
+    native_host(fixture, RecordingRunner::default())
+        .write_marker(mount, workspace, None, &identity(fixture))
+        .expect("mount marker");
+}
+
 fn native_host_with_mounts(
     fixture: &Fixture,
     runner: RecordingRunner,
@@ -1776,6 +1789,7 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         true,
         true,
     )]);
+    plant_mount_marker(&fixture, &main_mount(&fixture));
     let first = MacOsApfsExecutionHost::with_mount_source(
         RecordingRunner::default(),
         fixture.config(),
@@ -1786,7 +1800,6 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
     drop(first);
 
     let runner = RecordingRunner::default();
-    runner.set_volume_name("cowshed.acme--widget.main");
     let restarted =
         MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
             .expect("restarted host");
@@ -1801,15 +1814,10 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
             .to_string()
             .contains("cannot compact mounted image")
     );
-    let requests = runner.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests.iter().all(|request| {
-        request.program == Path::new("/usr/sbin/diskutil")
-            && request
-                .args
-                .first()
-                .is_some_and(|argument| argument == "info")
-    }));
+    assert!(
+        runner.requests().is_empty(),
+        "mount identity is read from the in-image marker, never from the volume label"
+    );
     restarted
         .detach_mounted(&workspace(ImageFormat::Sparse), false)
         .expect("restart-safe detach");
@@ -1839,6 +1847,7 @@ fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
         true,
         true,
     )]);
+    plant_mount_marker(&fixture, &main_mount(&fixture));
     let runner = FailingDetachRunner::new(2);
     let host = MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
         .expect("host");
@@ -1854,7 +1863,7 @@ fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
 }
 
 #[test]
-fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
+fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
     let fixture = Fixture::new("wrong-source");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
@@ -1867,12 +1876,24 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
         true,
         true,
     )]);
+    // An impostor that is itself a well-formed cowshed volume — a different project's — proves
+    // the check reads identity out of the marker rather than merely noticing a missing file.
+    let foreign = LifecycleWorkspace::new(
+        RepoId::parse("other/widget").expect("repo"),
+        WorkspaceName::new("main").expect("main"),
+        WorkspaceIncarnation::new("00000000000000000000000000000009").expect("incarnation"),
+        Revision::new(1),
+        Revision::new(1),
+        WorkspaceRole::Main,
+        ImageFormat::Sparse,
+    )
+    .expect("foreign workspace");
+    plant_foreign_mount_marker(&fixture, &main_mount(&fixture), &foreign);
     let runner = RecordingRunner::default();
-    runner.set_volume_name("unrelated.volume");
     let host = MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
         .expect("host");
     let error = host.mounts(&repo()).expect_err("impostor mount");
-    assert!(error.to_string().contains("mount source mismatch"));
+    assert!(error.to_string().contains("mount identity mismatch"));
     let error = host
         .heal_mount(&workspace(ImageFormat::Sparse), &main_mount(&fixture))
         .expect_err("impostor must not be healed destructively");
@@ -1890,11 +1911,8 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
             .contains("refusing to detach unrelated mount")
     );
     assert!(
-        runner.requests().iter().all(|request| request
-            .args
-            .first()
-            .is_some_and(|argument| argument == "info")),
-        "volume resolution may run, but impostor mount must never be detached"
+        runner.requests().is_empty(),
+        "an impostor mount is rejected from its marker alone and never detached"
     );
 }
 
@@ -1912,6 +1930,7 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
         false,
         false,
     )]);
+    plant_mount_marker(&fixture, &main_mount(&fixture));
     let runner = RecordingRunner::default();
     let host =
         MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source.clone())
@@ -1929,8 +1948,8 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
     let requests = runner.requests();
     assert_eq!(
         requests.len(),
-        4,
-        "three source-bound identity reads and one detach"
+        1,
+        "identity comes from the marker, so the only command is the detach"
     );
     let detach = requests.last().expect("detach request");
     assert_eq!(detach.program, Path::new("/usr/bin/hdiutil"));
@@ -3404,6 +3423,7 @@ fn kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
         let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
         create_image(canonical.image(), ImageFormat::Sparse);
+        plant_mount_marker(&fixture, &main_mount(&fixture));
         let source = FakeKernelMountSource::default();
         source.set(vec![KernelMountSnapshot::new(
             91,

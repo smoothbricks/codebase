@@ -768,14 +768,14 @@ pub struct MountIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageFact {
     pub workspace: LifecycleWorkspace,
-    pub volume_name: String,
+    pub volume_key: String,
 }
 
 /// A kernel mount-table fact supplied by the platform adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelMountFact {
     pub mount_id: u64,
-    pub volume_name: String,
+    pub volume_key: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -793,7 +793,7 @@ pub fn derive_workspaces(
 ) -> Result<Vec<DerivedWorkspace>, DerivationError> {
     let storage: Vec<_> = storage.into_iter().collect();
     let mut seen_workspaces = BTreeSet::new();
-    let mut seen_volume_names = BTreeSet::new();
+    let mut seen_volume_keys = BTreeSet::new();
     for fact in &storage {
         let workspace_key = (&fact.workspace.repo, &fact.workspace.name);
         if !seen_workspaces.insert(workspace_key) {
@@ -801,16 +801,14 @@ pub fn derive_workspaces(
                 fact.workspace.name.clone(),
             ));
         }
-        if !seen_volume_names.insert(fact.volume_name.as_str()) {
-            return Err(DerivationError::DuplicateVolumeName(
-                fact.volume_name.clone(),
-            ));
+        if !seen_volume_keys.insert(fact.volume_key.as_str()) {
+            return Err(DerivationError::DuplicateVolumeKey(fact.volume_key.clone()));
         }
     }
 
     let mounts: BTreeMap<_, _> = mounts
         .into_iter()
-        .map(|mount| (mount.volume_name, mount.mount_id))
+        .map(|mount| (mount.volume_key, mount.mount_id))
         .collect();
     let mut seen_checkpoints = BTreeSet::new();
     let mut checkpoints_by_workspace: BTreeMap<(RepoId, WorkspaceName), Vec<CheckpointFact>> =
@@ -836,7 +834,7 @@ pub fn derive_workspaces(
     let mut result = Vec::with_capacity(storage.len());
     for fact in storage {
         let mount_state = mounts
-            .get(&fact.volume_name)
+            .get(&fact.volume_key)
             .copied()
             .map_or(MountState::Detached, |mount_id| MountState::Mounted {
                 mount_id,
@@ -860,7 +858,7 @@ pub enum DerivationError {
     #[error("duplicate canonical workspace {0}")]
     DuplicateWorkspace(WorkspaceName),
     #[error("duplicate canonical volume name {0}")]
-    DuplicateVolumeName(String),
+    DuplicateVolumeKey(String),
     #[error("duplicate checkpoint {workspace}/{label}")]
     DuplicateCheckpoint {
         workspace: WorkspaceName,

@@ -108,8 +108,12 @@ clone automatically). Main and sessions use identical wiring; only the sandbox's
   project via `.cowshed.toml` `capacity`.
 - **Filesystem**: APFS, case sensitivity matching the volume that holds the adopted repository (queried via
   `pathconf(_PC_CASE_SENSITIVE)` at adopt time) so git behavior is identical inside and outside.
-- **Volume name**: `cowshed.<repo_id-encoded>.<workspace>` — `repo_id-encoded` is the two safe components joined with
-  `--`, so volume names are unique without embedding `/` and mount-table rows are unambiguous.
+- **Volume name**: the repository name for `main`, `<repo> — <workspace>` for every other workspace. The volume name is
+  a label and nothing else: Finder shows it in place of the directory name for a mounted volume's directory, so it is
+  written for the person looking at it. Nothing parses it, nothing classifies a volume by it, and nothing derives
+  identity from it — renaming a volume by hand (`diskutil rename`) changes the label and nothing else. Identity comes
+  from where the backing image lives and from the in-image marker; see "Ownership, identity, and the volume label"
+  below.
 - **Spotlight**: created with indexing disabled (`-nospotlight` / `mdutil -i off` post-attach).
 - **Time Machine**: backup policy is one per-volume decision, not path exclusions. If Time Machine includes additional
   internal volumes by default (verification item, 08_testing.md), adopt excludes `cowshed.store` and `cowshed.caches`
@@ -146,6 +150,30 @@ For every mounted attachment:
   mountpoint, a detached image, a mount owned by another project, or overlapping active mounts never grants a
   `WorkspaceRef`.
 - Personal workspaces may opt into Finder visibility with `--browse` at attach time.
+
+## Ownership, identity, and the volume label
+
+Three questions, three authorities, none of them the volume label:
+
+- **Which volumes are cowshed's?** Ownership is by location. Every backing image lives under `~/.cowshed`, and
+  enumeration is a `readdir` of that tree (`sessions/` plus the one canonical `main` image per project) — never a scan
+  of `diskutil list`. A volume cowshed did not create has no image there and is therefore invisible to enumeration, gc,
+  and crash-window classification regardless of what it is called.
+- **Which workspace is a given image?** The sibling `<image>.grants.json` metadata, cross-checked against the image's
+  filename stem. This is what makes discovery and attach possible while detached.
+- **Is the volume mounted here ours?** The in-image marker `.cowshed/workspace.json`, matched on `repoId`, `workspace`,
+  and `workspaceIncarnation`. Every operation that could damage something — healing a mount with wrong flags, detaching
+  after a controller restart, joining a kernel mount into enumeration — reads the marker at the mount point and refuses
+  when it does not name the expected workspace. A marker that cannot be read is not ours.
+
+The marker is the discriminator because it is the one identity that is both authoritative and re-stampable. An APFS
+clone inherits its source volume's name **and its volume UUID**, so a volume UUID recorded at creation cannot tell a
+workspace from the fork made out of it; that is why cloning re-stamps the label and rewrites the marker inside the same
+staging fence, before the clone is ever published. Volume UUIDs are therefore not recorded and not used.
+
+What follows: volume labels are free to be plain, and manual renaming is harmless rather than unsupported. Cowshed still
+derives an internal per-workspace key from `repo_id` and workspace name to pair a storage fact with a kernel mount fact
+within one project, but that key is computed from metadata on both sides and never read back off a volume.
 
 ## Dedicated volumes
 
@@ -194,7 +222,7 @@ precious.
 | ----------------------- | ----------------------------------------------------------------------------------------------------------- |
 | Which workspaces exist? | For the selected primary `repo_id`, `readdir` its `sessions/` images plus that project's exactly one `main` |
 | Image format            | Sibling metadata `imageFormat`, validated against the image extension                                       |
-| What is attached where? | Kernel mount table (`getmntinfo`), matched by volume name                                                   |
+| What is attached where? | Kernel mount table (`getmntinfo`), matched by mount point, identity confirmed by the in-image marker        |
 | Workspace identity      | In-image marker `.cowshed/workspace.json`                                                                   |
 | Grants                  | Sibling file `<image>.grants.json`                                                                          |
 | Concurrency             | `flock` on `<image>.lock` per lifecycle operation                                                           |
