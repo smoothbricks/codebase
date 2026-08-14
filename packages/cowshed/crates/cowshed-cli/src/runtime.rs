@@ -740,7 +740,7 @@ where
                 if json {
                     output.success(projects).map_err(output_error)?;
                 } else {
-                    emit_project_workspaces_tsv(output, &projects)?;
+                    emit_project_workspaces_table(output, &projects)?;
                 }
             } else {
                 let mut workspaces = service.list().await?;
@@ -749,7 +749,7 @@ where
                 if json {
                     output.success(workspaces).map_err(output_error)?;
                 } else {
-                    emit_workspace_tsv(output, &workspaces)?;
+                    emit_workspace_table(output, &workspaces)?;
                 }
                 if empty {
                     let others = service.other_adopted_project_count().await?;
@@ -1348,60 +1348,87 @@ fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport)
         .map_err(output_error)
 }
 
-fn emit_workspace_tsv<W: Write, E: Write>(
+fn emit_workspace_table<W: Write, E: Write>(
     output: &mut Output<W, E>,
     workspaces: &[WorkspaceInfo],
 ) -> Result<()> {
-    for workspace in workspaces {
-        emit_workspace_tsv_row(output, None, workspace)?;
-    }
-    Ok(())
+    let rows: Vec<Vec<String>> = workspaces
+        .iter()
+        .map(|workspace| workspace_row(None, workspace))
+        .collect();
+    emit_aligned_rows(output, &rows)
 }
 
-fn emit_project_workspaces_tsv<W: Write, E: Write>(
+fn emit_project_workspaces_table<W: Write, E: Write>(
     output: &mut Output<W, E>,
     projects: &[ProjectWorkspaces],
 ) -> Result<()> {
-    for project in projects {
-        for workspace in &project.workspaces {
-            emit_workspace_tsv_row(output, Some(&project.repo_id), workspace)?;
-        }
-    }
-    Ok(())
+    let rows: Vec<Vec<String>> = projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .workspaces
+                .iter()
+                .map(|workspace| workspace_row(Some(&project.repo_id), workspace))
+        })
+        .collect();
+    emit_aligned_rows(output, &rows)
 }
 
-fn emit_workspace_tsv_row<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    repo_id: Option<&RepoId>,
-    workspace: &WorkspaceInfo,
-) -> Result<()> {
+fn workspace_row(repo_id: Option<&RepoId>, workspace: &WorkspaceInfo) -> Vec<String> {
+    let mut row = Vec::with_capacity(5);
     if let Some(repo_id) = repo_id {
-        output
-            .bare(repo_id.as_str().as_bytes())
-            .and_then(|()| output.bare(b"\t"))
-            .map_err(output_error)?;
+        row.push(repo_id.as_str().to_owned());
     }
-    output
-        .bare(workspace.workspace.as_str().as_bytes())
-        .and_then(|()| output.bare(b"\t"))
-        .and_then(|()| {
-            output.bare(match workspace.state {
-                WorkspaceState::Attached => b"mounted",
-                WorkspaceState::Detached => b"detached",
-            })
-        })
-        .and_then(|()| output.bare(b"\t"))
-        .and_then(|()| output.bare(workspace.branch.as_deref().unwrap_or("").as_bytes()))
-        .and_then(|()| output.bare(b"\t"))
-        .and_then(|()| {
-            if workspace.state == WorkspaceState::Attached {
-                output.bare(workspace.mount.as_os_str().as_bytes())
-            } else {
-                Ok(())
+    row.push(workspace.workspace.as_str().to_owned());
+    row.push(
+        match workspace.state {
+            WorkspaceState::Attached => "mounted",
+            WorkspaceState::Detached => "detached",
+        }
+        .to_owned(),
+    );
+    row.push(workspace.branch.clone().unwrap_or_default());
+    row.push(if workspace.state == WorkspaceState::Attached {
+        workspace.mount.display().to_string()
+    } else {
+        String::new()
+    });
+    row
+}
+
+/// Human list output: columns padded with spaces to equal width (two-space
+/// gutter), so `ls` reads as a table. The final column — and any trailing
+/// empty cell — is never padded, keeping lines free of trailing whitespace.
+fn emit_aligned_rows<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    rows: &[Vec<String>],
+) -> Result<()> {
+    let columns = rows.first().map(Vec::len).unwrap_or(0);
+    let mut widths = vec![0usize; columns];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    for row in rows {
+        let mut line = String::new();
+        let last_filled = row.iter().rposition(|cell| !cell.is_empty()).unwrap_or(0);
+        for (index, cell) in row.iter().enumerate().take(last_filled + 1) {
+            if index > 0 {
+                line.push_str("  ");
             }
-        })
-        .and_then(|()| output.bare(b"\n"))
-        .map_err(output_error)
+            line.push_str(cell);
+            if index < last_filled {
+                for _ in cell.chars().count()..widths[index] {
+                    line.push(' ');
+                }
+            }
+        }
+        line.push('\n');
+        output.bare(line.as_bytes()).map_err(output_error)?;
+    }
+    Ok(())
 }
 
 fn emit_doctor<W: Write, E: Write>(output: &mut Output<W, E>, report: &DoctorReport) -> Result<()> {
