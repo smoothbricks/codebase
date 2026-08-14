@@ -416,11 +416,17 @@ fn parse_skill(
     };
     for name in &harnesses {
         if crate::skill::harness_named(scope, name).is_none() {
-            return Err(UsageError::new(
+            let suggestions = crate::skill::harness_suggestions(scope, name);
+            let detail = if suggestions.is_empty() {
                 format!(
-                    "unknown harness `{name}`; this scope installs for {}",
+                    "known harnesses include {}",
                     crate::skill::harness_names(scope)
-                ),
+                )
+            } else {
+                format!("did you mean {}?", suggestions.join(" or "))
+            };
+            return Err(UsageError::new(
+                format!("unknown harness `{name}`; {detail}"),
                 USAGE,
             ));
         }
