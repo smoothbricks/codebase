@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { BlockIndex } from '../../src/block-index.js';
-import { createBlockDependentsTool } from '../../src/tools/block-dependents.js';
-import { createExpandTool } from '../../src/tools/expand.js';
-import { createFindDefinitionTool } from '../../src/tools/find-definition.js';
-import { createFindReferencesTool } from '../../src/tools/find-references.js';
-import { createListBlocksTool } from '../../src/tools/list-blocks.js';
-import { createListTargetsTool } from '../../src/tools/list-targets.js';
+import { BlockIndex } from '../../block-index.js';
+import { createBlockDependentsTool } from '../../tools/block-dependents.js';
+import { createExpandTool } from '../../tools/expand.js';
+import { createFindDefinitionTool } from '../../tools/find-definition.js';
+import { createFindReferencesTool } from '../../tools/find-references.js';
+import { createListBlocksTool } from '../../tools/list-blocks.js';
+import { createListTargetsTool } from '../../tools/list-targets.js';
 
 const TEST_MD = `\`\`\`typescript {#signals file="src/signals.ts"}
 export const signals = defineSignals({});

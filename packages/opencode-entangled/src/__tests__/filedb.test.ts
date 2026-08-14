@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { FileDB, type FileDBData } from '../src/filedb.js';
+import { FileDB, type FileDBData } from '../filedb.js';
 
 // WHY: mock readFile so tests are pure and don't touch the filesystem
 function mockReader(contents: Record<string, string>): (path: string) => Promise<string> {
