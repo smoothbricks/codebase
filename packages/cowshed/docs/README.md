@@ -52,6 +52,23 @@ bun add --global @smoothbricks/cowshed # `cowshed` on PATH
 From a checkout of this repository, build the addon and TypeScript with `nx build cowshed`, then `bun link` the package
 to put that local build's `cowshed` on PATH.
 
+### The agent skill
+
+`cowshed skill install` writes the bundled skill into every agent harness detected on the host, and
+`cowshed skill install --project <path>` installs it into one repository. It is idempotent, needs no network, and works
+before `adopt` has run.
+
+Its harness table is a generated snapshot of [vercel-labs/skills](https://github.com/vercel-labs/skills), refreshed with
+`nx run cowshed:refresh-harnesses`. The generated file records the upstream revision it came from and lists the entries
+whose paths could not be reduced to a literal home path. Hand-verified entries in `VERIFIED_HARNESSES` override that
+snapshot by name and carry the evidence for doing so.
+
+For a harness outside the snapshot, install the shipped skill directory with the upstream tool instead:
+
+```sh
+npx skills add ./skills/cowshed -g
+```
+
 ## Five-minute quickstart
 
 ```sh
