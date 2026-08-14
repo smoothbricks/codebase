@@ -103,13 +103,35 @@ cowshed gateway status --json
 The gateway owns credentials, registry mirrors, and egress policy. Workspaces receive an isolated endpoint and opaque
 workspace token; secrets are not copied into the workspace.
 
-If the repository uses direnv, its `.envrc` can ask cowshed to heal mounts and emit the small environment contract:
+Direnv repositories put the environment contract in `.envrc`; it heals the mount and exports the workspace-local `GOENV`
+and `COWSHED_*` values:
 
 ```sh
 eval "$(cowshed ensure --envrc)"
 ```
 
-`ensure` is safe to run repeatedly. It does not install dependencies or fetch code.
+Devenv-native repositories have no hook that can run from a bare, unmounted mountpoint. After a reboot or manual eject,
+reattach explicitly, import the same cowshed exports into the human shell, and use the repository's `devenv:allow`
+command once for that mounted workspace:
+
+```sh
+cowshed ensure --attach
+eval "$(cowshed ensure --envrc)"
+npm run devenv:allow  # use the repository's equivalent script
+```
+
+Cowshed resolves the evaluation directory from repository-owned configuration:
+
+```toml
+[devenv]
+dir = "tooling/devenv"
+```
+
+The path must be relative and cannot contain `..`. Without that section, a `devenv.nix` at the workspace root selects
+the root; without either signal, exec behavior is unchanged.
+
+`ensure` is safe to run repeatedly. It does not install dependencies or fetch code, and cowshed never writes direnv or
+devenv trust records.
 
 ## Daily human workflow
 
@@ -129,6 +151,10 @@ For a command that should run under cowshed's sandbox:
 cowshed exec "$WS" -- bun test
 cowshed exec "$WS" -- git status --porcelain
 ```
+
+When `.cowshed.toml` selects a devenv directory, the workspace supervisor watches its devenv inputs. A changed input
+refreshes the saved environment exactly once before the next `cowshed exec`; clean execs reuse the snapshot without
+running devenv. Processes already running keep the environment they launched with.
 
 Before a risky operation, create a checkpoint:
 

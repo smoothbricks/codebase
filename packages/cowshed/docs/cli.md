@@ -19,7 +19,7 @@ Every cowshed command follows the same I/O discipline:
 | 2    | usage                            | unknown flag, missing argument                                                                                                      |
 | 3    | not-found                        | no such workspace/project/checkpoint                                                                                                |
 | 4    | conflict                         | name in use, workspace busy, restore over unsaved state without `--force`                                                           |
-| 5    | env-missing                      | gateway not running, caches volume absent, direnv missing                                                                           |
+| 5    | env-missing                      | gateway, storage, mount, or executable unavailable; configured devenv refresh failed                                                |
 | 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it |
 | 7    | integrity                        | committed job content missing, mutated, rolled back, or inconsistent with its controller commitment                                 |
 
@@ -87,10 +87,15 @@ cowshed: creating image ~/.cowshed/acme/widget/main.asif (capacity 100g, sparse)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
 cowshed: swapping <project-root> -> mountpoint (stub .envrc written beneath)
-next: eval "$(cowshed ensure --envrc)"   # add to .envrc
+next: eval "$(cowshed ensure --envrc)"   # direnv repositories: add to .envrc
 next: cowshed new <name>
 <project-root>
 ```
+
+The `.envrc` line is direnv wiring; cowshed does not authorize it. Devenv-native repositories instead reattach an
+unmounted workspace with `cowshed ensure --attach`, evaluate the same exports in the human shell with
+`eval "$(cowshed ensure --envrc)"`, and run the repository's `devenv:allow` command once for that workspace. Cowshed
+never modifies either tool's trust database.
 
 ### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse]`
 
@@ -234,16 +239,22 @@ binary output without UTF-8 assumptions or response-size growth.
 
 The fast auto-fix. Healthy fast-path is a marker read plus a statfs (~15–25 ms, silent, exit 0). Otherwise it reattaches
 images after reboot or Finder ejects, repairs mount flags, re-arms the autosave agent, and reconciles anything drifted —
-synchronously, so when it returns you are standing in a valid workspace. `--envrc` additionally prints exports for the
-current workspace on stdout, for `eval` in `.envrc`:
+synchronously, so when it returns you are standing in a valid workspace. Devenv-native repositories use
+`cowshed ensure --attach` as the explicit remount spelling. `--envrc` additionally prints POSIX shell exports for the
+current workspace:
 
-```
+```sh
 $ cowshed ensure --envrc
-export COWSHED_GATEWAY_TOKEN=cw1_r4v3n…
-export GOENV=~/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env
-export COWSHED_PORT_BASE=40960 PORT=40961
-export COWSHED_REPO_ID=acme/widget COWSHED_WORKSPACE=raven
+export GOENV='/Users/me/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env'
+export COWSHED_WORKSPACE_TOKEN='cw1_r4v3n…'
+export COWSHED_PORT_BASE='40960'
 ```
+
+Direnv repositories evaluate that output from `.envrc`. Devenv-native repositories may evaluate it after an explicit
+attach; sandboxed `cowshed exec` processes receive the cowshed-owned exports directly. If `[devenv] dir` is configured
+in `.cowshed.toml`, devenv's exported variables form the base environment for each new sandbox process, while
+controller-filtered values and cowshed's own `GOENV`/`COWSHED_*` values win on conflicts. The devenv-provided `PATH` is
+discarded in favor of cowshed's admitted, profile-first PATH.
 
 Deliberately short: wiring is carried by **files, not environment**. The registry URL (the macOS workspace gateway base
 port, or Linux's fixed private-loopback connector at `127.0.0.1:7644`) and the bun cache dir live in the committed
