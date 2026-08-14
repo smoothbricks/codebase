@@ -61,7 +61,7 @@ in {
       cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
       # Go toolchain for packages/lmao-ttsc/plugin (ttsc transform plugin)
       go
-      sccache # Shared Rust compile cache (cowshed cache layer 3)
+      sccache # Rust compiler cache; client of the host-owned daemon (cowshed sccache start)
       # Git hooks and formatters
       git-format-staged
       jq # Used in pre-commit hook and generally useful
@@ -88,8 +88,10 @@ in {
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
 
-  # The runner supplies the persistent cache directory, but this repository
-  # owns whether its compiler processes use the installed wrapper.
+  # The environment supplies the cache endpoint — inside a cowshed workspace,
+  # SCCACHE_SERVER_UDS points every wrapper invocation at the host-owned
+  # sccache daemon (cowshed sccache start) — but this repository owns whether
+  # its compiler processes use the installed wrapper.
   env.RUSTC_WRAPPER = "sccache";
 
   # Nx otherwise defaults to three workers. Scale to the cores available in each
