@@ -45,6 +45,7 @@ Shape:
 ;; (measured: the kernel canonicalizes the connect target before matching — a
 ;; /tmp-spelled rule silently denies what a /private/tmp rule allows).
 (allow network-outbound (remote unix-socket (path-literal "<nix daemon socket>")))
+(allow network-outbound (remote unix-socket (path-literal "~/.cowshed/sccache.sock")))  ;; host sccache daemon
 (allow network-outbound (remote unix-socket (path-literal "<own supervisor socket>")))
 
 ;; Loopback TCP — isolation rides ENTIRELY on outbound. Measured SBPL constraints
@@ -84,8 +85,10 @@ Shape:
 ;; so the carve-backs are emitted AFTER the deny:
 (deny file-read* file-write* (subpath "~/.cowshed"))
 (allow file-read* (subpath "~/.cowshed/caches"))       ;; layer-1/3 caches: readable
+;; sccache is absent from the write list: its store is daemon-write-only
+;; (03_caches.md) — clients speak to the host daemon over the socket above
+;; and never touch the store directly.
 (allow file-write*
-  (subpath "~/.cowshed/caches/sccache")
   (subpath "~/.cowshed/caches/zig")
   (subpath "~/.cowshed/caches/gradle")
   (subpath "~/.cowshed/caches/go/mod")
@@ -181,10 +184,9 @@ Notes:
   commits into and the `worktrees/<ws>` administrative directory it lives in — and on nothing else of main's. It is
   stated after every deny that would otherwise close it, because main's mount is inside cowshed's store under the
   symlink layout and is the denied project root under direct mount, and last-match-wins is what makes the carve-back
-  real. It is not
-  expressible as a read/write grant for exactly that reason: a grant intersecting an effective deny is refused. It is
-  controller-owned, carried by the workspaces that asked for the mode, and never implied by the baseline — main's
-  working tree is no more reachable than any other workspace's.
+  real. It is not expressible as a read/write grant for exactly that reason: a grant intersecting an effective deny is
+  refused. It is controller-owned, carried by the workspaces that asked for the mode, and never implied by the baseline
+  — main's working tree is no more reachable than any other workspace's.
 - **Effective denies are monotonic.** `repo_id` is the machine-independent lowercase `owner/repo` normalized from a
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may
@@ -419,12 +421,12 @@ guarantees cowshed owns:
   is therefore an off-gateway egress path — accepted as a trusted-mediator channel (root daemon, signature-checked
   caches), documented, never proxied. GC-root registration for `.devenv` profiles is likewise daemon-side; no grant
   needed.
-- **Nix client state**: the closed baseline's writable roots additionally include the shared cache subtrees
-  `nix/cache` and `nix/state` under `~/.cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite
-  files; they stay on the host and are shared across workspaces like any concurrency-safe cache. They live under the
-  cowshed caches root rather than under the user's `~/.cache` and `~/.local/state`, because the sandbox never grants a
-  path inside the real `$HOME` — the workspace's `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all private, in-image
-  directories, and admitting the user's own would hand every workspace the rest of what those roots contain.
+- **Nix client state**: the closed baseline's writable roots additionally include the shared cache subtrees `nix/cache`
+  and `nix/state` under `~/.cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite files; they
+  stay on the host and are shared across workspaces like any concurrency-safe cache. They live under the cowshed caches
+  root rather than under the user's `~/.cache` and `~/.local/state`, because the sandbox never grants a path inside the
+  real `$HOME` — the workspace's `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all private, in-image directories,
+  and admitting the user's own would hand every workspace the rest of what those roots contain.
 - **direnv trust is path-keyed**, so every clone's `.envrc` is untrusted at birth. cowshed (unsandboxed) writes the
   direnv allow entry for `<mount>/.envrc` at new/fork/restore — and `cowshed ensure` re-asserts it when healing.
   `cowshed exec` then loads the environment exactly as an interactive shell would: when a nearest `.envrc` exists, the
@@ -433,9 +435,9 @@ guarantees cowshed owns:
 
 ### Evaluating an edited `devenv.nix` inside its workspace
 
-A workspace that edits `devenv.nix` — adding a package, bumping a toolchain — must be able to evaluate the edit where
-it made it. This is the case that most wants isolation and is least served without it: a toolchain change tested only
-after landing is a toolchain change tested in production.
+A workspace that edits `devenv.nix` — adding a package, bumping a toolchain — must be able to evaluate the edit where it
+made it. This is the case that most wants isolation and is least served without it: a toolchain change tested only after
+landing is a toolchain change tested in production.
 
 Two things stand between the closed baseline and that working, and neither is a new grant.
 
@@ -443,25 +445,25 @@ Two things stand between the closed baseline and that working, and neither is a 
 controller-selected and canonical-path-scoped by construction, and every production call site passes an empty vector, so
 no `nix` client in a sandbox can reach the daemon. Wiring it is implementation catching up with this spec, not a
 widening of it. The **security posture is unchanged by that wiring**, and the reason is the daemon's, not cowshed's:
-builds and substitution already run *outside* the sandbox as root, the store is already world-readable through the broad
+builds and substitution already run _outside_ the sandbox as root, the store is already world-readable through the broad
 `file-read-data` allow, and binary-cache substitution is already documented above as an accepted off-gateway
-trusted-mediator channel. What the socket adds is the ability to *ask*. Evaluation itself runs in-sandbox and can
+trusted-mediator channel. What the socket adds is the ability to _ask_. Evaluation itself runs in-sandbox and can
 execute arbitrary Nix code — but arbitrary in-sandbox code execution is what a workspace is for, and evaluation gets no
 authority a `cargo build` in the same workspace does not already have.
 
 **The sandbox `PATH` is not a captured profile.** It is filtered live from the controller's own `PATH` at every spawn,
 admitting only immutable store-backed roots (`/nix/store`, `/run/current-system`, `/etc/profiles`,
 `/etc/static/profiles`), plus the workspace's `.cowshed/bin`. There is no adopt-time or mint-time profile snapshot
-anywhere, and therefore nothing that a workspace's toolchain could be said to have diverged *from*. The consequence is
+anywhere, and therefore nothing that a workspace's toolchain could be said to have diverged _from_. The consequence is
 the one that matters here: a workspace can evaluate an edited `devenv.nix` and the resulting tools still will not be on
 its `PATH`, because the controller's `PATH` is what is being filtered.
 
-A third thing had to be true and was not: `sandbox_path` admits the per-user profile roots
-(`/etc/profiles`, `/etc/static/profiles`) to `PATH`, but the Seatbelt profile granted neither, so every
-nix-installed tool on them was unrunnable — the exact breakage the `PATH` admission was added to fix. The broad
-`file-read-data` allow is not enough: resolving a path for exec needs `file-read*` on its roots. Both spellings are
-granted, for the same reason `/var/select` and `/private/var/select` both are — `/etc` is a symlink to `/private/etc`,
-and a rule naming only the pretty form silently never matches.
+A third thing had to be true and was not: `sandbox_path` admits the per-user profile roots (`/etc/profiles`,
+`/etc/static/profiles`) to `PATH`, but the Seatbelt profile granted neither, so every nix-installed tool on them was
+unrunnable — the exact breakage the `PATH` admission was added to fix. The broad `file-read-data` allow is not enough:
+resolving a path for exec needs `file-read*` on its roots. Both spellings are granted, for the same reason `/var/select`
+and `/private/var/select` both are — `/etc` is a symlink to `/private/etc`, and a rule naming only the pretty form
+silently never matches.
 
 The fix follows the mechanism that already exists rather than adding one. devenv materializes its evaluation as
 `.devenv/profile`, a symlink into `/nix/store`, inside the project directory — which in a workspace is in-image and
@@ -473,11 +475,11 @@ byte-identical to today. A stale profile is self-correcting, because the next su
 symlink. On land, main's own next evaluation picks the change up for future mints by the same rule.
 
 The bare-command check contract (02_workspaces.md) is unaffected and stays the default: the point of the workspace
-profile is that `just verify` resolves the *edited* toolchain without a wrapper, not that wrappers become useful.
+profile is that `just verify` resolves the _edited_ toolchain without a wrapper, not that wrappers become useful.
 
 **Residual: `devenv` itself writes to a hardcoded `/tmp`.** It ignores `TMPDIR` and creates `/tmp/devenv-<hash>`, which
 the closed baseline denies — the workspace's writable temp is its own `exec_temp_dir`, which is what `TMPDIR` points at.
-So evaluating *through the `devenv` CLI* inside the sandbox still fails on that write, while `nix` itself and an
+So evaluating _through the `devenv` CLI_ inside the sandbox still fails on that write, while `nix` itself and an
 already-materialized profile work. This is deliberately not papered over: granting write on `/private/tmp` would hand
 every workspace a world-shared directory, which is precisely the per-workspace-temp invariant this baseline exists to
 hold. The fix belongs upstream in devenv (honour `TMPDIR`) or in a wrapper that sets a short per-workspace temp path;
@@ -492,6 +494,28 @@ with a sibling doing the same and is unreachable from its own workspace's client
 in-sandbox clients: a workspace process can connect only to its own block ports, so service-to-service traffic inside a
 workspace must also ride block ports. On Linux the netns makes both moot: each workspace's loopback is private, no
 `COWSHED_PORT_BASE` exists, and package traffic uses the fixed connector address instead.
+
+## The sccache daemon as trusted mediator
+
+The host-owned sccache server (03_caches.md) follows the nix-daemon doctrine: a scoped canonical-path `unix-socket`
+allow in the baseline (`~/.cowshed/sccache.sock`), a daemon running _outside_ every sandbox, and no protocol translation
+by cowshed — sccache speaks its own client-server protocol, and cowshed adds lifecycle (the `dev.cowshed.sccache`
+LaunchAgent, managed by `cowshed sccache start|stop|status`) plus scoped access, nothing else. Unlike the nix socket,
+the path is admitted without resolving to a live socket: it is a cowshed-owned constant under `~/.cowshed`, where the
+store-wide deny leaves sandboxes unable to create, unlink, or bind anything, so naming the path grants nothing a sandbox
+could conjure and profiles stay correct across daemon restarts and late installs. The same deny doubles as the client
+fail-fast: sccache 0.16 has no client flag that suppresses spawning a fallback server on connect failure
+(source-verified — `SCCACHE_NO_DAEMON` only keeps a spawned server in the foreground), but the fallback must bind the
+socket path and cannot, so a down daemon costs a prompt compile error, never a wrong-boundary server serving siblings
+from inside a sandbox.
+
+**The confused-deputy surface is named, not implied.** The daemon reads sources and executes a _client-named_ compiler
+binary with client-supplied arguments and environment, unsandboxed, at the client's request — socket access equals
+arbitrary user-uid execution outside the sandbox. Accepted: the confinement threat model (semi-trusted agents running
+the user's own code) already concedes that class to a deliberate adversary through layer-3 cache poisoning — a poisoned
+sccache entry feeds main's next build (03_caches.md) — so the daemon adds immediacy, not new reach. In exchange the
+store itself narrows: the `~/.cowshed/caches/sccache` write carve-back is gone and every cache write flows through the
+daemon.
 
 ## Linux enforcement (ZFS substrate)
 
