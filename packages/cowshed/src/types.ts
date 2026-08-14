@@ -81,6 +81,8 @@ export interface EnsureReport {
   readonly mount: string;
   readonly action: EnsureAction;
   readonly goEnv: string;
+  /** Host-level sccache server socket (`SCCACHE_SERVER_UDS`), identical for every workspace. */
+  readonly sccacheServerUds: string;
   readonly workspaceToken: string;
   readonly portBlock?: PortBlock;
 }

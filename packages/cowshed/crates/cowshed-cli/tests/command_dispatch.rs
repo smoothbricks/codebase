@@ -150,6 +150,7 @@ impl CliService for FakeService {
             mount: PathBuf::from("/mnt/raven"),
             action: EnsureAction::AlreadyMounted,
             go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+            sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
             workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
             port_block: None,
         }))
@@ -667,13 +668,14 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
         mount: PathBuf::from("/mnt/raven"),
         action: EnsureAction::AlreadyMounted,
         go_env: PathBuf::from("/mnt/raven/nested dir/it's/go env"),
+        sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/scc'ache.sock"),
         workspace_token: token_path.clone(),
         port_block: Some(PortBlock::new(40960, 16).unwrap()),
     });
     let (_, stdout, stderr) = run(&mut service, ["ensure", "--envrc"]).await;
     assert_eq!(
         stdout,
-        b"export GOENV='/mnt/raven/nested dir/it'\\''s/go env'\nexport COWSHED_WORKSPACE_TOKEN='tok'\\''en'\nexport COWSHED_PORT_BASE='40960'\n"
+        b"export GOENV='/mnt/raven/nested dir/it'\\''s/go env'\nexport SCCACHE_SERVER_UDS='/Users/tester/.cowshed/scc'\\''ache.sock'\nexport COWSHED_WORKSPACE_TOKEN='tok'\\''en'\nexport COWSHED_PORT_BASE='40960'\n"
     );
     assert!(stderr.is_empty());
     assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
@@ -823,6 +825,7 @@ async fn ensure_uses_nested_invocation_cwd_and_reports_detached_healing() {
                 mount: PathBuf::from("/mnt/raven"),
                 action: EnsureAction::Attached,
                 go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+                sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
                 workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
                 port_block: None,
             }),
@@ -831,7 +834,7 @@ async fn ensure_uses_nested_invocation_cwd_and_reports_detached_healing() {
         let (_, stdout, stderr) = run(&mut service, ["ensure", "--json"]).await;
         assert_eq!(
             stdout,
-            b"{\"ok\":true,\"result\":{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"action\":\"attached\",\"goEnv\":\"/mnt/raven/.cowshed/cache/go/env\",\"workspaceToken\":\"/mnt/raven/.cowshed/token\"}}\n"
+            b"{\"ok\":true,\"result\":{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"action\":\"attached\",\"goEnv\":\"/mnt/raven/.cowshed/cache/go/env\",\"sccacheServerUds\":\"/Users/tester/.cowshed/sccache.sock\",\"workspaceToken\":\"/mnt/raven/.cowshed/token\"}}\n"
         );
         assert_eq!(stderr, b"cowshed: workspace raven is ready (attached)\n");
         assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
@@ -881,6 +884,7 @@ async fn ensure_resolution_and_token_errors_emit_no_partial_machine_output() {
             mount: PathBuf::from("/mnt/raven"),
             action: EnsureAction::AlreadyMounted,
             go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+            sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
             workspace_token: PathBuf::from("/definitely/missing/cowshed/token"),
             port_block: None,
         }),

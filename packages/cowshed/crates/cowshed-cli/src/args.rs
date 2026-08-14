@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  skill install      install the agent skill";
+pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  sccache <action>   manage the host sccache daemon\n  skill install      install the agent skill";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -38,6 +38,7 @@ pub enum Command {
     Land(LandArgs),
     Doctor,
     Gateway(GatewayCommand),
+    Sccache(SccacheCommand),
     Skill(SkillArgs),
 }
 
@@ -60,6 +61,13 @@ pub enum GatewayCommand {
     Stop,
     Status,
     Run,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SccacheCommand {
+    Start,
+    Stop,
+    Status,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -292,6 +300,7 @@ enum CommandName {
     Land,
     Doctor,
     Gateway,
+    Sccache,
     Skill,
 }
 
@@ -325,6 +334,7 @@ where
         Some("land") => CommandName::Land,
         Some("doctor") => CommandName::Doctor,
         Some("gateway") => CommandName::Gateway,
+        Some("sccache") => CommandName::Sccache,
         Some("skill") => CommandName::Skill,
         Some(other) => {
             return Err(UsageError::new(
@@ -356,6 +366,7 @@ where
         CommandName::Land => parse_land(&args, index, &mut global)?,
         CommandName::Doctor => parse_empty(&args, index, &mut global, "doctor", Command::Doctor)?,
         CommandName::Gateway => parse_gateway(&args, index, &mut global)?,
+        CommandName::Sccache => parse_sccache(&args, index, &mut global)?,
         CommandName::Skill => parse_skill(&args, index, &mut global)?,
     };
     Ok(Cli { global, command })
@@ -396,6 +407,42 @@ fn parse_gateway(
         ));
     }
     Ok(Command::Gateway(action))
+}
+
+fn parse_sccache(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    let usage = "sccache <start|stop|status>";
+    let action = match args.get(index).and_then(|argument| argument.to_str()) {
+        Some("start") => SccacheCommand::Start,
+        Some("stop") => SccacheCommand::Stop,
+        Some("status") => SccacheCommand::Status,
+        Some(other) => {
+            return Err(UsageError::new(
+                format!("unknown sccache action `{other}`"),
+                usage,
+            ));
+        }
+        None => return Err(UsageError::new("sccache action is required", usage)),
+    };
+    index += 1;
+    while index < args.len() && parse_global(args, &mut index, global)? {}
+    if index != args.len() {
+        let argument = args[index].to_string_lossy();
+        return Err(UsageError::new(
+            format!("unexpected sccache argument `{argument}`"),
+            usage,
+        ));
+    }
+    if global.project.is_some() {
+        return Err(UsageError::new(
+            "--project is not valid for sccache commands",
+            usage,
+        ));
+    }
+    Ok(Command::Sccache(action))
 }
 
 fn parse_skill(
