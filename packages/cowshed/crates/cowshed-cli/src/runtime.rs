@@ -107,6 +107,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Rebase(_)
         | Command::Land(_)
         | Command::Gateway(_)
+        | Command::Skill(_)
         | Command::Doctor => RuntimeOpenMode::ExistingOnly,
     }
 }
@@ -792,6 +793,9 @@ where
         }
         Command::Gateway(_) => Err(CowshedError::internal(
             "gateway commands must be dispatched by the host service entrypoint",
+        )),
+        Command::Skill(_) => Err(CowshedError::internal(
+            "skill commands must be dispatched before the runtime bridge",
         )),
     }
 }
