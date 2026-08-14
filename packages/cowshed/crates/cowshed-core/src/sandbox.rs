@@ -63,6 +63,24 @@ fn nix_daemon_socket_at(entry: &Path) -> Option<PathBuf> {
     metadata.file_type().is_socket().then_some(resolved)
 }
 
+/// The host-owned sccache server socket beneath the cowshed store root.
+///
+/// The socket is bound by the `dev.cowshed.sccache` LaunchAgent — an sccache
+/// server started by launchd *outside* every sandbox, so it enforces no
+/// workspace's boundary and can serve them all. Clients reach it through
+/// `SCCACHE_SERVER_UDS`; the profile admits exactly this path.
+///
+/// Unlike [`nix_daemon_socket`], the path is admitted without requiring a live
+/// socket: it is a cowshed-owned constant under `~/.cowshed`, where the
+/// store-wide deny leaves sandboxes unable to create, unlink, or bind anything,
+/// so naming the path grants nothing a sandbox could conjure — and it keeps
+/// profiles correct when the daemon is (re)started after a supervisor launched.
+/// The same deny is what makes a client's auto-spawned fallback server fail
+/// fast in-sandbox: binding here needs write-create, which no workspace holds.
+pub fn sccache_server_socket(home: &Path) -> PathBuf {
+    home.join(".cowshed/sccache.sock")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,
@@ -213,7 +231,7 @@ pub fn seatbelt_profile(
         "(allow mach-priv-task-port (target same-sandbox))",
     );
 
-    for socket in sockets {
+    for socket in &sockets {
         push_line(
             &mut profile,
             &format!(
@@ -221,11 +239,6 @@ pub fn seatbelt_profile(
                 sbpl_path(socket)?
             ),
         );
-        // Connecting resolves the path, so every ancestor must be traversable. The socket's own
-        // directory is not under any of the immutable roots granted above — on macOS the daemon
-        // socket resolves into `/private/var/run` — and without these literals the connect fails on
-        // path resolution before the outbound rule is ever consulted.
-        push_readable_ancestors(&mut profile, socket)?;
     }
     push_line(
         &mut profile,
@@ -269,11 +282,25 @@ pub fn seatbelt_profile(
     for path in read_grants.iter().chain(write_grants.iter()) {
         push_readable_ancestors(&mut profile, path)?;
     }
+    // Connecting to an allowed socket resolves its path, so every ancestor must
+    // be traversable. Socket directories are not under the immutable roots
+    // granted above — the nix daemon socket resolves into `/private/var/run`,
+    // and the sccache server socket lives under `~/.cowshed` itself — so the
+    // literals must land here, after the store-wide deny, or last-match-wins
+    // re-denies them and the connect fails on path resolution before the
+    // outbound rule is ever consulted.
+    for socket in &sockets {
+        push_readable_ancestors(&mut profile, socket)?;
+    }
     push_subpath_rule(&mut profile, "allow file-read*", &caches)?;
     for suffix in [
         "cargo/registry",
         "cargo/git",
-        "sccache",
+        // sccache is deliberately absent: every disk-cache read and write
+        // happens inside the host-owned sccache daemon (source-verified for
+        // sccache 0.16 — DiskCache is instantiated only in the server), which
+        // workspaces reach over the allowed unix socket. Sandboxes keep read
+        // through the caches-wide allow above; the store stays daemon-write-only.
         "zig",
         "gradle/caches",
         "go/mod",
@@ -643,6 +670,37 @@ mod tests {
         )
         .unwrap();
         assert!(!standalone.contains("/Users/tester/.cowshed/mnt/acme/widget/main/.git"));
+    }
+
+    /// The host-owned sccache daemon contract, stated as what the profile says:
+    /// the store is readable but never shed-writable, and the server socket is
+    /// reachable even though it lives under the store-wide deny.
+    #[test]
+    fn sccache_store_is_daemon_write_only_and_its_socket_outlives_the_store_deny() {
+        let mut with_socket = config(RunSandboxMode::ReadWrite);
+        let socket = sccache_server_socket(&with_socket.home);
+        assert_eq!(socket, PathBuf::from("/Users/tester/.cowshed/sccache.sock"));
+        with_socket.allowed_unix_sockets.push(socket.clone());
+        let profile = seatbelt_profile(&with_socket, SandboxProfileRole::ExecutedChild).unwrap();
+
+        // Daemon-only writes: caches-wide read stays, the write carve-back is gone.
+        assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/.cowshed/caches\"))"));
+        assert!(!profile.contains(
+            "(allow file-read* file-write* (subpath \"/Users/tester/.cowshed/caches/sccache\"))"
+        ));
+
+        assert!(profile.contains(
+            "(allow network-outbound (remote unix-socket (path-literal \"/Users/tester/.cowshed/sccache.sock\")))"
+        ));
+        // SBPL is last-match-wins: the ancestor literals that make the connect's
+        // path resolution work must be emitted after the store-wide deny.
+        let store_deny = profile
+            .find("(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))")
+            .unwrap();
+        let socket_literal = profile
+            .rfind("(allow file-read* (literal \"/Users/tester/.cowshed/sccache.sock\"))")
+            .expect("socket path literal");
+        assert!(store_deny < socket_literal);
     }
 
     #[test]
