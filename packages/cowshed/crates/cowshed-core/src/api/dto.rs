@@ -2017,6 +2017,10 @@ pub struct CreateOptions {
     /// Also register this workspace as a remote in main's repository. Off by default: it is
     /// host-side state that accumulates one entry per workspace and outlives an interrupted retire.
     pub register: bool,
+    /// Mint a registered linked worktree of main's repository instead of a standalone clone: one
+    /// object store and one ref namespace, at the cost of requiring main mounted and giving up
+    /// checkpoint and restore.
+    pub git_worktree: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

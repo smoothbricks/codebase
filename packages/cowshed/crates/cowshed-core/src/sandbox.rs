@@ -46,6 +46,17 @@ pub struct SandboxConfig {
     pub allowed_unix_sockets: Vec<PathBuf>,
     /// Monotonic effective denies supplied by trusted/operator/repository policy.
     pub additional_denies: Vec<PathBuf>,
+    /// The `.git` directory of main's canonical mount, for a git-worktree workspace only.
+    ///
+    /// This is the mode's stated hole in the isolation: the workspace's repository *is* main's, so
+    /// a committing agent reads and writes main's object store and its own
+    /// `worktrees/<ws>` administrative directory. It cannot ride the ordinary read/write grants —
+    /// those are refused outright when they intersect a protected path, and under the symlink
+    /// layout main's mount is inside cowshed's own store while under direct mount it is the
+    /// project root that policy denies. It is therefore a distinct, controller-only field, carried
+    /// by exactly the workspaces that asked for `--git-worktree` and never implied by the
+    /// baseline.
+    pub git_worktree_repository: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +112,9 @@ pub fn seatbelt_profile(
             size: config.port_block.size,
         })?;
 
+    if let Some(repository) = &config.git_worktree_repository {
+        validate_path(repository)?;
+    }
     let hard_denies = hard_denies(&config.home, &config.additional_denies)?;
     let read_grants = normalized_paths(&config.grants.read)?;
     let write_grants = normalized_paths(&config.grants.write)?;
@@ -240,6 +254,16 @@ pub fn seatbelt_profile(
         .filter(|path| path.as_ref() != cowshed.as_path())
     {
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
+    }
+
+    // After every deny that would otherwise close it: the store-wide `~/.cowshed` deny covers
+    // main's mount under the symlink layout, and policy denies the project root under direct
+    // mount. SBPL is last-match-wins, so the carve-back has to be stated last to be real — and it
+    // is narrowed to `.git`, never main's working tree, which stays as unreachable as any other
+    // workspace's.
+    if let Some(repository) = &config.git_worktree_repository {
+        push_readable_ancestors(&mut profile, repository)?;
+        push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", repository)?;
     }
 
     for protected in [
@@ -436,6 +460,7 @@ mod tests {
             },
             allowed_unix_sockets: vec![PathBuf::from("/var/run/nix/daemon-socket/socket")],
             additional_denies: vec![],
+            git_worktree_repository: None,
         }
     }
 
@@ -536,6 +561,42 @@ mod tests {
         }
         assert!(!first.contains("localhost:40960-40975"));
         assert!(!first.contains("example.com"));
+    }
+
+    /// The git-worktree hole, stated as what the profile actually says: narrowed to `.git`, and
+    /// last, because the store-wide deny and the project-root deny both cover the path it opens.
+    #[test]
+    fn git_worktree_repository_carve_back_is_narrow_and_outlives_every_deny() {
+        let mut linked = config(RunSandboxMode::ReadWrite);
+        let main_mount = PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/main");
+        linked.additional_denies = vec![main_mount.clone()];
+        linked.git_worktree_repository = Some(main_mount.join(".git"));
+        let profile = seatbelt_profile(&linked, SandboxProfileRole::ExecutedChild).unwrap();
+
+        let carve_back = profile
+            .find("(allow file-read* file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/main/.git\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/main/.git\"))")
+            .expect("git-worktree repository carve-back");
+        let store_deny = profile
+            .find("(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))")
+            .unwrap();
+        let policy_deny = profile
+            .rfind("(deny file-read* file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/main\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/main\"))")
+            .expect("policy deny on main's mount");
+        // SBPL is last-match-wins, so ordering is the whole enforcement.
+        assert!(store_deny < carve_back);
+        assert!(policy_deny < carve_back);
+        // Main's working tree stays as unreachable as any other workspace's.
+        assert!(!profile.contains(
+            "(allow file-read* file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/main\") (subpath"
+        ));
+
+        // A workspace that did not ask for the mode never gets the hole.
+        let standalone = seatbelt_profile(
+            &config(RunSandboxMode::ReadWrite),
+            SandboxProfileRole::ExecutedChild,
+        )
+        .unwrap();
+        assert!(!standalone.contains("/Users/tester/.cowshed/mnt/acme/widget/main/.git"));
     }
 
     #[test]

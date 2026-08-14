@@ -595,6 +595,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             browse: false,
             slot: Some(2),
             register: true,
+            git_worktree: true,
         })
         .unwrap(),
         json!({
@@ -602,7 +603,8 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             "fromWorkspace":"raven",
             "browse":false,
             "slot":2,
-            "register":true
+            "register":true,
+            "gitWorktree":true
         })
     );
     assert_eq!(

@@ -606,6 +606,17 @@ pub struct WorkspaceInfoSnapshot {
     pub forked_from: Option<WorkspaceName>,
     pub captured_at: String,
     pub stale: bool,
+    /// This workspace is a registered linked worktree of main's repository rather than a
+    /// standalone clone (`cowshed new --git-worktree`).
+    ///
+    /// Store-side, because every decision it drives — refusing checkpoint, pruning the
+    /// registration out of main at retirement, requiring main mounted before attach — has to be
+    /// made while the workspace itself is detached and its mount says nothing.
+    ///
+    /// Absent rather than `false` on a standalone workspace: the mode is the exception, and a
+    /// sidecar that never asked for it keeps the spelling it already had.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub git_worktree: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -613,6 +624,10 @@ pub struct WorkspaceInfoSnapshot {
 pub enum PublicationState {
     Active,
     PendingFence,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn active_publication_state() -> PublicationState {
@@ -1426,6 +1441,32 @@ mod tests {
             legacy.require_info_snapshot(),
             Err(MetadataError::MissingInfoSnapshot)
         ));
+    }
+
+    /// The git-worktree fact has to survive a sidecar round trip, because every decision it drives
+    /// — refusing checkpoint, pruning the registration out of main, requiring main mounted — is
+    /// taken from the store side while the workspace itself may be detached. It is written only
+    /// when true, so a standalone workspace's sidecar keeps the spelling it always had.
+    #[test]
+    fn git_worktree_mode_round_trips_and_is_absent_on_a_standalone_workspace() {
+        let standalone: DetachedWorkspaceMetadata =
+            serde_json::from_value(frozen_sidecar_json()).expect("decode sidecar");
+        assert!(!standalone.require_info_snapshot().unwrap().git_worktree);
+        assert!(
+            serde_json::to_value(&standalone).expect("encode sidecar")["infoSnapshot"]
+                .get("gitWorktree")
+                .is_none()
+        );
+
+        let mut wire = frozen_sidecar_json();
+        wire["infoSnapshot"]["gitWorktree"] = serde_json::Value::Bool(true);
+        let linked: DetachedWorkspaceMetadata =
+            serde_json::from_value(wire.clone()).expect("decode git-worktree sidecar");
+        assert!(linked.require_info_snapshot().unwrap().git_worktree);
+        assert_eq!(
+            serde_json::to_value(&linked).expect("encode sidecar")["infoSnapshot"],
+            wire["infoSnapshot"]
+        );
     }
 
     #[test]

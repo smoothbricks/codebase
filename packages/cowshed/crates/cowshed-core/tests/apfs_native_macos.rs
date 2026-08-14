@@ -299,6 +299,7 @@ fn metadata(format: ImageFormat) -> DetachedWorkspaceMetadata {
             forked_from: None,
             captured_at: "2026-07-13T00:00:00Z".to_owned(),
             stale: false,
+            git_worktree: false,
         }),
     }
 }
@@ -424,6 +425,7 @@ fn identity(fixture: &Fixture) -> OperationIdentity {
         branch: Some("main".to_owned()),
         forked_from: None,
         created_trace: "trace-apfs-boundary".to_owned(),
+        git_worktree: false,
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
     }
@@ -983,6 +985,7 @@ fn metadata_publication_writes_the_requested_identity_and_revision() {
             forked_from: None,
             captured_at: "2026-07-13T00:00:00Z".to_owned(),
             stale: false,
+            git_worktree: false,
         }
     );
 }

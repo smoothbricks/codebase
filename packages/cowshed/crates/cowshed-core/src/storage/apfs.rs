@@ -2878,6 +2878,7 @@ mod tests {
             branch: Some("main".to_owned()),
             forked_from: None,
             created_trace: "lock-table".to_owned(),
+            git_worktree: false,
             grants: GrantSet::default(),
         }
     }

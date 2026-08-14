@@ -841,6 +841,7 @@ fn identity() -> OperationIdentity {
         branch: Some("main".to_owned()),
         forked_from: None,
         created_trace: "apfs-storage".to_owned(),
+        git_worktree: false,
         grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
             .expect("grants"),
     }
