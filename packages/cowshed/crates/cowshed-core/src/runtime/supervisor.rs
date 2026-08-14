@@ -797,8 +797,36 @@ impl CommitmentSink for CommitmentPublisherHandle {
     }
 }
 
+/// devenv materializes an evaluation as `.devenv/profile`, a symlink into `/nix/store`, inside the
+/// project directory — which in a workspace is in-image, per-workspace, and isolated with the rest
+/// of the volume.
+const DEVENV_PROFILE_BIN: &str = ".devenv/profile/bin";
+
+/// The workspace's own evaluated toolchain, if it has evaluated one.
+///
+/// The sandbox `PATH` is otherwise filtered from the *controller's* environment, so a workspace
+/// that edits `devenv.nix` and evaluates it successfully would still not see the result — the tools
+/// exist, in the store, reachable, and simply not on `PATH`. Its own profile goes first so the
+/// edited toolchain wins over the inherited one, which is the entire point of evaluating it there.
+///
+/// Presence is the whole signal: the profile exists exactly when an evaluation succeeded in this
+/// workspace, so nothing has to be compared, refreshed, or flagged, and a workspace that never
+/// evaluated gets byte-identical behaviour to before. A stale profile self-corrects, because the
+/// next successful evaluation rewrites the symlink.
+///
+/// The *resolved* store path is admitted, never the in-image symlink: it is immutable and already
+/// covered by the store read grants, so what lands on `PATH` is what was validated rather than
+/// whatever the link happens to point at by the time the child execs.
+fn workspace_profile_bin(workspace_mount: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(workspace_mount.join(DEVENV_PROFILE_BIN)).ok()?;
+    resolved.starts_with("/nix/store").then_some(resolved)
+}
+
 fn sandbox_path(sandbox: &SandboxConfig) -> Result<OsString> {
     let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
+    if let Some(profile) = workspace_profile_bin(&sandbox.workspace_mount) {
+        paths.push(profile);
+    }
     let mut seen = paths.iter().cloned().collect::<BTreeSet<_>>();
     if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
         && seen.insert(path.clone())
@@ -3073,6 +3101,128 @@ fn retiring_error() -> CowshedError {
         "workspace supervisor is quiescing or retired",
         "reattach an active workspace before starting work",
     )
+}
+
+#[cfg(test)]
+mod workspace_toolchain_tests {
+    use super::*;
+    use crate::sandbox::{
+        RunSandboxMode, SandboxConfig, SandboxGrants, SandboxProfileRole, nix_daemon_socket,
+        seatbelt_profile,
+    };
+
+    fn sandbox_at(mount: &Path) -> SandboxConfig {
+        SandboxConfig {
+            home: mount.parent().expect("root").join("home"),
+            workspace_mount: mount.to_path_buf(),
+            exec_temp_dir: mount.parent().expect("root").join("tmp"),
+            port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
+            mode: RunSandboxMode::ReadWrite,
+            grants: SandboxGrants::default(),
+            allowed_unix_sockets: nix_daemon_socket().into_iter().collect(),
+            additional_denies: Vec::new(),
+            git_worktree_repository: None,
+        }
+    }
+
+    fn scratch(test: &str) -> PathBuf {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .join(format!(
+                "cowshed-toolchain-{test}-{}",
+                Uuid::new_v4().simple()
+            ));
+        std::fs::create_dir_all(&root).expect("scratch root");
+        root
+    }
+
+    #[test]
+    fn a_workspace_without_an_evaluated_profile_is_unchanged() {
+        let root = scratch("absent");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(&mount).expect("mount");
+
+        assert_eq!(workspace_profile_bin(&mount), None);
+
+        // A profile that does not resolve into the store is not a profile. This is the substitution
+        // guard: a workspace can create any symlink it likes inside its own volume, and only one
+        // that lands in the immutable store may go on PATH.
+        let devenv = mount.join(".devenv");
+        std::fs::create_dir_all(&devenv).expect("devenv");
+        let decoy = root.join("decoy/bin");
+        std::fs::create_dir_all(&decoy).expect("decoy");
+        std::os::unix::fs::symlink(root.join("decoy"), devenv.join("profile")).expect("decoy link");
+        assert_eq!(workspace_profile_bin(&mount), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The end of the mechanism, exercised for real: a workspace whose `devenv` evaluation
+    /// materialized a store profile gets that profile's tools on `PATH`, ahead of the inherited
+    /// roots, and can actually execute them inside its own Seatbelt sandbox.
+    #[cfg_attr(not(target_os = "macos"), ignore)]
+    #[test]
+    fn an_evaluated_workspace_profile_leads_path_and_runs_inside_the_sandbox() {
+        // Any multi-user Nix host has this profile, and it resolves into the store exactly as a
+        // devenv profile does, so it stands in for one without pinning a generated store path.
+        let Ok(store_profile) = std::fs::canonicalize("/nix/var/nix/profiles/default") else {
+            return;
+        };
+        if !store_profile.starts_with("/nix/store") {
+            return;
+        }
+        let Some(tool) = std::fs::read_dir(store_profile.join("bin"))
+            .ok()
+            .and_then(|mut entries| entries.find_map(|entry| entry.ok()))
+            .map(|entry| entry.path())
+        else {
+            return;
+        };
+
+        let root = scratch("profile");
+        let mount = root.join("workspace");
+        let config = sandbox_at(&mount);
+        for directory in [&mount.join(".devenv"), &config.home, &config.exec_temp_dir] {
+            std::fs::create_dir_all(directory).expect("directory");
+        }
+        // Exactly what `devenv shell` leaves behind: an in-image symlink into the store.
+        std::os::unix::fs::symlink(&store_profile, mount.join(".devenv/profile"))
+            .expect("profile link");
+
+        let profile_bin = workspace_profile_bin(&mount).expect("an evaluated profile is admitted");
+        // Resolved all the way through: a profile's `bin` is itself a symlink chain inside the
+        // store, and what goes on PATH is the immutable path it finally reaches.
+        assert!(profile_bin.starts_with("/nix/store"));
+        assert_eq!(
+            profile_bin,
+            std::fs::canonicalize(store_profile.join("bin")).expect("resolved profile bin")
+        );
+
+        let path = sandbox_path(&config).expect("sandbox PATH");
+        let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(
+            entries.get(1),
+            Some(&profile_bin),
+            "the workspace's own toolchain comes before the inherited roots, or an edited \
+             devenv.nix loses to the controller's environment"
+        );
+
+        // And it is genuinely reachable: the store read grants have to cover the resolved profile,
+        // or PATH names a tool the sandbox refuses to exec.
+        let profile =
+            seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).expect("profile");
+        let status = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "--", "/bin/test", "-x"])
+            .arg(&tool)
+            .status()
+            .expect("sandbox-exec");
+
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            status.success(),
+            "a tool on the workspace profile must be executable inside the sandbox"
+        );
+    }
 }
 
 #[cfg(test)]
