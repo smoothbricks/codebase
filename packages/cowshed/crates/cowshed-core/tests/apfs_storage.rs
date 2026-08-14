@@ -15,7 +15,7 @@ use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, IncarnationSource, LockMode, MarkerExpectation, MetadataPolicy,
-    PublicationError, RestoreStage, RetireExecutionError, volume_name,
+    PublicationError, RestoreStage, RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -110,7 +110,7 @@ impl FakeHost {
             key,
             StorageFact {
                 workspace: workspace.clone(),
-                volume_name: volume_name(workspace.repo(), workspace.name()),
+                volume_key: volume_key(workspace.repo(), workspace.name()),
             },
         );
     }
@@ -310,8 +310,8 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
-    fn rename_volume(&self, _: &Path, volume_name: &str) -> Result<(), ApfsStorageError> {
-        self.record(format!("rename-volume:{volume_name}"));
+    fn rename_volume(&self, _: &Path, volume_key: &str) -> Result<(), ApfsStorageError> {
+        self.record(format!("rename-volume:{volume_key}"));
         Ok(())
     }
 
@@ -401,7 +401,7 @@ impl ApfsExecutionHost for FakeHost {
             (workspace.repo().clone(), workspace.name().clone()),
             KernelMountFact {
                 mount_id,
-                volume_name: volume_name(workspace.repo(), workspace.name()),
+                volume_key: volume_key(workspace.repo(), workspace.name()),
             },
         );
         Ok(mount_id)
@@ -490,7 +490,7 @@ impl ApfsExecutionHost for FakeHost {
         }
         let fact = StorageFact {
             workspace: workspace.clone(),
-            volume_name: volume_name(workspace.repo(), workspace.name()),
+            volume_key: volume_key(workspace.repo(), workspace.name()),
         };
         if policy == MetadataPolicy::PendingFence {
             let key = (workspace.repo().clone(), workspace.name().clone());
@@ -1236,7 +1236,7 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
         host.list(&repo()).expect("active workspace"),
         vec![StorageFact {
             workspace: current,
-            volume_name: volume_name(&repo(), &WorkspaceName::new("raven").expect("workspace")),
+            volume_key: volume_key(&repo(), &WorkspaceName::new("raven").expect("workspace")),
         }]
     );
 }
@@ -1429,11 +1429,12 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(
         relabels,
         [
-            "rename-volume:cowshed.acme--widget.created",
-            "rename-volume:cowshed.acme--widget.forked",
-            "rename-volume:cowshed.acme--widget.main",
+            "rename-volume:widget — created",
+            "rename-volume:widget — forked",
+            "rename-volume:widget",
         ],
-        "each cloned staging volume is relabeled before publication"
+        "each cloned staging volume is relabeled before publication, and the label a clone \
+         inherits from its source is human-facing only"
     );
 
     let restore_events = host.events();
@@ -1778,7 +1779,7 @@ async fn aborting_create_and_fork_callbacks_detaches_and_reclaims_each_stage() {
             host.list(&repo()).expect("post-cancel listing"),
             vec![StorageFact {
                 workspace: source,
-                volume_name: volume_name(&repo(), &WorkspaceName::new("main").expect("main")),
+                volume_key: volume_key(&repo(), &WorkspaceName::new("main").expect("main")),
             }]
         );
         let events = host.events();
@@ -1921,7 +1922,7 @@ async fn aborting_restore_prepare_callback_cleans_replace_and_verify_mounts() {
             host.list(&repo()).expect("post-cancel listing"),
             vec![StorageFact {
                 workspace: current,
-                volume_name: volume_name(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
+                volume_key: volume_key(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
             }]
         );
         let events = host.events();
@@ -2002,7 +2003,7 @@ async fn aborting_restore_fence_leaves_recoverable_pending_publication() {
         host.list(&repo()).expect("recovered publication"),
         vec![StorageFact {
             workspace: replacement,
-            volume_name: volume_name(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
+            volume_key: volume_key(&repo(), &WorkspaceName::new("raven").expect("workspace"),),
         }]
     );
     assert!(
