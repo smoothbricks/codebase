@@ -40,17 +40,20 @@ machines; stderr is for humans and agents deciding what to do next.**
 
 ## Install
 
-The `cowshed` command is the `bin` of the `@smoothbricks/cowshed` npm package. The command and the Node-API library are
-the same artifact: the `bin` shim calls the addon's `runCli`, so there is no second per-platform executable to publish
-and no version skew between the two surfaces.
+The `cowshed` command is the `bin` of the `@smoothbricks/cowshed` npm package. Its exec trampoline launches the prebuilt
+Rust executable for the host platform without starting Node-API; a checkout's `target/release/cowshed` is the
+local-development fallback, and the Node-API addon's `runCli` remains the final compatibility fallback. The npm package
+contains the same four macOS/Linux architecture artifacts as the library's native-addon matrix, so the CLI and library
+are versioned and published together.
 
 ```sh
 bunx @smoothbricks/cowshed doctor      # one-off
 bun add --global @smoothbricks/cowshed # `cowshed` on PATH
 ```
 
-From a checkout of this repository, build the addon and TypeScript with `nx build cowshed`, then `bun link` the package
-to put that local build's `cowshed` on PATH.
+From a checkout of this repository, run `cargo build --release -p cowshed-cli` and `nx build cowshed`, then `bun link`
+the package. The linked `cowshed` trampoline uses `target/release/cowshed`, while `nx build cowshed` prepares the
+TypeScript library and host Node-API addon.
 
 ### The agent skill
 
