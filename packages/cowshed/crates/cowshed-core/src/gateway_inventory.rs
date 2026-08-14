@@ -27,7 +27,7 @@ use crate::workspace_credentials::{
 };
 
 const MAX_BINDING_BYTES: u64 = 1024 * 1024;
-const UNRESOLVED_MAIN_MOUNT: &str = ".unresolved-main-mount";
+const UNRESOLVED_CHECKOUT_PATH: &str = ".unresolved-main-mount";
 
 /// Complete controller-authoritative input for installing one gateway workspace session.
 pub struct GatewaySessionFact {
@@ -142,12 +142,16 @@ impl InventorySource for NativeInventorySource {
                 message: error.to_string(),
             }
         })?;
-        let main_mount = authoritative_main_mount(&layout, repo)?
-            .unwrap_or_else(|| storage.store().join("gateway").join(UNRESOLVED_MAIN_MOUNT));
+        let checkout_path = authoritative_checkout_path(&layout, repo)?.unwrap_or_else(|| {
+            storage
+                .store()
+                .join("gateway")
+                .join(UNRESOLVED_CHECKOUT_PATH)
+        });
         let config = ApfsSubstrateConfig::new(
             storage.store(),
             storage.caches(),
-            main_mount,
+            checkout_path,
             ApfsCaseSensitivity::Sensitive,
         );
         let captured = SystemKernelMountSource.mounts()?;
@@ -639,7 +643,7 @@ fn read_typed_json_nofollow<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
-fn authoritative_main_mount(
+fn authoritative_checkout_path(
     layout: &StorageLayout,
     repo: &RepoId,
 ) -> Result<Option<PathBuf>, GatewayInventoryError> {

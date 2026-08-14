@@ -34,7 +34,10 @@ const PRE_RESTORE_PREFIX: &str = "pre-restore-";
 pub struct ApfsSubstrateConfig {
     pub store_root: PathBuf,
     pub caches_root: PathBuf,
-    pub main_mount: PathBuf,
+    /// The adopted checkout's original path — the place in the user's source tree that adoption
+    /// took over. It is not a mountpoint: every workspace including main mounts under
+    /// `mnt/<owner>/<repo>/<name>`, and this path holds the symlink into main's mount.
+    pub checkout_path: PathBuf,
     pub case_sensitivity: ApfsCaseSensitivity,
     pub capacity: String,
 }
@@ -43,13 +46,13 @@ impl ApfsSubstrateConfig {
     pub fn new(
         store_root: impl Into<PathBuf>,
         caches_root: impl Into<PathBuf>,
-        main_mount: impl Into<PathBuf>,
+        checkout_path: impl Into<PathBuf>,
         case_sensitivity: ApfsCaseSensitivity,
     ) -> Self {
         Self {
             store_root: store_root.into(),
             caches_root: caches_root.into(),
-            main_mount: main_mount.into(),
+            checkout_path: checkout_path.into(),
             case_sensitivity,
             capacity: DEFAULT_IMAGE_CAPACITY.to_owned(),
         }
@@ -602,14 +605,14 @@ where
         pre_cowshed_checkout: &Path,
     ) -> Result<(), ApfsStorageError> {
         if !workspace.name().is_main()
-            || self.config.main_mount == pre_cowshed_checkout
-            || pre_cowshed_checkout.parent() != self.config.main_mount.parent()
+            || self.config.checkout_path == pre_cowshed_checkout
+            || pre_cowshed_checkout.parent() != self.config.checkout_path.parent()
         {
             return Err(ApfsStorageError::InvalidPlan(
                 "adoption rollback requires main and its exact pre-cowshed sibling",
             ));
         }
-        let mut expected_pre = self.config.main_mount.as_os_str().to_owned();
+        let mut expected_pre = self.config.checkout_path.as_os_str().to_owned();
         expected_pre.push(".pre-cowshed");
         if Path::new(&expected_pre) != pre_cowshed_checkout {
             return Err(ApfsStorageError::InvalidPlan(
@@ -624,7 +627,7 @@ where
             workspace.format(),
         )?];
         let workspace = workspace.clone();
-        let source_checkout = self.config.main_mount.clone();
+        let source_checkout = self.config.checkout_path.clone();
         let pre_cowshed_checkout = pre_cowshed_checkout.to_owned();
         self.dispatch_with_locks(lock_paths, true, move |host, _| {
             host.restore_adopted_checkout(&workspace, &source_checkout, &pre_cowshed_checkout)
@@ -1697,9 +1700,9 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         pre_cowshed_checkout,
         identity,
     } = execution;
-    if identity.project_root != source_checkout || config.main_mount != source_checkout {
+    if identity.project_root != source_checkout || config.checkout_path != source_checkout {
         return Err(ApfsStorageError::InvalidPlan(
-            "adopt source must equal operation project root and canonical main mount",
+            "adopt source must equal operation project root and the configured checkout path",
         ));
     }
     if pre_cowshed_checkout.exists() {
@@ -2714,7 +2717,7 @@ fn mount_point(
     workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     if workspace.name().is_main() {
-        Ok(config.main_mount.clone())
+        Ok(config.checkout_path.clone())
     } else {
         layout(config, workspace.repo())?
             .workspace_mount(workspace.name())
