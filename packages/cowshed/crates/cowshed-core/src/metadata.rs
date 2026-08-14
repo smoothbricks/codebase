@@ -309,6 +309,53 @@ impl<'de> Deserialize<'de> for WorkspaceIncarnation {
     }
 }
 
+/// Where a project's `main` workspace mounts. Per-project, chosen at adopt, and the one thing
+/// that decides what the user's checkout path holds afterwards.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckoutLayout {
+    /// `main` mounts at the checkout path itself. The user's path stays physical, so Git's
+    /// path-conditional configuration (`includeIf "gitdir:…"`) keeps matching.
+    #[default]
+    DirectMount,
+    /// `main` mounts at `mnt/<owner>/<repo>/main` like every other workspace and the checkout
+    /// path holds a symlink to it. One uniform mount namespace, no mount inside the source tree.
+    Symlink,
+}
+
+impl CheckoutLayout {
+    pub const fn mounts_at_checkout(self) -> bool {
+        matches!(self, Self::DirectMount)
+    }
+}
+
+/// The project-level record of the chosen layout, written by adopt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckoutLayoutRecord {
+    pub version: u32,
+    pub checkout_layout: CheckoutLayout,
+}
+
+impl CheckoutLayoutRecord {
+    pub fn new(checkout_layout: CheckoutLayout) -> Self {
+        Self {
+            version: METADATA_VERSION,
+            checkout_layout,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), MetadataError> {
+        if self.version != METADATA_VERSION {
+            return Err(MetadataError::UnsupportedVersion {
+                kind: "checkout layout record",
+                version: self.version,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceRole {

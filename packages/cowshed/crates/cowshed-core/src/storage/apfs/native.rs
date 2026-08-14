@@ -44,7 +44,8 @@ use super::super::{
 };
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingPublicationFact, PublicationError, companion_path, layout, volume_key,
+    MetadataPolicy, PendingPublicationFact, PublicationError, companion_path, layout,
+    main_aware_mount_point, volume_key,
 };
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
@@ -425,6 +426,23 @@ fn checkout_link_staging_path(source_checkout: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Sibling name the direct-mount handoff stages its mountpoint under. It must be a sibling: the
+/// handoff is a `RENAME_SWAP`, which requires both paths on the same filesystem.
+fn checkout_mountpoint_staging_path(source_checkout: &Path) -> PathBuf {
+    let mut path = source_checkout.as_os_str().to_owned();
+    path.push(".cowshed-mountpoint");
+    PathBuf::from(path)
+}
+
+/// Remove the staging name if it currently holds cowshed's own bare mountpoint stub; never touch
+/// anything else, and in particular never a tree with the user's files in it.
+fn remove_checkout_staging_mountpoint(staging: &Path) -> Result<(), ApfsStorageError> {
+    if !path_exists(staging)? {
+        return Ok(());
+    }
+    remove_exact_mount_stub(staging)
+}
+
 /// True when `path` is a symlink naming exactly `canonical_mount`.
 ///
 /// Adoption's rollback and restore arms key off this: only a symlink cowshed itself planted, at
@@ -553,6 +571,35 @@ fn restore_adopted_checkout_paths(
         return Err(ApfsStorageError::InvalidPlan(
             "adoption rollback paths are not exact absolute siblings",
         ));
+    }
+    // Direct mount: the checkout path is the mountpoint itself, so after the detach it is once
+    // more the bare stub. Restore is the same swap in reverse — stub out, retained tree back in —
+    // and the displaced stub is removed rather than unlinked as a symlink.
+    if canonical_mount == source_checkout {
+        if !path_exists(source_checkout)? {
+            return Err(ApfsStorageError::InvalidPlan(
+                "adopted checkout path is missing",
+            ));
+        }
+        if !exact_mount_stub(source_checkout)? {
+            // A prior attempt already swapped the tree back; the only way this is the user's own
+            // directory is that the restore completed.
+            return if path_exists(pre_cowshed_checkout)? {
+                Err(ApfsStorageError::InvalidPlan(
+                    "adopted checkout is neither the mount stub nor the sole restored tree",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        if !path_exists(pre_cowshed_checkout)? {
+            return Err(ApfsStorageError::InvalidPlan(
+                "retained pre-cowshed checkout is missing",
+            ));
+        }
+        swap_paths(source_checkout, pre_cowshed_checkout)?;
+        sync_parent_path(source_checkout)?;
+        return remove_exact_mount_stub(pre_cowshed_checkout);
     }
     let source_is_link = exact_checkout_symlink(source_checkout, canonical_mount)?;
     let source_is_directory = !source_is_link && exact_directory(source_checkout)?;
@@ -1398,10 +1445,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         &self,
         metadata: &DetachedWorkspaceMetadata,
     ) -> Result<PathBuf, ApfsStorageError> {
-        // Uniform for every workspace: main's mount is not the adopted checkout path.
-        layout(&self.config, &metadata.repo_id)?
-            .workspace_mount(&metadata.workspace)
-            .map_err(Into::into)
+        main_aware_mount_point(&self.config, &metadata.repo_id, &metadata.workspace)
     }
 
     /// A volume mounted at `mount_point` is this workspace's iff the in-image marker names it.
@@ -2710,12 +2754,11 @@ where
             ));
         }
 
-        let canonical_mount = layout(&self.config, workspace.repo())?
-            .workspace_mount(workspace.name())
-            .map_err(ApfsStorageError::from)?;
+        let canonical_mount =
+            main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
 
         // Reject a missing retained tree before detaching anything: with the checkout already
-        // pointing at the mount, there would be nothing to give the path back to.
+        // handed over to the mount, there would be nothing to give the path back to.
         if exact_checkout_symlink(source_checkout, &canonical_mount)?
             && !path_exists(pre_cowshed_checkout)?
         {
@@ -2725,6 +2768,11 @@ where
         }
         self.detach_mounted(workspace, false)?;
         restore_adopted_checkout_paths(source_checkout, pre_cowshed_checkout, &canonical_mount)?;
+        if canonical_mount == source_checkout {
+            // Direct mount: the swap above already carried the stub away and removed it. There is
+            // no separate mountpoint under the store to clean up.
+            return Ok(());
+        }
         // The mountpoint is cowshed's own, and after the detach it is once more the bare
         // self-healing stub. Leaving it would strand an empty mount root entry for a workspace
         // that no longer exists.
@@ -2904,6 +2952,103 @@ where
         // user's checkout is untouched — so this is a genuine rollback, and reporting it as a
         // cleanup failure would misclassify a re-runnable state as unrecoverable.
         self.publish_image(staged, canonical)
+    }
+
+    fn vacate_adopted_checkout(
+        &self,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), PublicationError> {
+        if !source_checkout.is_absolute()
+            || pre_cowshed_checkout != pre_cowshed_path(source_checkout)
+        {
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("invalid adopt checkout or pre-cowshed handoff"),
+            ));
+        }
+        let staging = checkout_mountpoint_staging_path(source_checkout);
+
+        // Resume: the swap is done once the checkout path is cowshed's own — either still the bare
+        // stub, or already mounted over. Only the final rename can be outstanding.
+        let already_swapped = self
+            .mount_source
+            .mounts()
+            .map_err(PublicationError::rolled_back)?
+            .iter()
+            .any(|mount| mount.mount_point == source_checkout)
+            || exact_mount_stub(source_checkout).map_err(PublicationError::rolled_back)?;
+        if already_swapped {
+            if !path_exists(&staging).map_err(PublicationError::forward_only)? {
+                return Ok(());
+            }
+            if path_exists(pre_cowshed_checkout).map_err(PublicationError::forward_only)? {
+                return Err(PublicationError::forward_only(
+                    ApfsStorageError::InvalidPlan(
+                        "displaced adopted checkout and retained pre-cowshed tree both exist",
+                    ),
+                ));
+            }
+            return fs::rename(&staging, pre_cowshed_checkout)
+                .map_err(|error| io_error("retain displaced checkout", pre_cowshed_checkout, error))
+                .and_then(|()| sync_parent_path(pre_cowshed_checkout))
+                .map_err(PublicationError::forward_only);
+        }
+
+        let metadata = fs::symlink_metadata(source_checkout).map_err(|error| {
+            PublicationError::rolled_back(io_error(
+                "inspect adopted checkout",
+                source_checkout,
+                error,
+            ))
+        })?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("adopted checkout is not the original directory"),
+            ));
+        }
+        if path_exists(pre_cowshed_checkout).map_err(PublicationError::rolled_back)? {
+            return Err(PublicationError::rolled_back(
+                ApfsStorageError::InvalidPlan("pre-cowshed checkout already exists"),
+            ));
+        }
+        remove_checkout_staging_mountpoint(&staging).map_err(PublicationError::rolled_back)?;
+        self.ensure_adopt_mountpoint(&staging)
+            .map_err(PublicationError::rolled_back)?;
+
+        // The one step that changes what the user sees, and the same primitive the symlink layout
+        // uses: `renameatx_np(RENAME_SWAP)` exchanges the original directory with the staged
+        // mountpoint atomically, so the checkout path goes straight from the user's tree to a
+        // mountpoint carrying the self-healing stub — never absent, never a half-built directory.
+        if let Err(primary) = swap_paths(source_checkout, &staging) {
+            return Err(match remove_checkout_staging_mountpoint(&staging) {
+                Ok(()) => PublicationError::rolled_back(primary),
+                Err(cleanup) => PublicationError::forward_only(ApfsStorageError::Cleanup {
+                    operation: "remove staged adopted mountpoint",
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }),
+            });
+        }
+
+        // The original tree now sits at the staging name; give it the retained name.
+        match fs::rename(&staging, pre_cowshed_checkout)
+            .map_err(|error| io_error("retain displaced checkout", pre_cowshed_checkout, error))
+            .and_then(|()| sync_parent_path(pre_cowshed_checkout))
+        {
+            Ok(()) => Ok(()),
+            Err(primary) => {
+                let cleanup = swap_paths(source_checkout, &staging)
+                    .and_then(|()| remove_checkout_staging_mountpoint(&staging));
+                Err(match cleanup {
+                    Ok(()) => PublicationError::rolled_back(primary),
+                    Err(cleanup) => PublicationError::forward_only(ApfsStorageError::Cleanup {
+                        operation: "restore adopted checkout after failed retention",
+                        primary: Box::new(primary),
+                        cleanup: Box::new(cleanup),
+                    }),
+                })
+            }
+        }
     }
 
     fn link_adopted_checkout(
@@ -3577,13 +3722,13 @@ where
         self.published_facts(repo)?
             .into_iter()
             .filter_map(|fact| {
-                // The kernel reports the canonical mount for every workspace including main; the
-                // adopted checkout path is a symlink and never appears as a mount point.
-                let expected = layout(&self.config, fact.workspace.repo()).and_then(|layout| {
-                    layout
-                        .workspace_mount(fact.workspace.name())
-                        .map_err(Into::into)
-                });
+                // The kernel reports each workspace's mount point, which for main is the checkout
+                // path under direct mount and the uniform `mnt/` path under the symlink layout.
+                let expected = main_aware_mount_point(
+                    &self.config,
+                    fact.workspace.repo(),
+                    fact.workspace.name(),
+                );
                 let expected = match expected {
                     Ok(path) => path,
                     Err(error) => return Some(Err(error)),
