@@ -187,7 +187,8 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 8. Print the mount path on stdout; guidance and `next:` hints on stderr.
 
 Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` instead of main's state),
-`--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--browse`.
+`--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--register` (see "The `main`
+remote"), `--git-worktree` (see "Git-worktree workspaces"), `--browse`.
 
 ## The `main` remote
 
@@ -231,6 +232,86 @@ the same point it prunes `refs/cowshed/<ws>/*`. A registration left behind by an
 idempotently by `cowshed gc` from the same revalidated retirement metadata that authorizes the rest of the cleanup — a
 remote naming a mount path that no longer exists is never by itself authority to delete anything.
 
+## Git-worktree workspaces: `cowshed new --git-worktree`
+
+A workspace is a standalone repository by default. `--git-worktree` makes it a **git-worktree workspace** instead: a
+registered linked worktree of the main workspace's repository, sharing main's object store and ref namespace rather than
+owning a copy of them.
+
+Everything expensive still arrives by CoW. The image is cloned from main exactly as always, so `node_modules`, build
+outputs, and the warm in-image caches cost the same ~2 ms they always did; only git state is replaced afterwards. Mint
+gains three steps between attach and publication:
+
+1. Discard the cloned `.git` **directory** in the image. It is a complete copy of main's repository and a linked
+   worktree must not carry one — two registrations claiming the same worktree id is precisely the failure mode that
+   makes cloning an already-linked worktree wrong (see the prototype report).
+2. Register the worktree against main's repository and plant the pointer file, using **main's canonical mount** as the
+   repository path. Under direct mount that is the checkout path; under the symlink layout it is
+   `~/.cowshed/mnt/<owner>/<repo>/main`, and the registration must name it rather than the symlink for the same reason
+   the `main` remote does — a registration recorded through the checkout symlink breaks the moment the checkout moves,
+   and `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already
+   present from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto
+   the mount root, and reconciles both directions with `git -C <main-canonical-mount> worktree repair <mount>`, which is
+   the primitive git provides for exactly this two-way pointer fixup.
+3. `git switch -c cowshed/<name>` as usual. The branch is created in main's ref namespace, so it is visible from main
+   immediately — with no fetch, and no `main` remote, which a git-worktree workspace does not get: there is nothing to
+   fetch from when the object store is already shared.
+
+**Main must be mounted**, at mint and at every subsequent attach and exec. The gitdir lives outside the workspace's
+volume, so with main detached the workspace has files and no repository — `git status` fails, and so does everything
+built on it. Cowshed checks before it acts and refuses with `next: cowshed attach main` rather than handing back a mount
+whose git is broken. This is the mode's defining cost, and it is why it is not the default: a standalone workspace is
+usable with main detached, unmounted, or being restored, and a git-worktree workspace is not.
+
+It is also a hole in the isolation, stated plainly. The sandbox needs read and write into
+`<main-canonical-mount>/.git/worktrees/<ws>` and into main's object store — a committing agent writes objects into the
+user's own repository. Grants carry that hole explicitly (04_sandbox.md); it is not implied by the baseline, and a
+workspace that did not ask for `--git-worktree` never has it.
+
+**Checkpoint and restore refuse** on a git-worktree workspace, exit 4, with `next:` hints. The image is not
+self-contained: a checkpoint clone would capture a tree whose history lives in a repository it does not include, so the
+clone is not a restorable state — it is half a repository. Restoring one is worse than useless, because the fresh
+incarnation would resurrect a registration for a worktree id that main has since pruned and quietly claim a branch
+another workspace may now hold. The hints name the two honest substitutes: commit and `cowshed land` to keep the work,
+or `cowshed new` a standalone workspace when checkpointing is what is actually wanted. Cowshed refuses rather than
+checkpointing something that cannot be restored.
+
+`cowshed rm` prunes the registration as part of retirement, in the same host-side-state-first step that drops a reverse
+remote: remove the worktree registration from main's repository, then prune, then trash the image. A registration
+orphaned by an interrupted retire is removed idempotently by `cowshed gc` from revalidated retirement metadata — never
+from the mere observation that a registered worktree's path is not mounted, which is also what a detached workspace
+looks like.
+
+`cowshed mv` repairs registrations. Moving main under direct mount moves the gitdir every git-worktree workspace points
+at, and moving a workspace moves the path main's registration records; both directions are repaired inside the same
+transaction that moves the mount, so there is no window in which a registration names a path nothing is mounted on.
+`cowshed land` needs no special case: its rule is already to route a fast-forward through the workspace that has the
+target branch checked out and to refuse only worktrees **unknown** to cowshed. A git-worktree workspace is known.
+
+### Why clone is the default
+
+Not storage. CoW makes a complete `.git` copy free — that is the whole premise of the substrate — so the classic
+argument for linked worktrees, that they avoid duplicating the object store, buys nothing here. It was never the
+reason and is not a reason now.
+
+The reasons are both about blast radius:
+
+**Crash isolation of the object store.** A shared object store is one repository that every worktree writes into, main
+included. A hard crash mid-write, a killed `git gc`, a corrupted pack, an over-eager `--prune` — in clone mode each
+lands inside one disposable image, and the cure is `cowshed rm` and a fresh `cowshed new`. In worktree mode it lands in
+the user's own repository, and the blast radius is every workspace plus main. Cowshed's entire posture is that a
+workspace is cheap and destroyable; that only holds while destroying one cannot take anything else with it.
+
+**History rewrites want isolation.** Workspaces exist to be rebased, replayed, and thrown away. `cowshed rebase
+--fresh` replays a branch onto a new base and destroys the old clone; agents rebase, amend, reset, and expire reflogs
+freely because nothing outside the image can notice. Doing that inside the user's object store means an agent's
+experimental rewrite shares a reflog and a loose-object pool with the human's work. A workspace whose job is to rewrite
+history should not be rewriting it where the user lives.
+
+`--git-worktree` exists for the cases where the shared namespace is the point: tooling that assumes one repository,
+`git worktree list` as the inventory, and reviewing a workspace's commits from main with no fetch step at all. It is a
+deliberate trade of isolation for immediacy, taken per workspace, and never by default.
+
 ## `cowshed fork <src> <dst>`
 
 Clones a _session_ mid-flight with the same barrier/fencing as `cowshed new`, preserving the source image's validated
@@ -243,6 +324,9 @@ source endpoint or CA.
 
 ## `cowshed checkpoint <ws> [label]` / `cowshed restore <ws> <label>`
 
+- Both verbs refuse a git-worktree workspace before any quota is read or any barrier is taken (exit 4, `next:` hints —
+  see "Git-worktree workspaces"). Its history lives outside the image, so there is no self-contained state to capture
+  and nothing coherent to restore.
 - Before pausing the supervisor or cloning, cowshed reads the target workspace's coordinator-owned `CheckpointQuota` and
   authoritative substrate stats. The projected count is its existing published checkpoint count plus one. The projected
   bytes are its existing published checkpoint allocated bytes (pinned and automatic) plus the active image's
@@ -349,8 +433,8 @@ images are excluded from backup by design (01_storage.md).
 ## Remote code ingress: `cowshed repo`
 
 Sandboxed git speaks only local paths. A workspace's remotes are the `main` remote (main's canonical mount) and
-read-only bare mirrors on the caches volume — never a network URL. There is no git endpoint on the gateway data plane, no credential
-helper, and no `insteadOf` rewriting inside any workspace.
+read-only bare mirrors on the caches volume — never a network URL. There is no git endpoint on the gateway data plane,
+no credential helper, and no `insteadOf` rewriting inside any workspace.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
   grants (`cowshed grant <ws> --repo github.com/org/*` — repo-scoped, finer than host egress), executes the fetch itself
@@ -441,9 +525,10 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
 2. Stop the supervisor: TERM → grace → KILL across the whole descendant tree (11_shell.md). Teardown precedes retirement
    — live children would otherwise hold the mount busy and keep enforcing stale launch-time authority after the grants
    disappear.
-3. Drop the workspace's reverse remote from main's repository if one was registered (see "The `main` remote"). Host-side
-   state goes before the image does: a remote pointing into a trashed mount is a broken fetch in the user's own
-   checkout, and it is the one piece of this teardown that lives where the user can see it.
+3. Remove the host-side state this workspace put in main's repository, before the image goes anywhere: its reverse
+   remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
+   This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
+   mount is a broken fetch and a broken `git worktree list` in the user's own checkout.
 4. Logically retire: preserve the image extension while atomically renaming the image and its detached grants/CA
    companions to `sessions/.trash/<ws>-<incarnation>.asif` for ASIF or `sessions/.trash/<ws>-<incarnation>.sparseimage`
    for SPARSE. The canonical image disappears from enumeration and the command returns here (typically well under a
@@ -508,9 +593,13 @@ resolves to the mountpoint whether or not it is mounted, so a `cd` to the famili
 inside a workspace manager and demands configuration. Main-as-base gives a fresher starting state for free: main is warm
 because it is used. The secrets invariant is what makes this safe; it is enforced, not assumed.
 
-**Linked git worktrees rejected.** They couple every workspace to the host `.git/worktrees/<id>` (sandbox holes, stale
-registrations, invalid when cloned). A standalone `.git` arrives via CoW at zero marginal cost, and the pull-based
-`cowshed push` replaces shared-state semantics with an explicit, auditable hand-back.
+**Linked git worktrees are not the default, and are available on request.** They couple a workspace to main's
+`.git/worktrees/<id>`: a sandbox hole into the user's object store, a registration that outlives an interrupted
+teardown, a gitdir that is invalid the moment the image is cloned, and a workspace that is unusable whenever main is
+detached. A standalone `.git` arrives via CoW at zero marginal cost and the pull-based `cowshed push` replaces
+shared-state semantics with an explicit, auditable hand-back — so clone is what `cowshed new` does. `--git-worktree`
+takes the trade deliberately, per workspace, and gives up checkpoint and restore for it (see "Git-worktree
+workspaces").
 
 **Gatewaying git rejected — workspace git is local-only.** A smart-HTTP credential broker on the gateway would let
 sandboxed git reach real remotes, reintroducing in-sandbox push, a git wire protocol to proxy faithfully, and
