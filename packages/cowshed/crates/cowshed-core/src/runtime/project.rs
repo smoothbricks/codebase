@@ -2757,7 +2757,9 @@ impl NativeProjectRuntimeHost {
                     })
                     .collect(),
             },
-            allowed_unix_sockets: Vec::new(),
+            // Multi-user Nix is a requirement, and evaluation inside a workspace is the point of
+            // a workspace: without the daemon the client cannot build or substitute at all.
+            allowed_unix_sockets: crate::sandbox::nix_daemon_socket().into_iter().collect(),
             additional_denies: vec![
                 self.layout.project().project_root.clone(),
                 self.telemetry_root.clone(),
@@ -5405,7 +5407,10 @@ fn supervisor_sandbox(
                 })
                 .collect(),
         },
-        allowed_unix_sockets: Vec::new(),
+        // The supervisor is the trusted tier of the same workspace; it gets the same daemon reach
+        // as the children it launches, or an in-workspace evaluation would depend on which tier ran
+        // it.
+        allowed_unix_sockets: crate::sandbox::nix_daemon_socket().into_iter().collect(),
         additional_denies: vec![
             layout.project().project_root.clone(),
             telemetry_root.to_path_buf(),
