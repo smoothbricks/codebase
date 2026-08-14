@@ -1363,6 +1363,14 @@ impl SpawnSink for SystemSpawnSink {
             .env("TMPDIR", &request.sandbox.exec_temp_dir)
             .env("PWD", &plan.cwd)
             .env("GOENV", private_cache.join("go/env"))
+            // rustc-wrapper clients speak to the host-owned sccache daemon; the
+            // Seatbelt profile admits exactly this socket and denies binding it,
+            // so a client whose daemon is down fails fast instead of spawning a
+            // wrong-boundary server inside the sandbox.
+            .env(
+                "SCCACHE_SERVER_UDS",
+                crate::sandbox::sccache_server_socket(&request.sandbox.home),
+            )
             .env("COWSHED_PORT_BASE", &port_base)
             .env("COWSHED_WORKSPACE_TOKEN", workspace_token)
             .env("HTTP_PROXY", &gateway_http)
