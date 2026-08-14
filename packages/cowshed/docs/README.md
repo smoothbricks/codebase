@@ -38,6 +38,20 @@ machines; stderr is for humans and agents deciding what to do next.**
 - **Inode-friendly.** Dependency and build trees live inside image files rather than expanding the host Data volume's
   inode namespace.
 
+## Install
+
+The `cowshed` command is the `bin` of the `@smoothbricks/cowshed` npm package. The command and the Node-API library are
+the same artifact: the `bin` shim calls the addon's `runCli`, so there is no second per-platform executable to publish
+and no version skew between the two surfaces.
+
+```sh
+bunx @smoothbricks/cowshed doctor      # one-off
+bun add --global @smoothbricks/cowshed # `cowshed` on PATH
+```
+
+From a checkout of this repository, build the addon and TypeScript with `nx build cowshed`, then `bun link` the package
+to put that local build's `cowshed` on PATH.
+
 ## Five-minute quickstart
 
 ```sh
