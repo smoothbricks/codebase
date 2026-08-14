@@ -15,9 +15,11 @@ fn apfs_evidence() -> StatFsEvidence {
 }
 
 fn explicit_zfs(pool: &str) -> SubstrateConfig {
-    parse_substrate_config(&format!("[substrate]\nkind = \"zfs\"\npool = \"{pool}\"\n"))
+    parse_cowshed_config(&format!("[substrate]\nkind = \"zfs\"\npool = \"{pool}\"\n"))
         .unwrap()
+        .substrate()
         .unwrap()
+        .clone()
 }
 
 fn absent_apfs_storage() -> BootstrapEvidence {
@@ -96,21 +98,30 @@ fn command_line(operation: &HostOperation) -> Option<String> {
 }
 
 #[test]
-fn substrate_config_parser_is_narrow_and_strict() {
+fn cowshed_config_parser_accepts_only_complete_known_sections() {
+    let config = parse_cowshed_config(
+        "# project settings\n[substrate] # deliberate override\nkind = \"zfs\"\npool = \"tank\" # no scan\n[devenv]\ndir = \"tooling/devenv\"\n",
+    )
+    .unwrap();
+    assert_eq!(config.substrate().unwrap().pool(), "tank");
+    assert_eq!(config.devenv().unwrap().dir(), Path::new("tooling/devenv"));
+
+    let substrate_only =
+        parse_cowshed_config("[substrate]\nkind = \"zfs\"\npool = \"tank\"\n").unwrap();
+    assert_eq!(substrate_only.substrate().unwrap().pool(), "tank");
+    assert_eq!(substrate_only.devenv(), None);
+
+    let devenv_only = parse_cowshed_config("[devenv]\ndir = \"tooling/devenv\"\n").unwrap();
+    assert_eq!(devenv_only.substrate(), None);
     assert_eq!(
-        parse_substrate_config("[repository]\nname = broken syntax\n").unwrap(),
-        None
-    );
-    assert_eq!(
-        parse_substrate_config(
-            "# project settings\n[other]\nvalue = 7\n[substrate] # deliberate override\nkind = \"zfs\"\npool = \"tank\" # no scan\n"
-        )
-        .unwrap()
-        .unwrap()
-        .pool(),
-        "tank"
+        devenv_only.devenv().unwrap().dir(),
+        Path::new("tooling/devenv")
     );
 
+    assert_eq!(
+        parse_cowshed_config("[repository]\nname = \"widget\"\n").unwrap_err(),
+        ConfigError::UnknownSection("repository".to_owned())
+    );
     let invalid = [
         (
             "[substrate]\npool = \"tank\"\n",
@@ -133,7 +144,15 @@ fn substrate_config_parser_is_narrow_and_strict() {
             "unknown [substrate] key",
         ),
         (
+            "[devenv]\ndir = \"tooling/devenv\"\nextra = \"x\"\n",
+            "unknown [devenv] key",
+        ),
+        (
             "[substrate]\nkind = \"zfs\"\nkind = \"zfs\"\npool = \"tank\"\n",
+            "duplicated",
+        ),
+        (
+            "[devenv]\ndir = \"tooling/devenv\"\ndir = \"other\"\n",
             "duplicated",
         ),
         (
@@ -144,13 +163,14 @@ fn substrate_config_parser_is_narrow_and_strict() {
             "[substrate]\nkind = \"zfs\"\npool = \"tank\"\n[substrate]\nkind = \"zfs\"\npool = \"tank\"\n",
             "duplicated",
         ),
+        ("[devenv]\n", "missing [devenv] key \"dir\""),
     ];
     for (source, message) in invalid {
-        let error = parse_substrate_config(source).unwrap_err();
+        let error = parse_cowshed_config(source).unwrap_err();
         assert!(error.to_string().contains(message), "{source:?}: {error}");
     }
     assert_eq!(
-        parse_substrate_config("[substrate]\nmalformed\n").unwrap_err(),
+        parse_cowshed_config("[substrate]\nmalformed\n").unwrap_err(),
         ConfigError::MalformedLine { line: 2 }
     );
     for source in [
@@ -158,17 +178,20 @@ fn substrate_config_parser_is_narrow_and_strict() {
         "[substrate]\nkind = zfs\"\npool = \"tank\"\n",
     ] {
         assert!(matches!(
-            parse_substrate_config(source),
-            Err(ConfigError::ExpectedQuotedString { line: 2 })
+            parse_cowshed_config(source),
+            Err(ConfigError::ExpectedQuotedString {
+                section: "substrate",
+                line: 2
+            })
         ));
     }
     assert_eq!(
-        parse_substrate_config("[substrate]\nkind = \"z#fs\" # outside comment\npool = \"tank\"\n")
+        parse_cowshed_config("[substrate]\nkind = \"z#fs\" # outside comment\npool = \"tank\"\n")
             .unwrap_err(),
         ConfigError::UnsupportedKind("z#fs".to_owned())
     );
     assert_eq!(
-        parse_substrate_config(
+        parse_cowshed_config(
             r##"[substrate]
 kind = "z\"#fs" # outside comment
 pool = "tank"
@@ -179,9 +202,19 @@ pool = "tank"
     );
     for pool in ["1tank", "-tank"] {
         assert!(matches!(
-            parse_substrate_config(&format!("[substrate]\nkind = \"zfs\"\npool = \"{pool}\"\n")),
+            parse_cowshed_config(&format!("[substrate]\nkind = \"zfs\"\npool = \"{pool}\"\n")),
             Err(ConfigError::InvalidPool(PoolNameError::InvalidPool))
         ));
+    }
+}
+
+#[test]
+fn devenv_dir_rejects_absolute_parent_and_empty_paths() {
+    for dir in ["/tmp/devenv", "../devenv", "tooling/../devenv", ""] {
+        assert_eq!(
+            parse_cowshed_config(&format!("[devenv]\ndir = {dir:?}\n")).unwrap_err(),
+            ConfigError::InvalidDevenvDir(dir.to_owned())
+        );
     }
 }
 

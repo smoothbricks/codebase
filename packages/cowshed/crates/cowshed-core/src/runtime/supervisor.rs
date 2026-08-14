@@ -1,13 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -193,9 +198,17 @@ pub struct ProcessSpawnRequest {
     pub argv: Vec<OsString>,
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
+    pub devenv_dir: Option<PathBuf>,
     pub sandbox: SandboxConfig,
     pub trusted_supervisor_profile: String,
     pub executed_child_profile: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DevenvCommandOutput {
+    pub status: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -248,6 +261,13 @@ pub trait SpawnSink: Send {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>>;
+
+    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<DevenvCommandOutput> {
+        Err(CowshedError::internal(format!(
+            "spawn sink cannot evaluate devenv at {}",
+            devenv_dir.display()
+        )))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -797,34 +817,384 @@ impl CommitmentSink for CommitmentPublisherHandle {
     }
 }
 
-/// devenv materializes an evaluation as `.devenv/profile`, a symlink into `/nix/store`, inside the
-/// project directory — which in a workspace is in-image, per-workspace, and isolated with the rest
-/// of the volume.
+const COWSHED_CONFIG_FILE: &str = ".cowshed.toml";
 const DEVENV_PROFILE_BIN: &str = ".devenv/profile/bin";
+const DEVENV_SNAPSHOT_FILE: &str = ".devenv/cowshed-env.json";
+const DEVENV_INPUT_FILES: [&str; 4] = [
+    "devenv.nix",
+    "devenv.lock",
+    "devenv.yaml",
+    "devenv.local.nix",
+];
 
-/// The workspace's own evaluated toolchain, if it has evaluated one.
-///
-/// The sandbox `PATH` is otherwise filtered from the *controller's* environment, so a workspace
-/// that edits `devenv.nix` and evaluates it successfully would still not see the result — the tools
-/// exist, in the store, reachable, and simply not on `PATH`. Its own profile goes first so the
-/// edited toolchain wins over the inherited one, which is the entire point of evaluating it there.
-///
-/// Presence is the whole signal: the profile exists exactly when an evaluation succeeded in this
-/// workspace, so nothing has to be compared, refreshed, or flagged, and a workspace that never
-/// evaluated gets byte-identical behaviour to before. A stale profile self-corrects, because the
-/// next successful evaluation rewrites the symlink.
-///
-/// The *resolved* store path is admitted, never the in-image symlink: it is immutable and already
-/// covered by the store read grants, so what lands on `PATH` is what was validated rather than
-/// whatever the link happens to point at by the time the child execs.
-fn workspace_profile_bin(workspace_mount: &Path) -> Option<PathBuf> {
-    let resolved = std::fs::canonicalize(workspace_mount.join(DEVENV_PROFILE_BIN)).ok()?;
-    resolved.starts_with("/nix/store").then_some(resolved)
+#[derive(Clone, Debug)]
+struct DevenvResolutionError {
+    message: String,
+    configured_dir: Option<PathBuf>,
 }
 
-fn sandbox_path(sandbox: &SandboxConfig) -> Result<OsString> {
+impl DevenvResolutionError {
+    fn into_cowshed_error(self) -> CowshedError {
+        CowshedError::environment_missing(
+            self.message,
+            "repair .cowshed.toml or the configured devenv directory, then retry",
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct DevenvEnvSnapshot {
+    vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrintedDevenvEnvironment {
+    variables: BTreeMap<String, PrintedDevenvVariable>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrintedDevenvVariable {
+    #[serde(rename = "type")]
+    kind: String,
+    value: serde_json::Value,
+}
+
+/// One long-lived watcher belongs to each mounted-workspace supervisor.
+///
+/// Source mtimes are reconciled once when the supervisor starts, covering edits made while the
+/// daemon was down. After that, filesystem events are the only staleness signal: clean execs do no
+/// source metadata work and never invoke devenv. A process that is already running keeps the
+/// environment it launched with; the next process consumes the dirty flag and refreshes.
+struct DevenvEnvironment {
+    workspace_mount: PathBuf,
+    dirty: Arc<AtomicBool>,
+    tracked_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
+    resolution: std::result::Result<Option<PathBuf>, DevenvResolutionError>,
+    _watcher: RecommendedWatcher,
+}
+
+impl DevenvEnvironment {
+    fn new(workspace_mount: &Path) -> Result<Self> {
+        let resolution = resolve_devenv_dir(workspace_mount);
+        let resolved = resolution.as_ref().ok().and_then(|value| value.as_deref());
+        let tracked_paths = Arc::new(RwLock::new(devenv_tracked_paths(
+            workspace_mount,
+            tracked_devenv_dir(&resolution),
+        )));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let callback_paths = Arc::clone(&tracked_paths);
+        let callback_dirty = Arc::clone(&dirty);
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+                Ok(event) => {
+                    let Ok(paths) = callback_paths.read() else {
+                        callback_dirty.store(true, Ordering::Release);
+                        return;
+                    };
+                    if event_touches_devenv(&event, &paths) {
+                        callback_dirty.store(true, Ordering::Release);
+                    }
+                }
+                Err(_) => callback_dirty.store(true, Ordering::Release),
+            })
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot create devenv watcher for {}: {error}",
+                        workspace_mount.display()
+                    ),
+                    "reattach the workspace and retry",
+                )
+            })?;
+        watcher
+            .watch(workspace_mount, RecursiveMode::Recursive)
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot watch workspace {} for devenv changes: {error}",
+                        workspace_mount.display()
+                    ),
+                    "reattach the workspace and retry",
+                )
+            })?;
+        if resolved.is_some_and(|dir| initial_devenv_snapshot_is_stale(workspace_mount, dir)) {
+            dirty.store(true, Ordering::Release);
+        }
+        Ok(Self {
+            workspace_mount: workspace_mount.to_owned(),
+            dirty,
+            tracked_paths,
+            resolution,
+            _watcher: watcher,
+        })
+    }
+
+    async fn environment_for_spawn(
+        &mut self,
+        spawner: &mut dyn SpawnSink,
+        controller_env: BTreeMap<String, String>,
+    ) -> Result<(Option<PathBuf>, BTreeMap<String, String>)> {
+        let changed = self.dirty.swap(false, Ordering::AcqRel);
+        if changed {
+            self.resolve_again();
+        }
+        let devenv_dir = self
+            .resolution
+            .clone()
+            .map_err(DevenvResolutionError::into_cowshed_error)?;
+        let Some(devenv_dir) = devenv_dir else {
+            return Ok((None, controller_env));
+        };
+
+        if !changed && let Some(snapshot) = read_devenv_snapshot(&devenv_dir).await {
+            return Ok((
+                Some(devenv_dir),
+                merge_devenv_environment(snapshot.vars, controller_env),
+            ));
+        }
+
+        match refresh_devenv_snapshot(spawner, &devenv_dir).await {
+            Ok(vars) => Ok((
+                Some(devenv_dir),
+                merge_devenv_environment(vars, controller_env),
+            )),
+            Err(error) => {
+                // A failed refresh is never a clean state and a stale snapshot is never reused.
+                self.dirty.store(true, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn resolve_again(&mut self) {
+        let resolution = resolve_devenv_dir(&self.workspace_mount);
+        if let Ok(mut paths) = self.tracked_paths.write() {
+            *paths = devenv_tracked_paths(&self.workspace_mount, tracked_devenv_dir(&resolution));
+        } else {
+            self.dirty.store(true, Ordering::Release);
+        }
+        self.resolution = resolution;
+    }
+}
+
+fn resolve_devenv_dir(
+    workspace_mount: &Path,
+) -> std::result::Result<Option<PathBuf>, DevenvResolutionError> {
+    let config_path = workspace_mount.join(COWSHED_CONFIG_FILE);
+    let config = match fs::read_to_string(&config_path) {
+        Ok(input) => Some(
+            crate::storage::bootstrap::parse_cowshed_config(&input).map_err(|error| {
+                DevenvResolutionError {
+                    message: format!("invalid {}: {error}", config_path.display()),
+                    configured_dir: None,
+                }
+            })?,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(DevenvResolutionError {
+                message: format!("cannot read {}: {error}", config_path.display()),
+                configured_dir: None,
+            });
+        }
+    };
+
+    if let Some(configured) = config.as_ref().and_then(|config| config.devenv()) {
+        let devenv_dir = workspace_mount.join(configured.dir());
+        let devenv_nix = devenv_dir.join("devenv.nix");
+        if !devenv_nix.is_file() {
+            return Err(DevenvResolutionError {
+                message: format!(
+                    "configured devenv directory {} is missing {}",
+                    devenv_dir.display(),
+                    devenv_nix.display()
+                ),
+                configured_dir: Some(devenv_dir.clone()),
+            });
+        }
+        return Ok(Some(devenv_dir));
+    }
+
+    let root_devenv_nix = workspace_mount.join("devenv.nix");
+    Ok(root_devenv_nix
+        .is_file()
+        .then(|| workspace_mount.to_owned()))
+}
+
+fn tracked_devenv_dir(
+    resolution: &std::result::Result<Option<PathBuf>, DevenvResolutionError>,
+) -> Option<&Path> {
+    match resolution {
+        Ok(Some(devenv_dir)) => Some(devenv_dir),
+        Err(error) => error.configured_dir.as_deref(),
+        Ok(None) => None,
+    }
+}
+
+fn devenv_tracked_paths(workspace_mount: &Path, devenv_dir: Option<&Path>) -> BTreeSet<PathBuf> {
+    let devenv_dir = devenv_dir.unwrap_or(workspace_mount);
+    std::iter::once(workspace_mount.join(COWSHED_CONFIG_FILE))
+        .chain(
+            DEVENV_INPUT_FILES
+                .into_iter()
+                .map(|file| devenv_dir.join(file)),
+        )
+        .collect()
+}
+
+fn event_touches_devenv(event: &Event, tracked_paths: &BTreeSet<PathBuf>) -> bool {
+    event.paths.iter().any(|path| tracked_paths.contains(path))
+}
+
+fn initial_devenv_snapshot_is_stale(workspace_mount: &Path, devenv_dir: &Path) -> bool {
+    let snapshot = devenv_dir.join(DEVENV_SNAPSHOT_FILE);
+    let Ok(snapshot_mtime) = fs::metadata(&snapshot).and_then(|metadata| metadata.modified())
+    else {
+        return true;
+    };
+    DEVENV_INPUT_FILES
+        .into_iter()
+        .map(|file| devenv_dir.join(file))
+        .chain(std::iter::once(workspace_mount.join(COWSHED_CONFIG_FILE)))
+        .any(
+            |path| match fs::metadata(path).and_then(|metadata| metadata.modified()) {
+                Ok(source_mtime) => source_mtime > snapshot_mtime,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            },
+        )
+}
+
+async fn read_devenv_snapshot(devenv_dir: &Path) -> Option<DevenvEnvSnapshot> {
+    let bytes = tokio::fs::read(devenv_dir.join(DEVENV_SNAPSHOT_FILE))
+        .await
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn refresh_devenv_snapshot(
+    spawner: &mut dyn SpawnSink,
+    devenv_dir: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let output = spawner.print_devenv_env(devenv_dir).await?;
+    if output.status != 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(CowshedError::environment_missing(
+            if detail.is_empty() {
+                format!(
+                    "devenv print-dev-env --json failed in {} with status {}",
+                    devenv_dir.display(),
+                    output.status
+                )
+            } else {
+                format!(
+                    "devenv print-dev-env --json failed in {}: {detail}",
+                    devenv_dir.display()
+                )
+            },
+            format!(
+                "run devenv print-dev-env --json in {} and repair the reported error",
+                devenv_dir.display()
+            ),
+        ));
+    }
+    let vars = parse_printed_devenv_environment(&output.stdout, devenv_dir)?;
+    let snapshot_path = devenv_dir.join(DEVENV_SNAPSHOT_FILE);
+    let parent = snapshot_path
+        .parent()
+        .expect("devenv snapshot always has a parent");
+    tokio::fs::create_dir_all(parent).await.map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot create devenv snapshot directory {}: {error}",
+                parent.display()
+            ),
+            "repair workspace permissions and retry",
+        )
+    })?;
+    let snapshot = DevenvEnvSnapshot { vars: vars.clone() };
+    let write_path = snapshot_path.clone();
+    tokio::task::spawn_blocking(move || crate::metadata::write_json(&write_path, &snapshot))
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!(
+                "devenv snapshot writer failed for {}: {error}",
+                snapshot_path.display()
+            ))
+        })?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot write devenv environment snapshot {}: {error}",
+                    snapshot_path.display()
+                ),
+                "repair workspace permissions and retry",
+            )
+        })?;
+    Ok(vars)
+}
+
+fn parse_printed_devenv_environment(
+    stdout: &[u8],
+    devenv_dir: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let printed: PrintedDevenvEnvironment = serde_json::from_slice(stdout).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "devenv print-dev-env --json returned invalid JSON in {}: {error}",
+                devenv_dir.display()
+            ),
+            "upgrade or repair devenv, then retry",
+        )
+    })?;
+    let mut vars = BTreeMap::new();
+    for (name, variable) in printed.variables {
+        if variable.kind != "exported" {
+            continue;
+        }
+        let value = variable.value.as_str().ok_or_else(|| {
+            CowshedError::environment_missing(
+                format!(
+                    "devenv exported variable {name:?} has a non-string value in {}",
+                    devenv_dir.display()
+                ),
+                "upgrade or repair devenv, then retry",
+            )
+        })?;
+        vars.insert(name, value.to_owned());
+    }
+    Ok(vars)
+}
+
+fn merge_devenv_environment(
+    mut snapshot: BTreeMap<String, String>,
+    controller_env: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    // PATH is constructed from admitted roots below; an evaluated shell cannot bypass that policy.
+    snapshot.remove("PATH");
+    snapshot.extend(controller_env);
+    snapshot
+}
+
+/// Resolve the evaluated profile produced inside a workspace.
+///
+/// Cowshed's cwd-based refresh writes state below the configured devenv directory, which is
+/// preferred. A user may also have evaluated through devenv's native root binding, whose state
+/// lives at the mount root, so that location is admitted as a presence-based fallback. Both paths
+/// retain the immutable `/nix/store` canonicalization guard.
+fn workspace_profile_bin(workspace_mount: &Path, devenv_dir: &Path) -> Option<PathBuf> {
+    [devenv_dir, workspace_mount].into_iter().find_map(|root| {
+        let resolved = fs::canonicalize(root.join(DEVENV_PROFILE_BIN)).ok()?;
+        resolved.starts_with("/nix/store").then_some(resolved)
+    })
+}
+
+fn sandbox_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<OsString> {
     let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
-    if let Some(profile) = workspace_profile_bin(&sandbox.workspace_mount) {
+    if let Some(profile) = devenv_dir
+        .and_then(|devenv_dir| workspace_profile_bin(&sandbox.workspace_mount, devenv_dir))
+    {
         paths.push(profile);
     }
     let mut seen = paths.iter().cloned().collect::<BTreeSet<_>>();
@@ -968,7 +1338,7 @@ impl SpawnSink for SystemSpawnSink {
                 "reattach the workspace to mint fresh credentials",
             ));
         }
-        let path = sandbox_path(&request.sandbox)?;
+        let path = sandbox_path(&request.sandbox, request.devenv_dir.as_deref())?;
         let port_base = request.sandbox.port_block.base().to_string();
         let gateway_http = format!("http://127.0.0.1:{port_base}");
 
@@ -987,6 +1357,7 @@ impl SpawnSink for SystemSpawnSink {
             .env("GIT_ATTR_NOSYSTEM", "1")
             .env("TMPDIR", &request.sandbox.exec_temp_dir)
             .env("PWD", &plan.cwd)
+            .env("GOENV", private_cache.join("go/env"))
             .env("COWSHED_PORT_BASE", &port_base)
             .env("COWSHED_WORKSPACE_TOKEN", workspace_token)
             .env("HTTP_PROXY", &gateway_http)
@@ -1078,6 +1449,28 @@ impl SpawnSink for SystemSpawnSink {
             stdin: stdin_sender,
             stdin_closed: false,
         }))
+    }
+
+    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<DevenvCommandOutput> {
+        let output = tokio::process::Command::new("devenv")
+            .args(["print-dev-env", "--json"])
+            .current_dir(devenv_dir)
+            .output()
+            .await
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot run devenv print-dev-env --json in {}: {error}",
+                        devenv_dir.display()
+                    ),
+                    "install devenv or repair the host PATH, then retry",
+                )
+            })?;
+        Ok(DevenvCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
     }
 }
 
@@ -1486,6 +1879,7 @@ impl WorkspaceSupervisor {
         commitments: Box<dyn CommitmentSink>,
     ) -> Result<WorkspaceSupervisorHandle> {
         config.validate()?;
+        let devenv = DevenvEnvironment::new(&config.workspace_root)?;
         let next_job_id = artifacts.next_job_id()?;
         let (commands, receiver) = mpsc::channel(config.actor_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_capacity);
@@ -1498,6 +1892,7 @@ impl WorkspaceSupervisor {
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
             sandbox: config.sandbox,
+            devenv,
             term_grace: config.term_grace,
             next_job_id,
             next_session_id: 1,
@@ -1684,6 +2079,7 @@ struct SupervisorActor {
     workspace_root: PathBuf,
     default_cwd: Option<WorkspacePath>,
     sandbox: SandboxConfig,
+    devenv: DevenvEnvironment,
     term_grace: Duration,
     next_job_id: JobId,
     next_session_id: u64,
@@ -2076,6 +2472,17 @@ impl SupervisorActor {
                 None,
             ),
         };
+        let (devenv_dir, merged_env) = match self
+            .devenv
+            .environment_for_spawn(&mut *self.spawner, merged_env)
+            .await
+        {
+            Ok(environment) => environment,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
         let job_id = self.next_job_id;
         let expected_next = match job_id
             .get()
@@ -2184,6 +2591,7 @@ impl SupervisorActor {
                         .map(Path::to_path_buf)
                         .unwrap_or_default(),
                     env: merged_env,
+                    devenv_dir,
                     sandbox: self.sandbox.clone(),
                     trusted_supervisor_profile,
                     executed_child_profile,
@@ -3141,19 +3549,143 @@ mod workspace_toolchain_tests {
         let root = scratch("absent");
         let mount = root.join("workspace");
         std::fs::create_dir_all(&mount).expect("mount");
+        let devenv_root = mount.join("tooling/devenv");
+        std::fs::create_dir_all(&devenv_root).expect("devenv root");
 
-        assert_eq!(workspace_profile_bin(&mount), None);
+        assert_eq!(workspace_profile_bin(&mount, &devenv_root), None);
 
         // A profile that does not resolve into the store is not a profile. This is the substitution
         // guard: a workspace can create any symlink it likes inside its own volume, and only one
         // that lands in the immutable store may go on PATH.
-        let devenv = mount.join(".devenv");
-        std::fs::create_dir_all(&devenv).expect("devenv");
+        let profile_state = devenv_root.join(".devenv");
+        std::fs::create_dir_all(&profile_state).expect("devenv state");
         let decoy = root.join("decoy/bin");
         std::fs::create_dir_all(&decoy).expect("decoy");
-        std::os::unix::fs::symlink(root.join("decoy"), devenv.join("profile")).expect("decoy link");
-        assert_eq!(workspace_profile_bin(&mount), None);
+        std::os::unix::fs::symlink(root.join("decoy"), profile_state.join("profile"))
+            .expect("decoy link");
+        assert_eq!(workspace_profile_bin(&mount, &devenv_root), None);
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn devenv_resolution_prefers_config_then_root_then_none() {
+        let root = scratch("resolution");
+        let mount = root.join("workspace");
+        let configured = mount.join("tooling/devenv");
+        std::fs::create_dir_all(&configured).expect("configured devenv");
+        std::fs::write(mount.join("devenv.nix"), "{}").expect("root devenv");
+        std::fs::write(configured.join("devenv.nix"), "{}").expect("configured devenv");
+        std::fs::write(
+            mount.join(COWSHED_CONFIG_FILE),
+            "[devenv]\ndir = \"tooling/devenv\"\n",
+        )
+        .expect("config");
+
+        assert_eq!(resolve_devenv_dir(&mount).unwrap(), Some(configured));
+
+        std::fs::remove_file(mount.join(COWSHED_CONFIG_FILE)).expect("remove config");
+        assert_eq!(resolve_devenv_dir(&mount).unwrap(), Some(mount.clone()));
+
+        std::fs::remove_file(mount.join("devenv.nix")).expect("remove root devenv");
+        assert_eq!(resolve_devenv_dir(&mount).unwrap(), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn configured_devenv_without_devenv_nix_is_an_error() {
+        let root = scratch("configured-missing");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(&mount).expect("mount");
+        std::fs::write(
+            mount.join(COWSHED_CONFIG_FILE),
+            "[devenv]\ndir = \"tooling/devenv\"\n",
+        )
+        .expect("config");
+
+        let error = resolve_devenv_dir(&mount).unwrap_err();
+        assert!(error.message.contains("tooling/devenv"));
+        assert!(error.message.contains("devenv.nix"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn startup_staleness_includes_config_and_ignores_missing_optional_inputs() {
+        let root = scratch("staleness");
+        let mount = root.join("workspace");
+        let devenv_root = mount.join("tooling/devenv");
+        let snapshot = devenv_root.join(DEVENV_SNAPSHOT_FILE);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
+        std::fs::write(devenv_root.join("devenv.nix"), "{}").expect("devenv.nix");
+        std::fs::write(
+            mount.join(COWSHED_CONFIG_FILE),
+            "[devenv]\ndir = \"tooling/devenv\"\n",
+        )
+        .expect("config");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&snapshot, "{\"vars\":{}}\n").expect("fresh snapshot");
+        assert!(!initial_devenv_snapshot_is_stale(&mount, &devenv_root));
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            mount.join(COWSHED_CONFIG_FILE),
+            "[devenv]\ndir = \"tooling/devenv\"\n# changed\n",
+        )
+        .expect("changed config");
+        assert!(initial_devenv_snapshot_is_stale(&mount, &devenv_root));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn snapshot_is_base_path_is_dropped_and_controller_values_win() {
+        let snapshot = BTreeMap::from([
+            ("PATH".to_owned(), "/untrusted/bin".to_owned()),
+            ("SAME".to_owned(), "snapshot".to_owned()),
+            ("SNAPSHOT_ONLY".to_owned(), "yes".to_owned()),
+        ]);
+        let controller = BTreeMap::from([
+            ("SAME".to_owned(), "controller".to_owned()),
+            ("GOENV".to_owned(), "/workspace/goenv".to_owned()),
+        ]);
+
+        assert_eq!(
+            merge_devenv_environment(snapshot, controller),
+            BTreeMap::from([
+                ("GOENV".to_owned(), "/workspace/goenv".to_owned()),
+                ("SAME".to_owned(), "controller".to_owned()),
+                ("SNAPSHOT_ONLY".to_owned(), "yes".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn watcher_marks_the_workspace_dirty_after_a_devenv_input_changes() {
+        let root = scratch("watcher");
+        let mount = root.join("workspace");
+        let snapshot = mount.join(DEVENV_SNAPSHOT_FILE);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
+        std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&snapshot, "{\"vars\":{}}\n").expect("fresh snapshot");
+        let environment = DevenvEnvironment::new(&mount).expect("watcher");
+        assert!(!environment.dirty.load(Ordering::Acquire));
+
+        std::fs::write(mount.join("devenv.nix"), "{ pkgs, ... }: {}").expect("change input");
+        for _ in 0..200 {
+            if environment.dirty.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            environment.dirty.load(Ordering::Acquire),
+            "a relevant filesystem event must dirty the next sandbox process"
+        );
+
+        drop(environment);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3181,15 +3713,21 @@ mod workspace_toolchain_tests {
 
         let root = scratch("profile");
         let mount = root.join("workspace");
+        let devenv_root = mount.join("tooling/devenv");
         let config = sandbox_at(&mount);
-        for directory in [&mount.join(".devenv"), &config.home, &config.exec_temp_dir] {
+        for directory in [
+            &devenv_root.join(".devenv"),
+            &config.home,
+            &config.exec_temp_dir,
+        ] {
             std::fs::create_dir_all(directory).expect("directory");
         }
         // Exactly what `devenv shell` leaves behind: an in-image symlink into the store.
-        std::os::unix::fs::symlink(&store_profile, mount.join(".devenv/profile"))
+        std::os::unix::fs::symlink(&store_profile, devenv_root.join(".devenv/profile"))
             .expect("profile link");
 
-        let profile_bin = workspace_profile_bin(&mount).expect("an evaluated profile is admitted");
+        let profile_bin =
+            workspace_profile_bin(&mount, &devenv_root).expect("an evaluated profile is admitted");
         // Resolved all the way through: a profile's `bin` is itself a symlink chain inside the
         // store, and what goes on PATH is the immutable path it finally reaches.
         assert!(profile_bin.starts_with("/nix/store"));
@@ -3198,7 +3736,7 @@ mod workspace_toolchain_tests {
             std::fs::canonicalize(store_profile.join("bin")).expect("resolved profile bin")
         );
 
-        let path = sandbox_path(&config).expect("sandbox PATH");
+        let path = sandbox_path(&config, Some(&devenv_root)).expect("sandbox PATH");
         let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
         assert_eq!(
             entries.get(1),
@@ -3216,6 +3754,18 @@ mod workspace_toolchain_tests {
             .arg(&tool)
             .status()
             .expect("sandbox-exec");
+
+        // Native devenv bindings anchor `.devenv` at the allowed repository root. Workspace paths
+        // have no binding, but accepting this fallback keeps a profile evaluated before mounting
+        // usable without weakening the same store-path guard.
+        std::fs::remove_file(devenv_root.join(".devenv/profile")).expect("nested profile");
+        std::fs::create_dir_all(mount.join(".devenv")).expect("root devenv state");
+        std::os::unix::fs::symlink(&store_profile, mount.join(".devenv/profile"))
+            .expect("root profile link");
+        assert_eq!(
+            workspace_profile_bin(&mount, &devenv_root),
+            Some(profile_bin.clone())
+        );
 
         std::fs::remove_dir_all(&root).ok();
         assert!(
