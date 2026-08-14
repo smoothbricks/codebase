@@ -546,16 +546,16 @@ async fn blocking_work_is_dispatched_off_the_async_worker() {
 }
 
 #[test]
-fn duplicate_canonical_volume_names_are_rejected_before_mount_joining() {
+fn duplicate_canonical_volume_keys_are_rejected_before_mount_joining() {
     let storage = || {
         vec![
             StorageFact {
                 workspace: workspace("alpha", 0, 0),
-                volume_name: "shared-volume".to_owned(),
+                volume_key: "shared-volume".to_owned(),
             },
             StorageFact {
                 workspace: workspace("beta", 0, 0),
-                volume_name: "shared-volume".to_owned(),
+                volume_key: "shared-volume".to_owned(),
             },
         ]
     };
@@ -563,18 +563,18 @@ fn duplicate_canonical_volume_names_are_rejected_before_mount_joining() {
         vec![],
         vec![KernelMountFact {
             mount_id: 41,
-            volume_name: "shared-volume".to_owned(),
+            volume_key: "shared-volume".to_owned(),
         }],
         vec![KernelMountFact {
             mount_id: 42,
-            volume_name: "unrelated-volume".to_owned(),
+            volume_key: "unrelated-volume".to_owned(),
         }],
     ];
 
     for mounts in mount_tables {
         assert_eq!(
             derive_workspaces(storage(), mounts, Vec::new()),
-            Err(DerivationError::DuplicateVolumeName(
+            Err(DerivationError::DuplicateVolumeKey(
                 "shared-volume".to_owned()
             ))
         );
@@ -585,7 +585,7 @@ fn duplicate_canonical_volume_names_are_rejected_before_mount_joining() {
 fn validated_retired_checkpoint_facts_do_not_republish_a_missing_workspace() {
     let main = StorageFact {
         workspace: workspace("main", 7, 9),
-        volume_name: "main-volume".to_owned(),
+        volume_key: "main-volume".to_owned(),
     };
     let retired = CheckpointFact {
         repo: repo(),
@@ -599,7 +599,7 @@ fn validated_retired_checkpoint_facts_do_not_republish_a_missing_workspace() {
         vec![main.clone()],
         vec![KernelMountFact {
             mount_id: 42,
-            volume_name: main.volume_name,
+            volume_key: main.volume_key,
         }],
         vec![retired],
     )
@@ -625,7 +625,7 @@ fn duplicate_retired_checkpoint_facts_are_rejected_before_exclusion() {
         derive_workspaces(
             vec![StorageFact {
                 workspace: workspace("main", 1, 1),
-                volume_name: "main-volume".to_owned(),
+                volume_key: "main-volume".to_owned(),
             }],
             Vec::new(),
             vec![checkpoint.clone(), checkpoint],
@@ -647,8 +647,8 @@ proptest! {
 
     #[test]
     fn derived_enumeration_uses_only_storage_and_kernel_facts(mounted in proptest::collection::btree_set(0u8..20, 0..20), count in 0u8..20) {
-        let storage: Vec<_> = (0..count).map(|index| StorageFact { workspace: workspace(&format!("ws-{index}"), 0, 0), volume_name: format!("volume-{index}") }).collect();
-        let mounts: Vec<_> = mounted.iter().map(|index| KernelMountFact { mount_id: u64::from(*index) + 100, volume_name: format!("volume-{index}") }).collect();
+        let storage: Vec<_> = (0..count).map(|index| StorageFact { workspace: workspace(&format!("ws-{index}"), 0, 0), volume_key: format!("volume-{index}") }).collect();
+        let mounts: Vec<_> = mounted.iter().map(|index| KernelMountFact { mount_id: u64::from(*index) + 100, volume_key: format!("volume-{index}") }).collect();
         let derived = derive_workspaces(storage, mounts, Vec::new()).unwrap();
         prop_assert_eq!(derived.len(), usize::from(count));
         for item in derived {
@@ -659,32 +659,32 @@ proptest! {
     }
 
     #[test]
-    fn generated_ambiguous_volume_names_are_rejected(
+    fn generated_ambiguous_volume_keys_are_rejected(
         left in 0u16..1000,
         right in 0u16..1000,
         volume in any::<u64>(),
         mount_id in any::<u64>(),
     ) {
         prop_assume!(left != right);
-        let volume_name = format!("volume-{volume}");
+        let volume_key = format!("volume-{volume}");
         let storage = vec![
             StorageFact {
                 workspace: workspace(&format!("left-{left}"), 0, 0),
-                volume_name: volume_name.clone(),
+                volume_key: volume_key.clone(),
             },
             StorageFact {
                 workspace: workspace(&format!("right-{right}"), 0, 0),
-                volume_name: volume_name.clone(),
+                volume_key: volume_key.clone(),
             },
         ];
         let mounts = vec![KernelMountFact {
             mount_id,
-            volume_name: volume_name.clone(),
+            volume_key: volume_key.clone(),
         }];
 
         prop_assert_eq!(
             derive_workspaces(storage, mounts, Vec::new()),
-            Err(DerivationError::DuplicateVolumeName(volume_name))
+            Err(DerivationError::DuplicateVolumeKey(volume_key))
         );
     }
 }

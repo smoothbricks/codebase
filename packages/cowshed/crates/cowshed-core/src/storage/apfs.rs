@@ -1116,11 +1116,11 @@ where
         )?];
         let retired = self
             .dispatch_with_locks(lock_paths, true, move |host, config| {
-                let volume = volume_name(workspace.repo(), workspace.name());
+                let volume = volume_key(workspace.repo(), workspace.name());
                 if host
                     .mounts(workspace.repo())?
                     .iter()
-                    .any(|mount| mount.volume_name == volume)
+                    .any(|mount| mount.volume_key == volume)
                 {
                     return Err(ApfsStorageError::InvalidPlan(
                         "restored main image remains mounted",
@@ -1733,7 +1733,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     let request = CreateImageRequest {
         staged_stem,
         capacity: config.capacity.clone(),
-        volume_name: volume_name(repo, &main_name()),
+        volume_name: volume_label(repo, &main_name()),
         case_sensitivity: config.case_sensitivity,
         owner_uid: unsafe { libc::getuid() },
         owner_gid: unsafe { libc::getgid() },
@@ -1972,7 +1972,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         .and_then(|()| {
             host.rename_volume(
                 &staging_mount,
-                &volume_name(workspace.repo(), workspace.name()),
+                &volume_label(workspace.repo(), workspace.name()),
             )?;
             host.mint_workspace_credentials(&workspace, &staging_mount, &staged_companion)?;
             host.write_marker(
@@ -2254,7 +2254,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         .and_then(|()| {
             host.rename_volume(
                 &staging_mount,
-                &volume_name(replacement.repo(), replacement.name()),
+                &volume_label(replacement.repo(), replacement.name()),
             )?;
             host.mint_workspace_credentials(&replacement, &staging_mount, &staged_companion)?;
             host.write_marker(&staging_mount, &replacement, None, identity)?;
@@ -2759,13 +2759,28 @@ fn mount_point(
         .map_err(Into::into)
 }
 
-pub fn volume_name(repo: &RepoId, workspace: &WorkspaceName) -> String {
+/// Internal join key for a workspace's volume, derived from metadata and never read back off a
+/// volume. Enumeration is keyed by image location and mount identity by the in-image marker, so
+/// this key exists only to pair a `StorageFact` with a `KernelMountFact` inside one project.
+pub fn volume_key(repo: &RepoId, workspace: &WorkspaceName) -> String {
     format!(
         "cowshed.{}--{}.{}",
         repo.owner(),
         repo.repo(),
         workspace.as_str()
     )
+}
+
+/// The APFS volume name, which Finder shows for a mounted volume's directory in place of the
+/// directory's own name. It is therefore purely human-facing: it carries no identity, nothing
+/// parses it, and nothing classifies a volume by it. Renaming a volume by hand changes nothing
+/// but the label.
+pub fn volume_label(repo: &RepoId, workspace: &WorkspaceName) -> String {
+    if workspace.is_main() {
+        repo.repo().to_owned()
+    } else {
+        format!("{} — {}", repo.repo(), workspace.as_str())
+    }
 }
 
 #[cfg(test)]

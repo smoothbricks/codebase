@@ -407,7 +407,7 @@ impl NativeGatewayInventory {
             let MountState::Mounted { mount_id } = workspace.mount_state else {
                 continue;
             };
-            let volume = crate::storage::apfs::volume_name(repo_id, workspace.workspace.name());
+            let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
             let mount = authoritative.mount_paths.get(&volume).ok_or_else(|| {
                 GatewayInventoryError::InvalidMetadata {
                     path: layout.project().project_root.clone(),
@@ -711,7 +711,7 @@ fn expected_mount_paths(
                 path: layout.project().mount_root.clone(),
                 message: error.to_string(),
             })?;
-        paths.insert(fact.volume_name.clone(), mount);
+        paths.insert(fact.volume_key.clone(), mount);
     }
     Ok(paths)
 }
@@ -759,9 +759,9 @@ fn reject_duplicate_mount_facts(mounts: &[KernelMountFact]) -> Result<(), Gatewa
     let mut volumes = BTreeSet::new();
     let mut ids = BTreeSet::new();
     for mount in mounts {
-        if !volumes.insert(mount.volume_name.as_str()) || !ids.insert(mount.mount_id) {
+        if !volumes.insert(mount.volume_key.as_str()) || !ids.insert(mount.mount_id) {
             return Err(GatewayInventoryError::AmbiguousMount(
-                mount.volume_name.clone(),
+                mount.volume_key.clone(),
             ));
         }
     }
@@ -1006,10 +1006,10 @@ mod tests {
             }
             .write_for_image(image.image())
             .expect("metadata");
-            let volume_name = crate::storage::apfs::volume_name(repo, &name);
+            let volume_key = crate::storage::apfs::volume_key(repo, &name);
             let storage = StorageFact {
                 workspace: workspace.clone(),
-                volume_name: volume_name.clone(),
+                volume_key: volume_key.clone(),
             };
             let mounted = mounted.then(|| {
                 fs::create_dir_all(&mount).expect("mount");
@@ -1018,7 +1018,7 @@ mod tests {
                 (
                     KernelMountFact {
                         mount_id: revision + 100,
-                        volume_name,
+                        volume_key,
                     },
                     mount,
                 )
@@ -1059,7 +1059,7 @@ mod tests {
                 ProjectInventoryFacts {
                     storage: vec![storage],
                     mounts: vec![mount.clone()],
-                    mount_paths: BTreeMap::from([(mount.volume_name, path)]),
+                    mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
             );
         }
@@ -1168,7 +1168,7 @@ mod tests {
                 ProjectInventoryFacts {
                     storage: vec![legacy, detached],
                     mounts: vec![mount.clone()],
-                    mount_paths: BTreeMap::from([(mount.volume_name, path)]),
+                    mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
             )])),
         });
@@ -1202,7 +1202,7 @@ mod tests {
         let (mount, path) = mounted.expect("mount");
         let duplicate = KernelMountFact {
             mount_id: mount.mount_id + 1,
-            volume_name: mount.volume_name.clone(),
+            volume_key: mount.volume_key.clone(),
         };
         let source = Arc::new(FixtureSource {
             projects: Mutex::new(BTreeMap::from([(
@@ -1210,7 +1210,7 @@ mod tests {
                 ProjectInventoryFacts {
                     storage: vec![storage],
                     mounts: vec![mount.clone(), duplicate],
-                    mount_paths: BTreeMap::from([(mount.volume_name, path)]),
+                    mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
             )])),
         });
