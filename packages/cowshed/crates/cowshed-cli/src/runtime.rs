@@ -6,6 +6,7 @@ use crate::output::Output;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
+pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointOptions, CheckpointResult, CommandArg,
@@ -20,7 +21,10 @@ use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
-use cowshed_core::{CowshedError, ErrorCode, Result};
+use cowshed_core::{
+    AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result,
+    validate_existing_host_storage,
+};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
@@ -63,6 +67,14 @@ pub trait CliService: Send {
     async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo>;
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>>;
+    async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
+        Err(CowshedError::internal(
+            "CLI service does not support store-wide workspace discovery",
+        ))
+    }
+    async fn other_adopted_project_count(&mut self) -> Result<usize> {
+        Ok(0)
+    }
     async fn path(&mut self, workspace: &str, no_attach: bool) -> Result<WorkspaceInfo>;
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<()>;
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<()>;
@@ -102,7 +114,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Checkpoint(_)
         | Command::Restore(_)
         | Command::Ensure(_)
-        | Command::List
+        | Command::List(_)
         | Command::Path(_)
         | Command::Exec(_)
         | Command::Remove(_)
@@ -204,6 +216,24 @@ impl ActorBridge {
         })
     }
 
+    fn repo_id(&self) -> Result<&RepoId> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| &runtime.descriptor().repo_id)
+            .ok_or_else(|| {
+                CowshedError::internal("the CLI project runtime has already been shut down")
+            })
+    }
+
+    async fn adopted_projects(&self) -> Result<Vec<AdoptedProject>> {
+        let home = gateway_service::canonical_home()?;
+        let storage = validate_existing_host_storage(&home).await?;
+        NativeGatewayInventory::new(storage)
+            .adopted_projects()
+            .await
+            .map_err(project_inventory_error)
+    }
+
     pub async fn shutdown(mut self) -> Result<()> {
         drop(self.coordinator.take());
         let connection_error = match self.connection.take() {
@@ -215,6 +245,19 @@ impl ActorBridge {
             None => None,
         };
         combine_teardown(connection_error, runtime_error)
+    }
+}
+
+async fn list_adopted_project(project: &AdoptedProject) -> Result<Vec<WorkspaceInfo>> {
+    let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
+    let primary = bridge.list().await;
+    let teardown = bridge.shutdown().await.err();
+    match primary {
+        Ok(workspaces) => match teardown {
+            Some(error) => Err(error),
+            None => Ok(workspaces),
+        },
+        Err(primary) => Err(merge_primary(primary, teardown)),
     }
 }
 
@@ -297,6 +340,34 @@ impl CliService for ActorBridge {
             .into_iter()
             .map(|workspace| workspace.into_info())
             .collect())
+    }
+
+    async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
+        let current_repo = self.repo_id()?.clone();
+        let projects = self.adopted_projects().await?;
+        let mut grouped = Vec::with_capacity(projects.len());
+        for project in projects {
+            let workspaces = if project.repo_id == current_repo {
+                self.list().await?
+            } else {
+                list_adopted_project(&project).await?
+            };
+            grouped.push(ProjectWorkspaces {
+                repo_id: project.repo_id,
+                workspaces,
+            });
+        }
+        Ok(grouped)
+    }
+
+    async fn other_adopted_project_count(&mut self) -> Result<usize> {
+        let current_repo = self.repo_id()?.clone();
+        Ok(self
+            .adopted_projects()
+            .await?
+            .into_iter()
+            .filter(|project| project.repo_id != current_repo)
+            .count())
     }
 
     async fn path(&mut self, workspace: &str, no_attach: bool) -> Result<WorkspaceInfo> {
@@ -440,6 +511,13 @@ fn output_error(error: io::Error) -> CowshedError {
     CowshedError::environment_missing(
         format!("could not write child output: {error}"),
         "check that the output consumer is still connected",
+    )
+}
+
+fn project_inventory_error(error: impl std::fmt::Display) -> CowshedError {
+    CowshedError::integrity(
+        format!("project inventory failed: {error}"),
+        "cowshed doctor --json",
     )
 }
 
@@ -650,13 +728,43 @@ where
             }
             Ok(success())
         }
-        Command::List => {
-            let mut workspaces = service.list().await?;
-            workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
-            if json {
-                output.success(workspaces).map_err(output_error)?;
+        Command::List(args) => {
+            if args.all {
+                let mut projects = service.list_all().await?;
+                projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+                for project in &mut projects {
+                    project
+                        .workspaces
+                        .sort_by(|left, right| left.workspace.cmp(&right.workspace));
+                }
+                if json {
+                    output.success(projects).map_err(output_error)?;
+                } else {
+                    emit_project_workspaces_tsv(output, &projects)?;
+                }
             } else {
-                emit_workspace_tsv(output, &workspaces)?;
+                let mut workspaces = service.list().await?;
+                workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+                let empty = workspaces.is_empty();
+                if json {
+                    output.success(workspaces).map_err(output_error)?;
+                } else {
+                    emit_workspace_tsv(output, &workspaces)?;
+                }
+                if empty {
+                    let others = service.other_adopted_project_count().await?;
+                    let noun = if others == 1 {
+                        "project exists"
+                    } else {
+                        "projects exist"
+                    };
+                    output
+                        .guidance(&format!(
+                            "current repository has no workspaces or is not adopted; {others} \
+                             other adopted {noun}; run cowshed ls --all"
+                        ))
+                        .map_err(output_error)?;
+                }
             }
             Ok(success())
         }
@@ -1245,29 +1353,55 @@ fn emit_workspace_tsv<W: Write, E: Write>(
     workspaces: &[WorkspaceInfo],
 ) -> Result<()> {
     for workspace in workspaces {
-        output
-            .bare(workspace.workspace.as_str().as_bytes())
-            .and_then(|()| output.bare(b"\t"))
-            .and_then(|()| {
-                output.bare(match workspace.state {
-                    WorkspaceState::Attached => b"mounted",
-                    WorkspaceState::Detached => b"detached",
-                })
-            })
-            .and_then(|()| output.bare(b"\t"))
-            .and_then(|()| output.bare(workspace.branch.as_deref().unwrap_or("").as_bytes()))
-            .and_then(|()| output.bare(b"\t"))
-            .and_then(|()| {
-                if workspace.state == WorkspaceState::Attached {
-                    output.bare(workspace.mount.as_os_str().as_bytes())
-                } else {
-                    Ok(())
-                }
-            })
-            .and_then(|()| output.bare(b"\n"))
-            .map_err(output_error)?;
+        emit_workspace_tsv_row(output, None, workspace)?;
     }
     Ok(())
+}
+
+fn emit_project_workspaces_tsv<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    projects: &[ProjectWorkspaces],
+) -> Result<()> {
+    for project in projects {
+        for workspace in &project.workspaces {
+            emit_workspace_tsv_row(output, Some(&project.repo_id), workspace)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_workspace_tsv_row<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    repo_id: Option<&RepoId>,
+    workspace: &WorkspaceInfo,
+) -> Result<()> {
+    if let Some(repo_id) = repo_id {
+        output
+            .bare(repo_id.as_str().as_bytes())
+            .and_then(|()| output.bare(b"\t"))
+            .map_err(output_error)?;
+    }
+    output
+        .bare(workspace.workspace.as_str().as_bytes())
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| {
+            output.bare(match workspace.state {
+                WorkspaceState::Attached => b"mounted",
+                WorkspaceState::Detached => b"detached",
+            })
+        })
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| output.bare(workspace.branch.as_deref().unwrap_or("").as_bytes()))
+        .and_then(|()| output.bare(b"\t"))
+        .and_then(|()| {
+            if workspace.state == WorkspaceState::Attached {
+                output.bare(workspace.mount.as_os_str().as_bytes())
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|()| output.bare(b"\n"))
+        .map_err(output_error)
 }
 
 fn emit_doctor<W: Write, E: Write>(output: &mut Output<W, E>, report: &DoctorReport) -> Result<()> {

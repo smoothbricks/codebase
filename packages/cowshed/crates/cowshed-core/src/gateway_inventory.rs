@@ -45,6 +45,13 @@ pub struct GatewaySessionFact {
     pub credentials: GatewayWorkspaceCredentials,
 }
 
+/// One validated adopted project discovered from `<store>/<owner>/<repo>/repository.json`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdoptedProject {
+    pub repo_id: RepoId,
+    pub project_root: PathBuf,
+}
+
 impl fmt::Debug for GatewaySessionFact {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -212,6 +219,39 @@ impl NativeGatewayInventory {
     #[cfg(test)]
     fn with_source(storage: ValidatedHostStorage, source: Arc<dyn InventorySource>) -> Self {
         Self { storage, source }
+    }
+
+    pub async fn adopted_projects(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
+        let inventory = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || inventory.adopted_projects_blocking())
+            .await
+            .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
+    fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
+        discover_repositories(self.storage.store())?
+            .into_iter()
+            .map(|repo_id| {
+                let layout =
+                    StorageLayout::new(self.storage.store(), &repo_id).map_err(|error| {
+                        GatewayInventoryError::InvalidMetadata {
+                            path: self.storage.store().to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                let project_root =
+                    authoritative_checkout_path(&layout, &repo_id)?.ok_or_else(|| {
+                        GatewayInventoryError::InvalidMetadata {
+                            path: layout.project().project_root.clone(),
+                            message: "project records no adopted checkout path".to_owned(),
+                        }
+                    })?;
+                Ok(AdoptedProject {
+                    repo_id,
+                    project_root,
+                })
+            })
+            .collect()
     }
 
     pub async fn all_attached(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {

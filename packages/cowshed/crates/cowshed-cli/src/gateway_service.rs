@@ -832,7 +832,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     })
 }
 
-fn canonical_home() -> Result<PathBuf> {
+pub(crate) fn canonical_home() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| {
         CowshedError::environment_missing("HOME is not set", "set HOME to your login directory")
     })?;
