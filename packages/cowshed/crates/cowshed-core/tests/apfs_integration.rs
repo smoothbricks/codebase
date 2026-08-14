@@ -157,6 +157,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             branch: Some("main".to_owned()),
             forked_from: None,
             created_trace: format!("apfs-integration-{}", format.extension()),
+            git_worktree: false,
             grants: GrantSet::closed_baseline(Some(PortBlock::new(30000, 16)?))?,
         })
     };

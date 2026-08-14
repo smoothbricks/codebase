@@ -300,6 +300,10 @@ pub struct OperationIdentity {
     pub forked_from: Option<WorkspaceName>,
     pub created_trace: String,
     pub grants: GrantSet,
+    /// Mint this workspace as a linked worktree of main's repository rather than a standalone
+    /// clone. Carried on the identity because the fresh metadata policy builds the whole persisted
+    /// info snapshot from it.
+    pub git_worktree: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -78,6 +78,7 @@ pub struct NewArgs {
     pub browse: bool,
     pub slot: Option<u32>,
     pub register: bool,
+    pub git_worktree: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -525,14 +526,14 @@ fn parse_new(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str =
-        "new <name> [--ref <rev> | --from <ws>] [--browse] [--slot <n>] [--register]";
+    const USAGE: &str = "new <name> [--ref <rev> | --from <ws>] [--browse] [--slot <n>] [--register] [--git-worktree]";
     let mut name = None;
     let mut reference = None;
     let mut from = None;
     let mut browse = false;
     let mut slot = None;
     let mut register = false;
+    let mut git_worktree = false;
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
             continue;
@@ -545,6 +546,7 @@ fn parse_new(
             }
             Some("--browse") => browse = true,
             Some("--register") => register = true,
+            Some("--git-worktree") => git_worktree = true,
             Some("--slot") => {
                 let value = take_value(args, &mut index, "--slot", USAGE)?;
                 let text = value
@@ -576,6 +578,7 @@ fn parse_new(
         browse,
         slot,
         register,
+        git_worktree,
     }))
 }
 
@@ -1455,6 +1458,22 @@ mod tests {
         assert!(parse_args(["new", "main"]).is_err());
         assert!(parse_args(["new", "raven", "--ref", "HEAD", "--from", "main"]).is_err());
         assert!(parse_args(["path", "main"]).is_ok());
+    }
+
+    #[test]
+    fn new_carries_the_git_worktree_request_through_to_the_command() {
+        let cli = parse_args(["new", "raven", "--git-worktree"]).unwrap();
+        let Command::New(args) = cli.command else {
+            panic!("expected new")
+        };
+        assert!(args.git_worktree);
+        assert!(!args.register);
+
+        let cli = parse_args(["new", "raven"]).unwrap();
+        let Command::New(args) = cli.command else {
+            panic!("expected new")
+        };
+        assert!(!args.git_worktree);
     }
 
     #[test]

@@ -535,6 +535,7 @@ mod tests {
                 grants: SandboxGrants::default(),
                 allowed_unix_sockets: vec![],
                 additional_denies: vec![],
+                git_worktree_repository: None,
             }
         }
     }

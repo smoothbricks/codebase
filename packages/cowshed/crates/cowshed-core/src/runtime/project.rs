@@ -1543,10 +1543,30 @@ impl NativeProjectRuntimeHost {
             &bootstrap_mode,
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
         );
+        let origin = if existing_only {
+            workspace_origin_from_marker(&git_root).await?
+        } else {
+            None
+        };
         let mut binding_repo_id = if existing_only {
-            repo_id_from_workspace_marker(&git_root).await?
+            origin.as_ref().map(|origin| origin.repo_id.clone())
         } else {
             requested_repo_id.cloned()
+        };
+        // Where the caller stands and where the project is checked out are two different facts,
+        // and only the first is what Git discovery reports. A coordinator verb invoked from inside
+        // a session workspace discovers that workspace's mount — a standalone repository in its own
+        // right — while everything downstream (the binding's remotes, the substrate's checkout
+        // path, the recorded-project-root agreement every enumeration checks) means the project's
+        // checkout. Every marker records that checkout, so when the two differ the marker is the
+        // authority and the invocation root is left behind here.
+        let (git_root, git) = match origin.as_ref() {
+            Some(origin) if !names_one_root(&origin.project_root, &git_root) => {
+                let root = origin.project_root.clone();
+                let git = crate::git::GitRepository::from_root(&root);
+                (root, git)
+            }
+            _ => (git_root, git),
         };
         if existing_only && binding_repo_id.is_none() {
             let storage =
@@ -1878,15 +1898,17 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
-    /// Point every mounted workspace's `main` remote at main's current mount.
+    /// Point every mounted workspace's link to main at main's current mount: the `main` remote for
+    /// a standalone workspace, the linked-worktree registration for a git-worktree one.
     ///
     /// Under direct mount main's mount *is* the checkout, so moving the checkout moves the URL
-    /// every workspace fetches from; under the symlink layout the mount never moves and this is the
-    /// idempotent re-run that `configure_main_remote` is built for. One code path covers both
-    /// because the layout is exactly the thing `workspace_mount_path` already answers.
+    /// every workspace fetches from and the gitdir every git-worktree workspace points at; under
+    /// the symlink layout the mount never moves and this is the idempotent re-run that
+    /// `configure_main_remote` is built for. One code path covers both because the layout is
+    /// exactly the thing `workspace_mount_path` already answers.
     ///
     /// Detached workspaces are skipped rather than mounted: there is nothing to write into an
-    /// unmounted volume, and `ensure` repairs the remote when the workspace is next used.
+    /// unmounted volume, and `ensure` repairs the link when the workspace is next used.
     async fn rewrite_main_remotes(&mut self) -> Result<()> {
         let main_mount = self.workspace_mount_path(&main_name())?;
         for workspace in self.authoritative().await? {
@@ -1900,6 +1922,10 @@ impl NativeProjectRuntimeHost {
                 continue;
             }
             let mount = self.workspace_mount_path(&name)?;
+            if is_git_worktree(&workspace.metadata) {
+                repair_git_worktree_link(&main_mount, &mount).await?;
+                continue;
+            }
             crate::git::GitRepository::from_root(&mount)
                 .configure_main_remote(&main_mount)
                 .await?;
@@ -2101,10 +2127,17 @@ impl NativeProjectRuntimeHost {
             .await
     }
 
-    /// Drop `workspace`'s registration from main. Main being unmounted is not a failure: there is
-    /// nothing to clean up in a repository that is not there, and `gc` re-runs this from the same
-    /// revalidated retirement metadata that authorizes the rest of cleanup.
-    async fn unregister_workspace_in_main(&self, workspace: &WorkspaceName) -> Result<()> {
+    /// Drop the host-side state `workspace` put in main's repository: its reverse remote, and its
+    /// linked-worktree registration if it is a git-worktree workspace.
+    ///
+    /// Main being unmounted is not a failure: there is nothing to clean up in a repository that is
+    /// not there, and `gc` re-runs this from the same revalidated retirement metadata that
+    /// authorizes the rest of cleanup.
+    async fn unregister_workspace_in_main(
+        &self,
+        workspace: &WorkspaceName,
+        git_worktree: bool,
+    ) -> Result<()> {
         if workspace.is_main() {
             return Ok(());
         }
@@ -2112,9 +2145,36 @@ impl NativeProjectRuntimeHost {
         if !main_mount.join(".git").exists() {
             return Ok(());
         }
-        crate::git::GitRepository::from_root(&main_mount)
-            .unregister_workspace_remote(workspace.as_str())
-            .await
+        let main = crate::git::GitRepository::from_root(&main_mount);
+        main.unregister_workspace_remote(workspace.as_str()).await?;
+        if git_worktree {
+            main.unregister_linked_worktree(workspace.as_str()).await?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a git-worktree operation while main is not mounted.
+    ///
+    /// The gitdir lives outside the workspace's volume, so with main detached the workspace has
+    /// files and no repository: `git status` fails and everything built on it fails with it.
+    /// Handing back a mount whose git is broken is worse than saying which command fixes it.
+    async fn require_main_mounted_for_git_worktree(
+        &mut self,
+        workspace: &WorkspaceName,
+    ) -> Result<()> {
+        let main = self.current(&main_name()).await?;
+        if matches!(
+            main.derived.mount_state,
+            crate::storage::lifecycle::MountState::Detached
+        ) {
+            return Err(CowshedError::conflict(
+                format!(
+                    "git-worktree workspace {workspace} needs main mounted: its repository lives in main"
+                ),
+                "cowshed attach main",
+            ));
+        }
+        Ok(())
     }
 
     fn snapshot(&self, workspace: &NativeWorkspace) -> Result<WorkspaceSnapshot> {
@@ -2249,6 +2309,7 @@ impl NativeProjectRuntimeHost {
         grants: GrantSet,
         branch: Option<String>,
         forked_from: Option<WorkspaceName>,
+        git_worktree: bool,
     ) -> Result<crate::storage::lifecycle::OperationIdentity> {
         Ok(crate::storage::lifecycle::OperationIdentity {
             project_root: self.descriptor.git_root.clone(),
@@ -2258,6 +2319,7 @@ impl NativeProjectRuntimeHost {
             forked_from,
             created_trace: uuid::Uuid::new_v4().simple().to_string(),
             grants,
+            git_worktree,
         })
     }
 
@@ -2619,6 +2681,13 @@ impl NativeProjectRuntimeHost {
 
         self.validate_binding().await?;
         let mut current = self.current(name).await?;
+        // Every verb that runs work in a workspace arrives here, so this is where the
+        // git-worktree precondition belongs: exec, sessions, and `path`'s implicit attach all get
+        // the same refusal rather than a mount whose git is broken.
+        if is_git_worktree(&current.metadata) {
+            self.require_main_mounted_for_git_worktree(name).await?;
+            current = self.current(name).await?;
+        }
         let was_detached = matches!(
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Detached
@@ -2681,6 +2750,10 @@ impl NativeProjectRuntimeHost {
                 self.layout.project().project_root.clone(),
                 self.telemetry_root.clone(),
             ],
+            git_worktree_repository: git_worktree_repository(
+                &current.metadata,
+                self.workspace_mount_path(&main_name())?,
+            ),
         };
         let admitted_historical_incarnations = self
             .commitments
@@ -2877,7 +2950,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let mut grants = reservation.grants.clone();
         grants.revision = 0;
         let identity = self
-            .operation_identity(grants, self.git.current_branch().await?, None)
+            .operation_identity(grants, self.git.current_branch().await?, None, false)
             .await?;
         let format = options
             .image_format
@@ -2950,12 +3023,27 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .clone()
             .unwrap_or_else(|| WorkspaceName::new("main").expect("fixed main"));
         let source = self.current(&source_name).await?;
+        // Git-worktree-ness is inherited, not just requested. A clone of a git-worktree workspace
+        // carries no repository of its own — only a pointer file naming the *source's*
+        // registration — so it has to be re-registered as one whatever the caller asked for.
+        let git_worktree = options.git_worktree || is_git_worktree(&source.metadata);
+        if git_worktree {
+            self.require_main_mounted_for_git_worktree(&workspace)
+                .await?;
+        }
+        if options.register && git_worktree {
+            return Err(CowshedError::usage(
+                "--register has nothing to fetch on a git-worktree workspace: main already holds its branch",
+                format!("cowshed new {workspace} --git-worktree"),
+            ));
+        }
         let reservation = self.fresh_grants().await?;
         let identity = self
             .operation_identity(
                 reservation.grants.clone(),
                 Some(format!("cowshed/{workspace}")),
                 None,
+                git_worktree,
             )
             .await?;
         let plan = self
@@ -2979,10 +3067,21 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let receipt = self
             .substrate
             .execute_create_staged(plan, move |stage| async move {
-                crate::git::GitRepository::from_root(&stage.mount_point)
-                    .prepare_workspace(&destination.to_string(), &main_mount, start.as_deref())
-                    .await
-                    .map(|_| ())
+                let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                if git_worktree {
+                    repository
+                        .adopt_as_linked_worktree(
+                            &destination.to_string(),
+                            &main_mount,
+                            start.as_deref(),
+                        )
+                        .await
+                } else {
+                    repository
+                        .prepare_workspace(&destination.to_string(), &main_mount, start.as_deref())
+                        .await
+                        .map(|_| ())
+                }
             })
             .await
             .map_err(native_staged_error)?;
@@ -3089,14 +3188,25 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "choose another workspace name",
             ));
         }
+        // A fork of a git-worktree workspace is one too, and has to be: the cloned image carries
+        // a pointer file naming the *source's* registration, so the destination is re-registered
+        // under its own id rather than left as a second claim on one worktree.
+        let source_is_git_worktree = is_git_worktree(&source_fact.metadata);
+        if source_is_git_worktree {
+            self.require_main_mounted_for_git_worktree(&destination)
+                .await?;
+        }
         let reservation = self.fresh_grants().await?;
         let identity = self
             .operation_identity(
                 reservation.grants.clone(),
                 Some(format!("cowshed/{destination}")),
                 Some(source.clone()),
+                source_is_git_worktree,
             )
             .await?;
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let forked = destination.clone();
         let plan = self
             .substrate
             .plan_fork(
@@ -3111,7 +3221,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_integrity_error)?;
         let receipt = self
             .substrate
-            .execute_fork_staged(plan, |_stage| async { Ok::<_, CowshedError>(()) })
+            .execute_fork_staged(plan, move |stage| async move {
+                if !source_is_git_worktree {
+                    return Ok(());
+                }
+                crate::git::GitRepository::from_root(&stage.mount_point)
+                    .adopt_as_linked_worktree(&forked.to_string(), &main_mount, None)
+                    .await
+            })
             .await
             .map_err(native_staged_error)?;
         self.commitments
@@ -3318,14 +3435,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         if !workspace.is_main() {
             // The reconciliation half of `mv`: a workspace that was detached while main moved
-            // still names main's old mount. `configure_main_remote` is idempotent and never
-            // touches a remote cowshed did not create, so running it on every ensure costs one
-            // config read and keeps every workspace's upstream true without a repair verb.
+            // still names main's old mount — as a remote URL, or as the gitdir a git-worktree
+            // workspace points at. Both repairs are idempotent and neither touches state cowshed
+            // did not create, so running one on every ensure keeps every workspace's link to main
+            // true without a repair verb.
             let main_mount = self.workspace_mount_path(&main_name())?;
             let mount = self.workspace_mount_path(&workspace)?;
-            crate::git::GitRepository::from_root(&mount)
-                .configure_main_remote(&main_mount)
-                .await?;
+            if is_git_worktree(&before.metadata) {
+                repair_git_worktree_link(&main_mount, &mount).await?;
+            } else {
+                crate::git::GitRepository::from_root(&mount)
+                    .configure_main_remote(&main_mount)
+                    .await?;
+            }
         }
         let current = self.current(&workspace).await?;
         let mount = self.workspace_mount_path(&workspace)?;
@@ -3348,6 +3470,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Detached
         );
+        if is_git_worktree(&current.metadata) {
+            self.require_main_mounted_for_git_worktree(&workspace)
+                .await?;
+        }
         self.substrate
             .ensure_mounted(
                 &current.derived.workspace,
@@ -3387,6 +3513,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if let Some(expected) = expected_incarnation.as_ref() {
             Self::require_exact_incarnation(&current, expected)?;
         }
+        require_checkpointable(&workspace, &current.metadata, "checkpoint")?;
         let explicitly_labeled = options.label.is_some();
         let label = crate::storage::CheckpointLabel::new(options.label.unwrap_or_else(|| {
             format!(
@@ -3438,6 +3565,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
 
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
+        require_checkpointable(&workspace, &current.metadata, "restore")?;
         let label = crate::storage::CheckpointLabel::new(label).map_err(native_integrity_error)?;
         let checkpoint = current
             .derived
@@ -3460,6 +3588,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 current.metadata.grants.clone(),
                 info.branch.clone(),
                 info.forked_from.clone(),
+                info.git_worktree,
             )
             .await?;
         self.stop_supervisor(&workspace).await?;
@@ -3681,7 +3810,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             // Host-side state goes before the image does. A remote naming a trashed mount is a
             // broken fetch in the user's own checkout — the one piece of this teardown that lives
             // where they can see it.
-            self.unregister_workspace_in_main(&workspace).await?;
+            self.unregister_workspace_in_main(&workspace, is_git_worktree(&current.metadata))
+                .await?;
             self.retire_workspace(current).await
         }
         .await;
@@ -3756,6 +3886,25 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 candidates,
             });
         }
+        // Host-side state goes before the image does here too, for the same reason retirement
+        // orders it that way: an image `gc` has already deleted leaves no authority to clean up
+        // what it left behind in main. The authority is the retired image's own revalidated
+        // sidecar — never the observation that a registered worktree's path is missing, which is
+        // also what a merely detached workspace looks like.
+        for candidate in plan.candidates() {
+            if !matches!(candidate.reason(), StorageGcReason::RetiredWorkspace) {
+                continue;
+            }
+            let Ok(metadata) =
+                crate::metadata::DetachedWorkspaceMetadata::read_for_image(candidate.path())
+            else {
+                continue;
+            };
+            if metadata.info_snapshot.is_some_and(|info| info.git_worktree) {
+                self.unregister_workspace_in_main(&metadata.workspace, true)
+                    .await?;
+            }
+        }
         let report = self
             .substrate
             .execute_gc(plan)
@@ -3807,12 +3956,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if let Some(handle) = self.supervisors.remove(&workspace) {
             let current = self.current(&workspace).await?;
             let mount = self.workspace_mount_path(&workspace)?;
+            let main_mount = self.workspace_mount_path(&main_name())?;
             let config = supervisor_sandbox(
                 &self.home,
                 &self.layout,
                 &self.telemetry_root,
                 &current,
                 mount,
+                main_mount,
             )?;
             let replacement = handle
                 .advance_authority(
@@ -3904,19 +4055,33 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ));
         }
         // The default destination follows the remote's name, which is `main` — and `cowshed-main`
-        // in a workspace where something else already held that name.
+        // in a workspace where something else already held that name. A git-worktree workspace has
+        // no remote at all and needs none: main's `main` branch is already in its ref namespace,
+        // so the default destination is that branch itself.
         let main_mount = self.workspace_mount_path(&main_name())?;
-        let main_remote = crate::git::GitRepository::from_root(&root)
-            .configure_main_remote(&main_mount)
-            .await?;
+        let mut fetch_remote = None;
+        let git_worktree = is_git_worktree(&current.metadata);
+        let default_onto = if git_worktree {
+            "main".to_owned()
+        } else {
+            let main_remote = crate::git::GitRepository::from_root(&root)
+                .configure_main_remote(&main_mount)
+                .await?;
+            fetch_remote = Some(main_remote.remote_name().to_owned());
+            format!("{}/main", main_remote.remote_name())
+        };
         let onto = options
             .onto
             .as_ref()
             .map(revision_target)
-            .unwrap_or_else(|| format!("{}/main", main_remote.remote_name()));
+            .unwrap_or(default_onto);
         // Refresh the remote-tracking refs first: rebasing onto `main/main` resolves a ref that
-        // only a fetch creates, and a stale one silently replays onto yesterday's base.
-        run_git(&root, ["fetch", "--no-tags", main_remote.remote_name()]).await?;
+        // only a fetch creates, and a stale one silently replays onto yesterday's base. A
+        // git-worktree workspace reads main's branches directly out of the shared ref namespace,
+        // so there is nothing to refresh and no remote to refresh it from.
+        if let Some(remote) = fetch_remote {
+            run_git(&root, ["fetch", "--no-tags", remote.as_str()]).await?;
+        }
         let onto_head = git_revision_oid(&root, &onto).await?;
         if options
             .expected_onto_head
@@ -4520,8 +4685,17 @@ fn binding_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "repair the repository binding")
 }
 
+/// What a workspace marker tells an opening controller about the project it belongs to.
 #[cfg(target_os = "macos")]
-async fn repo_id_from_workspace_marker(project_root: &Path) -> Result<Option<RepoId>> {
+struct WorkspaceOrigin {
+    repo_id: RepoId,
+    /// The project's checkout path, which every marker records — main's own for main, and main's
+    /// for a session, since a session is a clone of the project rather than a project of its own.
+    project_root: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<WorkspaceOrigin>> {
     let marker_path = project_root.join(crate::storage::WORKSPACE_MARKER_PATH);
     let marker = crate::storage::lifecycle::dispatch_blocking(move || {
         match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
@@ -4540,16 +4714,47 @@ async fn repo_id_from_workspace_marker(project_root: &Path) -> Result<Option<Rep
     let Some(marker) = marker else {
         return Ok(None);
     };
-    if !names_one_root(&marker.project_root, project_root)
-        || !marker.workspace.is_main()
-        || marker.role != crate::metadata::WorkspaceRole::Main
-    {
+    // The marker's job here is to name the repository, and every workspace's marker names it. A
+    // coordinator verb is routinely invoked from inside a session workspace — `cowshed rebase`
+    // infers its workspace from the cwd precisely so it can be — and that directory is a session
+    // mount carrying a session marker.
+    //
+    // The recorded project root cannot be compared against the invocation root for a session:
+    // every marker records the project's checkout path, which for a session is main's checkout and
+    // therefore a different directory than the mount the caller is standing in. Comparing them
+    // rejected every workspace cwd, and no amount of repairing main's marker could satisfy it,
+    // because main's marker was never the file being read.
+    //
+    // What remains checkable is real incoherence: a marker whose role and workspace name disagree
+    // is corrupt either way, and main's marker must still name the root it sits in, since for main
+    // — and only for main — the recorded project root and the invocation root are the same
+    // directory.
+    let claims_main = marker.workspace.is_main();
+    if claims_main != (marker.role == crate::metadata::WorkspaceRole::Main) {
         return Err(CowshedError::conflict(
-            "main workspace marker does not match this project root",
-            "reopen the canonical main workspace or repair its marker",
+            format!(
+                "workspace marker at {} names {} with role {:?}",
+                project_root.display(),
+                marker.workspace,
+                marker.role
+            ),
+            "repair the workspace marker, or reopen from the canonical main checkout",
         ));
     }
-    Ok(Some(marker.repo_id))
+    if claims_main && !names_one_root(&marker.project_root, project_root) {
+        return Err(CowshedError::conflict(
+            format!(
+                "main workspace marker records {} but was read at {}",
+                marker.project_root.display(),
+                project_root.display()
+            ),
+            "cowshed ensure",
+        ));
+    }
+    Ok(Some(WorkspaceOrigin {
+        repo_id: marker.repo_id,
+        project_root: marker.project_root,
+    }))
 }
 
 /// Do a recorded project root and an observed one name the same directory?
@@ -5088,18 +5293,31 @@ fn require_expected_ref(
 }
 
 #[cfg(target_os = "macos")]
+/// Turn a failed git invocation into an error whose `next:` names what actually went wrong.
+///
+/// A single catch-all hint is worse than no hint. Telling a user to "resolve the git conflict" when
+/// git failed to resolve a ref sends them looking for conflict markers and a rebase in progress
+/// that do not exist, and the real cause — a missing remote-tracking ref, an unknown revision —
+/// is the one thing the hint hides. Only a genuine merge/rebase conflict gets the conflict hint;
+/// everything else quotes git's own diagnosis and points at the state to inspect.
 fn require_git_success(operation: &str, output: &std::process::Output) -> Result<()> {
     if output.status.success() {
-        Ok(())
-    } else {
-        Err(CowshedError::conflict(
-            format!(
-                "{operation} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            "resolve the git conflict and retry",
-        ))
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = format!("{operation} failed: {stderr}");
+    // Git says "CONFLICT (content):" / "Automatic merge failed" / "could not apply" when a merge or
+    // rebase actually stopped on conflicting content. Anything else is a different failure wearing
+    // the same exit code.
+    let conflicted = stderr.contains("CONFLICT")
+        || stderr.contains("Automatic merge failed")
+        || stderr.contains("could not apply")
+        || stderr.contains("needs merge");
+    Err(if conflicted {
+        CowshedError::conflict(message, "resolve the git conflict and retry")
+    } else {
+        CowshedError::conflict(message, "inspect the repository state: git status")
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -5131,6 +5349,7 @@ fn supervisor_sandbox(
     telemetry_root: &Path,
     current: &NativeWorkspace,
     mount: PathBuf,
+    main_mount: PathBuf,
 ) -> Result<crate::sandbox::SandboxConfig> {
     Ok(crate::sandbox::SandboxConfig {
         home: home.to_path_buf(),
@@ -5162,6 +5381,7 @@ fn supervisor_sandbox(
             layout.project().project_root.clone(),
             telemetry_root.to_path_buf(),
         ],
+        git_worktree_repository: git_worktree_repository(&current.metadata, main_mount),
     })
 }
 
@@ -5477,6 +5697,66 @@ fn main_name() -> WorkspaceName {
     WorkspaceName::new("main").expect("fixed main workspace name is valid")
 }
 
+/// The repository a git-worktree workspace's sandbox must reach into, if it is one.
+///
+/// Narrowed to `.git`: the workspace needs main's object store and its own administrative
+/// directory, and nothing in main's working tree.
+fn git_worktree_repository(
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    main_mount: PathBuf,
+) -> Option<PathBuf> {
+    is_git_worktree(metadata).then(|| main_mount.join(".git"))
+}
+
+/// Re-aim a git-worktree workspace's registration at main's current mount, both directions.
+///
+/// `git worktree repair`, run from main, is the primitive for exactly this: it rewrites the
+/// pointer file in the worktree and the `gitdir` file in main's administrative directory from
+/// whichever of the two is still intact, which is what makes it correct whether main moved or the
+/// workspace did.
+async fn repair_git_worktree_link(main_mount: &Path, mount: &Path) -> Result<()> {
+    crate::git::GitRepository::from_root(main_mount)
+        .repair_linked_worktree(mount)
+        .await
+}
+
+/// Refuse `checkpoint` and `restore` on a git-worktree workspace.
+///
+/// Its image is not self-contained: the tree is here and the history is in main. A checkpoint
+/// clone would capture half a repository, and restoring one would resurrect a registration for a
+/// worktree id main has since pruned, quietly claiming a branch another workspace may now hold.
+/// The refusal lands before any quota read or barrier, because nothing about the workspace's size
+/// or its supervisor changes the answer, and the hints name the two honest substitutes.
+fn require_checkpointable(
+    name: &WorkspaceName,
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    verb: &str,
+) -> Result<()> {
+    if !is_git_worktree(metadata) {
+        return Ok(());
+    }
+    Err(CowshedError::conflict(
+        format!(
+            "git-worktree workspace {name} cannot {verb}: its history lives in main, not in its image"
+        ),
+        format!(
+            "commit and cowshed land {name}, or cowshed new <name> for a checkpointable workspace"
+        ),
+    ))
+}
+
+/// Whether this workspace is a registered linked worktree of main's repository.
+///
+/// Read from the store-side sidecar, so it answers while the workspace is detached — which is
+/// exactly when retirement and `gc` need it. A sidecar too old to carry the field describes a
+/// workspace minted before the mode existed, and those are standalone.
+fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> bool {
+    metadata
+        .info_snapshot
+        .as_ref()
+        .is_some_and(|info| info.git_worktree)
+}
+
 /// Decide which path a checkout-identity check should actually inspect.
 ///
 /// Exactly one symlink is legitimate at a checkout path: the one adoption plants there, aimed at
@@ -5531,6 +5811,91 @@ fn native_finding(
         message: error.message,
         hint: error.hint,
         path: None,
+    }
+}
+
+/// The git-worktree decisions are all read off one store-side fact, so they are tested off one
+/// too: a sidecar. Nothing here needs a mount, which is the point — every one of these answers has
+/// to be available while the workspace is detached.
+#[cfg(all(test, target_os = "macos"))]
+mod git_worktree_tests {
+    use super::*;
+    use crate::metadata::{
+        DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
+        PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole,
+    };
+
+    fn sidecar(git_worktree: bool) -> DetachedWorkspaceMetadata {
+        DetachedWorkspaceMetadata {
+            version: METADATA_VERSION,
+            repo_id: RepoId::parse("acme/widget").expect("repo identity"),
+            workspace: WorkspaceName::new("raven").expect("workspace name"),
+            workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .expect("incarnation"),
+            image_format: ImageFormat::Asif,
+            platform: Platform::Macos,
+            publication_state: PublicationState::Active,
+            updated_at: "2026-07-13T00:00:00Z".to_owned(),
+            grants: GrantSet::closed_baseline(Some(
+                PortBlock::new(40_960, 16).expect("port block"),
+            ))
+            .expect("grants"),
+            info_snapshot: Some(WorkspaceInfoSnapshot {
+                project_root: PathBuf::from("/project"),
+                role: WorkspaceRole::Workspace,
+                base_commit: "0123456789abcdef".to_owned(),
+                branch: Some("cowshed/raven".to_owned()),
+                created_at: "2026-07-13T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-13T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree,
+            }),
+        }
+    }
+
+    #[test]
+    fn checkpoint_and_restore_refuse_a_git_worktree_workspace_and_name_both_substitutes() {
+        let name = WorkspaceName::new("raven").expect("workspace name");
+        require_checkpointable(&name, &sidecar(false), "checkpoint")
+            .expect("a standalone workspace checkpoints");
+        require_checkpointable(&name, &sidecar(false), "restore")
+            .expect("a standalone workspace restores");
+
+        for verb in ["checkpoint", "restore"] {
+            let error = require_checkpointable(&name, &sidecar(true), verb)
+                .expect_err("a git-worktree workspace must refuse");
+            // Exit 4: the workspace is fine, the operation is the thing that cannot be done.
+            assert_eq!(error.exit_code(), 4);
+            assert!(error.message.contains(verb));
+            // Both honest substitutes: keep the work, or mint something checkpointable.
+            assert!(error.hint.contains("cowshed land raven"), "{}", error.hint);
+            assert!(error.hint.contains("cowshed new"), "{}", error.hint);
+        }
+    }
+
+    #[test]
+    fn only_a_git_worktree_workspace_reaches_into_mains_repository() {
+        let main_mount = PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/main");
+        assert_eq!(
+            git_worktree_repository(&sidecar(true), main_mount.clone()),
+            Some(main_mount.join(".git"))
+        );
+        assert_eq!(git_worktree_repository(&sidecar(false), main_mount), None);
+    }
+
+    /// A sidecar written before the mode existed describes a standalone workspace, and must read
+    /// as one rather than failing closed: the absent field is an answer, not a gap.
+    #[test]
+    fn a_sidecar_without_the_field_is_a_standalone_workspace() {
+        let mut wire = serde_json::to_value(sidecar(false)).expect("encode sidecar");
+        wire["infoSnapshot"]
+            .as_object_mut()
+            .expect("info snapshot object")
+            .remove("gitWorktree");
+        let decoded: DetachedWorkspaceMetadata =
+            serde_json::from_value(wire).expect("decode legacy sidecar");
+        assert!(!is_git_worktree(&decoded));
     }
 }
 

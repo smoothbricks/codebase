@@ -176,6 +176,15 @@ Notes:
   intentionally grantable and therefore are not deny-policy entries. By contrast, any path intersecting an effective
   deny is immutable from workspace grant authority: neither an ancestor grant nor a symlink, bind mount, hardlink, or
   alternate spelling can re-allow it.
+- **The git-worktree repository is a carve-back, not a grant.** A workspace minted with `--git-worktree` (02) keeps its
+  repository in main, so its profile allows read and write on `<main-canonical-mount>/.git` — the object store it
+  commits into and the `worktrees/<ws>` administrative directory it lives in — and on nothing else of main's. It is
+  stated after every deny that would otherwise close it, because main's mount is inside cowshed's store under the
+  symlink layout and is the denied project root under direct mount, and last-match-wins is what makes the carve-back
+  real. It is not
+  expressible as a read/write grant for exactly that reason: a grant intersecting an effective deny is refused. It is
+  controller-owned, carried by the workspaces that asked for the mode, and never implied by the baseline — main's
+  working tree is no more reachable than any other workspace's.
 - **Effective denies are monotonic.** `repo_id` is the machine-independent lowercase `owner/repo` normalized from a
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may
