@@ -7,26 +7,33 @@ the truth.
 
 ## Mounts
 
-**Workspace missing after reboot.** Mounts don't survive reboots; images do. Any cowshed command heals on contact — most
-naturally:
+**Workspace missing after reboot.** Mounts don't survive reboots; images do. Direnv repositories normally heal when
+their allowed `.envrc` runs:
 
-```
-$ cowshed ensure          # in an .envrc: this already ran when you cd'd in
+```sh
+$ cowshed ensure
 cowshed: reattached acme/widget/raven (image was healthy, mount was gone)
 ```
 
-Adopted main workspaces self-heal through the stub `.envrc` cowshed wrote _underneath_ the mountpoint during `adopt`:
-when unmounted, `cd <project-root>` hits the stub, which runs `cowshed ensure --attach`; the real `.envrc` shadows the
-stub once mounted, and direnv reloads. You `direnv allow` each file once. The login LaunchAgent attaches permanent
-workspaces proactively; `ensure` is the belt-and-braces.
+Adopted main workspaces retain the byte-stable stub `.envrc` cowshed wrote underneath the mountpoint. When unmounted,
+`cd <project-root>` exposes that stub, which runs `cowshed ensure --attach`; after the real workspace is mounted its own
+`.envrc` shadows the stub and direnv reloads. Cowshed does **not** authorize either file: run `direnv allow` once at
+each workspace path.
 
-**Finder ejected a volume** (or `hdiutil detach` by hand): same story — `cowshed ensure`, or just run the command you
-wanted; `exec`/`shell`/`path` all verify the mount first and reattach.
+Devenv's hook cannot activate from the bare mountpoint stub. For a devenv-native repository, remount explicitly with
+`cowshed ensure --attach`, evaluate `cowshed ensure --envrc` if the human shell needs cowshed's exports, then run the
+repository's `devenv:allow` command once at that workspace path. Cowshed never reads or writes devenv's trust database.
+The login LaunchAgent may attach permanent workspaces proactively, but explicit `ensure` remains the recovery command.
 
-**direnv says `.envrc is blocked` in a workspace.** Shouldn't happen: direnv trust is keyed by absolute path, so cowshed
-trusts each clone's `.envrc` at `new`/`fork`/`restore` and re-asserts it in `ensure` healing. If you see it anyway (e.g.
-the allow entry was cleaned), `cowshed ensure` fixes it; `direnv allow` works too. devenv inside workspaces needs
-multi-user (daemon) Nix — `cowshed doctor` flags single-user installs.
+**Finder ejected a volume** (or `hdiutil detach` by hand): use the same explicit `cowshed ensure --attach` recovery.
+
+**direnv says `.envrc is blocked` in a workspace.** This is expected until that clone path is authorized. Run
+`direnv allow`; `cowshed ensure` repairs mounts but deliberately does not change trust.
+
+**devenv refresh fails during `cowshed exec`.** With `[devenv] dir` in `.cowshed.toml` (or a root `devenv.nix`), cowshed
+watches the configuration inputs and refreshes the environment before the next sandbox process. A missing configured
+`devenv.nix`, missing `devenv` executable, or evaluation error fails closed with exit 5 and devenv's stderr; cowshed
+never reuses a stale snapshot. Existing long-running processes keep their launch environment.
 
 **`cowshed adopt` or `cowshed push` refused with exit 4 naming files.** The secrets gate found credential-shaped content
 (`.env*`, key files, known token prefixes, `.envrc` secret exports). For adopt: move each value into the gateway
