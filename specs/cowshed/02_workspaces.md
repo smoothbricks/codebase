@@ -50,10 +50,17 @@ so waived paths stay visible.
 
 ## `cowshed adopt` — create the main workspace
 
-Converts an existing checkout into that project's image-backed `main` workspace mounted at its original path. One-time
-per project, copy-bound (clonefile cannot cross volumes). The source is a _live_ tree — editors, watchers, and build
-daemons mutate it during the copy — so adopt is an explicit transaction with defined crash points, not a best-effort
-script:
+Converts an existing checkout into that project's image-backed `main` workspace, mounted at
+`~/.cowshed/mnt/<owner>/<repo>/main` with a symlink left at the checkout's original path. One-time per project,
+copy-bound (clonefile cannot cross volumes).
+
+Main mounts under the same `mnt/<owner>/<repo>/<name>` root as every other workspace: one uniform mount namespace, no
+special case for main in the layout, in the substrate, or in the runtime. Keeping mounts out of the user's source tree
+is the point — a volume mounted over `~/Dev/<project>` puts the mount table in the user's face, and Finder labels that
+directory with the _volume_ name rather than the directory the user chose. The symlink restores the familiar path: `cd`
+and every tool that follows symlinks land in the workspace, while `pwd -P` and anything resolving to a real path report
+the canonical mount. The source is a _live_ tree — editors, watchers, and build daemons mutate it during the copy — so
+adopt is an explicit transaction with defined crash points, not a best-effort script:
 
 1. Verify: git root, clean-enough state (adopt refuses mid-merge/rebase), free space, the secrets gate, and repository
    identity. Normalize every configured remote to a lowercase `owner/repo` candidate. With no remotes,
@@ -83,16 +90,19 @@ script:
    tool config files (03_caches.md). The main sidecar contains `portBlock` only on macOS; Linux omits it and creates its
    per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree against the
    source before publication.
-5. Publish: move the original tree aside (`<root>.pre-cowshed`), recreate the emptied directory as the mountpoint with
-   the self-healing stub `.envrc` inside it, rename the staged image and each sibling sidecar into place without
-   changing the format extension, `fsync` the parent directories around each rename, attach.
+5. Publish: move the original tree aside (`<root>.pre-cowshed`), create `~/.cowshed/mnt/<owner>/<repo>/main` as the
+   mountpoint with the self-healing stub `.envrc` inside it, rename the staged image and each sibling sidecar into place
+   without changing the format extension, `fsync` the parent directories around each rename, attach, then create the
+   symlink at the original checkout path pointing at that mountpoint. The symlink is created last, so it never resolves
+   to an unmounted directory.
 6. Print the mount path on stdout.
 
 Every step is idempotent to re-run. `cowshed doctor`/`cowshed gc` recognize each crash point — staged image present,
 tree moved but unattached, marker unpublished — and resume or roll back. `<root>.pre-cowshed` is retained until the user
 deletes it; cowshed never auto-deletes it.
 
-Adopting is reversible: `cowshed rm main --restore` detaches and moves `<root>.pre-cowshed` back.
+Adopting is reversible: `cowshed rm main --restore` detaches, removes the symlink at the original checkout path, and
+moves `<root>.pre-cowshed` back to it.
 
 ## `cowshed new <name>` — create a session workspace
 
@@ -397,7 +407,9 @@ eval "$(cowshed ensure --envrc)"
 
 **Self-healing stub**: the underlying (shadowed-when-mounted) mountpoint directory contains a one-line `.envrc` —
 `cowshed ensure --attach` — so `cd` into an unmounted workspace triggers direnv, cowshed re-attaches, and the real
-`.envrc` shadows the stub on the next prompt. Every `cd` is a repair opportunity.
+`.envrc` shadows the stub on the next prompt. Every `cd` is a repair opportunity. For main this works through the
+symlink at the original checkout path: the symlink resolves to the mountpoint whether or not it is mounted, so a `cd` to
+the familiar path reaches the stub and heals exactly as it does for any other workspace.
 
 ## Tradeoffs
 
