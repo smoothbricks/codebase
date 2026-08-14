@@ -244,7 +244,7 @@ folded into the specs):
   retired. `[install] cacheDir` is silently ignored — doctor checks for it.
 - Cross-volume bun install cost → **measured 6× slower + full-copy** (0.03 s/480 KiB in-volume vs 0.18 s/59 MB
   cross-volume, 1,579-file tree) — in-image placement confirmed (03_caches.md).
-- (d) cargo `[env]` → **reaches all rustc-wrapper invocations** (cargo 1.97); `SCCACHE_NO_DAEMON` rides there, no env
+- (d) cargo `[env]` → **reaches all rustc-wrapper invocations** (cargo 1.97); `SCCACHE_SERVER_UDS` rides there, no env
   fallback.
 - (e) SBPL semantics → **ranges don't parse; last-match-wins (denies must be emitted last); implicit bind-on-connect
   exempt; `bind(0)` breaks under bind restriction** → the outbound-only 16-single-port-rule model in 04_sandbox.md,

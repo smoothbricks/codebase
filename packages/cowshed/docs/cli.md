@@ -261,6 +261,7 @@ current workspace:
 ```sh
 $ cowshed ensure --envrc
 export GOENV='/Users/me/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env'
+export SCCACHE_SERVER_UDS='/Users/me/.cowshed/sccache.sock'
 export COWSHED_WORKSPACE_TOKEN='cw1_r4v3n…'
 export COWSHED_PORT_BASE='40960'
 ```
@@ -268,21 +269,21 @@ export COWSHED_PORT_BASE='40960'
 Direnv repositories evaluate that output from `.envrc`. Devenv-native repositories may evaluate it after an explicit
 attach; sandboxed `cowshed exec` processes receive the cowshed-owned exports directly. If `[devenv] dir` is configured
 in `.cowshed.toml`, devenv's exported variables form the base environment for each new sandbox process, while
-controller-filtered values and cowshed's own `GOENV`/`COWSHED_*` values win on conflicts. The devenv-provided `PATH` is
-discarded in favor of cowshed's admitted, profile-first PATH.
+controller-filtered values and cowshed's own `GOENV`/`SCCACHE_SERVER_UDS`/`COWSHED_*` values win on conflicts. The
+devenv-provided `PATH` is discarded in favor of cowshed's admitted, profile-first PATH.
 
 Deliberately short: wiring is carried by **files, not environment**. The registry URL (the macOS workspace gateway base
 port, or Linux's fixed private-loopback connector at `127.0.0.1:7644`) and the bun cache dir live in the committed
 `bunfig.toml` — bun honors a _relative_ `[install.cache] dir`, verified, so there is no cache export at all; cargo's
-source replacement and `SCCACHE_NO_DAEMON` live in the in-image `.cargo/config.toml` (cargo's `[env]` verifiably reaches
-rustc-wrapper invocations); the read-at-build caches (cargo registry, Go module/build caches, sccache, zig, gradle) are
-reached through their tools' _default_ host paths, relocated once onto the caches volume at first adopt — except Go,
-which has no directory-scoped config: its in-image env file (carrying the per-workspace `GOPROXY`, the shared caches,
-in-image `GOPATH`/`GOBIN`, and `GOTOOLCHAIN=local`) is reached via the `GOENV` export, so `~/go` is never created. The
-two load-bearing exports above each exist only until their verification passes (token-via-config kills the first; a
-file-based `GOENV` alternative — none known — would kill the second); on macOS, `PORT`/`COWSHED_PORT_BASE` wire dev
-servers into the workspace's port block (see "Dev servers" above); Linux has no block. The `COWSHED_*` identity lines
-are prompt conveniences, never load-bearing.
+source replacement and `SCCACHE_SERVER_UDS` live in the in-image `.cargo/config.toml` (cargo's `[env]` verifiably
+reaches rustc-wrapper invocations); the read-at-build caches (cargo registry, Go module/build caches, sccache, zig,
+gradle) are reached through their tools' _default_ host paths, relocated once onto the caches volume at first adopt —
+except Go, which has no directory-scoped config: its in-image env file (carrying the per-workspace `GOPROXY`, the shared
+caches, in-image `GOPATH`/`GOBIN`, and `GOTOOLCHAIN=local`) is reached via the `GOENV` export, so `~/go` is never
+created. The load-bearing exports above are few by design (token-via-config would kill the first; a file-based `GOENV`
+alternative — none known — would kill the second; `SCCACHE_SERVER_UDS` stays, as the host sccache daemon's endpoint has
+no per-tool config file); on macOS, `PORT`/`COWSHED_PORT_BASE` wire dev servers into the workspace's port block (see
+"Dev servers" above); Linux has no block. The `COWSHED_*` identity lines are prompt conveniences, never load-bearing.
 
 `ensure` never does slow or surprising work — no fetches, no compaction, no installs. Main gets the same wiring (that's
 the "main shares caches like sandboxes do" rule; the only difference is main isn't sandboxed).
@@ -464,6 +465,34 @@ provisioning, restores every authoritative attached workspace session, and drain
 `ensure`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
 reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
 `launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.
+
+### `cowshed sccache start` / `stop` / `status`
+
+`start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.sccache`, then waits until the server answers on
+its unix socket at `~/.cowshed/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ (resolved from the
+invoking shell's PATH — run it from a shell with the devenv/nix sccache available) as a foreground unix-socket server:
+`SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
+`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at `~/.cowshed/caches/sccache`.
+Stderr lands at `~/.cowshed/telemetry/sccache-stderr.log`. `stop` boots out the agent and removes the plist; both
+operations are idempotent. An sccache upgrade that moves the binary is picked up by rerunning `cowshed sccache start` —
+the plist is byte-compared and rewritten only on drift.
+
+`status` reports launchd and socket health without starting anything:
+
+```json
+{
+  "ok": true,
+  "result": {
+    "installed": true,
+    "running": true,
+    "socket": "/Users/me/.cowshed/sccache.sock"
+  }
+}
+```
+
+Workspaces reach the daemon through `SCCACHE_SERVER_UDS` (supervisor-injected, `ensure --envrc`-exported, and carried by
+the cargo `[env]` guidance); the Seatbelt profile admits exactly that socket and keeps the sccache store
+daemon-write-only. `sccache --show-stats` works from any shell with the export set — it speaks to the same server.
 
 ### `cowshed du`
 
