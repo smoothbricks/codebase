@@ -34,6 +34,35 @@ pub enum SandboxProfileRole {
     ExecutedChild,
 }
 
+/// The canonical entry point to a multi-user Nix installation's daemon socket.
+pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+
+/// The nix daemon socket to admit for this host, if it has one.
+///
+/// Multi-user Nix is a requirement: a sandboxed client never writes `/nix/store` itself, it asks
+/// the daemon, which runs as root *outside* the sandbox. Admitting the socket therefore grants the
+/// ability to ask, not the ability to write — the store is already world-readable through the broad
+/// `file-read-data` allow, and binary-cache substitution is already an accepted trusted-mediator
+/// channel. Without this, in-workspace `nix` and `devenv` evaluation cannot reach the daemon at all.
+///
+/// The canonical entry is conventionally a symlink — on macOS it points into `/var/run` — and
+/// Seatbelt matches `path-literal` against the resolved path, so the link is followed here rather
+/// than admitted as written. Resolving doubles as the check: what gets admitted is whatever the
+/// canonical entry actually reaches, and it has to be a socket, so nothing is admitted by being
+/// named. A host with no daemon yields no grant and the profile is byte-identical to one built
+/// before this existed.
+pub fn nix_daemon_socket() -> Option<PathBuf> {
+    nix_daemon_socket_at(Path::new(NIX_DAEMON_SOCKET))
+}
+
+fn nix_daemon_socket_at(entry: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let resolved = std::fs::canonicalize(entry).ok()?;
+    let metadata = std::fs::symlink_metadata(&resolved).ok()?;
+    metadata.file_type().is_socket().then_some(resolved)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,
@@ -153,6 +182,18 @@ pub fn seatbelt_profile(
         "/bin",
         "/opt",
         "/nix",
+        // Nix per-user profiles: where nix-darwin and NixOS put a user's installed tools, reached
+        // through a stable store-backed symlink. `sandbox_path` admits these to `PATH`, and without
+        // the matching read grant every tool on them is unrunnable — `file-read-data` on `/` is not
+        // enough, because resolving a path for exec needs `file-read*` metadata on its roots.
+        //
+        // Both spellings are listed for the same reason `/var/select` and `/private/var/select`
+        // both are: Seatbelt matches the *resolved* path, `/etc` is a symlink to `/private/etc`,
+        // and a rule naming only the pretty form silently never matches.
+        "/etc/profiles",
+        "/etc/static/profiles",
+        "/private/etc/profiles",
+        "/private/etc/static/profiles",
         "/private/var/select",
         "/sbin",
         "/usr",
@@ -180,6 +221,11 @@ pub fn seatbelt_profile(
                 sbpl_path(socket)?
             ),
         );
+        // Connecting resolves the path, so every ancestor must be traversable. The socket's own
+        // directory is not under any of the immutable roots granted above — on macOS the daemon
+        // socket resolves into `/private/var/run` — and without these literals the connect fails on
+        // path resolution before the outbound rule is ever consulted.
+        push_readable_ancestors(&mut profile, socket)?;
     }
     push_line(
         &mut profile,
@@ -722,6 +768,115 @@ mod tests {
             16
         );
     }
+    #[test]
+    fn the_daemon_socket_is_admitted_only_by_resolving_to_a_real_socket() {
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "cowshed-socket-test-{}-{sequence}",
+                std::process::id()
+            ));
+        fs::create_dir_all(&root).unwrap();
+
+        // A path that is not a socket is not admitted by being named, and neither is a missing one.
+        let regular = root.join("not-a-socket");
+        fs::write(&regular, b"").unwrap();
+        assert_eq!(nix_daemon_socket_at(&regular), None);
+        assert_eq!(nix_daemon_socket_at(&root.join("absent")), None);
+
+        // A symlink to a real socket is admitted as its resolved target, because that is what
+        // Seatbelt's `path-literal` matches against.
+        let listener = root.join("real.socket");
+        let _server = std::os::unix::net::UnixListener::bind(&listener).unwrap();
+        let link = root.join("link-to-socket");
+        std::os::unix::fs::symlink(&listener, &link).unwrap();
+        assert_eq!(nix_daemon_socket_at(&link), Some(listener.clone()));
+
+        // The admitted path reaches the profile with its ancestors traversable, or connecting fails
+        // on path resolution before the outbound rule is consulted.
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.allowed_unix_sockets = vec![listener.clone()];
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(profile.contains(&format!(
+            "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
+            listener.display()
+        )));
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read* (literal \"{}\"))",
+                root.display()
+            )),
+            "the socket's own directory must be traversable"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The boundary, exercised live: a sandboxed process must be able to reach the real Nix daemon
+    /// when the socket is admitted, and must not when it is not. Without this grant no in-workspace
+    /// `nix` or `devenv` evaluation can build or substitute anything.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_admits_the_nix_daemon_socket_only_when_it_is_granted() {
+        let Some(socket) = nix_daemon_socket() else {
+            // No multi-user Nix on this host: there is no boundary to exercise.
+            return;
+        };
+        let Ok(nix) = fs::canonicalize("/nix/var/nix/profiles/default/bin/nix") else {
+            return;
+        };
+
+        let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "cowshed-nix-daemon-{}-{sequence}",
+                std::process::id()
+            ));
+        let mut config = config(RunSandboxMode::ReadWrite);
+        config.home = root.join("home");
+        config.workspace_mount = root.join("workspace");
+        config.exec_temp_dir = root.join("tmp");
+        config.grants = SandboxGrants::default();
+        // The private HOME the supervisor exports lives inside the mount, and nix refuses to run
+        // without a readable one. Using the real home here would test a shape production never has.
+        let private_home = config.workspace_mount.join(".cowshed/home");
+        for directory in [&config.home, &private_home, &config.exec_temp_dir] {
+            fs::create_dir_all(directory).unwrap();
+        }
+
+        // `nix store info` does nothing but open the daemon connection and speak the handshake,
+        // which is exactly the authority under test and nothing else.
+        let run = |profile: &str| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", profile, "--"])
+                .arg(&nix)
+                .args(["store", "info", "--store", "daemon"])
+                .env("HOME", &private_home)
+                .env("NIX_REMOTE", "daemon")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+        };
+
+        config.allowed_unix_sockets = vec![socket];
+        let granted = run(&seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap());
+        config.allowed_unix_sockets.clear();
+        let denied = run(&seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap());
+
+        fs::remove_dir_all(&root).ok();
+        assert!(
+            granted.success(),
+            "an admitted daemon socket must be reachable from inside the sandbox"
+        );
+        assert!(
+            !denied.success(),
+            "without the grant the daemon must be unreachable, or the grant proves nothing"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_enforces_supervisor_and_child_artifact_authority() {
