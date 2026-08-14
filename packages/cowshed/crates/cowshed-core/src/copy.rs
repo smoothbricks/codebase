@@ -6,12 +6,6 @@ use crate::apfs::{
 };
 use crate::error::{CowshedError, Result};
 
-// Apple openrsync and upstream rsync spell extended-attribute preservation differently.
-#[cfg(target_os = "macos")]
-const RSYNC_XATTR_FLAG: &str = "--extended-attributes";
-#[cfg(not(target_os = "macos"))]
-const RSYNC_XATTR_FLAG: &str = "--xattrs";
-
 const DEFAULT_PASS_BUDGET: usize = 6;
 const CHURN_SAMPLE_LIMIT: usize = 8;
 const APFS_ROOT_METADATA_EXCLUDES: [&str; 5] = [
@@ -26,6 +20,57 @@ const APFS_ROOT_METADATA_EXCLUDES: [&str; 5] = [
 pub struct CopyReport {
     pub passes: usize,
     pub changed_entries: usize,
+}
+
+/// Which rsync implementation is on PATH.
+///
+/// The two differ in more than flag spelling. Apple's openrsync preserves
+/// extended attributes only under `--extended-attributes`, and under that flag
+/// it re-transfers every regular file on every pass — a tree that has not
+/// changed still itemizes as `>f+++++++` forever. Its itemized output can
+/// therefore never signal quiescence, so the variant decides how convergence is
+/// measured, not just which flag is spelled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RsyncVariant {
+    /// Apple openrsync (macOS 15+), which reports protocol version 29.
+    Openrsync,
+    /// Upstream rsync 3.x, whose itemized output is authoritative.
+    Upstream,
+}
+
+impl RsyncVariant {
+    /// Classify from `rsync --version` output.
+    ///
+    /// Upstream is the default for unrecognized output: its single-pass
+    /// convergence is the cheaper contract, and misclassifying openrsync as
+    /// upstream surfaces loudly as a non-quiescing adopt rather than silently
+    /// skipping extended attributes.
+    #[must_use]
+    pub fn classify(version_output: &[u8]) -> Self {
+        if String::from_utf8_lossy(version_output).contains("openrsync") {
+            Self::Openrsync
+        } else {
+            Self::Upstream
+        }
+    }
+
+    /// The flag that preserves extended attributes for this variant.
+    #[must_use]
+    pub const fn xattr_flag(self) -> &'static str {
+        match self {
+            Self::Openrsync => "--extended-attributes",
+            Self::Upstream => "--xattrs",
+        }
+    }
+
+    /// Whether a copy pass's own itemized output can decide quiescence.
+    ///
+    /// False for openrsync, which needs a separate probe because copying with
+    /// extended attributes always itemizes every regular file.
+    #[must_use]
+    pub const fn copy_pass_itemizes_truthfully(self) -> bool {
+        matches!(self, Self::Upstream)
+    }
 }
 
 impl<R> CommandRunner for &R
@@ -54,6 +99,24 @@ where
         self.copy_with_budget(source, destination, DEFAULT_PASS_BUDGET)
     }
 
+    fn detect_variant(&self) -> Result<RsyncVariant> {
+        let request = CommandRequest::new("rsync", [OsString::from("--version")]);
+        let output = self.runner.run(&request).map_err(copy_spawn_error)?;
+        if !output.succeeded() {
+            return Err(copy_process_error(&output));
+        }
+        Ok(RsyncVariant::classify(&output.stdout))
+    }
+
+    fn run_rsync(&self, request: &CommandRequest) -> Result<CommandOutput> {
+        let output = self.runner.run(request).map_err(copy_spawn_error)?;
+        if output.succeeded() {
+            Ok(output)
+        } else {
+            Err(copy_process_error(&output))
+        }
+    }
+
     pub fn copy_with_budget(
         &self,
         source: &Path,
@@ -69,33 +132,33 @@ where
         let (source, destination) = validate_copy_roots(source, destination)?;
         let source_contents = source.join(".");
         let destination_contents = destination.join(".");
+        let variant = self.detect_variant()?;
         let mut changed_entries = 0usize;
         let mut last_changes = Vec::new();
 
         for pass in 1..=pass_budget {
-            let request = CommandRequest::new(
-                "rsync",
-                [
-                    OsString::from("-a"),
-                    OsString::from(RSYNC_XATTR_FLAG),
-                    OsString::from("--delete"),
-                    OsString::from("--itemize-changes"),
-                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[0]),
-                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[1]),
-                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[2]),
-                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[3]),
-                    OsString::from(APFS_ROOT_METADATA_EXCLUDES[4]),
-                    OsString::from("--out-format=%i"),
-                    OsString::from("--"),
-                    source_contents.as_os_str().to_owned(),
-                    destination_contents.as_os_str().to_owned(),
-                ],
-            );
-            let output = self.runner.run(&request).map_err(copy_spawn_error)?;
-            if !output.succeeded() {
-                return Err(copy_process_error(&output));
-            }
-            let changes = parse_changes(&output.stdout)?;
+            let output = self.run_rsync(&rsync_request(
+                RsyncPass::Copy(variant),
+                &source_contents,
+                &destination_contents,
+            ))?;
+
+            let changes = if variant.copy_pass_itemizes_truthfully() {
+                parse_changes(&output.stdout)?
+            } else {
+                // openrsync's copy pass always claims to have transferred every
+                // regular file, so quiescence is measured by a probe that omits
+                // the extended-attribute flag. The probe transfers nothing when
+                // content and metadata already match, and it never strips the
+                // attributes the copy pass just wrote.
+                let probe = self.run_rsync(&rsync_request(
+                    RsyncPass::Probe,
+                    &source_contents,
+                    &destination_contents,
+                ))?;
+                parse_changes(&probe.stdout)?
+            };
+
             if changes.is_empty() {
                 return Ok(CopyReport {
                     passes: pass,
@@ -142,6 +205,35 @@ pub async fn copy_with_budget(
     })
     .await
     .map_err(|error| CowshedError::internal(format!("repository copy worker failed: {error}")))?
+}
+
+/// Which of the two invocations in a pass is being built.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RsyncPass {
+    /// Copies, preserving extended attributes with the variant's flag.
+    Copy(RsyncVariant),
+    /// Measures quiescence only; omits extended attributes so openrsync can
+    /// report an unchanged tree as unchanged.
+    Probe,
+}
+
+fn rsync_request(pass: RsyncPass, source: &Path, destination: &Path) -> CommandRequest {
+    let mut args = vec![OsString::from("-a")];
+    if let RsyncPass::Copy(variant) = pass {
+        args.push(OsString::from(variant.xattr_flag()));
+    }
+    args.push(OsString::from("--delete"));
+    args.push(OsString::from("--itemize-changes"));
+    args.extend(
+        APFS_ROOT_METADATA_EXCLUDES
+            .iter()
+            .map(|exclude| OsString::from(*exclude)),
+    );
+    args.push(OsString::from("--out-format=%i"));
+    args.push(OsString::from("--"));
+    args.push(source.as_os_str().to_owned());
+    args.push(destination.as_os_str().to_owned());
+    CommandRequest::new("rsync", args)
 }
 
 fn validate_copy_roots(source: &Path, destination: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -222,9 +314,13 @@ fn copy_process_error(output: &CommandOutput) -> CowshedError {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{copy_with_budget, parse_changes, validate_copy_roots};
+    use super::{
+        CommandOutput, CommandRequest, CommandRunError, CommandRunner, RsyncVariant, TreeCopier,
+        copy_with_budget, parse_changes, validate_copy_roots,
+    };
 
     fn temp_root(label: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -237,6 +333,211 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create fixture root");
         root
+    }
+
+    /// Records every rsync invocation and replays scripted stdout, so both
+    /// variants are exercised on a host that only has one of them installed.
+    struct ScriptedRsync {
+        version: &'static str,
+        /// stdout for each copy/probe invocation, in order.
+        transcripts: Mutex<Vec<&'static str>>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedRsync {
+        fn new(version: &'static str, transcripts: Vec<&'static str>) -> Self {
+            Self {
+                version,
+                transcripts: Mutex::new(transcripts),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().expect("calls").clone()
+        }
+    }
+
+    impl CommandRunner for ScriptedRsync {
+        fn run(
+            &self,
+            request: &CommandRequest,
+        ) -> std::result::Result<CommandOutput, CommandRunError> {
+            let args: Vec<String> = request
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            if args == ["--version"] {
+                return Ok(CommandOutput::success(self.version));
+            }
+            self.calls.lock().expect("calls").push(args);
+            let mut transcripts = self.transcripts.lock().expect("transcripts");
+            assert!(!transcripts.is_empty(), "unexpected extra rsync invocation");
+            Ok(CommandOutput::success(transcripts.remove(0)))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const TEST_XATTR: &str = "com.cowshed.test";
+
+    #[cfg(target_os = "macos")]
+    fn write_xattr(path: &std::path::Path, name: &str, value: &[u8]) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = CString::new(path.as_os_str().as_bytes()).expect("path");
+        let name = CString::new(name).expect("name");
+        // SAFETY: both C strings outlive the call, and the value slice is passed
+        // with its own length.
+        let written = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(written, 0, "setxattr: {}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_xattr(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = CString::new(path.as_os_str().as_bytes()).expect("path");
+        let name = CString::new(name).expect("name");
+        let mut buffer = vec![0u8; 64];
+        // SAFETY: the buffer is valid for `buffer.len()` bytes for the call.
+        let read = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+                0,
+            )
+        };
+        if read < 0 {
+            return None;
+        }
+        buffer.truncate(usize::try_from(read).expect("non-negative length"));
+        Some(buffer)
+    }
+
+    fn copy_roots(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = temp_root(label);
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir(&source).expect("create source");
+        fs::create_dir(&destination).expect("create destination");
+        (root, source, destination)
+    }
+
+    #[test]
+    fn variant_classification_keys_off_openrsync_and_defaults_to_upstream() {
+        assert_eq!(
+            RsyncVariant::classify(
+                b"openrsync: protocol version 29\nrsync version 2.6.9 compatible\n"
+            ),
+            RsyncVariant::Openrsync
+        );
+        assert_eq!(
+            RsyncVariant::classify(b"rsync  version 3.4.1  protocol version 32\n"),
+            RsyncVariant::Upstream
+        );
+        assert_eq!(
+            RsyncVariant::classify(b""),
+            RsyncVariant::Upstream,
+            "unrecognized output defaults to the cheaper single-pass contract"
+        );
+
+        assert_eq!(
+            RsyncVariant::Openrsync.xattr_flag(),
+            "--extended-attributes"
+        );
+        assert_eq!(RsyncVariant::Upstream.xattr_flag(), "--xattrs");
+        assert!(RsyncVariant::Upstream.copy_pass_itemizes_truthfully());
+        assert!(!RsyncVariant::Openrsync.copy_pass_itemizes_truthfully());
+    }
+
+    #[test]
+    fn upstream_rsync_decides_quiescence_from_the_copy_pass_alone() {
+        let (root, source, destination) = copy_roots("upstream-arm");
+        let runner = ScriptedRsync::new(
+            "rsync  version 3.4.1  protocol version 32\n",
+            vec![">f+++++++++\ncd+++++++++\n", ""],
+        );
+
+        let report = TreeCopier::new(&runner)
+            .copy_with_budget(&source, &destination, 4)
+            .expect("upstream converges");
+
+        assert_eq!(report.passes, 2);
+        assert_eq!(report.changed_entries, 2);
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2, "upstream runs one invocation per pass");
+        for call in &calls {
+            assert!(
+                call.contains(&"--xattrs".to_owned()),
+                "every upstream pass preserves extended attributes: {call:?}"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn openrsync_measures_quiescence_with_a_probe_that_omits_extended_attributes() {
+        let (root, source, destination) = copy_roots("openrsync-arm");
+        // The copy pass keeps claiming every regular file was transferred; only
+        // the probe reports the tree as settled.
+        let runner = ScriptedRsync::new(
+            "openrsync: protocol version 29\n",
+            vec![">f+++++++\n>f+++++++\n", ">f+++++++\n", ">f+++++++\n", ""],
+        );
+
+        let report = TreeCopier::new(&runner)
+            .copy_with_budget(&source, &destination, 4)
+            .expect("openrsync converges on the probe");
+
+        assert_eq!(report.passes, 2, "the second probe reports a settled tree");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 4, "each pass is one copy plus one probe");
+        for (index, call) in calls.iter().enumerate() {
+            let is_copy = index % 2 == 0;
+            assert_eq!(
+                call.contains(&"--extended-attributes".to_owned()),
+                is_copy,
+                "copy passes preserve attributes, probes must not: {call:?}"
+            );
+            assert!(call.contains(&"--itemize-changes".to_owned()));
+            assert!(call.contains(&"--delete".to_owned()));
+        }
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn a_tree_that_never_settles_is_a_conflict_naming_the_churn() {
+        let (root, source, destination) = copy_roots("never-settles");
+        let runner = ScriptedRsync::new(
+            "openrsync: protocol version 29\n",
+            vec![">f+++++++\n", ">f+++++++\n", ">f+++++++\n", ">f+++++++\n"],
+        );
+
+        let error = TreeCopier::new(&runner)
+            .copy_with_budget(&source, &destination, 2)
+            .expect_err("a churning tree cannot be adopted");
+
+        assert_eq!(error.code.as_str(), "conflict");
+        assert!(
+            error
+                .message
+                .contains("did not quiesce after 2 copy passes")
+        );
+        assert!(error.message.contains(">f+++++++"));
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -254,6 +555,8 @@ mod tests {
         fs::write(source.join(".git/HEAD"), b"ref: refs/heads/main\n")
             .expect("write source git metadata");
         fs::write(source.join("nested/file"), b"warm state\n").expect("write source file");
+        #[cfg(target_os = "macos")]
+        write_xattr(&source.join("nested/file"), TEST_XATTR, b"warm");
         fs::write(destination.join("stale-secret"), b"remove me\n").expect("write stale file");
         let apfs_metadata = destination.join(".fseventsd");
         fs::create_dir(&apfs_metadata).expect("create destination APFS metadata");
@@ -267,7 +570,7 @@ mod tests {
         let report = copy_with_budget(&source, &destination, 3)
             .await
             .expect("copy reaches quiescence");
-        assert!(report.passes >= 2);
+        assert!(report.passes >= 1 && report.passes <= 3);
         assert_eq!(
             fs::read(destination.join("nested/file")).expect("read copied file"),
             b"warm state\n"
@@ -277,6 +580,27 @@ mod tests {
             b"ref: refs/heads/main\n"
         );
         assert!(!destination.join("stale-secret").exists());
+
+        // Preserving extended attributes is the only reason the copy pass needs
+        // a variant-specific flag, so the fix for quiescence must not quietly
+        // stop carrying them.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            read_xattr(&destination.join("nested/file"), TEST_XATTR).as_deref(),
+            Some(&b"warm"[..]),
+            "the copy pass carries extended attributes"
+        );
+
+        // Quiescence must be a property of the tree, not of how many passes ran:
+        // copying an already-synced pair converges immediately having moved
+        // nothing. Under openrsync this is the assertion that fails when the
+        // copy pass's own itemized output is trusted, because it reports every
+        // regular file as freshly transferred forever.
+        let repeat = copy_with_budget(&source, &destination, 3)
+            .await
+            .expect("an already-synced tree is quiescent");
+        assert_eq!(repeat.passes, 1);
+        assert_eq!(repeat.changed_entries, 0);
 
         assert!(apfs_metadata.is_dir());
         #[cfg(unix)]
