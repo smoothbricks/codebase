@@ -439,7 +439,7 @@ function nixPackageComment(name: string): string {
     return '# Builds ttsc source plugins';
   }
   if (name === 'sccache') {
-    return '# Rust compiler wrapper and cache';
+    return '# Rust compiler cache; client of the host-owned daemon (cowshed sccache start)';
   }
   return '';
 }
