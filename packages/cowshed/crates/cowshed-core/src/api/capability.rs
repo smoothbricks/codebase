@@ -815,10 +815,26 @@ impl WorkspaceRef {
     }
 
     pub async fn ensure(&self) -> Result<super::dto::EnsureReport> {
+        self.ensure_observed_at(None).await
+    }
+
+    /// Ensure, telling the controller where the caller observed this workspace's checkout.
+    ///
+    /// The observation is what lets `ensure` converge a recorded checkout path that has fallen
+    /// behind a hand-moved symlink; `std::env::current_dir` cannot supply it, because it resolves
+    /// symlinks and so reports the mount rather than the name the user reached it by.
+    pub async fn ensure_observed_at(
+        &self,
+        observed: Option<&std::path::Path>,
+    ) -> Result<super::dto::EnsureReport> {
         call_typed(
             &self.runtime,
             "workspace.ensure",
-            json!({ "repoId": self.info.repo_id, "workspace": self.info.workspace }),
+            json!({
+                "repoId": self.info.repo_id,
+                "workspace": self.info.workspace,
+                "observedPath": observed,
+            }),
         )
         .await
     }
@@ -1363,6 +1379,15 @@ impl Coordinator {
         self.workspace_result(
             "coordinator.rename",
             json!({ "repoId": self.project.repo_id, "source": source, "destination": destination }),
+        )
+        .await
+    }
+
+    /// Move the project's checkout — `cowshed mv main <path>`.
+    pub async fn move_checkout(&self, destination: &std::path::Path) -> Result<WorkspaceRef> {
+        self.workspace_result(
+            "coordinator.moveCheckout",
+            json!({ "repoId": self.project.repo_id, "destination": destination }),
         )
         .await
     }
