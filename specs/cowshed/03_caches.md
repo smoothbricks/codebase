@@ -83,11 +83,13 @@ them there; they always contain an endpoint URL, never credentials.
     Caution, same verification: the `[install] cacheDir` spelling is _silently ignored_ (falls back to the global cache
     with no error); `cowshed doctor` checks for that misspelling.
   - cargo config: source replacement of crates.io with `sparse+<GATEWAY_HTTP>/cargo/`,
-    `[build] rustc-wrapper = "sccache"` when sccache is present, and `[env]` setting `SCCACHE_NO_DAEMON = "1"` —
-    **verified (cargo 1.97): `[env]` values reach every rustc-wrapper invocation; no environment fallback is needed.**
-    Host-global settings live in the host-owned `~/.cargo/config.toml` (never on the cache volume — see relocation
-    below); per-workspace ones live in the in-image `.cargo/config.toml`. Endpoint plus the registry authentication
-    mechanism carry the token; the URL never contains it (05_gateway.md).
+    `[build] rustc-wrapper = "sccache"` when sccache is present, and `[env]` setting `SCCACHE_SERVER_UDS` to the
+    expanded absolute host socket path (`~/.cowshed/sccache.sock`; cargo never expands `~`) so wrapper invocations reach
+    the host-owned sccache daemon (below) from processes cowshed never spawned — **verified (cargo 1.97): `[env]` values
+    reach every rustc-wrapper invocation; no environment fallback is needed.** Host-global settings live in the
+    host-owned `~/.cargo/config.toml` (never on the cache volume — see relocation below); per-workspace ones live in the
+    in-image `.cargo/config.toml`. Endpoint plus the registry authentication mechanism carry the token; the URL never
+    contains it (05_gateway.md).
   - No git remote/proxy config is written: workspace git speaks only local filesystem remotes (the `main` remote and
     gateway-owned bare mirrors — 05_gateway.md), so there is nothing to route through the gateway and no credential
     helper inside the image.
@@ -138,9 +140,10 @@ them there; they always contain an endpoint URL, never credentials.
   `~/.cargo/bin` (on PATH), and `~/.gradle/gradle.properties` are _not_ relocated and are on the secret deny list
   (04_sandbox.md) — relocating them wholesale would put user config, credentials, and PATH-resolved binaries on a
   sandbox-writable volume, a persistence-escape surface. No `CARGO_HOME`, `ZIG_GLOBAL_CACHE_DIR`, `GRADLE_USER_HOME`, or
-  `SCCACHE_DIR` exports exist. Go needs no symlink at all — `GOMODCACHE`/`GOCACHE` are directly configurable in its env
-  file (above), which is strictly cleaner than relocating a default path. Profile generation canonicalizes symlinked
-  paths when emitting write grants (the `/var` → `/private/var` handling generalizes).
+  `SCCACHE_DIR` exports exist in workspaces (`SCCACHE_DIR` is pinned only in the host sccache daemon's launchd
+  environment). Go needs no symlink at all — `GOMODCACHE`/`GOCACHE` are directly configurable in its env file (above),
+  which is strictly cleaner than relocating a default path. Profile generation canonicalizes symlinked paths when
+  emitting write grants (the `/var` → `/private/var` handling generalizes).
 
   On home-manager/NixOS/nix-darwin hosts this relocation is **declarative and mandatory**: the module creates the exact
   links/bindings above as generation-managed artifacts, including the two Nix subdirectories, and `adopt`/`ensure` only
@@ -149,7 +152,7 @@ them there; they always contain an endpoint URL, never credentials.
   links after an explicit confirmation. There is no automatic fallback from failed declarative validation; mixed
   ownership is a conflict and `doctor` points to the declarative option that must be fixed.
 
-- **Environment variables: at most two load-bearing.**
+- **Environment variables: at most three load-bearing.**
   - `BUN_INSTALL_CACHE_DIR` is **retired** — its verification passed (relative `[install.cache] dir` works, above); the
     committed bunfig line is the wiring and no export exists.
   - `COWSHED_GATEWAY_TOKEN` is one candidate: it dies if bun accepts the token via the registry auth mechanism against
@@ -166,10 +169,44 @@ them there; they always contain an endpoint URL, never credentials.
     package/proxy wiring uses fixed `GATEWAY_HTTP=http://127.0.0.1:7644`. Both platforms may emit **optional prompt
     conveniences — explicitly non-load-bearing** — `COWSHED_WORKSPACE` / `COWSHED_REPO_ID` / `COWSHED_LAYER` /
     `COWSHED_MOUNT`. Anything that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
+  - `SCCACHE_SERVER_UDS=~/.cowshed/sccache.sock` (expanded) is the third: the host sccache daemon's socket (below). It
+    is host-level rather than per-workspace — supervisor-spawned processes get it injected, `cowshed ensure --envrc`
+    exports it for IDE terminals, and the cargo `[env]` guidance above mirrors it for processes cowshed never spawned.
 
-`SCCACHE_NO_DAEMON=1` remains mandatory wiring wherever it is carried: a shared sccache server process would inherit the
-sandbox of whichever workspace spawned it and enforce the wrong boundary for every other client. In-process mode trades
-a small per-invocation cost for a per-exec-correct sandbox.
+### The sccache daemon
+
+sccache is served by a **host-owned daemon**: the `dev.cowshed.sccache` LaunchAgent runs the sccache binary itself as a
+foreground unix-socket server outside every sandbox — `SCCACHE_START_SERVER=1` selects server mode,
+`SCCACHE_NO_DAEMON=1` keeps it in the foreground under launchd supervision, `SCCACHE_IDLE_TIMEOUT=0` disables idle exit,
+and its environment pins `SCCACHE_SERVER_UDS=~/.cowshed/sccache.sock` and `SCCACHE_DIR=~/.cowshed/caches/sccache` (all
+source-verified against sccache 0.16, which reads `SCCACHE_SERVER_UDS` in both client and server ahead of
+`SCCACHE_SERVER_PORT`; the TCP port is the fallback wiring only on a platform without unix sockets, and then the
+Seatbelt loopback-allow class in 04_sandbox.md applies). `cowshed sccache start|stop|status` install, remove, and probe
+the agent; start is healthy when the socket answers. Every disk-cache read and write happens inside the daemon
+(source-verified: sccache instantiates its disk cache only in the server process), so the Seatbelt write carve-back for
+`~/.cowshed/caches/sccache` is gone — the store is **daemon-write-only** and sandboxes keep only the caches-wide read.
+
+Two earlier postures died to evidence:
+
+- **A workspace-spawned shared server** enforces the wrong boundary: it inherits the Seatbelt profile of whichever
+  workspace spawned it and applies that boundary to every other client. Host ownership, not daemon avoidance, is the fix
+  — launchd starts the server outside every sandbox, so it enforces no workspace's boundary and can serve them all.
+- **`SCCACHE_NO_DAEMON=1` as client wiring** assumed an in-process mode that does not exist. Source-verified (sccache
+  0.16): the flag only stops an auto-spawned server from detaching; the client still spawns a server on connect failure
+  and still compiles through it. Under concurrency that is strictly worse than a shared daemon — each first wrapper
+  invocation birthed a foreground server on the shared default port with its lifetime tied to that wrapper process, and
+  racing workspaces produced transient `Failed to read response header` exit-102 failures and a full wedge
+  (`cargo metadata` blocked indefinitely in its `rustc -vV` probe, zero CPU). Measured on a seven-workspace fleet;
+  backed out.
+
+Because no sccache 0.16 client flag suppresses the auto-spawn fallback, the sandbox provides the fail-fast: binding
+`~/.cowshed/sccache.sock` needs write-create under `~/.cowshed`, which no workspace holds, so a client whose daemon is
+down fails its compile promptly with a bind error instead of wedging — and can never stand up a wrong-boundary server
+for siblings. `SCCACHE_NO_DAEMON` is retired from all workspace wiring. The daemon is a trusted mediator in the
+nix-daemon sense, with its confused-deputy surface named explicitly in 04_sandbox.md: the unsandboxed daemon reads
+sources and executes a client-named compiler at a sandboxed client's request, accepted under the same threat model that
+already concedes layer-3 poisoning (below) because it adds immediacy, not new reach, while the store's write surface
+strictly narrows.
 
 ## Convention table
 
@@ -211,14 +248,17 @@ table is advisory metadata, not a gate.
   paths, and projects may opt into `trim-paths`/`--remap-path-prefix`. cowshed does not force compiler flags.
 - **Poisoning model.** Lockfile integrity hashes protect _downloads_ (layer 1 is verified by the package managers
   themselves), not cache _reuse_: layers 2–3 are trusted once written. State this plainly: the layer-3 write scope a
-  sandbox holds includes cargo's `registry/src`, the Go caches, and the sccache store — caches that _main itself
-  compiles from_, so a poisoned entry can influence main's next build. That is an accepted risk under the confinement
-  threat model (semi-trusted agents running the user's own code), bounded by write scope — a sandboxed workspace can
-  write only the designated layer-3 subtrees, never the gateway mirror or `repo-mirrors` (layer 1, gateway-only) and
-  never relocated Cargo/Gradle _config_ (host-side, deny-listed — see relocation above). Go's posture within that scope
-  is notably stronger than cargo's: module downloads verify against `go.sum` plus the checksum database, extraction is
-  ziphash-verified, and `GOMODCACHE` entries land read-only (0444) — tampering requires an explicit chmod, which the
-  escape suite exercises (04_sandbox.md); `GOCACHE` is the sccache-analog and shares its trust level.
+  sandbox holds includes cargo's `registry/src` and the Go caches — caches that _main itself compiles from_, so a
+  poisoned entry can influence main's next build. That is an accepted risk under the confinement threat model
+  (semi-trusted agents running the user's own code), bounded by write scope — a sandboxed workspace can write only the
+  designated layer-3 subtrees, never the gateway mirror or `repo-mirrors` (layer 1, gateway-only) and never relocated
+  Cargo/Gradle _config_ (host-side, deny-listed — see relocation above). The sccache store left that direct write scope
+  entirely (Wiring): it is daemon-write-only, so poisoning it means going through the daemon's compile path rather than
+  writing entries — the same trust class with one fewer direct write surface, traded against the daemon's named
+  confused-deputy surface (04_sandbox.md). Go's posture within that scope is notably stronger than cargo's: module
+  downloads verify against `go.sum` plus the checksum database, extraction is ziphash-verified, and `GOMODCACHE` entries
+  land read-only (0444) — tampering requires an explicit chmod, which the escape suite exercises (04_sandbox.md);
+  `GOCACHE` is the sccache-analog and shares its trust level.
 - **Proxy-unaware tools.** Tools that hardcode registries need per-tool shims in the wiring step; the shim list grows by
   experience and lives in cowshed-core, not user config.
 - **Simulator and Xcode state.** CoreSimulator device sets (`~/Library/Developer/CoreSimulator`) are **dev-uid host
@@ -243,11 +283,16 @@ cheap. On ZFS this tradeoff may not exist at all (BRT crosses datasets); that is
 
 **Environment-variable wiring (the original twelve exports) rejected.** Identity vars duplicated the marker file; the
 gateway URL duplicated the config files that actually consume it; four cache paths duplicated what a one-time relocation
-of the tools' default directories does more robustly; `SCCACHE_NO_DAEMON` belongs to cargo's `[env]` (verified to reach
-wrapper invocations). Environment survives only processes cowshed spawns; files and host paths survive everything. What
-remains is at most two exports (the gateway token, pending its own verification, and `GOENV` — Go's lack of any
-directory-scoped config makes it the one toolchain where a file cannot carry per-workspace wiring) — the bun cache
-export already died to its verification.
+of the tools' default directories does more robustly; `SCCACHE_SERVER_UDS` rides cargo's `[env]` (verified to reach
+wrapper invocations) _and_ stays a load-bearing export, because non-cargo compile paths and IDE terminals have no config
+file that carries it. Environment survives only processes cowshed spawns; files and host paths survive everything. What
+remains is at most three exports (the gateway token, pending its own verification; `GOENV` — Go's lack of any
+directory-scoped config makes it the one toolchain where a file cannot carry per-workspace wiring; and
+`SCCACHE_SERVER_UDS`, the host daemon endpoint) — the bun cache export already died to its verification.
+
+**Gateway-proxied sccache rejected.** Routing sccache through cowshed-gateway would mean translating sccache's own
+client-server protocol for zero policy gain — the gateway mediates _egress_, and the sccache daemon never leaves the
+host. cowshed adds lifecycle and scoped socket access, not protocol translation.
 
 **Cross-session cache harvest rejected.** Actively copying new cache entries between live sessions adds a mutable side
 channel between sandboxes and machinery (staging, folding, scheduling) whose entire benefit is bytes that

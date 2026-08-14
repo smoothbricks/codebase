@@ -14,6 +14,8 @@ programs.cowshed = {
   relocations = true;          # cache-subtree symlinks: ~/.cargo/{registry,git}, ~/.cache/zig,
                                #   ~/.gradle/caches (+ other gradle cache dirs), sccache default → ~/.cowshed/caches/…
   gateway.launchd = true;      # dev.cowshed.gateway LaunchAgent (HM manages ~/Library/LaunchAgents on darwin)
+  sccache.launchd = true;      # dev.cowshed.sccache LaunchAgent: host-owned foreground sccache UDS server
+                               #   (03_caches.md "The sccache daemon"); imperative counterpart: cowshed sccache start
   loginAttach = true;          # dev.cowshed.attach LaunchAgent: mount volumes + personal workspaces at login
   linuxConnector = true;       # Linux only: trusted per-attached-workspace netns connector runtime/identity
   goEnvDefaults = true;        # host-side go hygiene that is NOT per-workspace (GOTOOLCHAIN=local guidance; the
