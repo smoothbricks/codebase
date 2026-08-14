@@ -25,8 +25,8 @@ use cowshed_core::storage::apfs::native::{
     RestoreFailpoint, SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PublicationDisposition,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, CheckoutLayout, LockMode,
+    MarkerExpectation, MetadataPolicy, PublicationDisposition,
 };
 use cowshed_core::storage::lifecycle::{
     ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
@@ -90,10 +90,6 @@ impl RecordingRunner {
 
     fn requests(&self) -> Vec<CommandRequest> {
         self.requests.lock().expect("requests").clone()
-    }
-
-    fn set_volume_name(&self, volume_name: &str) {
-        *self.volume_name.lock().expect("volume name") = volume_name.to_owned();
     }
 }
 
@@ -246,10 +242,15 @@ impl Fixture {
     }
 
     fn config(&self) -> ApfsSubstrateConfig {
+        self.config_with_layout(CheckoutLayout::Symlink)
+    }
+
+    fn config_with_layout(&self, checkout_layout: CheckoutLayout) -> ApfsSubstrateConfig {
         ApfsSubstrateConfig::new(
             &self.root,
             self.root.join("caches"),
             self.root.join("mount"),
+            checkout_layout,
             cowshed_core::apfs::ApfsCaseSensitivity::Insensitive,
         )
     }
@@ -394,6 +395,7 @@ fn native_host_at(root: &Path) -> MacOsApfsExecutionHost<RecordingRunner> {
             root,
             root.join("caches"),
             root.join("mount"),
+            CheckoutLayout::Symlink,
             ApfsCaseSensitivity::Insensitive,
         ),
         SystemKernelMountSource,
@@ -1715,6 +1717,7 @@ fn gc_distinguishes_a_missing_store_from_a_non_directory_store() {
         &missing_root,
         missing_root.join("caches"),
         fixture.root.join("mount"),
+        CheckoutLayout::Symlink,
         ApfsCaseSensitivity::Insensitive,
     );
     let host =
@@ -1913,6 +1916,79 @@ fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
     assert!(
         runner.requests().is_empty(),
         "an impostor mount is rejected from its marker alone and never detached"
+    );
+}
+
+/// The direct-mount handoff has one job the symlink handoff also has: the user's path is never
+/// absent and never half-built. It gets there with the same `RENAME_SWAP`, exchanging the original
+/// tree for a mountpoint that already carries the self-healing stub.
+#[test]
+fn direct_mount_handoff_swaps_the_checkout_for_a_stubbed_mountpoint() {
+    let fixture = Fixture::new("direct-vacate");
+    let checkout = fixture.root.join("mount");
+    let pre_cowshed = fixture.root.join("mount.pre-cowshed");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    std::fs::write(checkout.join("README"), b"the user's tree").expect("user file");
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        RecordingRunner::default(),
+        fixture.config_with_layout(CheckoutLayout::DirectMount),
+        FakeKernelMountSource::default(),
+    )
+    .expect("host");
+
+    host.vacate_adopted_checkout(&checkout, &pre_cowshed)
+        .expect("vacate");
+
+    // The checkout path is now cowshed's mountpoint, carrying only the stub...
+    assert!(checkout.is_dir());
+    assert_eq!(
+        std::fs::read(checkout.join(".envrc")).expect("stub"),
+        b"cowshed ensure --attach\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(&checkout).expect("mountpoint").count(),
+        1,
+        "the mountpoint holds the stub and nothing else"
+    );
+    // ...and the user's tree is retained beside it, whole.
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("README")).expect("retained tree"),
+        b"the user's tree"
+    );
+    assert!(
+        !fixture.root.join("mount.cowshed-mountpoint").exists(),
+        "the staging name is consumed by the swap"
+    );
+
+    // Re-running is a no-op: the swap is already done and nothing is left to retain.
+    host.vacate_adopted_checkout(&checkout, &pre_cowshed)
+        .expect("idempotent vacate");
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("README")).expect("retained tree"),
+        b"the user's tree"
+    );
+}
+
+#[test]
+fn direct_mount_handoff_refuses_a_checkout_it_did_not_take_over() {
+    let fixture = Fixture::new("direct-vacate-refuse");
+    let checkout = fixture.root.join("mount");
+    let pre_cowshed = fixture.root.join("mount.pre-cowshed");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    std::fs::create_dir_all(&pre_cowshed).expect("collision");
+    let host = MacOsApfsExecutionHost::with_mount_source(
+        RecordingRunner::default(),
+        fixture.config_with_layout(CheckoutLayout::DirectMount),
+        FakeKernelMountSource::default(),
+    )
+    .expect("host");
+
+    // A retained tree already at the destination means a previous adoption left state behind.
+    host.vacate_adopted_checkout(&checkout, &pre_cowshed)
+        .expect_err("pre-cowshed collision must be refused before the user's tree is touched");
+    assert!(
+        !checkout.join(".envrc").exists(),
+        "a refused handoff must leave the checkout exactly as it was"
     );
 }
 

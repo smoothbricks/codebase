@@ -14,7 +14,8 @@ use cowshed_core::metadata::{GrantSet, ImageFormat, PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
-    ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource, TokioApfsBlockingLane,
+    ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, CheckoutLayout, IncarnationSource,
+    TokioApfsBlockingLane,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, MountIntent, OperationIdentity, Pin, RestoreMode,
@@ -144,6 +145,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         &store,
         &caches,
         &checkout_path,
+        CheckoutLayout::Symlink,
         ApfsCaseSensitivity::Insensitive,
     )
     .with_capacity("1g")?;

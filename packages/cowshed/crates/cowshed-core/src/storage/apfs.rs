@@ -11,6 +11,7 @@ use crate::apfs::{
     ApfsCaseSensitivity, ApfsError, CreateImageRequest, CreatedImage, ImageFormatSelection,
     MountAccess,
 };
+pub use crate::metadata::CheckoutLayout;
 use crate::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::RepoId;
 
@@ -35,9 +36,11 @@ pub struct ApfsSubstrateConfig {
     pub store_root: PathBuf,
     pub caches_root: PathBuf,
     /// The adopted checkout's original path — the place in the user's source tree that adoption
-    /// took over. It is not a mountpoint: every workspace including main mounts under
-    /// `mnt/<owner>/<repo>/<name>`, and this path holds the symlink into main's mount.
+    /// took over. Under `CheckoutLayout::DirectMount` it is main's mountpoint; under
+    /// `CheckoutLayout::Symlink` it is not a mountpoint at all and holds a symlink into main's
+    /// mount under `mnt/<owner>/<repo>/main`.
     pub checkout_path: PathBuf,
+    pub checkout_layout: CheckoutLayout,
     pub case_sensitivity: ApfsCaseSensitivity,
     pub capacity: String,
 }
@@ -47,12 +50,14 @@ impl ApfsSubstrateConfig {
         store_root: impl Into<PathBuf>,
         caches_root: impl Into<PathBuf>,
         checkout_path: impl Into<PathBuf>,
+        checkout_layout: CheckoutLayout,
         case_sensitivity: ApfsCaseSensitivity,
     ) -> Self {
         Self {
             store_root: store_root.into(),
             caches_root: caches_root.into(),
             checkout_path: checkout_path.into(),
+            checkout_layout,
             case_sensitivity,
             capacity: DEFAULT_IMAGE_CAPACITY.to_owned(),
         }
@@ -377,6 +382,19 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         pre_cowshed_checkout: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError>;
+    /// Hand the checkout path over to a direct mountpoint (`CheckoutLayout::DirectMount`).
+    ///
+    /// Builds the mountpoint directory with its self-healing stub under a staging sibling,
+    /// exchanges it with the original checkout in one `renameatx_np(RENAME_SWAP)`, and renames the
+    /// displaced original to `pre_cowshed_checkout`. The checkout path transitions straight from
+    /// the user's directory to the mountpoint, so it is never absent. The mount is attached
+    /// afterwards — it cannot be attached before, because the mountpoint does not exist until this
+    /// swap creates it — and until it is, the stub inside heals on the next `cd`.
+    fn vacate_adopted_checkout(
+        &self,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), PublicationError>;
     /// Prepare adoption's durable state without touching the user's tree.
     ///
     /// Creates `canonical_mount` with its self-healing stub and publishes the canonical image.
@@ -734,9 +752,10 @@ where
 
         let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
         let applied = self
             .lane
-            .dispatch(move || commit_prepared_adopt(host.as_ref(), prepared))
+            .dispatch(move || commit_prepared_adopt(host.as_ref(), &config, prepared))
             .await?;
         match applied {
             Applied::Lifecycle(receipt) => Ok(receipt),
@@ -1754,15 +1773,20 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     )
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid adopted workspace identity"))?;
     let canonical_image = canonical_image_path(config, &workspace)?;
-    // Main is not special in the mount namespace: adoption publishes it where the layout says
-    // every workspace lives. Two resolvers reach that path — the layout directly, and the
-    // substrate's `mount_point` — and the adopted checkout becomes a symlink to whatever they
-    // agree on. Disagreement would aim the symlink at a directory nothing ever mounts, so it is
-    // rejected here, before the user's tree is touched.
-    let canonical_mount = layout(config, repo)?
-        .workspace_mount(&main_name())
-        .map_err(ApfsStorageError::from)?;
-    if canonical_mount != mount_point(config, &workspace)? {
+    // Adoption publishes main where the project's checkout layout says it lives, and the layout
+    // is the only thing that decides. Cross-check the two resolvers that reach that path — the
+    // substrate's `mount_point` and the layout's own answer for the chosen shape — because a
+    // disagreement would aim the handoff at a directory nothing ever mounts, and that is not
+    // discoverable after the user's tree has been touched.
+    let canonical_mount = mount_point(config, &workspace)?;
+    let expected_mount = if config.checkout_layout.mounts_at_checkout() {
+        config.checkout_path.clone()
+    } else {
+        layout(config, repo)?
+            .workspace_mount(&main_name())
+            .map_err(ApfsStorageError::from)?
+    };
+    if canonical_mount != expected_mount {
         return Err(ApfsStorageError::InvalidPlan(
             "main's layout mount disagrees with the substrate mount point",
         ));
@@ -1853,6 +1877,7 @@ fn detach_and_reclaim_adopt<H: ApfsExecutionHost>(
 
 fn commit_prepared_adopt<H: ApfsExecutionHost>(
     host: &H,
+    config: &ApfsSubstrateConfig,
     prepared: PreparedAdopt<H::Attachment>,
 ) -> Result<Applied, ApfsStorageError> {
     let PreparedAdopt {
@@ -1884,11 +1909,21 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
             host.reclaim_image(&staged_image, stage.workspace.format()),
         );
     }
-    // Publication order is the transaction. Everything durable is built outside the user's tree
-    // first — mountpoint, then image — and only once the workspace is mounted and live does the
-    // adopted checkout path change hands, in a single atomic swap. A failure or crash before that
-    // last step leaves the user's directory exactly as it was.
-    if let Err(primary) = host.publish_adopt(&canonical_mount, &staged_image, &canonical_image) {
+    // Publication order is the transaction, and both layouts obey the same rule: every durable
+    // artifact is built before the user's tree is touched, and the checkout path changes hands in
+    // one atomic swap. They differ only in what the swap puts there and therefore in when the
+    // mount can happen. Under the symlink layout the mountpoint is cowshed's own, so the mount is
+    // already live when the symlink appears. Under direct mount the mountpoint *is* the checkout
+    // path and cannot exist until the swap creates it, so the swap comes first and the attach
+    // follows; the self-healing stub the swap plants covers that window. A failure or crash before
+    // the swap leaves the user's directory exactly as it was under either layout.
+    let direct = config.checkout_layout.mounts_at_checkout();
+    let published = if direct {
+        host.publish_image(&staged_image, &canonical_image)
+    } else {
+        host.publish_adopt(&canonical_mount, &staged_image, &canonical_image)
+    };
+    if let Err(primary) = published {
         let cleanup = match primary.disposition() {
             PublicationDisposition::RolledBack => {
                 host.reclaim_image(&staged_image, stage.workspace.format())
@@ -1897,11 +1932,19 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
         };
         return combine_cleanup("adopt publication", primary.into_source(), cleanup);
     }
-    mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
-    if let Err(primary) =
-        host.link_adopted_checkout(&canonical_mount, &source_checkout, &pre_cowshed_checkout)
-    {
-        return Err(primary.into_source());
+    if direct {
+        if let Err(primary) = host.vacate_adopted_checkout(&source_checkout, &pre_cowshed_checkout)
+        {
+            return Err(primary.into_source());
+        }
+        mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
+    } else {
+        mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
+        if let Err(primary) =
+            host.link_adopted_checkout(&canonical_mount, &source_checkout, &pre_cowshed_checkout)
+        {
+            return Err(primary.into_source());
+        }
     }
     Ok(Applied::Lifecycle(LifecycleReceipt {
         resulting_revision: stage.workspace.revision(),
@@ -2748,14 +2791,27 @@ fn retired_image_path(
     )))
 }
 
+/// Main's mountpoint is the one place the checkout layout is visible to the substrate: under
+/// `DirectMount` it is the user's checkout path, under `Symlink` it is the uniform
+/// `mnt/<owner>/<repo>/main` and the checkout path holds a symlink to it. Every other workspace
+/// mounts under `mnt/` in both layouts.
 fn mount_point(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
-    // One uniform mount namespace: main included. `config.checkout_path` is where the symlink to
-    // this mount lives, never a mount point of its own.
-    layout(config, workspace.repo())?
-        .workspace_mount(workspace.name())
+    main_aware_mount_point(config, workspace.repo(), workspace.name())
+}
+
+fn main_aware_mount_point(
+    config: &ApfsSubstrateConfig,
+    repo: &RepoId,
+    workspace: &WorkspaceName,
+) -> Result<PathBuf, ApfsStorageError> {
+    if workspace.is_main() && config.checkout_layout.mounts_at_checkout() {
+        return Ok(config.checkout_path.clone());
+    }
+    layout(config, repo)?
+        .workspace_mount(workspace)
         .map_err(Into::into)
 }
 
@@ -2806,6 +2862,7 @@ mod tests {
             "/tmp/cowshed-lock-table/store",
             "/tmp/cowshed-lock-table/caches",
             "/tmp/cowshed-lock-table/main",
+            CheckoutLayout::Symlink,
             ApfsCaseSensitivity::Sensitive,
         );
         let repo = RepoId::parse("acme/widget").expect("repo");
