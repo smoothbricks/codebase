@@ -32,6 +32,10 @@ pub const MAIN_REMOTE: &str = "main";
 /// it. Cowshed adds and lets the user remove; it never retargets a remote it did not create.
 pub const FALLBACK_MAIN_REMOTE: &str = "cowshed-main";
 
+/// The name this remote carried before it was named for what it is. Cowshed created it, so cowshed
+/// removes it: it is not a user remote, and it names the recorded checkout rather than the mount.
+const LEGACY_MAIN_REMOTE: &str = "host";
+
 /// The name a workspace's `main` remote is actually registered under, once configuration has run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainRemote {
@@ -423,6 +427,16 @@ impl GitRepository {
                 "workspace main remote must be an absolute local path",
                 "retry from a resolved repository root",
             ));
+        }
+        // Retire the name this remote used to carry. `host` was never the user's — mint strips
+        // every inherited remote and then creates exactly one — so cowshed may remove its own
+        // former spelling, and must: left alone it points at the recorded checkout path, which is
+        // the wrong path under the symlink layout and stale after any `cowshed mv`.
+        if self.remote_url(LEGACY_MAIN_REMOTE).await?.is_some() {
+            let output = self
+                .run(["remote", "remove", LEGACY_MAIN_REMOTE])
+                .await?;
+            ensure_git_success("remove superseded host remote", output)?;
         }
         match self.remote_url(MAIN_REMOTE).await? {
             // Already ours and already correct: the idempotent re-run.
@@ -898,6 +912,30 @@ mod tests {
             Some(mount)
         );
         assert_eq!(MainRemote::Displaced.remote_name(), FALLBACK_MAIN_REMOTE);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// A workspace minted before the rename carries `host`. Configuration retires it rather than
+    /// leaving a second remote aimed at the recorded checkout — the wrong path under the symlink
+    /// layout, and stale after any `cowshed mv`.
+    #[tokio::test]
+    async fn configuration_retires_the_superseded_host_remote() {
+        let root = repository();
+        let stale = PathBuf::from("/tmp/cowshed-recorded-checkout");
+        let mount = PathBuf::from("/tmp/cowshed-canonical-mount");
+        let repo = GitRepository::from_root(&root);
+        repo.set_remote("host", &stale).await.expect("legacy remote");
+
+        assert_eq!(
+            repo.configure_main_remote(&mount)
+                .await
+                .expect("configure over a legacy remote"),
+            MainRemote::Canonical
+        );
+        let remotes = repo.remotes().await.expect("read remotes");
+        assert_eq!(remotes.len(), 1, "exactly one upstream survives");
+        assert_eq!(remotes[0].name, MAIN_REMOTE);
+        assert_eq!(Path::new(&remotes[0].url), mount);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
