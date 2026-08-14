@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls                 list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  skill install      install the agent skill";
+pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  skill install      install the agent skill";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -26,7 +26,7 @@ pub enum Command {
     Checkpoint(CheckpointArgs),
     Restore(RestoreArgs),
     Ensure(EnsureArgs),
-    List,
+    List(ListArgs),
     Path(PathArgs),
     Exec(ExecArgs),
     Remove(RemoveArgs),
@@ -132,6 +132,11 @@ pub struct RestoreArgs {
 pub struct EnsureArgs {
     pub envrc: bool,
     pub attach: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ListArgs {
+    pub all: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,7 +344,7 @@ where
         CommandName::Checkpoint => parse_checkpoint(&args, index, &mut global)?,
         CommandName::Restore => parse_restore(&args, index, &mut global)?,
         CommandName::Ensure => parse_ensure(&args, index, &mut global)?,
-        CommandName::List => parse_empty(&args, index, &mut global, "ls", Command::List)?,
+        CommandName::List => parse_list(&args, index, &mut global)?,
         CommandName::Path => parse_path(&args, index, &mut global)?,
         CommandName::Exec => parse_exec(&mut args, index, &mut global)?,
         CommandName::Remove => parse_remove(&args, index, &mut global)?,
@@ -769,6 +774,29 @@ fn parse_ensure(
         index += 1;
     }
     Ok(Command::Ensure(parsed))
+}
+
+fn parse_list(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "ls [--all]";
+    let mut parsed = ListArgs::default();
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--all") => parsed.all = true,
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ => {
+                return Err(UsageError::new("ls accepts no positional arguments", USAGE));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::List(parsed))
 }
 
 fn parse_path(
@@ -1319,6 +1347,26 @@ mod tests {
         assert_eq!(short, long);
         assert!(short.global.quiet);
         assert!(short.global.json);
+    }
+
+    #[test]
+    fn list_all_is_an_explicit_flag_and_list_rejects_every_other_argument() {
+        let Command::List(scoped) = parse_args(["ls"]).unwrap().command else {
+            panic!("expected list")
+        };
+        assert!(!scoped.all);
+
+        let cli = parse_args(["ls", "--all", "--json"]).unwrap();
+        let Command::List(all) = cli.command else {
+            panic!("expected list")
+        };
+        assert!(all.all);
+        assert!(cli.global.json);
+
+        for invalid in [["ls", "project"], ["ls", "--unknown"]] {
+            let error = parse_args(invalid).unwrap_err();
+            assert!(error.hint.contains("cowshed ls [--all]"));
+        }
     }
 
     #[test]

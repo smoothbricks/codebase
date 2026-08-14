@@ -477,6 +477,13 @@ pub struct WorkspaceInfo {
     pub snapshot_stale: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectWorkspaces {
+    pub repo_id: RepoId,
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EnsureAction {
@@ -2256,6 +2263,7 @@ result_bodies!(
     AuditEvent,
     SkillInstallReport,
     Vec<WorkspaceInfo>,
+    Vec<ProjectWorkspaces>,
     Vec<JobInfo>,
     Vec<ExecRecord>,
     Vec<AuditEvent>,

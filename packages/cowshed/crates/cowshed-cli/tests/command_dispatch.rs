@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{
-    CliService, ExecCommand, ExecPresentation, ExecResult, dispatch, dispatch_and_shutdown,
+    CliService, ExecCommand, ExecPresentation, ExecResult, ProjectWorkspaces, dispatch,
+    dispatch_and_shutdown,
 };
 use cowshed_core::api::*;
 use cowshed_core::metadata::{
@@ -27,6 +28,9 @@ struct FakeService {
     presentation: Option<ExecPresentation>,
     child_exit: ExitStatus,
     fail_list: Option<CowshedError>,
+    listed_workspaces: Option<Vec<WorkspaceInfo>>,
+    listed_projects: Vec<ProjectWorkspaces>,
+    other_adopted_projects: usize,
     fail_push: Option<CowshedError>,
     fail_reconcile_gateway: Option<CowshedError>,
     adopt_options: Option<AdoptOptions>,
@@ -53,6 +57,9 @@ impl Default for FakeService {
             presentation: None,
             child_exit: ExitStatus::Exited { code: 0 },
             fail_list: None,
+            listed_workspaces: None,
+            listed_projects: Vec::new(),
+            other_adopted_projects: 0,
             fail_push: None,
             fail_reconcile_gateway: None,
             cwd_workspace: None,
@@ -153,10 +160,22 @@ impl CliService for FakeService {
         if let Some(error) = self.fail_list.take() {
             return Err(error);
         }
-        Ok(vec![
-            workspace("zebra", WorkspaceState::Detached),
-            workspace("main", WorkspaceState::Attached),
-        ])
+        Ok(self.listed_workspaces.take().unwrap_or_else(|| {
+            vec![
+                workspace("zebra", WorkspaceState::Detached),
+                workspace("main", WorkspaceState::Attached),
+            ]
+        }))
+    }
+
+    async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
+        self.events.push("ls-all".into());
+        Ok(std::mem::take(&mut self.listed_projects))
+    }
+
+    async fn other_adopted_project_count(&mut self) -> Result<usize> {
+        self.events.push("project-count".into());
+        Ok(self.other_adopted_projects)
     }
 
     async fn path(&mut self, name: &str, no_attach: bool) -> Result<WorkspaceInfo> {
@@ -292,8 +311,12 @@ impl CliService for FakeService {
 }
 
 fn workspace(name: &str, state: WorkspaceState) -> WorkspaceInfo {
+    workspace_for("acme/widget", name, state)
+}
+
+fn workspace_for(repo_id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
     WorkspaceInfo {
-        repo_id: RepoId::parse("acme/widget").unwrap(),
+        repo_id: RepoId::parse(repo_id).unwrap(),
         workspace: WorkspaceName::new(name).unwrap(),
         workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
             .unwrap(),
@@ -431,6 +454,77 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
             "doctor",
         ]
     );
+}
+
+#[tokio::test]
+async fn list_all_groups_every_project_in_stable_tsv_and_json_shapes() {
+    let projects = || {
+        vec![
+            ProjectWorkspaces {
+                repo_id: RepoId::parse("zeta/tool").unwrap(),
+                workspaces: vec![workspace_for(
+                    "zeta/tool",
+                    "warp-ceiling",
+                    WorkspaceState::Detached,
+                )],
+            },
+            ProjectWorkspaces {
+                repo_id: RepoId::parse("alpha/widget").unwrap(),
+                workspaces: vec![
+                    workspace_for("alpha/widget", "zebra", WorkspaceState::Attached),
+                    workspace_for("alpha/widget", "main", WorkspaceState::Attached),
+                ],
+            },
+        ]
+    };
+    let mut service = FakeService {
+        listed_projects: projects(),
+        ..FakeService::default()
+    };
+
+    let (_, stdout, stderr) = run(&mut service, ["ls", "--all"]).await;
+    assert_eq!(
+        stdout,
+        b"alpha/widget\tmain\tmounted\tmain\t/mnt/main\n\
+          alpha/widget\tzebra\tmounted\tcowshed/zebra\t/mnt/zebra\n\
+          zeta/tool\twarp-ceiling\tdetached\tcowshed/warp-ceiling\t\n"
+    );
+    assert!(stderr.is_empty());
+    assert_eq!(service.events, ["ls-all"]);
+
+    let mut service = FakeService {
+        listed_projects: projects(),
+        ..FakeService::default()
+    };
+    let (_, stdout, stderr) = run(&mut service, ["ls", "--all", "--json"]).await;
+    assert!(stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["result"][0]["repoId"], "alpha/widget");
+    assert_eq!(value["result"][0]["workspaces"][0]["workspace"], "main");
+    assert_eq!(value["result"][1]["repoId"], "zeta/tool");
+    assert_eq!(
+        value["result"][1]["workspaces"][0]["workspace"],
+        "warp-ceiling"
+    );
+}
+
+#[tokio::test]
+async fn empty_project_list_names_other_projects_and_guides_to_list_all() {
+    let mut service = FakeService {
+        listed_workspaces: Some(Vec::new()),
+        other_adopted_projects: 2,
+        ..FakeService::default()
+    };
+
+    let (_, stdout, stderr) = run(&mut service, ["ls"]).await;
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        b"cowshed: current repository has no workspaces or is not adopted; 2 other adopted \
+          projects exist; run cowshed ls --all\n"
+    );
+    assert_eq!(service.events, ["ls", "project-count"]);
 }
 
 #[tokio::test]
