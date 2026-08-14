@@ -139,7 +139,12 @@ export function checkBoundedTestTargetPolicy(
   if (!isRecord(testTarget)) {
     return false;
   }
-  if (isBoundedExecutionTarget(testTarget.executor, testTarget.options, new Set(['{projectRoot}']))) {
+  // `<root>/src` is equally bounded: bun-test targets run from src/ so bun's
+  // test-discovery scan never walks generated trees (a Rust package's cargo
+  // target/ directory alone costs tens of seconds per run).
+  if (
+    isBoundedExecutionTarget(testTarget.executor, testTarget.options, new Set(['{projectRoot}', '{projectRoot}/src']))
+  ) {
     return packageJson.scripts?.test === boundedTestScriptAlias(options.projectName);
   }
   if (!isNoopAggregateTarget(testTarget)) {
@@ -185,7 +190,9 @@ function resolvedAggregateTestIsBounded(project: ResolvedProjectTargets | undefi
   }
   const visiting = new Set<string>();
   const verified = new Map<string, boolean>();
-  const allowedCwds = new Set(['{projectRoot}', ...(project.root ? [project.root] : [])]);
+  const allowedCwds = new Set(
+    ['{projectRoot}', '{projectRoot}/src'].concat(project.root ? [project.root, `${project.root}/src`] : []),
+  );
 
   const visit = (targetName: string): boolean => {
     const cached = verified.get(targetName);

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { BlockIndex } from '../src/block-index.js';
-import { createEditRerouteHook } from '../src/hooks/edit-reroute.js';
+import { BlockIndex } from '../block-index.js';
+import { createEditRerouteHook } from '../hooks/edit-reroute.js';
 
 function md(...lines: string[]): string {
   return lines.join('\n');

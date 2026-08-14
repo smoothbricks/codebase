@@ -17,6 +17,7 @@ import {
   validatePublicPackageMetadata,
   validatePublicTags,
   validateRootPackagePolicy,
+  validateTestFileLocations,
   validateWorkspaceDependencies,
 } from '../package-policy.js';
 import {
@@ -100,7 +101,8 @@ const packs: MonorepoPack[] = [
         validateNxProjectNames(ctx.root) +
         validateNxReleaseConfig(ctx.root) +
         validateBunLockfileVersions(ctx.root) +
-        (await validateNxSync(ctx.root, ctx.verbose === true))
+        (await validateNxSync(ctx.root, ctx.verbose === true)) +
+        validateTestFileLocations(ctx.root)
       );
     },
   },

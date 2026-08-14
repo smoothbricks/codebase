@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { ManualStateBus } from '../src/manual';
+import { ManualStateBus } from '../manual';
 
 //*
 declare module '@smoothbricks/statebus-core' {
