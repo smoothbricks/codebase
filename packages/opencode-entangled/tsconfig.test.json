@@ -9,7 +9,6 @@
     "noEmit": true
   },
   "include": [
-    "tests/**/*.ts",
     "src/**/*.test.ts",
     "src/**/*.spec.ts",
     "src/**/__tests__/**/*.ts",

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { BlockIndex } from '../src/block-index.js';
+import { BlockIndex } from '../block-index.js';
 
 function md(...lines: string[]): string {
   return lines.join('\n');

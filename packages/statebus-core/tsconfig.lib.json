@@ -9,5 +9,6 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "references": []
+  "references": [],
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"]
 }

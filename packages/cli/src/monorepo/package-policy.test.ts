@@ -22,6 +22,7 @@ import {
   validateNxProjectNames,
   validateNxReleaseConfig,
   validateRootPackagePolicy,
+  validateTestFileLocations,
   validateWorkspaceDependencies,
 } from './package-policy.js';
 
@@ -199,6 +200,45 @@ describe('root smoo monorepo policy', () => {
     }
   });
 });
+
+describe('test file location policy', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('fails test files outside src/ and skips generated trees', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app' }],
+    });
+    try {
+      const app = join(root, 'packages/app');
+      // Allowed: anywhere under src/.
+      await writeSource(join(app, 'src/deep/feature.test.ts'));
+      // Ignored: generated/vendored trees are never scanned.
+      await writeSource(join(app, 'target/debug/build/foo/out/stray.test.ts'));
+      await writeSource(join(app, 'node_modules/dep/dep.test.ts'));
+      await writeSource(join(app, 'dist/bundled.test.ts'));
+      expect(validateTestFileLocations(root)).toBe(0);
+
+      // Stray: neither typechecked (tsconfig.test.json includes src/** only)
+      // nor run (bounded bun-test targets scan from src/).
+      await writeSource(join(app, 'scripts/helper.test.ts'));
+      await writeSource(join(app, 'stray.spec.tsx'));
+      const errors = captureConsoleErrors();
+      expect(validateTestFileLocations(root)).toBe(2);
+      expect(errors.join('\n')).toContain('scripts/helper.test.ts');
+      expect(errors.join('\n')).toContain('stray.spec.tsx');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+async function writeSource(path: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, 'export {};\n');
+}
 
 describe('Nx project name policy', () => {
   it('fixes same-scope packages without touching external or unscoped packages', async () => {

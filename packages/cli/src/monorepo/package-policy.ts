@@ -1,4 +1,5 @@
-import { join } from 'node:path';
+import { type Dirent, readdirSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import {
   applyWorkspaceBoundedTestTargetPolicy,
   checkWorkspaceBoundedTestTargetPolicy,
@@ -315,6 +316,74 @@ export function validatePublicTags(root: string): number {
   }
   console.log('npm:public tags are valid.');
   return 0;
+}
+
+const testFilePattern = /\.(test|spec)\.tsx?$/;
+
+/** Directories that legitimately hold generated/vendored trees a test-file
+ * scan must never descend into (cargo target/ alone holds 100k+ files). */
+const testScanSkippedDirectories = new Set([
+  'node_modules',
+  'dist',
+  'dist-test',
+  'target',
+  'coverage',
+  'tmp',
+  '.git',
+  '.devenv',
+  '.direnv',
+  '.nx',
+  '.cache',
+]);
+
+/**
+ * Every test file must live under the package's `src/`. The convention is
+ * otherwise only encoded generatively — tsconfig.test.json includes are
+ * `src/**` and the bounded bun-test targets run with cwd `<package>/src` —
+ * so a test file anywhere else is neither typechecked nor executed, with no
+ * diagnostic. This check turns that silent gap into a validation failure.
+ */
+export function validateTestFileLocations(root: string): number {
+  let failures = 0;
+  for (const pkg of getWorkspacePackages(root)) {
+    for (const stray of strayTestFiles(join(root, pkg.path))) {
+      console.error(
+        `${pkg.projectName}: test file outside src/ is neither typechecked nor run by the bounded test targets: ${stray}`,
+      );
+      failures++;
+    }
+  }
+  return failures;
+}
+
+function strayTestFiles(packagePath: string): string[] {
+  const stray: string[] = [];
+  const walk = (directory: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (testScanSkippedDirectories.has(entry.name)) {
+          continue;
+        }
+        if (directory === packagePath && entry.name === 'src') {
+          continue; // src/ is where tests belong.
+        }
+        walk(path);
+        continue;
+      }
+      if (entry.isFile() && testFilePattern.test(entry.name)) {
+        stray.push(relative(packagePath, path));
+      }
+    }
+  };
+  walk(packagePath);
+  return stray;
 }
 
 export function validatePublicPackageMetadata(root: string): number {
