@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 pub const GATEWAY_LABEL: &str = "dev.cowshed.gateway";
+pub const SCCACHE_LABEL: &str = "dev.cowshed.sccache";
 pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 pub const PRIVATE_PLIST_MODE: u32 = 0o600;
 
@@ -29,6 +30,7 @@ pub struct LaunchAgentSpec {
     label: String,
     executable: PathBuf,
     arguments: Vec<String>,
+    environment: Vec<(String, String)>,
     lifecycle: ServiceLifecycle,
     plist_path: PathBuf,
     standard_error_path: PathBuf,
@@ -42,12 +44,31 @@ impl LaunchAgentSpec {
         arguments: Vec<String>,
         lifecycle: ServiceLifecycle,
     ) -> Result<Self, LaunchdError> {
+        validate_arguments(&arguments)?;
+        Self::assemble(
+            home,
+            label.into(),
+            executable,
+            arguments,
+            Vec::new(),
+            lifecycle,
+            "daemon-stderr.log",
+        )
+    }
+
+    fn assemble(
+        home: &Path,
+        label: String,
+        executable: &Path,
+        arguments: Vec<String>,
+        environment: Vec<(String, String)>,
+        lifecycle: ServiceLifecycle,
+        standard_error_file: &str,
+    ) -> Result<Self, LaunchdError> {
         validate_canonical_absolute_path("home", home)?;
         validate_canonical_absolute_path("executable", executable)?;
-
-        let label = label.into();
         validate_label(&label)?;
-        validate_arguments(&arguments)?;
+        validate_environment(&environment)?;
 
         let plist_path = home
             .join("Library")
@@ -56,12 +77,13 @@ impl LaunchAgentSpec {
         let standard_error_path = home
             .join(".cowshed")
             .join("telemetry")
-            .join("daemon-stderr.log");
+            .join(standard_error_file);
 
         Ok(Self {
             label,
             executable: executable.to_path_buf(),
             arguments,
+            environment,
             lifecycle,
             plist_path,
             standard_error_path,
@@ -78,6 +100,44 @@ impl LaunchAgentSpec {
         )
     }
 
+    /// The host-owned sccache server agent.
+    ///
+    /// launchd runs the sccache binary itself: server mode is selected entirely
+    /// through the environment (`SCCACHE_START_SERVER=1` combined with any CLI
+    /// argument is a parse error in sccache), so this is the one agent with an
+    /// empty argv tail. `SCCACHE_NO_DAEMON=1` keeps the server in the
+    /// foreground under launchd's supervision, `SCCACHE_IDLE_TIMEOUT=0`
+    /// disables idle exit, and the socket and cache paths pin the shared
+    /// cowshed locations independent of the launchd session environment.
+    /// All source-verified against sccache 0.16.
+    pub fn sccache(
+        home: &Path,
+        sccache_executable: &Path,
+        server_socket: &Path,
+        cache_directory: &Path,
+    ) -> Result<Self, LaunchdError> {
+        validate_canonical_absolute_path("server-socket", server_socket)?;
+        validate_canonical_absolute_path("cache-directory", cache_directory)?;
+        let path_string =
+            |path: &Path| path.to_str().expect("validated paths are UTF-8").to_owned();
+        let environment = vec![
+            ("SCCACHE_START_SERVER".to_owned(), "1".to_owned()),
+            ("SCCACHE_NO_DAEMON".to_owned(), "1".to_owned()),
+            ("SCCACHE_IDLE_TIMEOUT".to_owned(), "0".to_owned()),
+            ("SCCACHE_SERVER_UDS".to_owned(), path_string(server_socket)),
+            ("SCCACHE_DIR".to_owned(), path_string(cache_directory)),
+        ];
+        Self::assemble(
+            home,
+            SCCACHE_LABEL.to_owned(),
+            sccache_executable,
+            Vec::new(),
+            environment,
+            ServiceLifecycle::KeepAlive,
+            "sccache-stderr.log",
+        )
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -88,6 +148,10 @@ impl LaunchAgentSpec {
 
     pub fn arguments(&self) -> &[String] {
         &self.arguments
+    }
+
+    pub fn environment(&self) -> &[(String, String)] {
+        &self.environment
     }
 
     pub fn lifecycle(&self) -> ServiceLifecycle {
@@ -147,6 +211,16 @@ impl LaunchAgentSpec {
                 .to_str()
                 .expect("validated home paths are UTF-8"),
         );
+        if !self.environment.is_empty() {
+            plist.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
+            for (name, value) in &self.environment {
+                plist.push_str("    ");
+                push_xml_key(&mut plist, name);
+                plist.push_str("    ");
+                push_xml_string(&mut plist, value);
+            }
+            plist.push_str("  </dict>\n");
+        }
         plist.push_str("</dict>\n</plist>\n");
         plist.into_bytes()
     }
@@ -977,6 +1051,10 @@ pub enum LaunchdError {
         index: usize,
         reason: &'static str,
     },
+    InvalidEnvironmentVariable {
+        name: String,
+        reason: &'static str,
+    },
     PrivilegedProvisioning,
 }
 
@@ -989,6 +1067,9 @@ impl fmt::Display for LaunchdError {
             Self::InvalidLabel => formatter.write_str("invalid launchd label"),
             Self::InvalidArgument { index, reason } => {
                 write!(formatter, "invalid service argument {index}: {reason}")
+            }
+            Self::InvalidEnvironmentVariable { name, reason } => {
+                write!(formatter, "invalid environment variable {name:?}: {reason}")
             }
             Self::PrivilegedProvisioning => formatter
                 .write_str("launchd services may not invoke foreground storage provisioning"),
@@ -1085,6 +1166,30 @@ fn validate_arguments(arguments: &[String]) -> Result<(), LaunchdError> {
     Ok(())
 }
 
+fn validate_environment(environment: &[(String, String)]) -> Result<(), LaunchdError> {
+    for (name, value) in environment {
+        if name.is_empty() {
+            return Err(LaunchdError::InvalidEnvironmentVariable {
+                name: name.clone(),
+                reason: "name must not be empty",
+            });
+        }
+        if name.contains('=') || name.chars().any(is_unsafe_xml_control) {
+            return Err(LaunchdError::InvalidEnvironmentVariable {
+                name: name.clone(),
+                reason: "name contains an unsafe character",
+            });
+        }
+        if value.chars().any(is_unsafe_xml_control) {
+            return Err(LaunchdError::InvalidEnvironmentVariable {
+                name: name.clone(),
+                reason: "value contains a control character",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn is_unsafe_xml_control(character: char) -> bool {
     matches!(character, '\0'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{7f}')
 }
@@ -1102,4 +1207,19 @@ fn push_xml_string(output: &mut String, value: &str) {
         }
     }
     output.push_str("</string>\n");
+}
+
+fn push_xml_key(output: &mut String, value: &str) {
+    output.push_str("<key>");
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '\'' => output.push_str("&apos;"),
+            '"' => output.push_str("&quot;"),
+            _ => output.push(character),
+        }
+    }
+    output.push_str("</key>\n");
 }
