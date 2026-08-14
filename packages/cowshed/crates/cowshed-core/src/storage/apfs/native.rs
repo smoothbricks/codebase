@@ -44,7 +44,7 @@ use super::super::{
 };
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingPublicationFact, PublicationError, companion_path, layout, volume_name,
+    MetadataPolicy, PendingPublicationFact, PublicationError, companion_path, layout, volume_key,
 };
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
@@ -1359,7 +1359,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         {
             facts.push(StorageFact {
                 workspace: metadata_workspace_ref(&metadata)?,
-                volume_name: volume_name(repo, &main),
+                volume_key: volume_key(repo, &main),
             });
         }
         let entries = match fs::read_dir(&layout.project().sessions) {
@@ -1389,7 +1389,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             }
             facts.push(StorageFact {
                 workspace: metadata_workspace_ref(&metadata)?,
-                volume_name: volume_name(repo, discovered.workspace()),
+                volume_key: volume_key(repo, discovered.workspace()),
             });
         }
         Ok(facts)
@@ -1404,19 +1404,36 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .map_err(Into::into)
     }
 
+    /// A volume mounted at `mount_point` is this workspace's iff the in-image marker names it.
+    /// The APFS volume label is human-facing and carries no identity — nothing parses it and
+    /// nothing classifies a volume by it — so the marker, written under the same staging fence
+    /// that stamps the label, is the only thing that separates our volume from an unrelated one
+    /// mounted at the same path. A marker that cannot be read is not ours.
+    fn mount_carries_marker(
+        &self,
+        mount_point: &Path,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+    ) -> bool {
+        WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH)).is_ok_and(|marker| {
+            marker.repo_id == *repo
+                && marker.workspace == *workspace
+                && marker.workspace_incarnation == *incarnation
+        })
+    }
+
     fn validate_kernel_mount(
         &self,
         mount: &KernelMountSnapshot,
         expected_path: &Path,
-        expected_volume: &str,
-    ) -> Result<(), ApfsStorageError>
-    where
-        R: CommandRunner,
-    {
-        let actual_volume = self.backend.volume_name(&mount.source_device)?;
-        if actual_volume != expected_volume {
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+    ) -> Result<(), ApfsStorageError> {
+        if !self.mount_carries_marker(expected_path, repo, workspace, incarnation) {
             return Err(ApfsStorageError::Host(format!(
-                "workspace mount source mismatch at {}: expected volume {expected_volume}, device {} resolves to {actual_volume}",
+                "workspace mount identity mismatch at {}: the volume mounted from {} carries no {repo}/{workspace} marker for incarnation {incarnation}",
                 expected_path.display(),
                 mount.source_device
             )));
@@ -1444,11 +1461,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         else {
             return Ok(None);
         };
-        let expected_volume = volume_name(&metadata.repo_id, &metadata.workspace);
-        self.validate_kernel_mount(&mount, &expected, &expected_volume)?;
+        self.validate_kernel_mount(
+            &mount,
+            &expected,
+            &metadata.repo_id,
+            &metadata.workspace,
+            &metadata.workspace_incarnation,
+        )?;
         Ok(Some(KernelMountFact {
             mount_id: mount.mount_id,
-            volume_name: expected_volume,
+            volume_key: volume_key(&metadata.repo_id, &metadata.workspace),
         }))
     }
 
@@ -2540,13 +2562,19 @@ where
         else {
             return Ok(());
         };
-        let expected_volume = volume_name(workspace.repo(), workspace.name());
-        let actual_volume = self.backend.volume_name(&mount.source_device)?;
-        if actual_volume != expected_volume {
+        if !self.mount_carries_marker(
+            mount_point,
+            workspace.repo(),
+            workspace.name(),
+            workspace.incarnation(),
+        ) {
             return Err(ApfsStorageError::Host(format!(
-                "refusing to heal unrelated mount at {}: expected volume {expected_volume}, device {} resolves to {actual_volume}",
+                "refusing to heal unrelated mount at {}: the volume mounted from {} carries no {}/{} marker for incarnation {}",
                 mount_point.display(),
-                mount.source_device
+                mount.source_device,
+                workspace.repo(),
+                workspace.name(),
+                workspace.incarnation()
             )));
         }
         if canonical_mount_flags(mount.flags) {
@@ -2611,13 +2639,19 @@ where
             else {
                 return Ok(());
             };
-            let expected_volume = volume_name(&metadata.repo_id, &metadata.workspace);
-            let actual_volume = self.backend.volume_name(&mount.source_device)?;
-            if actual_volume != expected_volume {
+            if !self.mount_carries_marker(
+                &mount_point,
+                &metadata.repo_id,
+                &metadata.workspace,
+                &metadata.workspace_incarnation,
+            ) {
                 return Err(ApfsStorageError::Host(format!(
-                    "refusing to detach unrelated mount at {}: expected volume {expected_volume}, device {} resolves to {actual_volume}",
+                    "refusing to detach unrelated mount at {}: the volume mounted from {} carries no {}/{} marker for incarnation {}",
                     mount_point.display(),
-                    mount.source_device
+                    mount.source_device,
+                    metadata.repo_id,
+                    metadata.workspace,
+                    metadata.workspace_incarnation
                 )));
             }
             return match self.backend.detach_target(
@@ -3555,13 +3589,18 @@ where
                     Err(error) => return Some(Err(error)),
                 };
                 let mount = kernel.iter().find(|mount| mount.mount_point == expected)?;
-                if let Err(error) = self.validate_kernel_mount(mount, &expected, &fact.volume_name)
-                {
+                if let Err(error) = self.validate_kernel_mount(
+                    mount,
+                    &expected,
+                    fact.workspace.repo(),
+                    fact.workspace.name(),
+                    fact.workspace.incarnation(),
+                ) {
                     return Some(Err(error));
                 }
                 Some(Ok(KernelMountFact {
                     mount_id: mount.mount_id,
-                    volume_name: fact.volume_name,
+                    volume_key: fact.volume_key,
                 }))
             })
             .collect()

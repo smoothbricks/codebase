@@ -5110,11 +5110,11 @@ mod binding_tests {
         let facts = vec![
             StorageFact {
                 workspace: source_workspace,
-                volume_name: "cowshed.acme--widget.main".to_owned(),
+                volume_key: "cowshed.acme--widget.main".to_owned(),
             },
             StorageFact {
                 workspace: destination_workspace.clone(),
-                volume_name: "cowshed.acme--widget.main".to_owned(),
+                volume_key: "cowshed.acme--widget.main".to_owned(),
             },
         ];
         let pending = PendingPublicationFact {
