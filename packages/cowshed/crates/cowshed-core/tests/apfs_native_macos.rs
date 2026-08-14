@@ -341,6 +341,26 @@ fn session_workspace(workspace: &str, incarnation: &str) -> LifecycleWorkspace {
     .expect("lifecycle workspace")
 }
 
+/// Main's canonical mount — under the layout's mount root like every other workspace, never the
+/// adopted checkout path.
+fn main_mount(fixture: &Fixture) -> PathBuf {
+    StorageLayout::new(&fixture.root, &repo())
+        .expect("layout")
+        .workspace_mount(&WorkspaceName::new("main").expect("main"))
+        .expect("main mount")
+}
+
+fn native_host_with_mounts(
+    fixture: &Fixture,
+    runner: RecordingRunner,
+    mounts: Vec<KernelMountSnapshot>,
+) -> MacOsApfsExecutionHost<RecordingRunner> {
+    let source = FakeKernelMountSource::default();
+    source.set(mounts);
+    MacOsApfsExecutionHost::with_mount_source(runner, fixture.config(), source)
+        .expect("native APFS host")
+}
+
 fn native_host(
     fixture: &Fixture,
     runner: RecordingRunner,
@@ -1751,7 +1771,7 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         42,
-        fixture.config().checkout_path,
+        main_mount(&fixture),
         "/dev/disk10s1",
         true,
         true,
@@ -1800,7 +1820,7 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         [
             std::ffi::OsString::from("detach"),
             std::ffi::OsString::from("-quiet"),
-            fixture.config().checkout_path.into_os_string(),
+            main_mount(&fixture).into_os_string(),
         ]
     );
 }
@@ -1814,7 +1834,7 @@ fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         43,
-        fixture.config().checkout_path,
+        main_mount(&fixture),
         "/dev/disk10s1",
         true,
         true,
@@ -1842,7 +1862,7 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         8,
-        fixture.config().checkout_path,
+        main_mount(&fixture),
         "/dev/disk10s1",
         true,
         true,
@@ -1854,10 +1874,7 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
     let error = host.mounts(&repo()).expect_err("impostor mount");
     assert!(error.to_string().contains("mount source mismatch"));
     let error = host
-        .heal_mount(
-            &workspace(ImageFormat::Sparse),
-            &fixture.config().checkout_path,
-        )
+        .heal_mount(&workspace(ImageFormat::Sparse), &main_mount(&fixture))
         .expect_err("impostor must not be healed destructively");
     assert!(
         error
@@ -1890,7 +1907,7 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         7,
-        fixture.config().checkout_path,
+        main_mount(&fixture),
         "/dev/disk10s1",
         false,
         false,
@@ -1907,7 +1924,7 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
             .contains("non-canonical flags")
     );
 
-    host.heal_mount(&workspace, &fixture.config().checkout_path)
+    host.heal_mount(&workspace, &main_mount(&fixture))
         .expect("heal by mountpoint");
     let requests = runner.requests();
     assert_eq!(
@@ -1922,7 +1939,7 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
         [
             std::ffi::OsString::from("detach"),
             std::ffi::OsString::from("-quiet"),
-            fixture.config().checkout_path.into_os_string(),
+            main_mount(&fixture).into_os_string(),
         ]
     );
     source.set(Vec::new());
@@ -2265,11 +2282,14 @@ fn gc_does_not_follow_symlinked_owner_repository_staging_or_image_paths() {
 }
 
 #[test]
-fn adopt_publication_moves_source_aside_writes_stub_and_publishes_image_atomically() {
+fn adopt_publication_builds_the_canonical_mount_without_touching_the_checkout() {
     let fixture = Fixture::new("adopt-publication");
     let config = fixture.config();
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let canonical_mount = layout
+        .workspace_mount(&WorkspaceName::new("main").expect("main"))
+        .expect("canonical mount");
     let staged = layout
         .project()
         .project_root
@@ -2280,90 +2300,125 @@ fn adopt_publication_moves_source_aside_writes_stub_and_publishes_image_atomical
     let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
 
     native_host(&fixture, RecordingRunner::default())
-        .publish_adopt(
-            &config.checkout_path,
-            &pre_cowshed,
-            &staged,
-            canonical.image(),
-        )
+        .publish_adopt(&canonical_mount, &staged, canonical.image())
         .expect("publish adopt");
 
+    // The durable half of the transaction landed...
     assert_eq!(
-        std::fs::read(pre_cowshed.join("tracked")).expect("retained source"),
-        b"source"
-    );
-    assert_eq!(
-        std::fs::read(config.checkout_path.join(".envrc")).expect("stub"),
+        std::fs::read(canonical_mount.join(".envrc")).expect("stub"),
         b"cowshed ensure --attach\n"
     );
     assert!(canonical.image().exists());
     assert!(sidecar_path(canonical.image()).exists());
     assert!(!staged.exists());
+    // ...and the user's tree is exactly where it was.
+    assert_eq!(
+        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
+        b"source"
+    );
+    assert!(!pre_cowshed.exists(), "the checkout is not moved aside yet");
 }
 
 #[test]
-fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
-    let before = Fixture::new("adopt-before-handoff");
-    let before_config = before.config();
-    let before_layout = StorageLayout::new(&before.root, &repo()).expect("layout");
-    let before_canonical = before_layout
-        .main_image(ImageFormat::Sparse)
-        .expect("canonical");
-    let before_staged = before_layout
-        .project()
-        .project_root
-        .join(".staging/main-00000000000000000000000000000001.sparseimage");
-    create_image(&before_staged, ImageFormat::Sparse);
-    std::fs::create_dir_all(&before_config.checkout_path).expect("source");
-    std::fs::write(before_config.checkout_path.join("tracked"), b"source").expect("source file");
-    let before_host = native_host(&before, RecordingRunner::default());
-    before_host
-        .recover_pending(&before_config, &[])
-        .expect("pre-handoff recovery");
-    assert!(before_staged.exists());
-    assert!(!before_canonical.image().exists());
-    let cleanup = execute_gc(&before_host, &before_config).expect("staging cleanup");
-    assert_eq!(cleanup.examined, 1);
-    assert_eq!(cleanup.reclaimed, 0);
-    assert!(before_staged.exists());
-    assert!(sidecar_path(&before_staged).exists());
+fn adopt_link_swaps_the_checkout_atomically_and_retains_the_original_tree() {
+    let fixture = Fixture::new("adopt-link");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical_mount = layout
+        .workspace_mount(&WorkspaceName::new("main").expect("main"))
+        .expect("canonical mount");
+    std::fs::create_dir_all(&canonical_mount).expect("canonical mount");
+    std::fs::create_dir_all(&config.checkout_path).expect("source");
+    std::fs::write(config.checkout_path.join("tracked"), b"source").expect("source file");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
+
+    let host = native_host_with_mounts(
+        &fixture,
+        RecordingRunner::default(),
+        vec![KernelMountSnapshot::new(
+            7,
+            canonical_mount.clone(),
+            "/dev/disk9s1",
+            true,
+            false,
+        )],
+    );
+    host.link_adopted_checkout(&canonical_mount, &config.checkout_path, &pre_cowshed)
+        .expect("link adopted checkout");
+
     assert_eq!(
-        std::fs::read(before_config.checkout_path.join("tracked")).expect("original source"),
+        std::fs::read_link(&config.checkout_path).expect("checkout symlink"),
+        canonical_mount
+    );
+    assert_eq!(
+        std::fs::read(pre_cowshed.join("tracked")).expect("retained source"),
         b"source"
     );
+    assert!(
+        !PathBuf::from(format!("{}.cowshed-link", config.checkout_path.display())).exists(),
+        "the staging name is cleared"
+    );
+}
 
-    let after = Fixture::new("adopt-after-handoff");
-    let after_config = after.config();
-    let after_layout = StorageLayout::new(&after.root, &repo()).expect("layout");
-    let after_canonical = after_layout
-        .main_image(ImageFormat::Sparse)
-        .expect("canonical");
-    let after_staged = after_layout
+#[test]
+fn adopt_link_refuses_to_aim_the_checkout_at_an_unmounted_directory() {
+    let fixture = Fixture::new("adopt-link-unmounted");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical_mount = layout
+        .workspace_mount(&WorkspaceName::new("main").expect("main"))
+        .expect("canonical mount");
+    std::fs::create_dir_all(&canonical_mount).expect("canonical mount");
+    std::fs::create_dir_all(&config.checkout_path).expect("source");
+    std::fs::write(config.checkout_path.join("tracked"), b"source").expect("source file");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
+
+    // No kernel mount at the canonical path: the symlink would resolve to a bare stub directory.
+    let error = native_host(&fixture, RecordingRunner::default())
+        .link_adopted_checkout(&canonical_mount, &config.checkout_path, &pre_cowshed)
+        .expect_err("unmounted canonical mount");
+    assert_eq!(error.disposition(), PublicationDisposition::RolledBack);
+    assert_eq!(
+        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
+        b"source"
+    );
+    assert!(!pre_cowshed.exists());
+}
+
+#[test]
+fn adopt_recovery_completes_publication_after_restart_without_the_checkout() {
+    // Adoption's durable state is built before the checkout changes hands, so the resumable crash
+    // point is "mount and image exist, swap still pending" — recovery needs nothing from the
+    // user's tree to finish it, and `.pre-cowshed` does not exist yet at this point.
+    let fixture = Fixture::new("adopt-recovery");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let canonical_mount = main_mount(&fixture);
+    let staged = layout
         .project()
         .project_root
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
-    create_image(&after_staged, ImageFormat::Sparse);
-    std::fs::create_dir_all(&after_config.checkout_path).expect("source");
-    std::fs::write(after_config.checkout_path.join("tracked"), b"source").expect("source file");
-    let after_pre = PathBuf::from(format!(
-        "{}.pre-cowshed",
-        after_config.checkout_path.display()
-    ));
-    std::fs::rename(&after_config.checkout_path, &after_pre).expect("simulate handoff crash");
+    create_image(&staged, ImageFormat::Sparse);
+    std::fs::create_dir_all(&config.checkout_path).expect("source");
+    std::fs::write(config.checkout_path.join("tracked"), b"source").expect("source file");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
 
-    native_host(&after, RecordingRunner::default())
-        .recover_pending(&after_config, &[])
-        .expect("post-handoff recovery");
-    assert!(after_canonical.image().exists());
-    assert!(!after_staged.exists());
+    native_host(&fixture, RecordingRunner::default())
+        .recover_pending(&config, &[])
+        .expect("recovery completes publication");
+
+    assert!(canonical.image().exists());
+    assert!(!staged.exists());
     assert_eq!(
-        std::fs::read(after_config.checkout_path.join(".envrc")).expect("stub"),
+        std::fs::read(canonical_mount.join(".envrc")).expect("stub"),
         b"cowshed ensure --attach\n"
     );
     assert_eq!(
-        std::fs::read(after_pre.join("tracked")).expect("retained source"),
+        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
         b"source"
     );
+    assert!(!pre_cowshed.exists());
 }
 
 #[test]
@@ -3352,7 +3407,7 @@ fn kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         let source = FakeKernelMountSource::default();
         source.set(vec![KernelMountSnapshot::new(
             91,
-            fixture.config().checkout_path,
+            main_mount(&fixture),
             "/dev/disk10s1",
             nobrowse,
             owners,
@@ -3556,7 +3611,7 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
     std::fs::create_dir_all(&config.checkout_path).expect("source checkout");
     std::fs::write(config.checkout_path.join("tracked"), b"original source").expect("source bytes");
     let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
-    std::fs::rename(&config.checkout_path, &pre_cowshed).expect("simulate completed handoff");
+    let canonical_mount = main_mount(&fixture);
 
     let host = native_host(&fixture, RecordingRunner::default());
     host.recover_pending(&config, &[])
@@ -3567,11 +3622,14 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
         b"complete adopted image"
     );
     DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+    // GC and recovery converge on the durable half of adoption without ever reaching for the
+    // user's tree: the checkout is still the original directory and the swap is still pending.
     assert_eq!(
-        std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
+        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
         b"original source"
     );
-    assert!(config.checkout_path.is_dir());
+    assert!(!pre_cowshed.exists());
+    assert!(canonical_mount.join(".envrc").exists());
     assert!(!staged.exists());
     assert!(!sidecar_path(&staged).exists());
 
@@ -3651,14 +3709,10 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
         std::fs::create_dir_all(&config.checkout_path).expect("source");
         std::fs::write(config.checkout_path.join("tracked"), b"original").expect("source bytes");
         let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
+        let canonical_mount = main_mount(&fixture);
         let host = native_host(&fixture, RecordingRunner::default());
         host.set_restore_failpoint(failpoint);
-        let result = host.publish_adopt(
-            &config.checkout_path,
-            &pre_cowshed,
-            &staged,
-            canonical.image(),
-        );
+        let result = host.publish_adopt(&canonical_mount, &staged, canonical.image());
         if matches!(
             failpoint,
             RestoreFailpoint::AfterCanonicalSidecarRename
@@ -3666,18 +3720,8 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
                 | RestoreFailpoint::AfterCanonicalCompanionRename
         ) {
             result.expect_err("prepublication adopt failure");
-            assert_eq!(
-                std::fs::read(config.checkout_path.join("tracked")).expect("restored source"),
-                b"original"
-            );
-            assert!(!pre_cowshed.exists());
             native_host(&fixture, RecordingRunner::default())
-                .publish_adopt(
-                    &config.checkout_path,
-                    &pre_cowshed,
-                    &staged,
-                    canonical.image(),
-                )
+                .publish_adopt(&canonical_mount, &staged, canonical.image())
                 .expect("adopt retry");
         } else {
             result.expect("durable adopt pair recovers as success");
@@ -3687,15 +3731,14 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
             b"adopted generation"
         );
         DetachedWorkspaceMetadata::read_for_image(canonical.image()).expect("canonical metadata");
+        // Publication never touches the user's tree, so no failpoint in it can lose the original:
+        // the checkout is still the original directory and nothing has been moved aside.
         assert_eq!(
-            std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
+            std::fs::read(config.checkout_path.join("tracked")).expect("untouched original"),
             b"original"
         );
-        assert!(
-            !config.checkout_path.join("tracked").exists(),
-            "nonempty original must never remain beneath the mountpoint"
-        );
-        assert!(config.checkout_path.join(".envrc").exists());
+        assert!(!pre_cowshed.exists());
+        assert!(canonical_mount.join(".envrc").exists());
         let restarted = native_host(&fixture, RecordingRunner::default());
         assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
         execute_gc(&restarted, &config).expect("GC convergence");
@@ -3724,15 +3767,11 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
     )
     .expect("source bytes");
     let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
+    let canonical_mount = main_mount(&fixture);
     let host = native_host(&fixture, RecordingRunner::default());
     host.set_restore_failpoint(RestoreFailpoint::PersistentCanonicalParentFsyncFailure);
     let error = host
-        .publish_adopt(
-            &config.checkout_path,
-            &pre_cowshed,
-            &staged,
-            canonical.image(),
-        )
+        .publish_adopt(&canonical_mount, &staged, canonical.image())
         .expect_err("persistent fsync remains uncertain");
     assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
     assert!(matches!(
@@ -3742,11 +3781,11 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
     assert!(canonical.image().exists());
     assert!(sidecar_path(canonical.image()).exists());
     assert_eq!(
-        std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
+        std::fs::read(config.checkout_path.join("tracked")).expect("untouched original"),
         b"irreplaceable original"
     );
-    assert!(!config.checkout_path.join("tracked").exists());
-    assert!(config.checkout_path.join(".envrc").exists());
+    assert!(!pre_cowshed.exists());
+    assert!(canonical_mount.join(".envrc").exists());
 
     drop(host);
     let restarted = native_host(&fixture, RecordingRunner::default());
@@ -3762,11 +3801,11 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
             b"durable adopted generation"
         );
         assert_eq!(
-            std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
+            std::fs::read(config.checkout_path.join("tracked")).expect("untouched original"),
             b"irreplaceable original"
         );
-        assert!(!config.checkout_path.join("tracked").exists());
-        assert!(config.checkout_path.join(".envrc").exists());
+        assert!(!pre_cowshed.exists());
+        assert!(canonical_mount.join(".envrc").exists());
         restarted
             .recover_pending(&config, &[])
             .expect("repeated recovery");
@@ -3792,15 +3831,11 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
     )
     .expect("source bytes");
     let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
+    let canonical_mount = main_mount(&fixture);
     let host = native_host(&fixture, RecordingRunner::default());
     host.set_restore_failpoint(RestoreFailpoint::CanonicalSidecarRollbackFailure);
     let error = host
-        .publish_adopt(
-            &config.checkout_path,
-            &pre_cowshed,
-            &staged,
-            canonical.image(),
-        )
+        .publish_adopt(&canonical_mount, &staged, canonical.image())
         .expect_err("compound publication failure");
     assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
     assert!(matches!(
@@ -3815,11 +3850,11 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
         "canonical sidecar remains the forward reference"
     );
     assert_eq!(
-        std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
+        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
         b"irreplaceable source"
     );
-    assert!(!config.checkout_path.join("tracked").exists());
-    assert!(config.checkout_path.join(".envrc").exists());
+    assert!(!pre_cowshed.exists());
+    assert!(canonical_mount.join(".envrc").exists());
 
     drop(host);
     let restarted = native_host(&fixture, RecordingRunner::default());
@@ -3838,8 +3873,8 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
         .recover_pending(&config, &[])
         .expect("idempotent recovery");
     assert_eq!(
-        std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
+        std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
         b"irreplaceable source"
     );
-    assert!(!config.checkout_path.join("tracked").exists());
+    assert!(!pre_cowshed.exists());
 }

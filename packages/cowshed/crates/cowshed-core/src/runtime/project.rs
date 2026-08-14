@@ -1748,13 +1748,11 @@ impl NativeProjectRuntimeHost {
     }
 
     fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
-        if workspace.is_main() {
-            Ok(self.descriptor.git_root.clone())
-        } else {
-            self.layout
-                .workspace_mount(workspace)
-                .map_err(native_integrity_error)
-        }
+        // Main is not special in the mount namespace. The adopted checkout path reaches this same
+        // directory through a symlink, but the mount itself lives where every workspace's does.
+        self.layout
+            .workspace_mount(workspace)
+            .map_err(native_integrity_error)
     }
 
     fn snapshot(&self, workspace: &NativeWorkspace) -> Result<WorkspaceSnapshot> {
@@ -1990,12 +1988,11 @@ impl NativeProjectRuntimeHost {
                 "restore the exact .pre-cowshed tree or move the collision aside",
             )
         })?;
-        if !path_metadata.file_type().is_dir() || path_metadata.file_type().is_symlink() {
-            return Err(CowshedError::conflict(
-                format!("{description} is not the exact retained checkout directory"),
-                "restore the exact .pre-cowshed tree or move the collision aside",
-            ));
-        }
+        let main_mount =
+            self.workspace_mount_path(&WorkspaceName::new("main").expect("fixed main"))?;
+        let resolved =
+            resolve_checkout_identity_path(path, &path_metadata, &main_mount, description).await?;
+        let path = resolved.as_path();
         let git = crate::git::GitRepository::discover(path)
             .await
             .map_err(|_| {
@@ -4829,6 +4826,48 @@ fn native_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "cowshed doctor --json")
 }
 
+/// Decide which path a checkout-identity check should actually inspect.
+///
+/// Exactly one symlink is legitimate at a checkout path: the one adoption plants there, aimed at
+/// main's own mount. It is accepted only when it resolves to precisely that mount, and the
+/// identity checks then run against the resolved target. Every other symlink is an unrelated path
+/// standing where the checkout belongs, and stays a conflict — the check narrows, never inverts.
+async fn resolve_checkout_identity_path(
+    path: &Path,
+    path_metadata: &std::fs::Metadata,
+    main_mount: &Path,
+    description: &str,
+) -> Result<PathBuf> {
+    if path_metadata.file_type().is_symlink() {
+        let target = tokio::fs::canonicalize(path).await.map_err(|_| {
+            CowshedError::conflict(
+                format!("{description} is a symlink that does not resolve"),
+                "restore the exact .pre-cowshed tree or move the collision aside",
+            )
+        })?;
+        let canonical_main = tokio::fs::canonicalize(main_mount).await.map_err(|_| {
+            CowshedError::conflict(
+                format!("{description} cannot be compared against main's mount"),
+                "restore the exact .pre-cowshed tree or move the collision aside",
+            )
+        })?;
+        if target != canonical_main {
+            return Err(CowshedError::conflict(
+                format!("{description} is a symlink to something other than main's mount"),
+                "move the unrelated symlink aside and retry",
+            ));
+        }
+        return Ok(target);
+    }
+    if path_metadata.file_type().is_dir() {
+        return Ok(path.to_owned());
+    }
+    Err(CowshedError::conflict(
+        format!("{description} is not the exact retained checkout directory"),
+        "restore the exact .pre-cowshed tree or move the collision aside",
+    ))
+}
+
 #[cfg(target_os = "macos")]
 fn native_finding(
     code: &str,
@@ -4915,7 +4954,6 @@ mod binding_tests {
         assert!(error.hint.contains("upstream/widget"));
     }
 
-    #[test]
     /// A local-path backup remote is ordinary Git and yields no owner/repo. It
     /// must not brick a checkout whose other remotes identify it perfectly well
     /// — that failure reached every command, including read-only ones.
@@ -4967,6 +5005,52 @@ mod binding_tests {
         );
     }
     #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn checkout_identity_accepts_only_the_symlink_into_mains_mount() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-checkout-identity-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let main_mount = root.join("mnt").join("main");
+        let elsewhere = root.join("elsewhere");
+        let checkout = root.join("project");
+        std::fs::create_dir_all(&main_mount).expect("main mount");
+        std::fs::create_dir_all(&elsewhere).expect("foreign target");
+
+        // The symlink adoption plants: accepted, and it resolves to main's mount.
+        std::os::unix::fs::symlink(&main_mount, &checkout).expect("adopted symlink");
+        let metadata = std::fs::symlink_metadata(&checkout).expect("symlink metadata");
+        let resolved =
+            resolve_checkout_identity_path(&checkout, &metadata, &main_mount, "checkout")
+                .await
+                .expect("adopted symlink is accepted");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&main_mount).expect("canonical main mount")
+        );
+
+        // A symlink to anything else stays a conflict.
+        std::fs::remove_file(&checkout).expect("clear symlink");
+        std::os::unix::fs::symlink(&elsewhere, &checkout).expect("foreign symlink");
+        let metadata = std::fs::symlink_metadata(&checkout).expect("symlink metadata");
+        resolve_checkout_identity_path(&checkout, &metadata, &main_mount, "checkout")
+            .await
+            .expect_err("a foreign symlink is not the adopted checkout");
+
+        // A real directory is inspected in place, exactly as before.
+        std::fs::remove_file(&checkout).expect("clear symlink");
+        std::fs::create_dir_all(&checkout).expect("real checkout");
+        let metadata = std::fs::symlink_metadata(&checkout).expect("directory metadata");
+        assert_eq!(
+            resolve_checkout_identity_path(&checkout, &metadata, &main_mount, "checkout")
+                .await
+                .expect("a real directory is accepted"),
+            checkout
+        );
+
+        std::fs::remove_dir_all(&root).expect("fixture cleanup");
+    }
+
     #[tokio::test]
     async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
         use crate::api::dto::Sha256Digest;

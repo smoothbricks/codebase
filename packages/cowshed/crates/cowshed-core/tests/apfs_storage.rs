@@ -444,18 +444,30 @@ impl ApfsExecutionHost for FakeHost {
     }
     fn publish_adopt(
         &self,
-        _: &Path,
-        _: &Path,
+        canonical_mount: &Path,
         staged: &Path,
         _: &Path,
     ) -> Result<(), PublicationError> {
-        self.record("atomic-adopt-handoff+publish");
+        self.record("atomic-adopt-mountpoint+publish");
+        self.record_path(canonical_mount);
         let mut state = self.state.lock().expect("fake state");
         if let Some(fact) = state.staged.remove(staged) {
             let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
             state.formats.insert(key.clone(), fact.workspace.format());
             state.published.insert(key, fact);
         }
+        Ok(())
+    }
+    fn link_adopted_checkout(
+        &self,
+        canonical_mount: &Path,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
+    ) -> Result<(), PublicationError> {
+        self.record("atomic-adopt-checkout-swap");
+        self.record_path(canonical_mount);
+        self.record_path(source_checkout);
+        self.record_path(pre_cowshed_checkout);
         Ok(())
     }
     fn publish_metadata(
@@ -574,15 +586,12 @@ impl ApfsExecutionHost for FakeHost {
         Ok(cowshed_core::storage::apfs::PendingPublicationFact {
             workspace: workspace.clone(),
             image: canonical.to_owned(),
-            mount_point: if workspace.name().is_main() {
-                PathBuf::from("/project")
-            } else {
-                PathBuf::from(format!(
-                    "/store/mnt/{}/{}",
-                    workspace.repo(),
-                    workspace.name()
-                ))
-            },
+            // Uniform mount namespace: main is not special.
+            mount_point: PathBuf::from(format!(
+                "/store/mnt/{}/{}",
+                workspace.repo(),
+                workspace.name()
+            )),
             source_checkpoint: source_image
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -672,11 +681,11 @@ impl ApfsExecutionHost for FakeHost {
                 |(image, fact)| cowshed_core::storage::apfs::PendingPublicationFact {
                     workspace: fact.workspace.clone(),
                     image: image.clone(),
-                    mount_point: if fact.workspace.name().is_main() {
-                        PathBuf::from("/project")
-                    } else {
-                        PathBuf::from(format!("/store/mnt/{}", fact.workspace.name()))
-                    },
+                    mount_point: PathBuf::from(format!(
+                        "/store/mnt/{}/{}",
+                        fact.workspace.repo(),
+                        fact.workspace.name()
+                    )),
                     source_checkpoint: "checkpoint-source".to_owned(),
                     source_incarnation: WorkspaceIncarnation::new(
                         "ffffffffffffffffffffffffffffffff",
@@ -929,7 +938,7 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             assert!(
                 !callback_host
                     .events()
-                    .contains(&"atomic-adopt-handoff+publish".to_owned())
+                    .contains(&"atomic-adopt-mountpoint+publish".to_owned())
             );
             callback_host.record("controller-initialize");
             Ok::<(), &'static str>(())
@@ -964,11 +973,14 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "validate-staged-companion",
             "validate-marker",
             "detach:false",
-            "atomic-adopt-handoff+publish",
+            // Durable state first, entirely outside the user's tree...
+            "atomic-adopt-mountpoint+publish",
             "attach-no-mount+fsck:Sparse",
             "mount:Sparse",
             "validate-marker",
             "retain-mounted",
+            // ...and only once main is mounted and live does the checkout path change hands.
+            "atomic-adopt-checkout-swap",
         ]
     );
     assert_eq!(
@@ -1023,7 +1035,7 @@ async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     assert!(events.contains(&"controller-rejected".to_owned()));
     assert!(events.contains(&"detach:false".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"atomic-adopt-handoff+publish".to_owned()));
+    assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
     assert!(!events.contains(&"retain-mounted".to_owned()));
 }
 
@@ -1052,7 +1064,7 @@ async fn credential_mint_failure_reclaims_adopt_stage_before_publication() {
     assert!(events.contains(&"detach:false".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"write-marker".to_owned()));
-    assert!(!events.contains(&"atomic-adopt-handoff+publish".to_owned()));
+    assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
     assert!(host.list(&repo()).expect("post-failure listing").is_empty());
 }
 
@@ -1084,7 +1096,7 @@ async fn initializer_and_cleanup_errors_are_both_preserved() {
     assert!(
         !host
             .events()
-            .contains(&"atomic-adopt-handoff+publish".to_owned())
+            .contains(&"atomic-adopt-mountpoint+publish".to_owned())
     );
 }
 
@@ -1119,7 +1131,7 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
         assert!(matches!(
             error,
             AdoptExecutionError::Storage(ApfsStorageError::InvalidPlan(
-                "adopt source must equal operation project root and canonical main mount"
+                "adopt source must equal operation project root and the configured checkout path"
             ))
         ));
         assert_eq!(host.events(), ["lock:1", "observe"]);
@@ -1150,7 +1162,7 @@ async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
         .await
         .expect("already mounted");
 
-    assert_eq!(path, PathBuf::from("/project"));
+    assert_eq!(path, PathBuf::from("/store/mnt/acme/widget/main"));
     assert!(
         !host
             .events()
@@ -1710,7 +1722,7 @@ async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
     let events = host.events();
     assert!(events.contains(&"detach:false".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"atomic-adopt-handoff+publish".to_owned()));
+    assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
 }
 
 #[tokio::test]

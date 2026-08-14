@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use cowshed_core::metadata::{GrantSet, ImageFormat, PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
-use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
     ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig, IncarnationSource, TokioApfsBlockingLane,
@@ -21,6 +20,7 @@ use cowshed_core::storage::lifecycle::{
     AdoptRequest, Destination, LifecyclePlanner, MountIntent, OperationIdentity, Pin, RestoreMode,
     Revision, Substrate,
 };
+use cowshed_core::storage::{CheckpointLabel, StorageLayout};
 
 struct IntegrationRoot {
     path: PathBuf,
@@ -196,13 +196,28 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             ))
             .into());
         }
+        // Main mounts under the store's mount root like every other workspace, and the adopted
+        // checkout path is a symlink into it.
+        let canonical_mount =
+            StorageLayout::new(&store, &repo)?.workspace_mount(&WorkspaceName::new("main")?)?;
         assert_eq!(
             substrate
                 .ensure_mounted(&main, MountIntent { browse: false })
                 .await
                 .map_err(|error| std::io::Error::other(format!("ensure main: {error}")))?,
-            checkout_path
+            canonical_mount
         );
+        assert_eq!(fs::read_link(&checkout_path)?, canonical_mount);
+        assert_eq!(
+            fs::canonicalize(&checkout_path)?,
+            fs::canonicalize(&canonical_mount)?,
+            "the familiar path resolves to the canonical mount"
+        );
+        assert!(
+            PathBuf::from(format!("{}.pre-cowshed", checkout_path.display())).is_dir(),
+            "the original tree is retained beside the checkout"
+        );
+        // Everything below reaches the workspace through the symlink, exactly as the user does.
         let mounted_root = fs::metadata(&checkout_path)?;
         assert_eq!(mounted_root.uid(), unsafe { libc::getuid() });
         assert_eq!(mounted_root.gid(), unsafe { libc::getgid() });
