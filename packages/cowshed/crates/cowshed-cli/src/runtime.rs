@@ -54,6 +54,7 @@ pub trait CliService: Send {
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo>;
     async fn create(&mut self, name: &str, options: CreateOptions) -> Result<WorkspaceInfo>;
     async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
+    async fn rename(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
     async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
     async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport>;
@@ -93,6 +94,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         Command::Adopt(_) => RuntimeOpenMode::Provision,
         Command::New(_)
         | Command::Fork(_)
+        | Command::Move(_)
         | Command::Checkpoint(_)
         | Command::Restore(_)
         | Command::Ensure(_)
@@ -226,6 +228,14 @@ impl CliService for ActorBridge {
         Ok(self
             .coordinator()?
             .fork(source, destination)
+            .await?
+            .into_info())
+    }
+
+    async fn rename(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo> {
+        Ok(self
+            .coordinator()?
+            .rename(source, destination)
             .await?
             .into_info())
     }
@@ -542,6 +552,15 @@ where
             emit_mount(output, json, &info)?;
             output
                 .hint(&format!("cowshed exec {} -- <cmd>", args.name))
+                .map_err(output_error)?;
+            Ok(success())
+        }
+        Command::Move(args) => {
+            let info = service.rename(&args.source, &args.destination).await?;
+            service.reconcile_gateway().await?;
+            emit_mount(output, json, &info)?;
+            output
+                .hint(&format!("cowshed exec {} -- <cmd>", args.destination))
                 .map_err(output_error)?;
             Ok(success())
         }

@@ -84,6 +84,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
         source: WorkspaceName,
         destination: WorkspaceName,
     ) -> Result<WorkspaceSnapshot>;
+    async fn rename(
+        &mut self,
+        source: WorkspaceName,
+        destination: WorkspaceName,
+    ) -> Result<WorkspaceSnapshot>;
     async fn ensure(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::EnsureReport>;
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
@@ -313,6 +318,7 @@ impl ProjectActor {
             "coordinator.adopt" => self.coordinator_adopt(request).await,
             "coordinator.create" => self.coordinator_create(request).await,
             "coordinator.fork" => self.coordinator_fork(request).await,
+            "coordinator.rename" => self.coordinator_rename(request).await,
             "coordinator.grant" => self.coordinator_grant(request, false).await,
             "coordinator.revoke" => self.coordinator_grant(request, true).await,
             "coordinator.rebase" => self.coordinator_rebase(request).await,
@@ -483,6 +489,14 @@ impl ProjectActor {
         let params: ForkParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         let snapshot = self.host.fork(params.source, params.destination).await?;
+        workspace_response(&snapshot)
+    }
+
+    async fn coordinator_rename(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: ForkParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let snapshot = self.host.rename(params.source, params.destination).await?;
         workspace_response(&snapshot)
     }
 
@@ -2762,6 +2776,72 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             })
             .await?;
         self.ensure_supervisor(&destination).await?;
+        self.snapshot_named(&destination).await
+    }
+
+    /// Renaming is a lifecycle operation for the same reason removal is: the name decides the
+    /// image path, the volume label, the marker, and the mount point, and a workspace cannot be
+    /// renamed out from under its own mount.
+    ///
+    /// It is composed rather than open-coded. A fork to the destination already clones the image,
+    /// mints a fresh incarnation, relabels the volume, rewrites the marker, and publishes the
+    /// result under one crash-safe transaction with its commitment; retiring the source is the
+    /// other half. Same-volume `clonefile` makes the copy free, so the composition costs an
+    /// incarnation and nothing else — and it inherits both transactions' recovery instead of
+    /// needing its own.
+    async fn rename(
+        &mut self,
+        source: WorkspaceName,
+        destination: WorkspaceName,
+    ) -> Result<WorkspaceSnapshot> {
+        if source.is_main() || destination.is_main() {
+            return Err(CowshedError::usage(
+                "main cannot be renamed; its name is fixed by the project layout",
+                "move the project checkout instead: cowshed mv main <path>",
+            ));
+        }
+        if source == destination {
+            return Err(CowshedError::usage(
+                format!("workspace {source} already has that name"),
+                "choose a different destination name",
+            ));
+        }
+        self.validate_binding().await?;
+        let current = self.current(&source).await?;
+        if self
+            .authoritative()
+            .await?
+            .iter()
+            .any(|existing| existing.derived.workspace.name() == &destination)
+        {
+            return Err(CowshedError::conflict(
+                format!("workspace {destination} already exists"),
+                "choose another destination name, or remove the occupant first",
+            ));
+        }
+
+        // Fence before either half runs. The source is about to be retired, so uncommitted or
+        // in-progress work has to be refused here rather than discovered halfway through.
+        let fence = self.removal_git_fence(&current).await?;
+        if fence.dirty || fence.in_progress.is_some() {
+            return Err(CowshedError::conflict(
+                format!("workspace {source} has uncommitted or in-progress Git work"),
+                format!("commit or stash the work, then retry: cowshed mv {source} {destination}"),
+            ));
+        }
+
+        self.fork(source.clone(), destination.clone()).await?;
+        // The work is not being discarded, it is being republished under the destination, so the
+        // unpushed-branch refusal that guards a real removal would be a false alarm here. The
+        // fence above is what makes this safe.
+        self.remove(
+            source,
+            RemoveOptions {
+                force: true,
+                restore: false,
+            },
+        )
+        .await?;
         self.snapshot_named(&destination).await
     }
 
