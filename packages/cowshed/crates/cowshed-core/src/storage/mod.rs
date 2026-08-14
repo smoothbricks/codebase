@@ -8,7 +8,9 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::metadata::{ImageFormat, MetadataError, WorkspaceName};
+use crate::metadata::{
+    CheckoutLayout, CheckoutLayoutRecord, ImageFormat, MetadataError, WorkspaceName,
+};
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
 pub mod apfs;
@@ -162,6 +164,44 @@ impl StorageLayout {
         workspace: &WorkspaceName,
     ) -> Result<PathBuf, StorageLayoutError> {
         checked_child(&self.project.mount_root, workspace.as_str())
+    }
+
+    /// Where this project's `main` mounts.
+    ///
+    /// The record adopt wrote is the authority. Without one there is exactly one inference worth
+    /// making and it is conclusive in the direction it fires: only the symlink layout ever creates
+    /// `mnt/<owner>/<repo>/main`, because under direct mount main mounts at the checkout path and
+    /// that directory is never made. A project with no record and no `mnt/.../main` is either not
+    /// adopted yet — in which case the answer is whatever adopt is about to choose — or it is a
+    /// detached symlink-layout project whose mountpoint `gc` has since removed, and guessing
+    /// between those would silently point every resolver at the wrong path. That case is an error,
+    /// not a default. Callers record whatever they resolve, so the inference runs at most once.
+    pub fn checkout_layout(&self) -> Result<CheckoutLayout, StorageLayoutError> {
+        if let Ok(record) =
+            crate::metadata::read_json::<CheckoutLayoutRecord>(&self.project.checkout_layout)
+        {
+            record.validate()?;
+            return Ok(record.checkout_layout);
+        }
+        if self
+            .workspace_mount(&WorkspaceName::new("main").expect("fixed main"))?
+            .is_dir()
+        {
+            return Ok(CheckoutLayout::Symlink);
+        }
+        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
+            if self.main_image(format)?.image().exists() {
+                return Err(StorageLayoutError::UnrecordedCheckoutLayout);
+            }
+        }
+        Ok(CheckoutLayout::default())
+    }
+
+    pub fn record_checkout_layout(&self, layout: CheckoutLayout) -> Result<(), MetadataError> {
+        crate::metadata::write_json(
+            &self.project.checkout_layout,
+            &CheckoutLayoutRecord::new(layout),
+        )
     }
 
     fn image_below(
@@ -334,6 +374,10 @@ pub enum StorageLayoutError {
     InvalidCheckpointLabel(String),
     #[error("workspace `main` is not a session")]
     MainIsNotSession,
+    #[error(
+        "the project is adopted but records no checkout layout, and its main mountpoint is absent"
+    )]
+    UnrecordedCheckoutLayout,
     #[error("unsafe storage path component {0:?}")]
     UnsafeComponent(String),
     #[error("derived storage path escapes its root")]
@@ -369,6 +413,72 @@ mod tests {
             &RepoId::parse("acme/widget").unwrap(),
         )
         .unwrap()
+    }
+
+    fn layout_under(root: &Path) -> StorageLayout {
+        StorageLayout::new(root, &RepoId::parse("acme/widget").unwrap()).unwrap()
+    }
+
+    fn temp_store(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-layout-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn recorded_checkout_layout_wins_over_every_inference() {
+        let root = temp_store("recorded");
+        let layout = layout_under(&root);
+        fs::create_dir_all(&layout.project().project_root).unwrap();
+        // Plant the shape that would otherwise be read as the symlink layout.
+        fs::create_dir_all(
+            layout
+                .workspace_mount(&WorkspaceName::new("main").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        layout
+            .record_checkout_layout(CheckoutLayout::DirectMount)
+            .unwrap();
+        assert_eq!(
+            layout.checkout_layout().unwrap(),
+            CheckoutLayout::DirectMount
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_layout_is_inferred_only_where_the_inference_is_conclusive() {
+        let root = temp_store("inferred");
+        let layout = layout_under(&root);
+        fs::create_dir_all(&layout.project().project_root).unwrap();
+
+        // Not adopted at all: no image, no mountpoint. Adopt is about to choose and record.
+        assert_eq!(
+            layout.checkout_layout().unwrap(),
+            CheckoutLayout::default(),
+            "an unadopted project has no layout to get wrong"
+        );
+
+        // Adopted, but nothing says where main mounts. Guessing here would silently point every
+        // resolver at the wrong path, so it is an error.
+        let image = layout.main_image(ImageFormat::Sparse).unwrap();
+        fs::create_dir_all(image.image().parent().unwrap()).unwrap();
+        fs::write(image.image(), b"image").unwrap();
+        assert!(matches!(
+            layout.checkout_layout(),
+            Err(StorageLayoutError::UnrecordedCheckoutLayout)
+        ));
+
+        // Only the symlink layout ever creates this directory, so its presence is conclusive.
+        fs::create_dir_all(
+            layout
+                .workspace_mount(&WorkspaceName::new("main").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(layout.checkout_layout().unwrap(), CheckoutLayout::Symlink);
     }
 
     #[test]
