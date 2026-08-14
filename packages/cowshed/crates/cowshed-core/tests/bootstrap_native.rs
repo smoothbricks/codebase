@@ -292,7 +292,7 @@ async fn existing_only_missing_volumes_rejects_before_dispatch_with_adopt_hint()
 
     match error {
         NativeBootstrapError::StorageSetupRequired { actions, hint } => {
-            assert_eq!(hint, "next: cowshed adopt");
+            assert_eq!(hint, "cowshed adopt");
             assert_eq!(
                 actions,
                 ["provision APFS volumes cowshed.store, cowshed.caches"]
@@ -415,7 +415,7 @@ async fn detached_exact_volume_requires_explicit_provisioning_without_prompt() {
     assert!(matches!(
         error,
         NativeBootstrapError::StorageSetupRequired {
-            hint: "next: cowshed adopt",
+            hint: "cowshed adopt",
             ..
         }
     ));
@@ -473,7 +473,7 @@ async fn mismounted_exact_volume_is_rejected_before_existing_only_dispatch() {
     assert!(matches!(
         error,
         NativeBootstrapError::StorageSetupRequired {
-            hint: "next: cowshed adopt",
+            hint: "cowshed adopt",
             ..
         }
     ));
