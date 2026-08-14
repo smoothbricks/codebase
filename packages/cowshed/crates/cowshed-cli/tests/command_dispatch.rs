@@ -419,7 +419,7 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
     let (_, stdout, stderr) = run(&mut service, ["ls"]).await;
     assert_eq!(
         stdout,
-        b"main\tmounted\tmain\t/mnt/main\nzebra\tdetached\tcowshed/zebra\t\n"
+        b"main   mounted   main           /mnt/main\nzebra  detached  cowshed/zebra\n"
     );
     assert!(stderr.is_empty());
 
@@ -485,9 +485,9 @@ async fn list_all_groups_every_project_in_stable_tsv_and_json_shapes() {
     let (_, stdout, stderr) = run(&mut service, ["ls", "--all"]).await;
     assert_eq!(
         stdout,
-        b"alpha/widget\tmain\tmounted\tmain\t/mnt/main\n\
-          alpha/widget\tzebra\tmounted\tcowshed/zebra\t/mnt/zebra\n\
-          zeta/tool\twarp-ceiling\tdetached\tcowshed/warp-ceiling\t\n"
+        b"alpha/widget  main          mounted   main                  /mnt/main\n\
+          alpha/widget  zebra         mounted   cowshed/zebra         /mnt/zebra\n\
+          zeta/tool     warp-ceiling  detached  cowshed/warp-ceiling\n"
     );
     assert!(stderr.is_empty());
     assert_eq!(service.events, ["ls-all"]);
