@@ -255,9 +255,14 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             .workspace;
         let fork_elapsed = fork_started.elapsed();
         churn.finish()?;
+        // Defends CoW-cheap fork lifecycle, not a benchmark: ~1s idle, but
+        // 5s and 10s budgets both flaked under real host contention (5.04s
+        // at load ~20, 12.8s at load ~59). The bound only needs to catch
+        // pathology — a copy-instead-of-clone or sync stall regression sits
+        // far beyond 30s — so it is deliberately generous.
         assert!(
-            fork_elapsed < Duration::from_secs(5),
-            "fork lifecycle exceeded 5 seconds: {fork_elapsed:?}"
+            fork_elapsed < Duration::from_secs(30),
+            "fork lifecycle exceeded 30 seconds: {fork_elapsed:?}"
         );
         let fork_mount = substrate
             .ensure_mounted(&fork, MountIntent { browse: false })
