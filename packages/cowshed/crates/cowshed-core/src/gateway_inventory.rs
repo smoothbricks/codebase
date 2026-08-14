@@ -420,19 +420,22 @@ impl NativeGatewayInventory {
                 image_paths.image(),
                 &workspace.workspace,
             )?;
-            let expected_mount = if workspace.workspace.name().is_main() {
-                let Ok(snapshot) = metadata.require_info_snapshot() else {
-                    continue;
-                };
-                snapshot.project_root.clone()
-            } else {
+            // Main with no recorded info snapshot never finished adoption: its checkout was never
+            // taken over, so nothing should be served from it. This is a deliberate exclusion, not
+            // a side effect of failing to resolve a path — the mount path itself is derivable from
+            // the layout for every workspace.
+            if workspace.workspace.name().is_main() && metadata.require_info_snapshot().is_err() {
+                continue;
+            }
+            // Every workspace including main mounts under the layout's mount root, so the expected
+            // path comes from the layout alone rather than from main's recorded checkout.
+            let expected_mount =
                 layout
                     .workspace_mount(workspace.workspace.name())
                     .map_err(|error| GatewayInventoryError::InvalidMetadata {
                         path: layout.project().mount_root.clone(),
                         message: error.to_string(),
-                    })?
-            };
+                    })?;
             if *mount != expected_mount {
                 return Err(GatewayInventoryError::InvalidMetadata {
                     path: mount.clone(),
@@ -700,27 +703,14 @@ fn expected_mount_paths(
 ) -> Result<BTreeMap<String, PathBuf>, GatewayInventoryError> {
     let mut paths = BTreeMap::new();
     for fact in storage {
-        let mount = if fact.workspace.name().is_main() {
-            let image = canonical_image_paths(layout, &fact.workspace)?;
-            let metadata =
-                DetachedWorkspaceMetadata::read_for_image(image.image()).map_err(|error| {
-                    GatewayInventoryError::InvalidMetadata {
-                        path: sidecar_path(image.image()),
-                        message: error.to_string(),
-                    }
-                })?;
-            let Ok(snapshot) = metadata.require_info_snapshot() else {
-                continue;
-            };
-            snapshot.project_root.clone()
-        } else {
-            layout
-                .workspace_mount(fact.workspace.name())
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().mount_root.clone(),
-                    message: error.to_string(),
-                })?
-        };
+        // Uniform mount namespace: main's expected path comes from the layout like any other
+        // workspace's, not from its metadata snapshot's adopted checkout.
+        let mount = layout
+            .workspace_mount(fact.workspace.name())
+            .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                path: layout.project().mount_root.clone(),
+                message: error.to_string(),
+            })?;
         paths.insert(fact.volume_name.clone(), mount);
     }
     Ok(paths)
@@ -976,18 +966,24 @@ mod tests {
             fs::create_dir_all(image.image().parent().expect("image parent"))
                 .expect("image parent");
             fs::write(image.image(), b"fixture").expect("image");
-            let mount = if name.is_main() {
-                self.root.join(format!("checkout-{}", repo.repo()))
-            } else {
-                layout.workspace_mount(&name).expect("session mount")
-            };
+            // Main mounts under the layout like every other workspace; only its recorded
+            // project_root still points at the adopted checkout outside the store.
+            let mount = layout.workspace_mount(&name).expect("workspace mount");
+            let checkout = self.root.join(format!("checkout-{}", repo.repo()));
+            if name.is_main() && persist_main_root {
+                fs::create_dir_all(&checkout).expect("adopted checkout");
+            }
             let mut grants =
                 GrantSet::closed_baseline(Some(PortBlock::new(40_960, 16).expect("port block")))
                     .expect("grants");
             grants.revision = revision;
             let info_snapshot =
                 (!name.is_main() || persist_main_root).then(|| WorkspaceInfoSnapshot {
-                    project_root: mount.clone(),
+                    project_root: if name.is_main() {
+                        checkout.clone()
+                    } else {
+                        mount.clone()
+                    },
                     role,
                     base_commit: "0123456789abcdef".to_owned(),
                     branch: Some("main".to_owned()),
