@@ -2183,6 +2183,32 @@ pub struct AuditEvent {
     pub trace: TraceContext,
 }
 
+/// Whether one skill install target was rewritten or already held the shipped bytes.
+///
+/// The distinction is the idempotence proof: a second install of an unchanged skill
+/// reports `Unchanged` for every target and touches no file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillInstallStatus {
+    Written,
+    Unchanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillInstall {
+    pub harness: String,
+    pub path: PathBuf,
+    pub status: SkillInstallStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillInstallReport {
+    pub skill: String,
+    pub installs: Vec<SkillInstall>,
+}
+
 mod result_body_seal {
     pub trait Sealed {}
 }
@@ -2221,6 +2247,7 @@ result_bodies!(
     GatewayStatus,
     MirrorInfo,
     AuditEvent,
+    SkillInstallReport,
     Vec<WorkspaceInfo>,
     Vec<JobInfo>,
     Vec<ExecRecord>,

@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls                 list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway";
+pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls                 list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  skill install      install the agent skill";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -37,6 +37,20 @@ pub enum Command {
     Land(LandArgs),
     Doctor,
     Gateway(GatewayCommand),
+    Skill(SkillArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkillCommand {
+    Install,
+}
+
+/// `--harness` names are validated at parse time, so an unknown harness is a
+/// usage error before any directory is touched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillArgs {
+    pub action: SkillCommand,
+    pub harnesses: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,6 +255,7 @@ enum CommandName {
     Land,
     Doctor,
     Gateway,
+    Skill,
 }
 
 pub fn parse_args<I, T>(args: I) -> Result<Cli, UsageError>
@@ -272,6 +287,7 @@ where
         Some("land") => CommandName::Land,
         Some("doctor") => CommandName::Doctor,
         Some("gateway") => CommandName::Gateway,
+        Some("skill") => CommandName::Skill,
         Some(other) => {
             return Err(UsageError::new(
                 format!("unknown command `{other}`"),
@@ -301,6 +317,7 @@ where
         CommandName::Land => parse_land(&args, index, &mut global)?,
         CommandName::Doctor => parse_empty(&args, index, &mut global, "doctor", Command::Doctor)?,
         CommandName::Gateway => parse_gateway(&args, index, &mut global)?,
+        CommandName::Skill => parse_skill(&args, index, &mut global)?,
     };
     Ok(Cli { global, command })
 }
@@ -340,6 +357,76 @@ fn parse_gateway(
         ));
     }
     Ok(Command::Gateway(action))
+}
+
+fn parse_skill(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "skill install [--harness <name>] [--project <path>]";
+    let action = match args.get(index).and_then(|argument| argument.to_str()) {
+        Some("install") => SkillCommand::Install,
+        Some(other) => {
+            return Err(UsageError::new(
+                format!("unknown skill action `{other}`"),
+                USAGE,
+            ));
+        }
+        None => return Err(UsageError::new("skill action is required", USAGE)),
+    };
+    index += 1;
+
+    let mut harnesses = Vec::new();
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--harness") => {
+                let value = take_value(args, &mut index, "--harness", USAGE)?;
+                let name = value
+                    .to_str()
+                    .ok_or_else(|| {
+                        UsageError::new("--harness requires a UTF-8 harness name", USAGE)
+                    })?
+                    .to_owned();
+                if !harnesses.contains(&name) {
+                    harnesses.push(name);
+                }
+            }
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ => {
+                let argument = args[index].to_string_lossy();
+                return Err(UsageError::new(
+                    format!("unexpected skill argument `{argument}`"),
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    // The scope decides which harness names exist, so validation waits until
+    // --project has been seen wherever it appears in the argument list.
+    let scope = if global.project.is_some() {
+        crate::skill::Scope::Project
+    } else {
+        crate::skill::Scope::Global
+    };
+    for name in &harnesses {
+        if crate::skill::harness_named(scope, name).is_none() {
+            return Err(UsageError::new(
+                format!(
+                    "unknown harness `{name}`; this scope installs for {}",
+                    crate::skill::harness_names(scope)
+                ),
+                USAGE,
+            ));
+        }
+    }
+
+    Ok(Command::Skill(SkillArgs { action, harnesses }))
 }
 
 fn parse_global(
