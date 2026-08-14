@@ -568,14 +568,19 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
 }
 
 function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean): TargetConfiguration {
-  const configFlag = hasDedicatedBunfig ? ' --config=bunfig.napi-test.toml' : '';
+  const configFlag = hasDedicatedBunfig ? ' --config=../bunfig.napi-test.toml' : ' --config=../bunfig.toml';
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     dependsOn: ['cargo-test', 'cargo-napi', 'tsc-js', '^build', 'build'],
     options: {
-      command: `bun${configFlag} test --timeout=30000 src/native.test.ts`,
-      cwd: projectRoot,
+      // cwd is src/, not the package root: `bun test <arg>` treats the arg as
+      // a FILTER and scans the whole cwd tree for test files, and a Rust
+      // package's cargo target/ directory turns that scan into tens of
+      // seconds. bun only auto-loads bunfig from the cwd, so the package
+      // config is passed explicitly.
+      command: `bun test${configFlag} --timeout=30000 native.test.ts`,
+      cwd: `${projectRoot}/src`,
       timeoutMs: 120000,
       killAfterMs: 10000,
     },
