@@ -58,6 +58,7 @@ pub trait CliService: Send {
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
     async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
     async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport>;
+    async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo>;
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>>;
     async fn path(&mut self, workspace: &str, no_attach: bool) -> Result<WorkspaceInfo>;
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<()>;
@@ -264,6 +265,15 @@ impl CliService for ActorBridge {
             .workspace_at(path)
             .await?
             .ensure()
+            .await
+    }
+
+    async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo> {
+        self.coordinator()?
+            .project()
+            .workspace_at(path)
+            .await?
+            .refresh_info()
             .await
     }
 
@@ -575,9 +585,10 @@ where
             Ok(success())
         }
         Command::Checkpoint(args) => {
+            let workspace = resolve_workspace(service, args.workspace, "checkpoint").await?;
             let label = service
                 .checkpoint(
-                    &args.workspace,
+                    &workspace,
                     CheckpointOptions {
                         label: args.label.map(os_utf8).transpose()?,
                         keep: args.keep,
@@ -633,7 +644,8 @@ where
             Ok(success())
         }
         Command::Path(args) => {
-            let info = service.path(&args.workspace, args.no_attach).await?;
+            let workspace = resolve_workspace(service, args.workspace, "path").await?;
+            let info = service.path(&workspace, args.no_attach).await?;
             if !args.no_attach {
                 service.reconcile_gateway().await?;
             }
@@ -741,6 +753,7 @@ where
             Ok(success())
         }
         Command::Push(args) => {
+            let workspace = resolve_workspace(service, args.workspace, "push").await?;
             let options = PushOptions {
                 branch: args.branch.map(os_branch).transpose()?,
                 expected_workspace_incarnation: args
@@ -753,7 +766,7 @@ where
                     .map(os_expected_ref)
                     .transpose()?,
             };
-            let report = service.push(&args.workspace, options).await?;
+            let report = service.push(&workspace, options).await?;
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else {
@@ -762,6 +775,7 @@ where
             Ok(success())
         }
         Command::Rebase(args) => {
+            let workspace = resolve_workspace(service, args.workspace, "rebase").await?;
             let options = RebaseOptions {
                 onto: args.onto.map(os_revision).transpose()?,
                 fresh: args.fresh,
@@ -772,7 +786,7 @@ where
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_onto_head: args.expected_onto_head.map(os_git_oid).transpose()?,
             };
-            let oid = service.rebase(&args.workspace, options).await?;
+            let oid = service.rebase(&workspace, options).await?;
             if json {
                 output
                     .success(RevisionResult { oid: oid.clone() })
@@ -916,6 +930,35 @@ fn os_expected_ref(value: std::ffi::OsString) -> Result<ExpectedRefHead> {
         Ok(ExpectedRefHead::Missing)
     } else {
         os_git_oid(value).map(ExpectedRefHead::Oid)
+    }
+}
+
+/// Resolve a `<ws>` argument, falling back to the workspace the command was run inside.
+///
+/// An explicit argument always wins — inference never overrides what the caller named. Otherwise
+/// the cwd is resolved the way `ensure` already resolves it: containment in exactly one currently
+/// mounted workspace, which is authoritative because mount identity is keyed off the in-image
+/// marker, and which already refuses an ambiguous match rather than picking one.
+///
+/// Only verbs that act on a workspace *in place* get this. Verbs that retire, replace, rename, or
+/// unmount one require it to be named, so that losing the workspace you are standing in is always
+/// something you asked for by name rather than something the cwd decided for you.
+async fn resolve_workspace(
+    service: &mut dyn CliService,
+    workspace: Option<String>,
+    verb: &str,
+) -> Result<String> {
+    if let Some(workspace) = workspace {
+        return Ok(workspace);
+    }
+    let cwd = invocation_cwd()?;
+    match service.workspace_at(cwd).await {
+        Ok(info) => Ok(info.workspace.to_string()),
+        Err(error) if error.code == ErrorCode::NotFound => Err(usage(
+            format!("{verb} requires a workspace"),
+            format!("name one — cowshed {verb} <ws> — or run it inside a mounted workspace"),
+        )),
+        Err(error) => Err(error),
     }
 }
 

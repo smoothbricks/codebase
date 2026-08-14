@@ -228,6 +228,26 @@ trades workspace-path uniqueness for warmth and only one workspace may hold a sl
 - Output stability: bare-stdout shapes and JSON keys are covered by CLI contract tests (08_testing.md); changing them is
   a breaking change.
 
+### Inferring `<ws>` from the working directory
+
+A command run inside a mounted workspace may omit that workspace's name. Resolution is the one `ensure` already uses —
+containment of the canonical cwd in exactly one currently mounted workspace (01_storage.md), which is exact because
+mount identity is keyed off the in-image marker, and which refuses an ambiguous match rather than picking one. An
+explicit argument always wins; inference never overrides what the caller named. Outside any workspace the refusal
+stands and names both ways out: name one, or run the command from inside one.
+
+The split is by what the verb does to the workspace, not by convenience:
+
+| Infers from cwd                                  | Requires the name                                         |
+| ------------------------------------------------ | ----------------------------------------------------------- |
+| `rebase`, `push`, `checkpoint`, `path`, `ensure` | `rm`, `land`, `restore`, `mv`, `attach`, `detach`, `exec` |
+
+Verbs that act on a workspace **in place** infer it. Verbs that **retire it** (`rm`, `land`), **replace it** (`restore`
+mints a fresh incarnation over the running one), **rename or move it** (`mv`), or **change its mount** (`attach`,
+`detach`) require it to be named, so that losing the workspace you are standing in is always something you asked for by
+name rather than something the working directory decided for you. `exec` is excluded for a second reason as well: its
+workspace argument is positionally ambiguous with the command it runs.
+
 ## Configuration
 
 None required. `cowshed adopt` through daily use works with zero files. Optional `.cowshed.toml` at the repo root, all
