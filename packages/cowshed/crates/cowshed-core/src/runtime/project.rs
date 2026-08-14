@@ -375,12 +375,24 @@ impl ProjectActor {
         require_coordinator(request.authority())?;
         let params: ProjectOpenParams = decode_params(request.params(), request.method())?;
         let requested = canonical_input_path(&params.path)?;
-        if requested != self.host.descriptor().git_root {
+        // The caller names where it is; the descriptor names the project. They are the same
+        // directory when the caller stands in main's checkout, and different ones whenever it
+        // stands in a workspace mount — which is the arrangement `cowshed rebase` and friends
+        // support by inferring their workspace from the cwd. String identity therefore refused the
+        // very callers the inference exists for, so the question asked is the one that matters:
+        // does the requested path belong to this project? A path resolving to the bound root does,
+        // and so does a workspace mount whose marker records that root.
+        let bound = self.host.descriptor().git_root.clone();
+        let belongs = names_one_root(&requested, &bound)
+            || marker_project_root(&requested)
+                .await?
+                .is_some_and(|root| names_one_root(&root, &bound));
+        if !belongs {
             return Err(CowshedError::conflict(
                 format!(
-                    "project path {} does not match bound git root {}",
+                    "project path {} does not belong to the bound project at {}",
                     requested.display(),
-                    self.host.descriptor().git_root.display()
+                    bound.display()
                 ),
                 "reopen the controller for the requested repository",
             ));
@@ -4683,6 +4695,23 @@ fn persistable_remote_url(value: &str) -> Option<String> {
 #[cfg(any(target_os = "macos", test))]
 fn binding_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "repair the repository binding")
+}
+
+/// The project checkout a path's workspace marker records, if it carries one.
+///
+/// Portable because the router needs it on every target: a marker is plain metadata, and the
+/// question "which project does this directory belong to" has nothing platform-specific in it.
+async fn marker_project_root(path: &Path) -> Result<Option<PathBuf>> {
+    let marker_path = path.join(crate::storage::WORKSPACE_MARKER_PATH);
+    let marker = crate::storage::lifecycle::dispatch_blocking(move || {
+        match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
+            Ok(marker) => Ok(Some(marker)),
+            Err(_) => Ok::<_, CowshedError>(None),
+        }
+    })
+    .await
+    .map_err(|error| CowshedError::internal(format!("workspace marker task failed: {error}")))??;
+    Ok(marker.map(|marker| marker.project_root))
 }
 
 /// What a workspace marker tells an opening controller about the project it belongs to.

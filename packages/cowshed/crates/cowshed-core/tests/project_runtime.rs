@@ -1552,6 +1552,74 @@ async fn moving_the_checkout_and_ensuring_from_an_alias_both_move_the_recorded_p
     );
 }
 
+/// A coordinator verb invoked from inside a workspace opens the project it belongs to. The
+/// workspace mount is a standalone repository, so the path the caller sends is that mount and not
+/// the project's checkout; demanding they be the same string refused the very callers that infer
+/// their workspace from the cwd. A path outside the project is still refused.
+#[tokio::test]
+async fn opening_the_project_accepts_a_workspace_mount_and_still_refuses_a_stranger() {
+    let root = test_root();
+    let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
+    adopt(&router, &repo).await;
+    let checkout = root.join("checkout");
+
+    let opened = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.open",
+        json!({ "path": checkout }),
+    )
+    .await
+    .expect("main's checkout opens the project");
+    assert_eq!(
+        opened["gitRoot"].as_str().expect("git root"),
+        checkout.to_string_lossy()
+    );
+
+    // A workspace mount carrying this project's marker belongs to it, though its path differs.
+    let mount = root.join("mnt/task");
+    std::fs::create_dir_all(mount.join(".cowshed")).expect("workspace mount");
+    std::fs::write(
+        mount.join(".cowshed/workspace.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "repoId": repo,
+            "projectRoot": checkout,
+            "workspace": "task",
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "role": "workspace",
+            "imageFormat": "asif",
+            "baseCommit": "0123456789abcdef",
+            "createdAt": "2026-07-13T00:00:00Z",
+            "createdTrace": "fixture",
+        }))
+        .expect("marker bytes"),
+    )
+    .expect("write marker");
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "project.open",
+        json!({ "path": mount }),
+    )
+    .await
+    .expect("a workspace mount opens its own project");
+
+    // A directory with no marker and no relation to the project is still not this project.
+    let stranger = root.join("stranger");
+    std::fs::create_dir_all(&stranger).expect("stranger");
+    assert!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "project.open",
+            json!({ "path": stranger }),
+        )
+        .await
+        .is_err()
+    );
+}
+
 #[tokio::test]
 async fn workspace_at_rejects_ambiguous_nested_active_mounts() {
     let root = test_root();
