@@ -433,9 +433,7 @@ impl GitRepository {
         // former spelling, and must: left alone it points at the recorded checkout path, which is
         // the wrong path under the symlink layout and stale after any `cowshed mv`.
         if self.remote_url(LEGACY_MAIN_REMOTE).await?.is_some() {
-            let output = self
-                .run(["remote", "remove", LEGACY_MAIN_REMOTE])
-                .await?;
+            let output = self.run(["remote", "remove", LEGACY_MAIN_REMOTE]).await?;
             ensure_git_success("remove superseded host remote", output)?;
         }
         match self.remote_url(MAIN_REMOTE).await? {
@@ -504,11 +502,7 @@ impl GitRepository {
     /// Create the remote, or retarget one cowshed already owns. Callers decide ownership first.
     async fn set_remote(&self, name: &str, url: &Path) -> Result<()> {
         let existing = self.remote_url(name).await?;
-        let verb = if existing.is_some() {
-            "set-url"
-        } else {
-            "add"
-        };
+        let verb = if existing.is_some() { "set-url" } else { "add" };
         let output = self
             .run([
                 OsStr::new("remote"),
@@ -924,7 +918,9 @@ mod tests {
         let stale = PathBuf::from("/tmp/cowshed-recorded-checkout");
         let mount = PathBuf::from("/tmp/cowshed-canonical-mount");
         let repo = GitRepository::from_root(&root);
-        repo.set_remote("host", &stale).await.expect("legacy remote");
+        repo.set_remote("host", &stale)
+            .await
+            .expect("legacy remote");
 
         assert_eq!(
             repo.configure_main_remote(&mount)

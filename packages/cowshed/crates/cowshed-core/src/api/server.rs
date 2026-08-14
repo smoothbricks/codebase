@@ -430,6 +430,7 @@ pub const CAPABILITY_METHODS: &[&str] = &[
     "coordinator.adopt",
     "coordinator.create",
     "coordinator.fork",
+    "coordinator.moveCheckout",
     "coordinator.grant",
     "coordinator.revoke",
     "coordinator.rebase",

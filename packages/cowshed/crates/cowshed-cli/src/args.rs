@@ -89,7 +89,29 @@ pub struct ForkArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MoveArgs {
     pub source: String,
-    pub destination: String,
+    pub destination: MoveDestination,
+}
+
+/// What `mv`'s second argument means, which the first argument decides.
+///
+/// `main` is not a renameable workspace — its name is fixed by the project layout — so `mv main`
+/// can only mean "move the checkout", and its destination is a path. Every other source names a
+/// workspace whose destination is a new workspace name. One verb, two grammars, and the source
+/// disambiguates them before either is validated, so a path is never rejected for failing the
+/// workspace-name charset and a workspace name is never resolved against the filesystem.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MoveDestination {
+    Workspace(String),
+    Checkout(PathBuf),
+}
+
+impl std::fmt::Display for MoveDestination {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Workspace(name) => formatter.write_str(name),
+            Self::Checkout(path) => write!(formatter, "{}", path.display()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -598,34 +620,55 @@ fn parse_move(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "mv <ws> <new-name>";
-    let mut source = None;
-    let mut destination = None;
+    const USAGE: &str = "mv <ws> <new-name> | mv main <new-checkout-path>";
+    let mut source: Option<String> = None;
+    let mut destination: Option<OsString> = None;
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
             continue;
         }
         match args[index].to_str() {
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            // `main` is accepted here and refused by the coordinator, which can say why and name
-            // the command that does what the user meant.
+            // `main` is accepted here and means the checkout move; every other source is a
+            // workspace the coordinator renames.
             _ if source.is_none() => {
                 source = Some(workspace_name(&args[index], false, USAGE)?);
             }
             _ if destination.is_none() => {
-                destination = Some(workspace_name(&args[index], true, USAGE)?);
+                destination = Some(args[index].clone());
             }
             _ => {
-                return Err(UsageError::new("mv accepts exactly two workspaces", USAGE));
+                return Err(UsageError::new("mv accepts exactly two arguments", USAGE));
             }
         }
         index += 1;
     }
+    let source = source.ok_or_else(|| UsageError::new("mv requires a workspace", USAGE))?;
+    let destination =
+        destination.ok_or_else(|| UsageError::new("mv requires a destination", USAGE))?;
+    let destination = if source == "main" {
+        MoveDestination::Checkout(checkout_destination(&destination, USAGE)?)
+    } else {
+        MoveDestination::Workspace(workspace_name(&destination, true, USAGE)?)
+    };
     Ok(Command::Move(MoveArgs {
-        source: source.ok_or_else(|| UsageError::new("mv requires a workspace", USAGE))?,
-        destination: destination
-            .ok_or_else(|| UsageError::new("mv requires a destination name", USAGE))?,
+        source,
+        destination,
     }))
+}
+
+/// A checkout destination is a path, and the only thing the parser can decide about it is that it
+/// is spelt absolutely. Whether it exists, is occupied, or overlaps cowshed storage is the
+/// coordinator's to refuse, with the project state in hand to say why.
+fn checkout_destination(value: &OsStr, usage: &'static str) -> Result<PathBuf, UsageError> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(UsageError::new(
+            "the checkout destination must be an absolute path",
+            usage,
+        ));
+    }
+    Ok(path)
 }
 
 fn parse_checkpoint(
@@ -1479,6 +1522,38 @@ mod tests {
                 "{verb} must not infer a workspace from the cwd"
             );
         }
+    }
+
+    #[test]
+    fn mv_reads_its_destination_according_to_its_source() {
+        let Command::Move(args) = parse_args(["mv", "raven", "kestrel"]).expect("rename").command
+        else {
+            panic!("mv <ws> <name> parses as a rename");
+        };
+        assert_eq!(
+            args.destination,
+            MoveDestination::Workspace("kestrel".to_owned())
+        );
+
+        let Command::Move(args) = parse_args(["mv", "main", "/Users/dev/moved"])
+            .expect("checkout move")
+            .command
+        else {
+            panic!("mv main <path> parses as a checkout move");
+        };
+        assert_eq!(args.source, "main");
+        assert_eq!(
+            args.destination,
+            MoveDestination::Checkout(PathBuf::from("/Users/dev/moved"))
+        );
+
+        // A path where a workspace name belongs, and a workspace name where a path belongs, are
+        // each rejected by the grammar the source selected — never silently reinterpreted.
+        assert!(parse_args(["mv", "raven", "/Users/dev/moved"]).is_err());
+        assert!(parse_args(["mv", "main", "relative/path"]).is_err());
+        assert!(parse_args(["mv", "main", "kestrel"]).is_err());
+        // `main` remains reserved as a rename destination.
+        assert!(parse_args(["mv", "raven", "main"]).is_err());
     }
 
     #[test]

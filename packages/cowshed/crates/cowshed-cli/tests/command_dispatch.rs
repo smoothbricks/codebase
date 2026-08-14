@@ -100,6 +100,12 @@ impl CliService for FakeService {
         Ok(workspace(destination, WorkspaceState::Attached))
     }
 
+    async fn move_checkout(&mut self, destination: &std::path::Path) -> Result<WorkspaceInfo> {
+        self.events
+            .push(format!("move-checkout:{}", destination.display()));
+        Ok(workspace("main", WorkspaceState::Attached))
+    }
+
     async fn checkpoint(&mut self, name: &str, options: CheckpointOptions) -> Result<String> {
         self.events.push(format!(
             "checkpoint:{name}:{:?}:{}",
@@ -518,6 +524,24 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
     assert_eq!(stdout, b"/mnt/kestrel\n");
     assert_eq!(stderr, b"next: cowshed exec kestrel -- <cmd>\n");
     assert!(service.events.contains(&"rename:raven:kestrel".to_owned()));
+
+    // `mv main` is the other grammar behind the same verb: the destination is a path, the checkout
+    // moves rather than a workspace being renamed, and the hint takes the user to the new place.
+    let (_, stdout, stderr) = run(&mut service, ["mv", "main", "/Users/dev/moved"]).await;
+    assert_eq!(stdout, b"/mnt/main\n");
+    assert_eq!(stderr, b"next: cd /Users/dev/moved\n");
+    assert!(
+        service
+            .events
+            .contains(&"move-checkout:/Users/dev/moved".to_owned())
+    );
+    assert!(
+        !service
+            .events
+            .iter()
+            .any(|event| event.starts_with("rename:main")),
+        "moving the checkout must never route through the workspace rename"
+    );
 
     let (_, stdout, stderr) = run(
         &mut service,
@@ -1020,6 +1044,9 @@ impl CliService for SerializedCreateService {
     }
 
     async fn rename(&mut self, _: &str, _: &str) -> Result<WorkspaceInfo> {
+        unreachable!()
+    }
+    async fn move_checkout(&mut self, _: &std::path::Path) -> Result<WorkspaceInfo> {
         unreachable!()
     }
     async fn checkpoint(&mut self, _: &str, _: CheckpointOptions) -> Result<String> {

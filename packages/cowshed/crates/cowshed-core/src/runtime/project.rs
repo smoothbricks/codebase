@@ -89,7 +89,15 @@ pub trait ProjectRuntimeHost: Send + 'static {
         source: WorkspaceName,
         destination: WorkspaceName,
     ) -> Result<WorkspaceSnapshot>;
-    async fn ensure(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::EnsureReport>;
+    /// Move the project's checkout to a new path, keeping every record of where it lives in step.
+    async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot>;
+    /// Attach `workspace`, converging the recorded checkout path onto `observed` when the caller
+    /// witnesses the checkout somewhere other than where the record says it is.
+    async fn ensure(
+        &mut self,
+        workspace: WorkspaceName,
+        observed: Option<PathBuf>,
+    ) -> Result<crate::api::dto::EnsureReport>;
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
     async fn checkpoint(
@@ -319,6 +327,7 @@ impl ProjectActor {
             "coordinator.create" => self.coordinator_create(request).await,
             "coordinator.fork" => self.coordinator_fork(request).await,
             "coordinator.rename" => self.coordinator_rename(request).await,
+            "coordinator.moveCheckout" => self.coordinator_move_checkout(request).await,
             "coordinator.grant" => self.coordinator_grant(request, false).await,
             "coordinator.revoke" => self.coordinator_grant(request, true).await,
             "coordinator.rebase" => self.coordinator_rebase(request).await,
@@ -429,10 +438,19 @@ impl ProjectActor {
 
     async fn workspace_ensure(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
-        let params: WorkspaceParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params)
+        let params: EnsureParams = decode_params(request.params(), request.method())?;
+        self.require_scoped_workspace(
+            request.authority(),
+            &WorkspaceParams {
+                repo_id: params.repo_id.clone(),
+                workspace: params.workspace.clone(),
+            },
+        )
+        .await?;
+        let result = self
+            .host
+            .ensure(params.workspace, params.observed_path)
             .await?;
-        let result = self.host.ensure(params.workspace).await?;
         json_response(result)
     }
 
@@ -497,6 +515,14 @@ impl ProjectActor {
         let params: ForkParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         let snapshot = self.host.rename(params.source, params.destination).await?;
+        workspace_response(&snapshot)
+    }
+
+    async fn coordinator_move_checkout(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: MoveCheckoutParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let snapshot = self.host.move_checkout(params.destination).await?;
         workspace_response(&snapshot)
     }
 
@@ -985,6 +1011,26 @@ struct ForkParams {
     repo_id: RepoId,
     source: WorkspaceName,
     destination: WorkspaceName,
+}
+
+/// `workspace.ensure`, which additionally carries where the caller observed the checkout.
+///
+/// Optional because only a caller with a real invocation directory has an observation to offer; an
+/// automated ensure with no cwd converges nothing rather than guessing.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EnsureParams {
+    repo_id: RepoId,
+    workspace: WorkspaceName,
+    #[serde(default)]
+    observed_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MoveCheckoutParams {
+    repo_id: RepoId,
+    destination: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -1776,6 +1822,268 @@ impl NativeProjectRuntimeHost {
         self.layout
             .workspace_mount(workspace)
             .map_err(native_integrity_error)
+    }
+
+    /// Where this project's durable record of the checkout path lives.
+    ///
+    /// The marker is read through main's mount, so this is only usable while main is mounted; the
+    /// sidecar half is store-side and always reachable.
+    fn checkout_record(&self, workspace: &NativeWorkspace) -> Result<crate::checkout::CheckoutRecord> {
+        Ok(crate::checkout::CheckoutRecord {
+            mount_point: self.workspace_mount_path(&main_name())?,
+            image: self
+                .layout
+                .main_image(workspace.derived.workspace.format())
+                .map_err(native_integrity_error)?
+                .image()
+                .to_path_buf(),
+        })
+    }
+
+    /// Rebuild the substrate around a checkout that now lives somewhere else.
+    ///
+    /// `ApfsSubstrate` and `MacOsApfsExecutionHost` each capture the substrate config by value, and
+    /// the substrate shares its copy with every clone it has handed out, so there is no in-place
+    /// mutation that could not be observed half-applied. The whole triple — config, execution host,
+    /// substrate — is therefore rebuilt and swapped at once. `&mut self` is what makes that safe:
+    /// the project actor owns the runtime host exclusively, so the swap cannot race a concurrent
+    /// operation, and the move transaction performs it at the one moment nothing is mounted.
+    ///
+    /// The Git repository handle and the descriptor's project root move with it. They are the same
+    /// fact spelled three ways, and leaving any one behind would send the next operation to the old
+    /// path.
+    fn rebind_checkout(
+        &mut self,
+        checkout_path: &Path,
+        checkout_layout: crate::metadata::CheckoutLayout,
+    ) -> Result<()> {
+        let config = self
+            .substrate_config
+            .rebind_checkout(checkout_path, checkout_layout);
+        let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
+            crate::apfs::SystemCommandRunner,
+            config.clone(),
+        )
+        .map_err(native_storage_error)?;
+        self.substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
+        self.substrate_config = config;
+        self.descriptor.git_root = checkout_path.to_owned();
+        self.git = crate::git::GitRepository::from_root(checkout_path);
+        Ok(())
+    }
+
+    /// Point every mounted workspace's `main` remote at main's current mount.
+    ///
+    /// Under direct mount main's mount *is* the checkout, so moving the checkout moves the URL
+    /// every workspace fetches from; under the symlink layout the mount never moves and this is the
+    /// idempotent re-run that `configure_main_remote` is built for. One code path covers both
+    /// because the layout is exactly the thing `workspace_mount_path` already answers.
+    ///
+    /// Detached workspaces are skipped rather than mounted: there is nothing to write into an
+    /// unmounted volume, and `ensure` repairs the remote when the workspace is next used.
+    async fn rewrite_main_remotes(&mut self) -> Result<()> {
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        for workspace in self.authoritative().await? {
+            let name = workspace.derived.workspace.name().clone();
+            if name.is_main()
+                || !matches!(
+                    workspace.derived.mount_state,
+                    crate::storage::lifecycle::MountState::Mounted { .. }
+                )
+            {
+                continue;
+            }
+            let mount = self.workspace_mount_path(&name)?;
+            crate::git::GitRepository::from_root(&mount)
+                .configure_main_remote(&main_mount)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Converge the recorded checkout path onto where the checkout is actually observed.
+    ///
+    /// `mv` is the sanctioned front door for moving a checkout; this is the safety net under it. A
+    /// user who moves a symlinked checkout by hand — or who reaches the project through a second
+    /// alias — has broken nothing, because both spellings still resolve to main's volume. The
+    /// record simply falls behind, and every later answer that quotes it (`doctor`, the gateway
+    /// inventory's project-root lookup, a cold open from the checkout directory) quotes a path the
+    /// user no longer uses.
+    ///
+    /// Convergence fires only when all of these hold, which together mean "the same checkout, spelt
+    /// differently" and nothing else:
+    ///
+    /// - `observed` sits inside main's mount, so the caller really is in this project;
+    /// - the checkout root above it resolves to main's mount, so it is a checkout and not some
+    ///   deeper directory;
+    /// - that root lies outside cowshed's own storage, so the mount path can never be mistaken for
+    ///   the user's checkout under the symlink layout;
+    /// - it differs from the record, so an agreeing record is never rewritten.
+    ///
+    /// The observed layout is recorded alongside the path: a checkout that is a symlink is the
+    /// symlink layout by construction, and one that is the mountpoint is direct mount. Recording
+    /// the observation rather than the previous belief is what keeps `mount_point()` — which reads
+    /// the layout to decide whether main mounts at the checkout — answering truthfully afterwards.
+    async fn converge_checkout_record(&mut self, observed: &Path) -> Result<()> {
+        let main = main_name();
+        let current = self.current(&main).await?;
+        if !matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            return Ok(());
+        }
+        let mount_point = self.workspace_mount_path(&main)?;
+        let record = self.checkout_record(&current)?;
+        let store_root = self.descriptor.store_root.clone();
+        let observed = observed.to_owned();
+        let probe_mount = mount_point.clone();
+        let Some((checkout, layout)) = crate::storage::lifecycle::dispatch_blocking(move || {
+            let checkout = crate::checkout::observed_checkout(&observed, &probe_mount)?;
+            if checkout.starts_with(&store_root) {
+                return None;
+            }
+            let layout = crate::checkout::observed_layout(&checkout);
+            Some((checkout, layout))
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("observed checkout task failed: {error}"))
+        })?
+        else {
+            return Ok(());
+        };
+        let converge_record = record.clone();
+        let converge_checkout = checkout.clone();
+        let changed = crate::storage::lifecycle::dispatch_blocking(move || {
+            converge_record.rewrite_project_root(&converge_checkout)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("checkout record task failed: {error}")))?
+        .map_err(native_integrity_error)?;
+        if !changed && layout == self.substrate_config.checkout_layout {
+            return Ok(());
+        }
+        let layout_record = self.layout.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            layout_record.record_checkout_layout(layout)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("layout record task failed: {error}")))?
+        .map_err(native_integrity_error)?;
+        self.rebind_checkout(&checkout, layout)
+    }
+
+    /// Refuse a checkout destination that cannot be moved onto, before anything is mutated.
+    async fn validate_move_destination(&self, source: &Path, destination: &Path) -> Result<()> {
+        if !destination.is_absolute()
+            || destination
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(CowshedError::usage(
+                format!(
+                    "{} is not an absolute, resolved path",
+                    destination.display()
+                ),
+                "pass an absolute destination path with no `..` segments",
+            ));
+        }
+        if destination == source {
+            return Err(CowshedError::usage(
+                format!("the checkout is already at {}", source.display()),
+                "choose a different destination path",
+            ));
+        }
+        // The store is cowshed's own; a checkout inside it would make the project root and the
+        // image tree alias each other, and every enumeration that walks the store would descend
+        // into the user's working tree.
+        if destination.starts_with(&self.descriptor.store_root)
+            || self.descriptor.store_root.starts_with(destination)
+            || destination.starts_with(source)
+        {
+            return Err(CowshedError::usage(
+                format!(
+                    "{} overlaps cowshed storage or the current checkout",
+                    destination.display()
+                ),
+                "choose a destination outside ~/.cowshed and outside the current checkout",
+            ));
+        }
+        let destination = destination.to_owned();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            if std::fs::symlink_metadata(&destination).is_ok() {
+                return Err(CowshedError::conflict(
+                    format!("{} already exists", destination.display()),
+                    "remove the occupant or choose another destination",
+                ));
+            }
+            let parent = destination.parent().ok_or_else(|| {
+                CowshedError::usage(
+                    format!("{} has no parent directory", destination.display()),
+                    "choose a destination inside an existing directory",
+                )
+            })?;
+            if !parent.is_dir() {
+                return Err(CowshedError::not_found(
+                    format!("{} is not an existing directory", parent.display()),
+                    "create the parent directory first",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("checkout destination task failed: {error}"))
+        })?
+    }
+
+    /// Detach main, rename its mountpoint directory, and leave the substrate rebound to the new
+    /// path with nothing mounted.
+    ///
+    /// Split out because it is the half that has an inverse: if the rename fails, main is put back
+    /// where it was and remounted, so a failed move is indistinguishable from one never attempted.
+    async fn move_direct_mount(
+        &mut self,
+        current: &NativeWorkspace,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        use crate::storage::lifecycle::{MountIntent, Substrate};
+
+        self.stop_supervisor(&main_name()).await?;
+        self.substrate
+            .unmount(&current.derived.workspace)
+            .await
+            .map_err(native_storage_error)?;
+        let rename_source = source.to_owned();
+        let rename_destination = destination.to_owned();
+        let renamed = crate::storage::lifecycle::dispatch_blocking(move || {
+            std::fs::rename(&rename_source, &rename_destination).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot move the checkout mountpoint to {}: {error}",
+                        rename_destination.display()
+                    ),
+                    "choose a destination on the same filesystem as the current checkout",
+                )
+            })
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("checkout rename task failed: {error}")))?;
+        if let Err(error) = renamed {
+            // Nothing moved; put main back exactly where the caller found it.
+            let _ = self
+                .substrate
+                .ensure_mounted(
+                    &current.derived.workspace,
+                    MountIntent { browse: false },
+                )
+                .await;
+            let _ = self.ensure_supervisor(&main_name()).await;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Add `workspace`'s mount as a remote in main's repository, for `cowshed new --register`.
@@ -2880,13 +3188,141 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.snapshot_named(&destination).await
     }
 
-    async fn ensure(&mut self, workspace: WorkspaceName) -> Result<crate::api::dto::EnsureReport> {
+    /// Move the project's checkout to `destination`, the `main` half of `cowshed mv`.
+    ///
+    /// The two layouts are genuinely different operations, not one operation with a branch:
+    ///
+    /// **Symlink.** Main stays mounted at `mnt/<owner>/<repo>/main` throughout — the checkout path
+    /// is only a symlink into it, and nothing about the mount depends on where that symlink sits.
+    /// So there is no unmount, and gaplessness costs nothing: the destination link is created
+    /// before the source link is removed, and the tree is reachable by at least one name at every
+    /// instant.
+    ///
+    /// **Direct mount.** The checkout path *is* the mountpoint, and a mountpoint cannot be renamed
+    /// while it is mounted. This is the real transaction: detach, rename the (now stub-carrying)
+    /// mountpoint directory, rebind the substrate onto the new path, re-attach. Every step after
+    /// the detach has an inverse, and a failure runs them in reverse so the checkout ends where it
+    /// started rather than in a half-moved state.
+    ///
+    /// The durable record is rewritten **before** the tree moves, in both layouts. Under direct
+    /// mount the source path stops existing the instant the rename lands, so a record still naming
+    /// it would be unrecoverable — nothing left to resolve — whereas a record naming the
+    /// destination becomes true the moment the rename completes, and `ensure` converges the rest.
+    /// Recording ahead of the move is what makes the crash window recoverable in the forward
+    /// direction instead of the dead one.
+    async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
+        use crate::storage::lifecycle::{MountIntent, Substrate};
+
+        self.validate_binding().await?;
+        let main = main_name();
+        let source = self.substrate_config.checkout_path.clone();
+        let layout = self.substrate_config.checkout_layout;
+        self.validate_move_destination(&source, &destination).await?;
+
+        let current = self.current(&main).await?;
+        let mount_point = self.workspace_mount_path(&main)?;
+        if !crate::checkout::resolves_to(&source, &mount_point) {
+            return Err(CowshedError::conflict(
+                format!(
+                    "the recorded checkout {} does not resolve to main's mount {}",
+                    source.display(),
+                    mount_point.display()
+                ),
+                "cowshed doctor --json",
+            ));
+        }
+        let record = self.checkout_record(&current)?;
+
+        // The record moves first; see the method comment for why this direction is the recoverable
+        // one. It is also the only step that can fail for a reason the filesystem cannot undo, so
+        // failing here costs nothing but a refusal.
+        let rewrite_record = record.clone();
+        let rewrite_destination = destination.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            rewrite_record.rewrite_project_root(&rewrite_destination)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("checkout record task failed: {error}")))?
+        .map_err(native_integrity_error)?;
+
+        let moved = if layout.mounts_at_checkout() {
+            self.move_direct_mount(&current, &source, &destination).await
+        } else {
+            let move_source = source.clone();
+            let move_destination = destination.clone();
+            let target = mount_point.clone();
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                crate::checkout::relink_checkout(&move_source, &move_destination, &target).map_err(
+                    |error| {
+                        CowshedError::environment_missing(
+                            format!(
+                                "cannot link {} to main's mount: {error}",
+                                move_destination.display()
+                            ),
+                            "choose a destination on a writable filesystem",
+                        )
+                    },
+                )
+            })
+            .await
+            .map_err(|error| CowshedError::internal(format!("checkout link task failed: {error}")))?
+        };
+        if let Err(error) = moved {
+            // The tree never moved, so the only thing to undo is the record.
+            let rollback = record.clone();
+            let rollback_source = source.clone();
+            let _ = crate::storage::lifecycle::dispatch_blocking(move || {
+                rollback.rewrite_project_root(&rollback_source)
+            })
+            .await;
+            return Err(error);
+        }
+
+        self.rebind_checkout(&destination, layout)?;
+        if layout.mounts_at_checkout() {
+            let current = self.current(&main).await?;
+            // Past the rename there is no way back worth taking: the record and the tree both name
+            // the destination, so a failure to re-attach here is a detached project at the right
+            // path, which `cowshed ensure` mounts. Rolling back would move the tree a second time
+            // to reach a state that is strictly further from where the user asked to be.
+            self.substrate
+                .ensure_mounted(
+                    &current.derived.workspace,
+                    MountIntent { browse: false },
+                )
+                .await
+                .map_err(native_storage_error)?;
+        }
+        self.rewrite_main_remotes().await?;
+        self.ensure_supervisor(&main).await?;
+        self.snapshot_named(&main).await
+    }
+
+    async fn ensure(
+        &mut self,
+        workspace: WorkspaceName,
+        observed: Option<PathBuf>,
+    ) -> Result<crate::api::dto::EnsureReport> {
         let before = self.current(&workspace).await?;
         let already = matches!(
             before.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         );
         self.ensure_supervisor(&workspace).await?;
+        if let Some(observed) = observed {
+            self.converge_checkout_record(&observed).await?;
+        }
+        if !workspace.is_main() {
+            // The reconciliation half of `mv`: a workspace that was detached while main moved
+            // still names main's old mount. `configure_main_remote` is idempotent and never
+            // touches a remote cowshed did not create, so running it on every ensure costs one
+            // config read and keeps every workspace's upstream true without a repair verb.
+            let main_mount = self.workspace_mount_path(&main_name())?;
+            let mount = self.workspace_mount_path(&workspace)?;
+            crate::git::GitRepository::from_root(&mount)
+                .configure_main_remote(&main_mount)
+                .await?;
+        }
         let current = self.current(&workspace).await?;
         let mount = self.workspace_mount_path(&workspace)?;
         Ok(self.ensure_report(

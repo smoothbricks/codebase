@@ -63,6 +63,32 @@ impl ApfsSubstrateConfig {
         }
     }
 
+    /// The same project, checked out somewhere else.
+    ///
+    /// The checkout path and the layout are the only two fields a live project can change — that
+    /// is what `cowshed mv main` does, and what `cowshed ensure` converges onto after a checkout is
+    /// rearranged by hand. Everything else (store root, caches root, capacity, case sensitivity) is
+    /// fixed for the project's lifetime.
+    ///
+    /// It is a whole-config clone rather than a mutable field because the config is shared by
+    /// value: `ApfsSubstrate` holds it behind an `Arc` that every clone of the substrate shares,
+    /// and `MacOsApfsExecutionHost` holds its own copy. Mutating it in place would let an
+    /// outstanding clone observe a half-applied move — a mount point derived from the new checkout
+    /// path against an execution host still validating against the old one. Rebinding instead
+    /// builds a new config, a new host, and a new substrate, and the caller swaps all three at
+    /// once, at the one point in the move transaction where nothing is mounted.
+    pub fn rebind_checkout(
+        &self,
+        checkout_path: impl Into<PathBuf>,
+        checkout_layout: CheckoutLayout,
+    ) -> Self {
+        Self {
+            checkout_path: checkout_path.into(),
+            checkout_layout,
+            ..self.clone()
+        }
+    }
+
     pub fn with_capacity(mut self, capacity: impl Into<String>) -> Result<Self, ApfsStorageError> {
         let capacity = capacity.into();
         if capacity.trim().is_empty() {
