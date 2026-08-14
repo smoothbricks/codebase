@@ -4,10 +4,10 @@
 
 Every cowshed command follows the same I/O discipline:
 
-- **Ordinary stdout** carries one control answer: a bare value, TSV rows, or a bounded JSON envelope with `--json`.
-  Job/status JSON contains lifecycle fields, typed artifact handles, byte counts, SHA-256 digests, bounded summaries,
-  and may contain small `Inline.data` bytes tagged as `utf8` or `base64`. Foreground exec, `cowshed job logs`,
-  `cowshed job attach`, and artifact reads are the explicit interfaces for unbounded raw bytes.
+- **Ordinary stdout** carries one control answer: a bare value, aligned table rows, or a bounded JSON envelope with
+  `--json`. Job/status JSON contains lifecycle fields, typed artifact handles, byte counts, SHA-256 digests, bounded
+  summaries, and may contain small `Inline.data` bytes tagged as `utf8` or `base64`. Foreground exec,
+  `cowshed job logs`, `cowshed job attach`, and artifact reads are the explicit interfaces for unbounded raw bytes.
 - **stderr** carries progress, explanations, warnings, and self-driving guidance. Guidance lines are prefixed
   `cowshed:`; suggested follow-up commands are prefixed `next:`. Agents and humans read the same hints.
 - **Exit codes** are stable:
@@ -48,7 +48,7 @@ remain handles, and unbounded bytes require `cowshed job logs`, `cowshed job att
 
 ## Global flags
 
-- `--json` — JSON envelope on stdout instead of bare values/TSV. Available on every command.
+- `--json` — JSON envelope on stdout instead of bare values/tables. Available on every command.
 - `--project <git-root>` — select an adopted repository explicitly. Default: discover the standalone Git root owning the
   current directory, then validate its cowshed repository binding. Exit 3 if neither resolves.
 - `-q` / `--quiet` — suppress `cowshed:` progress lines on stderr; errors and `next:` hints still print.
@@ -125,25 +125,25 @@ new Git branch at another revision and is mutually exclusive with `--from`. The 
 
 ### `cowshed ls [--all]`
 
-Bare `ls` remains scoped to the repository selected by cwd or `--project`. Its stdout is TSV: workspace name, state,
-branch, mountpoint (empty when detached).
+Bare `ls` remains scoped to the repository selected by cwd or `--project`. Its stdout is a space-aligned table:
+workspace name, state, branch, mountpoint (empty when detached).
 
 ```
 $ cowshed ls
-main	mounted	main	<project-root>
-raven	mounted	cowshed/raven	~/.cowshed/mnt/acme/widget/raven
-fox	detached	cowshed/fox
+main   mounted   main           <project-root>
+raven  mounted   cowshed/raven  ~/.cowshed/mnt/acme/widget/raven
+fox    detached  cowshed/fox
 ```
 
 If that scoped list is empty, stderr reports how many other adopted projects exist and points to `cowshed ls --all`.
 `--all` discovers every validated `<store>/<owner>/<repo>/repository.json`, then uses each project's normal listing
-path. Plain output adds `repoId` as the first TSV column and keeps projects contiguous:
+path. Plain output adds `repoId` as the first column and keeps projects contiguous:
 
 ```
 $ cowshed ls --all
-acme/api	main	mounted	main	~/src/api
-acme/api	raven	mounted	cowshed/raven	~/.cowshed/mnt/acme/api/raven
-acme/web	main	mounted	main	~/src/web
+acme/api  main   mounted  main           ~/src/api
+acme/api  raven  mounted  cowshed/raven  ~/.cowshed/mnt/acme/api/raven
+acme/web  main   mounted  main           ~/src/web
 ```
 
 With `--json`, the result is grouped explicitly as
