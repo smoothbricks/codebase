@@ -872,3 +872,25 @@ impl WorkspaceRef {
         })
     }
 }
+
+/// Run one `cowshed` CLI invocation in-process and resolve with its exit code.
+///
+/// `argv` excludes the interpreter and script path — it is exactly what the
+/// `cowshed` binary would see after argv[0]. The invocation runs on a blocking
+/// thread with its own current-thread runtime so it matches the binary's
+/// execution model byte for byte, and so a CLI command that blocks on stdin
+/// cannot starve the addon's shared runtime.
+#[napi(js_name = "runCli")]
+pub async fn run_cli(argv: Vec<String>) -> napi::Result<i32> {
+    napi::tokio::task::spawn_blocking(move || {
+        let runtime = napi::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok::<i32, io::Error>(runtime.block_on(cowshed_cli::run::run(
+            argv.into_iter().map(Into::into).collect(),
+        )))
+    })
+    .await
+    .map_err(|error| napi::Error::from_reason(format!("cowshed CLI task failed: {error}")))?
+    .map_err(|error| napi::Error::from_reason(format!("cowshed CLI runtime failed: {error}")))
+}
