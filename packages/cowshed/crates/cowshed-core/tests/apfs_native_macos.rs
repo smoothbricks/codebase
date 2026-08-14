@@ -1751,7 +1751,7 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         42,
-        fixture.config().main_mount,
+        fixture.config().checkout_path,
         "/dev/disk10s1",
         true,
         true,
@@ -1800,7 +1800,7 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         [
             std::ffi::OsString::from("detach"),
             std::ffi::OsString::from("-quiet"),
-            fixture.config().main_mount.into_os_string(),
+            fixture.config().checkout_path.into_os_string(),
         ]
     );
 }
@@ -1814,7 +1814,7 @@ fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         43,
-        fixture.config().main_mount,
+        fixture.config().checkout_path,
         "/dev/disk10s1",
         true,
         true,
@@ -1842,7 +1842,7 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         8,
-        fixture.config().main_mount,
+        fixture.config().checkout_path,
         "/dev/disk10s1",
         true,
         true,
@@ -1856,7 +1856,7 @@ fn canonical_path_with_unrelated_volume_fails_closed_without_detaching() {
     let error = host
         .heal_mount(
             &workspace(ImageFormat::Sparse),
-            &fixture.config().main_mount,
+            &fixture.config().checkout_path,
         )
         .expect_err("impostor must not be healed destructively");
     assert!(
@@ -1890,7 +1890,7 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
     let source = FakeKernelMountSource::default();
     source.set(vec![KernelMountSnapshot::new(
         7,
-        fixture.config().main_mount,
+        fixture.config().checkout_path,
         "/dev/disk10s1",
         false,
         false,
@@ -1907,7 +1907,7 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
             .contains("non-canonical flags")
     );
 
-    host.heal_mount(&workspace, &fixture.config().main_mount)
+    host.heal_mount(&workspace, &fixture.config().checkout_path)
         .expect("heal by mountpoint");
     let requests = runner.requests();
     assert_eq!(
@@ -1922,7 +1922,7 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
         [
             std::ffi::OsString::from("detach"),
             std::ffi::OsString::from("-quiet"),
-            fixture.config().main_mount.into_os_string(),
+            fixture.config().checkout_path.into_os_string(),
         ]
     );
     source.set(Vec::new());
@@ -2275,12 +2275,17 @@ fn adopt_publication_moves_source_aside_writes_stub_and_publishes_image_atomical
         .project_root
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
     create_image(&staged, ImageFormat::Sparse);
-    std::fs::create_dir_all(&config.main_mount).expect("source");
-    std::fs::write(config.main_mount.join("tracked"), b"source").expect("source file");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+    std::fs::create_dir_all(&config.checkout_path).expect("source");
+    std::fs::write(config.checkout_path.join("tracked"), b"source").expect("source file");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
 
     native_host(&fixture, RecordingRunner::default())
-        .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+        .publish_adopt(
+            &config.checkout_path,
+            &pre_cowshed,
+            &staged,
+            canonical.image(),
+        )
         .expect("publish adopt");
 
     assert_eq!(
@@ -2288,7 +2293,7 @@ fn adopt_publication_moves_source_aside_writes_stub_and_publishes_image_atomical
         b"source"
     );
     assert_eq!(
-        std::fs::read(config.main_mount.join(".envrc")).expect("stub"),
+        std::fs::read(config.checkout_path.join(".envrc")).expect("stub"),
         b"cowshed ensure --attach\n"
     );
     assert!(canonical.image().exists());
@@ -2309,8 +2314,8 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
         .project_root
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
     create_image(&before_staged, ImageFormat::Sparse);
-    std::fs::create_dir_all(&before_config.main_mount).expect("source");
-    std::fs::write(before_config.main_mount.join("tracked"), b"source").expect("source file");
+    std::fs::create_dir_all(&before_config.checkout_path).expect("source");
+    std::fs::write(before_config.checkout_path.join("tracked"), b"source").expect("source file");
     let before_host = native_host(&before, RecordingRunner::default());
     before_host
         .recover_pending(&before_config, &[])
@@ -2323,7 +2328,7 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
     assert!(before_staged.exists());
     assert!(sidecar_path(&before_staged).exists());
     assert_eq!(
-        std::fs::read(before_config.main_mount.join("tracked")).expect("original source"),
+        std::fs::read(before_config.checkout_path.join("tracked")).expect("original source"),
         b"source"
     );
 
@@ -2338,10 +2343,13 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
         .project_root
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
     create_image(&after_staged, ImageFormat::Sparse);
-    std::fs::create_dir_all(&after_config.main_mount).expect("source");
-    std::fs::write(after_config.main_mount.join("tracked"), b"source").expect("source file");
-    let after_pre = PathBuf::from(format!("{}.pre-cowshed", after_config.main_mount.display()));
-    std::fs::rename(&after_config.main_mount, &after_pre).expect("simulate handoff crash");
+    std::fs::create_dir_all(&after_config.checkout_path).expect("source");
+    std::fs::write(after_config.checkout_path.join("tracked"), b"source").expect("source file");
+    let after_pre = PathBuf::from(format!(
+        "{}.pre-cowshed",
+        after_config.checkout_path.display()
+    ));
+    std::fs::rename(&after_config.checkout_path, &after_pre).expect("simulate handoff crash");
 
     native_host(&after, RecordingRunner::default())
         .recover_pending(&after_config, &[])
@@ -2349,7 +2357,7 @@ fn adopt_recovery_waits_for_handoff_then_completes_publication_after_restart() {
     assert!(after_canonical.image().exists());
     assert!(!after_staged.exists());
     assert_eq!(
-        std::fs::read(after_config.main_mount.join(".envrc")).expect("stub"),
+        std::fs::read(after_config.checkout_path.join(".envrc")).expect("stub"),
         b"cowshed ensure --attach\n"
     );
     assert_eq!(
@@ -3344,7 +3352,7 @@ fn kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
         let source = FakeKernelMountSource::default();
         source.set(vec![KernelMountSnapshot::new(
             91,
-            fixture.config().main_mount,
+            fixture.config().checkout_path,
             "/dev/disk10s1",
             nobrowse,
             owners,
@@ -3545,10 +3553,10 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
     )
     .expect("valid staged credentials");
     std::fs::write(&staged, b"complete adopted image").expect("staged bytes");
-    std::fs::create_dir_all(&config.main_mount).expect("source checkout");
-    std::fs::write(config.main_mount.join("tracked"), b"original source").expect("source bytes");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
-    std::fs::rename(&config.main_mount, &pre_cowshed).expect("simulate completed handoff");
+    std::fs::create_dir_all(&config.checkout_path).expect("source checkout");
+    std::fs::write(config.checkout_path.join("tracked"), b"original source").expect("source bytes");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
+    std::fs::rename(&config.checkout_path, &pre_cowshed).expect("simulate completed handoff");
 
     let host = native_host(&fixture, RecordingRunner::default());
     host.recover_pending(&config, &[])
@@ -3563,7 +3571,7 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
         std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
         b"original source"
     );
-    assert!(config.main_mount.is_dir());
+    assert!(config.checkout_path.is_dir());
     assert!(!staged.exists());
     assert!(!sidecar_path(&staged).exists());
 
@@ -3640,13 +3648,17 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
             .join(".staging/main-00000000000000000000000000000001.sparseimage");
         create_image(&staged, ImageFormat::Sparse);
         std::fs::write(&staged, b"adopted generation").expect("staged bytes");
-        std::fs::create_dir_all(&config.main_mount).expect("source");
-        std::fs::write(config.main_mount.join("tracked"), b"original").expect("source bytes");
-        let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+        std::fs::create_dir_all(&config.checkout_path).expect("source");
+        std::fs::write(config.checkout_path.join("tracked"), b"original").expect("source bytes");
+        let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
         let host = native_host(&fixture, RecordingRunner::default());
         host.set_restore_failpoint(failpoint);
-        let result =
-            host.publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image());
+        let result = host.publish_adopt(
+            &config.checkout_path,
+            &pre_cowshed,
+            &staged,
+            canonical.image(),
+        );
         if matches!(
             failpoint,
             RestoreFailpoint::AfterCanonicalSidecarRename
@@ -3655,12 +3667,17 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
         ) {
             result.expect_err("prepublication adopt failure");
             assert_eq!(
-                std::fs::read(config.main_mount.join("tracked")).expect("restored source"),
+                std::fs::read(config.checkout_path.join("tracked")).expect("restored source"),
                 b"original"
             );
             assert!(!pre_cowshed.exists());
             native_host(&fixture, RecordingRunner::default())
-                .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+                .publish_adopt(
+                    &config.checkout_path,
+                    &pre_cowshed,
+                    &staged,
+                    canonical.image(),
+                )
                 .expect("adopt retry");
         } else {
             result.expect("durable adopt pair recovers as success");
@@ -3675,10 +3692,10 @@ fn publication_failpoints_converge_for_clone_and_adopt_callers() {
             b"original"
         );
         assert!(
-            !config.main_mount.join("tracked").exists(),
+            !config.checkout_path.join("tracked").exists(),
             "nonempty original must never remain beneath the mountpoint"
         );
-        assert!(config.main_mount.join(".envrc").exists());
+        assert!(config.checkout_path.join(".envrc").exists());
         let restarted = native_host(&fixture, RecordingRunner::default());
         assert_eq!(restarted.list(&repo()).expect("list").len(), 1);
         execute_gc(&restarted, &config).expect("GC convergence");
@@ -3700,14 +3717,22 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
     create_image(&staged, ImageFormat::Sparse);
     std::fs::write(&staged, b"durable adopted generation").expect("staged bytes");
-    std::fs::create_dir_all(&config.main_mount).expect("source");
-    std::fs::write(config.main_mount.join("tracked"), b"irreplaceable original")
-        .expect("source bytes");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+    std::fs::create_dir_all(&config.checkout_path).expect("source");
+    std::fs::write(
+        config.checkout_path.join("tracked"),
+        b"irreplaceable original",
+    )
+    .expect("source bytes");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
     let host = native_host(&fixture, RecordingRunner::default());
     host.set_restore_failpoint(RestoreFailpoint::PersistentCanonicalParentFsyncFailure);
     let error = host
-        .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+        .publish_adopt(
+            &config.checkout_path,
+            &pre_cowshed,
+            &staged,
+            canonical.image(),
+        )
         .expect_err("persistent fsync remains uncertain");
     assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
     assert!(matches!(
@@ -3720,8 +3745,8 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
         std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
         b"irreplaceable original"
     );
-    assert!(!config.main_mount.join("tracked").exists());
-    assert!(config.main_mount.join(".envrc").exists());
+    assert!(!config.checkout_path.join("tracked").exists());
+    assert!(config.checkout_path.join(".envrc").exists());
 
     drop(host);
     let restarted = native_host(&fixture, RecordingRunner::default());
@@ -3740,8 +3765,8 @@ fn persistent_parent_fsync_failure_never_restores_adopt_source_beside_canonical_
             std::fs::read(pre_cowshed.join("tracked")).expect("preserved original"),
             b"irreplaceable original"
         );
-        assert!(!config.main_mount.join("tracked").exists());
-        assert!(config.main_mount.join(".envrc").exists());
+        assert!(!config.checkout_path.join("tracked").exists());
+        assert!(config.checkout_path.join(".envrc").exists());
         restarted
             .recover_pending(&config, &[])
             .expect("repeated recovery");
@@ -3760,14 +3785,22 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
         .join(".staging/main-00000000000000000000000000000001.sparseimage");
     create_image(&staged, ImageFormat::Sparse);
     std::fs::write(&staged, b"complete forward image").expect("staged bytes");
-    std::fs::create_dir_all(&config.main_mount).expect("source");
-    std::fs::write(config.main_mount.join("tracked"), b"irreplaceable source")
-        .expect("source bytes");
-    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.main_mount.display()));
+    std::fs::create_dir_all(&config.checkout_path).expect("source");
+    std::fs::write(
+        config.checkout_path.join("tracked"),
+        b"irreplaceable source",
+    )
+    .expect("source bytes");
+    let pre_cowshed = PathBuf::from(format!("{}.pre-cowshed", config.checkout_path.display()));
     let host = native_host(&fixture, RecordingRunner::default());
     host.set_restore_failpoint(RestoreFailpoint::CanonicalSidecarRollbackFailure);
     let error = host
-        .publish_adopt(&config.main_mount, &pre_cowshed, &staged, canonical.image())
+        .publish_adopt(
+            &config.checkout_path,
+            &pre_cowshed,
+            &staged,
+            canonical.image(),
+        )
         .expect_err("compound publication failure");
     assert_eq!(error.disposition(), PublicationDisposition::ForwardOnly);
     assert!(matches!(
@@ -3785,8 +3818,8 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
         std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
         b"irreplaceable source"
     );
-    assert!(!config.main_mount.join("tracked").exists());
-    assert!(config.main_mount.join(".envrc").exists());
+    assert!(!config.checkout_path.join("tracked").exists());
+    assert!(config.checkout_path.join(".envrc").exists());
 
     drop(host);
     let restarted = native_host(&fixture, RecordingRunner::default());
@@ -3808,5 +3841,5 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
         std::fs::read(pre_cowshed.join("tracked")).expect("preserved source"),
         b"irreplaceable source"
     );
-    assert!(!config.main_mount.join("tracked").exists());
+    assert!(!config.checkout_path.join("tracked").exists());
 }
