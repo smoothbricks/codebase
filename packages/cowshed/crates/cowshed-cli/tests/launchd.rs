@@ -7,8 +7,8 @@ use cowshed_cli::launchd::{
     CommandOutput, CommandStatus, ControlAction, ControlExecutionError, ControlPlan, ExistingPlist,
     FilesystemOperation, GATEWAY_LABEL, InstallOutcome, InstallState, LAUNCHCTL_EXECUTABLE,
     LaunchAgentSpec, LaunchctlCommand, LaunchdError, LaunchdExecutor, LaunchdFilesystem,
-    LaunchdServiceStatus, Mutation, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, ServiceLifecycle,
-    plan_install, plan_remove,
+    LaunchdServiceStatus, Mutation, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_LABEL,
+    ServiceLifecycle, plan_install, plan_remove,
 };
 
 const HOME: &str = "/Users/cowshed-test";
@@ -86,6 +86,111 @@ fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
     assert!(plist.contains("<string>/Applications/Cowshed &amp; Tools/cowshed</string>"));
     assert!(plist.contains("<string>a&lt;b</string>"));
     assert!(plist.contains("<key>KeepAlive</key>\n  <false/>"));
+}
+
+/// The sccache agent is the one with an empty argv tail: server mode is
+/// selected entirely through the environment, and the plist carries the full
+/// foreground-server variable set with the shared cowshed paths.
+#[test]
+fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
+    let spec = LaunchAgentSpec::sccache(
+        Path::new(HOME),
+        Path::new("/nix/store/abc-sccache/bin/sccache"),
+        Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
+        Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+    )
+    .unwrap();
+
+    assert_eq!(spec.label(), SCCACHE_LABEL);
+    assert_eq!(spec.arguments(), [] as [String; 0]);
+    assert_eq!(spec.lifecycle(), ServiceLifecycle::KeepAlive);
+    assert_eq!(
+        spec.plist_path(),
+        Path::new("/Users/cowshed-test/Library/LaunchAgents/dev.cowshed.sccache.plist")
+    );
+    assert_eq!(
+        spec.standard_error_path(),
+        Path::new("/Users/cowshed-test/.cowshed/telemetry/sccache-stderr.log")
+    );
+    assert_eq!(
+        spec.environment(),
+        [
+            ("SCCACHE_START_SERVER".to_owned(), "1".to_owned()),
+            ("SCCACHE_NO_DAEMON".to_owned(), "1".to_owned()),
+            ("SCCACHE_IDLE_TIMEOUT".to_owned(), "0".to_owned()),
+            (
+                "SCCACHE_SERVER_UDS".to_owned(),
+                "/Users/cowshed-test/.cowshed/sccache.sock".to_owned()
+            ),
+            (
+                "SCCACHE_DIR".to_owned(),
+                "/Users/cowshed-test/.cowshed/caches/sccache".to_owned()
+            ),
+        ]
+    );
+
+    let expected = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+        "<plist version=\"1.0\">\n",
+        "<dict>\n",
+        "  <key>Label</key>\n",
+        "  <string>dev.cowshed.sccache</string>\n",
+        "  <key>ProgramArguments</key>\n",
+        "  <array>\n",
+        "    <string>/nix/store/abc-sccache/bin/sccache</string>\n",
+        "  </array>\n",
+        "  <key>RunAtLoad</key>\n",
+        "  <true/>\n",
+        "  <key>KeepAlive</key>\n",
+        "  <true/>\n",
+        "  <key>ProcessType</key>\n",
+        "  <string>Background</string>\n",
+        "  <key>StandardErrorPath</key>\n",
+        "  <string>/Users/cowshed-test/.cowshed/telemetry/sccache-stderr.log</string>\n",
+        "  <key>EnvironmentVariables</key>\n",
+        "  <dict>\n",
+        "    <key>SCCACHE_START_SERVER</key>\n",
+        "    <string>1</string>\n",
+        "    <key>SCCACHE_NO_DAEMON</key>\n",
+        "    <string>1</string>\n",
+        "    <key>SCCACHE_IDLE_TIMEOUT</key>\n",
+        "    <string>0</string>\n",
+        "    <key>SCCACHE_SERVER_UDS</key>\n",
+        "    <string>/Users/cowshed-test/.cowshed/sccache.sock</string>\n",
+        "    <key>SCCACHE_DIR</key>\n",
+        "    <string>/Users/cowshed-test/.cowshed/caches/sccache</string>\n",
+        "  </dict>\n",
+        "</dict>\n",
+        "</plist>\n",
+    );
+    assert_eq!(spec.plist_bytes(), expected.as_bytes());
+
+    // Idempotence rides on byte equality: a current plist plans no mutations.
+    let bytes = spec.plist_bytes();
+    let plan = plan_install(
+        &spec,
+        InstallState {
+            launch_agents_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
+            plist: Some(ExistingPlist {
+                bytes: &bytes,
+                mode: PRIVATE_PLIST_MODE,
+            }),
+        },
+    );
+    assert!(plan.is_noop());
+
+    // Socket and cache paths are validated like every other launchd path.
+    assert!(matches!(
+        LaunchAgentSpec::sccache(
+            Path::new(HOME),
+            Path::new("/nix/store/abc-sccache/bin/sccache"),
+            Path::new("relative.sock"),
+            Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+        ),
+        Err(LaunchdError::InvalidPath { .. })
+    ));
 }
 
 #[test]
