@@ -125,6 +125,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Rebase(_)
         | Command::Land(_)
         | Command::Gateway(_)
+        | Command::Sccache(_)
         | Command::Skill(_)
         | Command::Doctor => RuntimeOpenMode::ExistingOnly,
     }
@@ -970,6 +971,9 @@ where
         Command::Gateway(_) => Err(CowshedError::internal(
             "gateway commands must be dispatched by the host service entrypoint",
         )),
+        Command::Sccache(_) => Err(CowshedError::internal(
+            "sccache commands must be dispatched by the host service entrypoint",
+        )),
         Command::Skill(_) => Err(CowshedError::internal(
             "skill commands must be dispatched before the runtime bridge",
         )),
@@ -1255,6 +1259,15 @@ async fn emit_envrc<W: Write, E: Write>(
             )
         })?;
     emit_shell_export(output, b"GOENV", report.go_env.as_os_str().as_bytes())?;
+    // Host-level endpoint, identical for every workspace: rustc-wrapper clients
+    // in IDE terminals and other cowshed-unspawned processes must reach the
+    // host-owned sccache daemon instead of spawning a private server with
+    // default cache paths.
+    emit_shell_export(
+        output,
+        b"SCCACHE_SERVER_UDS",
+        report.sccache_server_uds.as_os_str().as_bytes(),
+    )?;
     emit_shell_export(output, b"COWSHED_WORKSPACE_TOKEN", &token)?;
     if let Some(port_block) = report.port_block {
         emit_shell_export(

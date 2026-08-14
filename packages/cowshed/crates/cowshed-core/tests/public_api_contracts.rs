@@ -264,6 +264,7 @@ fn ensure_doctor_gc_and_empty_results_have_exact_shapes() {
         mount: PathBuf::from("/mnt/raven"),
         action: EnsureAction::Healed,
         go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
+        sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
         workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
         port_block: Some(PortBlock::new(49_152, 16).expect("valid port block")),
     };
@@ -274,6 +275,7 @@ fn ensure_doctor_gc_and_empty_results_have_exact_shapes() {
             "mount":"/mnt/raven",
             "action":"healed",
             "goEnv":"/mnt/raven/.cowshed/cache/go/env",
+            "sccacheServerUds":"/Users/tester/.cowshed/sccache.sock",
             "workspaceToken":"/mnt/raven/.cowshed/token",
             "portBlock":{"base":49152,"size":16}
         })

@@ -724,17 +724,17 @@ pub fn emit_gateway_status<W: Write, E: Write>(
     Ok(())
 }
 
-struct ObservedInstallState {
-    directory_mode: Option<u32>,
-    plist: Option<ObservedPlist>,
+pub(crate) struct ObservedInstallState {
+    pub(crate) directory_mode: Option<u32>,
+    pub(crate) plist: Option<ObservedPlist>,
 }
 
-struct ObservedPlist {
-    bytes: Vec<u8>,
-    mode: u32,
+pub(crate) struct ObservedPlist {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) mode: u32,
 }
 
-fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedInstallState> {
+pub(crate) fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedInstallState> {
     let directory_mode = match fs::symlink_metadata(spec.launch_agents_directory()) {
         Ok(metadata) => {
             if !metadata.is_dir()
@@ -767,10 +767,11 @@ fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedInstallState>
             {
                 return Err(CowshedError::integrity(
                     format!(
-                        "gateway LaunchAgent plist is not a user-owned regular file: {}",
+                        "{} LaunchAgent plist is not a user-owned regular file: {}",
+                        spec.label(),
                         spec.plist_path().display()
                     ),
-                    "remove the unsafe plist and run cowshed gateway start",
+                    "remove the unsafe plist and rerun the service start command",
                 ));
             }
             let bytes = fs::read(spec.plist_path()).map_err(|error| {
@@ -852,7 +853,7 @@ pub(crate) fn canonical_home() -> Result<PathBuf> {
     Ok(home)
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
@@ -884,11 +885,11 @@ fn control_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::internal(format!("invalid gateway control configuration: {error}"))
 }
 
-fn launchd_error(error: impl std::fmt::Display) -> CowshedError {
-    CowshedError::internal(format!("gateway LaunchAgent operation failed: {error}"))
+pub(crate) fn launchd_error(error: impl std::fmt::Display) -> CowshedError {
+    CowshedError::internal(format!("LaunchAgent operation failed: {error}"))
 }
 
-fn output_error(error: io::Error) -> CowshedError {
+pub(crate) fn output_error(error: io::Error) -> CowshedError {
     CowshedError::internal(format!("could not write command output: {error}"))
 }
 
