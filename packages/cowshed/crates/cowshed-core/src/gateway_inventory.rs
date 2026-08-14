@@ -16,10 +16,13 @@ use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
 use crate::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
-use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig};
+use crate::storage::apfs::{
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrate, ApfsSubstrateConfig,
+};
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::lifecycle::{
-    DerivationError, KernelMountFact, MountState, StorageFact, derive_workspaces,
+    DerivationError, KernelMountFact, MountIntent, MountState, StorageFact, Substrate,
+    derive_workspaces,
 };
 use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
@@ -230,6 +233,71 @@ impl NativeGatewayInventory {
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
+    /// Attach and mount every recorded project's workspaces, main included.
+    ///
+    /// This runs at gateway startup, before serving, because the gateway is `RunAtLoad` and a
+    /// reboot is the one window adoption's "the checkout path is never absent and never dangling"
+    /// guarantee cannot defend on its own. Healing on contact would leave a dangling symlink — or,
+    /// under direct mount, a bare stub directory — visible in the user's shell, editor, and Finder
+    /// until something happened to touch it.
+    ///
+    /// Failures are per-project and returned rather than raised: one project whose store or image
+    /// cannot be healed must not cost every other project its gateway.
+    pub async fn heal_all(
+        &self,
+    ) -> Result<Vec<(RepoId, Result<usize, GatewayInventoryError>)>, GatewayInventoryError> {
+        let store = self.storage.store().to_owned();
+        let repositories =
+            crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
+                .await
+                .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))??;
+        let mut outcomes = Vec::with_capacity(repositories.len());
+        for repo in repositories {
+            let healed = self.heal_project(&repo).await;
+            outcomes.push((repo, healed));
+        }
+        Ok(outcomes)
+    }
+
+    async fn heal_project(&self, repo: &RepoId) -> Result<usize, GatewayInventoryError> {
+        let layout = StorageLayout::new(self.storage.store(), repo).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: self.storage.store().to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let checkout_path = authoritative_checkout_path(&layout, repo)?.ok_or_else(|| {
+            GatewayInventoryError::InvalidMetadata {
+                path: layout.project().project_root.clone(),
+                message: "project records no adopted checkout path".to_owned(),
+            }
+        })?;
+        let checkout_layout =
+            layout
+                .checkout_layout()
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: layout.project().project_root.clone(),
+                    message: error.to_string(),
+                })?;
+        let config = ApfsSubstrateConfig::new(
+            self.storage.store(),
+            self.storage.caches(),
+            checkout_path,
+            checkout_layout,
+            ApfsCaseSensitivity::Sensitive,
+        );
+        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
+        let substrate = ApfsSubstrate::new(config, host);
+        let mut healed = 0;
+        for workspace in substrate.list(repo).await? {
+            substrate
+                .ensure_mounted(&workspace.workspace, MountIntent { browse: false })
+                .await?;
+            healed += 1;
+        }
+        Ok(healed)
+    }
+
     pub async fn all_reserved_port_bases(&self) -> Result<BTreeSet<u16>, GatewayInventoryError> {
         let inventory = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
