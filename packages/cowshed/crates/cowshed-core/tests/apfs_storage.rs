@@ -1090,7 +1090,7 @@ async fn initializer_and_cleanup_errors_are_both_preserved() {
 
 #[tokio::test]
 async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
-    for (main_mount, project_root) in [
+    for (checkout_path, project_root) in [
         ("/project", "/different-project"),
         ("/different-main-mount", "/project"),
     ] {
@@ -1100,7 +1100,7 @@ async fn adopt_rejects_each_source_identity_mismatch_before_mutation() {
             ApfsSubstrateConfig::new(
                 "/store",
                 "/store/caches",
-                main_mount,
+                checkout_path,
                 ApfsCaseSensitivity::Insensitive,
             ),
             host.clone(),
