@@ -94,7 +94,7 @@ pub struct MoveArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointArgs {
-    pub workspace: String,
+    pub workspace: Option<String>,
     pub label: Option<OsString>,
     pub keep: bool,
 }
@@ -113,7 +113,7 @@ pub struct EnsureArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathArgs {
-    pub workspace: String,
+    pub workspace: Option<String>,
     pub no_attach: bool,
 }
 
@@ -164,7 +164,7 @@ pub struct GcArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PushArgs {
-    pub workspace: String,
+    pub workspace: Option<String>,
     pub branch: Option<OsString>,
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
@@ -173,7 +173,7 @@ pub struct PushArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebaseArgs {
-    pub workspace: String,
+    pub workspace: Option<String>,
     pub onto: Option<OsString>,
     pub fresh: bool,
     pub expected_workspace_incarnation: Option<OsString>,
@@ -658,8 +658,7 @@ fn parse_checkpoint(
         index += 1;
     }
     Ok(Command::Checkpoint(CheckpointArgs {
-        workspace: workspace
-            .ok_or_else(|| UsageError::new("checkpoint requires a workspace", USAGE))?,
+        workspace,
         label,
         keep,
     }))
@@ -749,7 +748,7 @@ fn parse_path(
         index += 1;
     }
     Ok(Command::Path(PathArgs {
-        workspace: workspace.ok_or_else(|| UsageError::new("path requires a workspace", USAGE))?,
+        workspace,
         no_attach,
     }))
 }
@@ -1035,7 +1034,7 @@ fn parse_push(
         index += 1;
     }
     Ok(Command::Push(PushArgs {
-        workspace: workspace.ok_or_else(|| UsageError::new("push requires a workspace", USAGE))?,
+        workspace,
         branch,
         expected_workspace_incarnation,
         expected_source_head,
@@ -1096,8 +1095,7 @@ fn parse_rebase(
         index += 1;
     }
     Ok(Command::Rebase(RebaseArgs {
-        workspace: workspace
-            .ok_or_else(|| UsageError::new("rebase requires a workspace", USAGE))?,
+        workspace,
         onto,
         fresh,
         expected_workspace_incarnation,
@@ -1460,10 +1458,32 @@ mod tests {
         assert!(!remove.force);
     }
 
+    /// Which verbs may omit `<ws>` is a parser-level fact, and the split is deliberate: acting on
+    /// the workspace you are standing in is inferable, losing it is not.
+    #[test]
+    fn only_in_place_verbs_accept_an_omitted_workspace() {
+        for verb in ["rebase", "push", "checkpoint", "path"] {
+            let cli = parse_args([verb]).unwrap_or_else(|_| panic!("{verb} may infer its cwd"));
+            let named = parse_args([verb, "raven"])
+                .unwrap_or_else(|_| panic!("{verb} still accepts a name"));
+            assert_ne!(
+                format!("{:?}", cli.command),
+                format!("{:?}", named.command),
+                "{verb} must carry the explicit name through rather than discarding it"
+            );
+        }
+        // Retire, replace, rename, unmount: the workspace has to be named.
+        for verb in ["rm", "land", "restore", "mv", "detach", "attach", "exec"] {
+            assert!(
+                parse_args([verb]).is_err(),
+                "{verb} must not infer a workspace from the cwd"
+            );
+        }
+    }
+
     #[test]
     fn lifecycle_parsers_enforce_required_values_and_preserve_revision_bytes() {
         assert!(parse_args(["fork", "raven"]).is_err());
-        assert!(parse_args(["checkpoint"]).is_err());
         assert!(parse_args(["restore", "raven"]).is_err());
         assert!(parse_args(["push", "raven", "--branch"]).is_err());
         assert!(parse_args(["land", "raven", "--check"]).is_err());

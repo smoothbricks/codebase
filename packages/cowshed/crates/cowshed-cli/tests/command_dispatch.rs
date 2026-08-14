@@ -36,6 +36,9 @@ struct FakeService {
     ensure_report: Option<EnsureReport>,
     ensure_error: Option<CowshedError>,
     ensure_path: Option<PathBuf>,
+    /// What `workspace_at` reports for the invocation cwd: `None` means the command was not run
+    /// inside any mounted workspace, which is what makes the refusal path testable.
+    cwd_workspace: Option<String>,
     gc_candidates: Vec<GcCandidate>,
     shutdowns: Option<Arc<AtomicUsize>>,
     shutdown_error: Option<CowshedError>,
@@ -52,6 +55,7 @@ impl Default for FakeService {
             fail_list: None,
             fail_push: None,
             fail_reconcile_gateway: None,
+            cwd_workspace: None,
             adopt_options: None,
             push_options: None,
             rebase_options: None,
@@ -109,6 +113,17 @@ impl CliService for FakeService {
     async fn restore(&mut self, name: &str, label: &str) -> Result<WorkspaceInfo> {
         self.events.push(format!("restore:{name}:{label}"));
         Ok(workspace(name, WorkspaceState::Attached))
+    }
+
+    async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo> {
+        self.events.push(format!("workspace-at:{}", path.display()));
+        match self.cwd_workspace.clone() {
+            Some(name) => Ok(workspace(&name, WorkspaceState::Attached)),
+            None => Err(CowshedError::not_found(
+                "no mounted workspace contains the invocation directory",
+                "run cowshed from inside a mounted workspace",
+            )),
+        }
     }
 
     async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport> {
@@ -1014,6 +1029,9 @@ impl CliService for SerializedCreateService {
         unreachable!()
     }
     async fn ensure_current(&mut self, _: PathBuf) -> Result<EnsureReport> {
+        unreachable!()
+    }
+    async fn workspace_at(&mut self, _: PathBuf) -> Result<WorkspaceInfo> {
         unreachable!()
     }
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {

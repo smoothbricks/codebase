@@ -500,10 +500,26 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
    4, workspace intact).
 2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else `.cowshed.toml` `[land] check`,
    else no validation with one honest `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact,
-   output captured as a job (11_shell.md) for diagnosis.
-3. **Fast-forward the target branch under its repository lock**: fetch the exact validated source head from the
-   workspace mount, revalidate the source workspace incarnation, source head, and expected target head, then require a
-   fast-forward. How the update is materialized depends only on checkout state:
+   output captured as a job (11_shell.md) for diagnosis. The check is an ordinary sandboxed exec and gets exactly the
+   environment one gets (04_sandbox.md): a curated `PATH` that admits the immutable store-backed roots — `/nix/store`,
+   `/run/current-system`, and the per-user profile roots `/etc/profiles` and `/etc/static/profiles` — plus a private
+   `HOME`. A verify command that needs more than that needs it wired into the workspace, not leaked from the caller's
+   shell; the check runs where the work was done, and a check that only passes in the coordinator's environment has not
+   validated the workspace.
+3. **Fast-forward the target branch under its repository lock**: **fetch** the workspace's branch from its mount into
+   the host — a workspace is a standalone repository whose commits the host has never seen, so without this the merge
+   resolves an object that does not exist and fails as "not something we can merge" — then revalidate the source
+   workspace incarnation, source head, and expected target head, and require a fast-forward. The fetch is also the
+   revalidation: what arrives must be the head the check validated, and a workspace that advanced in between is a
+   conflict rather than an unchecked land. The fetched branch lands in the workspace's own preservation namespace,
+   `refs/cowshed/<ws>/heads/<branch>`, which retirement prunes.
+
+   **Land has no branch-name contract.** It fetches whatever branch the workspace has checked out — `cowshed/<ws>` is
+   what `new` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the
+   minted name. Only the resolved head is load-bearing. A workspace with no checked-out branch is a conflict naming the
+   fix.
+
+   How the update is materialized depends only on checkout state:
    - If the target branch is checked out in the main workspace, run the fast-forward **through that checked-out
      workspace**. Its branch ref, `HEAD`, index, and working tree all advance to the validated source tree. This is the
      normal `main` case; Cowshed must not update only a hidden or non-checked-out ref while leaving the visible main

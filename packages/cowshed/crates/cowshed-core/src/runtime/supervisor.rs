@@ -815,6 +815,13 @@ fn sandbox_path(sandbox: &SandboxConfig) -> Result<OsString> {
                 && [
                     Path::new("/nix/store"),
                     Path::new("/run/current-system"),
+                    // Nix per-user profiles. `/etc/profiles/per-user/<user>/bin` is where
+                    // nix-darwin and NixOS put a user's installed tools — the same immutable
+                    // store-backed class as /nix/store, reached through a stable symlink. Omitting
+                    // it made every nix-installed verify command unrunnable inside a workspace
+                    // while the identical command worked in the user's own shell.
+                    Path::new("/etc/profiles"),
+                    Path::new("/etc/static/profiles"),
                     Path::new("/opt"),
                     Path::new("/System"),
                     Path::new("/Library"),
