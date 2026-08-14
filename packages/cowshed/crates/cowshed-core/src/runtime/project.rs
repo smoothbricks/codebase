@@ -1778,6 +1778,34 @@ impl NativeProjectRuntimeHost {
             .map_err(native_integrity_error)
     }
 
+    /// Add `workspace`'s mount as a remote in main's repository, for `cowshed new --register`.
+    ///
+    /// Opt-in because it is host-side state that accumulates one entry per workspace: a
+    /// coordinator minting and retiring all day would silt up the user's config.
+    async fn register_workspace_in_main(&self, workspace: &WorkspaceName) -> Result<()> {
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let workspace_mount = self.workspace_mount_path(workspace)?;
+        crate::git::GitRepository::from_root(&main_mount)
+            .register_workspace_remote(workspace.as_str(), &workspace_mount)
+            .await
+    }
+
+    /// Drop `workspace`'s registration from main. Main being unmounted is not a failure: there is
+    /// nothing to clean up in a repository that is not there, and `gc` re-runs this from the same
+    /// revalidated retirement metadata that authorizes the rest of cleanup.
+    async fn unregister_workspace_in_main(&self, workspace: &WorkspaceName) -> Result<()> {
+        if workspace.is_main() {
+            return Ok(());
+        }
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        if !main_mount.join(".git").exists() {
+            return Ok(());
+        }
+        crate::git::GitRepository::from_root(&main_mount)
+            .unregister_workspace_remote(workspace.as_str())
+            .await
+    }
+
     fn snapshot(&self, workspace: &NativeWorkspace) -> Result<WorkspaceSnapshot> {
         let info_snapshot = workspace.metadata.info_snapshot.as_ref();
         let base_commit = info_snapshot
@@ -2631,18 +2659,25 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 },
             )
             .map_err(native_integrity_error)?;
-        let host_root = self.descriptor.git_root.clone();
+        // Main's canonical mount, never `descriptor.git_root`: under the symlink layout the
+        // recorded checkout is a symlink outside this workspace's read grants that dangles as soon
+        // as the checkout moves, and only the canonical mount is maintained by `cowshed mv`.
+        let main_mount = self.workspace_mount_path(&main_name())?;
         let start = options.revision.as_ref().map(revision_target);
         let destination = workspace.clone();
         let receipt = self
             .substrate
             .execute_create_staged(plan, move |stage| async move {
                 crate::git::GitRepository::from_root(&stage.mount_point)
-                    .prepare_workspace(&destination.to_string(), &host_root, start.as_deref())
+                    .prepare_workspace(&destination.to_string(), &main_mount, start.as_deref())
                     .await
+                    .map(|_| ())
             })
             .await
             .map_err(native_staged_error)?;
+        if options.register {
+            self.register_workspace_in_main(&workspace).await?;
+        }
         self.commitments
             .ensure_workspace_introduced(
                 self.descriptor.repo_id.clone(),
@@ -3203,6 +3238,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 self.require_session_removal_safe(&workspace, &final_fence)
                     .await?;
             }
+            // Host-side state goes before the image does. A remote naming a trashed mount is a
+            // broken fetch in the user's own checkout — the one piece of this teardown that lives
+            // where they can see it.
+            self.unregister_workspace_in_main(&workspace).await?;
             self.retire_workspace(current).await
         }
         .await;
@@ -4939,6 +4978,11 @@ fn native_environment_error(
 #[cfg(target_os = "macos")]
 fn native_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "cowshed doctor --json")
+}
+
+#[cfg(target_os = "macos")]
+fn main_name() -> WorkspaceName {
+    WorkspaceName::new("main").expect("fixed main workspace name is valid")
 }
 
 /// Decide which path a checkout-identity check should actually inspect.
