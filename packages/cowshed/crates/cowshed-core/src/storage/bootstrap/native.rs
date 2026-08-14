@@ -215,7 +215,7 @@ where
 }
 
 fn existing_host_storage_error(error: NativeBootstrapError) -> CowshedError {
-    CowshedError::environment_missing(error.to_string(), "next: cowshed adopt")
+    CowshedError::environment_missing(error.to_string(), "cowshed adopt")
 }
 
 /// Apply a previously planned native bootstrap with an explicit provisioning capability.
@@ -237,7 +237,7 @@ where
         if !actions.is_empty() {
             return Err(NativeBootstrapError::StorageSetupRequired {
                 actions,
-                hint: "next: cowshed adopt",
+                hint: "cowshed adopt",
             });
         }
     }
@@ -3076,7 +3076,7 @@ mod tests {
             .expect_err("existing-only validation must reject marker repair");
 
         assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, "next: cowshed adopt");
+        assert_eq!(error.hint, "cowshed adopt");
         assert!(error.message.contains("storage setup is required"));
         assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
         assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
@@ -3106,7 +3106,7 @@ mod tests {
         ));
         let error = existing_host_storage_error(native);
         assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, "next: cowshed adopt");
+        assert_eq!(error.hint, "cowshed adopt");
     }
 
     #[tokio::test]
@@ -3137,7 +3137,7 @@ mod tests {
                 .expect_err("existing-only validation rejects unsafe roots");
 
             assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-            assert_eq!(error.hint, "next: cowshed adopt");
+            assert_eq!(error.hint, "cowshed adopt");
             assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
             assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
             assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
@@ -3161,7 +3161,7 @@ mod tests {
             .expect_err("existing-only validation rejects provisioning");
 
         assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, "next: cowshed adopt");
+        assert_eq!(error.hint, "cowshed adopt");
         assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
