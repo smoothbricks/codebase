@@ -3772,18 +3772,37 @@ fn binding_from_remotes(
         .map_err(binding_integrity_error);
     }
 
+    // A remote that yields no owner/repo identity is not an error: local-path
+    // mirrors and backup remotes are ordinary Git and carry no identity to
+    // derive. They are skipped as identity candidates, and only reported if
+    // nothing else identifies the repository — one unusable remote must not
+    // brick read-only commands in an otherwise well-formed checkout.
     let mut candidates = Vec::with_capacity(remotes.len());
+    let mut unusable = Vec::new();
     for remote in remotes {
-        let repo_id = crate::repository::normalize_remote_url(&remote.url).map_err(|error| {
-            CowshedError::usage(
+        match crate::repository::normalize_remote_url(&remote.url) {
+            Ok(repo_id) => candidates.push((remote, repo_id)),
+            Err(error) => unusable.push(format!("{} ({error})", remote.name)),
+        }
+    }
+
+    if candidates.is_empty() {
+        let repo_id = requested_repo_id.cloned().ok_or_else(|| {
+            CowshedError::environment_missing(
                 format!(
-                    "Git remote {} has an invalid repository URL: {error}",
-                    remote.name
+                    "no Git remote yields a repository identity; skipped: {}",
+                    unusable.join(", ")
                 ),
-                format!("fix or remove Git remote {}", remote.name),
+                "retry adoption with --repo-id owner/repo",
             )
         })?;
-        candidates.push((remote, repo_id));
+        return RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id,
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .map_err(binding_integrity_error);
     }
 
     let available = candidates
@@ -4894,6 +4913,41 @@ mod binding_tests {
         assert!(error.hint.contains("--repo-id"));
         assert!(error.hint.contains("acme/widget"));
         assert!(error.hint.contains("upstream/widget"));
+    }
+
+    #[test]
+    /// A local-path backup remote is ordinary Git and yields no owner/repo. It
+    /// must not brick a checkout whose other remotes identify it perfectly well
+    /// — that failure reached every command, including read-only ones.
+    #[test]
+    fn a_remote_without_a_derivable_identity_is_skipped_not_fatal() {
+        let remotes = [
+            remote("axe", "https://github.com/axe-scale/minigraf.git"),
+            remote("backup", "/Volumes/Backup/Dev/_fork/minigraf.git"),
+        ];
+
+        let binding =
+            binding_from_remotes(&remotes, None).expect("the usable remote identifies it");
+
+        let primary = binding.primary().expect("primary");
+        assert_eq!(primary.repo_id, repo_id("axe-scale/minigraf"));
+        assert_eq!(primary.remote_name.as_deref(), Some("axe"));
+    }
+
+    #[test]
+    fn a_checkout_whose_every_remote_is_unusable_reports_what_it_skipped() {
+        let remotes = [remote("backup", "/Volumes/Backup/Dev/_fork/minigraf.git")];
+
+        let error =
+            binding_from_remotes(&remotes, None).expect_err("nothing identifies the repository");
+        assert_eq!(error.code.as_str(), "environment-missing");
+        assert!(error.message.contains("backup"), "{}", error.message);
+
+        // An explicit identity is still enough to proceed.
+        let requested = repo_id("axe-scale/minigraf");
+        let binding =
+            binding_from_remotes(&remotes, Some(&requested)).expect("explicit identity suffices");
+        assert_eq!(binding.primary().expect("primary").repo_id, requested);
     }
 
     #[test]
