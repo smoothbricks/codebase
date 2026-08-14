@@ -367,8 +367,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<(), ApfsStorageError>;
     /// Detach adopted main and atomically restore its exact retained host checkout.
     ///
-    /// Implementations derive retry state solely from `source_checkout` and its exact
-    /// `pre_cowshed_checkout` sibling. They must never recursively copy or merge either tree.
+    /// Implementations derive retry state solely from `source_checkout`, its exact
+    /// `pre_cowshed_checkout` sibling, and the canonical mount the checkout symlink names. They
+    /// must never recursively copy or merge either tree.
     fn restore_adopted_checkout(
         &self,
         workspace: &LifecycleWorkspace,
@@ -376,12 +377,27 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         pre_cowshed_checkout: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn publish_image(&self, staged: &Path, canonical: &Path) -> Result<(), PublicationError>;
+    /// Prepare adoption's durable state without touching the user's tree.
+    ///
+    /// Creates `canonical_mount` with its self-healing stub and publishes the canonical image.
+    /// The adopted checkout is untouched: it is still the user's original directory when this
+    /// returns, and `link_adopted_checkout` takes it over only once the mount is live.
     fn publish_adopt(
         &self,
-        source_checkout: &Path,
-        pre_cowshed_checkout: &Path,
+        canonical_mount: &Path,
         staged: &Path,
         canonical: &Path,
+    ) -> Result<(), PublicationError>;
+    /// Take over the adopted checkout path atomically, once `canonical_mount` is mounted.
+    ///
+    /// Swaps a symlink naming `canonical_mount` into the checkout path and lands the displaced
+    /// original tree at `pre_cowshed_checkout`. The checkout path is at every instant either the
+    /// original directory or a symlink to the live mount — never absent, never dangling.
+    fn link_adopted_checkout(
+        &self,
+        canonical_mount: &Path,
+        source_checkout: &Path,
+        pre_cowshed_checkout: &Path,
     ) -> Result<(), PublicationError>;
     fn publish_metadata(
         &self,
@@ -1519,6 +1535,7 @@ struct PreparedAdopt<A> {
     attachment: A,
     staged_image: PathBuf,
     canonical_image: PathBuf,
+    canonical_mount: PathBuf,
     source_checkout: PathBuf,
     pre_cowshed_checkout: PathBuf,
 }
@@ -1737,6 +1754,19 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     )
     .map_err(|_| ApfsStorageError::InvalidPlan("invalid adopted workspace identity"))?;
     let canonical_image = canonical_image_path(config, &workspace)?;
+    // Main is not special in the mount namespace: adoption publishes it where the layout says
+    // every workspace lives. Two resolvers reach that path — the layout directly, and the
+    // substrate's `mount_point` — and the adopted checkout becomes a symlink to whatever they
+    // agree on. Disagreement would aim the symlink at a directory nothing ever mounts, so it is
+    // rejected here, before the user's tree is touched.
+    let canonical_mount = layout(config, repo)?
+        .workspace_mount(&main_name())
+        .map_err(ApfsStorageError::from)?;
+    if canonical_mount != mount_point(config, &workspace)? {
+        return Err(ApfsStorageError::InvalidPlan(
+            "main's layout mount disagrees with the substrate mount point",
+        ));
+    }
     let mount_point = staging_mount(config, &workspace)?;
     let staged_companion = companion_path(&created.path);
 
@@ -1789,6 +1819,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
         attachment,
         staged_image: created.path,
         canonical_image,
+        canonical_mount,
         source_checkout: source_checkout.to_owned(),
         pre_cowshed_checkout: pre_cowshed_checkout.to_owned(),
     })
@@ -1829,6 +1860,7 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
         attachment,
         staged_image,
         canonical_image,
+        canonical_mount,
         source_checkout,
         pre_cowshed_checkout,
     } = prepared;
@@ -1852,12 +1884,11 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
             host.reclaim_image(&staged_image, stage.workspace.format()),
         );
     }
-    if let Err(primary) = host.publish_adopt(
-        &source_checkout,
-        &pre_cowshed_checkout,
-        &staged_image,
-        &canonical_image,
-    ) {
+    // Publication order is the transaction. Everything durable is built outside the user's tree
+    // first — mountpoint, then image — and only once the workspace is mounted and live does the
+    // adopted checkout path change hands, in a single atomic swap. A failure or crash before that
+    // last step leaves the user's directory exactly as it was.
+    if let Err(primary) = host.publish_adopt(&canonical_mount, &staged_image, &canonical_image) {
         let cleanup = match primary.disposition() {
             PublicationDisposition::RolledBack => {
                 host.reclaim_image(&staged_image, stage.workspace.format())
@@ -1866,7 +1897,12 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
         };
         return combine_cleanup("adopt publication", primary.into_source(), cleanup);
     }
-    mount_canonical(host, &canonical_image, &source_checkout, &stage.workspace)?;
+    mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
+    if let Err(primary) =
+        host.link_adopted_checkout(&canonical_mount, &source_checkout, &pre_cowshed_checkout)
+    {
+        return Err(primary.into_source());
+    }
     Ok(Applied::Lifecycle(LifecycleReceipt {
         resulting_revision: stage.workspace.revision(),
         workspace: stage.workspace,
@@ -2716,13 +2752,11 @@ fn mount_point(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
-    if workspace.name().is_main() {
-        Ok(config.checkout_path.clone())
-    } else {
-        layout(config, workspace.repo())?
-            .workspace_mount(workspace.name())
-            .map_err(Into::into)
-    }
+    // One uniform mount namespace: main included. `config.checkout_path` is where the symlink to
+    // this mount lives, never a mount point of its own.
+    layout(config, workspace.repo())?
+        .workspace_mount(workspace.name())
+        .map_err(Into::into)
 }
 
 pub fn volume_name(repo: &RepoId, workspace: &WorkspaceName) -> String {
