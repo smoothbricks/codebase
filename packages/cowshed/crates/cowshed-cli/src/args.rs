@@ -22,6 +22,7 @@ pub enum Command {
     Adopt(AdoptArgs),
     New(NewArgs),
     Fork(ForkArgs),
+    Move(MoveArgs),
     Checkpoint(CheckpointArgs),
     Restore(RestoreArgs),
     Ensure(EnsureArgs),
@@ -80,6 +81,12 @@ pub struct NewArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkArgs {
+    pub source: String,
+    pub destination: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MoveArgs {
     pub source: String,
     pub destination: String,
 }
@@ -240,6 +247,7 @@ enum CommandName {
     Adopt,
     New,
     Fork,
+    Move,
     Checkpoint,
     Restore,
     Ensure,
@@ -272,6 +280,7 @@ where
         Some("adopt") => CommandName::Adopt,
         Some("new") => CommandName::New,
         Some("fork") => CommandName::Fork,
+        Some("mv") => CommandName::Move,
         Some("checkpoint") => CommandName::Checkpoint,
         Some("restore") => CommandName::Restore,
         Some("ensure") => CommandName::Ensure,
@@ -302,6 +311,7 @@ where
         CommandName::Adopt => parse_adopt(&args, index, &mut global)?,
         CommandName::New => parse_new(&args, index, &mut global)?,
         CommandName::Fork => parse_fork(&args, index, &mut global)?,
+        CommandName::Move => parse_move(&args, index, &mut global)?,
         CommandName::Checkpoint => parse_checkpoint(&args, index, &mut global)?,
         CommandName::Restore => parse_restore(&args, index, &mut global)?,
         CommandName::Ensure => parse_ensure(&args, index, &mut global)?,
@@ -575,6 +585,41 @@ fn parse_fork(
         source: source.ok_or_else(|| UsageError::new("fork requires a source workspace", USAGE))?,
         destination: destination
             .ok_or_else(|| UsageError::new("fork requires a destination workspace", USAGE))?,
+    }))
+}
+
+fn parse_move(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "mv <ws> <new-name>";
+    let mut source = None;
+    let mut destination = None;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            // `main` is accepted here and refused by the coordinator, which can say why and name
+            // the command that does what the user meant.
+            _ if source.is_none() => {
+                source = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ if destination.is_none() => {
+                destination = Some(workspace_name(&args[index], true, USAGE)?);
+            }
+            _ => {
+                return Err(UsageError::new("mv accepts exactly two workspaces", USAGE));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Move(MoveArgs {
+        source: source.ok_or_else(|| UsageError::new("mv requires a workspace", USAGE))?,
+        destination: destination
+            .ok_or_else(|| UsageError::new("mv requires a destination name", USAGE))?,
     }))
 }
 

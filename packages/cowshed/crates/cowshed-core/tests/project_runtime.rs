@@ -444,6 +444,15 @@ impl ProjectRuntimeHost for FakeHost {
         self.create(destination, CreateOptions::default()).await
     }
 
+    async fn rename(
+        &mut self,
+        source: WorkspaceName,
+        destination: WorkspaceName,
+    ) -> Result<WorkspaceSnapshot> {
+        self.workspace(&source)?;
+        self.create(destination, CreateOptions::default()).await
+    }
+
     async fn ensure(&mut self, workspace: WorkspaceName) -> Result<EnsureReport> {
         let current = self.workspace(&workspace)?;
         let mount = self.snapshot(current).info.mount;
