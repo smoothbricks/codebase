@@ -203,13 +203,18 @@ into its git config and would dangle the moment the checkout moves; the canonica
 the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every attached
 workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label.
 
-Configuring the remote **never clobbers a remote the user already has**. The workspace's `.git` arrives by CoW, so it
-carries whatever remotes main carried, and `main` is a plausible name for a user's own remote — a fork's upstream, a
-mirror, a second origin. Cowshed inspects before it writes:
+A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote main had, network
+URLs included, so mint **strips them all** before configuring its own. That is the "no remote URL ever exists inside a
+sandbox" invariant, not a judgement about user intent — nothing in a just-cloned image is the user's yet.
+
+Afterwards it is, and configuration **never clobbers a remote cowshed did not create**. Remote configuration is
+idempotent and re-runs on reconciliation, against a repository an agent has been working in — where `cowshed repo`
+mirrors and hand-added remotes are real, and `main` is a plausible name for one of them. Cowshed inspects before it
+writes:
 
 - No remote named `main`: create it.
-- A remote named `main` whose URL is already the canonical mount: leave it. This is the idempotent re-mint case.
-- A remote named `main` pointing anywhere else: it is the user's. Leave it untouched, register cowshed's under
+- A remote named `main` whose URL is already the canonical mount: leave it. This is the idempotent re-run.
+- A remote named `main` pointing anywhere else: it is not cowshed's. Leave it untouched, register cowshed's under
   `cowshed-main` instead, and print one `cowshed:` stderr line naming both. The workspace is fully functional; only the
   spelling in `next:` hints changes, and the hints print the name actually in force.
 

@@ -105,8 +105,8 @@ the branch and the working tree are single-writer.
 ## Git semantics
 
 A workspace is **not** a worktree. Its `.git` is a full independent repository, not a gitdir file pointing at a shared
-object store. Inherited remotes are stripped and replaced by exactly one remote, `host`, pointing at the absolute path
-of the host checkout. Nothing touches the network.
+object store. Inherited remotes are stripped and replaced by exactly one remote, `main`, pointing at the absolute path
+of main's canonical mount. Nothing touches the network.
 
 The branch is `cowshed/<name>`, created off the source HEAD.
 
@@ -115,13 +115,17 @@ This maps directly onto a rebase-then-fast-forward coordinator flow:
 | Step                             | Command                                                                                                                                                         |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Agent commits                    | ordinary `git commit` inside the workspace, on `cowshed/<name>`                                                                                                 |
-| Agent rebases onto main          | `cowshed rebase <ws>` — runs `git rebase host/main` inside the workspace                                                                                        |
+| Agent rebases onto main          | `cowshed rebase <ws>` — runs `git rebase main/main` inside the workspace                                                                                        |
 | Coordinator lands                | `cowshed land <ws> --target main --check '<verify cmd>'` — rebases, runs the check, then `git merge --ff-only` in the host checkout, then retires the workspace |
-| Deliver a branch without merging | `cowshed push <ws> --branch <name>` — `git push host HEAD:refs/heads/<name>`                                                                                    |
+| Deliver a branch without merging | `cowshed push <ws> --branch <name>` — `git push main HEAD:refs/heads/<name>`                                                                                    |
 
 `land` is the whole coordinator step in one command, and it fast-forwards only: if the check fails or the merge would
 not fast-forward, it stops with a non-zero exit rather than creating a merge commit. Use `push --branch` when the host
 should receive the branch under a specific name for review instead of an immediate merge.
+
+The division of labor is fixed: the WORKER runs `cowshed rebase` and resolves conflicts itself — it holds the
+implementation context — so `land`'s own rebase is a no-op on a well-handed-off branch. If `land` hits a rebase
+conflict, the coordinator does not resolve it: send the workspace back to its worker to rebase again.
 
 ## Copy-on-write facts worth relying on
 
