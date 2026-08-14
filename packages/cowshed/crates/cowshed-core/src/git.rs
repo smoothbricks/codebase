@@ -21,6 +21,41 @@ pub struct RemoteUrl {
     pub url: String,
 }
 
+/// The name a workspace's upstream carries: the main workspace, so `main`.
+///
+/// `git fetch main` then reads as what it does, and an agent that has never seen this codebase
+/// guesses it on the first try — which the previous name, `host`, did not deliver: it named a
+/// machine rather than something you fetch from.
+pub const MAIN_REMOTE: &str = "main";
+
+/// Where cowshed's upstream goes when the workspace already has a remote named `main` that is not
+/// it. Cowshed adds and lets the user remove; it never retargets a remote it did not create.
+pub const FALLBACK_MAIN_REMOTE: &str = "cowshed-main";
+
+/// The name a workspace's `main` remote is actually registered under, once configuration has run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MainRemote {
+    /// The remote is `main`, either freshly created or already correct.
+    Canonical,
+    /// A foreign remote holds the name `main`, so cowshed's is `cowshed-main`. `next:` hints must
+    /// print this name rather than the canonical one — the guidance has to name what exists.
+    Displaced,
+}
+
+impl MainRemote {
+    pub const fn remote_name(self) -> &'static str {
+        match self {
+            Self::Canonical => MAIN_REMOTE,
+            Self::Displaced => FALLBACK_MAIN_REMOTE,
+        }
+    }
+}
+
+/// The name of the remote main registers for a workspace under `--register`.
+pub fn workspace_remote_name(workspace: &str) -> String {
+    format!("cowshed/{workspace}")
+}
+
 #[derive(Clone, Debug)]
 pub struct GitRepository {
     root: PathBuf,
@@ -319,15 +354,20 @@ impl GitRepository {
     }
 
     /// Configure local-only workspace Git and create its session branch.
+    ///
+    /// `main_mount` is main's *canonical mount*, never the recorded checkout path. Under the
+    /// symlink layout those differ, and the checkout path is a symlink outside the workspace's read
+    /// grants that dangles the moment the checkout moves; the canonical mount is the path the
+    /// substrate owns, the grants cover, and `cowshed mv` maintains.
     pub async fn prepare_workspace(
         &self,
         name: &str,
-        host_path: &Path,
+        main_mount: &Path,
         start: Option<&str>,
-    ) -> Result<()> {
-        if !host_path.is_absolute() {
+    ) -> Result<MainRemote> {
+        if !main_mount.is_absolute() {
             return Err(CowshedError::usage(
-                "workspace host remote must be an absolute local path",
+                "workspace main remote must be an absolute local path",
                 "retry from a resolved repository root",
             ));
         }
@@ -346,23 +386,15 @@ impl GitRepository {
             return Err(git_internal("check workspace branch", &exists));
         }
 
-        let remotes = self.run(["remote"]).await?;
-        if !remotes.status.success() {
-            return Err(git_internal("list workspace remotes", &remotes));
-        }
-        for remote in parse_lines(&remotes.stdout, "remote name")? {
+        // The `.git` directory arrived by CoW carrying every remote main had, including network
+        // URLs. Sandboxed git speaks only local paths, so a fresh mint drops the lot before
+        // configuring its own upstream — this is the "no remote URL ever exists inside a sandbox"
+        // invariant, not a clobber of user intent: nothing in this repository is the user's yet.
+        for remote in self.remote_names().await? {
             let output = self.run(["remote", "remove", remote.as_str()]).await?;
             ensure_git_success("remove inherited remote", output)?;
         }
-        let output = self
-            .run([
-                OsStr::new("remote"),
-                OsStr::new("add"),
-                OsStr::new("host"),
-                host_path.as_os_str(),
-            ])
-            .await?;
-        ensure_git_success("add host remote", output)?;
+        let main_remote = self.configure_main_remote(main_mount).await?;
 
         let mut args = vec![
             OsString::from("switch"),
@@ -374,7 +406,104 @@ impl GitRepository {
             args.push(OsString::from(start));
         }
         let output = self.run(args).await?;
-        ensure_git_success("create workspace branch", output)
+        ensure_git_success("create workspace branch", output)?;
+        Ok(main_remote)
+    }
+
+    /// Point this workspace at main's canonical mount, without ever clobbering a remote cowshed
+    /// did not create.
+    ///
+    /// Idempotent, and that is the point: it runs at mint against a repository whose remotes were
+    /// just stripped, and again on any later reconciliation against one an agent has been working
+    /// in — where `cowshed repo` mirrors and hand-added remotes are the user's, and a remote named
+    /// `main` may well be one of them.
+    pub async fn configure_main_remote(&self, main_mount: &Path) -> Result<MainRemote> {
+        if !main_mount.is_absolute() {
+            return Err(CowshedError::usage(
+                "workspace main remote must be an absolute local path",
+                "retry from a resolved repository root",
+            ));
+        }
+        match self.remote_url(MAIN_REMOTE).await? {
+            // Already ours and already correct: the idempotent re-run.
+            Some(url) if Path::new(&url) == main_mount => Ok(MainRemote::Canonical),
+            // Someone else holds the name. Leave it exactly as it is and stand beside it.
+            Some(_) => {
+                self.set_remote(FALLBACK_MAIN_REMOTE, main_mount).await?;
+                Ok(MainRemote::Displaced)
+            }
+            None => {
+                self.set_remote(MAIN_REMOTE, main_mount).await?;
+                Ok(MainRemote::Canonical)
+            }
+        }
+    }
+
+    /// Register `workspace`'s mount as a remote in *this* repository, which is main's.
+    ///
+    /// The direction is the safe one: main fetches from a workspace, and a workspace never pushes
+    /// into main — the same pull-based hand-back `push`, autosave, and `land` use.
+    pub async fn register_workspace_remote(&self, workspace: &str, mount: &Path) -> Result<()> {
+        if !mount.is_absolute() {
+            return Err(CowshedError::usage(
+                "workspace remote must be an absolute local path",
+                "retry once the workspace is mounted",
+            ));
+        }
+        self.set_remote(&workspace_remote_name(workspace), mount)
+            .await
+    }
+
+    /// Drop `workspace`'s registration from main. Absent is success: retirement is idempotent and
+    /// `gc` re-runs this from the same revalidated metadata that authorizes the rest of cleanup.
+    pub async fn unregister_workspace_remote(&self, workspace: &str) -> Result<()> {
+        let name = workspace_remote_name(workspace);
+        if self.remote_url(&name).await?.is_none() {
+            return Ok(());
+        }
+        let output = self.run(["remote", "remove", name.as_str()]).await?;
+        ensure_git_success("remove workspace remote", output)
+    }
+
+    async fn remote_names(&self) -> Result<Vec<String>> {
+        let output = self.run(["remote"]).await?;
+        if !output.status.success() {
+            return Err(git_internal("list workspace remotes", &output));
+        }
+        parse_lines(&output.stdout, "remote name")
+    }
+
+    async fn remote_url(&self, name: &str) -> Result<Option<PathBuf>> {
+        let output = self
+            .run(["config", "--get", &format!("remote.{name}.url")])
+            .await?;
+        if output.status.success() {
+            return Ok(Some(parse_one_path(&output.stdout, "remote url")?));
+        }
+        // git-config exits 1 for an absent key; anything else is a real failure.
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        Err(git_internal("read remote url", &output))
+    }
+
+    /// Create the remote, or retarget one cowshed already owns. Callers decide ownership first.
+    async fn set_remote(&self, name: &str, url: &Path) -> Result<()> {
+        let existing = self.remote_url(name).await?;
+        let verb = if existing.is_some() {
+            "set-url"
+        } else {
+            "add"
+        };
+        let output = self
+            .run([
+                OsStr::new("remote"),
+                OsStr::new(verb),
+                OsStr::new(name),
+                url.as_os_str(),
+            ])
+            .await?;
+        ensure_git_success("configure remote", output)
     }
 
     async fn read_one<I, S>(&self, args: I, operation: &str) -> Result<String>
@@ -492,7 +621,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{GIT, GitRepository, ensure_git_success, git_message};
+    use super::{
+        FALLBACK_MAIN_REMOTE, GIT, GitRepository, MAIN_REMOTE, MainRemote, ensure_git_success,
+        git_message, workspace_remote_name,
+    };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn repository() -> PathBuf {
@@ -674,7 +806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepares_standalone_workspace_branch_and_only_local_host_remote() {
+    async fn prepares_standalone_workspace_branch_and_only_the_local_main_remote() {
         let root = repository();
         let status = Command::new(GIT)
             .arg("-C")
@@ -690,42 +822,153 @@ mod tests {
         assert!(status.success());
 
         let repo = GitRepository::from_root(&root);
-        repo.prepare_workspace("raven", &root, Some("main"))
-            .await
-            .expect("prepare workspace");
+        assert_eq!(
+            repo.prepare_workspace("raven", &root, Some("main"))
+                .await
+                .expect("prepare workspace"),
+            MainRemote::Canonical
+        );
         assert_eq!(
             repo.current_branch().await.expect("read branch").as_deref(),
             Some("cowshed/raven")
         );
+        // The inherited network remote is gone and exactly one local remote stands in its place.
         let remotes = repo.remotes().await.expect("read remotes");
         assert_eq!(remotes.len(), 1);
-        assert_eq!(remotes[0].name, "host");
+        assert_eq!(remotes[0].name, MAIN_REMOTE);
         assert_eq!(Path::new(&remotes[0].url), root);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
+    /// The three cases of `configure_main_remote`, witnessed by what the config actually holds
+    /// afterwards rather than by whether a command was issued.
     #[tokio::test]
-    async fn preserves_non_utf8_host_remote_argument() {
+    async fn main_remote_configuration_is_idempotent_and_never_clobbers_a_foreign_remote() {
         let root = repository();
-        let host_path = PathBuf::from(OsString::from_vec(b"/tmp/cowshed-host-\xff".to_vec()));
+        let mount = PathBuf::from("/tmp/cowshed-canonical-mount");
         let repo = GitRepository::from_root(&root);
-        repo.prepare_workspace("raven", &host_path, None)
+
+        // Absent: created.
+        assert_eq!(
+            repo.configure_main_remote(&mount)
+                .await
+                .expect("create main remote"),
+            MainRemote::Canonical
+        );
+        assert_eq!(
+            repo.remote_url(MAIN_REMOTE).await.expect("read url"),
+            Some(mount.clone())
+        );
+
+        // Already ours and already correct: re-running changes nothing and adds no fallback.
+        assert_eq!(
+            repo.configure_main_remote(&mount)
+                .await
+                .expect("idempotent re-run"),
+            MainRemote::Canonical
+        );
+        assert_eq!(
+            repo.remote_url(FALLBACK_MAIN_REMOTE)
+                .await
+                .expect("read fallback"),
+            None
+        );
+
+        // Foreign: the user's remote keeps both its name and its URL, byte for byte, and cowshed's
+        // upstream stands beside it under the fallback name.
+        let foreign = PathBuf::from("/tmp/somewhere-the-user-chose");
+        repo.set_remote(MAIN_REMOTE, &foreign)
+            .await
+            .expect("user retargets main");
+        assert_eq!(
+            repo.configure_main_remote(&mount)
+                .await
+                .expect("configure beside a foreign remote"),
+            MainRemote::Displaced
+        );
+        assert_eq!(
+            repo.remote_url(MAIN_REMOTE).await.expect("read url"),
+            Some(foreign),
+            "cowshed never retargets a remote it did not create"
+        );
+        assert_eq!(
+            repo.remote_url(FALLBACK_MAIN_REMOTE)
+                .await
+                .expect("read fallback"),
+            Some(mount)
+        );
+        assert_eq!(MainRemote::Displaced.remote_name(), FALLBACK_MAIN_REMOTE);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// Reverse registration lives in main's repository and disappears with the workspace.
+    #[tokio::test]
+    async fn workspace_registration_round_trips_and_absent_removal_succeeds() {
+        let root = repository();
+        let mount = PathBuf::from("/tmp/cowshed-raven-mount");
+        let main = GitRepository::from_root(&root);
+
+        // Removing what was never registered is success: retirement re-runs idempotently.
+        main.unregister_workspace_remote("raven")
+            .await
+            .expect("absent registration is not an error");
+
+        main.register_workspace_remote("raven", &mount)
+            .await
+            .expect("register workspace");
+        assert_eq!(
+            main.remote_url(&workspace_remote_name("raven"))
+                .await
+                .expect("read registration"),
+            Some(mount)
+        );
+
+        main.unregister_workspace_remote("raven")
+            .await
+            .expect("drop registration");
+        assert_eq!(
+            main.remote_url(&workspace_remote_name("raven"))
+                .await
+                .expect("read registration"),
+            None
+        );
+
+        main.register_workspace_remote("raven", Path::new("relative/path"))
+            .await
+            .expect_err("a registration must name an absolute mount");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn preserves_non_utf8_main_remote_argument() {
+        let root = repository();
+        let main_mount = PathBuf::from(OsString::from_vec(b"/tmp/cowshed-main-\xff".to_vec()));
+        let repo = GitRepository::from_root(&root);
+        repo.prepare_workspace("raven", &main_mount, None)
             .await
             .expect("prepare workspace");
 
         let output = Command::new(GIT)
             .arg("-C")
             .arg(&root)
-            .args(["remote", "get-url", "host"])
+            .args(["remote", "get-url", MAIN_REMOTE])
             .output()
-            .expect("read raw host remote");
+            .expect("read raw main remote");
         assert!(output.status.success());
         assert_eq!(
             output
                 .stdout
                 .strip_suffix(b"\n")
                 .expect("git output newline"),
-            host_path.as_os_str().as_bytes()
+            main_mount.as_os_str().as_bytes()
+        );
+        // The idempotent path compares the stored URL against the mount, so it has to survive the
+        // round trip through git config as bytes rather than as lossy UTF-8.
+        assert_eq!(
+            repo.configure_main_remote(&main_mount)
+                .await
+                .expect("idempotent re-run over a non-UTF-8 mount"),
+            MainRemote::Canonical
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }

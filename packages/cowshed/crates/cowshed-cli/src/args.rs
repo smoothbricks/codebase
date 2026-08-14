@@ -77,6 +77,7 @@ pub struct NewArgs {
     pub from: Option<String>,
     pub browse: bool,
     pub slot: Option<u32>,
+    pub register: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -502,12 +503,14 @@ fn parse_new(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "new <name> [--ref <rev> | --from <ws>] [--browse] [--slot <n>]";
+    const USAGE: &str =
+        "new <name> [--ref <rev> | --from <ws>] [--browse] [--slot <n>] [--register]";
     let mut name = None;
     let mut reference = None;
     let mut from = None;
     let mut browse = false;
     let mut slot = None;
+    let mut register = false;
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
             continue;
@@ -519,6 +522,7 @@ fn parse_new(
                 from = Some(workspace_name(&value, false, USAGE)?);
             }
             Some("--browse") => browse = true,
+            Some("--register") => register = true,
             Some("--slot") => {
                 let value = take_value(args, &mut index, "--slot", USAGE)?;
                 let text = value
@@ -549,6 +553,7 @@ fn parse_new(
         from,
         browse,
         slot,
+        register,
     }))
 }
 

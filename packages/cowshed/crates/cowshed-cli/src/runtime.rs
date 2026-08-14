@@ -546,6 +546,7 @@ where
                     )?,
                     browse: args.browse,
                     slot: args.slot,
+                    register: args.register,
                 };
             let info = service.create(&args.name, options).await?;
             service.reconcile_gateway().await?;

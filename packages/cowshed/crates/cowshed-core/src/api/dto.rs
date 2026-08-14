@@ -2014,6 +2014,9 @@ pub struct CreateOptions {
     pub browse: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<u32>,
+    /// Also register this workspace as a remote in main's repository. Off by default: it is
+    /// host-side state that accumulates one entry per workspace and outlives an interrupted retire.
+    pub register: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

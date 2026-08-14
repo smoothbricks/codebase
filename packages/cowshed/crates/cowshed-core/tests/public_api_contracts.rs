@@ -594,13 +594,15 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             from_workspace: Some(workspace()),
             browse: false,
             slot: Some(2),
+            register: true,
         })
         .unwrap(),
         json!({
             "revision":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
             "fromWorkspace":"raven",
             "browse":false,
-            "slot":2
+            "slot":2,
+            "register":true
         })
     );
     assert_eq!(
