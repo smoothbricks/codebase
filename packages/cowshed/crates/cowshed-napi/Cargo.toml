@@ -8,6 +8,7 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+cowshed-cli = { path = "../cowshed-cli" }
 cowshed-core.workspace = true
 libc = "0.2"
 napi.workspace = true
