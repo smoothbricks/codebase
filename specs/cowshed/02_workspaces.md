@@ -177,10 +177,10 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    private netns on `127.0.0.1:7644` (04_sandbox.md/05_gateway.md). Mark `<mount>/.envrc` direnv-trusted. In-image Bun,
    Cargo, Go, and proxy wiring uses the platform endpoint, and tool shims are placed at `.cowshed/bin/`; there is no git
    network wiring — workspace git is local-only (see "Remote code ingress").
-6. Inside the mount, under the workspace's closed sandbox: `git remote add host <project-root>` (idempotent),
+6. Inside the mount, under the workspace's closed sandbox: configure the `main` remote (see "The `main` remote") and
    `git switch -c cowshed/<name>` from the checked-out state. The `.git` directory arrived complete via CoW — the
    workspace is a standalone repository with **no linked-worktree registration and no back-references** into the host
-   checkout.
+   checkout, unless it was created with `--git-worktree` (see "Git-worktree workspaces").
 7. Publish
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`
    before the new workspace becomes discoverable.
@@ -188,6 +188,48 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
 
 Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` instead of main's state),
 `--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--browse`.
+
+## The `main` remote
+
+Every session workspace is minted with one remote, named `main`, whose URL is **main's canonical mount path**. The name
+says what the remote is — the main workspace — so `git fetch main`, `git log main/main`, and `git diff main/main` read
+as what they do, and an agent that knows nothing about cowshed guesses it correctly on the first try.
+
+The URL is the canonical mount, never the recorded checkout path, and the two differ by checkout layout (see "Checkout
+layouts"): under direct mount they are the same directory, and under the symlink layout the checkout path is a symlink
+into `~/.cowshed/mnt/<owner>/<repo>/main`. Recording the symlink would put a path outside the workspace's read grants
+into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate owns,
+the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every attached
+workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label.
+
+Configuring the remote **never clobbers a remote the user already has**. The workspace's `.git` arrives by CoW, so it
+carries whatever remotes main carried, and `main` is a plausible name for a user's own remote — a fork's upstream, a
+mirror, a second origin. Cowshed inspects before it writes:
+
+- No remote named `main`: create it.
+- A remote named `main` whose URL is already the canonical mount: leave it. This is the idempotent re-mint case.
+- A remote named `main` pointing anywhere else: it is the user's. Leave it untouched, register cowshed's under
+  `cowshed-main` instead, and print one `cowshed:` stderr line naming both. The workspace is fully functional; only the
+  spelling in `next:` hints changes, and the hints print the name actually in force.
+
+Cowshed never renames, retargets, or deletes a remote it did not create. The rule is the same one the secrets gate and
+`.pre-cowshed` retention follow: cowshed adds, and lets the user remove.
+
+**Reverse registration is optional and off by default.** `cowshed new --register` (or `.cowshed.toml`
+`[remotes] register-workspaces = true`) additionally adds a remote named `cowshed/<ws>` in the **main** workspace's
+repository, pointing at the new workspace's canonical mount, so a human working in main can `git fetch cowshed/<ws>` and
+review a workspace's branch without leaving their checkout. It is off by default because it is host-side state that
+accumulates: a coordinator that mints and retires workspaces all day would grow a remote per workspace and leave the
+stale ones behind on any crash between retire and cleanup.
+
+The direction is the safe one. The reverse remote lets main **fetch from** a workspace; it never lets a workspace push
+into main, which is the same pull-based hand-back `cowshed push`, autosave, and `land` all use, and for the same trust
+reason — the sandboxed side is never the side that initiates a write.
+
+`cowshed rm` drops the reverse registration as part of retirement, before the image is trashed, and `land` drops it at
+the same point it prunes `refs/cowshed/<ws>/*`. A registration left behind by an interrupted retire is removed
+idempotently by `cowshed gc` from the same revalidated retirement metadata that authorizes the rest of the cleanup — a
+remote naming a mount path that no longer exists is never by itself authority to delete anything.
 
 ## `cowshed fork <src> <dst>`
 
@@ -306,8 +348,8 @@ images are excluded from backup by design (01_storage.md).
 
 ## Remote code ingress: `cowshed repo`
 
-Sandboxed git speaks only local paths. A workspace's remotes are the `host` remote (main's mount) and read-only bare
-mirrors on the caches volume — never a network URL. There is no git endpoint on the gateway data plane, no credential
+Sandboxed git speaks only local paths. A workspace's remotes are the `main` remote (main's canonical mount) and
+read-only bare mirrors on the caches volume — never a network URL. There is no git endpoint on the gateway data plane, no credential
 helper, and no `insteadOf` rewriting inside any workspace.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
@@ -399,13 +441,16 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
 2. Stop the supervisor: TERM → grace → KILL across the whole descendant tree (11_shell.md). Teardown precedes retirement
    — live children would otherwise hold the mount busy and keep enforcing stale launch-time authority after the grants
    disappear.
-3. Logically retire: preserve the image extension while atomically renaming the image and its detached grants/CA
+3. Drop the workspace's reverse remote from main's repository if one was registered (see "The `main` remote"). Host-side
+   state goes before the image does: a remote pointing into a trashed mount is a broken fetch in the user's own
+   checkout, and it is the one piece of this teardown that lives where the user can see it.
+4. Logically retire: preserve the image extension while atomically renaming the image and its detached grants/CA
    companions to `sessions/.trash/<ws>-<incarnation>.asif` for ASIF or `sessions/.trash/<ws>-<incarnation>.sparseimage`
    for SPARSE. The canonical image disappears from enumeration and the command returns here (typically well under a
    second; a stubborn process tree delays it by at most the kill grace). Valid checkpoint facts left behind during this
    asynchronous phase neither republish the workspace nor authorize deletion by themselves; malformed, foreign, and
    duplicate facts remain integrity errors.
-4. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s grace), unlink the trashed image
+5. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s grace), unlink the trashed image
    and companions, every checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact,
    then the empty checkpoint and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc`
    only from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
