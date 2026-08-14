@@ -119,6 +119,12 @@ This maps directly onto a rebase-then-fast-forward coordinator flow:
 | Coordinator lands                | `cowshed land <ws> --target main --check '<verify cmd>'` — rebases, runs the check, then `git merge --ff-only` in the host checkout, then retires the workspace |
 | Deliver a branch without merging | `cowshed push <ws> --branch <name>` — `git push main HEAD:refs/heads/<name>`                                                                                    |
 
+Write the check as a **bare command** — `just verify`, `cargo test --workspace`. The sandbox `PATH` is already the
+project's pinned toolchain resolved to store paths, so wrapping it in `devenv shell -q --` or a direnv re-evaluation
+asks for the caller's `HOME` and a fresh evaluation, both of which the sandbox withholds on purpose; the wrapper fails
+where the command inside it passes. `cowshed exec <ws> -- <cmd>` and `land --check <cmd>` are the same sandboxed exec,
+so run the check in the workspace and fix what it finds before hand-off — the coordinator's verdict will match.
+
 `land` is the whole coordinator step in one command, and it fast-forwards only: if the check fails or the merge would
 not fast-forward, it stops with a non-zero exit rather than creating a merge commit. Use `push --branch` when the host
 should receive the branch under a specific name for review instead of an immediate merge.
