@@ -5899,6 +5899,146 @@ mod git_worktree_tests {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod workspace_origin_tests {
+    use super::*;
+    use crate::metadata::{
+        ImageFormat, METADATA_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole,
+    };
+
+    fn temp_directory(test: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cowshed-origin-{test}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("temp directory");
+        path
+    }
+
+    fn write_marker(root: &Path, workspace: &str, role: WorkspaceRole, project_root: &Path) {
+        let path = root.join(crate::storage::WORKSPACE_MARKER_PATH);
+        std::fs::create_dir_all(path.parent().expect("marker parent")).expect("marker directory");
+        crate::metadata::write_json(
+            &path,
+            &WorkspaceMarker {
+                version: METADATA_VERSION,
+                repo_id: RepoId::parse("acme/widget").expect("repo"),
+                project_root: project_root.to_owned(),
+                workspace: WorkspaceName::new(workspace).expect("workspace"),
+                workspace_incarnation: WorkspaceIncarnation::new(
+                    "00000000000000000000000000000001",
+                )
+                .expect("incarnation"),
+                role,
+                image_format: ImageFormat::Asif,
+                base_commit: "0123456789abcdef".to_owned(),
+                created_at: "2026-07-13T00:00:00Z".to_owned(),
+                forked_from: None,
+                created_trace: "fixture".to_owned(),
+            },
+        )
+        .expect("write marker");
+    }
+
+    /// A coordinator verb invoked from inside a session workspace must open the project, not be
+    /// refused. The session's marker records main's checkout — a different directory than the mount
+    /// the caller stands in — and that difference is the normal case, not a mismatch.
+    #[tokio::test]
+    async fn a_session_mount_names_its_project_and_reports_mains_checkout() {
+        let temp = temp_directory("session");
+        let checkout = temp.join("checkout");
+        let mount = temp.join("mnt/task");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+        std::fs::create_dir_all(&mount).expect("mount");
+        write_marker(&mount, "task", WorkspaceRole::Workspace, &checkout);
+
+        let origin = workspace_origin_from_marker(&mount)
+            .await
+            .expect("a session marker identifies its project")
+            .expect("marker present");
+        assert_eq!(origin.repo_id, RepoId::parse("acme/widget").expect("repo"));
+        assert_eq!(
+            origin.project_root, checkout,
+            "the project checkout comes from the marker, never from the invocation directory"
+        );
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[tokio::test]
+    async fn mains_marker_must_still_name_the_root_it_sits_in_and_roles_must_agree() {
+        let temp = temp_directory("main");
+        let checkout = temp.join("checkout");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+
+        write_marker(&checkout, "main", WorkspaceRole::Main, &checkout);
+        let origin = workspace_origin_from_marker(&checkout)
+            .await
+            .expect("coherent main marker")
+            .expect("marker present");
+        assert_eq!(origin.project_root, checkout);
+
+        // Main recorded somewhere it is not: the one project-root disagreement that is still real.
+        write_marker(
+            &checkout,
+            "main",
+            WorkspaceRole::Main,
+            &temp.join("elsewhere"),
+        );
+        assert!(workspace_origin_from_marker(&checkout).await.is_err());
+
+        // Role and name disagreeing is corruption in either direction.
+        write_marker(&checkout, "task", WorkspaceRole::Main, &checkout);
+        assert!(workspace_origin_from_marker(&checkout).await.is_err());
+        write_marker(&checkout, "main", WorkspaceRole::Workspace, &checkout);
+        assert!(workspace_origin_from_marker(&checkout).await.is_err());
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// A failed git invocation must not be reported as a conflict unless git said so: the phantom
+    /// "resolve the git conflict" hint sent users looking for markers and a rebase that never
+    /// existed, and hid git's own diagnosis behind it.
+    #[test]
+    fn only_a_real_conflict_gets_the_conflict_hint() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let failed = |stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        let error = require_git_success("rebase", &failed("fatal: invalid upstream 'main/main'"))
+            .expect_err("a missing upstream is a failure");
+        assert!(
+            !error.hint.contains("resolve the git conflict"),
+            "a missing upstream is not a conflict: {}",
+            error.hint
+        );
+        assert!(
+            error.message.contains("invalid upstream"),
+            "git's own diagnosis survives: {}",
+            error.message
+        );
+
+        let error = require_git_success(
+            "rebase",
+            &failed("CONFLICT (content): Merge conflict in src/lib.rs"),
+        )
+        .expect_err("a conflict is a failure");
+        assert!(
+            error.hint.contains("resolve the git conflict"),
+            "{}",
+            error.hint
+        );
+    }
+}
+
 #[cfg(test)]
 mod binding_tests {
     use super::*;
