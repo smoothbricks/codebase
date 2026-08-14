@@ -562,6 +562,29 @@ fn is_reserved_store_namespace(name: &str) -> bool {
     name.starts_with('.') || RESERVED_STORE_NAMESPACES.contains(&name)
 }
 
+/// Is this store entry something other than a project namespace?
+///
+/// Three kinds of neighbour share the store root with `<owner>/<repo>` projects and none of them is
+/// one: the bootstrap volumes, which carry a `.cowshed-volume.json` role marker and are their own
+/// namespace; macOS's per-volume system directories (`.fseventsd`, `.Spotlight-V100`, `.Trashes`),
+/// which are root-owned and unreadable to us; and cowshed's own reserved namespaces. The volume
+/// marker is the structural test and is checked first, because it identifies a volume root by what
+/// it *is* rather than by what it is called — a name list cannot keep up with a mountpoint the user
+/// relocates, and being wrong here costs the whole inventory.
+fn is_not_a_project_namespace(path: &Path, name: &str) -> bool {
+    is_reserved_store_namespace(name)
+        || fs::symlink_metadata(path.join(crate::storage::bootstrap::VOLUME_MARKER_FILE)).is_ok()
+}
+
+/// Enumerate the projects in the store, skipping everything that is not one.
+///
+/// Discovery is per-entry isolated for the same reason healing is (see `heal_all`): the store root
+/// is a mount point with neighbours cowshed does not own and cannot read, and an entry that cannot
+/// be inspected is evidence that it is not a project — not grounds to fail the pass. Raising here
+/// took down the entire gateway inventory over one root-owned system directory, which left launchd
+/// showing a running process while status and doctor reported nothing started and eager heal never
+/// ran. A candidate that cannot be read is skipped; a candidate that reads as a real but broken
+/// project still raises, because that is cowshed's own state and hiding it would hide corruption.
 fn discover_repositories(store_root: &Path) -> Result<Vec<RepoId>, GatewayInventoryError> {
     ensure_directory(store_root, "opening validated store root")?;
     let mut repositories = BTreeSet::new();
@@ -569,15 +592,26 @@ fn discover_repositories(store_root: &Path) -> Result<Vec<RepoId>, GatewayInvent
         let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if is_reserved_store_namespace(owner_name) || !is_directory(&owner)? {
+        if is_not_a_project_namespace(&owner, owner_name) || !is_directory(&owner).unwrap_or(false)
+        {
             continue;
         }
-        for project in read_directory(&owner, "enumerating owner repositories")? {
-            if !is_directory(&project)? {
+        let Ok(projects) = read_directory(&owner, "enumerating owner repositories") else {
+            continue;
+        };
+        for project in projects {
+            let Some(project_name) = project.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if is_not_a_project_namespace(&project, project_name)
+                || !is_directory(&project).unwrap_or(false)
+            {
                 continue;
             }
             let binding_path = project.join("repository.json");
-            if !binding_path_exists(&binding_path)? {
+            // Unreadable is "not a project"; only a binding that is present and readable is held
+            // to the project contract.
+            if !binding_path_exists(&binding_path).unwrap_or(false) {
                 continue;
             }
             let repo = load_binding_candidate(store_root, &project, &binding_path)?;
@@ -1115,6 +1149,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The store root is a volume mount point with neighbours cowshed does not own: the caches
+    /// volume beside it, and macOS's root-owned per-volume system directories inside both. Probing
+    /// one of those for a repository binding earns `EPERM`, and raising it took the whole inventory
+    /// down — launchd showed a running gateway while status and doctor reported nothing started.
+    #[test]
+    fn store_neighbours_and_unreadable_entries_never_fail_the_discovery_pass() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new("discovery-neighbours");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let store = fixture.storage.store().to_owned();
+
+        // The caches volume, mounted inside the store root and carrying its role marker.
+        let caches = store.join("caches");
+        fs::create_dir_all(&caches).expect("caches volume");
+        fs::write(
+            caches.join(crate::storage::bootstrap::VOLUME_MARKER_FILE),
+            b"{}",
+        )
+        .expect("volume marker");
+        let caches_system = caches.join(".fseventsd");
+        fs::create_dir_all(&caches_system).expect("caches system directory");
+
+        // A volume root whose name is not on any reserved list — a relocated mount is identified by
+        // its marker, never by what it happens to be called.
+        // Its child carries a binding, so without the marker skip it would be discovered as the
+        // bogus repository `scratch-volume/anything`.
+        let relocated = store.join("scratch-volume");
+        fs::create_dir_all(relocated.join("anything")).expect("relocated volume");
+        fs::write(relocated.join("anything/repository.json"), b"{}").expect("decoy binding");
+        fs::write(
+            relocated.join(crate::storage::bootstrap::VOLUME_MARKER_FILE),
+            b"{}",
+        )
+        .expect("relocated marker");
+
+        // A genuinely unreadable owner-level directory: not a project, and not a reason to stop.
+        let opaque = store.join("opaque-owner");
+        fs::create_dir_all(opaque.join("child")).expect("opaque owner");
+        fs::set_permissions(&opaque, fs::Permissions::from_mode(0o000)).expect("chmod opaque");
+
+        let discovered = discover_repositories(&store);
+        fs::set_permissions(&opaque, fs::Permissions::from_mode(0o755)).expect("restore opaque");
+
+        assert_eq!(
+            discovered.expect("discovery survives its neighbours"),
+            vec![repo],
+            "only real projects are discovered, and no neighbour fails the pass"
+        );
     }
 
     #[tokio::test]
