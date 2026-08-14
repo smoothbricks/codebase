@@ -629,6 +629,10 @@ async fn run_daemon() -> Result<()> {
     let paths = GatewayPaths::from_storage(&storage);
     ensure_private_directory(&paths.cache)?;
     ensure_private_directory(&paths.telemetry)?;
+    // Startup contract (05_gateway.md): validated store, then heal every project's mounts, then
+    // serve. The gateway is RunAtLoad, so this pass is what closes the reboot window in which a
+    // checkout path would otherwise dangle until something touched it.
+    heal_recorded_projects(&storage).await;
     let inventory = NativeSessionInventory::new(storage);
     let executable = fs::canonicalize(std::env::current_exe().map_err(|error| {
         CowshedError::internal(format!(
@@ -656,6 +660,24 @@ async fn run_daemon() -> Result<()> {
     }
 
     drain_after_shutdown(gateway, wait_for_shutdown_signal()).await
+}
+
+/// Heal every recorded project, reporting rather than raising. A project that cannot be healed is
+/// a finding for `cowshed doctor`; it must never stop the gateway from serving the healthy ones.
+async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
+    let inventory = NativeGatewayInventory::new(storage.clone());
+    match inventory.heal_all().await {
+        Ok(outcomes) => {
+            for (repo, outcome) in outcomes {
+                if let Err(error) = outcome {
+                    eprintln!("cowshed: could not heal {repo} at startup: {error}");
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("cowshed: could not enumerate projects to heal at startup: {error}");
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
