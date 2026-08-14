@@ -3463,11 +3463,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "refresh the workspace revision and retry rebase",
             ));
         }
+        // The default destination follows the remote's name, which is `main` — and `cowshed-main`
+        // in a workspace where something else already held that name.
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let main_remote = crate::git::GitRepository::from_root(&root)
+            .configure_main_remote(&main_mount)
+            .await?;
         let onto = options
             .onto
             .as_ref()
             .map(revision_target)
-            .unwrap_or_else(|| "host/main".to_owned());
+            .unwrap_or_else(|| format!("{}/main", main_remote.remote_name()));
+        // Refresh the remote-tracking refs first: rebasing onto `main/main` resolves a ref that
+        // only a fetch creates, and a stale one silently replays onto yesterday's base.
+        run_git(&root, ["fetch", "--no-tags", main_remote.remote_name()]).await?;
         let onto_head = git_revision_oid(&root, &onto).await?;
         if options
             .expected_onto_head
@@ -3539,6 +3548,49 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     "fix the workspace and retry land",
                 ));
             }
+        }
+        // Bring the workspace's objects into the host before merging them. A workspace is a
+        // standalone repository — nothing has ever replicated its commits — so a bare `merge`
+        // against a validated source head resolves to an object the host has never seen and fails
+        // with git's own "not something we can merge". The fetch is the hand-back, and it is
+        // pull-based like every other direction cowshed moves work.
+        //
+        // Land has no branch-name contract with the workspace: it fetches whatever branch the
+        // workspace has checked out, whether an agent named it `cowshed/<ws>`, `wt/<ws>`, or
+        // anything else. Only the resolved head is load-bearing.
+        let source_mount = current_snapshot_mount(self, &current)?;
+        let source_branch = crate::git::GitRepository::from_root(&source_mount)
+            .current_branch()
+            .await?
+            .ok_or_else(|| {
+                CowshedError::conflict(
+                    format!("workspace {workspace} has no checked-out branch to land"),
+                    "check out a branch in the workspace and retry land",
+                )
+            })?;
+        let preservation_ref = format!("refs/cowshed/{workspace}/heads/{source_branch}");
+        run_git(
+            &self.descriptor.git_root,
+            [
+                "fetch",
+                "--no-tags",
+                source_mount.to_str().ok_or_else(|| {
+                    CowshedError::internal("workspace mount path is not valid UTF-8")
+                })?,
+                &format!("+refs/heads/{source_branch}:{preservation_ref}"),
+            ],
+        )
+        .await?;
+        // The fetch is also the revalidation: if the workspace advanced between the check and now,
+        // what arrived is not what was validated, and landing it would land unchecked work.
+        let fetched = git_revision_oid(&self.descriptor.git_root, &preservation_ref).await?;
+        if fetched != source_head {
+            return Err(CowshedError::conflict(
+                format!(
+                    "workspace {workspace} advanced from {source_head} to {fetched} during land"
+                ),
+                "re-run the check against the new head and retry land",
+            ));
         }
         run_git(
             &self.descriptor.git_root,
