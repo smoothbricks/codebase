@@ -419,14 +419,54 @@ guarantees cowshed owns:
   is therefore an off-gateway egress path — accepted as a trusted-mediator channel (root daemon, signature-checked
   caches), documented, never proxied. GC-root registration for `.devenv` profiles is likewise daemon-side; no grant
   needed.
-- **Nix client state**: the closed baseline's writable roots additionally include `~/.cache/nix` and
-  `~/.local/state/nix` (eval/fetcher caches, profiles state). These are small SQLite files; they stay on the host and
-  are shared across workspaces like any concurrency-safe cache.
+- **Nix client state**: the closed baseline's writable roots additionally include the shared cache subtrees
+  `nix/cache` and `nix/state` under `~/.cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite
+  files; they stay on the host and are shared across workspaces like any concurrency-safe cache. They live under the
+  cowshed caches root rather than under the user's `~/.cache` and `~/.local/state`, because the sandbox never grants a
+  path inside the real `$HOME` — the workspace's `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all private, in-image
+  directories, and admitting the user's own would hand every workspace the rest of what those roots contain.
 - **direnv trust is path-keyed**, so every clone's `.envrc` is untrusted at birth. cowshed (unsandboxed) writes the
   direnv allow entry for `<mount>/.envrc` at new/fork/restore — and `cowshed ensure` re-asserts it when healing.
   `cowshed exec` then loads the environment exactly as an interactive shell would: when a nearest `.envrc` exists, the
   command is wrapped fail-closed in `direnv export` (missing direnv or a failed export is an error, never a silent
   skip). Inside a cowshed workspace the full exported environment is safe by the no-secrets invariant.
+
+### Evaluating an edited `devenv.nix` inside its workspace
+
+A workspace that edits `devenv.nix` — adding a package, bumping a toolchain — must be able to evaluate the edit where
+it made it. This is the case that most wants isolation and is least served without it: a toolchain change tested only
+after landing is a toolchain change tested in production.
+
+Two things stand between the closed baseline and that working, and neither is a new grant.
+
+**The daemon socket allow is specified above but never populated.** `SandboxConfig::allowed_unix_sockets` is
+controller-selected and canonical-path-scoped by construction, and every production call site passes an empty vector, so
+no `nix` client in a sandbox can reach the daemon. Wiring it is implementation catching up with this spec, not a
+widening of it. The **security posture is unchanged by that wiring**, and the reason is the daemon's, not cowshed's:
+builds and substitution already run *outside* the sandbox as root, the store is already world-readable through the broad
+`file-read-data` allow, and binary-cache substitution is already documented above as an accepted off-gateway
+trusted-mediator channel. What the socket adds is the ability to *ask*. Evaluation itself runs in-sandbox and can
+execute arbitrary Nix code — but arbitrary in-sandbox code execution is what a workspace is for, and evaluation gets no
+authority a `cargo build` in the same workspace does not already have.
+
+**The sandbox `PATH` is not a captured profile.** It is filtered live from the controller's own `PATH` at every spawn,
+admitting only immutable store-backed roots (`/nix/store`, `/run/current-system`, `/etc/profiles`,
+`/etc/static/profiles`), plus the workspace's `.cowshed/bin`. There is no adopt-time or mint-time profile snapshot
+anywhere, and therefore nothing that a workspace's toolchain could be said to have diverged *from*. The consequence is
+the one that matters here: a workspace can evaluate an edited `devenv.nix` and the resulting tools still will not be on
+its `PATH`, because the controller's `PATH` is what is being filtered.
+
+The fix follows the mechanism that already exists rather than adding one. devenv materializes its evaluation as
+`.devenv/profile`, a symlink into `/nix/store`, inside the project directory — which in a workspace is in-image and
+per-workspace already, keyed and isolated with everything else in the volume. So the workspace's own
+`.devenv/profile/bin` is prepended to its sandbox `PATH` whenever it resolves into the store, ahead of the inherited
+roots. Presence is the whole signal: the profile exists exactly when an evaluation succeeded in that workspace, so no
+digest comparison against main, no refresh verb, and no flag is needed, and a workspace that never evaluated is
+byte-identical to today. A stale profile is self-correcting, because the next successful evaluation rewrites the
+symlink. On land, main's own next evaluation picks the change up for future mints by the same rule.
+
+The bare-command check contract (02_workspaces.md) is unaffected and stays the default: the point of the workspace
+profile is that `just verify` resolves the *edited* toolchain without a wrapper, not that wrappers become useful.
 
 On macOS, port collisions between workspaces are handled by the per-workspace port block, not left to the user:
 `devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base), so two workspaces running the
