@@ -125,6 +125,22 @@ fn stop_service() -> Result<()> {
     executor
         .execute_install(&plan_remove(&spec, installed))
         .map_err(launchd_error)?;
+    // The socket file is the daemon's artifact and cowshed owns its lifecycle:
+    // a booted-out server never unlinks it, and a stale socket only confuses
+    // inspection (a fresh server unlinks-then-rebinds anyway). Remove exactly
+    // a socket; anything else at the path is not ours to delete.
+    let socket = sccache_server_socket(&home);
+    if let Ok(metadata) = fs::symlink_metadata(&socket) {
+        use std::os::unix::fs::FileTypeExt as _;
+        if metadata.file_type().is_socket() {
+            fs::remove_file(&socket).map_err(|error| {
+                CowshedError::internal(format!(
+                    "could not remove stale sccache socket {}: {error}",
+                    socket.display()
+                ))
+            })?;
+        }
+    }
     Ok(())
 }
 
