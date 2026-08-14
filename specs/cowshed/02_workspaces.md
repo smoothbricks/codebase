@@ -141,14 +141,14 @@ path, and recorded metadata move together — and `cowshed mv main <new-checkout
 There is no separate verb per layout and no flag on `ensure`: one front door, symmetric with `rm`.
 
 The second argument means what the first one decides. `main` is not a renameable workspace — its name is fixed by the
-project layout — so `mv main` can only be the checkout move and its destination is a path, while every other source names
-a workspace whose destination is a new workspace name. The source disambiguates before either destination is validated,
-so a path is never rejected for failing the workspace-name charset and a workspace name is never resolved against the
-filesystem.
+project layout — so `mv main` can only be the checkout move and its destination is a path, while every other source
+names a workspace whose destination is a new workspace name. The source disambiguates before either destination is
+validated, so a path is never rejected for failing the workspace-name charset and a workspace name is never resolved
+against the filesystem.
 
 The checkout path is written down in three places, and no two of them can be derived from the third: the in-image marker
 at main's mount root, the `infoSnapshot.projectRoot` in the sidecar beside main's canonical image, and the layout record
-that says whether the checkout *is* the mountpoint. Every move carries all three.
+that says whether the checkout _is_ the mountpoint. Every move carries all three.
 
 **Symlink layout.** Main stays mounted at `mnt/<owner>/<repo>/main` throughout. The checkout path is only a symlink into
 it and nothing about the mount depends on where that symlink sits, so there is no unmount and no remount — the move is
@@ -156,7 +156,7 @@ the relink alone. Gaplessness therefore costs nothing: the destination link is c
 removed, and the tree answers to at least one name at every instant. A crash between the two steps leaves both names,
 which is an extra alias rather than a lost checkout.
 
-**Direct mount.** The checkout path *is* the mountpoint, and a mountpoint cannot be renamed while it is mounted. This is
+**Direct mount.** The checkout path _is_ the mountpoint, and a mountpoint cannot be renamed while it is mounted. This is
 the real transaction: detach → rename the (now stub-carrying) mountpoint directory → rebind the substrate onto the new
 path → re-attach. The rename is inverted on failure, so a refused move is indistinguishable from one never attempted.
 Past the rename there is no way back worth taking: the record and the tree both name the destination, so a failure to
@@ -175,7 +175,7 @@ ownership, at the one moment nothing is mounted.
 
 Refusals are self-guiding as everywhere else and fire before any mutation: for the workspace rename, a dirty tree or an
 in-flight job; for the checkout move, a relative destination, one that is occupied, one whose parent does not exist, and
-one that overlaps cowshed storage or the current checkout. A dirty tree is *not* a refusal for the checkout move — the
+one that overlaps cowshed storage or the current checkout. A dirty tree is _not_ a refusal for the checkout move — the
 working tree is carried across untouched rather than republished, so there is nothing for a fence to protect.
 
 A user who moves a symlinked checkout by hand has not broken anything: `cowshed doctor` accepts a checkout path that
@@ -302,8 +302,8 @@ gains three steps between attach and publication:
    and `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already
    present from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto
    the mount root, and reconciles both directions with `git -C <main-canonical-mount> worktree repair <mount>`, which is
-   the primitive git provides for exactly this two-way pointer fixup. `git worktree add` insists on creating the path
-   it registers, so the registration is taken out through a staging directory inside the image and the pointer file is
+   the primitive git provides for exactly this two-way pointer fixup. `git worktree add` insists on creating the path it
+   registers, so the registration is taken out through a staging directory inside the image and the pointer file is
    moved up to the mount root afterwards; the staging directory's name is the worktree id git derives from it, which is
    why it is the workspace name and not anything mount-derived — a `--slot` mount does not carry the name, and
    retirement has to find the registration from the name alone.
@@ -316,14 +316,14 @@ gains three steps between attach and publication:
    fetches nothing first.
 
 A workspace's mode is not only requested, it is **inherited**. `cowshed fork`, `cowshed new --from`, and the fork half
-of `cowshed mv` all clone an image whose only git state is a pointer file naming the *source's* registration, so a clone
-of a git-worktree workspace is re-registered under its own id and is a git-worktree workspace too. There is no image
-to be standalone from. `--register` is refused alongside `--git-worktree` rather than quietly ignored: a reverse remote
+of `cowshed mv` all clone an image whose only git state is a pointer file naming the _source's_ registration, so a clone
+of a git-worktree workspace is re-registered under its own id and is a git-worktree workspace too. There is no image to
+be standalone from. `--register` is refused alongside `--git-worktree` rather than quietly ignored: a reverse remote
 exists so main can fetch a workspace's branch, and main already holds that branch.
 
 Main's config is shared along with its objects, so the network remotes in it are visible from inside a git-worktree
 workspace — cowshed cannot strip them without editing the user's own repository, and does not. The invariant that holds
-is the enforced one: the sandbox has no egress those URLs could reach, and cowshed still never *writes* a remote URL
+is the enforced one: the sandbox has no egress those URLs could reach, and cowshed still never _writes_ a remote URL
 into a repository a workspace can see.
 
 **Main must be mounted**, at mint and at every subsequent attach and exec. The gitdir lives outside the workspace's
@@ -354,7 +354,7 @@ remote: remove the worktree registration from main's repository, then trash the 
 that worktree's administrative directory and nothing else, because both commands that look more obvious are wrong here.
 `git worktree remove` deletes the working tree at the registered path — the workspace's own files, which retirement
 trashes as an image and `gc` may find already gone — and refuses on dirty state that `rm --force` has already accepted.
-`git worktree prune` unregisters *every* worktree whose path is missing, and a merely detached cowshed workspace looks
+`git worktree prune` unregisters _every_ worktree whose path is missing, and a merely detached cowshed workspace looks
 exactly like that. A registration orphaned by an interrupted retire is removed idempotently by `cowshed gc` from
 revalidated retirement metadata, before the image that carries that metadata is deleted — never from the mere
 observation that a registered worktree's path is not mounted.
@@ -368,13 +368,16 @@ standalone workspace, which is the correct answer rather than a gap.
 at, and moving a workspace moves the path main's registration records; both directions are repaired inside the same
 transaction that moves the mount, so there is no window in which a registration names a path nothing is mounted on.
 `cowshed land` needs no special case: its rule is already to route a fast-forward through the workspace that has the
-target branch checked out and to refuse only worktrees **unknown** to cowshed. A git-worktree workspace is known.
+target branch checked out and to refuse only worktrees **unknown** to cowshed. A git-worktree workspace is known. The
+unknown-worktree refusal itself is specified here but not yet implemented: today `land` performs no worktree routing at
+all (the merge always runs in the project's git root and never consults `git worktree list`), so a checkout held by a
+foreign worktree is not refused. Implementing the routing and its refusal is the open half of this rule.
 
 ### Why clone is the default
 
 Not storage. CoW makes a complete `.git` copy free — that is the whole premise of the substrate — so the classic
-argument for linked worktrees, that they avoid duplicating the object store, buys nothing here. It was never the
-reason and is not a reason now.
+argument for linked worktrees, that they avoid duplicating the object store, buys nothing here. It was never the reason
+and is not a reason now.
 
 The reasons are both about blast radius:
 
@@ -384,11 +387,11 @@ lands inside one disposable image, and the cure is `cowshed rm` and a fresh `cow
 the user's own repository, and the blast radius is every workspace plus main. Cowshed's entire posture is that a
 workspace is cheap and destroyable; that only holds while destroying one cannot take anything else with it.
 
-**History rewrites want isolation.** Workspaces exist to be rebased, replayed, and thrown away. `cowshed rebase
---fresh` replays a branch onto a new base and destroys the old clone; agents rebase, amend, reset, and expire reflogs
-freely because nothing outside the image can notice. Doing that inside the user's object store means an agent's
-experimental rewrite shares a reflog and a loose-object pool with the human's work. A workspace whose job is to rewrite
-history should not be rewriting it where the user lives.
+**History rewrites want isolation.** Workspaces exist to be rebased, replayed, and thrown away. `cowshed rebase --fresh`
+replays a branch onto a new base and destroys the old clone; agents rebase, amend, reset, and expire reflogs freely
+because nothing outside the image can notice. Doing that inside the user's object store means an agent's experimental
+rewrite shares a reflog and a loose-object pool with the human's work. A workspace whose job is to rewrite history
+should not be rewriting it where the user lives.
 
 `--git-worktree` exists for the cases where the shared namespace is the point: tooling that assumes one repository,
 `git worktree list` as the inventory, and reviewing a workspace's commits from main with no fetch step at all. It is a
@@ -584,13 +587,14 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
    shell; the check runs where the work was done, and a check that only passes in the coordinator's environment has not
    validated the workspace.
 
-   Write checks as **bare commands** — `just verify`, `cargo test --workspace`. The sandbox `PATH` already *is* the
+   Write checks as **bare commands** — `just verify`, `cargo test --workspace`. The sandbox `PATH` already _is_ the
    project's pinned toolchain, resolved to store paths, so wrapping a check in `devenv shell --` or a direnv
    re-evaluation asks for exactly the two things the sandbox deliberately withholds: the caller's `HOME` and a fresh
    evaluation. The wrapper fails where the command inside it would have passed. This is also what makes coordinator and
    worker verdicts identical rather than merely similar: `cowshed exec <ws> -- <cmd>` and `land --check <cmd>` are the
    same sandboxed exec, so a worker that fixes its own failures before hand-off has already run the check the
    coordinator will run.
+
 3. **Fast-forward the target branch under its repository lock**: **fetch** the workspace's branch from its mount into
    the host — a workspace is a standalone repository whose commits the host has never seen, so without this the merge
    resolves an object that does not exist and fails as "not something we can merge" — then revalidate the source
@@ -616,6 +620,7 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
      worktree's index and files stale. If the target advanced during validation, any expected head changed, or the
      update is not a fast-forward, return `Conflict`, leave both source and target intact, and report the moved value.
      Cowshed never retries against a new base internally; the coordinator decides whether to rebase and re-run checks.
+
 4. **Retire**: only after the target branch and, when checked out, its visible working state resolve to the validated
    source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
    preservation refs on the host.
@@ -704,8 +709,7 @@ because it is used. The secrets invariant is what makes this safe; it is enforce
 teardown, a gitdir that is invalid the moment the image is cloned, and a workspace that is unusable whenever main is
 detached. A standalone `.git` arrives via CoW at zero marginal cost and the pull-based `cowshed push` replaces
 shared-state semantics with an explicit, auditable hand-back — so clone is what `cowshed new` does. `--git-worktree`
-takes the trade deliberately, per workspace, and gives up checkpoint and restore for it (see "Git-worktree
-workspaces").
+takes the trade deliberately, per workspace, and gives up checkpoint and restore for it (see "Git-worktree workspaces").
 
 **Gatewaying git rejected — workspace git is local-only.** A smart-HTTP credential broker on the gateway would let
 sandboxed git reach real remotes, reintroducing in-sandbox push, a git wire protocol to proxy faithfully, and
