@@ -74,9 +74,12 @@ impl LaunchAgentSpec {
             .join("Library")
             .join("LaunchAgents")
             .join(format!("{label}.plist"));
+        // launchd creates StandardErrorPath before the gateway can remount
+        // ~/.cowshed. Keep this on Data so reboot cannot mask the store volume.
         let standard_error_path = home
-            .join(".cowshed")
-            .join("telemetry")
+            .join("Library")
+            .join("Logs")
+            .join("cowshed")
             .join(standard_error_file);
 
         Ok(Self {
