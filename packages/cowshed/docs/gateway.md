@@ -63,16 +63,16 @@ cowshed gateway status --json
 
 `start` atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with the absolute current
 executable followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures
-go only to `~/.cowshed/telemetry/daemon-stderr.log`. The CLI uses fixed `/bin/launchctl bootstrap`, `kickstart -k`,
-`bootout`, and `print` argv—never shell text—and maps already-loaded/not-loaded states idempotently. It waits for the
-authenticated Unix control socket before returning success. `cowshed gateway stop` boots out the agent and removes its
-plist.
+go only to `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `~/.cowshed` mountpoint. The CLI uses fixed
+`/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
+already-loaded/not-loaded states idempotently. It waits for the authenticated Unix control socket before returning
+success. `cowshed gateway stop` boots out the agent and removes its plist.
 
-The internal `cowshed gateway run` entrypoint refuses to provision storage: it first validates the existing mounted APFS
-host store, constructs production cache/telemetry/control configuration with TCP control disabled, starts the gateway,
-and restores all canonical attached sessions from repository bindings, mount/incarnation facts, grants, and validated
-workspace credentials. Detached and retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain
-the gateway before exit.
+The internal `cowshed gateway run` entrypoint first remounts already-created host volumes if macOS auto-mounted them at
+`/Volumes` or if a leftover launchd stub occupies `~/.cowshed`. It never creates volumes or opens an authorization
+prompt. After the store is mounted at the canonical path it starts the gateway and restores all canonical attached
+sessions from repository bindings, mount/incarnation facts, grants, and validated workspace credentials. Detached and
+retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before exit.
 
 Every ordinary `exec`, `ensure`, and `doctor` invocation reconciles the current project before use. Attach, detach,
 restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed

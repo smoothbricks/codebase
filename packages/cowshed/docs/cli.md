@@ -442,7 +442,7 @@ next: cowshed exec raven -- git status
 
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.gateway`, then waits until its authenticated Unix
 control socket is healthy. The generated mode-0600 plist uses the absolute current `cowshed` executable, `RunAtLoad`,
-`KeepAlive`, and stable pre-tracer stderr at `~/.cowshed/telemetry/daemon-stderr.log`. `stop` boots out the agent and
+`KeepAlive`, and stable pre-tracer stderr at `~/Library/Logs/cowshed/daemon-stderr.log`. `stop` boots out the agent and
 removes the plist; both operations are idempotent.
 
 `status` reports health without starting the service. Its JSON result is the standard frozen envelope:
@@ -473,7 +473,7 @@ its unix socket at `~/.cowshed/sccache.sock`. The mode-0600 plist runs the _scca
 invoking shell's PATH — run it from a shell with the devenv/nix sccache available) as a foreground unix-socket server:
 `SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
 `SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at `~/.cowshed/caches/sccache`.
-Stderr lands at `~/.cowshed/telemetry/sccache-stderr.log`. `stop` boots out the agent and removes the plist; both
+Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the agent and removes the plist; both
 operations are idempotent. An sccache upgrade that moves the binary is picked up by rerunning `cowshed sccache start` —
 the plist is byte-compared and rewritten only on drift.
 
