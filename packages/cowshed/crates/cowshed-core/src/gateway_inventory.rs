@@ -229,29 +229,28 @@ impl NativeGatewayInventory {
     }
 
     fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
-        discover_repositories(self.storage.store())?
-            .into_iter()
-            .map(|repo_id| {
-                let layout =
-                    StorageLayout::new(self.storage.store(), &repo_id).map_err(|error| {
-                        GatewayInventoryError::InvalidMetadata {
-                            path: self.storage.store().to_owned(),
-                            message: error.to_string(),
-                        }
-                    })?;
-                let project_root =
-                    authoritative_checkout_path(&layout, &repo_id)?.ok_or_else(|| {
-                        GatewayInventoryError::InvalidMetadata {
-                            path: layout.project().project_root.clone(),
-                            message: "project records no adopted checkout path".to_owned(),
-                        }
-                    })?;
-                Ok(AdoptedProject {
+        let mut projects = Vec::new();
+        for repo_id in discover_repositories(self.storage.store())? {
+            let layout = match StorageLayout::new(self.storage.store(), &repo_id) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    eprintln!("cowshed: skipping unhealable project {repo_id}: {error}");
+                    continue;
+                }
+            };
+            match authoritative_checkout_path(&layout, &repo_id) {
+                Ok(Some(project_root)) => projects.push(AdoptedProject {
                     repo_id,
                     project_root,
-                })
-            })
-            .collect()
+                }),
+                Ok(None) | Err(_) => {
+                    eprintln!(
+                        "cowshed: skipping unhealable project {repo_id}: project records no adopted checkout path"
+                    );
+                }
+            }
+        }
+        Ok(projects)
     }
 
     pub async fn all_attached(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
@@ -485,7 +484,24 @@ impl NativeGatewayInventory {
         let repositories = discover_repositories(self.storage.store())?;
         let mut facts = Vec::new();
         for repo in repositories {
-            facts.extend(self.load_project(&repo)?);
+            match self.load_project(&repo) {
+                Ok(project) => facts.extend(project),
+                Err(error) => {
+                    // Store-wide identity collisions stay fatal. A single project's
+                    // mount/metadata mismatch is a doctor finding and must not take
+                    // the RunAtLoad gateway down with it.
+                    if matches!(
+                        error,
+                        GatewayInventoryError::DuplicateRepository(_)
+                            | GatewayInventoryError::DuplicatePortBlock(_)
+                            | GatewayInventoryError::AmbiguousProjectRoot(_)
+                            | GatewayInventoryError::ForeignBinding { .. }
+                    ) {
+                        return Err(error);
+                    }
+                    eprintln!("cowshed: skipping unhealable project {repo}: {error}");
+                }
+            }
         }
         facts.sort_by(|left, right| {
             (&left.repo_id, &left.workspace).cmp(&(&right.repo_id, &right.workspace))
