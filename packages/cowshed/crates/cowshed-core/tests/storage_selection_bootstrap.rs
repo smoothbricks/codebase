@@ -71,6 +71,7 @@ fn mutates_host(operation: &HostOperation) -> bool {
     matches!(
         operation,
         HostOperation::EnsureDirectory(_)
+            | HostOperation::ReclaimMountpoint(_)
             | HostOperation::MountApfsVolume { .. }
             | HostOperation::ProvisionApfsVolumes { .. }
             | HostOperation::RunCommand(_)
@@ -922,6 +923,11 @@ impl BootstrapHost for SpyHost {
         Ok(())
     }
 
+    fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
+        self.record(true);
+        Ok(())
+    }
+
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
         self.record(true);
         let stdout = if command
@@ -1026,6 +1032,14 @@ impl BootstrapHost for TransitionHost {
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError> {
+        self.next_sequence();
+        if path.ends_with("caches") {
+            self.caches_mutations.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError> {
         self.next_sequence();
         if path.ends_with("caches") {
             self.caches_mutations.fetch_add(1, Ordering::SeqCst);

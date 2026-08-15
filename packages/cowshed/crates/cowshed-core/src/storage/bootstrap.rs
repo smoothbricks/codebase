@@ -809,6 +809,8 @@ pub enum HostOperation {
         substrate: SubstrateKind,
     },
     EnsureDirectory(PathBuf),
+    /// Delete a launchd StandardErrorPath stub so an existing cowshed volume can remount.
+    ReclaimMountpoint(PathBuf),
     MountApfsVolume {
         mountpoint: PathBuf,
         volume: VolumeRef,
@@ -902,12 +904,19 @@ fn plan_apfs(
         ExistingStorage::Absent
             | ExistingStorage::MountedIncomplete { .. }
             | ExistingStorage::DetachedIncomplete { .. }
-            | ExistingStorage::MisMountedIncomplete { .. }
+    ) || matches!(
+        store,
+        ExistingStorage::MisMountedIncomplete {
+            current_mountpoint,
+            ..
+        } if current_mountpoint == roots.store()
     );
     let mut operations = Vec::new();
     let mut volumes = Vec::new();
 
-    if !mounted_but_unpublished_at(store, roots.store()) {
+    if !mounted_but_unpublished_at(store, roots.store())
+        && !remounting_from_elsewhere(store, roots.store())
+    {
         operations.push(guard(roots.store(), VolumeRole::Store, SubstrateKind::Apfs));
     }
     plan_apfs_volume(
@@ -919,7 +928,10 @@ fn plan_apfs(
         store,
     );
 
-    if !store_is_batched && !mounted_but_unpublished_at(caches, roots.caches()) {
+    if !store_is_batched
+        && !mounted_but_unpublished_at(caches, roots.caches())
+        && !remounting_from_elsewhere(caches, roots.caches())
+    {
         operations.push(guard(
             roots.caches(),
             VolumeRole::Caches,
@@ -953,6 +965,16 @@ fn mounted_but_unpublished_at(state: &ExistingStorage, path: &Path) -> bool {
                 ..
             } if current_mountpoint == path
         )
+}
+
+fn remounting_from_elsewhere(state: &ExistingStorage, path: &Path) -> bool {
+    matches!(
+        state,
+        ExistingStorage::MisMountedIncomplete {
+            current_mountpoint,
+            ..
+        } if current_mountpoint != path
+    )
 }
 
 fn plan_apfs_volume(
@@ -994,7 +1016,7 @@ fn plan_apfs_volume(
         ExistingStorage::MisMountedIncomplete {
             exact_identifier,
             current_mountpoint,
-        } => {
+        } if current_mountpoint == mountpoint => {
             volumes.push(ApfsVolumeProvision {
                 name: volume_name,
                 mountpoint: mountpoint.to_owned(),
@@ -1004,6 +1026,20 @@ fn plan_apfs_volume(
                     current_mountpoint: current_mountpoint.clone(),
                 },
             });
+        }
+        ExistingStorage::MisMountedIncomplete {
+            exact_identifier, ..
+        } => {
+            operations.push(HostOperation::ReclaimMountpoint(mountpoint.to_owned()));
+            operations.push(HostOperation::RunCommand(HostCommand::new(
+                DISKUTIL,
+                ["unmount", "force", exact_identifier.as_str()],
+            )));
+            operations.push(apfs_mount(
+                mountpoint,
+                VolumeRef::ExistingExact(exact_identifier.clone()),
+            ));
+            operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
         }
         ExistingStorage::ExistingUnmounted {
             exact_identifier, ..
@@ -1293,8 +1329,13 @@ pub enum PlanError {
 pub enum MountpointState {
     Missing,
     EmptyDirectory,
+    /// Data-volume residue launchd creates for StandardErrorPath before the
+    /// store volume is remounted. Safe to delete; not user data.
+    ReclaimableStub,
     NonEmptyDirectoryWithoutMount,
-    Mounted { marker: Option<Vec<u8>> },
+    Mounted {
+        marker: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1310,6 +1351,7 @@ pub trait BootstrapHost: Send + Sync {
     fn verify_zfs_delegation(&self, pool: &str, required_root: &str) -> Result<(), HostError>;
     fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError>;
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError>;
+    fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError>;
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError>;
     fn provision_apfs_volumes(
         &self,
@@ -1425,7 +1467,9 @@ fn apply_operation(
             .inspect_mountpoint(path)
             .map_err(BootstrapExecutionError::Host)?
         {
-            MountpointState::Missing | MountpointState::EmptyDirectory => Ok(()),
+            MountpointState::Missing
+            | MountpointState::EmptyDirectory
+            | MountpointState::ReclaimableStub => Ok(()),
             MountpointState::NonEmptyDirectoryWithoutMount => {
                 Err(BootstrapExecutionError::MaskedData(path.clone()))
             }
@@ -1440,6 +1484,9 @@ fn apply_operation(
         },
         HostOperation::EnsureDirectory(path) => host
             .create_dir_all(path)
+            .map_err(BootstrapExecutionError::Host),
+        HostOperation::ReclaimMountpoint(path) => host
+            .reclaim_mountpoint(path)
             .map_err(BootstrapExecutionError::Host),
         HostOperation::MountApfsVolume { .. } => {
             Err(BootstrapExecutionError::UnresolvedMountOperation)
