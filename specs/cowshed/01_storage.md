@@ -62,12 +62,13 @@ intermediate `store/` level; the volume root is the layout root:
     <workspaceIncarnation>.sock      # bind-mounted into exactly one attached workspace; absent after detach/restore fence
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
-    daemon-stderr.log                #   the one text file: launchd stderr for pre-tracer-init crashes only
   caches/                            # ← cowshed.caches volume, NESTED mount (mirror, git mirrors, layer-3 caches)
   mnt/<owner>/<repo>/<workspace>/    # ← session workspace mounts, nested (empty dirs when detached)
 
 ~/Library/LaunchAgents/dev.cowshed.*.plist   # the ONLY ~/Library residue — launchd requires this location;
                                              # home-manager-owned on nix hosts (14_nix.md)
+~/Library/Logs/cowshed/daemon-stderr.log     # launchd stderr for pre-tracer-init crashes only; kept off the
+                                             # ~/.cowshed mountpoint so reboot remount cannot be masked
 ```
 
 Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Repository paths are safe because both `repo_id`
@@ -197,18 +198,19 @@ Both volumes are created lazily by explicit foreground `cowshed adopt`
 (`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`, then mounted `-nobrowse`) and share
 the container's free-space pool — no sizing, no space cost for the split. The complete create/mount/ownership
 transaction uses the one provisioning authorization session described in 14_nix.md. macOS auto-mounts container volumes
-at boot, but `-nobrowse` is not sticky: `cowshed ensure`, `cowshed doctor`, and login agents validate presence, markers,
-ownership, and flags. If either dedicated volume is absent, unmounted, incomplete, or mounted with noncanonical flags,
-every existing-only command fails before mutation with `environment-missing` and `next: cowshed adopt`; only explicit
-foreground adopt may remount or repair it.
+at boot, but `-nobrowse` is not sticky. `cowshed ensure`, `cowshed doctor`, and the RunAtLoad gateway therefore reclaim
+a Data-volume launchd stub (only `telemetry/daemon-stderr.log` and `telemetry/sccache-stderr.log`) and remount an
+already-created cowshed volume at its canonical path with `-nobrowse`. That remount is unprivileged `diskutil` work and
+does not open an authorization prompt. Volume _creation_ remains foreground `cowshed adopt` only. If either dedicated
+volume is absent, or the mountpoint holds anything other than a reclaimable stub, existing-only commands fail before
+mutation with `environment-missing` and `next: cowshed adopt`.
 
 **Mount ordering and the unmounted-masking guard.** The layout nests: the caches volume and every workspace mount at
-directories that live _on_ the store volume, so validation and foreground adopt sequence store → caches → workspaces.
-When the store volume is not mounted, `~/.cowshed` is a bare, empty directory on Data; the volume-root marker
-`.cowshed-volume.json` is how every cowshed command tells the difference — marker absent ⇒ treat as unmounted and
-require foreground adopt before doing anything (the same shape as the workspace stub `.envrc`). A launchd/background job
-reports the remediation but never repairs storage or triggers authorization. The underlying Data directory is kept empty
-by construction so nothing ever silently lands on Data behind an unmounted volume.
+directories that live _on_ the store volume, so validation and remount sequence store → caches → workspaces. When the
+store volume is not mounted, `~/.cowshed` is a bare directory on Data; the volume-root marker `.cowshed-volume.json` is
+how every cowshed command tells the difference. launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`,
+never under the mountpoint, so a reboot cannot recreate the masking stub. A leftover `telemetry/` stub from an older
+plist is deleted before remount.
 
 Why volumes and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops
