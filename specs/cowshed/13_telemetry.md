@@ -123,8 +123,9 @@ Cowshed uses Arrow IPC for both tiers, but placement and authority differ:
   named by a workspace-readable path or token. Admission and terminal/checkpoint commitments are flushed and atomically
   published before their corresponding operation is acknowledged. The short-timer one-batch crash window applies only to
   non-commitment diagnostic/audit events; gateway decision boundaries retain the flush policy below.
-- **The one text-file survivor** — `~/.cowshed/telemetry/daemon-stderr.log`, the launchd `StandardErrorPath` target,
-  exists only for crashes before tracer initialization. `doctor` flags it when non-empty.
+- **The one text-file survivor** — `~/Library/Logs/cowshed/daemon-stderr.log`, the launchd `StandardErrorPath` target,
+  exists only for crashes before tracer initialization. It lives off the `~/.cowshed` mountpoint so reboot remount
+  cannot be masked. `doctor` flags it when non-empty.
 
 `StreamInfo` is the shared content descriptor:
 
