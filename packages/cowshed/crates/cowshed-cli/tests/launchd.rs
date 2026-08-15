@@ -36,7 +36,7 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
     );
     assert_eq!(
         spec.standard_error_path(),
-        Path::new("/Users/cowshed-test/.cowshed/telemetry/daemon-stderr.log")
+        Path::new("/Users/cowshed-test/Library/Logs/cowshed/daemon-stderr.log")
     );
     assert_eq!(
         spec.program_arguments().collect::<Vec<_>>(),
@@ -64,7 +64,7 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "  <key>ProcessType</key>\n",
         "  <string>Background</string>\n",
         "  <key>StandardErrorPath</key>\n",
-        "  <string>/Users/cowshed-test/.cowshed/telemetry/daemon-stderr.log</string>\n",
+        "  <string>/Users/cowshed-test/Library/Logs/cowshed/daemon-stderr.log</string>\n",
         "</dict>\n",
         "</plist>\n",
     );
@@ -110,7 +110,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     );
     assert_eq!(
         spec.standard_error_path(),
-        Path::new("/Users/cowshed-test/.cowshed/telemetry/sccache-stderr.log")
+        Path::new("/Users/cowshed-test/Library/Logs/cowshed/sccache-stderr.log")
     );
     assert_eq!(
         spec.environment(),
@@ -148,7 +148,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         "  <key>ProcessType</key>\n",
         "  <string>Background</string>\n",
         "  <key>StandardErrorPath</key>\n",
-        "  <string>/Users/cowshed-test/.cowshed/telemetry/sccache-stderr.log</string>\n",
+        "  <string>/Users/cowshed-test/Library/Logs/cowshed/sccache-stderr.log</string>\n",
         "  <key>EnvironmentVariables</key>\n",
         "  <dict>\n",
         "    <key>SCCACHE_START_SERVER</key>\n",
