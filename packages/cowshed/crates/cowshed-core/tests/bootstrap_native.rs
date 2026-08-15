@@ -63,9 +63,17 @@ impl BootstrapHost for ValidationHost {
         Ok(())
     }
 
+    fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn run_command(&self, _command: &HostCommand) -> Result<HostCommandOutput, HostError> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Ok(HostCommandOutput::default())
+        Ok(HostCommandOutput {
+            success: true,
+            ..HostCommandOutput::default()
+        })
     }
 
     fn provision_apfs_volumes(
@@ -104,6 +112,10 @@ impl BootstrapHost for RecordingHost {
     }
 
     fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
         Ok(())
     }
 
@@ -425,7 +437,7 @@ async fn detached_exact_volume_requires_explicit_provisioning_without_prompt() {
 }
 
 #[tokio::test]
-async fn mismounted_exact_volume_is_rejected_before_existing_only_dispatch() {
+async fn automounted_exact_volume_remounts_without_provisioning() {
     let selected = select_substrate(
         StatFsEvidence::Apfs {
             mount_source: "/dev/disk3s5".into(),
@@ -443,43 +455,42 @@ async fn mismounted_exact_volume_is_rejected_before_existing_only_dispatch() {
         },
     )
     .unwrap();
-    assert!(plan.operations().iter().any(|operation| matches!(
-        operation,
-        HostOperation::ProvisionApfsVolumes { volumes, .. }
-            if matches!(
-                volumes.as_slice(),
-                [volume]
-                    if matches!(
-                        volume.kind(),
-                        ApfsProvisionKind::RepairMisMounted {
-                            exact_identifier,
-                            current_mountpoint,
-                        } if exact_identifier == "disk3s9"
-                            && current_mountpoint == Path::new("/Volumes/cowshed-wrong")
-                    )
-            )
-    )));
+    assert!(matches!(
+        plan.operations(),
+        [
+            HostOperation::GuardMountpoint {
+                role: VolumeRole::Store,
+                ..
+            },
+            HostOperation::ReclaimMountpoint(path),
+            HostOperation::RunCommand(command),
+            HostOperation::MountApfsVolume { .. },
+            HostOperation::GuardMountpoint {
+                role: VolumeRole::Caches,
+                ..
+            },
+        ] if path == Path::new("/Users/alice/.cowshed/caches")
+            && command.args() == ["unmount", "force", "disk3s9"]
+    ));
+    assert!(
+        !plan
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, HostOperation::ProvisionApfsVolumes { .. }))
+    );
 
     let host = Arc::new(ValidationHost::default());
     let lane = CountingLane::default();
-    let error = execute_native_bootstrap_plan(
+    execute_native_bootstrap_plan(
         &plan,
         NativeBootstrapMode::ExistingOnly,
         Arc::clone(&host),
         &lane,
     )
     .await
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        NativeBootstrapError::StorageSetupRequired {
-            hint: "cowshed adopt",
-            ..
-        }
-    ));
-    assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
-    assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
-    assert_eq!(host.mutations.load(Ordering::SeqCst), 0);
+    .unwrap();
+    assert!(lane.dispatches.load(Ordering::SeqCst) > 0);
+    assert!(host.mutations.load(Ordering::SeqCst) > 0);
 }
 
 #[test]

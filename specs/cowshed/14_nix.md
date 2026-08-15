@@ -65,11 +65,11 @@ bootstrap error with a declarative remediation hint, never an imperative fallbac
 **What stays imperative always**, on every host: volume creation (`diskutil apfs addVolume` — stateful, hardware-
 adjacent) and every per-project/per-workspace artifact (images, grants, tokens, CA keys). Native volume creation is
 capability-fenced further: only an explicit, foreground `cowshed adopt` uses provisioning mode and may cause the
-one-time macOS administrator authorization prompt that creates and mounts `cowshed.store` and `cowshed.caches`. All
-other commands and every launchd/background service use existing-only mode. They may validate filesystem, `diskutil`,
-mount, and marker evidence, but a plan requiring any directory, volume, mount, command, or marker mutation is rejected
-before executor dispatch with `environment-missing` and `next: cowshed adopt`. Consequently a launchd job can report
-incomplete setup but can never repair it or trigger an authorization prompt. Per-project/per-workspace artifacts live
+one-time macOS administrator authorization prompt that creates `cowshed.store` and `cowshed.caches`. All other commands
+and every launchd/background service use existing-only mode. They may validate filesystem, `diskutil`, mount, and marker
+evidence, reclaim a launchd StandardErrorPath stub, and remount an already-created cowshed volume at its canonical
+`-nobrowse` path. A plan that would create a volume, write a marker, or otherwise require authorization is rejected
+before executor dispatch with `environment-missing` and `next: cowshed adopt`. Per-project/per-workspace artifacts live
 inside cowshed's volumes, not `$HOME`; there is nothing for a dotfile generation to own. Trusted repository bindings and
 policy are the exception: despite living under the cowshed volume, they remain host-bootstrap-owned and outside
 workspace authority.
@@ -133,9 +133,9 @@ wrinkle, stated honestly: dev's **login keychain is not auto-unlocked** without 
 (or an explicit `cowshed unlock`) unlocks it, and the gateway defers Keychain reads until then (mirror cache hits and
 unauthenticated upstreams work before unlock; credentialed flows queue a clear exit-5 hint).
 
-These daemons always enter cowshed through the existing-only runtime API. Boot or login may therefore surface an
-`environment-missing` diagnostic when the APFS volumes are absent or mis-mounted, but it never opens an administrator
-authorization dialog; the human resolves the finding later with foreground `cowshed adopt`.
+These daemons always enter cowshed through the existing-only runtime API. Boot or login remounts already-created volumes
+and reclaims a leftover launchd stub; that never opens an administrator authorization dialog. Volume creation still
+requires foreground `cowshed adopt`.
 
 ### iOS, Xcode, and simulators (posture B)
 
