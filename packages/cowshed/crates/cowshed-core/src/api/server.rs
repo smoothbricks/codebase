@@ -436,6 +436,7 @@ pub const CAPABILITY_METHODS: &[&str] = &[
     "coordinator.rebase",
     "coordinator.land",
     "coordinator.restore",
+    "coordinator.resize",
     "coordinator.detach",
     "coordinator.assignSlot",
     "coordinator.destroy",
