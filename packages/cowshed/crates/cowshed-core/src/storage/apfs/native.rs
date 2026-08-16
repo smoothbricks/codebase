@@ -18,14 +18,14 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
-    ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage, DetachTarget,
-    ImageFormatSelection, MacOsApfsBackend, MountAccess,
+    ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage,
+    DetachTarget, ImageFormatSelection, MacOsApfsBackend, MountAccess,
 };
 use crate::copy::TreeCopier;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, PublicationState,
-    WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName, WorkspaceRole,
-    sidecar_path,
+    DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, METADATA_VERSION, Platform,
+    PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
+    WorkspaceRole, sidecar_path,
 };
 use crate::repository::RepoId;
 use crate::workspace_credentials::{
@@ -36,8 +36,8 @@ use sha2::{Digest, Sha256};
 
 use super::super::lifecycle::{
     CheckpointFact, ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState,
-    OperationIdentity, Pin, RetiredRef, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
-    StorageGcReason, StorageGcReport, SubstrateStats,
+    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate,
+    StorageGcPlan, StorageGcReason, StorageGcReport, SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -2298,6 +2298,25 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             None => Ok(()),
         }
     }
+
+    /// Hand back the attachment a failed resize step left behind, reporting the original failure.
+    ///
+    /// The image is already grown at this point and stays grown: the resize itself succeeded, and
+    /// re-running the verb converges. What must not survive is a stray attachment nothing owns.
+    fn abandon_resized_attachment(
+        &self,
+        attachment: AttachedImage,
+        primary: ApfsStorageError,
+    ) -> ApfsStorageError {
+        match self.backend.detach(&attachment, false) {
+            Ok(()) => primary,
+            Err(cleanup) => ApfsStorageError::Cleanup {
+                operation: "detach the attachment a failed resize left behind",
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup.into()),
+            },
+        }
+    }
 }
 
 impl<R> ApfsExecutionHost for MacOsApfsExecutionHost<R>
@@ -2737,6 +2756,82 @@ where
                 }
             }
         }
+    }
+
+    fn resize(
+        &self,
+        workspace: &LifecycleWorkspace,
+        image: &Path,
+        mount_point: &Path,
+        capacity: ImageCapacity,
+    ) -> Result<ResizeOutcome, ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        self.verify_controller_path(mount_point)?;
+        let format = workspace.format();
+        // The capacity to compare against comes from whichever authority can see the image right
+        // now: the kernel's attachment inventory while it is attached, the image's own resize
+        // limits while it is not. Reading it before anything is detached keeps a refused resize
+        // from disturbing a live workspace.
+        let previous = match self.backend.attached_capacity(image) {
+            Ok(capacity) => capacity,
+            Err(ApfsError::ImageNotAttached(_)) => self.backend.image_capacity(image, format)?,
+            Err(error) => return Err(error.into()),
+        };
+        if capacity <= previous {
+            return Err(ApfsStorageError::CapacityNotGrowing {
+                current: previous,
+                requested: capacity,
+            });
+        }
+
+        let was_mounted = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .any(|mount| mount.mount_point == mount_point);
+        self.detach_mounted(workspace, false)?;
+        self.backend.resize_image(image, format, capacity)?;
+
+        let attachment = self.backend.attach_verified(image, format)?;
+        if let Err(primary) = self.backend.grow_container(&attachment) {
+            return Err(self.abandon_resized_attachment(attachment, primary.into()));
+        }
+        let observed = match self.backend.attached_capacity(image) {
+            Ok(observed) => observed,
+            Err(primary) => return Err(self.abandon_resized_attachment(attachment, primary.into())),
+        };
+        if observed < capacity {
+            return Err(self.abandon_resized_attachment(
+                attachment,
+                ApfsStorageError::ResizeNotObserved {
+                    requested: capacity,
+                    observed,
+                },
+            ));
+        }
+
+        if !was_mounted {
+            self.backend.detach(&attachment, false)?;
+            return Ok(ResizeOutcome {
+                previous,
+                capacity: observed,
+            });
+        }
+        if let Err(primary) = self
+            .backend
+            .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
+            .map_err(ApfsStorageError::from)
+            .and_then(|()| {
+                self.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))
+            })
+        {
+            return Err(self.abandon_resized_attachment(attachment, primary));
+        }
+        self.retain_mounted(workspace, attachment)?;
+        Ok(ResizeOutcome {
+            previous,
+            capacity: observed,
+        })
     }
 
     fn restore_adopted_checkout(

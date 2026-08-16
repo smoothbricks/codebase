@@ -2040,6 +2040,15 @@ pub struct AttachOptions {
     pub browse: bool,
 }
 
+/// What `cowshed resize` changed, with both capacities as the image itself reports them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResizeResult {
+    pub workspace: WorkspaceName,
+    pub previous_capacity: String,
+    pub capacity: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckpointOptions {
@@ -2270,6 +2279,7 @@ result_bodies!(
     GcReport,
     CheckpointResult,
     RevisionResult,
+    ResizeResult,
     SlotResult,
     WorkspaceInfo,
     JobInfo,

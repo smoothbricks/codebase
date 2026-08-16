@@ -11,7 +11,7 @@ use cowshed_core::api::dto::{
     CheckpointResult, CommandArg, CreateOptions, DoctorReport, EnsureAction, EnsureReport, Finding,
     FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId,
     JobInfo, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, WorkspaceInfo, WorkspaceState,
+    RebaseOptions, RemoveOptions, ResizeResult, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -502,6 +502,15 @@ impl ProjectRuntimeHost for FakeHost {
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()> {
         self.workspace_mut(&workspace)?.attached = false;
         self.persist()
+    }
+
+    async fn resize(&mut self, workspace: WorkspaceName, capacity: String) -> Result<ResizeResult> {
+        self.workspace(&workspace)?;
+        Ok(ResizeResult {
+            workspace,
+            previous_capacity: "100g".to_owned(),
+            capacity,
+        })
     }
 
     async fn checkpoint(

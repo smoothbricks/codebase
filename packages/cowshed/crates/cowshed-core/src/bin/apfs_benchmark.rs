@@ -7,7 +7,7 @@ mod macos {
         ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, ImageFormatSelection,
         MacOsApfsBackend, SystemCommandRunner,
     };
-    use cowshed_core::metadata::ImageFormat;
+    use cowshed_core::metadata::{ImageCapacity, ImageFormat};
 
     pub fn run() {
         let formats = [ImageFormat::Sparse, ImageFormat::Asif];
@@ -71,7 +71,7 @@ mod macos {
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
         let request = CreateImageRequest {
             staged_stem: root.0.join("source"),
-            capacity: "1g".to_owned(),
+            capacity: ImageCapacity::from_gibibytes(1),
             volume_name: format!("cowshed.bench.{}", format.extension()),
             case_sensitivity: ApfsCaseSensitivity::Insensitive,
             owner_uid: unsafe { libc::getuid() },

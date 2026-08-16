@@ -80,7 +80,8 @@ cowshed adopt /path/to/repo --capacity 400g --repo-id owner/repo
 `--capacity` covers the live cache, the source, `.git`, and headroom for divergence: workspaces share extents at clone
 time but every rebuild writes new blocks, so allocation grows with the number of workspaces and how far each one's build
 diverges. Retire finished workspaces and run `cowshed gc` on a regular cadence — that reclamation, not a lean image, is
-what keeps the storage bounded.
+what keeps the storage bounded. If the image turns out too small, `cowshed resize <ws|main> <size>` grows it in place;
+it never shrinks.
 
 If any command exits `5` with `provision APFS volumes cowshed.store, cowshed.caches`, adopt has not run on this host.
 That is the fix — not a retry.
