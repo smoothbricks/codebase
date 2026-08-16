@@ -8,20 +8,22 @@ use cowshed_core::apfs::{
     ApfsCaseSensitivity, CreateImageRequest, CreatedImage, ImageFormatSelection, MountAccess,
 };
 use cowshed_core::metadata::{
-    GrantSet, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    GrantSet, ImageCapacity, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName,
+    WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
-    ApfsSubstrateConfig, CheckoutLayout, IncarnationSource, LockMode, MarkerExpectation,
-    MetadataPolicy, PublicationError, RestoreStage, RetireExecutionError, volume_key,
+    ApfsSubstrateConfig, CheckoutLayout, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode,
+    MarkerExpectation, MetadataPolicy, PublicationError, RestoreStage, RetireExecutionError,
+    volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
     LifecycleWorkspace, MountIntent, MountState, ObservedState, OperationIdentity, Pin,
-    RestoreMode, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate,
-    SubstrateStats,
+    ResizeOutcome, RestoreMode, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport,
+    Substrate, SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -420,6 +422,22 @@ impl ApfsExecutionHost for FakeHost {
             .remove(&(workspace.repo().clone(), workspace.name().clone()));
         Ok(())
     }
+
+    fn resize(
+        &self,
+        workspace: &LifecycleWorkspace,
+        image: &Path,
+        _: &Path,
+        capacity: ImageCapacity,
+    ) -> Result<ResizeOutcome, ApfsStorageError> {
+        self.record_path(image);
+        self.record(format!("resize:{}:{capacity}", workspace.name()));
+        Ok(ResizeOutcome {
+            previous: DEFAULT_IMAGE_CAPACITY,
+            capacity,
+        })
+    }
+
     fn restore_adopted_checkout(
         &self,
         workspace: &LifecycleWorkspace,
@@ -851,6 +869,7 @@ fn adopt_request(format: ImageFormat) -> AdoptRequest {
     AdoptRequest {
         repo: repo(),
         format,
+        capacity: DEFAULT_IMAGE_CAPACITY,
         topology_revision: Revision::new(0),
         source_checkout: PathBuf::from("/project"),
         pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),

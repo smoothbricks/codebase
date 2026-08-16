@@ -2,8 +2,8 @@ use super::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
     GrantSet, JobId, JobInfo, JobState, LandOptions, LandReport, MirrorInfo, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource,
-    WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
+    PushReport, RebaseOptions, RemoveOptions, ResizeResult, RevisionResult, RunSandboxMode,
+    StdinSource, WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
 };
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
@@ -1462,6 +1462,20 @@ impl Coordinator {
             &self.runtime,
             "coordinator.detach",
             json!({ "repoId": self.project.repo_id, "workspace": workspace }),
+        )
+        .await
+    }
+
+    /// Grow a workspace's image. Capacity only ever goes up; a smaller request is refused.
+    pub async fn resize(&self, workspace: &str, capacity: &str) -> Result<ResizeResult> {
+        call_typed(
+            &self.runtime,
+            "coordinator.resize",
+            json!({
+                "repoId": self.project.repo_id,
+                "workspace": workspace,
+                "capacity": capacity,
+            }),
         )
         .await
     }

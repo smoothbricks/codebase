@@ -201,6 +201,15 @@ impl CliService for FakeService {
         Ok(())
     }
 
+    async fn resize(&mut self, name: &str, capacity: &str) -> Result<ResizeResult> {
+        self.events.push(format!("resize:{name}:{capacity}"));
+        Ok(ResizeResult {
+            workspace: WorkspaceName::new(name).unwrap(),
+            previous_capacity: "100g".to_owned(),
+            capacity: capacity.to_owned(),
+        })
+    }
+
     async fn doctor(&mut self) -> Result<DoctorReport> {
         self.events.push("doctor".into());
         Ok(DoctorReport {
@@ -411,7 +420,10 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
 
     let (_, stdout, stderr) = run(&mut service, ["adopt", "/repo"]).await;
     assert_eq!(stdout, b"/mnt/main\n");
-    assert_eq!(stderr, b"next: cowshed new <name>\n");
+    assert_eq!(
+        stderr,
+        b"cowshed: image capacity 100g\nnext: cowshed new <name>\n"
+    );
 
     let (_, stdout, stderr) = run(&mut service, ["new", "raven", "--browse"]).await;
     assert_eq!(stdout, b"/mnt/raven\n");
@@ -553,7 +565,10 @@ async fn adopt_delegates_explicit_identity_and_quarantine_with_exact_output() {
         )
         .as_bytes()
     );
-    assert_eq!(stderr, b"next: cowshed new <name>\n");
+    assert_eq!(
+        stderr,
+        b"cowshed: image capacity 100g\nnext: cowshed new <name>\n"
+    );
     assert_eq!(
         service.adopt_options,
         Some(AdoptOptions {
@@ -1172,6 +1187,9 @@ impl CliService for SerializedCreateService {
         unreachable!()
     }
     async fn detach(&mut self, _: &str) -> Result<()> {
+        unreachable!()
+    }
+    async fn resize(&mut self, _: &str, _: &str) -> Result<ResizeResult> {
         unreachable!()
     }
     async fn doctor(&mut self) -> Result<DoctorReport> {

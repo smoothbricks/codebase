@@ -100,6 +100,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
     ) -> Result<crate::api::dto::EnsureReport>;
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
+    async fn resize(
+        &mut self,
+        workspace: WorkspaceName,
+        capacity: String,
+    ) -> Result<crate::api::dto::ResizeResult>;
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,
@@ -333,6 +338,7 @@ impl ProjectActor {
             "coordinator.rebase" => self.coordinator_rebase(request).await,
             "coordinator.land" => self.coordinator_land(request).await,
             "coordinator.restore" => self.coordinator_restore(request).await,
+            "coordinator.resize" => self.coordinator_resize(request).await,
             "coordinator.detach" => self.coordinator_detach(request).await,
             "coordinator.assignSlot" => self.coordinator_assign_slot(request).await,
             "coordinator.destroy" => self.coordinator_destroy(request).await,
@@ -588,6 +594,14 @@ impl ProjectActor {
         self.require_repo(&params.repo_id)?;
         self.host.detach(params.workspace).await?;
         json_response(EmptyResult {})
+    }
+
+    async fn coordinator_resize(&mut self, request: RouterRequest) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: ResizeParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let result = self.host.resize(params.workspace, params.capacity).await?;
+        json_response(result)
     }
 
     async fn coordinator_assign_slot(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -1054,6 +1068,14 @@ struct RestoreParams {
     repo_id: RepoId,
     workspace: WorkspaceName,
     label: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResizeParams {
+    repo_id: RepoId,
+    workspace: WorkspaceName,
+    capacity: String,
 }
 
 #[derive(Deserialize)]
@@ -2975,12 +2997,19 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let format = options
             .image_format
             .unwrap_or(crate::metadata::ImageFormat::Asif);
+        // Capacity is fixed for the image's lifetime at creation; `cowshed resize` is what moves
+        // it afterwards. An unset option means the project default rather than "no capacity".
+        let capacity = match options.capacity.as_deref() {
+            Some(requested) => parse_capacity(requested)?,
+            None => self.substrate_config.capacity,
+        };
         let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
         let plan = self
             .substrate
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
                 repo: self.descriptor.repo_id.clone(),
                 format,
+                capacity,
                 topology_revision: crate::storage::lifecycle::Revision::new(0),
                 source_checkout: self.descriptor.git_root.clone(),
                 pre_cowshed_checkout: pre_cowshed,
@@ -3518,6 +3547,40 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .unmount(&current.derived.workspace)
             .await
             .map_err(native_storage_error)
+    }
+
+    /// Grow a workspace's image, restoring the mount state the verb found it in.
+    ///
+    /// The supervisor is stopped first for the same reason `detach` stops it: the image has to
+    /// leave the kernel for the resize, and a supervisor holding the mount would either keep it
+    /// busy or come back pointed at a volume that went away underneath it.
+    async fn resize(
+        &mut self,
+        workspace: WorkspaceName,
+        capacity: String,
+    ) -> Result<crate::api::dto::ResizeResult> {
+        use crate::storage::lifecycle::Substrate;
+        self.validate_binding().await?;
+        let requested = parse_capacity(&capacity)?;
+        let current = self.current(&workspace).await?;
+        let was_mounted = matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        );
+        self.stop_supervisor(&workspace).await?;
+        let outcome = self
+            .substrate
+            .resize(&current.derived.workspace, requested)
+            .await
+            .map_err(native_storage_error)?;
+        if was_mounted {
+            self.ensure_supervisor(&workspace).await?;
+        }
+        Ok(crate::api::dto::ResizeResult {
+            workspace,
+            previous_capacity: outcome.previous.to_string(),
+            capacity: outcome.capacity.to_string(),
+        })
     }
 
     async fn checkpoint(
@@ -5688,6 +5751,18 @@ fn native_restore_error(
     }
 }
 
+/// Read a capacity the way both image verbs spell it, refusing anything the tools would have to
+/// round or reinterpret before the caller's workspace is touched.
+#[cfg(target_os = "macos")]
+fn parse_capacity(value: &str) -> Result<crate::metadata::ImageCapacity> {
+    crate::metadata::ImageCapacity::parse(value).map_err(|error| {
+        CowshedError::usage(
+            error.to_string(),
+            "use a capacity such as 100g, 200g, or 1t",
+        )
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
     match error {
@@ -5702,6 +5777,14 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             format!("restore publication is pending at {}", path.display()),
             "repair commitment/gateway evidence and retry restore",
         ),
+        // Asking to shrink, or to resize to the size it already is, is a mistake in the request,
+        // not a broken host: report it as usage so the caller is told to name a larger capacity.
+        error @ crate::storage::apfs::ApfsStorageError::CapacityNotGrowing { .. } => {
+            CowshedError::usage(
+                error.to_string(),
+                "cowshed resize <workspace> <capacity larger than the current one>",
+            )
+        }
         crate::storage::apfs::ApfsStorageError::MarkerMismatch(message)
         | crate::storage::apfs::ApfsStorageError::Host(message) => {
             CowshedError::integrity(message, "cowshed doctor --json")
