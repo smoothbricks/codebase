@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::metadata::{GrantSet, ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use crate::metadata::{
+    GrantSet, ImageCapacity, ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use crate::repository::RepoId;
 
 use super::CheckpointLabel;
@@ -311,6 +313,7 @@ pub enum Operation {
     Adopt {
         repo: RepoId,
         format: ImageFormat,
+        capacity: ImageCapacity,
         source_checkout: PathBuf,
         pre_cowshed_checkout: PathBuf,
         identity: OperationIdentity,
@@ -350,6 +353,8 @@ pub enum Operation {
 pub struct AdoptRequest {
     pub repo: RepoId,
     pub format: ImageFormat,
+    /// Capacity main's image is minted at.
+    pub capacity: ImageCapacity,
     pub topology_revision: Revision,
     pub source_checkout: PathBuf,
     pub pre_cowshed_checkout: PathBuf,
@@ -449,6 +454,7 @@ impl LifecyclePlanner for PurePlanner {
             operation: Operation::Adopt {
                 repo: request.repo,
                 format: request.format,
+                capacity: request.capacity,
                 source_checkout: request.source_checkout,
                 pre_cowshed_checkout: request.pre_cowshed_checkout,
                 identity: request.identity,
@@ -768,6 +774,13 @@ pub struct MountIntent {
     pub browse: bool,
 }
 
+/// What a completed resize changed, both values read back from the image itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResizeOutcome {
+    pub previous: ImageCapacity,
+    pub capacity: ImageCapacity,
+}
+
 /// Canonical persistent fact read from an image/dataset and its sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageFact {
@@ -942,6 +955,12 @@ pub trait Substrate: LifecyclePlanner {
         intent: MountIntent,
     ) -> Result<PathBuf, Self::Error>;
     async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error>;
+    /// Grow the workspace's image to `capacity`, leaving it mounted exactly as it was found.
+    async fn resize(
+        &self,
+        workspace: &LifecycleWorkspace,
+        capacity: ImageCapacity,
+    ) -> Result<ResizeOutcome, Self::Error>;
     async fn caches_root(&self) -> Result<PathBuf, Self::Error>;
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error>;
     async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error>;

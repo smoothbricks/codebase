@@ -4,7 +4,8 @@ use std::thread::ThreadId;
 
 use async_trait::async_trait;
 use cowshed_core::metadata::{
-    GrantSet, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    GrantSet, ImageCapacity, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName,
+    WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
@@ -271,6 +272,21 @@ impl Substrate for ContractSubstrate {
     async fn unmount(&self, workspace: &LifecycleWorkspace) -> Result<(), Self::Error> {
         if workspace == &self.workspace {
             Ok(())
+        } else {
+            Err("wrong workspace")
+        }
+    }
+
+    async fn resize(
+        &self,
+        workspace: &LifecycleWorkspace,
+        capacity: ImageCapacity,
+    ) -> Result<ResizeOutcome, Self::Error> {
+        if workspace == &self.workspace {
+            Ok(ResizeOutcome {
+                previous: ImageCapacity::from_gibibytes(100),
+                capacity,
+            })
         } else {
             Err("wrong workspace")
         }

@@ -4,7 +4,7 @@ use std::fs::{FileTimes, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -15,9 +15,9 @@ use cowshed_core::apfs::{
     CreateImageRequest, ImageFormatSelection, MountAccess,
 };
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-    PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
-    sidecar_path,
+    DetachedWorkspaceMetadata, GrantSet, ImageCapacity, ImageFormat, METADATA_VERSION, Platform,
+    PortBlock, PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
+    WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::{
@@ -872,7 +872,7 @@ fn lifecycle_create_selection_mismatches_fail_before_native_commands() {
     let host = native_host(&fixture, runner.clone());
     let exact_asif = CreateImageRequest {
         staged_stem: fixture.root.join(".staging/main"),
-        capacity: "1g".to_owned(),
+        capacity: ImageCapacity::from_gibibytes(1),
         volume_name: "cowshed.acme--widget.main".to_owned(),
         case_sensitivity: ApfsCaseSensitivity::Insensitive,
         owner_uid: unsafe { libc::getuid() },
@@ -3666,7 +3666,7 @@ fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effect
             .project()
             .project_root
             .join(".staging/main-00000000000000000000000000000001"),
-        capacity: "1g".to_owned(),
+        capacity: ImageCapacity::from_gibibytes(1),
         volume_name: "cowshed.acme--widget.main".to_owned(),
         case_sensitivity: ApfsCaseSensitivity::Insensitive,
         image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
@@ -3976,4 +3976,402 @@ fn sidecar_primary_and_rollback_double_failure_retains_every_forward_artifact() 
         b"irreplaceable source"
     );
     assert!(!pre_cowshed.exists());
+}
+
+/// Answers the resize sequence the way the real tools do: the image reports its old capacity
+/// until it is grown, and the attachment inventory only lists it once `attach` has run — which is
+/// what lets one runner serve both the pre-flight capacity read and the post-growth verification.
+#[derive(Clone)]
+struct ResizeRunner {
+    requests: Arc<Mutex<Vec<CommandRequest>>>,
+    image: PathBuf,
+    before: ImageCapacity,
+    after: ImageCapacity,
+    resized: Arc<AtomicBool>,
+    attached: Arc<AtomicBool>,
+    detach_failures: Arc<AtomicUsize>,
+}
+
+impl ResizeRunner {
+    fn new(image: &Path, before: ImageCapacity, after: ImageCapacity) -> Self {
+        Self {
+            requests: Arc::default(),
+            image: std::path::absolute(image).expect("absolute image path"),
+            before,
+            after,
+            resized: Arc::new(AtomicBool::new(false)),
+            attached: Arc::new(AtomicBool::new(false)),
+            detach_failures: Arc::default(),
+        }
+    }
+
+    fn failing_detach(self, failures: usize) -> Self {
+        self.detach_failures.store(failures, Ordering::SeqCst);
+        self
+    }
+
+    fn requests(&self) -> Vec<CommandRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
+
+    fn argv(&self) -> Vec<Vec<String>> {
+        self.requests()
+            .iter()
+            .map(|request| {
+                std::iter::once(request.program.to_string_lossy().into_owned())
+                    .chain(
+                        request
+                            .args
+                            .iter()
+                            .map(|argument| argument.to_string_lossy().into_owned()),
+                    )
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn capacity(&self) -> ImageCapacity {
+        if self.resized.load(Ordering::SeqCst) {
+            self.after
+        } else {
+            self.before
+        }
+    }
+
+    fn inventory(&self) -> Vec<u8> {
+        if !self.attached.load(Ordering::SeqCst) {
+            return EMPTY_ATTACHMENT_INVENTORY.as_bytes().to_vec();
+        }
+        format!(
+            r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict>
+              <key>image-path</key><string>{}</string>
+              <key>blockcount</key><integer>{}</integer>
+              <key>blocksize</key><integer>512</integer>
+              <key>system-entities</key><array>
+                <dict><key>dev-entry</key><string>/dev/disk9</string></dict>
+              </array>
+            </dict></array></dict></plist>"#,
+            self.image.display(),
+            self.capacity().bytes() / 512
+        )
+        .into_bytes()
+    }
+
+    fn limits(&self) -> Vec<u8> {
+        format!(
+            r#"<?xml version="1.0"?><plist version="1.0"><dict>
+              <key>content-length</key><integer>{}</integer>
+              <key>content-min-length</key><integer>45136</integer>
+            </dict></plist>"#,
+            self.capacity().bytes() / 512
+        )
+        .into_bytes()
+    }
+}
+
+impl CommandRunner for ResizeRunner {
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        self.requests
+            .lock()
+            .expect("requests")
+            .push(request.clone());
+        let args: Vec<_> = request
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let head: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
+        Ok(match head.as_slice() {
+            ["info", "-plist"] => CommandOutput::success(self.inventory()),
+            ["resize", "-limits"] => CommandOutput::success(self.limits()),
+            ["resize", "-size"] => {
+                self.resized.store(true, Ordering::SeqCst);
+                CommandOutput::success([])
+            }
+            ["attach", ..] => {
+                self.attached.store(true, Ordering::SeqCst);
+                CommandOutput::success(ATTACH_PLIST.as_bytes().to_vec())
+            }
+            ["detach", ..] | ["eject", ..] => {
+                if self
+                    .detach_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    CommandOutput::failure(1, "Resource busy")
+                } else {
+                    self.attached.store(false, Ordering::SeqCst);
+                    CommandOutput::success([])
+                }
+            }
+            ["apfs", "list"] => CommandOutput::success(APFS_LIST_PLIST.as_bytes().to_vec()),
+            _ => CommandOutput::success([]),
+        })
+    }
+}
+
+fn resize_host(
+    fixture: &Fixture,
+    runner: ResizeRunner,
+    mounts: Vec<KernelMountSnapshot>,
+) -> MacOsApfsExecutionHost<ResizeRunner> {
+    let source = FakeKernelMountSource::default();
+    source.set(mounts);
+    MacOsApfsExecutionHost::with_mount_source(runner, fixture.config(), source)
+        .expect("native APFS host")
+}
+
+#[test]
+fn resizing_a_detached_workspace_grows_the_image_then_the_container_and_verifies_the_capacity() {
+    let fixture = Fixture::new("resize-detached");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image(ImageFormat::Sparse).expect("image");
+    create_image(image.image(), ImageFormat::Sparse);
+    let runner = ResizeRunner::new(
+        image.image(),
+        ImageCapacity::from_gibibytes(100),
+        ImageCapacity::from_gibibytes(200),
+    );
+    let host = resize_host(&fixture, runner.clone(), Vec::new());
+
+    let outcome = host
+        .resize(
+            &workspace(ImageFormat::Sparse),
+            image.image(),
+            &main_mount(&fixture),
+            ImageCapacity::from_gibibytes(200),
+        )
+        .expect("resize a detached workspace");
+
+    assert_eq!(outcome.previous, ImageCapacity::from_gibibytes(100));
+    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(200));
+    let image_path = image.image().to_string_lossy().into_owned();
+    assert_eq!(
+        runner.argv(),
+        vec![
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "info".into(),
+                "-plist".into()
+            ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "resize".into(),
+                "-limits".into(),
+                "-plist".into(),
+                image_path.clone(),
+            ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "resize".into(),
+                "-size".into(),
+                "214748364800".into(),
+                image_path.clone(),
+            ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "info".into(),
+                "-plist".into()
+            ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "attach".into(),
+                "-nobrowse".into(),
+                "-owners".into(),
+                "on".into(),
+                "-nomount".into(),
+                "-plist".into(),
+                image_path,
+            ],
+            vec![
+                "/usr/sbin/diskutil".to_owned(),
+                "apfs".into(),
+                "list".into(),
+                "-plist".into(),
+            ],
+            vec![
+                "/sbin/fsck_apfs".to_owned(),
+                "-q".into(),
+                "/dev/rdisk10s1".into()
+            ],
+            vec![
+                "/usr/sbin/diskutil".to_owned(),
+                "apfs".into(),
+                "resizeContainer".into(),
+                "/dev/disk10".into(),
+                "0".into(),
+            ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "info".into(),
+                "-plist".into()
+            ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "detach".into(),
+                "-quiet".into(),
+                "/dev/disk9".into(),
+            ],
+        ],
+        "a detached workspace is grown, verified, and handed back detached"
+    );
+}
+
+#[test]
+fn resize_refuses_a_capacity_that_does_not_grow_before_touching_the_image() {
+    let fixture = Fixture::new("resize-shrink");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image(ImageFormat::Sparse).expect("image");
+    create_image(image.image(), ImageFormat::Sparse);
+
+    for requested in [
+        ImageCapacity::from_gibibytes(50),
+        ImageCapacity::from_gibibytes(100),
+    ] {
+        let runner = ResizeRunner::new(
+            image.image(),
+            ImageCapacity::from_gibibytes(100),
+            ImageCapacity::from_gibibytes(200),
+        );
+        let host = resize_host(&fixture, runner.clone(), Vec::new());
+
+        let error = host
+            .resize(
+                &workspace(ImageFormat::Sparse),
+                image.image(),
+                &main_mount(&fixture),
+                requested,
+            )
+            .expect_err("resize only ever grows");
+
+        assert!(
+            matches!(
+                error,
+                ApfsStorageError::CapacityNotGrowing { current, requested: asked }
+                    if current == ImageCapacity::from_gibibytes(100) && asked == requested
+            ),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            runner
+                .argv()
+                .iter()
+                .all(|argv| !argv.contains(&"-size".to_owned())),
+            "a refused resize must not have grown anything: {:?}",
+            runner.argv()
+        );
+    }
+}
+
+#[test]
+fn resize_refuses_a_busy_workspace_before_growing_the_image() {
+    let fixture = Fixture::new("resize-busy");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image(ImageFormat::Sparse).expect("image");
+    create_image(image.image(), ImageFormat::Sparse);
+    plant_mount_marker(&fixture, &main_mount(&fixture));
+    let runner = ResizeRunner::new(
+        image.image(),
+        ImageCapacity::from_gibibytes(100),
+        ImageCapacity::from_gibibytes(200),
+    )
+    .failing_detach(1);
+    let host = resize_host(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            main_mount(&fixture),
+            "/dev/disk10s1",
+            true,
+            true,
+        )],
+    );
+
+    host.resize(
+        &workspace(ImageFormat::Sparse),
+        image.image(),
+        &main_mount(&fixture),
+        ImageCapacity::from_gibibytes(200),
+    )
+    .expect_err("a busy volume refuses the resize rather than being torn out");
+
+    assert!(
+        runner
+            .argv()
+            .iter()
+            .all(|argv| !argv.contains(&"-size".to_owned())),
+        "a workspace that would not detach must keep its capacity: {:?}",
+        runner.argv()
+    );
+}
+
+#[test]
+fn resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
+    let fixture = Fixture::new("resize-mounted");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image(ImageFormat::Sparse).expect("image");
+    create_image(image.image(), ImageFormat::Sparse);
+    let mount = main_mount(&fixture);
+    plant_mount_marker(&fixture, &mount);
+    native_host(&fixture, RecordingRunner::default())
+        .mint_workspace_credentials(
+            &workspace(ImageFormat::Sparse),
+            &mount,
+            &fixture.root.join("resize.ca.key"),
+        )
+        .expect("workspace credentials");
+    let runner = ResizeRunner::new(
+        image.image(),
+        ImageCapacity::from_gibibytes(100),
+        ImageCapacity::from_gibibytes(200),
+    );
+    let host = resize_host(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            mount.clone(),
+            "/dev/disk10s1",
+            true,
+            true,
+        )],
+    );
+
+    let outcome = host
+        .resize(
+            &workspace(ImageFormat::Sparse),
+            image.image(),
+            &mount,
+            ImageCapacity::from_gibibytes(200),
+        )
+        .expect("resize a mounted workspace");
+
+    assert_eq!(outcome.capacity, ImageCapacity::from_gibibytes(200));
+    let argv = runner.argv();
+    let detached_first = argv
+        .iter()
+        .position(|command| command.contains(&"detach".to_owned()))
+        .expect("the mounted volume is detached first");
+    let grew = argv
+        .iter()
+        .position(|command| command.contains(&"-size".to_owned()))
+        .expect("the image is grown");
+    let remounted = argv
+        .iter()
+        .position(|command| command.contains(&"mount".to_owned()))
+        .expect("the workspace is mounted again");
+    assert!(
+        detached_first < grew && grew < remounted,
+        "resize must detach, grow, then remount: {argv:?}"
+    );
+    assert!(
+        argv[remounted].contains(&mount.to_string_lossy().into_owned()),
+        "the workspace returns to its own mount point: {:?}",
+        argv[remounted]
+    );
+    host.detach_mounted(&workspace(ImageFormat::Sparse), false)
+        .expect("the resized attachment is owned by the mount registry");
 }

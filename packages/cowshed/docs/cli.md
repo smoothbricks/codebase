@@ -292,6 +292,25 @@ the "main shares caches like sandboxes do" rule; the only difference is main isn
 
 Suspend and resume a workspace without destroying it. Detached workspaces cost one closed file.
 
+### `cowshed resize <name|main> <size>`
+
+Grow one workspace's image. Sizes are `100g`, `200g`, `1t` — binary units, at least a mebibyte, and a whole number of
+the 4 KiB blocks the image tools resize in.
+
+```
+$ cowshed resize raven 200g
+200g
+cowshed: workspace raven grew from 100g to 200g
+```
+
+Resize only ever grows: a size that does not exceed what the image already holds is refused, with the current capacity
+named, before anything is touched. A mounted workspace is detached, grown, and put back on its mount; a workspace whose
+volume is busy refuses the resize rather than being torn out from under running work.
+
+Capacity itself is chosen once, at `cowshed adopt --capacity <size>` (default `100g`), because that is the only verb
+that mints an image — `new` and `fork` clone main's and inherit its capacity, so `resize` is how a clone gets a bigger
+one.
+
 ### Simulators (iOS) — `cowshed sim export <name> [artifact]`
 
 Copies a built `.app` to the one-way drop dir (`<shared-drop-root>/<owner>/<repo>/`, using the separately validated

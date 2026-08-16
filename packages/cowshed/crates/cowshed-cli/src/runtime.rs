@@ -13,14 +13,15 @@ use cowshed_core::api::{
     Coordinator, CreateOptions, DoctorReport, EmptyResult, EnsureAction, EnsureReport, ExecRequest,
     ExitStatus, ExpectedRefHead, GcOptions, GcReason, GcReport, GitOid, JobInfo, JobStream,
     LandOptions, LandReport, MountResult, OutputPublication, PublicationPolicy, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RevisionResult, RevisionTarget, RunSandboxMode,
-    StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
+    PushReport, RebaseOptions, RemoveOptions, ResizeResult, RevisionResult, RevisionTarget,
+    RunSandboxMode, StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
     validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
+use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
 use cowshed_core::{
     AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result,
     validate_existing_host_storage,
@@ -79,6 +80,7 @@ pub trait CliService: Send {
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<()>;
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
+    async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
     async fn doctor(&mut self) -> Result<DoctorReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport>;
@@ -120,6 +122,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Remove(_)
         | Command::Attach(_)
         | Command::Detach(_)
+        | Command::Resize(_)
         | Command::Gc(_)
         | Command::Push(_)
         | Command::Rebase(_)
@@ -397,6 +400,10 @@ impl CliService for ActorBridge {
         self.coordinator()?.detach(workspace).await.map(|_| ())
     }
 
+    async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult> {
+        self.coordinator()?.resize(workspace, capacity).await
+    }
+
     async fn doctor(&mut self) -> Result<DoctorReport> {
         self.coordinator()?.doctor().await
     }
@@ -614,6 +621,12 @@ where
     match cli.command {
         Command::Adopt(args) => {
             let options = adopt_options(args)?;
+            // The capacity is resolved here rather than left implicit, so the line that reports
+            // the adoption states the size the image was actually minted at.
+            let capacity = options
+                .capacity
+                .clone()
+                .unwrap_or_else(|| DEFAULT_IMAGE_CAPACITY.to_string());
             let info = service.adopt(options).await?;
             // Adoption is the durable state change and it has already happened:
             // the tree is copied and the image is mounted. A gateway that is not
@@ -623,6 +636,9 @@ where
             // gateway, and let `doctor` be the health verdict.
             let gateway = service.reconcile_gateway().await;
             emit_mount(output, json, &info)?;
+            output
+                .guidance(&format!("image capacity {capacity}"))
+                .map_err(output_error)?;
             match gateway {
                 Ok(()) => output.hint("cowshed new <name>").map_err(output_error)?,
                 Err(error) => {
@@ -846,6 +862,27 @@ where
             }
             Ok(success())
         }
+        Command::Resize(args) => {
+            let capacity = os_capacity(args.capacity)?;
+            let result = service.resize(&args.workspace, &capacity).await?;
+            // Resize leaves the workspace mounted exactly as it found it, but the mount it comes
+            // back on is a new attachment, so the gateway's view has to be refreshed.
+            service.reconcile_gateway().await?;
+            if json {
+                output.success(result.clone()).map_err(output_error)?;
+            } else {
+                output
+                    .bare_line(result.capacity.as_bytes())
+                    .map_err(output_error)?;
+            }
+            output
+                .guidance(&format!(
+                    "workspace {} grew from {} to {}",
+                    result.workspace, result.previous_capacity, result.capacity
+                ))
+                .map_err(output_error)?;
+            Ok(success())
+        }
         Command::Gc(args) => {
             let report = service
                 .gc(GcOptions {
@@ -995,10 +1032,24 @@ fn adopt_options(args: AdoptArgs) -> Result<AdoptOptions> {
     Ok(AdoptOptions {
         path: args.path,
         repo_id: args.repo_id.map(os_repo_id).transpose()?,
-        capacity: args.capacity.map(os_utf8).transpose()?,
+        capacity: args.capacity.map(os_capacity).transpose()?,
         quarantine: args.quarantine,
         image_format: None,
     })
+}
+
+/// Validate and normalise a capacity at the CLI boundary, so a malformed size is refused before
+/// any host state is touched and the size the CLI reports is the one the image is sized to.
+fn os_capacity(value: std::ffi::OsString) -> Result<String> {
+    let text = os_utf8(value)?;
+    ImageCapacity::parse(&text)
+        .map(|capacity| capacity.to_string())
+        .map_err(|error| {
+            usage(
+                error.to_string(),
+                "use a capacity such as 100g, 200g, or 1t",
+            )
+        })
 }
 
 fn os_repo_id(value: std::ffi::OsString) -> Result<RepoId> {

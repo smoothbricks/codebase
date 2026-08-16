@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  sccache <action>   manage the host sccache daemon\n  skill install      install the agent skill";
+pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  resize <ws> <size> grow a workspace image\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  sccache <action>   manage the host sccache daemon\n  skill install      install the agent skill";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -32,6 +32,7 @@ pub enum Command {
     Remove(RemoveArgs),
     Attach(AttachArgs),
     Detach(DetachArgs),
+    Resize(ResizeArgs),
     Gc(GcArgs),
     Push(PushArgs),
     Rebase(RebaseArgs),
@@ -193,6 +194,13 @@ pub struct DetachArgs {
     pub workspace: String,
 }
 
+/// `resize <ws|main> <size>` — grow one workspace's image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResizeArgs {
+    pub workspace: String,
+    pub capacity: OsString,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcArgs {
     pub dry_run: bool,
@@ -294,6 +302,7 @@ enum CommandName {
     Remove,
     Attach,
     Detach,
+    Resize,
     Gc,
     Push,
     Rebase,
@@ -328,6 +337,7 @@ where
         Some("rm") => CommandName::Remove,
         Some("attach") => CommandName::Attach,
         Some("detach") => CommandName::Detach,
+        Some("resize") => CommandName::Resize,
         Some("gc") => CommandName::Gc,
         Some("push") => CommandName::Push,
         Some("rebase") => CommandName::Rebase,
@@ -360,6 +370,7 @@ where
         CommandName::Remove => parse_remove(&args, index, &mut global)?,
         CommandName::Attach => parse_attach(&args, index, &mut global)?,
         CommandName::Detach => parse_detach(&args, index, &mut global)?,
+        CommandName::Resize => parse_resize(&args, index, &mut global)?,
         CommandName::Gc => parse_gc(&args, index, &mut global)?,
         CommandName::Push => parse_push(&args, index, &mut global)?,
         CommandName::Rebase => parse_rebase(&args, index, &mut global)?,
@@ -1081,6 +1092,42 @@ fn parse_detach(
     Ok(Command::Detach(DetachArgs {
         workspace: workspace
             .ok_or_else(|| UsageError::new("detach requires a workspace", USAGE))?,
+    }))
+}
+
+fn parse_resize(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &str = "resize <ws> <size>";
+    let mut workspace = None;
+    let mut capacity: Option<OsString> = None;
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            // `main` resizes too, so the name is not reserved here the way it is for verbs that
+            // would create or replace a workspace.
+            _ if workspace.is_none() => {
+                workspace = Some(workspace_name(&args[index], false, USAGE)?);
+            }
+            _ if capacity.is_none() => capacity = Some(args[index].clone()),
+            _ => {
+                return Err(UsageError::new(
+                    "resize accepts exactly one workspace and one size",
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Resize(ResizeArgs {
+        workspace: workspace
+            .ok_or_else(|| UsageError::new("resize requires a workspace", USAGE))?,
+        capacity: capacity.ok_or_else(|| UsageError::new("resize requires a size", USAGE))?,
     }))
 }
 
