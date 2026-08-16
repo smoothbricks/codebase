@@ -3,7 +3,7 @@
 //! Every external operation crosses [`CommandRunner`]. Commands are represented
 //! as an executable plus an argument vector; this module never invokes a shell.
 
-use crate::metadata::ImageFormat;
+use crate::metadata::{ImageCapacity, ImageFormat};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -18,6 +18,17 @@ const FSCK_APFS: &str = "/sbin/fsck_apfs";
 const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
 const SYNC: &str = "/bin/sync";
 const SW_VERS: &str = "/usr/bin/sw_vers";
+
+/// The unit `hdiutil` reports and accepts image extents in.
+const SECTOR_BYTES: u64 = 512;
+
+/// `diskutil apfs resizeContainer <ref> 0` asks for grow-to-fit, and macOS reports "there is
+/// nothing to grow into" as a failure rather than a no-op: -69743 when the computed size equals
+/// the current one, -69519 when no gap follows the physical store. Both say the container
+/// already spans the whole image, which is exactly the requested post-condition, so both are
+/// accepted. Every other failure propagates, and the caller still reads the resulting capacity
+/// back out of the attachment inventory.
+const CONTAINER_ALREADY_SPANS_IMAGE: [&str; 2] = ["Error: -69743:", "Error: -69519:"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest {
@@ -135,8 +146,8 @@ pub enum ImageFormatSelection {
 pub struct CreateImageRequest {
     /// Staged path without an image extension, e.g. `.staging/main`.
     pub staged_stem: PathBuf,
-    /// Sparse capacity accepted by the native tools, e.g. `100g`.
-    pub capacity: String,
+    /// Capacity the image is created at.
+    pub capacity: ImageCapacity,
     pub volume_name: String,
     pub case_sensitivity: ApfsCaseSensitivity,
     pub image_format: ImageFormatSelection,
@@ -372,6 +383,8 @@ pub enum ApfsError {
         detach: Option<Box<ApfsError>>,
         remove: Option<Box<ApfsError>>,
     },
+    InvalidResizeLimits(String),
+    ImageNotAttached(PathBuf),
 }
 
 impl fmt::Display for ApfsError {
@@ -459,6 +472,14 @@ impl fmt::Display for ApfsError {
             Self::AsifCreationAndCleanupFailed { .. } => {
                 f.write_str("ASIF creation failed, and staged-image cleanup also failed")
             }
+            Self::InvalidResizeLimits(message) => {
+                write!(f, "invalid image resize limits: {message}")
+            }
+            Self::ImageNotAttached(image) => write!(
+                f,
+                "{} reports no attachment to read a capacity from",
+                image.display()
+            ),
         }
     }
 }
@@ -527,6 +548,20 @@ pub trait ApfsBackend {
         force: bool,
     ) -> Result<(), ApfsError>;
     fn delete_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError>;
+    /// The capacity a detached image currently holds, read from its own resize limits.
+    fn image_capacity(&self, image: &Path, format: ImageFormat)
+    -> Result<ImageCapacity, ApfsError>;
+    /// Grow a detached image, and the partition and container inside it, to `capacity`.
+    fn resize_image(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+        capacity: ImageCapacity,
+    ) -> Result<(), ApfsError>;
+    /// Grow the APFS container an attachment exposes until it spans the whole image.
+    fn grow_container(&self, attachment: &AttachedImage) -> Result<(), ApfsError>;
+    /// The capacity the kernel reports for an attached image.
+    fn attached_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError>;
 }
 
 pub struct MacOsApfsBackend<R> {
@@ -676,7 +711,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 OsString::from("--format"),
                 OsString::from("ASIF"),
                 OsString::from("--size"),
-                OsString::from(&request.capacity),
+                OsString::from(capacity_argument(request.capacity)),
                 OsString::from("--volumeName"),
                 OsString::from(&request.volume_name),
                 OsString::from("--fs"),
@@ -784,7 +819,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 OsString::from("create"),
                 OsString::from("-quiet"),
                 OsString::from("-size"),
-                OsString::from(&request.capacity),
+                OsString::from(capacity_argument(request.capacity)),
                 OsString::from("-type"),
                 OsString::from("SPARSE"),
                 OsString::from("-fs"),
@@ -933,11 +968,6 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
         }
         if request.staged_stem.file_name().is_none() {
             return Err(ApfsError::InvalidStagedStem(request.staged_stem.clone()));
-        }
-        if request.capacity.trim().is_empty() {
-            return Err(ApfsError::InvalidCreateRequest(
-                "image capacity must not be empty",
-            ));
         }
         if !is_valid_apfs_volume_name(&request.volume_name) {
             return Err(ApfsError::InvalidCreateRequest(
@@ -1176,6 +1206,217 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
             }),
         }
     }
+
+    fn image_capacity(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+    ) -> Result<ImageCapacity, ApfsError> {
+        validate_image_path(image, format)?;
+        match format {
+            ImageFormat::Sparse => {
+                let output = self.run_checked(
+                    "read SPARSE image resize limits",
+                    CommandRequest::new(
+                        HDIUTIL,
+                        [
+                            OsString::from("resize"),
+                            OsString::from("-limits"),
+                            OsString::from("-plist"),
+                            image.as_os_str().to_owned(),
+                        ],
+                    ),
+                )?;
+                parse_sparse_resize_limits(&output.stdout)
+            }
+            ImageFormat::Asif => {
+                let output = self.run_checked(
+                    "read ASIF image resize limits",
+                    CommandRequest::new(
+                        DISKUTIL,
+                        [
+                            OsString::from("image"),
+                            OsString::from("resize"),
+                            OsString::from("--plist"),
+                            image.as_os_str().to_owned(),
+                        ],
+                    ),
+                )?;
+                parse_asif_resize_limits(&output.stdout)
+            }
+        }
+    }
+
+    fn resize_image(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+        capacity: ImageCapacity,
+    ) -> Result<(), ApfsError> {
+        validate_image_path(image, format)?;
+        let request = match format {
+            ImageFormat::Sparse => CommandRequest::new(
+                HDIUTIL,
+                [
+                    OsString::from("resize"),
+                    OsString::from("-size"),
+                    OsString::from(capacity_argument(capacity)),
+                    image.as_os_str().to_owned(),
+                ],
+            ),
+            ImageFormat::Asif => CommandRequest::new(
+                DISKUTIL,
+                [
+                    OsString::from("image"),
+                    OsString::from("resize"),
+                    OsString::from("--size"),
+                    OsString::from(capacity_argument(capacity)),
+                    image.as_os_str().to_owned(),
+                ],
+            ),
+        };
+        self.run_checked("resize image", request).map(|_| ())
+    }
+
+    fn grow_container(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
+        // The container reference is the parent of the APFS volume device, never the image's own
+        // whole device: under SPARSE that device is the GPT scheme holding the physical store,
+        // and `resizeContainer` accepts only a container reference or a physical store.
+        let container = whole_device_from(&attachment.volume_device)
+            .ok_or_else(|| ApfsError::InvalidVolumeDevice(attachment.volume_device.clone()))?;
+        let request = CommandRequest::new(
+            DISKUTIL,
+            [
+                OsString::from("apfs"),
+                OsString::from("resizeContainer"),
+                OsString::from(&container),
+                OsString::from("0"),
+            ],
+        );
+        let output = self.runner.run(&request)?;
+        if output.succeeded() || container_already_spans_image(&output) {
+            Ok(())
+        } else {
+            Err(ApfsError::CommandFailed {
+                operation: "grow APFS container into image",
+                request,
+                output,
+            })
+        }
+    }
+
+    fn attached_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError> {
+        let image = attachment_inventory_path(image)?;
+        let output = self.run_checked(
+            "inventory attached disk images",
+            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
+        )?;
+        parse_attachment_capacity(&image, &output.stdout)
+    }
+}
+
+/// Every size handed to `hdiutil` or `diskutil` is a plain byte count: the two tools read the
+/// same unit letters with different multipliers, and a byte count is the one spelling that means
+/// the same thing to both.
+fn capacity_argument(capacity: ImageCapacity) -> String {
+    capacity.bytes().to_string()
+}
+
+fn container_already_spans_image(output: &CommandOutput) -> bool {
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    CONTAINER_ALREADY_SPANS_IMAGE
+        .iter()
+        .any(|code| message.contains(code))
+}
+
+/// `hdiutil resize -limits -plist` reports the image's own extent as `content-length`, counted in
+/// 512-byte sectors; the nested `subcontent-list` describes the partition inside it and is not
+/// the capacity being asked for.
+fn parse_sparse_resize_limits(bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidResizeLimits(error.to_string()))?;
+    let sectors = value
+        .as_dictionary()
+        .and_then(|root| root.get("content-length"))
+        .and_then(plist::Value::as_unsigned_integer)
+        .ok_or_else(|| {
+            ApfsError::InvalidResizeLimits("missing unsigned content-length".to_owned())
+        })?;
+    sectors
+        .checked_mul(SECTOR_BYTES)
+        .map(ImageCapacity::from_bytes)
+        .ok_or_else(|| {
+            ApfsError::InvalidResizeLimits(format!("content-length {sectors} overflows"))
+        })
+}
+
+/// `diskutil image resize --plist` reports limits in bytes under `current`.
+fn parse_asif_resize_limits(bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidResizeLimits(error.to_string()))?;
+    value
+        .as_dictionary()
+        .and_then(|root| root.get("current"))
+        .and_then(plist::Value::as_unsigned_integer)
+        .map(ImageCapacity::from_bytes)
+        .ok_or_else(|| ApfsError::InvalidResizeLimits("missing unsigned current".to_owned()))
+}
+
+/// The capacity the kernel exposes for an attached image, as `blockcount` blocks of `blocksize`
+/// bytes in the same read-only inventory attachment discovery already parses.
+fn parse_attachment_capacity(image: &Path, bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
+    let expected = image.to_str().ok_or_else(|| {
+        ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
+    })?;
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
+    let images = value
+        .as_dictionary()
+        .and_then(|root| root.get("images"))
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
+    let mut capacity = None;
+    for entry in images {
+        let dictionary = entry.as_dictionary().ok_or_else(|| {
+            ApfsError::InvalidAttachmentInventory("images entry is not a dictionary".into())
+        })?;
+        if dictionary
+            .get("image-path")
+            .and_then(plist::Value::as_string)
+            != Some(expected)
+        {
+            continue;
+        }
+        let extent = |key: &str| {
+            dictionary
+                .get(key)
+                .and_then(plist::Value::as_unsigned_integer)
+                .ok_or_else(|| {
+                    ApfsError::InvalidAttachmentInventory(format!(
+                        "matching image has no unsigned {key}"
+                    ))
+                })
+        };
+        let bytes = extent("blockcount")?
+            .checked_mul(extent("blocksize")?)
+            .ok_or_else(|| {
+                ApfsError::InvalidAttachmentInventory(
+                    "matching image reports an overflowing extent".into(),
+                )
+            })?;
+        let observed = ImageCapacity::from_bytes(bytes);
+        if capacity.is_some_and(|previous| previous != observed) {
+            return Err(ApfsError::InvalidAttachmentInventory(
+                "matching image is attached twice at different capacities".into(),
+            ));
+        }
+        capacity = Some(observed);
+    }
+    capacity.ok_or_else(|| ApfsError::ImageNotAttached(image.to_owned()))
 }
 
 fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsError> {
@@ -1771,6 +2012,10 @@ mod tests {
                 .pop_front()
                 .expect("test supplied an output for each command"))
         }
+    }
+
+    fn capacity(value: &str) -> ImageCapacity {
+        ImageCapacity::parse(value).expect("test capacities are well formed")
     }
 
     fn argv(request: &CommandRequest) -> Vec<String> {
@@ -2504,7 +2749,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -2613,7 +2858,7 @@ mod tests {
             let error = backend
                 .create_staged_image(&CreateImageRequest {
                     staged_stem: stem,
-                    capacity: "5g".into(),
+                    capacity: capacity("5g"),
                     volume_name: "main".into(),
                     case_sensitivity: ApfsCaseSensitivity::Insensitive,
                     image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -2664,7 +2909,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/main"),
-                capacity: "100g".into(),
+                capacity: capacity("100g"),
                 volume_name: "cowshed.owner--repo.main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
@@ -2704,7 +2949,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/auto"),
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
@@ -2744,7 +2989,7 @@ mod tests {
                 "--format",
                 "ASIF",
                 "--size",
-                "5g",
+                "5368709120",
                 "--volumeName",
                 "main",
                 "--fs",
@@ -2778,7 +3023,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/sensitive"),
-                capacity: "8g".into(),
+                capacity: capacity("8g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Sensitive,
                 image_format: ImageFormatSelection::Auto,
@@ -2803,7 +3048,7 @@ mod tests {
                 "create",
                 "-quiet",
                 "-size",
-                "8g",
+                "8589934592",
                 "-type",
                 "SPARSE",
                 "-fs",
@@ -2828,7 +3073,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/exact"),
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -2873,7 +3118,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/exact"),
-                capacity: "8g".into(),
+                capacity: capacity("8g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Sensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
@@ -2898,7 +3143,7 @@ mod tests {
                 "create",
                 "-quiet",
                 "-size",
-                "8g",
+                "8589934592",
                 "-type",
                 "SPARSE",
                 "-fs",
@@ -2921,7 +3166,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/exact"),
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -2953,7 +3198,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/exact"),
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
@@ -2987,7 +3232,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/sensitive-asif"),
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "sensitive".into(),
                 case_sensitivity: ApfsCaseSensitivity::Sensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -3031,7 +3276,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
@@ -3075,7 +3320,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -3110,7 +3355,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -3149,7 +3394,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -3199,7 +3444,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -3246,7 +3491,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "5g".into(),
+                capacity: capacity("5g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -3352,7 +3597,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/main"),
-                capacity: "100g".into(),
+                capacity: capacity("100g"),
                 volume_name: "cowshed.owner--repo.main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
@@ -3402,7 +3647,7 @@ mod tests {
         let error = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: PathBuf::from(".staging/main"),
-                capacity: "100g".into(),
+                capacity: capacity("100g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
@@ -3442,7 +3687,7 @@ mod tests {
         let created = backend
             .create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "1g".into(),
+                capacity: capacity("1g"),
                 volume_name: "main".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Auto,
@@ -3802,7 +4047,7 @@ mod tests {
         let result = (|| -> Result<(), ApfsError> {
             let created = backend.create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "64m".into(),
+                capacity: capacity("64m"),
                 volume_name: "cowshed-apfs-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
@@ -3828,7 +4073,7 @@ mod tests {
         let result = (|| -> Result<(), ApfsError> {
             let created = backend.create_staged_image(&CreateImageRequest {
                 staged_stem: stem,
-                capacity: "64m".into(),
+                capacity: capacity("64m"),
                 volume_name: "cowshed-asif-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
@@ -3980,6 +4225,234 @@ mod tests {
             }) if candidate == "/dev/disk4s1"
                 && devices == ["/dev/disk5s2", "/dev/disk6s2"]
         ));
+    }
+
+    const SPARSE_RESIZE_LIMITS_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>content-hint</key><string>GPT</string>
+      <key>content-length</key><integer>209715200</integer>
+      <key>content-max-length</key><integer>274877906944</integer>
+      <key>content-min-length</key><integer>45136</integer>
+      <key>subcontent-list</key><array><dict>
+        <key>content-length</key><integer>209715120</integer>
+      </dict></array>
+    </dict></plist>"#;
+
+    const ASIF_RESIZE_LIMITS_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>current</key><integer>107374182400</integer>
+      <key>max</key><integer>4503599626321920</integer>
+      <key>min</key><integer>20971520</integer>
+    </dict></plist>"#;
+
+    /// `/dev/disk5` is the container the SPARSE attachment plist's volume `/dev/disk5s1` sits in;
+    /// `blockcount * blocksize` is 200 GiB, the capacity these tests resize to.
+    const RESIZED_INVENTORY: &str = r#"<?xml version="1.0"?><plist><dict><key>images</key><array>
+      <dict>
+        <key>image-path</key><string>{image}</string>
+        <key>blockcount</key><integer>419430400</integer>
+        <key>blocksize</key><integer>512</integer>
+        <key>system-entities</key><array>
+          <dict><key>dev-entry</key><string>/dev/disk4</string></dict>
+        </array>
+      </dict>
+    </array></dict></plist>"#;
+
+    fn resized_inventory(image: &Path) -> String {
+        RESIZED_INVENTORY.replace(
+            "{image}",
+            &attachment_inventory_path(image).unwrap().to_string_lossy(),
+        )
+    }
+
+    #[test]
+    fn sparse_resize_grows_the_image_then_the_container_and_reads_the_new_capacity_back() {
+        let image = Path::new("/tmp/cowshed-resize/main.sparseimage");
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(SPARSE_RESIZE_LIMITS_PLIST),
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
+            CommandOutput::success([]),
+            CommandOutput::success([]),
+            CommandOutput::success(resized_inventory(image)),
+        ]));
+
+        assert!(matches!(
+            backend.attached_capacity(image),
+            Err(ApfsError::ImageNotAttached(reported)) if reported == image
+        ));
+        assert_eq!(
+            backend.image_capacity(image, ImageFormat::Sparse).unwrap(),
+            capacity("100g")
+        );
+        backend
+            .resize_image(image, ImageFormat::Sparse, capacity("200g"))
+            .unwrap();
+        let attachment = backend.attach_verified(image, ImageFormat::Sparse).unwrap();
+        backend.grow_container(&attachment).unwrap();
+        assert_eq!(backend.attached_capacity(image).unwrap(), capacity("200g"));
+
+        let requests = backend.runner().requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.program.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new(HDIUTIL),
+                Path::new(HDIUTIL),
+                Path::new(HDIUTIL),
+                Path::new(HDIUTIL),
+                Path::new(HDIUTIL),
+                Path::new(DISKUTIL),
+                Path::new(FSCK_APFS),
+                Path::new(DISKUTIL),
+                Path::new(HDIUTIL),
+            ]
+        );
+        assert_eq!(
+            argv(&requests[1]),
+            [
+                "resize",
+                "-limits",
+                "-plist",
+                "/tmp/cowshed-resize/main.sparseimage"
+            ]
+        );
+        assert_eq!(
+            argv(&requests[2]),
+            [
+                "resize",
+                "-size",
+                "214748364800",
+                "/tmp/cowshed-resize/main.sparseimage"
+            ]
+        );
+        assert_eq!(
+            argv(&requests[7]),
+            ["apfs", "resizeContainer", "/dev/disk5", "0"]
+        );
+        assert_eq!(argv(&requests[8]), ["info", "-plist"]);
+    }
+
+    #[test]
+    fn asif_resize_uses_the_diskutil_image_verbs_for_both_limits_and_growth() {
+        let image = Path::new("/tmp/cowshed-resize/main.asif");
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(ASIF_RESIZE_LIMITS_PLIST),
+            CommandOutput::success([]),
+        ]));
+
+        assert_eq!(
+            backend.image_capacity(image, ImageFormat::Asif).unwrap(),
+            capacity("100g")
+        );
+        backend
+            .resize_image(image, ImageFormat::Asif, capacity("200g"))
+            .unwrap();
+
+        let requests = backend.runner().requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.program.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new(DISKUTIL), Path::new(DISKUTIL)]
+        );
+        assert_eq!(
+            argv(&requests[0]),
+            [
+                "image",
+                "resize",
+                "--plist",
+                "/tmp/cowshed-resize/main.asif"
+            ]
+        );
+        assert_eq!(
+            argv(&requests[1]),
+            [
+                "image",
+                "resize",
+                "--size",
+                "214748364800",
+                "/tmp/cowshed-resize/main.asif"
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_refuses_an_image_whose_extension_disagrees_with_its_format() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::default());
+        let image = Path::new("/tmp/cowshed-resize/main.asif");
+        assert!(matches!(
+            backend.resize_image(image, ImageFormat::Sparse, capacity("200g")),
+            Err(ApfsError::InvalidImagePath { .. })
+        ));
+        assert!(backend.runner().requests().is_empty());
+    }
+
+    #[test]
+    fn growing_a_container_that_already_spans_the_image_is_not_a_failure() {
+        for refusal in [
+            "Error: -69743: The new size must be different than the existing size",
+            "Error: -69519: The target disk is too small for this operation",
+        ] {
+            let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+                CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+                CommandOutput::success(SPARSE_ATTACH_PLIST),
+                CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
+                CommandOutput::success([]),
+                CommandOutput::failure(1, refusal),
+            ]));
+            let attachment = backend
+                .attach_verified(
+                    Path::new("/tmp/cowshed-resize/main.sparseimage"),
+                    ImageFormat::Sparse,
+                )
+                .unwrap();
+            backend.grow_container(&attachment).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_container_growth_failure_that_is_not_an_already_full_refusal_propagates() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
+            CommandOutput::success([]),
+            CommandOutput::failure(1, "Error: -69620: The given file system is not supported"),
+        ]));
+        let attachment = backend
+            .attach_verified(
+                Path::new("/tmp/cowshed-resize/main.sparseimage"),
+                ImageFormat::Sparse,
+            )
+            .unwrap();
+        assert!(matches!(
+            backend.grow_container(&attachment),
+            Err(ApfsError::CommandFailed {
+                operation: "grow APFS container into image",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn capacities_round_trip_through_the_units_the_cli_accepts() {
+        assert_eq!(capacity("100g").bytes(), 107_374_182_400);
+        assert_eq!(capacity("1t").bytes(), 1_099_511_627_776);
+        assert_eq!(capacity("200G"), capacity("204800m"));
+        assert_eq!(capacity("100g").to_string(), "100g");
+        assert_eq!(capacity("1024g").to_string(), "1t");
+        assert_eq!(ImageCapacity::from_bytes(1_500_000).to_string(), "1500000");
+        for rejected in ["", "g", "100", "100k", "-1g", "1.5g", "100gb"] {
+            assert!(
+                ImageCapacity::parse(rejected).is_err(),
+                "{rejected} must not parse as a capacity"
+            );
+        }
     }
 
     #[test]
