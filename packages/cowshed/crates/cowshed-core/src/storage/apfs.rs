@@ -12,7 +12,9 @@ use crate::apfs::{
     MountAccess,
 };
 pub use crate::metadata::CheckoutLayout;
-use crate::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
+use crate::metadata::{
+    ImageCapacity, ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use crate::repository::RepoId;
 
 use super::lifecycle::{
@@ -20,13 +22,13 @@ use super::lifecycle::{
     DerivedWorkspace, Destination, ExecuteError, ExpectedState, ForkPlan, ImmutablePlan,
     KernelMountFact, LifecycleBackend, LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace,
     MountIntent, MountState, ObservedState, Operation, OperationIdentity, Pin, PlanError,
-    PurePlanner, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision,
-    StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked,
-    revalidate,
+    PurePlanner, ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef,
+    Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
+    execute_checked, revalidate,
 };
 use super::{CheckpointLabel, StorageLayout, StorageLayoutError};
 
-pub const DEFAULT_IMAGE_CAPACITY: &str = "100g";
+pub const DEFAULT_IMAGE_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(100);
 const STAGING_NAMESPACE: &str = ".staging";
 const TRASH_NAMESPACE: &str = ".trash";
 const PRE_RESTORE_PREFIX: &str = "pre-restore-";
@@ -42,7 +44,7 @@ pub struct ApfsSubstrateConfig {
     pub checkout_path: PathBuf,
     pub checkout_layout: CheckoutLayout,
     pub case_sensitivity: ApfsCaseSensitivity,
-    pub capacity: String,
+    pub capacity: ImageCapacity,
 }
 
 impl ApfsSubstrateConfig {
@@ -59,7 +61,7 @@ impl ApfsSubstrateConfig {
             checkout_path: checkout_path.into(),
             checkout_layout,
             case_sensitivity,
-            capacity: DEFAULT_IMAGE_CAPACITY.to_owned(),
+            capacity: DEFAULT_IMAGE_CAPACITY,
         }
     }
 
@@ -89,13 +91,9 @@ impl ApfsSubstrateConfig {
         }
     }
 
-    pub fn with_capacity(mut self, capacity: impl Into<String>) -> Result<Self, ApfsStorageError> {
-        let capacity = capacity.into();
-        if capacity.trim().is_empty() {
-            return Err(ApfsStorageError::InvalidCapacity);
-        }
+    pub fn with_capacity(mut self, capacity: ImageCapacity) -> Self {
         self.capacity = capacity;
-        Ok(self)
+        self
     }
 }
 pub trait IncarnationSource: Send + Sync + 'static {
@@ -396,6 +394,18 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
         force: bool,
     ) -> Result<(), ApfsStorageError>;
+    /// Grow the workspace's image to `capacity` and restore the mount state it was found in.
+    ///
+    /// Refuses before touching the image when `capacity` does not exceed what the image already
+    /// holds: resize only ever grows. A mounted workspace is detached non-forcibly first, so a
+    /// volume with work in flight refuses the resize instead of being torn out from under it.
+    fn resize(
+        &self,
+        workspace: &LifecycleWorkspace,
+        image: &Path,
+        mount_point: &Path,
+        capacity: ImageCapacity,
+    ) -> Result<ResizeOutcome, ApfsStorageError>;
     /// Detach adopted main and atomically restore its exact retained host checkout.
     ///
     /// Implementations derive retry state solely from `source_checkout`, its exact
@@ -563,8 +573,16 @@ pub enum ApfsStorageError {
     PendingPublication(PathBuf),
     #[error("blocking APFS task failed: {0}")]
     BlockingTask(String),
-    #[error("image capacity must not be empty")]
-    InvalidCapacity,
+    #[error("requested capacity {requested} does not exceed the image's current {current}")]
+    CapacityNotGrowing {
+        current: ImageCapacity,
+        requested: ImageCapacity,
+    },
+    #[error("resized image reports {observed}, short of the requested {requested}")]
+    ResizeNotObserved {
+        requested: ImageCapacity,
+        observed: ImageCapacity,
+    },
     #[error("unexpected lifecycle operation result")]
     UnexpectedResult,
     #[error("invalid APFS lifecycle plan: {0}")]
@@ -733,6 +751,7 @@ where
                 let Operation::Adopt {
                     repo,
                     format,
+                    capacity,
                     source_checkout,
                     pre_cowshed_checkout,
                     identity,
@@ -749,6 +768,7 @@ where
                     AdoptExecution {
                         repo,
                         requested_format: *format,
+                        capacity: *capacity,
                         source_checkout,
                         pre_cowshed_checkout,
                         identity,
@@ -1416,6 +1436,26 @@ where
         .await
     }
 
+    async fn resize(
+        &self,
+        workspace: &LifecycleWorkspace,
+        capacity: ImageCapacity,
+    ) -> Result<ResizeOutcome, Self::Error> {
+        let lock_paths = vec![workspace_lock_path(
+            &self.config,
+            workspace.repo(),
+            workspace.name(),
+            workspace.format(),
+        )?];
+        let workspace = workspace.clone();
+        self.dispatch_with_locks(lock_paths, true, move |host, config| {
+            let image = canonical_image_path(&config, &workspace)?;
+            let mount_point = mount_point(&config, &workspace)?;
+            host.resize(&workspace, &image, &mount_point, capacity)
+        })
+        .await
+    }
+
     async fn caches_root(&self) -> Result<PathBuf, Self::Error> {
         Ok(self.config.caches_root.clone())
     }
@@ -1570,6 +1610,7 @@ where
 struct AdoptExecution<'a> {
     repo: &'a RepoId,
     requested_format: ImageFormat,
+    capacity: ImageCapacity,
     source_checkout: &'a Path,
     pre_cowshed_checkout: &'a Path,
     identity: &'a OperationIdentity,
@@ -1758,6 +1799,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     let AdoptExecution {
         repo,
         requested_format,
+        capacity,
         source_checkout,
         pre_cowshed_checkout,
         identity,
@@ -1777,7 +1819,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     let staged_stem = staging_stem(config, repo, &main_name(), &incarnation)?;
     let request = CreateImageRequest {
         staged_stem,
-        capacity: config.capacity.clone(),
+        capacity,
         volume_name: volume_label(repo, &main_name()),
         case_sensitivity: config.case_sensitivity,
         owner_uid: unsafe { libc::getuid() },
@@ -2921,6 +2963,7 @@ mod tests {
                 Operation::Adopt {
                     repo: repo.clone(),
                     format: ImageFormat::Asif,
+                    capacity: DEFAULT_IMAGE_CAPACITY,
                     source_checkout: PathBuf::from("/project"),
                     pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
                     identity: identity(),
@@ -2931,6 +2974,7 @@ mod tests {
                 Operation::Adopt {
                     repo: repo.clone(),
                     format: ImageFormat::Sparse,
+                    capacity: DEFAULT_IMAGE_CAPACITY,
                     source_checkout: PathBuf::from("/project"),
                     pre_cowshed_checkout: PathBuf::from("/project.pre-cowshed"),
                     identity: identity(),

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
-use cowshed_core::metadata::{GrantSet, ImageFormat, PortBlock, WorkspaceName};
+use cowshed_core::metadata::{GrantSet, ImageCapacity, ImageFormat, PortBlock, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
@@ -148,7 +148,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         CheckoutLayout::Symlink,
         ApfsCaseSensitivity::Insensitive,
     )
-    .with_capacity("1g")?;
+    .with_capacity(ImageCapacity::from_gibibytes(1));
     let identity = || -> Result<OperationIdentity, Box<dyn Error>> {
         Ok(OperationIdentity {
             project_root: checkout_path.clone(),
@@ -182,6 +182,7 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
         let adopt = substrate.plan_adopt(AdoptRequest {
             repo: repo.clone(),
             format,
+            capacity: ImageCapacity::from_gibibytes(1),
             topology_revision: Revision::new(0),
             source_checkout: checkout_path.clone(),
             pre_cowshed_checkout: PathBuf::from(format!("{}.pre-cowshed", checkout_path.display())),
