@@ -4632,6 +4632,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     }
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
+        use crate::storage::lifecycle::{StorageGcReason, Substrate};
+
         let mut findings = Vec::new();
         if let Err(error) = self.validate_binding().await {
             findings.push(native_finding(
@@ -4685,6 +4687,49 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "metadata-integrity",
                 crate::api::dto::FindingSeverity::Error,
                 error,
+            )),
+        }
+        // A blocked collection sends the operator here, so this reads gc's own preview rather than a
+        // second scan that could disagree with the command that forwarded to it. A preview that
+        // cannot be taken at all is itself the finding — reporting a healthy host while `gc` refuses
+        // leaves the operator with no next move.
+        match self.substrate.preview_gc(&self.descriptor.repo_id).await {
+            Ok(plan) => {
+                let stranded = plan
+                    .candidates()
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(candidate.reason(), StorageGcReason::RetiredWorkspace)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(first) = stranded.first() {
+                    let bytes = stranded
+                        .iter()
+                        .try_fold(0_u64, |sum, candidate| sum.checked_add(candidate.bytes()))
+                        .ok_or_else(|| {
+                            CowshedError::internal("GC candidate byte accounting overflow")
+                        })?;
+                    findings.push(crate::api::dto::Finding {
+                        code: "retired-trash".into(),
+                        severity: crate::api::dto::FindingSeverity::Warning,
+                        message: format!(
+                            "sessions/.trash holds {} retired workspace {} totalling {bytes} bytes",
+                            stranded.len(),
+                            if stranded.len() == 1 {
+                                "entry"
+                            } else {
+                                "entries"
+                            }
+                        ),
+                        hint: "cowshed gc".into(),
+                        path: Some(first.path().to_owned()),
+                    });
+                }
+            }
+            Err(error) => findings.push(native_finding(
+                "gc-preview",
+                crate::api::dto::FindingSeverity::Error,
+                native_storage_error(error),
             )),
         }
         Ok(DoctorReport {
