@@ -176,11 +176,19 @@ pub struct ExecArgs {
     pub replace_output: bool,
 }
 
+/// `rm <ws>` — retire one workspace.
+///
+/// The two overrides are separate on purpose. `force` overrides *transient* state: a dirty tree, a
+/// half-finished merge, a mount that is still busy. `abandon` is the only flag that authorizes
+/// destroying commits `main` does not contain, and it has no short spelling — a script that carries
+/// `--force` to get past a stuck workspace must not thereby acquire the power to delete work that
+/// has no other home.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoveArgs {
     pub workspace: String,
     pub force: bool,
     pub restore: bool,
+    pub abandon: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -997,10 +1005,13 @@ fn parse_remove(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "rm <ws> [--force] [--restore]";
+    // Usage text is where the destructive flag is documented: a human reads options here
+    // deliberately, whereas a refusal message is what an agent pattern-matches into a retry.
+    const USAGE: &str = "rm <ws> [--force] [--restore] [--abandon]";
     let mut workspace = None;
     let mut force = false;
     let mut restore = false;
+    let mut abandon = false;
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
             continue;
@@ -1008,6 +1019,7 @@ fn parse_remove(
         match args[index].to_str() {
             Some("--force") => force = true,
             Some("--restore") => restore = true,
+            Some("--abandon") => abandon = true,
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
             _ if workspace.is_none() => {
                 workspace = Some(workspace_name(&args[index], false, USAGE)?)
@@ -1023,10 +1035,17 @@ fn parse_remove(
             USAGE,
         ));
     }
+    if abandon && workspace == "main" {
+        return Err(UsageError::new(
+            "--abandon applies to session workspaces, whose commits main can contain",
+            USAGE,
+        ));
+    }
     Ok(Command::Remove(RemoveArgs {
         workspace,
         force,
         restore,
+        abandon,
     }))
 }
 
@@ -1660,6 +1679,46 @@ mod tests {
         };
         assert!(remove.restore);
         assert!(!remove.force);
+    }
+
+    /// `--force` and `--abandon` are separate flags carrying separate authorizations, and the
+    /// destructive one is long-form only so no short spelling can be typed by accident.
+    #[test]
+    fn rm_parses_force_and_abandon_as_independent_authorizations() {
+        let Command::Remove(plain) = parse_args(["rm", "raven"]).unwrap().command else {
+            panic!("expected remove")
+        };
+        assert!(!plain.force && !plain.restore && !plain.abandon);
+
+        let Command::Remove(forced) = parse_args(["rm", "raven", "--force"]).unwrap().command
+        else {
+            panic!("expected remove")
+        };
+        assert!(forced.force && !forced.abandon);
+
+        let Command::Remove(abandoned) = parse_args(["rm", "raven", "--abandon"]).unwrap().command
+        else {
+            panic!("expected remove")
+        };
+        assert!(abandoned.abandon && !abandoned.force);
+
+        let Command::Remove(both) = parse_args(["rm", "raven", "--force", "--abandon"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected remove")
+        };
+        assert!(both.force && both.abandon);
+
+        // No short spelling, and nothing on main to abandon: main *is* the branch.
+        assert!(parse_args(["rm", "raven", "-a"]).is_err());
+        let error = parse_args(["rm", "main", "--abandon"]).expect_err("main has no landed gate");
+        assert!(error.message.contains("--abandon"));
+        // Usage text is where the flags are documented deliberately.
+        assert_eq!(
+            error.hint,
+            "cowshed rm <ws> [--force] [--restore] [--abandon]"
+        );
     }
 
     /// Which verbs may omit `<ws>` is a parser-level fact, and the split is deliberate: acting on

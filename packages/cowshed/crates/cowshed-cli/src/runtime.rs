@@ -1,7 +1,7 @@
 use crate::args::{
     AdoptArgs, Cli, Command, ExecArgs, MoveDestination, StdinSource as CliStdinSource,
 };
-use crate::gateway_service;
+use crate::gateway_service::{self, canonical_home};
 use crate::output::Output;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -13,9 +13,9 @@ use cowshed_core::api::{
     Coordinator, CreateOptions, DoctorReport, EmptyResult, EnsureAction, EnsureReport, ExecRequest,
     ExitStatus, ExpectedRefHead, GcOptions, GcReason, GcReport, GitOid, JobInfo, JobStream,
     LandOptions, LandReport, MountResult, OutputPublication, PublicationPolicy, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, ResizeResult, RevisionResult, RevisionTarget,
-    RunSandboxMode, StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RevisionResult,
+    RevisionTarget, RunSandboxMode, StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath,
+    WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
@@ -77,7 +77,7 @@ pub trait CliService: Send {
         Ok(0)
     }
     async fn path(&mut self, workspace: &str, no_attach: bool) -> Result<WorkspaceInfo>;
-    async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<()>;
+    async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport>;
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
@@ -383,7 +383,7 @@ impl CliService for ActorBridge {
         snapshot.refresh_info().await
     }
 
-    async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<()> {
+    async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport> {
         self.coordinator()?.destroy(workspace, options).await
     }
 
@@ -823,18 +823,44 @@ where
             }
         }
         Command::Remove(args) => {
-            service
+            let report = service
                 .remove(
                     &args.workspace,
                     RemoveOptions {
                         force: args.force,
                         restore: args.restore,
+                        abandon: args.abandon,
                     },
                 )
                 .await?;
             service.reconcile_gateway().await?;
             if json {
-                output.success(EmptyResult {}).map_err(output_error)?;
+                output.success(report.clone()).map_err(output_error)?;
+            }
+            // An authorized abandonment still says out loud what it destroyed and where the only
+            // remaining copy went. The refusal it replaced would have said the same thing; passing
+            // the flag buys the deletion, not silence.
+            if let Some(abandoned) = report.abandoned.as_ref() {
+                output
+                    .guidance(&format!(
+                        "abandoned {} commit{} at {} that {} ({}) did not contain",
+                        abandoned.unlanded_commits,
+                        if abandoned.unlanded_commits == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        abandoned.head,
+                        abandoned.target_branch,
+                        match abandoned.target_head.as_ref() {
+                            Some(head) => format!("at {head}"),
+                            None => "no such branch".to_owned(),
+                        }
+                    ))
+                    .map_err(output_error)?;
+                output
+                    .guidance(&format!("bundled to {}", abandoned.bundle.display()))
+                    .map_err(output_error)?;
             }
             output.hint("cowshed gc").map_err(output_error)?;
             Ok(success())

@@ -68,10 +68,9 @@ cowshed exec "$WS" --project "$PROJECT" -- bun install
 cowshed exec "$WS" --project "$PROJECT" -- bun test
 cowshed exec "$WS" --project "$PROJECT" -- cargo clippy --workspace
 
-# ship & destroy
+# ship & destroy — landing retires the workspace, so this is one step
 cowshed exec "$WS" --project "$PROJECT" -- git commit -am "implement feature"
-cowshed push "$WS" --project "$PROJECT"
-cowshed rm "$WS" --project "$PROJECT"
+cowshed land "$WS" --project "$PROJECT"
 ```
 
 Notes for harness integration:
@@ -80,8 +79,12 @@ Notes for harness integration:
   repository; exit 4 means the name is taken — pick another instead of retrying the same name.
 - The workspace branch is `cowshed/<name>`; `cowshed push` delivers it to the main repo's refs, where a human (or a
   merge queue) takes over. Never push to main's checked-out branch.
-- `cowshed rm` refuses (exit 4) if the branch was never pushed — that's your signal work would be lost. Push first or
-  `--force` deliberately.
+- `cowshed rm` refuses (exit 4) unless `main` already contains the workspace's `HEAD` — the image about to be deleted is
+  where those commits live, so the refusal is your signal that work would be lost. Land it. `--force` overrides only
+  _transient_ state (dirty tree, in-progress merge, busy mount) and deliberately cannot get past this gate; `--abandon`
+  is the sole authorization for destroying unlanded commits, and it bundles them into `sessions/.trash` first.
+- **Never turn a removal conflict into a retry with a flag.** The gate is the whole point: a coordinator script that
+  answers exit 4 by adding `--force` is the failure mode this design exists to prevent.
 - If a task needs a _snapshot to retry from_, `cowshed checkpoint <ws> <label>` before the risky step and
   `cowshed restore <ws> <label>` on failure — both are milliseconds, and far cheaper than re-creating the workspace.
   Checkpoint publication first crosses a supervisor barrier: complete Arrow batches and spill files are sealed, and a
