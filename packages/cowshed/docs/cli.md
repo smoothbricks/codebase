@@ -97,7 +97,7 @@ unmounted workspace with `cowshed ensure --attach`, evaluate the same exports in
 `eval "$(cowshed ensure --envrc)"`, and run the repository's `devenv:allow` command once for that workspace. Cowshed
 never modifies either tool's trust database.
 
-### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse]`
+### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse] [--slot <n>]`
 
 Clones a live image from the repository selected by cwd or `--project`, then mounts it. The source is that repository's
 `main` by default:
@@ -122,6 +122,10 @@ cowshed new raven-alt --from raven --project ~/src/api
 Cross-repository `--from` is forbidden; select another repository with cwd or `--project` instead. `--ref` starts the
 new Git branch at another revision and is mutually exclusive with `--from`. The storage clone remains warm regardless.
 `--browse` makes the volume visible in Finder; the default mount is nobrowse.
+
+`--slot <n>` binds the workspace to a build slot, so it mounts at that slot's stable path instead of one named after it
+— see [`cowshed path --slot`](#cowshed-path---slot-n--build-slots-and-compiler-cache-reuse). A slot already held by
+another workspace is a conflict (exit 4).
 
 ### `cowshed ls [--all]`
 
@@ -153,6 +157,46 @@ With `--json`, the result is grouped explicitly as
 
 Bare mountpoint on stdout. Exit 3 if the workspace doesn't exist. A detached workspace is attached first, so the printed
 path is always live; pass `--no-attach` to skip the healing and get the would-be path with a `cowshed:` note instead.
+
+### `cowshed path --slot <n>` — build slots and compiler-cache reuse
+
+A **build slot** is one stable mount path, occupied by one workspace at a time. `cowshed new <name> --slot 3` binds slot
+3, and that workspace mounts at `~/.cowshed/mnt/<owner>/<repo>/slot@3` instead of `.../<name>`. When it is removed or
+renamed the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
+
+That path identity is the entire feature, because compiler caches key on absolute paths:
+
+- Cargo derives `-C metadata` and `-C extra-filename` from a package id that carries the **absolute manifest
+  directory**, so a local crate compiled at two paths is two different compilations.
+- sccache additionally hashes the compiler's **physical** working directory.
+
+Measured on this hardware with sccache 0.16 over a ten-crate workspace, second checkout of identical sources:
+
+| build path                         | Rust units hit |
+| ---------------------------------- | -------------- |
+| same absolute path (slot)          | **22/22**      |
+| sibling paths                      | 9/22           |
+| sibling paths + `SCCACHE_BASEDIRS` | 9/22           |
+| symlink + `cargo --manifest-path`  | 12/22          |
+
+The 9 that hit without a slot are registry crates, whose package ids carry no path. Note what does _not_ work: a symlink
+is inert, because cargo resolves its working directory with `getcwd` (`cargo metadata` through a symlinked checkout
+reports the physical path), and `SCCACHE_BASEDIRS` cannot help either, because `-C metadata` is a hash sccache never
+sees. Only the mount path itself can be the stable thing.
+
+`cowshed path --slot <n>` prints the tenant's mountpoint without you knowing which workspace holds the slot (exit 4 if
+nobody does); `cowshed path <name>` prints the same path from the other direction. **Builds must run through the slot
+path to benefit** — that is where a slot-bound workspace is mounted, so `cd $(cowshed path --slot 3)` and `cowshed exec`
+both land there, but a build reached through some other route to the same files (a symlink you made, a `--manifest-path`
+into one) is a different compilation.
+
+The trade: a workspace mounted at a slot path gets `RUSTC_WRAPPER=sccache` **and `CARGO_INCREMENTAL=0`**, from
+`ensure --envrc` and from `cowshed exec` alike. Incremental compilation is per-unit local state sccache cannot cache and
+cargo prefers when both are available, so a slot tenant is choosing the shared cross-generation cache over local
+incrementality. Name-mounted workspaces are never opted in: they get the cache endpoints (`SCCACHE_SERVER_UDS`,
+`SCCACHE_DIR`) but nothing that routes rustc through a cache their path cannot share.
+
+`main` cannot take a slot — its mount is fixed by the project's checkout layout.
 
 ### `cowshed rm <name> [--force] [--restore] [--abandon]`
 
@@ -512,7 +556,11 @@ provisioning, restores every authoritative attached workspace session, and drain
 reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
 `launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.
 
-### `cowshed sccache start` / `stop` / `status`
+### `cowshed sccache start [--capacity <size>]` / `stop` / `status`
+
+The gateway daemon starts this agent itself, so a healthy host already has it: `run_daemon` heals every project's mounts
+and then the compile cache. A host without sccache on PATH logs one line and serves normally. The verbs are for repair,
+inspection, and resizing.
 
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.sccache`, then waits until the server answers on
 its unix socket at `~/.cowshed/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ (resolved from the
@@ -523,7 +571,19 @@ Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out th
 operations are idempotent. An sccache upgrade that moves the binary is picked up by rerunning `cowshed sccache start` —
 the plist is byte-compared and rewritten only on drift.
 
-`status` reports launchd and socket health without starting anything:
+Two more variables are in that plist because sccache reads them once, at server start, and no client can supply them:
+
+- `SCCACHE_CACHE_SIZE` — the cap. sccache's own default is 10 GiB, which is smaller than one debug graph of a project
+  cowshed hosts, so the default evicts the entries a second slot tenant came for. The derived default is the summed
+  allocated size of every adopted project's `main` image, floored at **40 GiB** and rounded up to a whole gibibyte;
+  `--capacity 120g` overrides it (same size grammar as `cowshed adopt`/`resize`).
+- `SCCACHE_BASEDIRS` — **plural**. sccache 0.16 has no `SCCACHE_BASEDIR` at all and ignores it silently, which is how a
+  host can look configured while `--show-stats` reports `Base directories (none)`. It is set to the store root. Do not
+  expect it to buy cross-path Rust reuse: measured, it changes nothing there, because cargo's `-C metadata` is a hash
+  sccache never sees. Build slots are what fix that.
+
+`status` reports launchd and socket health without starting anything, and surfaces the daemon's own `--show-stats`
+whenever it answers:
 
 ```json
 {
@@ -531,10 +591,21 @@ the plist is byte-compared and rewritten only on drift.
   "result": {
     "installed": true,
     "running": true,
-    "socket": "/Users/me/.cowshed/sccache.sock"
+    "socket": "/Users/me/.cowshed/sccache.sock",
+    "stats": {
+      "maxCacheSize": 42949672960,
+      "baseDirectories": ["/Users/me/.cowshed"],
+      "compileRequests": 1204,
+      "requestsExecuted": 1204,
+      "hits": { "C/C++": 39, "Rust": 22 },
+      "misses": { "Rust": 0 }
+    }
   }
 }
 ```
+
+Hits and misses are per language on purpose: cross-workspace C and C++ reuse works without any slot, so a healthy
+aggregate hit rate routinely hides a Rust hit rate of zero — which is the number a slot host is managing.
 
 Workspaces reach the daemon through `SCCACHE_SERVER_UDS` (supervisor-injected, `ensure --envrc`-exported, and carried by
 the cargo `[env]` guidance); the Seatbelt profile admits exactly that socket and keeps the sccache store

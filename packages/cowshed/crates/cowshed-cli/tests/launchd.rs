@@ -10,6 +10,7 @@ use cowshed_cli::launchd::{
     LaunchdServiceStatus, Mutation, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_LABEL,
     ServiceLifecycle, plan_install, plan_remove,
 };
+use cowshed_core::metadata::ImageCapacity;
 
 const HOME: &str = "/Users/cowshed-test";
 const EXECUTABLE: &str = "/nix/store/abc-cowshed/bin/cowshed";
@@ -91,6 +92,10 @@ fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
 /// The sccache agent is the one with an empty argv tail: server mode is
 /// selected entirely through the environment, and the plist carries the full
 /// foreground-server variable set with the shared cowshed paths.
+///
+/// The cap and the base directory are part of that set because sccache reads both once, at server
+/// start: no client can supply them. `SCCACHE_BASEDIRS` is asserted by its plural name — sccache
+/// 0.16 has no singular `SCCACHE_BASEDIR` and ignores it silently, so the name is the contract.
 #[test]
 fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     let spec = LaunchAgentSpec::sccache(
@@ -98,6 +103,8 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         Path::new("/nix/store/abc-sccache/bin/sccache"),
         Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
         Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+        ImageCapacity::from_gibibytes(40),
+        Path::new("/Users/cowshed-test/.cowshed"),
     )
     .unwrap();
 
@@ -125,6 +132,11 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
             (
                 "SCCACHE_DIR".to_owned(),
                 "/Users/cowshed-test/.cowshed/caches/sccache".to_owned()
+            ),
+            ("SCCACHE_CACHE_SIZE".to_owned(), "40g".to_owned()),
+            (
+                "SCCACHE_BASEDIRS".to_owned(),
+                "/Users/cowshed-test/.cowshed".to_owned()
             ),
         ]
     );
@@ -161,6 +173,10 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         "    <string>/Users/cowshed-test/.cowshed/sccache.sock</string>\n",
         "    <key>SCCACHE_DIR</key>\n",
         "    <string>/Users/cowshed-test/.cowshed/caches/sccache</string>\n",
+        "    <key>SCCACHE_CACHE_SIZE</key>\n",
+        "    <string>40g</string>\n",
+        "    <key>SCCACHE_BASEDIRS</key>\n",
+        "    <string>/Users/cowshed-test/.cowshed</string>\n",
         "  </dict>\n",
         "</dict>\n",
         "</plist>\n",
@@ -188,6 +204,8 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
             Path::new("/nix/store/abc-sccache/bin/sccache"),
             Path::new("relative.sock"),
             Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+            ImageCapacity::from_gibibytes(40),
+            Path::new("/Users/cowshed-test/.cowshed"),
         ),
         Err(LaunchdError::InvalidPath { .. })
     ));

@@ -633,6 +633,7 @@ async fn run_daemon() -> Result<()> {
     // serve. The gateway is RunAtLoad, so this pass is what closes the reboot window in which a
     // checkout path would otherwise dangle until something touched it.
     heal_recorded_projects(&storage).await;
+    heal_sccache_daemon().await;
     let inventory = NativeSessionInventory::new(storage);
     let executable = fs::canonicalize(std::env::current_exe().map_err(|error| {
         CowshedError::internal(format!(
@@ -677,6 +678,25 @@ async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
         Err(error) => {
             eprintln!("cowshed: could not enumerate projects to heal at startup: {error}");
         }
+    }
+}
+
+/// Bring the compile cache up with the gateway, reporting rather than raising.
+///
+/// The daemon is part of the host's serving posture, not an opt-in: a workspace shell exports
+/// `SCCACHE_SERVER_UDS` unconditionally and a client that finds nothing there either compiles
+/// uncached or tries to bind the socket itself, which the store-wide sandbox deny refuses. Starting
+/// it here is also what re-establishes it after a reboot, since the sccache agent is only ever
+/// installed by a cowshed that could resolve the sccache binary on PATH.
+///
+/// A host without sccache installed is not a broken host, so failure is a log line: the gateway's
+/// job is to serve, and every workspace works without a compile cache.
+async fn heal_sccache_daemon() {
+    if let Err(error) = crate::sccache_service::start_service(None).await {
+        eprintln!(
+            "cowshed: could not start the sccache daemon at startup: {}",
+            error.message
+        );
     }
 }
 

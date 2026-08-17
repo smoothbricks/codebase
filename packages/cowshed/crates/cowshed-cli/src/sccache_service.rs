@@ -18,9 +18,11 @@ use crate::launchd::{
     NativeFilesystem, NativeLaunchctlCommand, plan_install, plan_remove,
 };
 use crate::output::Output;
-use cowshed_core::api::{EmptyResult, SccacheStatus};
-use cowshed_core::sandbox::sccache_server_socket;
-use cowshed_core::{CowshedError, Result, validate_existing_host_storage};
+use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
+use cowshed_core::metadata::ImageCapacity;
+use cowshed_core::sandbox::{sccache_cache_directory, sccache_server_socket};
+use cowshed_core::storage::bootstrap::ValidatedHostStorage;
+use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,13 @@ use std::time::Duration;
 
 const START_DEADLINE: Duration = Duration::from_secs(10);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// No host gets a smaller cache than this, whatever the store currently holds.
+///
+/// One debug graph of a workspace-shaped Rust project measures around 18 GB on this hardware, and
+/// the point of the cache is to hold several generations of one, so sccache's 10 GiB default
+/// evicts a single project's entries faster than a second tenant can reuse them.
+const MINIMUM_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(40);
 
 pub async fn dispatch<W, E>(
     action: SccacheCommand,
@@ -39,8 +48,29 @@ where
     E: Write + Send,
 {
     match action {
-        SccacheCommand::Start => {
-            let status = start_service().await?;
+        SccacheCommand::Start { capacity } => {
+            let capacity = capacity
+                .as_deref()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .ok_or_else(|| {
+                            CowshedError::usage(
+                                "--capacity must be valid UTF-8",
+                                "use a capacity such as 40g, 120g, or 1t",
+                            )
+                        })
+                        .and_then(|text| {
+                            ImageCapacity::parse(text).map_err(|error| {
+                                CowshedError::usage(
+                                    error.to_string(),
+                                    "use a capacity such as 40g, 120g, or 1t",
+                                )
+                            })
+                        })
+                })
+                .transpose()?;
+            let status = start_service(capacity).await?;
             emit_sccache_status(output, json, status)?;
         }
         SccacheCommand::Stop => {
@@ -61,20 +91,36 @@ where
     Ok(0)
 }
 
-async fn start_service() -> Result<SccacheStatus> {
+/// Install (or repair) the agent and wait for its socket.
+///
+/// The cap is the caller's when given and derived from the store otherwise, and it is written into
+/// the plist: sccache reads `SCCACHE_CACHE_SIZE` once, at server start, so the number has to be in
+/// launchd's environment rather than any client's.
+pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheStatus> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
-    let cache_directory = storage.caches().join("sccache");
+    let cache_directory = sccache_cache_directory(&home);
     fs::create_dir_all(&cache_directory).map_err(|error| {
         CowshedError::internal(format!(
             "could not create {}: {error}",
             cache_directory.display()
         ))
     })?;
+    let capacity = match capacity {
+        Some(capacity) => capacity,
+        None => derived_capacity(&storage).await?,
+    };
     let socket = sccache_server_socket(&home);
     let executable = resolve_sccache_executable()?;
-    let spec = LaunchAgentSpec::sccache(&home, &executable, &socket, &cache_directory)
-        .map_err(launchd_error)?;
+    let spec = LaunchAgentSpec::sccache(
+        &home,
+        &executable,
+        &socket,
+        &cache_directory,
+        capacity,
+        storage.store(),
+    )
+    .map_err(launchd_error)?;
     if let Some(parent) = spec.standard_error_path().parent() {
         fs::create_dir_all(parent).map_err(|error| {
             CowshedError::internal(format!("could not create {}: {error}", parent.display()))
@@ -102,6 +148,7 @@ async fn start_service() -> Result<SccacheStatus> {
             return Ok(SccacheStatus {
                 installed: true,
                 running: true,
+                stats: read_stats(&socket).await,
                 socket,
             });
         }
@@ -113,6 +160,50 @@ async fn start_service() -> Result<SccacheStatus> {
         }
         tokio::time::sleep(START_POLL_INTERVAL).await;
     }
+}
+
+/// The cache cap for a host that did not name one.
+///
+/// Derived from the size the store already carries: the sum of every adopted project's main image
+/// as it is *allocated* on disk, floored at [`MINIMUM_CAPACITY`] and rounded up to a whole
+/// gibibyte. That sum is the closest cheap proxy for "how much compiled output this host produces"
+/// — a main image holds a checkout and, on a host that builds in it, that checkout's object graph —
+/// and the cache has to hold the compressed artifacts of several generations of it.
+///
+/// Allocated rather than logical bytes: these images are sparse and provisioned far beyond their
+/// contents (100 GiB by default), so `len()` would derive a cap from the provisioning, not the data.
+async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<ImageCapacity> {
+    use cowshed_core::metadata::ImageFormat;
+    use cowshed_core::storage::StorageLayout;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let projects = NativeGatewayInventory::new(storage.clone())
+        .adopted_projects()
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("could not enumerate adopted projects: {error}"))
+        })?;
+    let mut bytes = 0_u64;
+    for project in projects {
+        let layout = StorageLayout::new(storage.store(), &project.repo_id).map_err(|error| {
+            CowshedError::internal(format!(
+                "could not resolve the layout of {}: {error}",
+                project.repo_id
+            ))
+        })?;
+        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
+            let Ok(image) = layout.main_image(format) else {
+                continue;
+            };
+            if let Ok(metadata) = fs::metadata(image.image()) {
+                bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+    }
+    let gibibytes = bytes.div_ceil(ImageCapacity::GIBIBYTE);
+    Ok(ImageCapacity::from_gibibytes(
+        gibibytes.max(MINIMUM_CAPACITY.bytes() / ImageCapacity::GIBIBYTE),
+    ))
 }
 
 fn stop_service() -> Result<()> {
@@ -157,10 +248,65 @@ async fn service_status() -> Result<SccacheStatus> {
         LaunchdServiceStatus::NotLoaded { .. } => false,
     };
     let running = socket_answers(&socket).await;
+    let stats = if running {
+        read_stats(&socket).await
+    } else {
+        None
+    };
     Ok(SccacheStatus {
         installed,
         running,
+        stats,
         socket,
+    })
+}
+
+/// The daemon's own `--show-stats`, as the only authority on what it is doing.
+///
+/// Reported per language, because the operational question a slot host asks is never "how many
+/// hits" but "are the *Rust* units hitting" — cross-workspace C/C++ reuse works without slots and
+/// would otherwise mask a Rust hit rate of zero. `base_directories` rides along for the same
+/// reason: it is the only way to see whether the server actually took `SCCACHE_BASEDIRS`.
+///
+/// A stats read that fails is absence, not an error: the verb's job is to report health, and a
+/// daemon that answers its socket but not a stats request is still installed and running.
+async fn read_stats(socket: &Path) -> Option<SccacheStats> {
+    #[derive(serde::Deserialize)]
+    struct Counted {
+        counts: std::collections::BTreeMap<String, u64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Counters {
+        compile_requests: u64,
+        requests_executed: u64,
+        cache_hits: Counted,
+        cache_misses: Counted,
+    }
+    #[derive(serde::Deserialize)]
+    struct Report {
+        max_cache_size: Option<u64>,
+        #[serde(default)]
+        basedirs: Vec<PathBuf>,
+        stats: Counters,
+    }
+
+    let output = tokio::process::Command::new(resolve_sccache_executable().ok()?)
+        .args(["--show-stats", "--stats-format", "json"])
+        .env("SCCACHE_SERVER_UDS", socket)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let report: Report = serde_json::from_slice(&output.stdout).ok()?;
+    Some(SccacheStats {
+        max_cache_size: report.max_cache_size.unwrap_or_default(),
+        base_directories: report.basedirs,
+        compile_requests: report.stats.compile_requests,
+        requests_executed: report.stats.requests_executed,
+        hits: report.stats.cache_hits.counts,
+        misses: report.stats.cache_misses.counts,
     })
 }
 
@@ -172,7 +318,7 @@ async fn service_status() -> Result<SccacheStatus> {
 /// plist, and `start` always resolves the real sccache executable.
 fn control_spec(home: &Path) -> Result<LaunchAgentSpec> {
     let socket = sccache_server_socket(home);
-    let cache_directory = home.join(".cowshed/caches/sccache");
+    let cache_directory = sccache_cache_directory(home);
     let executable = resolve_sccache_executable().or_else(|_| {
         fs::canonicalize(std::env::current_exe().map_err(|error| {
             CowshedError::internal(format!(
@@ -183,7 +329,15 @@ fn control_spec(home: &Path) -> Result<LaunchAgentSpec> {
             CowshedError::internal(format!("could not resolve the cowshed executable: {error}"))
         })
     })?;
-    LaunchAgentSpec::sccache(home, &executable, &socket, &cache_directory).map_err(launchd_error)
+    LaunchAgentSpec::sccache(
+        home,
+        &executable,
+        &socket,
+        &cache_directory,
+        MINIMUM_CAPACITY,
+        &home.join(".cowshed"),
+    )
+    .map_err(launchd_error)
 }
 
 fn resolve_sccache_executable() -> Result<PathBuf> {

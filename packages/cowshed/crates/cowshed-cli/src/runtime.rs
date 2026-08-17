@@ -1,7 +1,7 @@
 use crate::args::{
     AdoptArgs, Cli, Command, ExecArgs, MoveDestination, StdinSource as CliStdinSource,
 };
-use crate::gateway_service::{self, canonical_home};
+use crate::gateway_service;
 use crate::output::Output;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -18,7 +18,7 @@ use cowshed_core::api::{
     WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_core::metadata::{ImageCapacity, WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::metadata::{ImageCapacity, SlotId, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
@@ -786,7 +786,10 @@ where
             Ok(success())
         }
         Command::Path(args) => {
-            let workspace = resolve_workspace(service, args.workspace, "path").await?;
+            let workspace = match args.slot {
+                Some(slot) => slot_tenant(service, slot).await?,
+                None => resolve_workspace(service, args.workspace, "path").await?,
+            };
             let info = service.path(&workspace, args.no_attach).await?;
             if !args.no_attach {
                 service.reconcile_gateway().await?;
@@ -1177,6 +1180,31 @@ fn invocation_cwd() -> Result<PathBuf> {
     })
 }
 
+/// Which workspace currently occupies a build slot.
+///
+/// Resolved from the mount path rather than a separate index: a slot's mountpoint leaf *is* the
+/// slot, so the listing the CLI already has is authoritative and there is no second record to keep
+/// in step.
+async fn slot_tenant(service: &mut dyn CliService, slot: u32) -> Result<String> {
+    let wanted = SlotId::new(slot).map_err(|error| {
+        usage(
+            error.to_string(),
+            "choose a slot within the project's range",
+        )
+    })?;
+    let workspaces = service.list().await?;
+    workspaces
+        .into_iter()
+        .find(|info| SlotId::from_mount_path(&info.mount) == Some(wanted))
+        .map(|info| info.workspace.to_string())
+        .ok_or_else(|| {
+            CowshedError::not_found(
+                format!("no workspace occupies slot {slot}"),
+                format!("give the slot a tenant: cowshed new <name> --slot {slot}"),
+            )
+        })
+}
+
 fn os_utf8(value: std::ffi::OsString) -> Result<String> {
     value.into_string().map_err(|_| {
         usage(
@@ -1345,6 +1373,21 @@ async fn emit_envrc<W: Write, E: Write>(
         b"SCCACHE_SERVER_UDS",
         report.sccache_server_uds.as_os_str().as_bytes(),
     )?;
+    emit_shell_export(
+        output,
+        b"SCCACHE_DIR",
+        report.sccache_dir.as_os_str().as_bytes(),
+    )?;
+    // Routing Rust through sccache is a slot-path privilege, not a default. Cargo's `-C metadata`
+    // and sccache's own key both carry the absolute build path, so only a workspace mounted at a
+    // slot's stable path can hit another generation's entries; a name-mounted workspace would pay
+    // the wrapper's cost for a cache it can never share. The same trade forces incremental off:
+    // incremental compilation is per-unit local state sccache cannot cache, and cargo silently
+    // wins the race, so a slot tenant chooses the shared cache over local incrementality.
+    if SlotId::from_mount_path(&report.mount).is_some() {
+        emit_shell_export(output, b"RUSTC_WRAPPER", b"sccache")?;
+        emit_shell_export(output, b"CARGO_INCREMENTAL", b"0")?;
+    }
     emit_shell_export(output, b"COWSHED_WORKSPACE_TOKEN", &token)?;
     if let Some(port_block) = report.port_block {
         emit_shell_export(

@@ -503,6 +503,10 @@ pub struct EnsureReport {
     /// every workspace on the host; carried per report so envrc emission needs
     /// no ambient environment.
     pub sccache_server_uds: PathBuf,
+    /// Host-level sccache cache directory (`SCCACHE_DIR`), carried for the same reason as the
+    /// socket: a client that finds no daemon spawns its own server, and that server must land in
+    /// the shared cache rather than sccache's user default.
+    pub sccache_dir: PathBuf,
     pub workspace_token: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_block: Option<PortBlock>,
@@ -2238,6 +2242,9 @@ pub struct SccacheStatus {
     pub installed: bool,
     pub running: bool,
     pub socket: PathBuf,
+    /// The daemon's own counters, absent unless it answered a stats request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SccacheStats>,
 }
 
 /// What the running sccache daemon reports about itself.
