@@ -21,12 +21,20 @@ connector; it is not the host control listener. Data-plane identity depends on t
   policy, token, CA key, registry credential, or upstream-network authority. There is no veth, route, DNAT, host
   listener, or sibling-reachable loopback; socket inode plus netns, not port 7644, identifies the workspace.
 
-Every request also sends exactly `Proxy-Authorization: Bearer <opaque-token>`. The endpoint selects the workspace; the
-32-byte unpadded-base64url token is defense in depth. It is never accepted in a URL, cookie, alternate header, or query
-parameter, is compared in constant time, and is stripped before upstream forwarding. Restore rotates the token and CA,
-drains and kills the old Linux connector cgroup, closes all old gateway connections, recreates the Linux socket/netns
-connector, and atomically rewrites client wiring; a preserved macOS port therefore does not preserve authority. Detach
-drains and removes the connector/socket before releasing the netns; attach creates exactly one before admitting execs.
+Every request also carries the workspace's 32-byte unpadded-base64url token in `Proxy-Authorization`, in one of two
+accepted spellings: `Bearer <token>` for anything that can set a header, and `Basic <base64(cowshed:<token>)>` for the
+standard clients that cannot. The second is why the exported proxy variables carry the token as userinfo
+(`http://cowshed:<token>@127.0.0.1:<base>`): curl, libcurl — so cargo — reqwest, and Go all turn proxy userinfo into a
+`Basic` credential on the first `CONNECT`, and none of them can be told to send `Bearer`. The username is a fixed label
+and is not compared. Both spellings reach the same constant-time comparison, and the token is stripped before upstream
+forwarding either way; it is still never accepted in a request URL, cookie, alternate header, or query parameter.
+
+The endpoint selects the workspace; the token is defense in depth. A missing or wrong credential is `407` with
+`Proxy-Authenticate: Basic realm="cowshed"` — one terminal round trip, so a client either answers with the credential it
+holds or aborts instead of retrying a tunnel that will never open. Restore rotates the token and CA, drains and kills
+the old Linux connector cgroup, closes all old gateway connections, recreates the Linux socket/netns connector, and
+atomically rewrites client wiring; a preserved macOS port therefore does not preserve authority. Detach drains and
+removes the connector/socket before releasing the netns; attach creates exactly one before admitting execs.
 
 Five jobs:
 
@@ -104,19 +112,22 @@ followed. Credential rotation is observed on next use; nothing inside a workspac
 Wiring is written at adopt/new/fork and revalidated by `ensure`. `portBlock` is optional and macOS-only. The exact
 registry URLs are:
 
-| Client                | macOS                                         | Linux                                 |
-| --------------------- | --------------------------------------------- | ------------------------------------- |
-| Bun/npm               | `http://127.0.0.1:<block-base>/npm`           | `http://127.0.0.1:7644/npm`           |
-| Cargo sparse source   | `sparse+http://127.0.0.1:<block-base>/cargo/` | `sparse+http://127.0.0.1:7644/cargo/` |
-| Go `GOPROXY`          | `http://127.0.0.1:<block-base>/go`            | `http://127.0.0.1:7644/go`            |
-| Generic HTTP(S) proxy | `http://127.0.0.1:<block-base>`               | `http://127.0.0.1:7644`               |
+| Client                | macOS                                           | Linux                                   |
+| --------------------- | ----------------------------------------------- | --------------------------------------- |
+| Bun/npm               | `http://127.0.0.1:<block-base>/npm`             | `http://127.0.0.1:7644/npm`             |
+| Cargo sparse source   | `sparse+http://127.0.0.1:<block-base>/cargo/`   | `sparse+http://127.0.0.1:7644/cargo/`   |
+| Go `GOPROXY`          | `http://127.0.0.1:<block-base>/go`              | `http://127.0.0.1:7644/go`              |
+| Generic HTTP(S) proxy | `http://cowshed:<token>@127.0.0.1:<block-base>` | `http://cowshed:<token>@127.0.0.1:7644` |
 
 `HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase forms use the generic base. Linux clients do **not** speak HTTP over
 the Unix socket: only the connector opens `/run/cowshed/gateway.sock`. No direct fallback is configured.
 
-All requests load the token from mode-0600 configuration and send it only in `Proxy-Authorization`; no token is exported
-in a URL or proxy variable. The compatibility listener provides reachability, not identity or authority: endpoint/socket
-selection plus the token still authenticate, and gateway policy still authorizes.
+Per-protocol clients load the token from mode-0600 configuration and send it only in `Proxy-Authorization`. The generic
+proxy variables are the exception, and they must be: a generic proxy client has no cowshed configuration file and no way
+to add a header, so the token rides as userinfo and the client turns it into `Proxy-Authorization: Basic` itself. That
+exports no authority into the sandbox that `COWSHED_WORKSPACE_TOKEN` does not already give it, and the token still
+authenticates against nothing but that workspace's own endpoint. The compatibility listener provides reachability, not
+identity or authority: endpoint/socket selection plus the token still authenticate, and gateway policy still authorizes.
 
 The workspace's public CA certificate is installed as a server trust anchor for supported tool families. Its private key
 never enters a mount. macOS-native TLS clients that ignore configured anchors must fail or use an explicitly granted

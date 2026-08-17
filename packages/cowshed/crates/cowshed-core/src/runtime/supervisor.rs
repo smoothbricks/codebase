@@ -1269,6 +1269,82 @@ fn valid_workspace_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// The `HTTP_PROXY` value for a workspace's own gateway endpoint.
+///
+/// The token rides as basic-auth userinfo because that is the only channel a standard client has:
+/// curl, libcurl (so cargo), reqwest, and Go all turn proxy userinfo into `Proxy-Authorization:
+/// Basic` on the first CONNECT, and none of them can be told to send cowshed's `Bearer` spelling.
+/// Without it every CONNECT is rejected, and cargo reads the rejection as a spurious network error
+/// and retries its whole ladder before failing.
+///
+/// This exports no authority the sandbox lacks: it also receives `COWSHED_WORKSPACE_TOKEN`, and
+/// the token authenticates against nothing but this workspace's own loopback port. The username is
+/// a fixed label the gateway does not compare. The token's alphabet is unpadded base64url, which
+/// is userinfo-safe, so the value never needs percent-encoding.
+fn gateway_proxy_url(port_base: &str, workspace_token: &str) -> String {
+    format!("http://cowshed:{workspace_token}@127.0.0.1:{port_base}")
+}
+
+/// Point the private HOME's `$CARGO_HOME` registry at the host's download cache.
+///
+/// `$CARGO_HOME` follows `HOME`, so exporting a private HOME hands cargo an empty registry and
+/// every workspace refetches crates the host already has — over the gateway, one CONNECT at a
+/// time. Linking is what makes the profile's read grant reachable: Seatbelt matches resolved
+/// paths, so these links carry the host registry's authority, which is read-only.
+///
+/// `src` — where cargo unpacks an archive — is a real directory inside the mount, so a crate the
+/// host downloaded but never built still unpacks, per workspace, and copy-on-write hands a warm
+/// one to every clone. A host with no registry yet yields no links and an ordinary empty
+/// `$CARGO_HOME`; an existing real directory is left alone, because it is a workspace's own
+/// registry state and losing it is worse than not sharing.
+async fn link_cargo_registry(private_home: &Path, host_home: &Path) -> Result<()> {
+    let host_registry = crate::sandbox::host_cargo_registry(host_home);
+    let registry = private_home.join(".cargo/registry");
+    let unpacked = registry.join("src");
+    tokio::fs::create_dir_all(&unpacked)
+        .await
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot prepare sandbox cargo registry {}: {error}",
+                    unpacked.display()
+                ),
+                "reattach the workspace and retry",
+            )
+        })?;
+    for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
+        let target = host_registry.join(directory);
+        if !target.is_dir() {
+            continue;
+        }
+        let link = registry.join(directory);
+        match tokio::fs::read_link(&link).await {
+            Ok(existing) if existing == target => continue,
+            Ok(_) => tokio::fs::remove_file(&link).await.map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot replace stale sandbox cargo link {}: {error}",
+                        link.display()
+                    ),
+                    "reattach the workspace and retry",
+                )
+            })?,
+            Err(_) if link.exists() => continue,
+            Err(_) => {}
+        }
+        tokio::fs::symlink(&target, &link).await.map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot link sandbox cargo cache {}: {error}",
+                    link.display()
+                ),
+                "reattach the workspace and retry",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemSpawnSink;
 
@@ -1343,9 +1419,10 @@ impl SpawnSink for SystemSpawnSink {
                 "reattach the workspace to mint fresh credentials",
             ));
         }
+        link_cargo_registry(&private_home, &request.sandbox.home).await?;
         let path = sandbox_path(&request.sandbox, request.devenv_dir.as_deref())?;
         let port_base = request.sandbox.port_block.base().to_string();
-        let gateway_http = format!("http://127.0.0.1:{port_base}");
+        let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
 
         let mut command = tokio::process::Command::new(&plan.program);
         command
@@ -4067,6 +4144,107 @@ mod lifecycle_commitment_tests {
 
         drop(publisher);
         tokio::task::yield_now().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sandbox_environment_tests {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("cowshed-{label}-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn proxy_url_carries_the_token_as_basic_auth_userinfo() {
+        let token = "0123456789abcdefghijklmnopqrstuvwxyz-_ABCDE";
+        assert!(valid_workspace_token(token));
+        assert_eq!(
+            gateway_proxy_url("40960", token),
+            format!("http://cowshed:{token}@127.0.0.1:40960")
+        );
+    }
+
+    #[tokio::test]
+    async fn cargo_registry_links_the_host_download_cache_and_keeps_unpacking_local() {
+        let root = scratch("cargo-registry");
+        let host_home = root.join("host");
+        let private_home = root.join("mount/.cowshed/home");
+        let host_registry = crate::sandbox::host_cargo_registry(&host_home);
+        for directory in ["index", "cache", "src"] {
+            std::fs::create_dir_all(host_registry.join(directory)).unwrap();
+        }
+
+        link_cargo_registry(&private_home, &host_home)
+            .await
+            .unwrap();
+
+        let registry = private_home.join(".cargo/registry");
+        for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
+            assert_eq!(
+                std::fs::read_link(registry.join(directory)).unwrap(),
+                host_registry.join(directory)
+            );
+        }
+        // Unpacking must stay writable inside the mount, so `src` is a real directory and never a
+        // link onto the read-only host tree.
+        let unpacked = registry.join("src");
+        assert!(unpacked.is_dir());
+        assert!(std::fs::read_link(&unpacked).is_err());
+        std::fs::write(unpacked.join("witness"), b"unpacked").unwrap();
+
+        // Idempotent across execs, and a stale link from an earlier host layout is replaced.
+        let stale = registry.join("index");
+        std::fs::remove_file(&stale).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &stale).unwrap();
+        link_cargo_registry(&private_home, &host_home)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_link(&stale).unwrap(),
+            host_registry.join("index")
+        );
+        assert_eq!(
+            std::fs::read(unpacked.join("witness")).unwrap(),
+            b"unpacked"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cargo_registry_yields_an_ordinary_home_without_a_host_cache() {
+        let root = scratch("cargo-registry-absent");
+        let host_home = root.join("host");
+        let private_home = root.join("mount/.cowshed/home");
+        std::fs::create_dir_all(&host_home).unwrap();
+
+        link_cargo_registry(&private_home, &host_home)
+            .await
+            .unwrap();
+
+        let registry = private_home.join(".cargo/registry");
+        assert!(registry.join("src").is_dir());
+        for directory in crate::sandbox::SHARED_CARGO_REGISTRY_DIRECTORIES {
+            assert!(!registry.join(directory).exists());
+        }
+
+        // A workspace that built its own registry before the host had one keeps it: losing a real
+        // directory of registry state is worse than not sharing the host's.
+        let owned = registry.join("index");
+        std::fs::create_dir_all(owned.join("index.crates.io-0000000000000000")).unwrap();
+        std::fs::create_dir_all(crate::sandbox::host_cargo_registry(&host_home).join("index"))
+            .unwrap();
+        link_cargo_registry(&private_home, &host_home)
+            .await
+            .unwrap();
+        assert!(std::fs::read_link(&owned).is_err());
+        assert!(owned.join("index.crates.io-0000000000000000").is_dir());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }
