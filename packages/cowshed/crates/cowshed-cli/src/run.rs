@@ -12,7 +12,7 @@ use std::io;
 use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
-use crate::{args, gateway_service, output, runtime, sccache_service, skill};
+use crate::{args, gateway_service, help, output, runtime, sccache_service, skill};
 
 /// Run one CLI invocation. `arguments` excludes argv[0].
 ///
@@ -64,6 +64,21 @@ async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
     let stdout = io::stdout();
     let stderr = io::stderr();
     let mut output = output::Output::new(stdout, stderr, parsed.global.quiet);
+    // Help is an answer, not a diagnostic: it goes to stdout, exits 0, and is never suppressed by
+    // --quiet, because it is the output the caller asked for.
+    if let args::Command::Help(topic) = &parsed.command {
+        let page = match topic {
+            Some(spec) => spec.page(),
+            None => help::overview(),
+        };
+        return match output.bare(page.as_bytes()) {
+            Ok(()) => 0,
+            Err(write_error) => {
+                eprintln!("cowshed: failed to write command result: {write_error}");
+                1
+            }
+        };
+    }
     if let args::Command::Skill(skill_args) = &parsed.command {
         return match skill::dispatch(skill_args, &parsed.global, &mut output) {
             Ok(exit_code) => exit_code,

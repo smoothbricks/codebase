@@ -30,6 +30,10 @@ Every command follows one I/O discipline, and reading it correctly is most of th
 Use `--json` whenever a result is consumed programmatically, and `--quiet` to drop guidance while keeping hints and
 errors.
 
+`cowshed --help` lists every command and `cowshed <command> --help` prints its full grammar with one line per flag —
+both on stdout, exit 0. Ask the binary before guessing a flag: the usage line is generated from the parser's own option
+table, so it is never behind the CLI. A mistyped verb is corrected rather than merely refused.
+
 ## One-time: adopt the repository
 
 `adopt` converts a checkout into the repository's warm `main` image. It provisions the `cowshed.store` and
