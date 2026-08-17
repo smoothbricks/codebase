@@ -151,6 +151,7 @@ impl CliService for FakeService {
             action: EnsureAction::AlreadyMounted,
             go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
             sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
+            sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
             workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
             port_block: None,
         }))
@@ -454,6 +455,26 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
     let (_, stdout, _) = run(&mut service, ["path", "raven"]).await;
     assert_eq!(stdout, b"/mnt/raven\n");
 
+    // `path --slot` answers from the mount paths the listing already carries: a slot's mountpoint
+    // leaf *is* the slot, so there is no second record to consult or keep in step.
+    service.listed_workspaces = Some(vec![
+        workspace("main", WorkspaceState::Attached),
+        WorkspaceInfo {
+            mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/slot@2"),
+            ..workspace("raven", WorkspaceState::Attached)
+        },
+    ]);
+    let (_, stdout, _) = run(&mut service, ["path", "--slot", "2"]).await;
+    assert_eq!(stdout, b"/mnt/raven\n");
+    let cli = parse_args(["path", "--slot", "5"]).unwrap();
+    let mut sink = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut service, cli, tokio::io::empty(), &mut sink)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound);
+    assert_eq!(error.message, "no workspace occupies slot 5");
+    assert!(sink.into_inner().0.is_empty());
+
     let (code, stdout, stderr) = run(&mut service, ["exec", "raven", "--", "true"]).await;
     assert_eq!(code, 0);
     assert_eq!(stdout, b"out\xff");
@@ -475,6 +496,11 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
             "new:raven:true",
             "ls",
             "path:raven:false",
+            // `--slot` resolves through the listing, then paths the tenant it found.
+            "ls",
+            "path:raven:false",
+            // A slot with no tenant stops at the listing.
+            "ls",
             "exec:raven",
             "rm:raven:true:false:false",
             "attach:raven:true",
@@ -699,13 +725,16 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
         action: EnsureAction::AlreadyMounted,
         go_env: PathBuf::from("/mnt/raven/nested dir/it's/go env"),
         sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/scc'ache.sock"),
+        sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
         workspace_token: token_path.clone(),
         port_block: Some(PortBlock::new(40960, 16).unwrap()),
     });
     let (_, stdout, stderr) = run(&mut service, ["ensure", "--envrc"]).await;
+    // A name-mounted workspace gets the cache endpoints and nothing that routes rustc through
+    // them: `RUSTC_WRAPPER` here would buy a cache this path can never share.
     assert_eq!(
         stdout,
-        b"export GOENV='/mnt/raven/nested dir/it'\\''s/go env'\nexport SCCACHE_SERVER_UDS='/Users/tester/.cowshed/scc'\\''ache.sock'\nexport COWSHED_WORKSPACE_TOKEN='tok'\\''en'\nexport COWSHED_PORT_BASE='40960'\n"
+        b"export GOENV='/mnt/raven/nested dir/it'\\''s/go env'\nexport SCCACHE_SERVER_UDS='/Users/tester/.cowshed/scc'\\''ache.sock'\nexport SCCACHE_DIR='/Users/tester/.cowshed/caches/sccache'\nexport COWSHED_WORKSPACE_TOKEN='tok'\\''en'\nexport COWSHED_PORT_BASE='40960'\n"
     );
     assert!(stderr.is_empty());
     assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
@@ -901,6 +930,7 @@ async fn ensure_uses_nested_invocation_cwd_and_reports_detached_healing() {
                 action: EnsureAction::Attached,
                 go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
                 sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
+                sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
                 workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
                 port_block: None,
             }),
@@ -909,7 +939,7 @@ async fn ensure_uses_nested_invocation_cwd_and_reports_detached_healing() {
         let (_, stdout, stderr) = run(&mut service, ["ensure", "--json"]).await;
         assert_eq!(
             stdout,
-            b"{\"ok\":true,\"result\":{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"action\":\"attached\",\"goEnv\":\"/mnt/raven/.cowshed/cache/go/env\",\"sccacheServerUds\":\"/Users/tester/.cowshed/sccache.sock\",\"workspaceToken\":\"/mnt/raven/.cowshed/token\"}}\n"
+            b"{\"ok\":true,\"result\":{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"action\":\"attached\",\"goEnv\":\"/mnt/raven/.cowshed/cache/go/env\",\"sccacheServerUds\":\"/Users/tester/.cowshed/sccache.sock\",\"sccacheDir\":\"/Users/tester/.cowshed/caches/sccache\",\"workspaceToken\":\"/mnt/raven/.cowshed/token\"}}\n"
         );
         assert_eq!(stderr, b"cowshed: workspace raven is ready (attached)\n");
         assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
@@ -960,6 +990,7 @@ async fn ensure_resolution_and_token_errors_emit_no_partial_machine_output() {
             action: EnsureAction::AlreadyMounted,
             go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
             sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
+            sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
             workspace_token: PathBuf::from("/definitely/missing/cowshed/token"),
             port_block: None,
         }),

@@ -93,7 +93,9 @@ async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
         };
     }
     if let args::Command::Sccache(action) = &parsed.command {
-        return match sccache_service::dispatch(*action, parsed.global.json, &mut output).await {
+        return match sccache_service::dispatch(action.clone(), parsed.global.json, &mut output)
+            .await
+        {
             Ok(exit_code) => exit_code,
             Err(error) => {
                 let exit_code = i32::from(error.exit_code());

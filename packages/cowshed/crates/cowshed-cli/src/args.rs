@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            remove a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  resize <ws> <size> grow a workspace image\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  sccache <action>   manage the host sccache daemon\n  skill install      install the agent skill";
+pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            retire a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  resize <ws> <size> grow a workspace image\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  sccache <action>   manage the host sccache daemon\n  skill install      install the agent skill";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -64,9 +64,12 @@ pub enum GatewayCommand {
     Run,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// `start` takes the cache cap because the cap is the one thing a host operator has to be able to
+/// override: the derived default is sized from what the store already holds, and a host that
+/// builds more graphs than it stores needs a bigger number.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SccacheCommand {
-    Start,
+    Start { capacity: Option<OsString> },
     Stop,
     Status,
 }
@@ -148,9 +151,13 @@ pub struct ListArgs {
     pub all: bool,
 }
 
+/// `cowshed path` resolves either a workspace by name or a build slot by number. A slot is a
+/// stable mount path shared by successive tenants, so `--slot` answers "what absolute path do I
+/// build slot n through" without the caller knowing which workspace currently holds it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathArgs {
     pub workspace: Option<String>,
+    pub slot: Option<u32>,
     pub no_attach: bool,
 }
 
@@ -433,9 +440,9 @@ fn parse_sccache(
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    let usage = "sccache <start|stop|status>";
-    let action = match args.get(index).and_then(|argument| argument.to_str()) {
-        Some("start") => SccacheCommand::Start,
+    let usage = "sccache <start [--capacity <size>] | stop | status>";
+    let mut action = match args.get(index).and_then(|argument| argument.to_str()) {
+        Some("start") => SccacheCommand::Start { capacity: None },
         Some("stop") => SccacheCommand::Stop,
         Some("status") => SccacheCommand::Status,
         Some(other) => {
@@ -447,13 +454,23 @@ fn parse_sccache(
         None => return Err(UsageError::new("sccache action is required", usage)),
     };
     index += 1;
-    while index < args.len() && parse_global(args, &mut index, global)? {}
-    if index != args.len() {
-        let argument = args[index].to_string_lossy();
-        return Err(UsageError::new(
-            format!("unexpected sccache argument `{argument}`"),
-            usage,
-        ));
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match (args[index].to_str(), &mut action) {
+            (Some("--capacity"), SccacheCommand::Start { capacity }) => {
+                *capacity = Some(take_value(args, &mut index, "--capacity", usage)?);
+            }
+            _ => {
+                let argument = args[index].to_string_lossy();
+                return Err(UsageError::new(
+                    format!("unexpected sccache argument `{argument}`"),
+                    usage,
+                ));
+            }
+        }
+        index += 1;
     }
     if global.project.is_some() {
         return Err(UsageError::new(
@@ -618,16 +635,7 @@ fn parse_new(
             Some("--browse") => browse = true,
             Some("--register") => register = true,
             Some("--git-worktree") => git_worktree = true,
-            Some("--slot") => {
-                let value = take_value(args, &mut index, "--slot", USAGE)?;
-                let text = value
-                    .to_str()
-                    .ok_or_else(|| UsageError::new("--slot must be an unsigned integer", USAGE))?;
-                slot =
-                    Some(text.parse().map_err(|_| {
-                        UsageError::new("--slot must be an unsigned integer", USAGE)
-                    })?);
-            }
+            Some("--slot") => slot = Some(parse_slot(args, &mut index, USAGE)?),
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
             _ if name.is_none() => name = Some(workspace_name(&args[index], true, USAGE)?),
             _ => {
@@ -865,13 +873,27 @@ fn parse_list(
     Ok(Command::List(parsed))
 }
 
+/// `--slot <n>` in every verb that takes one.
+fn parse_slot(
+    args: &[OsString],
+    index: &mut usize,
+    usage: &'static str,
+) -> Result<u32, UsageError> {
+    let value = take_value(args, index, "--slot", usage)?;
+    value
+        .to_str()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| UsageError::new("--slot must be an unsigned integer", usage))
+}
+
 fn parse_path(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "path <ws> [--no-attach]";
+    const USAGE: &str = "path [<ws> | --slot <n>] [--no-attach]";
     let mut workspace = None;
+    let mut slot = None;
     let mut no_attach = false;
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
@@ -879,6 +901,7 @@ fn parse_path(
         }
         match args[index].to_str() {
             Some("--no-attach") => no_attach = true,
+            Some("--slot") => slot = Some(parse_slot(args, &mut index, USAGE)?),
             Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
             _ if workspace.is_none() => {
                 workspace = Some(workspace_name(&args[index], false, USAGE)?)
@@ -887,8 +910,15 @@ fn parse_path(
         }
         index += 1;
     }
+    if workspace.is_some() && slot.is_some() {
+        return Err(UsageError::new(
+            "path takes a workspace or --slot, not both",
+            USAGE,
+        ));
+    }
     Ok(Command::Path(PathArgs {
         workspace,
+        slot,
         no_attach,
     }))
 }
@@ -1635,6 +1665,59 @@ mod tests {
             panic!("expected new")
         };
         assert!(!args.git_worktree);
+    }
+
+    #[test]
+    fn slots_parse_on_new_and_path_and_refuse_a_workspace_alongside() {
+        let cli = parse_args(["new", "raven", "--slot", "3"]).unwrap();
+        let Command::New(args) = cli.command else {
+            panic!("expected new")
+        };
+        assert_eq!(args.slot, Some(3));
+
+        let cli = parse_args(["path", "--slot", "3"]).unwrap();
+        let Command::Path(args) = cli.command else {
+            panic!("expected path")
+        };
+        assert_eq!(args.slot, Some(3));
+        assert_eq!(args.workspace, None);
+
+        let cli = parse_args(["path", "raven"]).unwrap();
+        let Command::Path(args) = cli.command else {
+            panic!("expected path")
+        };
+        assert_eq!(args.slot, None);
+        assert_eq!(args.workspace.as_deref(), Some("raven"));
+
+        // A slot and a name are two different questions; answering both at once would let the
+        // caller believe it asked the one it did not.
+        assert!(parse_args(["path", "raven", "--slot", "3"]).is_err());
+        assert!(parse_args(["path", "--slot", "three"]).is_err());
+        assert!(parse_args(["path", "--slot"]).is_err());
+    }
+
+    #[test]
+    fn sccache_start_takes_a_capacity_and_the_other_verbs_do_not() {
+        let cli = parse_args(["sccache", "start", "--capacity", "80g"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Sccache(SccacheCommand::Start {
+                capacity: Some(OsString::from("80g"))
+            })
+        );
+
+        let cli = parse_args(["sccache", "start"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Sccache(SccacheCommand::Start { capacity: None })
+        );
+
+        let cli = parse_args(["sccache", "status", "--json"]).unwrap();
+        assert_eq!(cli.command, Command::Sccache(SccacheCommand::Status));
+        assert!(cli.global.json);
+
+        assert!(parse_args(["sccache", "stop", "--capacity", "80g"]).is_err());
+        assert!(parse_args(["sccache", "start", "--capacity"]).is_err());
     }
 
     #[test]
