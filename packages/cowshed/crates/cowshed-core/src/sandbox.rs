@@ -81,6 +81,16 @@ pub fn sccache_server_socket(home: &Path) -> PathBuf {
     home.join(".cowshed/sccache.sock")
 }
 
+/// The host-owned sccache cache directory beneath the cowshed store root.
+///
+/// One cache for every workspace on the host: cross-generation reuse is the entire point, and a
+/// per-workspace cache would have nothing to reuse. The daemon owns it, but clients export it too
+/// — a client that finds no daemon spawns its own server, and that fallback must land in this cache
+/// rather than sccache's user-default directory.
+pub fn sccache_cache_directory(home: &Path) -> PathBuf {
+    home.join(".cowshed/caches/sccache")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,

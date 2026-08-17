@@ -53,6 +53,16 @@ pub enum MetadataError {
     },
     InvalidPath(PathBuf),
     TemporaryFileExhausted(PathBuf),
+    SlotOutOfRange(u32),
+    SlotAlreadyBound {
+        slot: u32,
+        workspace: String,
+    },
+    WorkspaceAlreadySlotted {
+        workspace: String,
+        slot: u32,
+    },
+    MainIsNotSlottable,
 }
 
 impl fmt::Display for MetadataError {
@@ -119,6 +129,18 @@ impl fmt::Display for MetadataError {
                     path.display()
                 )
             }
+            Self::SlotOutOfRange(slot) => {
+                write!(f, "slot {slot} is outside 0..={}", SlotId::MAX)
+            }
+            Self::SlotAlreadyBound { slot, workspace } => {
+                write!(f, "slot {slot} is already bound to workspace {workspace:?}")
+            }
+            Self::WorkspaceAlreadySlotted { workspace, slot } => {
+                write!(f, "workspace {workspace:?} is already bound to slot {slot}")
+            }
+            Self::MainIsNotSlottable => f.write_str(
+                "main cannot take a build slot: its mount is fixed by the project's checkout layout",
+            ),
         }
     }
 }
@@ -457,6 +479,174 @@ impl CheckoutLayoutRecord {
             });
         }
         Ok(())
+    }
+}
+
+/// A per-project build slot: one stable mount path, occupied by one workspace at a time.
+///
+/// Compiler caches key on absolute paths. Cargo derives `-C metadata` and `-C extra-filename`
+/// from a package id that carries the absolute manifest directory, and sccache additionally
+/// hashes the compiler's physical working directory, so two checkouts of one repository at
+/// different paths share nothing. Measured with sccache 0.16 over a ten-crate workspace: 22/22
+/// Rust units hit when the second generation builds through the same absolute path, 9/22 across
+/// path-varying siblings (the 9 are registry crates, whose package ids carry no path). Neither
+/// `SCCACHE_BASEDIRS` nor a symlink moves that number — sccache and cargo both resolve the
+/// physical directory — so the mount path itself has to be the stable thing, which is what a
+/// slot is: successive tenants of slot n mount at `mnt/<owner>/<repo>/slot@n`.
+///
+/// Slot numbering is shared with `coordinator.assignSlot`'s port blocks, hence the same upper
+/// bound: a slot has to be expressible as a `PORT_BLOCK_SIZE`-aligned base inside the 16-bit
+/// port space.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SlotId(u32);
+
+impl SlotId {
+    pub const MAX: u32 = (u16::MAX / PORT_BLOCK_SIZE) as u32;
+
+    /// The mount directory leaf for this slot. `@` is outside the `WorkspaceName` grammar, so a
+    /// slot mountpoint can never collide with a name-derived sibling under the same mount root.
+    const MOUNT_PREFIX: &'static str = "slot@";
+
+    pub fn new(value: u32) -> Result<Self, MetadataError> {
+        if value > Self::MAX {
+            return Err(MetadataError::SlotOutOfRange(value));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub fn mount_name(self) -> String {
+        format!("{}{}", Self::MOUNT_PREFIX, self.0)
+    }
+
+    /// The slot a path is the mountpoint of, if any. This is how "entered through a slot path" is
+    /// decided everywhere: the path is the identity, so no caller needs to carry a flag.
+    pub fn from_mount_path(path: &Path) -> Option<Self> {
+        let digits = path
+            .file_name()?
+            .to_str()?
+            .strip_prefix(Self::MOUNT_PREFIX)?;
+        Self::new(digits.parse().ok()?).ok()
+    }
+}
+
+impl fmt::Display for SlotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SlotBinding {
+    pub slot: SlotId,
+    pub workspace: WorkspaceName,
+}
+
+/// The project-level record of which workspace occupies which slot.
+///
+/// A list rather than a map: the durable form is order-stable, the validation that no slot and no
+/// workspace appears twice is explicit, and JSON map keys stay out of it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SlotBindingsRecord {
+    pub version: u32,
+    pub bindings: Vec<SlotBinding>,
+}
+
+impl SlotBindingsRecord {
+    pub fn new(bindings: &SlotBindings) -> Self {
+        Self {
+            version: METADATA_VERSION,
+            bindings: bindings.entries.clone(),
+        }
+    }
+
+    pub fn into_bindings(self) -> Result<SlotBindings, MetadataError> {
+        if self.version != METADATA_VERSION {
+            return Err(MetadataError::UnsupportedVersion {
+                kind: "slot bindings record",
+                version: self.version,
+            });
+        }
+        let mut bindings = SlotBindings::default();
+        for entry in self.bindings {
+            bindings.bind(entry.slot, entry.workspace)?;
+        }
+        Ok(bindings)
+    }
+}
+
+/// Every slot occupancy for one project, kept sorted by slot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SlotBindings {
+    entries: Vec<SlotBinding>,
+}
+
+impl SlotBindings {
+    pub fn slot_of(&self, workspace: &WorkspaceName) -> Option<SlotId> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.workspace == workspace)
+            .map(|entry| entry.slot)
+    }
+
+    pub fn tenant(&self, slot: SlotId) -> Option<&WorkspaceName> {
+        self.entries
+            .iter()
+            .find(|entry| entry.slot == slot)
+            .map(|entry| &entry.workspace)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SlotBinding> {
+        self.entries.iter()
+    }
+
+    /// Occupy a slot. Both directions are exclusive: a slot holds one workspace, and a workspace
+    /// mounts at one path. Re-binding the pair it already holds is accepted so create and repair
+    /// are idempotent.
+    pub fn bind(&mut self, slot: SlotId, workspace: WorkspaceName) -> Result<(), MetadataError> {
+        if workspace.is_main() {
+            return Err(MetadataError::MainIsNotSlottable);
+        }
+        if let Some(occupant) = self.tenant(slot) {
+            if occupant == &workspace {
+                return Ok(());
+            }
+            return Err(MetadataError::SlotAlreadyBound {
+                slot: slot.get(),
+                workspace: occupant.to_string(),
+            });
+        }
+        if let Some(existing) = self.slot_of(&workspace) {
+            return Err(MetadataError::WorkspaceAlreadySlotted {
+                workspace: workspace.to_string(),
+                slot: existing.get(),
+            });
+        }
+        let entry = SlotBinding { slot, workspace };
+        let at = self
+            .entries
+            .partition_point(|existing| existing.slot < entry.slot);
+        self.entries.insert(at, entry);
+        Ok(())
+    }
+
+    /// Vacate whatever slot this workspace held, reporting it.
+    pub fn release(&mut self, workspace: &WorkspaceName) -> Option<SlotId> {
+        let at = self
+            .entries
+            .iter()
+            .position(|entry| &entry.workspace == workspace)?;
+        Some(self.entries.remove(at).slot)
     }
 }
 

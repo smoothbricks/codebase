@@ -1892,6 +1892,50 @@ impl NativeProjectRuntimeHost {
             .map_err(native_integrity_error)
     }
 
+    /// Give `workspace` the stable mount path of `slot`.
+    ///
+    /// Recorded before the workspace's first mount, because the record is what every mount path
+    /// derivation reads: binding a workspace that is already mounted would leave the live volume at
+    /// one path and the whole controller looking at another.
+    async fn bind_slot(
+        &self,
+        workspace: &WorkspaceName,
+        slot: crate::metadata::SlotId,
+    ) -> Result<()> {
+        let layout = self.layout.clone();
+        let workspace = workspace.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let mut bindings = layout.slot_bindings()?;
+            bindings.bind(slot, workspace)?;
+            layout.record_slot_bindings(&bindings)?;
+            Ok::<_, crate::storage::StorageLayoutError>(())
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("slot binding task failed: {error}")))?
+        .map_err(slot_binding_error)
+    }
+
+    /// Vacate whatever slot `workspace` held, reporting it. Idempotent: an unbound workspace is
+    /// already in the desired state.
+    async fn release_slot(
+        &self,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<crate::metadata::SlotId>> {
+        let layout = self.layout.clone();
+        let workspace = workspace.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let mut bindings = layout.slot_bindings()?;
+            let released = bindings.release(&workspace);
+            if released.is_some() {
+                layout.record_slot_bindings(&bindings)?;
+            }
+            Ok::<_, crate::storage::StorageLayoutError>(released)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("slot release task failed: {error}")))?
+        .map_err(native_integrity_error)
+    }
+
     /// Where this project's durable record of the checkout path lives.
     ///
     /// The marker is read through main's mount, so this is only usable while main is mounted; the
@@ -2279,6 +2323,7 @@ impl NativeProjectRuntimeHost {
             workspace: workspace.derived.workspace.name().clone(),
             go_env: mount.join(".cowshed/cache/go/env"),
             sccache_server_uds: crate::sandbox::sccache_server_socket(&self.home),
+            sccache_dir: crate::sandbox::sccache_cache_directory(&self.home),
             workspace_token: mount.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH),
             port_block: workspace.metadata.grants.port_block,
             mount,
@@ -3027,6 +3072,12 @@ impl NativeProjectRuntimeHost {
             })
             .await
             .map_err(native_retire_error)?;
+        // The volume is detached, so the slot is free for its next tenant. Released before
+        // reclamation rather than after: reclamation only ever removes an empty mountpoint the
+        // *name* derives, and a slot mountpoint is meant to outlive its tenants — the next
+        // workspace to take the slot mounts at exactly the same absolute path, which is the whole
+        // point of a slot.
+        self.release_slot(current.derived.workspace.name()).await?;
         let substrate = self.substrate.clone();
         std::mem::drop(tokio::spawn(async move {
             // Retirement removed the canonical image from discovery. Reclamation is deliberately
@@ -3270,65 +3321,93 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 format!("cowshed new {workspace} --git-worktree"),
             ));
         }
-        let reservation = self.fresh_grants().await?;
-        let identity = self
-            .operation_identity(
-                reservation.grants.clone(),
-                Some(format!("cowshed/{workspace}")),
-                None,
-                git_worktree,
-            )
-            .await?;
-        let plan = self
-            .substrate
-            .plan_create(
-                &source.derived.workspace,
-                crate::storage::lifecycle::Destination {
-                    repo: self.descriptor.repo_id.clone(),
-                    name: workspace.clone(),
-                    topology_revision: source.derived.workspace.topology_revision(),
-                    identity,
-                },
-            )
-            .map_err(native_integrity_error)?;
-        // Main's canonical mount, never `descriptor.git_root`: under the symlink layout the
-        // recorded checkout is a symlink outside this workspace's read grants that dangles as soon
-        // as the checkout moves, and only the canonical mount is maintained by `cowshed mv`.
-        let main_mount = self.workspace_mount_path(&main_name())?;
-        let start = options.revision.as_ref().map(revision_target);
-        let destination = workspace.clone();
-        let receipt = self
-            .substrate
-            .execute_create_staged(plan, move |stage| async move {
-                let repository = crate::git::GitRepository::from_root(&stage.mount_point);
-                if git_worktree {
-                    repository
-                        .adopt_as_linked_worktree(
-                            &destination.to_string(),
-                            &main_mount,
-                            start.as_deref(),
-                        )
-                        .await
-                } else {
-                    repository
-                        .prepare_workspace(&destination.to_string(), &main_mount, start.as_deref())
-                        .await
-                        .map(|_| ())
-                }
-            })
-            .await
-            .map_err(native_staged_error)?;
-        if options.register {
-            self.register_workspace_in_main(&workspace).await?;
+        // The slot is recorded before anything derives a mount path, because the record is what
+        // decides where this workspace mounts. A failure after this point has to give the slot
+        // back: a binding without a workspace would keep the next tenant out for good.
+        let slot = options
+            .slot
+            .map(crate::metadata::SlotId::new)
+            .transpose()
+            .map_err(|error| {
+                CowshedError::usage(
+                    error.to_string(),
+                    "choose a slot within the project's range",
+                )
+            })?;
+        if let Some(slot) = slot {
+            self.bind_slot(&workspace, slot).await?;
         }
-        self.commitments
-            .ensure_workspace_introduced(
-                self.descriptor.repo_id.clone(),
-                receipt.workspace.incarnation().clone(),
-            )
-            .await?;
-        self.ensure_supervisor(&workspace).await?;
-        self.snapshot_named(&workspace).await
+        let created = async {
+            let reservation = self.fresh_grants().await?;
+            let identity = self
+                .operation_identity(
+                    reservation.grants.clone(),
+                    Some(format!("cowshed/{workspace}")),
+                    None,
+                    git_worktree,
+                )
+                .await?;
+            let plan = self
+                .substrate
+                .plan_create(
+                    &source.derived.workspace,
+                    crate::storage::lifecycle::Destination {
+                        repo: self.descriptor.repo_id.clone(),
+                        name: workspace.clone(),
+                        topology_revision: source.derived.workspace.topology_revision(),
+                        identity,
+                    },
+                )
+                .map_err(native_integrity_error)?;
+            // Main's canonical mount, never `descriptor.git_root`: under the symlink layout the
+            // recorded checkout is a symlink outside this workspace's read grants that dangles as
+            // soon as the checkout moves, and only the canonical mount is maintained by
+            // `cowshed mv`.
+            let main_mount = self.workspace_mount_path(&main_name())?;
+            let start = options.revision.as_ref().map(revision_target);
+            let destination = workspace.clone();
+            let receipt = self
+                .substrate
+                .execute_create_staged(plan, move |stage| async move {
+                    let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                    if git_worktree {
+                        repository
+                            .adopt_as_linked_worktree(
+                                &destination.to_string(),
+                                &main_mount,
+                                start.as_deref(),
+                            )
+                            .await
+                    } else {
+                        repository
+                            .prepare_workspace(
+                                &destination.to_string(),
+                                &main_mount,
+                                start.as_deref(),
+                            )
+                            .await
+                            .map(|_| ())
+                    }
+                })
+                .await
+                .map_err(native_staged_error)?;
+            if options.register {
+                self.register_workspace_in_main(&workspace).await?;
+            }
+            self.commitments
+                .ensure_workspace_introduced(
+                    self.descriptor.repo_id.clone(),
+                    receipt.workspace.incarnation().clone(),
+                )
+                .await?;
+            self.ensure_supervisor(&workspace).await?;
+            self.snapshot_named(&workspace).await
+        }
+        .await;
+        if created.is_err() && slot.is_some() {
+            let _ = self.release_slot(&workspace).await;
+        }
+        created
     }
 
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot> {
@@ -6126,6 +6205,7 @@ fn removal_in_progress_refusal(workspace: &WorkspaceName, operation: &str) -> Co
         "finish or abort the Git operation, then retry",
     )
 }
+
 #[cfg(target_os = "macos")]
 fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
     CowshedError::conflict(
@@ -6133,6 +6213,7 @@ fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
         format!("commit the work and land it: cowshed land {workspace}"),
     )
 }
+
 /// The gate the incident turned on: these commits exist nowhere but the image about to be deleted.
 #[cfg(target_os = "macos")]
 fn removal_unlanded_refusal(
@@ -6154,6 +6235,25 @@ fn removal_unlanded_refusal(
         format!("land the workspace: cowshed land {workspace}"),
     )
 }
+
+/// A refused slot binding is the caller's problem, not the store's: the slot is taken, or the
+/// workspace already has one. Only genuine record damage becomes an integrity error.
+#[cfg(target_os = "macos")]
+fn slot_binding_error(error: crate::storage::StorageLayoutError) -> CowshedError {
+    use crate::metadata::MetadataError;
+    use crate::storage::StorageLayoutError;
+
+    match &error {
+        StorageLayoutError::Metadata(
+            MetadataError::SlotAlreadyBound { .. }
+            | MetadataError::WorkspaceAlreadySlotted { .. }
+            | MetadataError::MainIsNotSlottable
+            | MetadataError::SlotOutOfRange(_),
+        ) => CowshedError::conflict(error.to_string(), "choose a free slot: cowshed ls"),
+        _ => native_integrity_error(error),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn removal_head_moved_refusal(
     workspace: &WorkspaceName,
@@ -6165,6 +6265,7 @@ fn removal_head_moved_refusal(
         "review the new HEAD and retry removal",
     )
 }
+
 /// Removing main without `--restore` throws the project's warm image away for good, so the gate
 /// points at the mode that recovers the pre-adoption checkout instead.
 #[cfg(target_os = "macos")]

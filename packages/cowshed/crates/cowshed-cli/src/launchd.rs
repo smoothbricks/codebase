@@ -4,6 +4,7 @@
 //! command adapters so callers can keep one mutable, actor-owned executor while
 //! tests remain entirely host-independent.
 
+use cowshed_core::metadata::ImageCapacity;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
@@ -112,15 +113,29 @@ impl LaunchAgentSpec {
     /// foreground under launchd's supervision, `SCCACHE_IDLE_TIMEOUT=0`
     /// disables idle exit, and the socket and cache paths pin the shared
     /// cowshed locations independent of the launchd session environment.
+    ///
+    /// `SCCACHE_CACHE_SIZE` and `SCCACHE_BASEDIRS` are read once, by the server, at start: neither
+    /// can be set by a client, so both belong here or nowhere. The cap has to be stated because
+    /// sccache's default is 10 GiB — smaller than one debug graph of the projects cowshed hosts, so
+    /// the default evicts the entries a second slot tenant came for. `SCCACHE_BASEDIRS` is the
+    /// *plural*, colon-separated name; sccache 0.16 has no `SCCACHE_BASEDIR` at all and ignores it
+    /// in silence, which is why a host can look configured and report "Base directories (none)".
+    /// Measured: basedirs cannot buy cross-path Rust reuse either way, because cargo's
+    /// `-C metadata` is a hash it never sees — the stable slot mount is what does that. It is set
+    /// to the store root so every path the daemon does relativize is store-relative.
+    ///
     /// All source-verified against sccache 0.16.
     pub fn sccache(
         home: &Path,
         sccache_executable: &Path,
         server_socket: &Path,
         cache_directory: &Path,
+        cache_capacity: ImageCapacity,
+        base_directory: &Path,
     ) -> Result<Self, LaunchdError> {
         validate_canonical_absolute_path("server-socket", server_socket)?;
         validate_canonical_absolute_path("cache-directory", cache_directory)?;
+        validate_canonical_absolute_path("base-directory", base_directory)?;
         let path_string =
             |path: &Path| path.to_str().expect("validated paths are UTF-8").to_owned();
         let environment = vec![
@@ -129,6 +144,8 @@ impl LaunchAgentSpec {
             ("SCCACHE_IDLE_TIMEOUT".to_owned(), "0".to_owned()),
             ("SCCACHE_SERVER_UDS".to_owned(), path_string(server_socket)),
             ("SCCACHE_DIR".to_owned(), path_string(cache_directory)),
+            ("SCCACHE_CACHE_SIZE".to_owned(), cache_capacity.to_string()),
+            ("SCCACHE_BASEDIRS".to_owned(), path_string(base_directory)),
         ];
         Self::assemble(
             home,
