@@ -535,7 +535,13 @@ async fn allow_deny_malformed_token_and_audit_fields() {
         "/allowed/item",
     );
     let response = proxy_request(endpoint, malformed).await;
-    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 407"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("proxy-authenticate: basic realm=\"cowshed\""),
+        "{response}"
+    );
 
     let denied = absolute_request("denied.test", upstream_port, &token, "/allowed/item");
     let response = proxy_request(endpoint, denied).await;
@@ -582,7 +588,7 @@ async fn allow_deny_malformed_token_and_audit_fields() {
         .expect("audit timeout")
         .expect("unauthorized audit");
     assert_eq!(unauthorized.workspace_id, "raven");
-    assert_eq!(unauthorized.http_status, Some(401));
+    assert_eq!(unauthorized.http_status, Some(407));
     assert_eq!(unauthorized.method.as_deref(), Some("GET"));
     assert_eq!(unauthorized.path.as_deref(), Some("/allowed/item"));
 
@@ -627,6 +633,173 @@ async fn allow_deny_malformed_token_and_audit_fields() {
             && denied.sequence < allowed.sequence
             && allowed.sequence < invalid.sequence
     );
+    gateway.drain().await.expect("drain gateway");
+}
+
+/// The `HTTP_PROXY` userinfo path a standard client actually takes: `Proxy-Authorization: Basic`
+/// on the first CONNECT, no challenge round trip, and a terminal, immediate 407 when it is absent.
+#[tokio::test]
+async fn connect_accepts_basic_proxy_credentials_and_challenges_without_them() {
+    let (upstream_port, _captured, _upstream) = http_fixture(0, None).await;
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let policy = WorkspacePolicy {
+        grants: vec![grant("basic.test", upstream_port)],
+        mirrors: Vec::new(),
+    };
+    let (session, token, _) = session(
+        "raven",
+        "owner/repo-basic",
+        WorkspaceEndpoint::Tcp(endpoint),
+        11,
+        1,
+        policy,
+    );
+    gateway
+        .handle()
+        .install(session)
+        .await
+        .expect("install session");
+
+    let connect = |credential: Option<String>| {
+        let header = credential
+            .map(|value| format!("Proxy-Authorization: {value}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "CONNECT basic.test:{upstream_port} HTTP/1.1\r\nHost: basic.test:{upstream_port}\r\n{header}\r\n"
+        )
+    };
+
+    for user in ["cowshed", "anything"] {
+        let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
+        stream
+            .write_all(connect(Some(basic_credential(user, &token))).as_bytes())
+            .await
+            .expect("write authenticated CONNECT");
+        let head = read_response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{user}: {head}");
+    }
+
+    let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
+    stream
+        .write_all(connect(Some(basic_credential("cowshed", "wrong-token"))).as_bytes())
+        .await
+        .expect("write wrong-token CONNECT");
+    let head = read_response_head(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 407"), "{head}");
+
+    // Fail fast: the rejection is one round trip, so a client aborts instead of waiting out a
+    // tunnel that will never open.
+    let mut stream = TcpStream::connect(endpoint).await.expect("connect gateway");
+    stream
+        .write_all(connect(None).as_bytes())
+        .await
+        .expect("write unauthenticated CONNECT");
+    let head = timeout(Duration::from_secs(1), read_response_head(&mut stream))
+        .await
+        .expect("unauthenticated CONNECT must answer immediately");
+    assert!(head.starts_with("HTTP/1.1 407"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("proxy-authenticate: basic realm=\"cowshed\""),
+        "{head}"
+    );
+    gateway.drain().await.expect("drain gateway");
+}
+
+/// The contract with the clients cowshed cannot configure, exercised by one of them.
+///
+/// libcurl is what cargo's registry downloads run on, so what curl does here is what cargo does:
+/// take `user:password` out of the proxy URL, send `Proxy-Authorization: Basic` on the first
+/// CONNECT, and tunnel — no challenge round trip, and no way to be told cowshed's `Bearer`
+/// spelling. The tunnel it opens is the intercepted path a sandbox walks: CONNECT, minted leaf,
+/// request authorization, upstream fetch.
+#[tokio::test]
+async fn curl_tunnels_with_proxy_userinfo_and_fails_fast_without_it() {
+    let (upstream_port, _captured, _upstream) = http_fixture(1, None).await;
+    let endpoint = free_endpoint();
+    let gateway = gateway(
+        test_config(),
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let policy = WorkspacePolicy {
+        grants: vec![grant("secure.test", upstream_port)],
+        mirrors: Vec::new(),
+    };
+    let (session, token, _) = session(
+        "raven",
+        "owner/repo-curl",
+        WorkspaceEndpoint::Tcp(endpoint),
+        13,
+        1,
+        policy,
+    );
+    gateway
+        .handle()
+        .install(session)
+        .await
+        .expect("install session");
+    let target = format!("https://secure.test:{upstream_port}/allowed/item");
+    let curl = |proxy: String| {
+        let target = target.clone();
+        async move {
+            tokio::process::Command::new("/usr/bin/curl")
+                .args([
+                    "-sS",
+                    "--max-time",
+                    "5",
+                    // The system curl's TLS backend is Secure Transport, which takes trust anchors
+                    // only from a keychain, never from `--cacert`. The workspace CA chain is
+                    // covered by the rustls intercept tests; what only a real client can prove is
+                    // the credential on the wire, and that happens before any TLS.
+                    "--insecure",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    "-x",
+                    &proxy,
+                    &target,
+                ])
+                .output()
+                .await
+                .expect("run curl")
+        }
+    };
+
+    let port = endpoint.port();
+    let authenticated = curl(format!("http://cowshed:{token}@127.0.0.1:{port}")).await;
+    assert!(
+        authenticated.status.success(),
+        "curl failed: {}",
+        String::from_utf8_lossy(&authenticated.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&authenticated.stdout), "200");
+
+    // No credential is a terminal answer, not a stall: curl reports the proxy's status and exits
+    // rather than waiting out a tunnel that will never open.
+    let started = Instant::now();
+    let anonymous = curl(format!("http://127.0.0.1:{port}")).await;
+    let elapsed = started.elapsed();
+    assert!(!anonymous.status.success());
+    let reported = String::from_utf8_lossy(&anonymous.stderr);
+    assert!(reported.contains("407"), "{reported}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     gateway.drain().await.expect("drain gateway");
 }
 
@@ -683,9 +856,23 @@ async fn endpoint_identity_precedes_token_authentication() {
     )
     .await;
     assert!(
-        wrong_endpoint.starts_with("HTTP/1.1 401"),
+        wrong_endpoint.starts_with("HTTP/1.1 407"),
         "{wrong_endpoint}"
     );
+
+    // The Basic spelling is the same credential, not a weaker one: another workspace's token is
+    // rejected through it exactly as it is through Bearer.
+    let wrong_basic = proxy_request(
+        endpoint_b,
+        basic_absolute_request(
+            "isolated.test",
+            upstream_port,
+            &basic_credential("cowshed", &token_a),
+            "/allowed",
+        ),
+    )
+    .await;
+    assert!(wrong_basic.starts_with("HTTP/1.1 407"), "{wrong_basic}");
 
     let own_endpoint = proxy_request(
         endpoint_b,
