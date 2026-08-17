@@ -1371,6 +1371,10 @@ impl SpawnSink for SystemSpawnSink {
                 "SCCACHE_SERVER_UDS",
                 crate::sandbox::sccache_server_socket(&request.sandbox.home),
             )
+            .env(
+                "SCCACHE_DIR",
+                crate::sandbox::sccache_cache_directory(&request.sandbox.home),
+            )
             .env("COWSHED_PORT_BASE", &port_base)
             .env("COWSHED_WORKSPACE_TOKEN", workspace_token)
             .env("HTTP_PROXY", &gateway_http)
@@ -1385,6 +1389,15 @@ impl SpawnSink for SystemSpawnSink {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
+        }
+        // Rust through sccache is a slot-path privilege. Cargo's `-C metadata` and sccache's key
+        // both carry the absolute build path, so only a workspace mounted at a slot's stable path
+        // can reuse another generation's entries; the same trade turns incremental off, because
+        // incremental state is per-unit local output sccache cannot cache and cargo prefers it.
+        if crate::metadata::SlotId::from_mount_path(&request.sandbox.workspace_mount).is_some() {
+            command
+                .env("RUSTC_WRAPPER", "sccache")
+                .env("CARGO_INCREMENTAL", "0");
         }
         if let Some(directory) = developer_directory() {
             command.env("DEVELOPER_DIR", directory);
