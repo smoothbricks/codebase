@@ -1154,19 +1154,24 @@ impl Actor {
             Authentication::Generation(generation) => generation == session.generation,
         };
         if !authenticated {
+            // 407, not 401: this is a proxy rejecting the client's credential for itself, and only
+            // 407 carries the `Proxy-Authenticate` challenge that lets a standard client answer
+            // with the proxy userinfo it already holds. A 401 tells the client the *upstream*
+            // demanded authentication, which no client can act on and every client reports as an
+            // opaque tunnel failure.
             let draft = denial_draft(
                 &workspace_id,
                 session,
                 &intent,
                 AuditStatus::Unauthorized,
-                StatusCode::UNAUTHORIZED,
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
                 None,
             );
             let recorded = self.record(draft).await;
             let _ = reply.send(Err(if recorded {
                 admission_error(
-                    StatusCode::UNAUTHORIZED,
-                    "missing or invalid proxy bearer token",
+                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                    "missing or invalid proxy credential",
                     AuditStatus::Unauthorized,
                     None,
                 )

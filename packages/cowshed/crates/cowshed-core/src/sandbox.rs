@@ -91,6 +91,31 @@ pub fn sccache_cache_directory(home: &Path) -> PathBuf {
     home.join(".cowshed/caches/sccache")
 }
 
+/// The host cargo registry subdirectories every sandbox reads.
+///
+/// `index` and `cache` are the download side of cargo's registry: resolved index entries and the
+/// `.crate` archives fetched for them. They are pure network artifacts, digest-checked by cargo
+/// against the index it stores beside them, so sharing the host's copy costs nothing and saves
+/// every workspace from refetching a crate the host already has.
+///
+/// `src` is deliberately absent: it is the *output* of unpacking an archive, so a sandbox has to
+/// be able to create it. It stays inside the private HOME, where a workspace's mount carries it
+/// and copy-on-write hands it to every clone.
+pub const SHARED_CARGO_REGISTRY_DIRECTORIES: [&str; 2] = ["index", "cache"];
+
+/// The host cargo registry, shared read-only with every sandbox.
+///
+/// The private HOME the supervisor exports makes `$CARGO_HOME` a per-workspace directory, so
+/// nothing in the host registry is reachable by cargo's default path resolution. This is the path
+/// the supervisor links the shared subdirectories to and the profile grants read access on.
+///
+/// Only `registry` is named. `~/.cargo` also holds `config.toml`, `credentials.toml`, and `bin`
+/// — a registry credential, a global build configuration, and binaries on `PATH` — each an
+/// explicit hard deny, and none of them a cache.
+pub fn host_cargo_registry(home: &Path) -> PathBuf {
+    home.join(".cargo/registry")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,
@@ -323,6 +348,18 @@ pub fn seatbelt_profile(
             "allow file-read* file-write*",
             &caches.join(suffix),
         )?;
+    }
+    // The host cargo registry, reached through symlinks the supervisor plants in the private
+    // HOME's `.cargo`. Seatbelt matches the resolved path, so the link is inert without these
+    // rules and the grant has to name the host path, not the link. `file-read-data` on `/` is not
+    // enough: cargo lists the index and stats archives, and that is `file-read*` metadata, which
+    // no rule grants inside the user's home. Read-only is the whole posture — the download side of
+    // the registry is shared, the unpacked side is per-workspace and writable.
+    let cargo_registry = host_cargo_registry(&config.home);
+    for directory in SHARED_CARGO_REGISTRY_DIRECTORIES {
+        let path = cargo_registry.join(directory);
+        push_subpath_rule(&mut profile, "allow file-read*", &path)?;
+        push_readable_ancestors(&mut profile, &path)?;
     }
     push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
@@ -711,6 +748,55 @@ mod tests {
             .rfind("(allow file-read* (literal \"/Users/tester/.cowshed/sccache.sock\"))")
             .expect("socket path literal");
         assert!(store_deny < socket_literal);
+    }
+
+    /// The download side of the host cargo registry is readable, the credential side is not, and
+    /// nothing in the host registry becomes writable.
+    #[test]
+    fn host_cargo_registry_is_readable_download_cache_only() {
+        let config = config(RunSandboxMode::ReadWrite);
+        assert_eq!(
+            host_cargo_registry(&config.home),
+            PathBuf::from("/Users/tester/.cargo/registry")
+        );
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+
+        for directory in SHARED_CARGO_REGISTRY_DIRECTORIES {
+            let path = format!("/Users/tester/.cargo/registry/{directory}");
+            assert!(
+                profile.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
+                "{directory} is not readable"
+            );
+            assert!(
+                !profile.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{path}\"))"
+                )),
+                "{directory} must never be writable"
+            );
+        }
+        // Unpacking is the sandbox's own work inside the private HOME; granting the host's
+        // unpacked tree would hand a workspace paths it must never be able to alias.
+        assert!(!profile.contains("/Users/tester/.cargo/registry/src"));
+
+        // Path resolution needs the exact ancestors, and no more: `~/.cargo` is readable as a
+        // directory while its credential, global config, and PATH binaries stay denied.
+        assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.cargo\"))"));
+        assert!(!profile.contains("(allow file-read* (subpath \"/Users/tester/.cargo\"))"));
+        for denied in ["config.toml", "credentials.toml", "bin"] {
+            let path = format!("/Users/tester/.cargo/{denied}");
+            let grant = profile
+                .rfind("(allow file-read* (subpath \"/Users/tester/.cargo/registry/index\"))")
+                .unwrap();
+            let deny = profile
+                .rfind(&format!(
+                    "(deny file-read* file-write* (literal \"{path}\") (subpath \"{path}\"))"
+                ))
+                .unwrap_or_else(|| panic!("{denied} must stay denied"));
+            assert!(
+                grant < deny,
+                "{denied} deny must outlive the registry grant"
+            );
+        }
     }
 
     #[test]
