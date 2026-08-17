@@ -488,6 +488,7 @@ impl ProjectRuntimeHost for FakeHost {
             workspace,
             go_env: mount.join(".cowshed/cache/go/env"),
             sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
+            sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
             workspace_token: mount.join(".cowshed/token"),
             port_block: current.grants.port_block,
             mount,

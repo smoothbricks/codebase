@@ -9,7 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::metadata::{
-    CheckoutLayout, CheckoutLayoutRecord, ImageFormat, MetadataError, WorkspaceName,
+    CheckoutLayout, CheckoutLayoutRecord, ImageFormat, MetadataError, SlotBindings,
+    SlotBindingsRecord, WorkspaceName,
 };
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
@@ -159,11 +160,40 @@ impl StorageLayout {
         self.image_below(&workspace_directory, label.as_str(), format)
     }
 
+    /// Where this workspace mounts.
+    ///
+    /// A workspace bound to a build slot mounts at that slot's stable path instead of its own
+    /// name, so successive tenants of the slot present one absolute path to every compiler cache
+    /// (`SlotId` documents the measurement). The binding record is read here rather than cached on
+    /// the caller because this is the one derivation every mount, unmount and reverse lookup goes
+    /// through: a stale copy would point half the system at the wrong directory, and the read is a
+    /// single small file next to path joins that already spawn `diskutil`.
     pub fn workspace_mount(
         &self,
         workspace: &WorkspaceName,
     ) -> Result<PathBuf, StorageLayoutError> {
-        checked_child(&self.project.mount_root, workspace.as_str())
+        match self.slot_bindings()?.slot_of(workspace) {
+            Some(slot) => checked_child(&self.project.mount_root, &slot.mount_name()),
+            None => checked_child(&self.project.mount_root, workspace.as_str()),
+        }
+    }
+
+    /// Every slot occupancy for this project. An absent record is no occupancies.
+    pub fn slot_bindings(&self) -> Result<SlotBindings, StorageLayoutError> {
+        match crate::metadata::read_json::<SlotBindingsRecord>(&self.project.slot_bindings) {
+            Ok(record) => Ok(record.into_bindings()?),
+            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(SlotBindings::default())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn record_slot_bindings(&self, bindings: &SlotBindings) -> Result<(), MetadataError> {
+        crate::metadata::write_json(
+            &self.project.slot_bindings,
+            &SlotBindingsRecord::new(bindings),
+        )
     }
 
     /// Where this project's `main` mounts.
@@ -405,6 +435,7 @@ pub enum StorageLayoutError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::SlotId;
     use proptest::prelude::*;
 
     fn layout() -> StorageLayout {
@@ -539,6 +570,91 @@ mod tests {
             Path::new("/Users/test/.cowshed/mnt/acme/widget/raven")
         );
         assert_eq!(WORKSPACE_MARKER_PATH, ".cowshed/workspace.json");
+    }
+
+    #[test]
+    fn a_slot_bound_workspace_mounts_at_the_slot_and_its_successor_inherits_the_path() {
+        let root = temp_store("slots");
+        let layout = layout_under(&root);
+        fs::create_dir_all(&layout.project().project_root).unwrap();
+        let first = WorkspaceName::session("raven").unwrap();
+        let second = WorkspaceName::session("kestrel").unwrap();
+        let slot = SlotId::new(3).unwrap();
+
+        // Unbound: the name is the path.
+        assert!(layout.slot_bindings().unwrap().is_empty());
+        assert!(
+            layout
+                .workspace_mount(&first)
+                .unwrap()
+                .ends_with("mnt/acme/widget/raven")
+        );
+
+        let mut bindings = layout.slot_bindings().unwrap();
+        bindings.bind(slot, first.clone()).unwrap();
+        layout.record_slot_bindings(&bindings).unwrap();
+        let bound = layout.workspace_mount(&first).unwrap();
+        assert!(bound.ends_with("mnt/acme/widget/slot@3"), "{bound:?}");
+
+        // The whole point: the next tenant of the slot sees byte-identical bytes for its build
+        // path, which is what makes cargo's `-C metadata` and every sccache key match.
+        let mut bindings = layout.slot_bindings().unwrap();
+        assert_eq!(bindings.release(&first), Some(slot));
+        bindings.bind(slot, second.clone()).unwrap();
+        layout.record_slot_bindings(&bindings).unwrap();
+        assert_eq!(layout.workspace_mount(&second).unwrap(), bound);
+        assert!(
+            layout
+                .workspace_mount(&first)
+                .unwrap()
+                .ends_with("mnt/acme/widget/raven")
+        );
+    }
+
+    #[test]
+    fn slot_occupancy_is_exclusive_in_both_directions() {
+        let raven = WorkspaceName::session("raven").unwrap();
+        let kestrel = WorkspaceName::session("kestrel").unwrap();
+        let mut bindings = SlotBindings::default();
+        bindings
+            .bind(SlotId::new(0).unwrap(), raven.clone())
+            .unwrap();
+
+        // Re-binding the same pair is how create and repair stay idempotent.
+        bindings
+            .bind(SlotId::new(0).unwrap(), raven.clone())
+            .unwrap();
+
+        assert!(matches!(
+            bindings.bind(SlotId::new(0).unwrap(), kestrel.clone()),
+            Err(MetadataError::SlotAlreadyBound { slot: 0, .. })
+        ));
+        assert!(matches!(
+            bindings.bind(SlotId::new(1).unwrap(), raven.clone()),
+            Err(MetadataError::WorkspaceAlreadySlotted { slot: 0, .. })
+        ));
+        assert!(matches!(
+            bindings.bind(SlotId::new(1).unwrap(), WorkspaceName::new("main").unwrap()),
+            Err(MetadataError::MainIsNotSlottable)
+        ));
+        assert_eq!(bindings.release(&kestrel), None);
+        assert_eq!(bindings.release(&raven), Some(SlotId::new(0).unwrap()));
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn a_slot_mountpoint_is_recognised_from_its_path_alone() {
+        let slot = SlotId::new(7).unwrap();
+        let mount = Path::new("/Users/test/.cowshed/mnt/acme/widget").join(slot.mount_name());
+        assert_eq!(SlotId::from_mount_path(&mount), Some(slot));
+        // A name-mounted workspace is not a slot, and no workspace name can imitate one: `@` is
+        // outside the `WorkspaceName` grammar.
+        assert_eq!(
+            SlotId::from_mount_path(Path::new("/Users/test/.cowshed/mnt/acme/widget/slot-7")),
+            None
+        );
+        assert!(WorkspaceName::new("slot@7").is_err());
+        assert!(SlotId::new(SlotId::MAX + 1).is_err());
     }
 
     #[test]
