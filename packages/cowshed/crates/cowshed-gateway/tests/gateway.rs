@@ -16,6 +16,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus,
     AuthorizedTarget, CanonicalTarget, ConnectError, CredentialError, CredentialProvider,
@@ -245,6 +246,20 @@ async fn read_headers(stream: &mut TcpStream) -> String {
 fn absolute_request(host: &str, port: u16, token: &str, path: &str) -> String {
     format!(
         "GET http://{host}:{port}{path} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// The `Proxy-Authorization` value a client builds from `http://cowshed:<token>@127.0.0.1:<port>`.
+fn basic_credential(user: &str, token: &str) -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{token}"))
+    )
+}
+
+fn basic_absolute_request(host: &str, port: u16, credential: &str, path: &str) -> String {
+    format!(
+        "GET http://{host}:{port}{path} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: {credential}\r\nConnection: close\r\n\r\n"
     )
 }
 
