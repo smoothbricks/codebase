@@ -52,6 +52,14 @@ remain handles, and unbounded bytes require `cowshed job logs`, `cowshed job att
 - `--project <git-root>` — select an adopted repository explicitly. Default: discover the standalone Git root owning the
   current directory, then validate its cowshed repository binding. Exit 3 if neither resolves.
 - `-q` / `--quiet` — suppress `cowshed:` progress lines on stderr; errors and `next:` hints still print.
+- `--help` / `-h` — the command map, or one command's full usage when a verb precedes it. `cowshed help [<command>]` is
+  the same request. Help is an answer, not a diagnostic: it goes to stdout and exits 0, and `--help` anywhere in a
+  command's own arguments answers instead of refusing the half-typed grammar it appears in. Past `--` the argument
+  belongs to the child, so `cowshed exec raven -- cargo --help` runs cargo's help inside the workspace.
+
+Usage lines are generated from the same option table the parser reads, so a flag a command accepts is a flag its usage
+line and its `--help` page name, with one line saying what it does. A mistyped verb is corrected against the command
+list: `cowshed sscache` refuses with `did you mean: sccache`.
 
 Workspace names are `[a-z0-9][a-z0-9-]*`, unique per project. Commands taking `<name>` accept `main` wherever it makes
 sense. `cowshed exec main -- ...` uses the same closed sandbox and explicit grants as every other workspace.
