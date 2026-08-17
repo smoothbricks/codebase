@@ -916,7 +916,59 @@ struct RetiredCheckpointArtifacts {
 struct RetiredCleanupArtifacts {
     checkpoint_images: Vec<(PathBuf, ImageFormat)>,
     paths: Vec<PathBuf>,
-    mount_point: PathBuf,
+    mount_point: Option<PathBuf>,
+}
+
+/// Whether a retirement may collect the artifacts keyed on its workspace name rather than on its
+/// incarnation: `checkpoints/<name>` and the mountpoint.
+///
+/// A trash entry is unique per `<name>-<incarnation>`, so N retirements of one name are N
+/// independently collectable entries. Those two paths are not: re-minting a name hands the new
+/// lifetime the very same ones. They belong to whoever holds the name now — a live canonical image
+/// if there is one, otherwise the newest retirement still in trash — and every other retirement of
+/// that name collects only its own per-incarnation artifacts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NameScope {
+    Owned,
+    Foreign,
+}
+
+/// The newest retired incarnation of every name present in trash.
+///
+/// Read off the trash filenames rather than each sidecar because `retired_authority` already proves
+/// the two agree for every entry a plan contains, and because this answer must be identical during
+/// preview and at execution time or every plan would revalidate as stale.
+fn retired_name_owners(
+    images: &[(PathBuf, ImageFormat)],
+) -> BTreeMap<WorkspaceName, WorkspaceIncarnation> {
+    let mut owners = BTreeMap::new();
+    for (image, _) in images {
+        let Some((name, incarnation)) = image
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(split_retired_stem)
+        else {
+            continue;
+        };
+        match owners.get_mut(&name) {
+            Some(owner) if *owner < incarnation => *owner = incarnation,
+            Some(_) => {}
+            None => {
+                owners.insert(name, incarnation);
+            }
+        }
+    }
+    owners
+}
+
+/// Splits a `<name>-<incarnation>` trash stem. Incarnations are fixed-width lowercase hex, which is
+/// what keeps the split unambiguous for the many workspace names that contain hyphens themselves.
+fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, WorkspaceIncarnation)> {
+    let (name, incarnation) = stem.rsplit_once('-')?;
+    Some((
+        WorkspaceName::new(name).ok()?,
+        WorkspaceIncarnation::new(incarnation).ok()?,
+    ))
 }
 
 type MountKey = (RepoId, WorkspaceName);
@@ -1666,27 +1718,30 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 trash_image.display()
             )));
         }
-        let canonical = super::canonical_image_path(&self.config, &workspace)?;
+        let revision = Revision::new(workspace.revision().get().saturating_add(1));
+        Ok(RetiredRef::new(workspace, revision))
+    }
+
+    fn retired_name_scope(
+        &self,
+        workspace: &LifecycleWorkspace,
+        newest_retired: Option<&WorkspaceIncarnation>,
+    ) -> Result<NameScope, ApfsStorageError> {
+        let canonical = super::canonical_image_path(&self.config, workspace)?;
+        let sidecar = sidecar_path(&canonical);
         if canonical
             .try_exists()
             .map_err(|error| io_error("inspect retired canonical image", &canonical, error))?
-            || sidecar_path(&canonical).try_exists().map_err(|error| {
-                io_error(
-                    "inspect retired canonical metadata",
-                    &sidecar_path(&canonical),
-                    error,
-                )
-            })?
+            || sidecar
+                .try_exists()
+                .map_err(|error| io_error("inspect retired canonical metadata", &sidecar, error))?
         {
-            return Err(ApfsStorageError::MarkerMismatch(format!(
-                "retired trash conflicts with canonical workspace {}",
-                workspace.name()
-            )));
+            return Ok(NameScope::Foreign);
         }
-        Ok(RetiredRef::new(
-            workspace.clone(),
-            Revision::new(workspace.revision().get().saturating_add(1)),
-        ))
+        Ok(match newest_retired {
+            Some(newest) if newest != workspace.incarnation() => NameScope::Foreign,
+            _ => NameScope::Owned,
+        })
     }
 
     fn retired_checkpoint_artifacts(
@@ -1816,14 +1871,30 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         project: &Path,
         retired: &RetiredRef,
         trash_image: &Path,
+        scope: NameScope,
     ) -> Result<RetiredCleanupArtifacts, ApfsStorageError> {
-        let RetiredCheckpointArtifacts {
-            images,
-            paths: mut artifacts,
-        } = self.retired_checkpoint_artifacts(project, retired)?;
+        let mut checkpoint_images = Vec::new();
+        let mut artifacts = Vec::new();
+        let mut mount_point = None;
+        if scope == NameScope::Owned {
+            let checkpoints = self.retired_checkpoint_artifacts(project, retired)?;
+            checkpoint_images = checkpoints.images;
+            artifacts = checkpoints.paths;
+            mount_point = Some(self.retired_mount_point(retired)?);
+        }
         artifacts.extend(image_gc_paths(trash_image));
         artifacts.sort();
         artifacts.dedup();
+        Ok(RetiredCleanupArtifacts {
+            checkpoint_images,
+            paths: artifacts,
+            mount_point,
+        })
+    }
+
+    /// The mountpoint a retirement is entitled to remove, which must be an empty directory or
+    /// already absent: anything with contents is a live mount, and gc never removes those.
+    fn retired_mount_point(&self, retired: &RetiredRef) -> Result<PathBuf, ApfsStorageError> {
         let mount_point = layout(&self.config, retired.workspace().repo())?
             .project()
             .mount_root
@@ -1850,11 +1921,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error("inspect retired mountpoint", &mount_point, error)),
         }
-        Ok(RetiredCleanupArtifacts {
-            checkpoint_images: images,
-            paths: artifacts,
-            mount_point,
-        })
+        Ok(mount_point)
     }
 
     fn reclaim_retired_authority(
@@ -1875,33 +1942,42 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 trash_image.display()
             )));
         }
-        let cleanup = self.retired_cleanup_artifacts(project, &authority, trash_image)?;
+        // Recomputed per entry instead of carried in the plan, because `reclaim_retired` runs this
+        // with no plan at all. A scope only ever widens as siblings are collected, so an entry that
+        // runs after its name's owner converges on the same already-removed shared paths.
+        let trash = project.join("sessions").join(super::TRASH_NAMESPACE);
+        let owners = retired_name_owners(&self.retired_trash_images(&trash)?);
+        let scope = self.retired_name_scope(
+            authority.workspace(),
+            owners.get(authority.workspace().name()),
+        )?;
+        let cleanup = self.retired_cleanup_artifacts(project, &authority, trash_image, scope)?;
         for (image, image_format) in cleanup.checkpoint_images {
             self.reclaim_image(&image, image_format)?;
         }
-        let checkpoint_directory = project
-            .join("checkpoints")
-            .join(authority.workspace().name().as_str());
-        match fs::remove_dir(&checkpoint_directory) {
-            Ok(()) => sync_parent_path(&checkpoint_directory)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io_error(
-                    "remove retired checkpoint directory",
-                    &checkpoint_directory,
-                    error,
-                ));
+        if scope == NameScope::Owned {
+            let checkpoint_directory = project
+                .join("checkpoints")
+                .join(authority.workspace().name().as_str());
+            match fs::remove_dir(&checkpoint_directory) {
+                Ok(()) => sync_parent_path(&checkpoint_directory)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_error(
+                        "remove retired checkpoint directory",
+                        &checkpoint_directory,
+                        error,
+                    ));
+                }
             }
         }
-        match fs::remove_dir(&cleanup.mount_point) {
-            Ok(()) => sync_parent_path(&cleanup.mount_point)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io_error(
-                    "remove retired mountpoint",
-                    &cleanup.mount_point,
-                    error,
-                ));
+        if let Some(mount_point) = &cleanup.mount_point {
+            match fs::remove_dir(mount_point) {
+                Ok(()) => sync_parent_path(mount_point)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_error("remove retired mountpoint", mount_point, error));
+                }
             }
         }
         self.reclaim_image(trash_image, format)
@@ -1959,17 +2035,20 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let mut retained_recent = 0_usize;
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
-        let mut retired_workspaces = BTreeSet::new();
-        for (path, format) in self.retired_trash_images(&trash)? {
+        let trash_images = self.retired_trash_images(&trash)?;
+        let name_owners = retired_name_owners(&trash_images);
+        let mut claimed_checkpoint_names = BTreeSet::new();
+        for (path, format) in trash_images {
             let retired = self.retired_authority(project, repo, &path, format)?;
-            if !retired_workspaces.insert(retired.workspace().name().clone()) {
-                return Err(ApfsStorageError::Host(format!(
-                    "duplicate retired cleanup authority for {}",
-                    retired.workspace().name()
-                )));
+            let scope = self.retired_name_scope(
+                retired.workspace(),
+                name_owners.get(retired.workspace().name()),
+            )?;
+            if scope == NameScope::Owned {
+                claimed_checkpoint_names.insert(retired.workspace().name().clone());
             }
             let artifacts = self
-                .retired_cleanup_artifacts(project, &retired, &path)?
+                .retired_cleanup_artifacts(project, &retired, &path, scope)?
                 .paths;
             examined = examined
                 .checked_add(1)
@@ -2059,7 +2138,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     WorkspaceName::new(name)
                         .map_err(|error| ApfsStorageError::Host(error.to_string()))
                 })?;
-            if retired_workspaces.contains(&workspace_name) {
+            if claimed_checkpoint_names.contains(&workspace_name) {
                 continue;
             }
             let mut checkpoints = Vec::new();

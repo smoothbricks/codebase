@@ -1410,6 +1410,167 @@ fn retired_reclaim_excludes_workspace_immediately_and_removes_every_restore_arti
     assert!(!mountpoint.exists());
 }
 
+/// Trash entries are keyed `<name>-<incarnation>`, but `checkpoints/<name>` and the mountpoint are
+/// keyed on the name alone. Re-minting a retired name hands the new lifetime those same two paths,
+/// so a live workspace has to withhold them from a stranded retirement of its name without
+/// withholding that retirement's own per-incarnation artifacts — which are garbage either way.
+#[test]
+fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name() {
+    const FIRST: &str = "1836ace7b0cd4b41b3ca31a9eb1d131a";
+    const SECOND: &str = "a5e833cf3c73476184ef904ef11846d1";
+    const LIVE: &str = "00000000000000000000000000000009";
+    let fixture = Fixture::new("retired-name-reuse-live");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let main = layout.main_image(ImageFormat::Sparse).expect("main");
+    create_image(main.image(), ImageFormat::Sparse);
+
+    let name = WorkspaceName::session("lockfree-doctrine").expect("session workspace");
+    let live = layout
+        .session_image(&name, ImageFormat::Sparse)
+        .expect("session image");
+    create_image(live.image(), ImageFormat::Sparse);
+    write_session_metadata(live.image(), "lockfree-doctrine", LIVE, ImageFormat::Sparse);
+
+    let label = CheckpointLabel::new("pinned").expect("checkpoint label");
+    let checkpoint = layout
+        .checkpoint_image(&name, &label, ImageFormat::Sparse)
+        .expect("checkpoint")
+        .image()
+        .to_owned();
+    create_image(&checkpoint, ImageFormat::Sparse);
+    write_session_metadata(&checkpoint, "lockfree-doctrine", LIVE, ImageFormat::Sparse);
+    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(3), Pin::Pinned)
+        .expect("pinned checkpoint fact");
+    let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
+    std::fs::create_dir_all(&mountpoint).expect("live mountpoint");
+
+    let stranded = [FIRST, SECOND].map(|incarnation| {
+        let path = layout.project().sessions.join(format!(
+            ".trash/lockfree-doctrine-{incarnation}.sparseimage"
+        ));
+        create_image(&path, ImageFormat::Sparse);
+        write_session_metadata(&path, "lockfree-doctrine", incarnation, ImageFormat::Sparse);
+        path
+    });
+
+    let plan = host
+        .preview_gc(&config, &repo())
+        .expect("a reused name does not block its stranded retirements");
+    let retired = plan
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.reason() == StorageGcReason::RetiredWorkspace)
+        .map(|candidate| candidate.path().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(retired, stranded.to_vec());
+    host.execute_gc(&config, plan)
+        .expect("collect both stranded retirements");
+
+    for image in &stranded {
+        assert!(!image.exists(), "{} image remains", image.display());
+        assert!(
+            !sidecar_path(image).exists(),
+            "{} grants remain",
+            image.display()
+        );
+        assert!(
+            !ca_key_path(image).exists(),
+            "{} CA key remains",
+            image.display()
+        );
+    }
+    assert!(live.image().exists(), "live workspace image was collected");
+    assert!(
+        sidecar_path(live.image()).exists(),
+        "live workspace grants were collected"
+    );
+    assert!(
+        checkpoint.exists(),
+        "live lifetime checkpoint was collected"
+    );
+    assert!(
+        checkpoint_fact_path(&checkpoint).exists(),
+        "live lifetime checkpoint fact was collected"
+    );
+    assert!(
+        mountpoint.exists(),
+        "live workspace mountpoint was collected"
+    );
+}
+
+/// Retiring one name twice leaves two independently collectable entries. The paths keyed on the
+/// name alone belong to exactly one of them, so they are collected once rather than claimed twice
+/// or abandoned along with the entry that did not own them.
+#[test]
+fn gc_collects_every_stranded_retirement_of_one_name_and_its_shared_paths_once() {
+    const FIRST: &str = "1836ace7b0cd4b41b3ca31a9eb1d131a";
+    const SECOND: &str = "a5e833cf3c73476184ef904ef11846d1";
+    let fixture = Fixture::new("retired-name-reuse-stranded");
+    let config = fixture.config();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let main = layout.main_image(ImageFormat::Sparse).expect("main");
+    create_image(main.image(), ImageFormat::Sparse);
+
+    let name = WorkspaceName::session("lockfree-doctrine").expect("session workspace");
+    let label = CheckpointLabel::new("keep").expect("checkpoint label");
+    let checkpoint = layout
+        .checkpoint_image(&name, &label, ImageFormat::Sparse)
+        .expect("checkpoint")
+        .image()
+        .to_owned();
+    create_image(&checkpoint, ImageFormat::Sparse);
+    write_session_metadata(
+        &checkpoint,
+        "lockfree-doctrine",
+        SECOND,
+        ImageFormat::Sparse,
+    );
+    host.publish_checkpoint_fact(&checkpoint, &label, Revision::new(2), Pin::Pinned)
+        .expect("pinned checkpoint fact");
+    let checkpoint_directory = layout.project().checkpoints.join("lockfree-doctrine");
+    let mountpoint = layout.workspace_mount(&name).expect("workspace mountpoint");
+    std::fs::create_dir_all(&mountpoint).expect("empty mountpoint");
+
+    let stranded = [FIRST, SECOND].map(|incarnation| {
+        let path = layout.project().sessions.join(format!(
+            ".trash/lockfree-doctrine-{incarnation}.sparseimage"
+        ));
+        create_image(&path, ImageFormat::Sparse);
+        write_session_metadata(&path, "lockfree-doctrine", incarnation, ImageFormat::Sparse);
+        path
+    });
+
+    let report = execute_gc(&host, &config).expect("two retirements of one name both collect");
+    assert_eq!(report.reclaimed, 2);
+    assert_eq!(report.retained_pinned, 0);
+    for image in &stranded {
+        assert!(!image.exists(), "{} image remains", image.display());
+        assert!(
+            !sidecar_path(image).exists(),
+            "{} grants remain",
+            image.display()
+        );
+        assert!(
+            !ca_key_path(image).exists(),
+            "{} CA key remains",
+            image.display()
+        );
+    }
+    assert!(!checkpoint.exists(), "shared checkpoint image remains");
+    assert!(
+        !checkpoint_fact_path(&checkpoint).exists(),
+        "shared checkpoint fact remains"
+    );
+    assert!(
+        !checkpoint_directory.exists(),
+        "shared checkpoint directory remains"
+    );
+    assert!(!mountpoint.exists(), "shared mountpoint remains");
+}
+
 #[test]
 fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
     const CURRENT: &str = "00000000000000000000000000000003";
