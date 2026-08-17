@@ -130,6 +130,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Gateway(_)
         | Command::Sccache(_)
         | Command::Skill(_)
+        | Command::Help(_)
         | Command::Doctor => RuntimeOpenMode::ExistingOnly,
     }
 }
@@ -1042,6 +1043,9 @@ where
         )),
         Command::Skill(_) => Err(CowshedError::internal(
             "skill commands must be dispatched before the runtime bridge",
+        )),
+        Command::Help(_) => Err(CowshedError::internal(
+            "help is answered before the runtime bridge",
         )),
     }
 }

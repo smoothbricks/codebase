@@ -2,7 +2,36 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const COMMAND_MAP: &str = "commands:\n  adopt [path]       adopt a checkout\n  new <name>         create a workspace\n  fork <src> <dst>   fork a workspace\n  checkpoint <ws>    create a checkpoint\n  restore <ws> <id>  restore a checkpoint\n  ensure             heal the current workspace\n  ls [--all]         list workspaces\n  path <ws>          print a workspace mount\n  exec <ws> -- <cmd> run an argv command\n  rm <ws>            retire a workspace\n  attach <ws>        attach a workspace\n  detach <ws>        detach a workspace\n  resize <ws> <size> grow a workspace image\n  gc                 reclaim storage\n  push <ws>          preserve a workspace ref\n  rebase <ws>        rebase a workspace\n  land <ws>          land a workspace\n  doctor             check invariants\n  gateway <action>   manage the host gateway\n  sccache <action>   manage the host sccache daemon\n  skill install      install the agent skill";
+use crate::help::{self, CommandSpec, Opt};
+
+/// Every command, in the order the command map lists them.
+///
+/// This is the list `cowshed --help` prints and the list an unknown command is corrected against,
+/// so a verb the parser dispatches is a verb the help knows about.
+pub static COMMANDS: &[&CommandSpec] = &[
+    &ADOPT,
+    &NEW,
+    &FORK,
+    &MOVE,
+    &CHECKPOINT,
+    &RESTORE,
+    &ENSURE,
+    &LIST,
+    &PATH,
+    &EXEC,
+    &REMOVE,
+    &ATTACH,
+    &DETACH,
+    &RESIZE,
+    &GC,
+    &PUSH,
+    &REBASE,
+    &LAND,
+    &DOCTOR,
+    &GATEWAY,
+    &SCCACHE,
+    &SKILL,
+];
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GlobalOptions {
@@ -41,6 +70,8 @@ pub enum Command {
     Gateway(GatewayCommand),
     Sccache(SccacheCommand),
     Skill(SkillArgs),
+    /// `--help`, `-h`, or `help`: the command map, or one command's page.
+    Help(Option<&'static CommandSpec>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,11 +297,21 @@ pub struct UsageError {
 }
 
 impl UsageError {
-    fn new(message: impl Into<String>, usage: &'static str) -> Self {
+    /// A refusal from inside one command, hinting that command's own grammar.
+    fn new(message: impl Into<String>, spec: &'static CommandSpec) -> Self {
         Self {
             kind: UsageErrorKind::InvalidArguments,
             message: message.into(),
-            hint: format!("cowshed {usage}"),
+            hint: spec.hint(),
+        }
+    }
+
+    /// A refusal from outside any command, which has to spell its own next step.
+    fn with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            kind: UsageErrorKind::InvalidArguments,
+            message: message.into(),
+            hint: hint.into(),
         }
     }
 
@@ -278,7 +319,7 @@ impl UsageError {
         Self {
             kind: UsageErrorKind::MissingCommand,
             message: "a command is required".to_owned(),
-            hint: "choose a command from the command map".to_owned(),
+            hint: "cowshed --help".to_owned(),
         }
     }
 
@@ -286,9 +327,9 @@ impl UsageError {
         2
     }
 
-    pub const fn command_map(&self) -> Option<&'static str> {
+    pub fn command_map(&self) -> Option<&'static str> {
         match self.kind {
-            UsageErrorKind::MissingCommand => Some(COMMAND_MAP),
+            UsageErrorKind::MissingCommand => Some(help::command_map()),
             UsageErrorKind::InvalidArguments => None,
         }
     }
@@ -328,6 +369,36 @@ enum CommandName {
     Skill,
 }
 
+impl CommandName {
+    /// The dispatched verb's entry in the table, which is where its help and its grammar live.
+    fn spec(self) -> &'static CommandSpec {
+        match self {
+            Self::Adopt => &ADOPT,
+            Self::New => &NEW,
+            Self::Fork => &FORK,
+            Self::Move => &MOVE,
+            Self::Checkpoint => &CHECKPOINT,
+            Self::Restore => &RESTORE,
+            Self::Ensure => &ENSURE,
+            Self::List => &LIST,
+            Self::Path => &PATH,
+            Self::Exec => &EXEC,
+            Self::Remove => &REMOVE,
+            Self::Attach => &ATTACH,
+            Self::Detach => &DETACH,
+            Self::Resize => &RESIZE,
+            Self::Gc => &GC,
+            Self::Push => &PUSH,
+            Self::Rebase => &REBASE,
+            Self::Land => &LAND,
+            Self::Doctor => &DOCTOR,
+            Self::Gateway => &GATEWAY,
+            Self::Sccache => &SCCACHE,
+            Self::Skill => &SKILL,
+        }
+    }
+}
+
 pub fn parse_args<I, T>(args: I) -> Result<Cli, UsageError>
 where
     I: IntoIterator<Item = T>,
@@ -361,15 +432,24 @@ where
         Some("gateway") => CommandName::Gateway,
         Some("sccache") => CommandName::Sccache,
         Some("skill") => CommandName::Skill,
-        Some(other) => {
-            return Err(UsageError::new(
-                format!("unknown command `{other}`"),
-                "<command>",
-            ));
+        Some("--help" | "-h" | "help") => {
+            let command = parse_help(&args, index + 1)?;
+            return Ok(Cli { global, command });
         }
+        Some(other) => return Err(unknown_command(other)),
         None => return Err(UsageError::missing_command()),
     };
     index += 1;
+
+    // `--help` among a verb's own arguments answers the question the command line was about to get
+    // wrong, rather than refusing the half-typed grammar it appears in. The scan stops at `--`,
+    // where cowshed's arguments end and the child's begin.
+    if wants_help(&args[index..]) {
+        return Ok(Cli {
+            global,
+            command: Command::Help(Some(command.spec())),
+        });
+    }
 
     let command = match command {
         CommandName::Adopt => parse_adopt(&args, index, &mut global)?,
@@ -390,7 +470,7 @@ where
         CommandName::Push => parse_push(&args, index, &mut global)?,
         CommandName::Rebase => parse_rebase(&args, index, &mut global)?,
         CommandName::Land => parse_land(&args, index, &mut global)?,
-        CommandName::Doctor => parse_empty(&args, index, &mut global, "doctor", Command::Doctor)?,
+        CommandName::Doctor => parse_empty(&args, index, &mut global, &DOCTOR, Command::Doctor)?,
         CommandName::Gateway => parse_gateway(&args, index, &mut global)?,
         CommandName::Sccache => parse_sccache(&args, index, &mut global)?,
         CommandName::Skill => parse_skill(&args, index, &mut global)?,
@@ -398,12 +478,73 @@ where
     Ok(Cli { global, command })
 }
 
+/// `help [<command>]`, and the `--help`/`-h` spellings of the same request.
+fn parse_help(args: &[OsString], mut index: usize) -> Result<Command, UsageError> {
+    const HINT: &str = "cowshed help [<command>]";
+    let mut topic = None;
+    while index < args.len() {
+        match args[index].to_str() {
+            Some("--help" | "-h") => {}
+            Some(name) if !name.starts_with('-') && topic.is_none() => {
+                topic = Some(help::command_named(name).ok_or_else(|| unknown_command(name))?);
+            }
+            _ => {
+                let argument = args[index].to_string_lossy();
+                return Err(UsageError::with_hint(
+                    format!("help describes one command at a time, not `{argument}`"),
+                    HINT,
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(Command::Help(topic))
+}
+
+/// Whether `--help` appears before the `--` that ends cowshed's own arguments.
+fn wants_help(arguments: &[OsString]) -> bool {
+    arguments
+        .iter()
+        .map(|argument| argument.to_str())
+        .take_while(|argument| *argument != Some("--"))
+        .any(|argument| argument == Some("--help") || argument == Some("-h"))
+}
+
+/// A verb nobody has, corrected against the ones that exist.
+///
+/// The correction matters more than the refusal: an agent that mistypes a verb otherwise retries
+/// the same spelling, and a near miss is the overwhelmingly common way a command line is wrong.
+fn unknown_command(name: &str) -> UsageError {
+    let nearest = help::nearest_commands(name);
+    let message = if nearest.is_empty() {
+        format!("unknown command `{name}`")
+    } else {
+        format!(
+            "unknown command `{name}`; did you mean: {}",
+            nearest.join(", ")
+        )
+    };
+    UsageError::with_hint(message, "cowshed --help")
+}
+
+const GATEWAY: CommandSpec = CommandSpec {
+    name: "gateway",
+    args: "<start|stop|status|run>",
+    trailing: "",
+    summary: "manage the host gateway",
+    about: &[
+        "The gateway is the one trusted process outside every sandbox: workspaces reach the network, main's repository, and each other only through its authenticated Unix socket. `start` installs and loads the per-user LaunchAgent and waits until that socket answers; `stop` boots it out; `status` reports health without starting anything. Both mutations are idempotent.",
+        "`run` is the LaunchAgent's own foreground entrypoint. It validates already-mounted storage and never provisions any, so a background start can report missing setup but can never raise an authorization prompt.",
+    ],
+    options: &[],
+};
+
 fn parse_gateway(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    let usage = "gateway <start|stop|status|run>";
+    let usage: &'static CommandSpec = &GATEWAY;
     let action = match args.get(index).and_then(|argument| argument.to_str()) {
         Some("start") => GatewayCommand::Start,
         Some("stop") => GatewayCommand::Stop,
@@ -435,12 +576,27 @@ fn parse_gateway(
     Ok(Command::Gateway(action))
 }
 
+const SCCACHE: CommandSpec = CommandSpec {
+    name: "sccache",
+    args: "<start|stop|status>",
+    trailing: "",
+    summary: "manage the host sccache daemon",
+    about: &[
+        "Runs the shared compile cache as a supervised LaunchAgent, so its configuration is pinned before any client speaks to it. sccache reads its store path, its cache cap, and its base directories once, at server start, and never again — so the first client to need a server and spawn one implicitly would freeze its own environment into the daemon every later workspace then shares. Starting the daemon deliberately is what keeps the cap and the store where the host meant them.",
+        "The gateway daemon starts this agent itself, so a healthy host already has it; these verbs are for repair, inspection, and resizing. `status` reports launchd and socket health without starting anything, and surfaces the daemon's own statistics whenever it answers. Hits are reported per language on purpose: cross-workspace C and C++ reuse needs no build slot, so a healthy aggregate hit rate routinely hides a Rust hit rate of zero.",
+    ],
+    options: &[Opt {
+        spelling: "--capacity <size>",
+        meaning: "`start` only: cache cap (100g, 1t). The default is the summed size of every adopted project's main image, floored at 40 GiB, because sccache's own 10 GiB default is smaller than one debug graph and evicts what the next slot tenant came for",
+    }],
+};
+
 fn parse_sccache(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    let usage = "sccache <start [--capacity <size>] | stop | status>";
+    let usage: &'static CommandSpec = &SCCACHE;
     let mut action = match args.get(index).and_then(|argument| argument.to_str()) {
         Some("start") => SccacheCommand::Start { capacity: None },
         Some("stop") => SccacheCommand::Stop,
@@ -481,12 +637,27 @@ fn parse_sccache(
     Ok(Command::Sccache(action))
 }
 
+const SKILL: CommandSpec = CommandSpec {
+    name: "skill",
+    args: "install",
+    trailing: "",
+    summary: "install the agent skill",
+    about: &[
+        "Writes cowshed's agent skill into every harness already present on the host, so an agent working in a workspace knows the verbs without being told them. A repeat install that finds the shipped bytes already there reports `unchanged` and leaves mtimes alone.",
+        "`--project` decides the scope: with it the skill is installed into the project's own harness directories, without it into the user's.",
+    ],
+    options: &[Opt {
+        spelling: "--harness <name>",
+        meaning: "install into this harness whether or not it is detected; repeatable",
+    }],
+};
+
 fn parse_skill(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "skill install [--harness <name>] [--project <path>]";
+    const USAGE: &CommandSpec = &SKILL;
     let action = match args.get(index).and_then(|argument| argument.to_str()) {
         Some("install") => SkillCommand::Install,
         Some(other) => {
@@ -568,9 +739,9 @@ fn parse_global(
         Some("--project") => {
             *index += 1;
             let value = args.get(*index).ok_or_else(|| {
-                UsageError::new(
+                UsageError::with_hint(
                     "--project requires a git root",
-                    "--project <git-root> <command>",
+                    "cowshed --project <git-root> <command>",
                 )
             })?;
             global.project = Some(PathBuf::from(value));
@@ -581,12 +752,36 @@ fn parse_global(
     Ok(true)
 }
 
+const ADOPT: CommandSpec = CommandSpec {
+    name: "adopt",
+    args: "[path]",
+    trailing: "",
+    summary: "adopt a checkout",
+    about: &[
+        "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and on macOS the only command allowed to provision storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no later command ever can.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--capacity <size>",
+            meaning: "capacity of the images this project creates (100g, 1t); `cowshed resize` grows them later",
+        },
+        Opt {
+            spelling: "--repo-id <owner/repo>",
+            meaning: "identity for a repository whose remotes cannot supply one unambiguously",
+        },
+        Opt {
+            spelling: "--quarantine",
+            meaning: "move detected secret files into the project's quarantine instead of refusing the adopt",
+        },
+    ],
+};
+
 fn parse_adopt(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "adopt [path] [--capacity <size>] [--repo-id <owner/repo>] [--quarantine]";
+    const USAGE: &CommandSpec = &ADOPT;
     let mut parsed = AdoptArgs::default();
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
@@ -609,12 +804,49 @@ fn parse_adopt(
     Ok(Command::Adopt(parsed))
 }
 
+const NEW: CommandSpec = CommandSpec {
+    name: "new",
+    args: "<name>",
+    trailing: "",
+    summary: "create a workspace",
+    about: &[
+        "Clones a live image of the project's main workspace and mounts it. The clone is copy-on-write, so a workspace costs the writes it makes rather than a copy of the tree, and it inherits main's source, dependencies, and build state warm.",
+        "A build slot is a stable mount path — `mnt/<owner>/<repo>/slot@<n>` — held by one workspace at a time and released when that workspace is removed or renamed, so the next tenant of slot n builds through byte-identical absolute paths. That path identity is the whole feature: cargo derives `-C metadata` from a package id carrying the absolute manifest directory, and sccache hashes the compiler's physical working directory, so the same sources built at two paths are two different compilations that share no compile cache. A slot tenant is therefore also given `RUSTC_WRAPPER=sccache` and `CARGO_INCREMENTAL=0`, trading local incrementality for a cache its successors can hit; main cannot take a slot, because its mount is fixed by the checkout layout.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--ref <rev>",
+            meaning: "start the branch at <rev> instead of main's tip; conflicts with --from",
+        },
+        Opt {
+            spelling: "--from <ws>",
+            meaning: "clone another workspace of this project instead of main; conflicts with --ref",
+        },
+        Opt {
+            spelling: "--browse",
+            meaning: "show the volume in Finder; the default mount is nobrowse",
+        },
+        Opt {
+            spelling: "--slot <n>",
+            meaning: "mount at build slot <n>'s stable path instead of one named after the workspace, so compiler caches keyed on absolute paths survive the tenant",
+        },
+        Opt {
+            spelling: "--register",
+            meaning: "also add the workspace as a remote in main's repository; off by default because it is host-side state that outlives an interrupted retire",
+        },
+        Opt {
+            spelling: "--git-worktree",
+            meaning: "mint a linked worktree of main's repository instead of a standalone clone: one object store and one ref namespace, at the cost of requiring main mounted and giving up checkpoint and restore",
+        },
+    ],
+};
+
 fn parse_new(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "new <name> [--ref <rev> | --from <ws>] [--browse] [--slot <n>] [--register] [--git-worktree]";
+    const USAGE: &CommandSpec = &NEW;
     let mut name = None;
     let mut reference = None;
     let mut from = None;
@@ -661,12 +893,23 @@ fn parse_new(
     }))
 }
 
+const FORK: CommandSpec = CommandSpec {
+    name: "fork",
+    args: "<src> <dst>",
+    trailing: "",
+    summary: "fork a workspace",
+    about: &[
+        "Clones a running workspace: two divergent futures from the same mid-flight state, in milliseconds. Grants are not inherited — a fork starts closed, like any new workspace.",
+    ],
+    options: &[],
+};
+
 fn parse_fork(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "fork <src> <dst>";
+    const USAGE: &CommandSpec = &FORK;
     let mut source = None;
     let mut destination = None;
     while index < args.len() {
@@ -697,12 +940,23 @@ fn parse_fork(
     }))
 }
 
+const MOVE: CommandSpec = CommandSpec {
+    name: "mv",
+    args: "<ws> <new-name> | main <new-checkout-path>",
+    trailing: "",
+    summary: "rename a workspace or move the checkout",
+    about: &[
+        "The source decides what the destination means. `mv main <path>` moves the adopted checkout to an absolute path and keeps every record of where it lives in step; every other source renames a workspace, whose new name is subject to the ordinary name grammar and cannot be `main`.",
+    ],
+    options: &[],
+};
+
 fn parse_move(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "mv <ws> <new-name> | mv main <new-checkout-path>";
+    const USAGE: &CommandSpec = &MOVE;
     let mut source: Option<String> = None;
     let mut destination: Option<OsString> = None;
     while index < args.len() {
@@ -742,7 +996,7 @@ fn parse_move(
 /// A checkout destination is a path, and the only thing the parser can decide about it is that it
 /// is spelt absolutely. Whether it exists, is occupied, or overlaps cowshed storage is the
 /// coordinator's to refuse, with the project state in hand to say why.
-fn checkout_destination(value: &OsStr, usage: &'static str) -> Result<PathBuf, UsageError> {
+fn checkout_destination(value: &OsStr, usage: &'static CommandSpec) -> Result<PathBuf, UsageError> {
     let path = PathBuf::from(value);
     if !path.is_absolute() {
         return Err(UsageError::new(
@@ -753,12 +1007,26 @@ fn checkout_destination(value: &OsStr, usage: &'static str) -> Result<PathBuf, U
     Ok(path)
 }
 
+const CHECKPOINT: CommandSpec = CommandSpec {
+    name: "checkpoint",
+    args: "[<ws>] [label]",
+    trailing: "",
+    summary: "create a checkpoint",
+    about: &[
+        "Clonefiles the workspace image under a label — generated from the UTC timestamp when you do not give one — after a supervisor barrier seals complete job output, so the snapshot is crash-consistent rather than merely recent. Omit the workspace to checkpoint the one you are standing in.",
+    ],
+    options: &[Opt {
+        spelling: "--keep",
+        meaning: "pin the checkpoint so expiry pruning never reclaims it; an explicit label pins it too",
+    }],
+};
+
 fn parse_checkpoint(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "checkpoint <ws> [label] [--keep]";
+    const USAGE: &CommandSpec = &CHECKPOINT;
     let mut workspace = None;
     let mut label = None;
     let mut keep = false;
@@ -789,12 +1057,23 @@ fn parse_checkpoint(
     }))
 }
 
+const RESTORE: CommandSpec = CommandSpec {
+    name: "restore",
+    args: "<ws> <label>",
+    trailing: "",
+    summary: "restore a checkpoint",
+    about: &[
+        "Swaps the workspace's image for the checkpoint and mints a new workspace incarnation. The displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is itself undoable; a restore over unsaved work is refused.",
+    ],
+    options: &[],
+};
+
 fn parse_restore(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "restore <ws> <label>";
+    const USAGE: &CommandSpec = &RESTORE;
     let mut workspace = None;
     let mut label = None;
     while index < args.len() {
@@ -823,12 +1102,32 @@ fn parse_restore(
     }))
 }
 
+const ENSURE: CommandSpec = CommandSpec {
+    name: "ensure",
+    args: "",
+    trailing: "",
+    summary: "heal the current workspace",
+    about: &[
+        "The fast auto-fix, and the one command safe to run on every prompt: a healthy workspace costs a marker read and a statfs, and says nothing. Otherwise it reattaches images after a reboot or a Finder eject, repairs mount flags, re-arms the autosave agent, and reconciles whatever drifted — synchronously, so when it returns you are standing in a valid workspace.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--envrc",
+            meaning: "also print the POSIX shell exports for the current workspace, for `eval` or an .envrc",
+        },
+        Opt {
+            spelling: "--attach",
+            meaning: "the explicit remount spelling, for devenv-native repositories",
+        },
+    ],
+};
+
 fn parse_ensure(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "ensure [--envrc] [--attach]";
+    const USAGE: &CommandSpec = &ENSURE;
     let mut parsed = EnsureArgs::default();
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
@@ -850,12 +1149,26 @@ fn parse_ensure(
     Ok(Command::Ensure(parsed))
 }
 
+const LIST: CommandSpec = CommandSpec {
+    name: "ls",
+    args: "",
+    trailing: "",
+    summary: "list workspaces",
+    about: &[
+        "One line per workspace of the project selected by the cwd or `--project`: name, state, branch, and mountpoint (empty when detached).",
+    ],
+    options: &[Opt {
+        spelling: "--all",
+        meaning: "every adopted project on the host, with its repository id as the first column",
+    }],
+};
+
 fn parse_list(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "ls [--all]";
+    const USAGE: &CommandSpec = &LIST;
     let mut parsed = ListArgs::default();
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
@@ -877,7 +1190,7 @@ fn parse_list(
 fn parse_slot(
     args: &[OsString],
     index: &mut usize,
-    usage: &'static str,
+    usage: &'static CommandSpec,
 ) -> Result<u32, UsageError> {
     let value = take_value(args, index, "--slot", usage)?;
     value
@@ -886,12 +1199,32 @@ fn parse_slot(
         .ok_or_else(|| UsageError::new("--slot must be an unsigned integer", usage))
 }
 
+const PATH: CommandSpec = CommandSpec {
+    name: "path",
+    args: "[<ws>]",
+    trailing: "",
+    summary: "print a workspace mount",
+    about: &[
+        "The mountpoint, bare on stdout, for `cd $(cowshed path raven)`. A detached workspace is attached first, so the path printed is always live. Naming no workspace answers for the one you are standing in.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--slot <n>",
+            meaning: "answer for build slot <n>'s current tenant instead of a named workspace, without the caller knowing which workspace holds it; the two are exclusive",
+        },
+        Opt {
+            spelling: "--no-attach",
+            meaning: "skip the healing and print the would-be path of a detached workspace",
+        },
+    ],
+};
+
 fn parse_path(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "path [<ws> | --slot <n>] [--no-attach]";
+    const USAGE: &CommandSpec = &PATH;
     let mut workspace = None;
     let mut slot = None;
     let mut no_attach = false;
@@ -923,12 +1256,69 @@ fn parse_path(
     }))
 }
 
+const EXEC: CommandSpec = CommandSpec {
+    name: "exec",
+    args: "<ws>",
+    trailing: "-- <cmd...>",
+    summary: "run an argv command",
+    about: &[
+        "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
+        "Long commands auto-background at the soft timeout and keep running under the workspace supervisor, where `cowshed job` reaches them.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--stdin",
+            meaning: "forward this process's stdin to the child",
+        },
+        Opt {
+            spelling: "--stdin-file <rel>",
+            meaning: "read the child's stdin from a workspace-relative file",
+        },
+        Opt {
+            spelling: "--stdin-base64 <data>",
+            meaning: "decode the child's stdin from inline base64, instead of interpolating input into command text",
+        },
+        Opt {
+            spelling: "--ro",
+            meaning: "run against a read-only view of the workspace",
+        },
+        Opt {
+            spelling: "--cwd <rel>",
+            meaning: "run in a workspace-relative directory instead of the workspace root",
+        },
+        Opt {
+            spelling: "--session <name>",
+            meaning: "run in a persistent named shell session whose cwd, variables, and jobs survive across calls",
+        },
+        Opt {
+            spelling: "--timeout <dur>",
+            meaning: "soft timeout before the command auto-backgrounds (default 120s)",
+        },
+        Opt {
+            spelling: "--background",
+            meaning: "background the command immediately instead of waiting for the soft timeout",
+        },
+        Opt {
+            spelling: "--stdout-copy <rel>",
+            meaning: "also publish stdout to this workspace-relative file",
+        },
+        Opt {
+            spelling: "--stderr-copy <rel>",
+            meaning: "also publish stderr to this workspace-relative file",
+        },
+        Opt {
+            spelling: "--replace-output",
+            meaning: "overwrite an existing publication target; without it a copy refuses to clobber",
+        },
+    ],
+};
+
 fn parse_exec(
     args: &mut Vec<OsString>,
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "exec <ws> [--stdin | --stdin-file <rel> | --stdin-base64 <data>] [--ro] [--cwd <rel>] [--session <name>] [--timeout <dur>] [--background] [--stdout-copy <rel>] [--stderr-copy <rel>] [--replace-output] -- <cmd...>";
+    const USAGE: &CommandSpec = &EXEC;
     let mut workspace = None;
     let mut stdin = None;
     let mut read_only = false;
@@ -1030,14 +1420,40 @@ fn parse_exec(
     }))
 }
 
+/// Usage text is where the destructive flags are documented: a human reads options here
+/// deliberately, whereas a refusal message is what an agent pattern-matches into a retry — which
+/// is why no refusal names the flag that would override it.
+const REMOVE: CommandSpec = CommandSpec {
+    name: "rm",
+    args: "<ws>",
+    trailing: "",
+    summary: "retire a workspace",
+    about: &[
+        "Retires one workspace, deleting the image its commits live in. The gate is therefore ancestry, not preservation: `rm` refuses unless the project's main branch already contains the workspace's HEAD, read out of main's own repository. The workspace is marked deleted immediately; detach and image deletion finish in the background.",
+        "The two overrides authorize different losses and neither substitutes for the other, so a script carrying one has not acquired the other.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--force",
+            meaning: "waive transient state only — a dirty tree, an in-progress merge, a busy mount; it does not reach the landed-ancestry gate",
+        },
+        Opt {
+            spelling: "--restore",
+            meaning: "main only: put the pre-adoption checkout back and unbind the project, the reverse of adopt",
+        },
+        Opt {
+            spelling: "--abandon",
+            meaning: "the sole authorization for destroying commits main does not contain; before deleting, main..HEAD is bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported, so it stays recoverable by fetching that bundle",
+        },
+    ],
+};
+
 fn parse_remove(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    // Usage text is where the destructive flag is documented: a human reads options here
-    // deliberately, whereas a refusal message is what an agent pattern-matches into a retry.
-    const USAGE: &str = "rm <ws> [--force] [--restore] [--abandon]";
+    const USAGE: &CommandSpec = &REMOVE;
     let mut workspace = None;
     let mut force = false;
     let mut restore = false;
@@ -1079,12 +1495,26 @@ fn parse_remove(
     }))
 }
 
+const ATTACH: CommandSpec = CommandSpec {
+    name: "attach",
+    args: "<ws>",
+    trailing: "",
+    summary: "attach a workspace",
+    about: &[
+        "Mounts a detached workspace again. A detached workspace costs one closed file, so detaching is how a workspace waits without being deleted.",
+    ],
+    options: &[Opt {
+        spelling: "--browse",
+        meaning: "show the volume in Finder; the default mount is nobrowse",
+    }],
+};
+
 fn parse_attach(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "attach <ws> [--browse]";
+    const USAGE: &CommandSpec = &ATTACH;
     let mut workspace = None;
     let mut browse = false;
     while index < args.len() {
@@ -1113,12 +1543,23 @@ fn parse_attach(
     }))
 }
 
+const DETACH: CommandSpec = CommandSpec {
+    name: "detach",
+    args: "<ws>",
+    trailing: "",
+    summary: "detach a workspace",
+    about: &[
+        "Unmounts the workspace and stops its supervisor without destroying anything. `attach`, `path`, and `ensure` bring it back.",
+    ],
+    options: &[],
+};
+
 fn parse_detach(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "detach <ws>";
+    const USAGE: &CommandSpec = &DETACH;
     let mut workspace = None;
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
@@ -1144,12 +1585,23 @@ fn parse_detach(
     }))
 }
 
+const RESIZE: CommandSpec = CommandSpec {
+    name: "resize",
+    args: "<ws|main> <size>",
+    trailing: "",
+    summary: "grow a workspace image",
+    about: &[
+        "Grows one workspace's image. Sizes are binary units — 100g, 200g, 1t — at least a mebibyte and a whole number of the 4 KiB blocks the image tools resize in. The supervisor is stopped for the resize and restarted after, because the image has to leave the kernel.",
+    ],
+    options: &[],
+};
+
 fn parse_resize(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "resize <ws> <size>";
+    const USAGE: &CommandSpec = &RESIZE;
     let mut workspace = None;
     let mut capacity: Option<OsString> = None;
     while index < args.len() {
@@ -1180,12 +1632,26 @@ fn parse_resize(
     }))
 }
 
+const GC: CommandSpec = CommandSpec {
+    name: "gc",
+    args: "",
+    trailing: "",
+    summary: "reclaim storage",
+    about: &[
+        "Deletes orphaned images and stale mountpoint directories, prunes expired checkpoints, compacts detached images, and reports what it reclaimed. Safe at any time; other commands run it opportunistically.",
+    ],
+    options: &[Opt {
+        spelling: "--dry-run",
+        meaning: "report what would be reclaimed without deleting anything",
+    }],
+};
+
 fn parse_gc(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "gc [--dry-run]";
+    const USAGE: &CommandSpec = &GC;
     let mut parsed = GcArgs::default();
     while index < args.len() {
         if parse_global(args, &mut index, global)? {
@@ -1201,12 +1667,41 @@ fn parse_gc(
     Ok(Command::Gc(parsed))
 }
 
+const PUSH: CommandSpec = CommandSpec {
+    name: "push",
+    args: "[<ws>]",
+    trailing: "",
+    summary: "preserve a workspace ref",
+    about: &[
+        "Delivers the workspace branch into main's repository. Under the hood it is a host-side fetch from the workspace mount, so nothing inside the sandbox — hooks, `.git/config` — ever runs outside it. Naming no workspace pushes the one you are standing in.",
+        "The `--expected-*` preconditions are for a coordinator driving several workspaces at once: each is checked before anything moves, so a stale plan is refused rather than applied to a workspace that changed underneath it.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--branch <name>",
+            meaning: "destination branch in main's repository instead of the workspace's own",
+        },
+        Opt {
+            spelling: "--expected-workspace-incarnation <id>",
+            meaning: "refuse unless the workspace is still this incarnation",
+        },
+        Opt {
+            spelling: "--expected-source-head <oid>",
+            meaning: "refuse unless the workspace HEAD is still this commit",
+        },
+        Opt {
+            spelling: "--expected-destination-head <oid|missing>",
+            meaning: "refuse unless the destination branch is still this commit, or `missing` for one that must not exist yet",
+        },
+    ],
+};
+
 fn parse_push(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "push <ws> [--branch <name>] [--expected-workspace-incarnation <id>] [--expected-source-head <oid>] [--expected-destination-head <oid|missing>]";
+    const USAGE: &CommandSpec = &PUSH;
     let mut workspace = None;
     let mut branch = None;
     let mut expected_workspace_incarnation = None;
@@ -1259,12 +1754,44 @@ fn parse_push(
     }))
 }
 
+const REBASE: CommandSpec = CommandSpec {
+    name: "rebase",
+    args: "[<ws>]",
+    trailing: "",
+    summary: "rebase a workspace",
+    about: &[
+        "Brings the workspace branch up to current main, run inside the sandbox. A conflict aborts cleanly and names the conflicted paths, leaving the workspace as it was. Naming no workspace rebases the one you are standing in.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--onto <rev>",
+            meaning: "rebase onto this revision instead of main",
+        },
+        Opt {
+            spelling: "--fresh",
+            meaning: "shed accumulated image divergence: replay the branch onto a brand-new clone of current main and transplant the workspace's identity onto it; refused on a dirty tree",
+        },
+        Opt {
+            spelling: "--expected-workspace-incarnation <id>",
+            meaning: "refuse unless the workspace is still this incarnation",
+        },
+        Opt {
+            spelling: "--expected-source-head <oid>",
+            meaning: "refuse unless the workspace HEAD is still this commit",
+        },
+        Opt {
+            spelling: "--expected-onto-head <oid>",
+            meaning: "refuse unless the revision being rebased onto is still this commit",
+        },
+    ],
+};
+
 fn parse_rebase(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "rebase <ws> [--onto <rev>] [--fresh] [--expected-workspace-incarnation <id>] [--expected-source-head <oid>] [--expected-onto-head <oid>]";
+    const USAGE: &CommandSpec = &REBASE;
     let mut workspace = None;
     let mut onto = None;
     let mut fresh = false;
@@ -1321,12 +1848,53 @@ fn parse_rebase(
     }))
 }
 
+const LAND: CommandSpec = CommandSpec {
+    name: "land",
+    args: "<ws>",
+    trailing: "",
+    summary: "land a workspace",
+    about: &[
+        "The whole close-out as one primitive: rebase onto the target branch, run the checks inside the sandbox, fast-forward main's repository from the workspace, retire the workspace. Any failing step stops there and leaves the workspace intact, so a landing is all-or-nothing without being a long-lived transaction.",
+        "Landing is also what `rm` measures against: the ancestry gate a removal enforces is satisfied by the branch this command delivers to.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--target <branch>",
+            meaning: "land onto this branch of main's repository instead of main",
+        },
+        Opt {
+            spelling: "--check <cmd>",
+            meaning: "validation command run inside the sandbox, repeatable; the default comes from .cowshed.toml [land] check",
+        },
+        Opt {
+            spelling: "--no-retire",
+            meaning: "keep the workspace after a successful landing",
+        },
+        Opt {
+            spelling: "--push-only",
+            meaning: "stop after validation and delivery, for review-gated flows",
+        },
+        Opt {
+            spelling: "--expected-workspace-incarnation <id>",
+            meaning: "refuse unless the workspace is still this incarnation",
+        },
+        Opt {
+            spelling: "--expected-source-head <oid>",
+            meaning: "refuse unless the workspace HEAD is still this commit",
+        },
+        Opt {
+            spelling: "--expected-target-head <oid|missing>",
+            meaning: "refuse unless the target branch is still this commit, or `missing` for one that must not exist yet",
+        },
+    ],
+};
+
 fn parse_land(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
-    const USAGE: &str = "land <ws> [--target <branch>] [--check <cmd>] [--no-retire] [--push-only] [--expected-workspace-incarnation <id>] [--expected-source-head <oid>] [--expected-target-head <oid|missing>]";
+    const USAGE: &CommandSpec = &LAND;
     let mut workspace = None;
     let mut target = None;
     let mut checks = Vec::new();
@@ -1388,11 +1956,22 @@ fn parse_land(
     }))
 }
 
+const DOCTOR: CommandSpec = CommandSpec {
+    name: "doctor",
+    args: "",
+    trailing: "",
+    summary: "check invariants",
+    about: &[
+        "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh. Exit 0 when healthy, otherwise the code of the most severe finding.",
+    ],
+    options: &[],
+};
+
 fn parse_empty(
     args: &[OsString],
     mut index: usize,
     global: &mut GlobalOptions,
-    command: &'static str,
+    spec: &'static CommandSpec,
     parsed: Command,
 ) -> Result<Command, UsageError> {
     while index < args.len() {
@@ -1400,8 +1979,8 @@ fn parse_empty(
             continue;
         }
         return Err(UsageError::new(
-            format!("{command} accepts no arguments"),
-            command,
+            format!("{} accepts no arguments", spec.name),
+            spec,
         ));
     }
     Ok(parsed)
@@ -1411,7 +1990,7 @@ fn take_value(
     args: &[OsString],
     index: &mut usize,
     option: &str,
-    usage: &'static str,
+    usage: &'static CommandSpec,
 ) -> Result<OsString, UsageError> {
     *index += 1;
     args.get(*index)
@@ -1422,7 +2001,7 @@ fn take_value(
 fn set_stdin(
     target: &mut Option<StdinSource>,
     value: StdinSource,
-    usage: &'static str,
+    usage: &'static CommandSpec,
 ) -> Result<(), UsageError> {
     if target.is_some() {
         return Err(UsageError::new(
@@ -1437,7 +2016,7 @@ fn set_output_copy(
     target: &mut Option<PathBuf>,
     value: PathBuf,
     option: &str,
-    usage: &'static str,
+    usage: &'static CommandSpec,
 ) -> Result<(), UsageError> {
     if target.replace(value).is_some() {
         return Err(UsageError::new(
@@ -1451,7 +2030,7 @@ fn set_output_copy(
 fn workspace_name(
     value: &OsStr,
     reserve_main: bool,
-    usage: &'static str,
+    usage: &'static CommandSpec,
 ) -> Result<String, UsageError> {
     let Some(value) = value.to_str() else {
         return Err(UsageError::new("workspace names must be UTF-8", usage));
@@ -1475,7 +2054,7 @@ fn workspace_name(
     Ok(value.to_owned())
 }
 
-fn unknown_flag(flag: &str, usage: &'static str) -> UsageError {
+fn unknown_flag(flag: &str, usage: &'static CommandSpec) -> UsageError {
     UsageError::new(format!("unknown flag `{flag}`"), usage)
 }
 
@@ -1893,30 +2472,107 @@ mod tests {
         assert_eq!(error.exit_code(), 2);
         assert_eq!(error.kind, UsageErrorKind::MissingCommand);
         let map = error.command_map().unwrap();
-        for command in [
-            "adopt",
-            "new",
-            "fork",
-            "checkpoint",
-            "restore",
-            "ensure",
-            "ls",
-            "path",
-            "exec",
-            "rm",
-            "attach",
-            "detach",
-            "gc",
-            "push",
-            "rebase",
-            "land",
-            "doctor",
-        ] {
+        // Every verb the parser dispatches, including the ones a hand-written map forgot.
+        for spec in COMMANDS {
             assert!(
                 map.lines()
-                    .any(|line| line.trim_start().starts_with(command)),
-                "missing {command}"
+                    .any(|line| line.trim_start().starts_with(spec.name)),
+                "missing {}",
+                spec.name
             );
+        }
+        assert!(map.lines().any(|line| line.trim_start().starts_with("mv")));
+    }
+
+    /// `--help` is answered wherever it is typed, including inside a command line the parser would
+    /// otherwise refuse — which is exactly when it gets typed.
+    #[test]
+    fn help_is_answered_before_a_verb_grammar_is_enforced() {
+        for spelling in [["--help"], ["-h"], ["help"]] {
+            assert_eq!(parse_args(spelling).unwrap().command, Command::Help(None));
+        }
+
+        let new = help::command_named("new").unwrap();
+        assert_eq!(
+            parse_args(["new", "--help"]).unwrap().command,
+            Command::Help(Some(new))
+        );
+        assert_eq!(
+            parse_args(["help", "new"]).unwrap().command,
+            Command::Help(Some(new))
+        );
+        // A half-typed line answers the question rather than refusing the grammar it is missing.
+        assert_eq!(
+            parse_args(["new", "--slot", "--help"]).unwrap().command,
+            Command::Help(Some(new))
+        );
+
+        // Globals still parse around it.
+        let cli = parse_args(["--json", "--help"]).unwrap();
+        assert_eq!(cli.command, Command::Help(None));
+        assert!(cli.global.json);
+
+        // Past `--` the argument belongs to the child, not to cowshed.
+        let Command::Exec(exec) = parse_args(["exec", "raven", "--", "cargo", "--help"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected exec")
+        };
+        assert_eq!(exec.argv, ["cargo", "--help"]);
+        assert_eq!(
+            parse_args(["exec", "raven", "--help", "--", "cargo"])
+                .unwrap()
+                .command,
+            Command::Help(help::command_named("exec"))
+        );
+
+        assert!(parse_args(["help", "new", "rm"]).is_err());
+    }
+
+    /// A mistyped verb is corrected, because an agent that only learns "unknown command" retries
+    /// the same spelling.
+    #[test]
+    fn an_unknown_command_names_the_command_that_was_meant() {
+        let error = parse_args(["sscache"]).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.message,
+            "unknown command `sscache`; did you mean: sccache"
+        );
+        assert_eq!(error.hint, "cowshed --help");
+
+        assert_eq!(
+            parse_args(["help", "sscache"]).unwrap_err().message,
+            "unknown command `sscache`; did you mean: sccache"
+        );
+
+        // Nothing within two edits: no invented suggestion.
+        let unrelated = parse_args(["frobnicate"]).unwrap_err();
+        assert_eq!(unrelated.message, "unknown command `frobnicate`");
+    }
+
+    /// The grammar a usage error hints is the option table printed, so the flags a verb accepts
+    /// and the flags its usage line advertises cannot drift apart.
+    #[test]
+    fn usage_hints_come_from_the_same_table_as_the_help() {
+        let error = parse_args(["new", "raven", "--unknown"]).unwrap_err();
+        assert_eq!(error.message, "unknown flag `--unknown`");
+        assert_eq!(
+            error.hint,
+            "cowshed new <name> [--ref <rev>] [--from <ws>] [--browse] [--slot <n>] [--register] [--git-worktree]"
+        );
+
+        for spec in COMMANDS {
+            let hint = spec.hint();
+            for option in spec.options {
+                assert!(
+                    hint.contains(option.spelling),
+                    "{} hints without {}",
+                    spec.name,
+                    option.spelling
+                );
+            }
         }
     }
 }
