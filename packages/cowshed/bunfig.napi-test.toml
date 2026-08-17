@@ -1,4 +1,6 @@
 [test]
 # The NAPI smoke test imports compiled JavaScript, so Typia source transformation is unnecessary.
 # Keep trace coverage through LMAO's compiled preload without paying compiler startup on every run.
-preload = ["../lmao/dist/ts/bun/trace-preload.js"]
+# Bun resolves a preload path against the cwd, not against this file, and both targets that pass
+# this config run from <projectRoot>/src so `bun test <arg>` never scans the cargo target tree.
+preload = ["../../lmao/dist/ts/bun/trace-preload.js"]
