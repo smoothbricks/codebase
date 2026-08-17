@@ -93,9 +93,8 @@ MOUNT=$(cowshed new "$WS")
 cd "$MOUNT"
 cowshed exec "$WS" -- bun test
 
-# 5. Preserve the branch, then remove the workspace.
-cowshed push "$WS"
-cowshed rm "$WS"
+# 5. Land the branch into main; that retires the workspace.
+cowshed land "$WS"
 ```
 
 From outside the repository, make selection explicit:

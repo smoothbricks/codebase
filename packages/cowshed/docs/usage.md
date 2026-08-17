@@ -168,14 +168,18 @@ Restore it if needed:
 cowshed restore "$WS" before-refactor
 ```
 
-Preserve the branch, then remove the workspace:
+Land the work, then remove the workspace:
 
 ```sh
-cowshed push "$WS"
-cowshed rm "$WS"
+cowshed land "$WS"
 ```
 
-`rm` refuses when commits have not been preserved. Use `--force` only when discarding them is intentional.
+`land` retires the workspace once its commits are in `main`, so there is usually no separate `rm`. Removing a workspace
+destroys the image its commits live in, so `rm` refuses until `main` contains the workspace's `HEAD`.
+
+`--force` overrides _transient_ state only — a dirty tree, an in-progress merge, a busy mount. It does not authorize
+destroying commits. `--abandon` does, and only that: it bundles the unlanded commits into `sessions/.trash` first and
+prints what it destroyed.
 
 ## Recommended coding-agent workflow
 
@@ -214,15 +218,15 @@ For parallel exploration, fork the current state instead of rebuilding it:
 cowshed fork "$WS" "$WS-alt" --project "$PROJECT"
 ```
 
-When the task is complete:
+When the task is complete, land it:
 
 ```sh
-cowshed push "$WS" --project "$PROJECT"
-cowshed rm "$WS" --project "$PROJECT"
+cowshed land "$WS" --project "$PROJECT"
 ```
 
-If `rm` reports a conflict, do not automatically add `--force`: the conflict is the data-loss fence telling the agent to
-preserve or explicitly discard its work.
+If `rm` reports a conflict, **do not reach for a flag**. The conflict is the data-loss fence: the workspace holds
+commits that exist nowhere else, and the remedy it names — `cowshed land <ws>` — is the one that keeps them. `--force`
+will not get past it, by design; `--abandon` will, and destroys them (recoverably, via the bundle it writes) on purpose.
 
 ## Machine-readable operation
 
@@ -259,8 +263,8 @@ Errors use the same frozen shape:
   "ok": false,
   "error": {
     "code": "conflict",
-    "message": "workspace agent-4821 has unpublished changes",
-    "hint": "push or land the workspace, or retry with: cowshed rm agent-4821 --force"
+    "message": "workspace agent-4821 head 9b2e77d… is not contained by main (main is at 6f3a2c1…)",
+    "hint": "land the workspace: cowshed land agent-4821"
   }
 }
 ```

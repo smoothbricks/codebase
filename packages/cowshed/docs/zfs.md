@@ -123,7 +123,7 @@ it per workspace:
 
 ```
 cowshed: raven pins 1.2g of main@cowshed:raven (workspace 9 days old)
-next: cowshed push raven && cowshed rm raven   # if it's done
+next: cowshed land raven   # if it's done
 ```
 
 `cowshed gc` prunes `cowshed:*` snapshots whose workspace is gone (crash leftovers).

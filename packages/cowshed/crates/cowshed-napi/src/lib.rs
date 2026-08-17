@@ -455,10 +455,11 @@ impl Coordinator {
         let coordinator = Arc::clone(&self.inner);
         spawn_promise(env, async move {
             let options = parse_json::<RemoveOptions>("remove options", &options_json)?;
-            coordinator
+            let report = coordinator
                 .destroy(&workspace, options)
                 .await
-                .map_err(AddonFailure::from)
+                .map_err(AddonFailure::from)?;
+            canonical_json("remove report", &report)
         })
     }
 
