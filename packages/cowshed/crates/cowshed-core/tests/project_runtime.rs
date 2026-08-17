@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::dto::{
-    AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
+    AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, CreateOptions, DoctorReport, EnsureAction, EnsureReport, Finding,
     FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId,
     JobInfo, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, ResizeResult, WorkspaceInfo, WorkspaceState,
+    RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -41,6 +41,7 @@ enum Event {
     RestoreEvidence(WorkspaceName),
     RestoreActivate(WorkspaceName),
     GitSafety(WorkspaceName),
+    Bundle(WorkspaceName),
     Detach(WorkspaceName),
     AtomicCheckoutRestore(PathBuf),
     RemoveBinding,
@@ -78,7 +79,7 @@ struct DurableState {
 #[derive(Clone, Debug)]
 struct FakeRemoval {
     dirty: std::collections::BTreeSet<WorkspaceName>,
-    unpreserved: std::collections::BTreeSet<WorkspaceName>,
+    unlanded: std::collections::BTreeSet<WorkspaceName>,
     change_head_at_fence: std::collections::BTreeSet<WorkspaceName>,
     main_in_progress: bool,
     pre_cowshed_present: bool,
@@ -92,7 +93,7 @@ impl Default for FakeRemoval {
     fn default() -> Self {
         Self {
             dirty: std::collections::BTreeSet::new(),
-            unpreserved: std::collections::BTreeSet::new(),
+            unlanded: std::collections::BTreeSet::new(),
             change_head_at_fence: std::collections::BTreeSet::new(),
             main_in_progress: false,
             pre_cowshed_present: true,
@@ -629,7 +630,11 @@ impl ProjectRuntimeHost for FakeHost {
         self.persist()
     }
 
-    async fn remove(&mut self, workspace: WorkspaceName, options: RemoveOptions) -> Result<()> {
+    async fn remove(
+        &mut self,
+        workspace: WorkspaceName,
+        options: RemoveOptions,
+    ) -> Result<RemoveReport> {
         if options.force && options.restore {
             return Err(CowshedError::usage(
                 "force and restore are ambiguous",
@@ -649,6 +654,7 @@ impl ProjectRuntimeHost for FakeHost {
             .position(|current| current.name == workspace)
             .ok_or_else(|| CowshedError::not_found("workspace missing", "list workspaces"))?;
         self.events.send(Event::GitSafety(workspace.clone())).ok();
+        let mut abandoned = None;
 
         if options.restore {
             if !self.removal.pre_cowshed_present && !self.removal.restore_swapped {
@@ -687,10 +693,16 @@ impl ProjectRuntimeHost for FakeHost {
                 }
             }
         } else {
+            if workspace.is_main() && options.abandon {
+                return Err(CowshedError::usage(
+                    "abandon applies to session workspaces",
+                    "remove a session with abandon",
+                ));
+            }
             if workspace.is_main() && !options.force {
                 return Err(CowshedError::conflict(
-                    "main requires force",
-                    "retry with force or restore",
+                    "main removal without restore destroys the warm main image",
+                    "recover the pre-adoption checkout instead",
                 ));
             }
             if workspace.is_main()
@@ -701,14 +713,21 @@ impl ProjectRuntimeHost for FakeHost {
                     "finish or discard Git work",
                 ));
             }
+            // Transient state is force's business; unlanded commits are abandon's, and neither
+            // flag stands in for the other.
+            if !workspace.is_main() && !options.force && self.removal.dirty.contains(&workspace) {
+                return Err(CowshedError::conflict(
+                    "workspace has uncommitted Git work",
+                    "commit the work and land it",
+                ));
+            }
             if !workspace.is_main()
-                && !options.force
-                && (self.removal.dirty.contains(&workspace)
-                    || self.removal.unpreserved.contains(&workspace))
+                && !options.abandon
+                && self.removal.unlanded.contains(&workspace)
             {
                 return Err(CowshedError::conflict(
-                    "workspace work is not preserved",
-                    "push or land, or retry with force",
+                    "workspace head is not contained by main",
+                    "land the workspace",
                 ));
             }
             self.events.send(Event::Stop(workspace.clone())).ok();
@@ -717,6 +736,19 @@ impl ProjectRuntimeHost for FakeHost {
                     "workspace HEAD changed during removal",
                     "review and retry",
                 ));
+            }
+            if self.removal.unlanded.contains(&workspace) {
+                abandoned = Some(AbandonedWork {
+                    head: GitOid::new("4".repeat(40)).expect("fixed head"),
+                    target_branch: "main".to_owned(),
+                    target_head: Some(GitOid::new("1".repeat(40)).expect("fixed tip")),
+                    unlanded_commits: 3,
+                    bundle: self.descriptor.store_root.join(format!(
+                        "sessions/.trash/{workspace}-{}.bundle",
+                        "4".repeat(40)
+                    )),
+                });
+                self.events.send(Event::Bundle(workspace.clone())).ok();
             }
         }
 
@@ -734,7 +766,7 @@ impl ProjectRuntimeHost for FakeHost {
             }
             events.send(Event::Reclaim(workspace)).ok();
         }));
-        Ok(())
+        Ok(RemoveReport { abandoned })
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
@@ -2036,61 +2068,138 @@ async fn remove_stops_supervisor_before_retirement() {
     );
 }
 
+/// Dirt is `--force`'s business and nothing else's: it must not authorize a commit loss.
 #[tokio::test]
-async fn session_removal_refuses_dirty_or_unpreserved_work_unless_forced() {
-    for unsafe_kind in ["dirty", "unpreserved"] {
-        let root = test_root();
-        let name = WorkspaceName::new("unsafe").expect("name");
-        let mut removal = FakeRemoval::default();
-        if unsafe_kind == "dirty" {
-            removal.dirty.insert(name.clone());
-        } else {
-            removal.unpreserved.insert(name.clone());
-        }
-        let (_runtime, router, repo, mut events) =
-            start_with_removal(&root, false, false, Vec::new(), removal).await;
-        adopt(&router, &repo).await;
-        route(
-            &router,
-            coordinator(repo.clone()),
-            "coordinator.create",
-            json!({ "repoId": repo, "workspace": "unsafe", "options": CreateOptions::default() }),
-        )
-        .await
-        .expect("create");
-        while events.try_recv().is_ok() {}
+async fn session_removal_refuses_dirty_work_until_forced() {
+    let root = test_root();
+    let name = WorkspaceName::new("unsafe").expect("name");
+    let mut removal = FakeRemoval::default();
+    removal.dirty.insert(name.clone());
+    let (_runtime, router, repo, mut events) =
+        start_with_removal(&root, false, false, Vec::new(), removal).await;
+    adopt(&router, &repo).await;
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "unsafe", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+    while events.try_recv().is_ok() {}
 
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({ "repoId": repo, "workspace": "unsafe", "options": RemoveOptions::default() }),
+    )
+    .await
+    .expect_err("dirty work must be refused");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
+    assert!(
+        events.try_recv().is_err(),
+        "safe refusal must not stop or retire"
+    );
+
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({
+            "repoId": repo,
+            "workspace": "unsafe",
+            "options": RemoveOptions { force: true, restore: false, abandon: false }
+        }),
+    )
+    .await
+    .expect("force overrides transient state");
+    assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
+    assert_eq!(events.recv().await, Some(Event::Stop(name.clone())));
+    assert_eq!(events.recv().await, Some(Event::Retire(name)));
+}
+
+/// The incident this gate exists for: a scripted `--force` removal of a workspace whose commits
+/// main does not contain. `--force` must not get past it; only `--abandon` may, and it leaves a
+/// bundle and a report behind.
+#[tokio::test]
+async fn unlanded_session_removal_survives_force_and_only_abandon_destroys_it() {
+    let root = test_root();
+    let name = WorkspaceName::new("unsafe").expect("name");
+    let mut removal = FakeRemoval::default();
+    removal.unlanded.insert(name.clone());
+    let (_runtime, router, repo, mut events) =
+        start_with_removal(&root, false, false, Vec::new(), removal).await;
+    adopt(&router, &repo).await;
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.create",
+        json!({ "repoId": repo, "workspace": "unsafe", "options": CreateOptions::default() }),
+    )
+    .await
+    .expect("create");
+    while events.try_recv().is_ok() {}
+
+    for options in [
+        RemoveOptions::default(),
+        RemoveOptions {
+            force: true,
+            restore: false,
+            abandon: false,
+        },
+    ] {
         let error = route(
             &router,
             coordinator(repo.clone()),
             "coordinator.destroy",
-            json!({ "repoId": repo, "workspace": "unsafe", "options": RemoveOptions::default() }),
+            json!({ "repoId": repo, "workspace": "unsafe", "options": options }),
         )
         .await
-        .expect_err("unsafe work must be refused");
+        .expect_err("unlanded commits must survive both plain and forced removal");
         assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(
+            !error.message.contains("--force")
+                && !error.message.contains("--abandon")
+                && !error.hint.contains("--force")
+                && !error.hint.contains("--abandon"),
+            "a refusal must not teach the flag that overrides it: {error:?}"
+        );
         assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
         assert!(
             events.try_recv().is_err(),
-            "safe refusal must not stop or retire"
+            "a landed-ancestry refusal must not stop or retire"
         );
-
-        route(
-            &router,
-            coordinator(repo.clone()),
-            "coordinator.destroy",
-            json!({
-                "repoId": repo,
-                "workspace": "unsafe",
-                "options": RemoveOptions { force: true, restore: false }
-            }),
-        )
-        .await
-        .expect("force explicitly accepts loss");
-        assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
-        assert_eq!(events.recv().await, Some(Event::Stop(name.clone())));
-        assert_eq!(events.recv().await, Some(Event::Retire(name)));
     }
+
+    let report: RemoveReport = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.destroy",
+        json!({
+            "repoId": repo,
+            "workspace": "unsafe",
+            "options": RemoveOptions { force: false, restore: false, abandon: true }
+        }),
+    )
+    .await
+    .map(|value| serde_json::from_value(value).expect("removal report"))
+    .expect("abandon is the sole authorization for unlanded commits");
+    let abandoned = report.abandoned.expect("abandonment must be reported");
+    assert_eq!(abandoned.target_branch, "main");
+    assert_eq!(abandoned.unlanded_commits, 3);
+    assert!(
+        abandoned
+            .bundle
+            .to_string_lossy()
+            .ends_with(&format!("unsafe-{}.bundle", "4".repeat(40))),
+        "the bundle path names the workspace and the abandoned tip: {abandoned:?}"
+    );
+    assert_eq!(events.recv().await, Some(Event::GitSafety(name.clone())));
+    assert_eq!(events.recv().await, Some(Event::Stop(name.clone())));
+    assert_eq!(events.recv().await, Some(Event::Bundle(name.clone())));
+    assert_eq!(events.recv().await, Some(Event::Retire(name)));
 }
 
 #[tokio::test]
@@ -2154,7 +2263,7 @@ async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
         json!({
             "repoId": repo,
             "workspace": "main",
-            "options": RemoveOptions { force: true, restore: false }
+            "options": RemoveOptions { force: true, restore: false, abandon: false }
         }),
     )
     .await
@@ -2175,7 +2284,7 @@ async fn plain_main_removal_requires_force_and_still_requires_clean_git() {
         json!({
             "repoId": repo,
             "workspace": "main",
-            "options": RemoveOptions { force: true, restore: false }
+            "options": RemoveOptions { force: true, restore: false, abandon: false }
         }),
     )
     .await
@@ -2199,7 +2308,7 @@ async fn main_restore_detaches_swaps_exact_checkout_and_then_retires() {
         json!({
             "repoId": repo,
             "workspace": "main",
-            "options": RemoveOptions { force: false, restore: true }
+            "options": RemoveOptions { force: false, restore: true, abandon: false }
         }),
     )
     .await
@@ -2245,7 +2354,7 @@ async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing(
             json!({
                 "repoId": repo,
                 "workspace": "main",
-                "options": RemoveOptions { force: false, restore: true }
+                "options": RemoveOptions { force: false, restore: true, abandon: false }
             }),
         )
         .await
@@ -2269,7 +2378,7 @@ async fn main_restore_missing_tree_collision_and_force_ambiguity_mutate_nothing(
         json!({
             "repoId": repo,
             "workspace": "main",
-            "options": RemoveOptions { force: true, restore: true }
+            "options": RemoveOptions { force: true, restore: true, abandon: false }
         }),
     )
     .await
@@ -2294,6 +2403,7 @@ async fn main_restore_retries_after_each_detach_and_swap_crash_boundary() {
         let options = RemoveOptions {
             force: false,
             restore: true,
+            abandon: false,
         };
         let error = route(
             &router,

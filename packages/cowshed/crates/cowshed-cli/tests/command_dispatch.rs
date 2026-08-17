@@ -184,10 +184,25 @@ impl CliService for FakeService {
         Ok(workspace(name, WorkspaceState::Attached))
     }
 
-    async fn remove(&mut self, name: &str, options: RemoveOptions) -> Result<()> {
-        self.events
-            .push(format!("rm:{name}:{}:{}", options.force, options.restore));
-        Ok(())
+    async fn remove(&mut self, name: &str, options: RemoveOptions) -> Result<RemoveReport> {
+        self.events.push(format!(
+            "rm:{name}:{}:{}:{}",
+            options.force, options.restore, options.abandon
+        ));
+        // Only an authorized abandonment has anything to report, and the dispatcher has to print
+        // exactly that.
+        Ok(RemoveReport {
+            abandoned: options.abandon.then(|| AbandonedWork {
+                head: GitOid::new("4".repeat(40)).expect("fixed head"),
+                target_branch: "main".to_owned(),
+                target_head: Some(GitOid::new("1".repeat(40)).expect("fixed tip")),
+                unlanded_commits: 3,
+                bundle: PathBuf::from(format!(
+                    "/store/acme/widget/sessions/.trash/{name}-{}.bundle",
+                    "4".repeat(40)
+                )),
+            }),
+        })
     }
 
     async fn attach(&mut self, name: &str, options: AttachOptions) -> Result<()> {
@@ -461,7 +476,7 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
             "ls",
             "path:raven:false",
             "exec:raven",
-            "rm:raven:true:false",
+            "rm:raven:true:false:false",
             "attach:raven:true",
             "detach:raven",
             "doctor",
@@ -826,7 +841,52 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
         service
             .events
             .iter()
-            .any(|event| event == "rm:main:false:true")
+            .any(|event| event == "rm:main:false:true:false")
+    );
+}
+
+/// An authorized abandonment is not a silent one: passing the flag buys the deletion, not silence.
+/// Both the tip that died and the bundle that is now its only copy have to reach the operator.
+#[tokio::test]
+async fn abandoning_removal_prints_what_it_destroyed_and_where_the_bundle_went() {
+    let mut service = FakeService::default();
+    let (_, stdout, stderr) = run(&mut service, ["rm", "raven", "--abandon"]).await;
+    assert!(stdout.is_empty(), "human mode keeps stdout free of prose");
+    let stderr = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert_eq!(
+        stderr,
+        format!(
+            "cowshed: abandoned 3 commits at {tip} that main (at {main}) did not contain\n\
+             cowshed: bundled to /store/acme/widget/sessions/.trash/raven-{tip}.bundle\n\
+             next: cowshed gc\n",
+            tip = "4".repeat(40),
+            main = "1".repeat(40)
+        )
+    );
+    assert!(
+        service
+            .events
+            .iter()
+            .any(|event| event == "rm:raven:false:false:true")
+    );
+
+    // An ordinary removal has nothing to announce, and says nothing.
+    let mut service = FakeService::default();
+    let (_, _, stderr) = run(&mut service, ["rm", "raven"]).await;
+    assert_eq!(stderr, b"next: cowshed gc\n");
+
+    // The machine-readable form carries the same facts, so a harness never has to scrape prose.
+    let mut service = FakeService::default();
+    let (_, stdout, _) = run(&mut service, ["rm", "raven", "--abandon", "--json"]).await;
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("machine-readable envelope");
+    assert_eq!(
+        envelope["result"]["abandoned"]["unlandedCommits"],
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        envelope["result"]["abandoned"]["head"],
+        serde_json::json!("4".repeat(40))
     );
 }
 
@@ -1180,7 +1240,7 @@ impl CliService for SerializedCreateService {
     async fn path(&mut self, _: &str, _: bool) -> Result<WorkspaceInfo> {
         unreachable!()
     }
-    async fn remove(&mut self, _: &str, _: RemoveOptions) -> Result<()> {
+    async fn remove(&mut self, _: &str, _: RemoveOptions) -> Result<RemoveReport> {
         unreachable!()
     }
     async fn attach(&mut self, _: &str, _: AttachOptions) -> Result<()> {

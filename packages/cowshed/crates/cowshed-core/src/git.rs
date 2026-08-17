@@ -306,17 +306,37 @@ impl GitRepository {
         .map_err(|error| CowshedError::internal(format!("Git exclude task failed: {error}")))?
     }
 
-    /// Whether `commit` is contained by a host branch or a Cowshed preservation ref.
+    /// Resolve `revision` to the commit object this repository actually holds for it.
     ///
-    /// A commit absent from this repository is an ordinary negative result: session repositories
-    /// can contain unpublished objects that the controller-side host repository has never seen.
+    /// `None` — no such ref, or an oid whose object is not here — is an ordinary negative result
+    /// rather than an error: session repositories can contain unpublished objects that the
+    /// controller-side host repository has never seen, and every proof built on top of this one
+    /// reads that as "not held here".
+    ///
+    /// `rev-parse --verify --quiet` is the only spelling that answers this in one call for both
+    /// refs and oids. `show-ref --verify` is fatal (exit 128) on a ref that is merely absent, and
+    /// `cat-file -e` cannot take a ref name.
+    async fn resolve_commit(&self, revision: &str) -> Result<Option<String>> {
+        let peeled = format!("{revision}^{{commit}}");
+        let output = self
+            .run(["rev-parse", "--verify", "--quiet", peeled.as_str()])
+            .await?;
+        match output.status.code() {
+            Some(0) => parse_one_string(&output.stdout, "commit revision").map(Some),
+            Some(1) => Ok(None),
+            _ => Err(git_internal("resolve commit revision", &output)),
+        }
+    }
+
+    async fn has_commit(&self, commit: &str) -> Result<bool> {
+        Ok(self.resolve_commit(commit).await?.is_some())
+    }
+
+    /// Whether `commit` is contained by a host branch or a Cowshed preservation ref.
     pub async fn commit_is_preserved(&self, commit: &str) -> Result<bool> {
-        let object = format!("{commit}^{{commit}}");
-        let exists = self.run(["cat-file", "-e", object.as_str()]).await?;
-        if !exists.status.success() {
+        if !self.has_commit(commit).await? {
             return Ok(false);
         }
-
         let output = self
             .run([
                 "for-each-ref",
@@ -339,9 +359,7 @@ impl GitRepository {
     /// local heads disappear with that image, while a remote-tracking ref records a push/fetch
     /// boundary whose remote retains the commit.
     pub async fn commit_is_remote_preserved(&self, commit: &str) -> Result<bool> {
-        let object = format!("{commit}^{{commit}}");
-        let exists = self.run(["cat-file", "-e", object.as_str()]).await?;
-        if !exists.status.success() {
+        if !self.has_commit(commit).await? {
             return Ok(false);
         }
         let output = self
@@ -360,6 +378,93 @@ impl GitRepository {
             ));
         }
         Ok(!output.stdout.is_empty())
+    }
+
+    /// The tip of local branch `branch`, or `None` when this repository has no such branch.
+    pub async fn branch_tip(&self, branch: &str) -> Result<Option<String>> {
+        self.resolve_commit(&format!("refs/heads/{branch}")).await
+    }
+
+    /// Whether `commit` is reachable from `descendant` in *this* repository.
+    ///
+    /// This is the proof that destroying the object store `commit` lives in loses nothing:
+    /// `descendant` already contains it. Either object being absent here is a conclusive negative
+    /// — an object this repository has never seen is not held by anything in it.
+    pub async fn commit_is_ancestor(&self, commit: &str, descendant: &str) -> Result<bool> {
+        if !self.has_commit(commit).await? || !self.has_commit(descendant).await? {
+            return Ok(false);
+        }
+        let output = self
+            .run(["merge-base", "--is-ancestor", commit, descendant])
+            .await?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            // Exit 1 is git's answer, not a failure: not an ancestor.
+            Some(1) => Ok(false),
+            _ => Err(git_internal("compare commit ancestry", &output)),
+        }
+    }
+
+    /// How many commits are reachable from `head` but not from `exclude`.
+    ///
+    /// `exclude` absent — no such branch, or an object this repository does not hold — counts the
+    /// whole history reachable from `head`: nothing here proves any of it is held elsewhere.
+    pub async fn commits_ahead(&self, exclude: Option<&str>, head: &str) -> Result<u64> {
+        let range = match self.usable_exclude(exclude).await? {
+            Some(exclude) => format!("{exclude}..{head}"),
+            None => head.to_owned(),
+        };
+        let count = self
+            .read_one(["rev-list", "--count", range.as_str()], "count commits")
+            .await?;
+        count.parse().map_err(|_| {
+            CowshedError::integrity(
+                format!("git reported an unparseable commit count: {count}"),
+                "repair the git repository",
+            )
+        })
+    }
+
+    /// Write a Git bundle of the commits `head` has and `exclude` does not.
+    ///
+    /// The range form produces a *thin* bundle whose one prerequisite is `exclude`. That is the
+    /// right trade here: the bundle is written beside a workspace's retired image, and the
+    /// repository it would ever be restored into is main's, which contains `exclude` by
+    /// construction — a workspace image is a copy of main's, so its local `main` is an ancestor of
+    /// main's own. When there is no usable range (no such branch, or nothing ahead of it) the
+    /// bundle carries every ref instead, because a bundle that cannot stand alone is not a belt.
+    ///
+    /// `head` MUST be a ref spelling — `HEAD` or a branch — never a raw oid. `git bundle create`
+    /// names a bundle's contents after the refs in its rev range, so an oid tip yields a bundle
+    /// with no refs, which git rejects outright as empty.
+    pub async fn bundle_commits(
+        &self,
+        destination: &Path,
+        exclude: Option<&str>,
+        head: &str,
+    ) -> Result<()> {
+        let range = match self.usable_exclude(exclude).await? {
+            Some(exclude) if self.commits_ahead(Some(&exclude), head).await? > 0 => {
+                Some(format!("{exclude}..{head}"))
+            }
+            _ => None,
+        };
+        let mut args = vec![
+            OsString::from("bundle"),
+            OsString::from("create"),
+            destination.as_os_str().to_owned(),
+        ];
+        args.push(OsString::from(range.unwrap_or_else(|| "--all".to_owned())));
+        let output = self.run(args).await?;
+        ensure_git_success("write commit bundle", output)
+    }
+
+    /// The `exclude` endpoint of a range, reduced to an oid this repository holds.
+    async fn usable_exclude(&self, exclude: Option<&str>) -> Result<Option<String>> {
+        match exclude {
+            Some(exclude) => self.resolve_commit(exclude).await,
+            None => Ok(None),
+        }
     }
 
     /// Configure local-only workspace Git and create its session branch.
@@ -1526,6 +1631,240 @@ mod tests {
                 .as_deref(),
             Some("MERGE_HEAD")
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// Commit `label` on top of whatever is checked out in `root`, and answer the new head.
+    fn commit_on(root: &Path, label: &str) -> String {
+        fs::write(root.join(label), format!("{label}\n")).expect("write fixture change");
+        let status = Command::new(GIT)
+            .arg("-C")
+            .arg(root)
+            .args(["add", "."])
+            .status()
+            .expect("run git add");
+        assert!(status.success());
+        let status = Command::new(GIT)
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                label,
+            ])
+            .status()
+            .expect("run git commit");
+        assert!(status.success());
+        let output = Command::new(GIT)
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("read head");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf-8 oid")
+            .trim_end()
+            .to_owned()
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new(GIT)
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[tokio::test]
+    async fn ancestry_answers_landed_and_treats_an_unknown_object_as_not_held() {
+        let root = repository();
+        let repo = GitRepository::from_root(&root);
+        let base = repo.head_oid().await.expect("read base");
+        git(&root, &["switch", "-qc", "cowshed/raven"]);
+        let work = commit_on(&root, "session-work");
+
+        assert_eq!(
+            repo.branch_tip("main").await.expect("resolve main tip"),
+            Some(base.clone())
+        );
+        assert_eq!(
+            repo.branch_tip("release").await.expect("absent branch"),
+            None
+        );
+        // Not landed: main does not contain the session commit.
+        assert!(
+            !repo
+                .commit_is_ancestor(&work, &base)
+                .await
+                .expect("compare ancestry")
+        );
+        // The base is landed by definition, and a commit is its own ancestor.
+        assert!(
+            repo.commit_is_ancestor(&base, &work)
+                .await
+                .expect("compare")
+        );
+        assert!(
+            repo.commit_is_ancestor(&work, &work)
+                .await
+                .expect("compare")
+        );
+        // An object this repository has never seen is a conclusive negative, not an error.
+        assert!(
+            !repo
+                .commit_is_ancestor(&work, &"9".repeat(40))
+                .await
+                .expect("unknown descendant")
+        );
+        assert!(
+            !repo
+                .commit_is_ancestor(&"9".repeat(40), &work)
+                .await
+                .expect("unknown commit")
+        );
+
+        git(&root, &["switch", "-q", "main"]);
+        git(&root, &["merge", "-q", "--ff-only", "cowshed/raven"]);
+        let landed_tip = repo.branch_tip("main").await.expect("tip").expect("branch");
+        assert_eq!(landed_tip, work);
+        assert!(
+            repo.commit_is_ancestor(&work, &landed_tip)
+                .await
+                .expect("landed work is contained by main")
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn unlanded_count_falls_back_to_the_whole_history_without_a_usable_exclude() {
+        let root = repository();
+        let repo = GitRepository::from_root(&root);
+        let base = repo.head_oid().await.expect("read base");
+        git(&root, &["switch", "-qc", "cowshed/raven"]);
+        commit_on(&root, "one");
+        commit_on(&root, "two");
+
+        assert_eq!(
+            repo.commits_ahead(Some(&base), "HEAD")
+                .await
+                .expect("count ahead of main"),
+            2
+        );
+        // An exclude this repository does not hold cannot prove anything is held: count it all.
+        assert_eq!(
+            repo.commits_ahead(Some(&"9".repeat(40)), "HEAD")
+                .await
+                .expect("count without a usable exclude"),
+            3
+        );
+        assert_eq!(
+            repo.commits_ahead(None, "HEAD").await.expect("count all"),
+            3
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn bundled_unlanded_commits_restore_into_a_repository_holding_the_prerequisite() {
+        let root = repository();
+        let repo = GitRepository::from_root(&root);
+        let base = repo.head_oid().await.expect("read base");
+        git(&root, &["switch", "-qc", "cowshed/raven"]);
+        commit_on(&root, "one");
+        let tip = commit_on(&root, "two");
+
+        let bundle = root.join("raven.bundle");
+        repo.bundle_commits(&bundle, Some("main"), "HEAD")
+            .await
+            .expect("bundle the unlanded range");
+        assert!(bundle.is_file());
+
+        // A raw-oid tip names no ref, so git refuses the bundle as empty. This is the shape a live
+        // abandonment hit: the caller had the fenced oid in hand and the range looked right.
+        let refless = repo
+            .bundle_commits(&root.join("refless.bundle"), Some("main"), &tip)
+            .await
+            .expect_err("an oid tip produces a ref-less bundle git will not write");
+        assert!(refless.message.contains("empty bundle"), "{refless:?}");
+
+        // The recovery repository is main's: it holds the prerequisite and nothing of the session.
+        let recovery = repository();
+        git(
+            &recovery,
+            &[
+                "fetch",
+                "-q",
+                root.to_str().expect("utf-8 root"),
+                "+refs/heads/main:refs/heads/mint",
+            ],
+        );
+        let recovery_repo = GitRepository::from_root(&recovery);
+        assert!(
+            !recovery_repo
+                .has_commit(&tip)
+                .await
+                .expect("recovery repository has no session object yet")
+        );
+        git(
+            &recovery,
+            &[
+                "fetch",
+                "-q",
+                bundle.to_str().expect("utf-8 bundle"),
+                "HEAD:refs/heads/recovered",
+            ],
+        );
+        assert!(
+            recovery_repo
+                .has_commit(&tip)
+                .await
+                .expect("bundle restores the abandoned tip")
+        );
+        assert_eq!(
+            recovery_repo
+                .commits_ahead(Some(&base), "refs/heads/recovered")
+                .await
+                .expect("count restored commits"),
+            2
+        );
+
+        // No usable range: the bundle has to stand alone, so it carries every ref.
+        let standalone = root.join("standalone.bundle");
+        repo.bundle_commits(&standalone, Some("no-such-branch"), "HEAD")
+            .await
+            .expect("bundle every ref");
+        let empty_recovery = std::env::temp_dir().join(format!(
+            "cowshed-git-test-empty-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&empty_recovery).expect("create empty recovery");
+        git(&empty_recovery, &["init", "-q", "-b", "main"]);
+        git(
+            &empty_recovery,
+            &[
+                "fetch",
+                "-q",
+                standalone.to_str().expect("utf-8 bundle"),
+                "+refs/heads/cowshed/raven:refs/heads/recovered",
+            ],
+        );
+        assert!(
+            GitRepository::from_root(&empty_recovery)
+                .has_commit(&tip)
+                .await
+                .expect("all-refs bundle stands alone")
+        );
+
+        fs::remove_dir_all(empty_recovery).expect("remove empty recovery");
+        fs::remove_dir_all(recovery).expect("remove recovery fixture");
         fs::remove_dir_all(root).expect("remove fixture");
     }
 }
