@@ -617,9 +617,34 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         serde_json::to_value(RemoveOptions {
             force: false,
             restore: true,
+            abandon: false,
         })
         .unwrap(),
-        json!({"force":false,"restore":true})
+        json!({"force":false,"restore":true,"abandon":false})
+    );
+    // An ordinary removal reports an empty object: `abandoned` appears only when commits died.
+    assert_eq!(
+        serde_json::to_value(RemoveReport::default()).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        serde_json::to_value(RemoveReport {
+            abandoned: Some(AbandonedWork {
+                head: GitOid::new("4".repeat(40)).unwrap(),
+                target_branch: "main".into(),
+                target_head: Some(GitOid::new("1".repeat(40)).unwrap()),
+                unlanded_commits: 3,
+                bundle: PathBuf::from("/store/acme/widget/sessions/.trash/raven-tip.bundle"),
+            }),
+        })
+        .unwrap(),
+        json!({"abandoned":{
+            "head":"4444444444444444444444444444444444444444",
+            "targetBranch":"main",
+            "targetHead":"1111111111111111111111111111111111111111",
+            "unlandedCommits":3,
+            "bundle":"/store/acme/widget/sessions/.trash/raven-tip.bundle"
+        }})
     );
     assert_eq!(
         serde_json::to_value(CheckpointOptions {

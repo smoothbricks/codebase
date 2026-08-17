@@ -11,11 +11,11 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::api::dto::{
-    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
-    CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
-    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, RevisionResult, RunSandboxMode, StdinSource,
-    WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
+    AbandonedWork, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
+    CheckpointResult, CommandArg, CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions,
+    GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
+    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, RevisionResult,
+    RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
@@ -26,6 +26,13 @@ use crate::repository::{RepoId, RepositoryBinding};
 
 const ROUTER_CAPACITY: usize = 64;
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
+
+/// The branch a workspace's commits are expected to reach.
+///
+/// One constant for two questions that must never disagree: where `land` merges by default, and
+/// which branch `rm` requires to contain a workspace's head before destroying its object store.
+/// If they diverged, `land` would satisfy a check `rm` does not make.
+pub const DEFAULT_LANDING_BRANCH: &str = "main";
 
 /// Immutable facts returned by one authoritative substrate enumeration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,7 +119,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
         options: CheckpointOptions,
     ) -> Result<CheckpointResult>;
     async fn restore(&mut self, workspace: WorkspaceName, label: String) -> Result<()>;
-    async fn remove(&mut self, workspace: WorkspaceName, options: RemoveOptions) -> Result<()>;
+    async fn remove(
+        &mut self,
+        workspace: WorkspaceName,
+        options: RemoveOptions,
+    ) -> Result<RemoveReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
     async fn grant(
         &mut self,
@@ -617,8 +628,8 @@ impl ProjectActor {
         let params: WorkspaceOptionsParams<RemoveOptions> =
             decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
-        self.host.remove(params.workspace, params.options).await?;
-        json_response(EmptyResult {})
+        let report = self.host.remove(params.workspace, params.options).await?;
+        json_response(report)
     }
 
     async fn coordinator_gc(&mut self, request: RouterRequest) -> Result<RouterResponse> {
@@ -2373,31 +2384,193 @@ impl NativeProjectRuntimeHost {
         })
     }
 
-    async fn require_session_removal_safe(
+    /// Every gate a removal must pass, in the order that puts the cheapest refusal first.
+    ///
+    /// Answers `Some` when an authorized abandonment has commits to bundle. Run twice per removal —
+    /// once before the supervisor stops and again on the revalidated fence — because both halves of
+    /// the answer can move underneath a removal: the workspace can pick up work, and main can land
+    /// or rewind it.
+    async fn require_removal_safe(
         &self,
+        workspace: &WorkspaceName,
+        options: RemoveOptions,
+        fence: &NativeRemovalGitFence,
+    ) -> Result<Option<NativeLandedState>> {
+        if workspace.is_main() {
+            // Main's removal has no landed gate: main *is* the branch a session has to reach, and
+            // its own preservation proof is the retained checkout or a remote ref, which the
+            // `--restore` path checks. What remains here is transient state — and unlike a session,
+            // main's is not overridable, because there is no fork of it to fall back on.
+            Self::require_session_state_clean(workspace, fence)?;
+            return Ok(None);
+        }
+        if !options.force {
+            Self::require_session_state_clean(workspace, fence)?;
+        }
+        self.require_session_landed(workspace, fence, options.abandon)
+            .await
+    }
+
+    /// Stop the supervisor, then prove the workspace is still the one that was checked.
+    ///
+    /// The gap between a safety decision and the deletion it authorizes is where a workspace can
+    /// pick up a commit, so both the incarnation and the head are re-read *after* the only thing
+    /// that could still be writing to the volume has stopped.
+    async fn revalidated_removal_fence(
+        &mut self,
+        workspace: &WorkspaceName,
+        initial: &NativeRemovalGitFence,
+    ) -> Result<(NativeWorkspace, NativeRemovalGitFence)> {
+        self.stop_supervisor(workspace).await?;
+        let current = self.current(workspace).await?;
+        Self::require_exact_incarnation(&current, &initial.incarnation)?;
+        let fence = self.removal_git_fence(&current).await?;
+        if fence.head != initial.head {
+            return Err(removal_head_moved_refusal(
+                workspace,
+                &initial.head,
+                &fence.head,
+            ));
+        }
+        Ok((current, fence))
+    }
+
+    /// Drop the workspace's host-side registrations, then retire its image.
+    ///
+    /// Host-side state goes before the image does. A remote naming a trashed mount is a broken
+    /// fetch in the user's own checkout — the one piece of this teardown that lives where they can
+    /// see it.
+    async fn finish_retirement(&mut self, current: NativeWorkspace) -> Result<()> {
+        let workspace = current.derived.workspace.name().clone();
+        let git_worktree = is_git_worktree(&current.metadata);
+        self.unregister_workspace_in_main(&workspace, git_worktree)
+            .await?;
+        self.retire_workspace(current).await
+    }
+
+    /// Refuse a session removal whose workspace is in transient Git state.
+    ///
+    /// Transient means recoverable-by-hand: uncommitted edits, a half-finished merge. This is the
+    /// class `--force` overrides, and the hint names only remedies that lose nothing — naming the
+    /// override here is what taught coordinator scripts to reach for it by reflex.
+    fn require_session_state_clean(
         workspace: &WorkspaceName,
         fence: &NativeRemovalGitFence,
     ) -> Result<()> {
-        if fence.dirty || fence.in_progress.is_some() {
-            return Err(CowshedError::conflict(
-                format!("workspace {workspace} has uncommitted or in-progress Git work"),
-                format!(
-                    "commit and push or land the work, or retry with: cowshed rm {workspace} --force"
-                ),
-            ));
+        if let Some(operation) = fence.in_progress.as_deref() {
+            return Err(removal_in_progress_refusal(workspace, operation));
         }
-        if !self.git.commit_is_preserved(fence.head.as_str()).await? {
-            return Err(CowshedError::conflict(
-                format!(
-                    "workspace {workspace} head {} is absent from host branches and Cowshed preservation refs",
-                    fence.head
-                ),
-                format!(
-                    "push or land the workspace, or retry with: cowshed rm {workspace} --force"
-                ),
-            ));
+        if fence.dirty {
+            return Err(removal_dirty_refusal(workspace));
         }
         Ok(())
+    }
+
+    /// Where a session's commits stand relative to the branch that has to hold them.
+    ///
+    /// Read out of *main's* repository, because that is the object store that survives this
+    /// workspace: it holds the branch tip, and it holds the session's commits only if they were
+    /// ever landed or pushed there. A head main has never seen is therefore conclusively unlanded
+    /// without a single network call.
+    async fn landed_state(&self, head: &GitOid) -> Result<NativeLandedState> {
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let main = crate::git::GitRepository::from_root(&main_mount);
+        let tip = main
+            .branch_tip(DEFAULT_LANDING_BRANCH)
+            .await?
+            .map(GitOid::new)
+            .transpose()
+            .map_err(native_integrity_error)?;
+        let landed = match tip.as_ref() {
+            Some(tip) => main.commit_is_ancestor(head.as_str(), tip.as_str()).await?,
+            // No such branch: there is nothing anywhere that could be holding these commits.
+            None => false,
+        };
+        Ok(NativeLandedState {
+            branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            tip,
+            landed,
+        })
+    }
+
+    /// Refuse a session removal that would destroy commits `main` does not contain.
+    ///
+    /// `--abandon` is the only authorization: `--force` covers transient state and deliberately
+    /// stops there, so a script that carries `--force` to get past a stuck workspace cannot also
+    /// delete work with no other home. Answers `Some` when the caller authorized an abandonment
+    /// and there is genuinely something to abandon, so the caller can bundle it before deleting.
+    async fn require_session_landed(
+        &self,
+        workspace: &WorkspaceName,
+        fence: &NativeRemovalGitFence,
+        abandon: bool,
+    ) -> Result<Option<NativeLandedState>> {
+        let landed = self.landed_state(&fence.head).await?;
+        if landed.landed {
+            return Ok(None);
+        }
+        if abandon {
+            return Ok(Some(landed));
+        }
+        Err(removal_unlanded_refusal(workspace, &fence.head, &landed))
+    }
+
+    /// Write the unlanded commits beside the image that is about to be trashed.
+    ///
+    /// Belt for a deliberate abandonment: the refs die with the image, so a bundle in the same
+    /// trash directory as the retired sidecars is the only thing that keeps the commits fetchable
+    /// afterwards. Written from the workspace's own repository, whose local `main` is main's tip at
+    /// mint time and therefore a prerequisite main's repository still holds.
+    async fn bundle_abandoned_work(
+        &self,
+        workspace: &NativeWorkspace,
+        fence: &NativeRemovalGitFence,
+        landed: NativeLandedState,
+    ) -> Result<AbandonedWork> {
+        let mount = current_snapshot_mount(self, workspace)?;
+        let git = crate::git::GitRepository::from_root(&mount);
+        // `HEAD`, not the fence oid, and the difference is load-bearing: `git bundle create` names
+        // the bundle's contents after the *refs* in its rev range, so a range whose tip is a raw
+        // oid produces a bundle with no refs — which git rejects as empty. The fence has already
+        // proved HEAD is exactly `fence.head`, so the ref spelling is the same commit.
+        let unlanded_commits = git
+            .commits_ahead(Some(landed.branch.as_str()), "HEAD")
+            .await?;
+        let trash = self
+            .layout
+            .project()
+            .sessions
+            .join(crate::storage::recovery::TRASH_NAMESPACE);
+        let bundle = trash.join(format!(
+            "{}-{}.bundle",
+            workspace.derived.workspace.name().as_str(),
+            fence.head
+        ));
+        let directory = trash.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            std::fs::create_dir_all(&directory).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot create the retirement trash directory {}: {error}",
+                        directory.display()
+                    ),
+                    "repair the cowshed store and retry",
+                )
+            })
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("trash directory task failed: {error}"))
+        })??;
+        git.bundle_commits(&bundle, Some(landed.branch.as_str()), "HEAD")
+            .await?;
+        Ok(AbandonedWork {
+            head: fence.head.clone(),
+            target_branch: landed.branch,
+            target_head: landed.tip,
+            unlanded_commits,
+            bundle,
+        })
     }
 
     async fn require_main_restore_safe(
@@ -2409,7 +2582,7 @@ impl NativeProjectRuntimeHost {
         if fence.dirty || fence.in_progress.is_some() {
             return Err(CowshedError::conflict(
                 "main has uncommitted or in-progress Git work",
-                "commit and push the work, or retry with: cowshed rm main --restore --force",
+                "commit or discard the changes, then retry",
             ));
         }
         let current_git =
@@ -2419,7 +2592,7 @@ impl NativeProjectRuntimeHost {
             .map_err(|_| {
                 CowshedError::conflict(
                     "retained pre-cowshed checkout cannot prove main commit preservation",
-                    "restore the exact retained checkout, push main, or retry with --force",
+                    "restore the exact retained checkout, or push main to its remote, then retry",
                 )
             })?;
         let preserved_locally = retained_git
@@ -2434,7 +2607,7 @@ impl NativeProjectRuntimeHost {
                     "main head {} is not preserved by the retained checkout or a remote ref",
                     fence.head
                 ),
-                "push or land main, or retry with: cowshed rm main --restore --force",
+                "push main to its remote so its commits survive, then retry",
             ));
         }
         Ok(())
@@ -2916,6 +3089,17 @@ struct NativeRemovalGitFence {
     in_progress: Option<String>,
 }
 
+/// Whether the branch that outlives a workspace already contains the workspace's head.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeLandedState {
+    branch: String,
+    /// `None` when the project has no such branch: nothing can be landed in a branch that is not
+    /// there, so this is a conclusive negative rather than missing information.
+    tip: Option<GitOid>,
+    landed: bool,
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeAdoptRollbackState {
@@ -3343,17 +3527,22 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
 
         self.fork(source.clone(), destination.clone()).await?;
-        // The work is not being discarded, it is being republished under the destination, so the
-        // unpushed-branch refusal that guards a real removal would be a false alarm here. The
-        // fence above is what makes this safe.
-        self.remove(
-            source,
-            RemoveOptions {
-                force: true,
-                restore: false,
-            },
-        )
-        .await?;
+        // The source's commits are not being discarded, they are being republished under the
+        // destination, whose image is a copy of this one — so the landed-ancestry gate that guards
+        // a real removal would refuse a rename that loses nothing. This retires the source directly
+        // instead of laundering that through a removal override: the fork is the preservation, and
+        // the fence above is what makes the retirement safe.
+        let retirement = async {
+            let (retiring, _) = self.revalidated_removal_fence(&source, &fence).await?;
+            self.finish_retirement(retiring).await
+        }
+        .await;
+        if let Err(error) = retirement {
+            // The destination now holds the work; leaving the source usable is the recoverable
+            // half of a half-done rename.
+            let _ = self.ensure_supervisor(&source).await;
+            return Err(error);
+        }
         self.snapshot_named(&destination).await
     }
 
@@ -3719,13 +3908,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
     }
 
-    async fn remove(&mut self, workspace: WorkspaceName, options: RemoveOptions) -> Result<()> {
+    async fn remove(
+        &mut self,
+        workspace: WorkspaceName,
+        options: RemoveOptions,
+    ) -> Result<RemoveReport> {
         use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
 
         if options.restore && options.force {
             return Err(CowshedError::usage(
                 "--force and --restore select conflicting main removal modes",
-                "use exactly one of: cowshed rm main --force, cowshed rm main --restore",
+                "choose exactly one main removal mode",
             ));
         }
         if options.restore && !workspace.is_main() {
@@ -3734,11 +3927,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "remove a session without --restore",
             ));
         }
-        if workspace.is_main() && !options.restore && !options.force {
-            return Err(CowshedError::conflict(
-                "plain main removal requires --force",
-                "use --restore to recover the pre-adoption checkout, or retry with: cowshed rm main --force",
+        // `--abandon` authorizes destroying commits the project's main branch does not contain.
+        // Main *is* that branch, so on main the flag has nothing to authorize and accepting it
+        // would let a script carry one spelling for both and lose main to a typo.
+        if options.abandon && workspace.is_main() {
+            return Err(CowshedError::usage(
+                "--abandon applies to session workspaces, whose commits main can contain",
+                "recover the pre-adoption checkout instead: cowshed rm main --restore",
             ));
+        }
+        if workspace.is_main() && !options.restore && !options.force {
+            return Err(main_removal_mode_refusal());
         }
 
         self.validate_binding().await?;
@@ -3756,7 +3955,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         .is_ok()
                 {
                     self.remove_project_binding_after_restore().await?;
-                    return Ok(());
+                    return Ok(RemoveReport::default());
                 }
                 return Err(error);
             }
@@ -3811,7 +4010,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             self.retire_restored_main(current).await?;
             self.remove_project_binding_after_restore().await?;
-            return Ok(());
+            return Ok(RemoveReport::default());
         }
 
         let initially_detached = matches!(current.derived.mount_state, MountState::Detached);
@@ -3821,101 +4020,76 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .await
                 .map_err(native_storage_error)?;
         }
-        let current = self.current(&workspace).await?;
-        let initial_fence = self.removal_git_fence(&current).await;
-        let initial_fence = match initial_fence {
-            Ok(fence) => fence,
-            Err(error) => {
-                if initially_detached {
-                    self.substrate
-                        .unmount(&current.derived.workspace)
-                        .await
-                        .map_err(native_storage_error)?;
-                }
-                return Err(error);
-            }
-        };
-        let safety = if workspace.is_main() {
-            if let Some(operation) = initial_fence.in_progress.as_deref() {
-                Err(CowshedError::conflict(
-                    format!("main has an in-progress {operation} Git operation"),
-                    "finish or abort the Git operation before removing main",
-                ))
-            } else if initial_fence.dirty {
-                Err(CowshedError::conflict(
-                    "main has uncommitted Git work",
-                    "commit or discard all changes before removing main",
-                ))
-            } else {
-                Ok(())
-            }
-        } else if options.force {
-            Ok(())
-        } else {
-            self.require_session_removal_safe(&workspace, &initial_fence)
-                .await
-        };
-        if let Err(error) = safety {
-            if initially_detached {
+        // The landed proof lives in main's repository, so main has to be readable for the whole
+        // removal — including the revalidation after the supervisor stops. A project whose main is
+        // detached still gets the proof: main is mounted for the duration and put back as found,
+        // because the answer to "would this destroy work" must not depend on mount posture.
+        let main_initially_detached = !workspace.is_main() && {
+            let main = self.current(&main_name()).await?;
+            let detached = matches!(main.derived.mount_state, MountState::Detached);
+            if detached {
                 self.substrate
-                    .unmount(&current.derived.workspace)
+                    .ensure_mounted(&main.derived.workspace, MountIntent { browse: false })
                     .await
                     .map_err(native_storage_error)?;
             }
-            return Err(error);
-        }
+            detached
+        };
 
         let removal = async {
-            self.stop_supervisor(&workspace).await?;
             let current = self.current(&workspace).await?;
-            Self::require_exact_incarnation(&current, &initial_fence.incarnation)?;
-            let final_fence = self.removal_git_fence(&current).await?;
-            if final_fence.head != initial_fence.head {
-                return Err(CowshedError::conflict(
-                    format!(
-                        "workspace {workspace} HEAD changed from {} to {} during removal",
-                        initial_fence.head, final_fence.head
-                    ),
-                    "review the new HEAD and retry removal",
-                ));
-            }
-            if workspace.is_main() {
-                if final_fence.dirty || final_fence.in_progress.is_some() {
-                    return Err(CowshedError::conflict(
-                        "main Git state changed during removal",
-                        "finish or discard the new work and retry",
-                    ));
-                }
-            } else if !options.force {
-                self.require_session_removal_safe(&workspace, &final_fence)
-                    .await?;
-            }
-            // Host-side state goes before the image does. A remote naming a trashed mount is a
-            // broken fetch in the user's own checkout — the one piece of this teardown that lives
-            // where they can see it.
-            self.unregister_workspace_in_main(&workspace, is_git_worktree(&current.metadata))
+            let initial_fence = self.removal_git_fence(&current).await?;
+            self.require_removal_safe(&workspace, options, &initial_fence)
                 .await?;
-            self.retire_workspace(current).await
+            let (current, final_fence) = self
+                .revalidated_removal_fence(&workspace, &initial_fence)
+                .await?;
+            let abandoning = self
+                .require_removal_safe(&workspace, options, &final_fence)
+                .await?;
+            // The bundle goes in before anything is destroyed: a belt written after the image is
+            // gone would have nothing left to read.
+            let abandoned = match abandoning {
+                Some(landed) => Some(
+                    self.bundle_abandoned_work(&current, &final_fence, landed)
+                        .await?,
+                ),
+                None => None,
+            };
+            self.finish_retirement(current).await?;
+            Ok(RemoveReport { abandoned })
         }
         .await;
-        if let Err(primary) = removal {
-            let cleanup = match self.current(&workspace).await {
-                Ok(current) if initially_detached => self
-                    .substrate
-                    .unmount(&current.derived.workspace)
-                    .await
-                    .map_err(native_storage_error),
-                Ok(_) => self.ensure_supervisor(&workspace).await.map(|_| ()),
-                Err(_) => Ok(()),
-            };
-            return match cleanup {
-                Ok(()) => Err(primary),
-                Err(cleanup) => Err(CowshedError::internal(format!(
-                    "workspace removal failed: {primary}; state restoration also failed: {cleanup}"
-                ))),
-            };
+
+        if main_initially_detached {
+            let main = self.current(&main_name()).await?;
+            self.stop_supervisor(&main_name()).await?;
+            self.substrate
+                .unmount(&main.derived.workspace)
+                .await
+                .map_err(native_storage_error)?;
         }
-        Ok(())
+        let report = match removal {
+            Ok(report) => report,
+            Err(primary) => {
+                let cleanup = match self.current(&workspace).await {
+                    Ok(current) if initially_detached => self
+                        .substrate
+                        .unmount(&current.derived.workspace)
+                        .await
+                        .map_err(native_storage_error),
+                    Ok(_) => self.ensure_supervisor(&workspace).await.map(|_| ()),
+                    Err(_) => Ok(()),
+                };
+                return match cleanup {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(CowshedError::internal(format!(
+                        "workspace removal failed: {primary}; state restoration also failed: {cleanup}"
+                    ))),
+                };
+            }
+        };
+        Ok(report)
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
@@ -4200,7 +4374,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let target_branch = options
             .target_branch
             .clone()
-            .unwrap_or_else(|| "main".into());
+            .unwrap_or_else(|| DEFAULT_LANDING_BRANCH.to_owned());
         let target_ref = format!("refs/heads/{target_branch}");
         let previous = git_optional_ref_oid(&self.descriptor.git_root, &target_ref).await?;
         require_expected_ref(
@@ -5253,6 +5427,115 @@ mod pre_cowshed_tests {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod removal_refusal_tests {
+    use super::*;
+
+    fn workspace() -> WorkspaceName {
+        WorkspaceName::new("raven").expect("fixed workspace name")
+    }
+
+    fn oid(fill: char) -> GitOid {
+        GitOid::new(fill.to_string().repeat(40)).expect("fixed oid")
+    }
+
+    fn fence(dirty: bool, in_progress: Option<&str>) -> NativeRemovalGitFence {
+        NativeRemovalGitFence {
+            incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .expect("fixed incarnation"),
+            head: oid('4'),
+            dirty,
+            in_progress: in_progress.map(str::to_owned),
+        }
+    }
+
+    fn unlanded(tip: Option<GitOid>) -> NativeLandedState {
+        NativeLandedState {
+            branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            tip,
+            landed: false,
+        }
+    }
+
+    /// Every refusal a removal can answer with, so the sweep below cannot miss one.
+    fn every_removal_refusal() -> Vec<CowshedError> {
+        vec![
+            removal_in_progress_refusal(&workspace(), "rebase-merge"),
+            removal_dirty_refusal(&workspace()),
+            removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(Some(oid('1')))),
+            removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(None)),
+            removal_head_moved_refusal(&workspace(), &oid('1'), &oid('4')),
+            main_removal_mode_refusal(),
+            NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &fence(true, None))
+                .expect_err("dirty is refused"),
+            NativeProjectRuntimeHost::require_session_state_clean(
+                &workspace(),
+                &fence(false, Some("MERGE_HEAD")),
+            )
+            .expect_err("an in-progress operation is refused"),
+        ]
+    }
+
+    /// The regression that produced this gate: a refusal that prescribed `--force` taught
+    /// coordinator scripts to retry with it, and the retry destroyed unlanded work. A refusal may
+    /// never name the flag that overrides it — the flags are documented in `cowshed rm`'s usage
+    /// text, where a human reads options deliberately.
+    #[test]
+    fn no_removal_refusal_prescribes_the_flag_that_overrides_it() {
+        for refusal in every_removal_refusal() {
+            for (field, value) in [("message", &refusal.message), ("hint", &refusal.hint)] {
+                for flag in ["--force", "--abandon"] {
+                    assert!(
+                        !value.contains(flag),
+                        "removal refusal {field} prescribes {flag}: {value}"
+                    );
+                }
+            }
+            assert_eq!(refusal.code, ErrorCode::Conflict);
+        }
+    }
+
+    /// The refusal has to be actionable on its own: it names the head that is at risk, the branch
+    /// that does not hold it, and where that branch stands.
+    #[test]
+    fn the_unlanded_refusal_names_the_head_the_branch_and_the_tip() {
+        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(Some(oid('1'))));
+        assert_eq!(
+            refusal.message,
+            format!(
+                "workspace raven head {} is not contained by main (main is at {})",
+                oid('4'),
+                oid('1')
+            )
+        );
+        assert_eq!(refusal.hint, "land the workspace: cowshed land raven");
+
+        // No branch at all is a conclusive negative, and says so rather than printing an absence.
+        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(None));
+        assert_eq!(
+            refusal.message,
+            format!(
+                "workspace raven head {} is not contained by main: this project has no main branch",
+                oid('4')
+            )
+        );
+    }
+
+    /// `--force` and `--abandon` authorize different losses, and the dispatcher must not let either
+    /// stand in for the other. Only the transient half is overridable by `--force`.
+    #[test]
+    fn force_overrides_transient_state_and_nothing_else() {
+        let clean = fence(false, None);
+        NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &clean)
+            .expect("a clean workspace passes the transient gate");
+        assert!(
+            NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &fence(true, None))
+                .is_err(),
+            "dirt is exactly what the transient gate is for"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn revision_target(target: &crate::api::dto::RevisionTarget) -> String {
     match target {
@@ -5324,10 +5607,15 @@ async fn git_revision_oid(root: &Path, revision: &str) -> Result<GitOid> {
     GitOid::new(value.trim_end()).map_err(native_integrity_error)
 }
 
+/// Resolve `reference`, answering `None` when this repository simply does not have it.
+///
+/// `rev-parse --verify --quiet` is the spelling that distinguishes those two outcomes: `show-ref
+/// --verify` is *fatal* (exit 128) on an absent ref, which would turn "the target branch does not
+/// exist yet" into an internal error instead of the `None` every caller here is written for.
 #[cfg(target_os = "macos")]
 async fn git_optional_ref_oid(root: &Path, reference: &str) -> Result<Option<GitOid>> {
     let output = tokio::process::Command::new("/usr/bin/git")
-        .args(["show-ref", "--verify", "--hash", reference])
+        .args(["rev-parse", "--verify", "--quiet", reference])
         .current_dir(root)
         .output()
         .await
@@ -5821,6 +6109,70 @@ fn native_integrity_error(error: impl std::fmt::Display) -> CowshedError {
 #[cfg(target_os = "macos")]
 fn main_name() -> WorkspaceName {
     WorkspaceName::new("main").expect("fixed main workspace name is valid")
+}
+
+/// Every refusal the removal path can answer with, in one place.
+///
+/// They are free functions rather than inline `CowshedError::conflict` calls for one reason: the
+/// invariant that *no removal refusal may name the flag that overrides it* is only enforceable if
+/// the refusals can be enumerated and swept. Tonight's incident was a coordinator script that
+/// learned `--force` from a refusal that prescribed it, so the hints here name safe remedies only —
+/// land it, commit it, finish the merge — and the destructive flag is documented where a human
+/// reads options deliberately, in `cowshed rm`'s usage text.
+#[cfg(target_os = "macos")]
+fn removal_in_progress_refusal(workspace: &WorkspaceName, operation: &str) -> CowshedError {
+    CowshedError::conflict(
+        format!("workspace {workspace} has an in-progress {operation} Git operation"),
+        "finish or abort the Git operation, then retry",
+    )
+}
+#[cfg(target_os = "macos")]
+fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
+    CowshedError::conflict(
+        format!("workspace {workspace} has uncommitted Git work"),
+        format!("commit the work and land it: cowshed land {workspace}"),
+    )
+}
+/// The gate the incident turned on: these commits exist nowhere but the image about to be deleted.
+#[cfg(target_os = "macos")]
+fn removal_unlanded_refusal(
+    workspace: &WorkspaceName,
+    head: &GitOid,
+    landed: &NativeLandedState,
+) -> CowshedError {
+    CowshedError::conflict(
+        match landed.tip.as_ref() {
+            Some(tip) => format!(
+                "workspace {workspace} head {head} is not contained by {} ({} is at {tip})",
+                landed.branch, landed.branch
+            ),
+            None => format!(
+                "workspace {workspace} head {head} is not contained by {}: this project has no {} branch",
+                landed.branch, landed.branch
+            ),
+        },
+        format!("land the workspace: cowshed land {workspace}"),
+    )
+}
+#[cfg(target_os = "macos")]
+fn removal_head_moved_refusal(
+    workspace: &WorkspaceName,
+    from: &GitOid,
+    to: &GitOid,
+) -> CowshedError {
+    CowshedError::conflict(
+        format!("workspace {workspace} HEAD changed from {from} to {to} during removal"),
+        "review the new HEAD and retry removal",
+    )
+}
+/// Removing main without `--restore` throws the project's warm image away for good, so the gate
+/// points at the mode that recovers the pre-adoption checkout instead.
+#[cfg(target_os = "macos")]
+fn main_removal_mode_refusal() -> CowshedError {
+    CowshedError::conflict(
+        "removing main without --restore destroys this project's warm main image",
+        "recover the pre-adoption checkout instead: cowshed rm main --restore",
+    )
 }
 
 /// The repository a git-worktree workspace's sandbox must reach into, if it is one.

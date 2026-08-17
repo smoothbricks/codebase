@@ -92,7 +92,8 @@ That is the fix — not a retry.
 cowshed --project /path/to/repo new agent-a   # clone; creates branch cowshed/agent-a
 cowshed path agent-a                          # print the mount path (bare value on stdout)
 cowshed exec agent-a -- cargo test            # run argv inside the workspace sandbox
-cowshed rm agent-a                            # retire it; --force if it holds unpushed commits
+cowshed land agent-a                          # merge into main and retire the workspace
+cowshed rm agent-a                            # retire only; refuses until main contains its HEAD
 cowshed gc --dry-run                          # review reclaimable storage, then `cowshed gc`
 ```
 
@@ -100,8 +101,14 @@ cowshed gc --dry-run                          # review reclaimable storage, then
 second or two per agent rather than a rebuild. `ls` lists workspaces; `ensure` heals the current one; `fork <src> <dst>`
 clones one workspace from another instead of from `main`.
 
-Give every agent its own workspace and let `rm` be the cleanup. Do not share one workspace between concurrent agents —
+Give every agent its own workspace and let `land` be the cleanup. Do not share one workspace between concurrent agents —
 the branch and the working tree are single-writer.
+
+`rm` destroys the image the workspace's commits live in, so it refuses (exit 4) unless `main` already contains the
+workspace's `HEAD`. **Never answer that refusal with a flag.** `--force` overrides transient state only — a dirty tree,
+an in-progress merge, a busy mount — and deliberately cannot get past the landed-ancestry gate. `--abandon` is the sole
+authorization for destroying unlanded commits; it bundles them into `sessions/.trash/<ws>-<tip>.bundle` first and prints
+what it destroyed.
 
 ## Git semantics
 

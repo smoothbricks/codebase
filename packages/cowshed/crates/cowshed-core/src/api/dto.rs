@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 #[cfg(unix)]
@@ -2057,11 +2057,20 @@ pub struct CheckpointOptions {
     pub keep: bool,
 }
 
+/// What `cowshed rm` is allowed to override.
+///
+/// The two overrides are deliberately separate, because they authorize losses of different kinds.
+/// `force` covers *transient* state — a dirty tree, an in-progress merge, a busy mount — none of
+/// which is unrecoverable content. `abandon` is the only thing that authorizes destroying commits
+/// the project's main branch does not contain, and it is spelled out in full for exactly that
+/// reason: a script that reaches for `force` to get past a stuck workspace must not thereby
+/// acquire the power to delete work that has no other home.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveOptions {
     pub force: bool,
     pub restore: bool,
+    pub abandon: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -2165,6 +2174,33 @@ pub struct LandReport {
     pub retired: bool,
 }
 
+/// The commits a `--abandon` removal destroyed, and where their bundle went.
+///
+/// Every field is what a reader needs to *undo* the abandonment: the tip that is gone, the branch
+/// it never reached and where that branch stood, how much history went with it, and the bundle to
+/// fetch from.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AbandonedWork {
+    pub head: GitOid,
+    pub target_branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_head: Option<GitOid>,
+    pub unlanded_commits: u64,
+    pub bundle: PathBuf,
+}
+
+/// What `cowshed rm` destroyed beyond the workspace image itself.
+///
+/// `abandoned` is `None` for every removal whose commits the target branch already contained —
+/// the ordinary case, where the image is the only thing that dies.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<AbandonedWork>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MirrorInfo {
@@ -2202,6 +2238,24 @@ pub struct SccacheStatus {
     pub installed: bool,
     pub running: bool,
     pub socket: PathBuf,
+}
+
+/// What the running sccache daemon reports about itself.
+///
+/// Hits and misses are per language rather than summed: cross-workspace C and C++ reuse works
+/// without any slot, so a healthy aggregate hit rate routinely hides a Rust hit rate of zero, which
+/// is the number a slot host is actually managing. `base_directories` is reported because it is the
+/// only observable proof that the server took `SCCACHE_BASEDIRS` — sccache 0.16 ignores the
+/// singular `SCCACHE_BASEDIR` entirely, and silently.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SccacheStats {
+    pub max_cache_size: u64,
+    pub base_directories: Vec<PathBuf>,
+    pub compile_requests: u64,
+    pub requests_executed: u64,
+    pub hits: BTreeMap<String, u64>,
+    pub misses: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2286,6 +2340,7 @@ result_bodies!(
     ExecRecord,
     PushReport,
     LandReport,
+    RemoveReport,
     GrantSet,
     GatewayStatus,
     SccacheStatus,
