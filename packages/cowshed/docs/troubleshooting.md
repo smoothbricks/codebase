@@ -80,11 +80,16 @@ and the gateway audit events for egress (`cowshed audit --denied | tail`). Commo
 - **Linux package/proxy client gets connection refused at `127.0.0.1:7644`**: do not point it at the Unix socket or a
   macOS block base. Run `cowshed ensure`; `doctor` distinguishes a detached workspace, absent/dead connector, missing or
   wrong per-incarnation socket mount, and a dead host gateway. A healthy workspace uses
-  `http://127.0.0.1:7644/{npm,cargo,go}` and the same base in `HTTP_PROXY`/`HTTPS_PROXY` (plus lowercase forms). Detach
-  and restore intentionally drain old connections; retry only after the new attachment is admitted.
-- **Linux 401 versus 403**: 401 means the endpoint/token pair did not authenticate—often stale pre-restore wiring. 403
-  means endpoint and token authenticated but policy denied the destination; use the gateway's grant hint. Port 7644 by
-  itself is not workspace identity: the private netns plus mounted socket inode selects the workspace.
+  `http://127.0.0.1:7644/{npm,cargo,go}` and the same base, with the token as userinfo
+  (`http://cowshed:<token>@127.0.0.1:7644`), in `HTTP_PROXY`/`HTTPS_PROXY` (plus lowercase forms). Detach and restore
+  intentionally drain old connections; retry only after the new attachment is admitted.
+- **407 versus 403**: 407 means the endpoint/credential pair did not authenticate — most often proxy variables that lost
+  their userinfo, or stale pre-restore wiring. A client without the credential gets one 407 with
+  `Proxy-Authenticate: Basic realm="cowshed"` and stops; cargo instead reads a bare tunnel failure as a spurious network
+  error and grinds through its retry ladder, so a cargo command that hangs for minutes on `CONNECT tunnel failed` is a
+  credential problem, not a slow network. 403 means endpoint and credential authenticated but policy denied the
+  destination; use the gateway's grant hint. Port 7644 by itself is not workspace identity: the private netns plus
+  mounted socket inode selects the workspace.
 - **`go` denied writing `~/go`**: that deny is a deliberate tripwire, not a bug — it means a go invocation ran without
   the workspace's `GOENV` wiring (an unwrapped spawn, or an editor without direnv integration). Run it through
   `cowshed exec`/a direnv shell, or fix the editor's direnv plugin; never grant `~/go`. `cowshed doctor` prints the same
@@ -123,6 +128,13 @@ space with everything else.
 
 Cargo's shared writable caches are `~/.cowshed/caches/cargo/{registry,git}`; gateway-owned bare repository mirrors are
 separate at `~/.cowshed/caches/repo-mirrors` and must remain sandbox-read-only.
+
+**A sandbox refetches a crate the host already has.** `$CARGO_HOME` follows the private `HOME`, so each workspace has
+its own `.cargo`. Its `registry/index` and `registry/cache` are symlinks to the host's, read-only, and `registry/src` —
+where cargo unpacks — is real and writable inside the mount. A crate already downloaded on the host therefore builds
+offline in a workspace. If those links are missing, the exec predates them or the host has no `~/.cargo/registry` yet;
+the next `cowshed exec` plants them. A real directory sitting where a link belongs is left alone on purpose: that is a
+workspace's own registry state, and cowshed will not delete it to share the host's.
 
 **Nix cache/state points at the host filesystem.** On declarative hosts the module must own
 `~/.cache/nix → ~/.cowshed/caches/nix/cache` and `~/.local/state/nix → ~/.cowshed/caches/nix/state`; `adopt` and

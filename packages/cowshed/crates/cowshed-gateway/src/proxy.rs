@@ -12,6 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, Version, header,
@@ -2348,6 +2349,17 @@ where
     Ok(())
 }
 
+/// The single workspace credential a proxy client presents, in either accepted spelling.
+///
+/// `Bearer <token>` is cowshed's own spelling, used by everything that can set a header.
+/// `Basic <base64(user:token)>` exists because no standard client can be told to add an
+/// arbitrary header to a `CONNECT`, while curl, libcurl (so cargo), reqwest, and Go all read
+/// `user:password` out of the `HTTP_PROXY` URL and send it preemptively as `Proxy-Authorization:
+/// Basic`. Only the password is the credential — the username is a fixed, non-secret label and
+/// is deliberately not compared, so nothing depends on a client preserving it.
+///
+/// Both spellings hand the same opaque token to the same constant-time comparison; neither is
+/// weaker than the other, and the token is stripped before upstream forwarding either way.
 fn proxy_token(headers: &HeaderMap) -> Option<String> {
     let values: Vec<_> = headers
         .get_all(header::PROXY_AUTHORIZATION)
@@ -2357,11 +2369,19 @@ fn proxy_token(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     let value = values[0].to_str().ok()?;
-    let token = value.strip_prefix("Bearer ")?;
+    let token = match value.split_once(' ') {
+        Some(("Bearer", token)) => token.to_owned(),
+        Some(("Basic", credentials)) => {
+            let decoded = STANDARD.decode(credentials).ok()?;
+            let decoded = String::from_utf8(decoded).ok()?;
+            decoded.split_once(':')?.1.to_owned()
+        }
+        _ => return None,
+    };
     if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return None;
     }
-    Some(token.to_owned())
+    Some(token)
 }
 fn request_authority_matches<B>(request: &Request<B>, target: &CanonicalTarget) -> bool {
     if request.version() != Version::HTTP_2 {
@@ -2920,6 +2940,13 @@ fn empty(status: StatusCode) -> Response<ResponseBody> {
         .expect("static response is valid")
 }
 
+/// The realm named in the `Proxy-Authenticate` challenge.
+///
+/// One realm for every workspace on the host: the realm scopes a client's credential cache, and
+/// the endpoint — the workspace's own loopback port or mounted socket — already selects the
+/// workspace, so a per-workspace realm would only teach clients to re-challenge across ports.
+const PROXY_REALM: &str = "Basic realm=\"cowshed\", charset=\"UTF-8\"";
+
 fn problem(status: StatusCode, message: &str, hint: Option<&str>) -> Response<ResponseBody> {
     let value = serde_json::json!({
         "error": message,
@@ -2929,9 +2956,17 @@ fn problem(status: StatusCode, message: &str, hint: Option<&str>) -> Response<Re
     let body = Full::new(bytes)
         .map_err(|never| -> BoxError { match never {} })
         .boxed();
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/json");
+    // RFC 9110 requires the challenge on every 407, and it is what turns a missing credential
+    // into one round trip: a client holding proxy userinfo answers the challenge instead of
+    // reporting an opaque tunnel failure. Emitted here rather than at each call site so no
+    // authentication failure — CONNECT, absolute-form HTTP, or mirror route — can omit it.
+    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        builder = builder.header(header::PROXY_AUTHENTICATE, PROXY_REALM);
+    }
+    builder
         .body(ProxyBody::boxed(body))
         .expect("static response is valid")
 }
