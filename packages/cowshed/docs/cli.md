@@ -154,19 +154,46 @@ With `--json`, the result is grouped explicitly as
 Bare mountpoint on stdout. Exit 3 if the workspace doesn't exist. A detached workspace is attached first, so the printed
 path is always live; pass `--no-attach` to skip the healing and get the would-be path with a `cowshed:` note instead.
 
-### `cowshed rm <name> [--force]`
+### `cowshed rm <name> [--force] [--restore] [--abandon]`
 
-Marks the workspace deleted and returns immediately; detach and image deletion happen in the background. Refuses
-(exit 4) when the branch has commits not pushed anywhere unless `--force`.
+Marks the workspace deleted and returns immediately; detach and image deletion happen in the background.
+
+Removing a workspace destroys its image, and the image is where its commits live — so `rm` refuses (exit 4) unless
+`main` already contains the workspace's `HEAD`. The refusal names main's tip and points at `cowshed land <ws>`.
+
+The two overrides authorize different losses and neither substitutes for the other:
+
+| Flag        | Overrides                                                         | Does **not** override    |
+| ----------- | ----------------------------------------------------------------- | ------------------------ |
+| `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount | the landed-ancestry gate |
+| `--abandon` | the landed-ancestry gate — commits `main` does not contain        | transient state          |
+
+`--abandon` has no short spelling, and it is the only way to delete unlanded commits. Before deleting, it writes a Git
+bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle` and prints what it destroyed, so
+even a deliberate abandonment is recoverable:
 
 ```
 $ cowshed rm raven
-cowshed: cowshed/raven is pushed (host has 6f3a2c1..9b2e77d)
-cowshed: detaching and deleting in background
+cowshed: workspace raven head 9b2e77d… is not contained by main (main is at 6f3a2c1…)
+next: land the workspace: cowshed land raven
+
+$ cowshed rm raven --abandon
+cowshed: abandoned 9 commits at 9b2e77d… that main (at 6f3a2c1…) did not contain
+cowshed: bundled to ~/.cowshed/store/acme/api/sessions/.trash/raven-9b2e77d….bundle
 next: cowshed gc   # reclaim space from old checkpoints too
 ```
 
-Nothing on stdout — `rm` has no answer to give.
+Recover an abandoned bundle from main's repository, which holds its one prerequisite:
+
+```sh
+git fetch <bundle> HEAD:refs/heads/recovered-raven
+```
+
+`cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
+Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
+
+Nothing on stdout — `rm` has no answer to give. With `--json`, the result is `{}`, or
+`{"abandoned":{"head":…,"targetBranch":"main","targetHead":…,"unlandedCommits":9,"bundle":…}}` after an abandonment.
 
 ## Daily work
 
