@@ -78,6 +78,13 @@ Span completion entry types (all written to row 1):
     - `retry_delay_ms`: Delay before next attempt
   - Duration measures the failed attempt (not including retry delay)
 
+- **`span-detach`** - Detached-Op dispatch complete, business result pending - **Row 2+ (appended)**
+  - Written when an Op handler returns the detached-pending sentinel (AxE `31d-streaming-ops`): the dispatch succeeded,
+    the business result arrives through a later execution
+  - The span still closes normally at row 1 (`span-ok` = the dispatch itself succeeded)
+  - Continuation executions (pumps, re-attach, post-restart delivery) are separate spans linked by identity — see
+    "Detach Entry Type" below
+
 #### Buffer Initialization Code
 
 The fixed row layout is established at span creation and updated on completion:
@@ -264,6 +271,51 @@ span-start: op:fetchPayment
 span-retry: retry:op:fetchPayment (attempt=1, error="503 Service Unavailable", delay=100ms)
 span-retry: retry:op:fetchPayment (attempt=2, error="503 Service Unavailable", delay=200ms)
 span-ok: op:fetchPayment (success on attempt 3)
+```
+
+### Detach Entry Type <a id="smoo/lmao!n/lmao-entry-detach-entry-type"></a>
+
+The `span-detach` entry type provides inspector legibility for **detached Ops** — Ops whose execution outlives their
+dispatch (AxE `31d-streaming-ops`: the handler returns the pending sentinel; the business result arrives later via a
+poller, webhook, or journal attach). It adds **no execution semantics**: retry, result delivery, and suspension are
+unchanged. It exists so one logical Op renders as one story across detach, re-attach, and process restart instead of as
+orphan spans.
+
+**When written:**
+
+- The Op handler returns the detached-pending sentinel — dispatch (submit, enqueue, journal registration) succeeded
+- Logged before the span closes; the span then completes row 1 with `span-ok` (the dispatch itself succeeded)
+
+**What it contains:**
+
+- Message: `detach:op:{opName}` (prefix-based querying, mirroring `retry:op:{name}`)
+- Attributes: the Op idempotency key and executor kind (batch poll / remote worker / journal attach) — enough for a
+  continuation span to be joined back without new columns
+
+**Continuations are segment-linked, not re-parented:**
+
+Later executions of the same logical Op (result-delivery pumps, journal re-attach, post-restart completion) run in fresh
+buffers, possibly in a different process. They are **separate spans** carrying the same `trace_id` and referencing the
+originating span through the existing packed span identity ([Span Identity](./01b4_span_identity.md)) — the same
+convergence discipline the Cloudflare segment tier already uses for split-brain traces
+([Cloudflare Trace Segments](./01u_cloudflare_trace_segments.md)). No new linking machinery: the inspector groups by
+`(trace_id, originating span_id)` and renders detach → pump(s) → completion as one logical Op.
+
+**Numeric assignment:**
+
+`span-detach` takes the **next free ordinal at implementation time** (the tail of the entry-type registry in
+`schema/systemSchema.ts`). It is never inserted into the existing 1–5 span-lifecycle band: consumers range-check
+contiguous bands (e.g. the log-level classification in `convertToArrow.ts`), so bands are append-only.
+
+**Example trace:**
+
+```
+span-start:  op:transcodeVideo
+span-detach: detach:op:transcodeVideo (key=job-42, executor=batch-poll)
+span-ok:     op:transcodeVideo (dispatch complete)
+--- later, possibly another process ---
+span-start:  op:transcodeVideo/attach (same trace_id, links job-42's originating span)
+span-ok:     op:transcodeVideo/attach (result delivered)
 ```
 
 ### Log Level Entry Types <a id="smoo/lmao!n/lmao-entry-log-level-entry-types"></a>
