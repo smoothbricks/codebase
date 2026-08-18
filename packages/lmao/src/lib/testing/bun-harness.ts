@@ -972,19 +972,26 @@ export {
 // Auto-discovery preload
 // =============================================================================
 
-export type AutoSetupOptions = {
-  /** Absolute path to the packages directory to scan for test-suite-tracer.ts files. */
-  packagesDir: string;
-};
+export type AutoSetupTarget =
+  | {
+      /** Root of the single consumer package whose tests are running. */
+      readonly packageRoot: string;
+    }
+  | {
+      /** Workspace root for a cross-package run, with its member package roots. */
+      readonly workspaceRoot: string;
+      readonly packageRoots: readonly string[];
+    };
 
 /**
- * Auto-discover package test-suite-tracers and create the root tracer for the
- * current bun test run.
+ * Create the root tracer for the current bun test run from a resolved consumer
+ * target (see `resolveConsumerTarget` in `./consumer-package.js`).
  *
- * When Bun is running from inside `packages/<name>`, prefer that package's own
- * `src/test-suite-tracer.ts` and avoid importing unrelated packages. Repo-root
- * runs still fall back to the full scan so cross-package test runs keep the
- * merged-schema behavior.
+ * A package target imports that package's own `src/test-suite-tracer.ts` (if
+ * present) and writes `.trace-results.db` at the package root. A
+ * workspace-root target scans the member packages' tracer modules so
+ * cross-package runs keep the merged-schema behavior, writing the DB at the
+ * workspace root.
  *
  * Per-package `useTestSpan()` delegates to the global `useTestSpan()` from this
  * module which checks `_activeSuiteTracer` — set by the root preload via
@@ -992,22 +999,19 @@ export type AutoSetupOptions = {
  *
  * @example
  * ```ts
- * // test-trace-preload.ts (monorepo root)
- * import { autoSetupBunTestTracing } from './packages/lmao/src/lib/testing/bun-harness.js';
- * await autoSetupBunTestTracing({ packagesDir: './packages' });
+ * // bun trace preload
+ * const target = resolveConsumerTarget(process.cwd());
+ * if (target.kind === 'package') await autoSetupBunTestTracing({ packageRoot: target.packageRoot });
  * ```
  */
-export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promise<boolean> {
-  const { join, relative, resolve, sep } = await import('node:path');
-  const { existsSync, readdirSync } = await import('node:fs');
+export async function autoSetupBunTestTracing(target: AutoSetupTarget): Promise<boolean> {
+  const { join } = await import('node:path');
+  const { existsSync } = await import('node:fs');
 
-  const packagesDir = resolve(options.packagesDir);
-  if (!existsSync(packagesDir)) return false;
-
-  const installSuite = (opContext: OpContextBinding, mergedSchema: Record<string, unknown>): boolean => {
+  const installSuite = (opContext: OpContextBinding, mergedSchema: Record<string, unknown>, dbDir: string): boolean => {
     const hasCustomSchema = Object.keys(mergedSchema).length > 0;
     const suite = makeBunTestSuiteTracer(opContext, {
-      sqlite: { dbPath: '.trace-results.db' },
+      sqlite: { dbPath: join(dbDir, '.trace-results.db') },
       extraTestColumns: hasCustomSchema && isSchemaFieldsRecord(mergedSchema) ? mergedSchema : undefined,
     });
 
@@ -1015,34 +1019,25 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     return true;
   };
 
-  const cwd = resolve(process.cwd());
-  const relativeToPackagesDir = relative(packagesDir, cwd);
-  const isPackageLocalRun =
-    relativeToPackagesDir !== '' &&
-    !relativeToPackagesDir.startsWith('..') &&
-    !relativeToPackagesDir.startsWith(`.${sep}`);
-
-  if (isPackageLocalRun) {
-    const [packageName] = relativeToPackagesDir.split(sep);
-    const tracerPath = join(packagesDir, packageName, 'src', 'test-suite-tracer.ts');
+  if ('packageRoot' in target) {
+    const tracerPath = join(target.packageRoot, 'src', 'test-suite-tracer.ts');
 
     if (!existsSync(tracerPath)) {
-      return installSuite(defaultAutoSetupOpContext, {});
+      return installSuite(defaultAutoSetupOpContext, {}, target.packageRoot);
     }
 
     const mod = await import(tracerPath);
     const mergedSchema = isSchemaFieldsRecord(mod.extraTestColumns) ? mod.extraTestColumns : {};
     const opContext = isOpContextBindingLike(mod.opContext) ? mod.opContext : defaultAutoSetupOpContext;
 
-    return installSuite(opContext, mergedSchema);
+    return installSuite(opContext, mergedSchema, target.packageRoot);
   }
 
   const mergedSchema: Record<string, unknown> = {};
   let opContext: OpContextBinding | null = null;
 
-  for (const entry of readdirSync(packagesDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const tracerPath = join(packagesDir, entry.name, 'src', 'test-suite-tracer.ts');
+  for (const packageRoot of target.packageRoots) {
+    const tracerPath = join(packageRoot, 'src', 'test-suite-tracer.ts');
     if (!existsSync(tracerPath)) continue;
 
     const mod = await import(tracerPath);
@@ -1058,5 +1053,5 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     }
   }
 
-  return installSuite(opContext ?? defaultAutoSetupOpContext, mergedSchema);
+  return installSuite(opContext ?? defaultAutoSetupOpContext, mergedSchema, target.workspaceRoot);
 }
