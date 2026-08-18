@@ -165,6 +165,42 @@ describe('pure core: checkWorkspaceConfig', () => {
     expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(true);
   });
 
+  it('accepts additional project-root dist siblings in build outputs', () => {
+    const issues = checkWorkspaceConfig({
+      plugins: validPlugins(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        build: { cache: true, outputs: ['{projectRoot}/dist', '{projectRoot}/dist-node'] },
+      },
+      namedInputs: validNamedInputs(),
+    });
+    expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(false);
+  });
+
+  it('rejects build outputs missing the canonical dist tree', () => {
+    const issues = checkWorkspaceConfig({
+      plugins: validPlugins(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        build: { cache: true, outputs: ['{projectRoot}/dist-node'] },
+      },
+      namedInputs: validNamedInputs(),
+    });
+    expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(true);
+  });
+
+  it('rejects build outputs outside the project-root dist family', () => {
+    const issues = checkWorkspaceConfig({
+      plugins: validPlugins(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        build: { cache: true, outputs: ['{projectRoot}/dist', '{workspaceRoot}/out'] },
+      },
+      namedInputs: validNamedInputs(),
+    });
+    expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(true);
+  });
+
   it('detects missing sharedGlobals', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
@@ -182,6 +218,32 @@ describe('pure core: applyWorkspaceConfig', () => {
   it('returns false for already-valid config', () => {
     const nxJson = validNxJson();
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
+  });
+
+  it('preserves valid extra dist siblings in build outputs', () => {
+    const nxJson = {
+      ...validNxJson(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        build: { cache: true, outputs: ['{projectRoot}/dist', '{projectRoot}/dist-node'] },
+      },
+    };
+    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    const build = expectRecord(expectRecord(nxJson.targetDefaults).build);
+    expect(build.outputs).toEqual(['{projectRoot}/dist', '{projectRoot}/dist-node']);
+  });
+
+  it('resets invalid build outputs to the canonical dist tree', () => {
+    const nxJson = {
+      ...validNxJson(),
+      targetDefaults: {
+        ...validTargetDefaults(),
+        build: { cache: true, outputs: ['{workspaceRoot}/out'] },
+      },
+    };
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
+    const build = expectRecord(expectRecord(nxJson.targetDefaults).build);
+    expect(build.outputs).toEqual(['{projectRoot}/dist']);
   });
 
   it('fixes missing plugins', () => {
