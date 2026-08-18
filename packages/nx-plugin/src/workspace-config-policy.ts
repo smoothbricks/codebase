@@ -187,9 +187,27 @@ function validateBuildTargetDefault(
     issues.push({ path: nxJsonPath, message: 'targetDefaults.build.cache must be true' });
   }
   const outputs = build?.outputs;
-  if (!Array.isArray(outputs) || outputs.length !== 1 || outputs[0] !== '{projectRoot}/dist') {
-    issues.push({ path: nxJsonPath, message: 'targetDefaults.build.outputs must be ["{projectRoot}/dist"]' });
+  if (!isValidBuildOutputs(outputs)) {
+    issues.push({
+      path: nxJsonPath,
+      message:
+        'targetDefaults.build.outputs must contain "{projectRoot}/dist" and only "{projectRoot}/dist-<suffix>" siblings (e.g. "{projectRoot}/dist-node")',
+    });
   }
+}
+
+/**
+ * Build outputs must include the canonical dist tree; additional project-root
+ * dist siblings (dist-node, dist-test, …) are legitimate secondary outputs a
+ * repo may aggregate into `build` — the policy pins outputs under the project
+ * root's dist family, not the exact array.
+ */
+function isValidBuildOutputs(outputs: unknown): outputs is string[] {
+  return (
+    Array.isArray(outputs) &&
+    outputs.includes('{projectRoot}/dist') &&
+    outputs.every((output) => typeof output === 'string' && /^\{projectRoot\}\/dist(-[\w.-]+)?$/.test(output))
+  );
 }
 
 function validateCleanTargetDefault(
@@ -253,7 +271,11 @@ function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
   const targetDefaults = getOrCreateRecord(nxJson, 'targetDefaults');
   const build = getOrCreateRecord(targetDefaults, 'build');
   let changed = setBooleanProperty(build, 'cache', true);
-  changed = setStringArrayProperty(build, 'outputs', ['{projectRoot}/dist']) || changed;
+  // Reset only invalid outputs: valid extra dist siblings (dist-node, …) are a
+  // repo decision the fixer must not clobber.
+  if (!isValidBuildOutputs(build.outputs)) {
+    changed = setStringArrayProperty(build, 'outputs', ['{projectRoot}/dist']) || changed;
+  }
   return changed;
 }
 
