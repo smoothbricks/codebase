@@ -95,6 +95,7 @@
       "name": "@smoothbricks/duration",
       "version": "0.1.6-next.0",
       "dependencies": {
+        "@smoothbricks/time": "workspace:*",
         "tslib": "^2.8.1",
       },
       "devDependencies": {
