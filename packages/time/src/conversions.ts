@@ -51,3 +51,8 @@ export function nowMillis(): EpochMillis {
 export function microsToISODate(us: EpochMicros): string {
   return microsToDate(us).toISOString().slice(0, 10);
 }
+
+/** Convert EpochMicros to a full ISO-8601 timestamp — display edge only. */
+export function microsToISOString(us: EpochMicros): string {
+  return microsToDate(us).toISOString();
+}
