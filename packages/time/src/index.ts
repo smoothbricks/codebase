@@ -17,6 +17,7 @@
  * @packageDocumentation
  */
 
+export { computeTimeBoundary } from './compute-time-boundary.js';
 export {
   dateToMicros,
   dateToMillis,
@@ -24,6 +25,7 @@ export {
   epochMillisToMicros,
   microsToDate,
   microsToISODate,
+  microsToISOString,
   millisToDate,
   nowMicros,
   nowMillis,

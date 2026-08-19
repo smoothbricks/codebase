@@ -10,15 +10,18 @@
  * // Parse to milliseconds
  * parseDuration('5 minutes');  // 300000
  *
- * // Add to date
- * addDuration(new Date(), '1 hour');  // Date 1 hour from now
+ * // Add to EpochMicros (canonical decide clock)
+ * addDuration(nowMicros(), '1 hour');
+ *
+ * // Add to Date (display / civil edges)
+ * addDuration(new Date(), '1 hour');
  * ```
  *
  * @packageDocumentation
  */
 
-// Convenience wrapper - date + string → Date
-export { addDuration } from './add-duration.js';
+// Clock + string → same clock domain (Date or EpochMicros)
+export { addDuration, durationToMicros } from './add-duration.js';
 
 // Core function - string → milliseconds
 export { parseDuration } from './parse-duration.js';

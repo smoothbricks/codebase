@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { addDuration } from '../add-duration.js';
+import { dateToMicros, EpochMicros } from '@smoothbricks/time';
+import { addDuration, durationToMicros } from '../add-duration.js';
 
 describe('addDuration', () => {
   // Use a fixed base date for consistent testing
@@ -78,6 +79,24 @@ describe('addDuration', () => {
       expect(addDuration(baseDate, '5m').toISOString()).toBe('2024-01-01T00:05:00.000Z');
       expect(addDuration(baseDate, '2h').toISOString()).toBe('2024-01-01T02:00:00.000Z');
       expect(addDuration(baseDate, '1d').toISOString()).toBe('2024-01-02T00:00:00.000Z');
+    });
+  });
+
+  describe('EpochMicros clock', () => {
+    const base = dateToMicros(baseDate);
+
+    it('adds minutes in the microsecond domain', () => {
+      expect(addDuration(base, '5 minutes')).toBe(EpochMicros(base + 5n * 60n * 1_000_000n));
+    });
+
+    it('preserves leftover sub-millisecond micros', () => {
+      const odd = EpochMicros(base + 250n);
+      expect(addDuration(odd, '1 second')).toBe(EpochMicros(odd + 1_000_000n));
+    });
+
+    it('scales fractional milliseconds to micros', () => {
+      expect(durationToMicros('0.5 ms')).toBe(500n);
+      expect(addDuration(base, '0.5 ms')).toBe(EpochMicros(base + 500n));
     });
   });
 });
