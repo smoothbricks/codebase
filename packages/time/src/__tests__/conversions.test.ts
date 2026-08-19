@@ -9,6 +9,7 @@ import {
   epochMillisToMicros,
   microsToDate,
   microsToISODate,
+  microsToISOString,
   millisToDate,
   nowMicros,
   nowMillis,
@@ -202,5 +203,12 @@ describe('microsToISODate', () => {
     const d = new Date('2099-12-31T00:00:00.000Z');
     const us = dateToMicros(d);
     expect(microsToISODate(us)).toBe('2099-12-31');
+  });
+});
+
+describe('microsToISOString', () => {
+  it('preserves the full UTC timestamp', () => {
+    const d = new Date('2024-06-15T12:30:45.123Z');
+    expect(microsToISOString(dateToMicros(d))).toBe('2024-06-15T12:30:45.123Z');
   });
 });
