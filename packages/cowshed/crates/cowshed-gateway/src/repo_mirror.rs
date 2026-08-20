@@ -1333,10 +1333,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
-    use tokio::{
-        io::{AsyncReadExt as _, AsyncWriteExt as _},
-        sync::Notify,
-    };
+    use tokio::sync::Notify;
 
     use super::*;
 
