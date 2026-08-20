@@ -1574,6 +1574,7 @@ pub(crate) enum CreatedMountState {
     AutoMounted,
 }
 
+#[cfg(target_os = "macos")]
 fn attest_created_apfs_info(
     bytes: &[u8],
     expected_identifier: &str,
