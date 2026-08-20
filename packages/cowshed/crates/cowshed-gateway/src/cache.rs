@@ -1499,7 +1499,7 @@ fn hex_decode_32(value: &str) -> Result<[u8; 32], CacheError> {
         return Err(CacheError::InvalidMetadata);
     }
     let mut decoded = [0; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Ok(decoded)
@@ -1510,7 +1510,7 @@ fn hex_decode_64(value: &str) -> Result<[u8; 64], CacheError> {
         return Err(CacheError::InvalidMetadata);
     }
     let mut decoded = [0; 64];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Ok(decoded)
