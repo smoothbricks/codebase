@@ -10,12 +10,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use url::Url;
 
+#[cfg(target_os = "macos")]
+use crate::api::dto::AbandonedWork;
 use crate::api::dto::{
-    AbandonedWork, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions,
-    GcReport, GitOid, GrantDelta, GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo,
-    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, RevisionResult,
-    RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
+    AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
+    CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
+    GrantSet, JobId, JobInfo, LandOptions, LandReport, MirrorInfo, PushOptions, PushReport,
+    RebaseOptions, RemoveOptions, RemoveReport, RevisionResult, RunSandboxMode, StdinSource,
+    WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
 };
 use crate::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
