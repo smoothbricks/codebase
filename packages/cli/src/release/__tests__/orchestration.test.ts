@@ -188,13 +188,13 @@ describe('release orchestration', () => {
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: false }]);
   });
 
-  it('reports dry-run version packages resolved by Nx without creating a release mode', async () => {
+  it('reports dry-run version packages as a release candidate for validation', async () => {
     const preview = { ...stable, version: '1.1.0' };
     const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [stable], preview });
 
     const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
 
-    expect(result).toEqual({ mode: 'none', packages: [preview], status: 'dry-run' });
+    expect(result).toEqual({ mode: 'dry-run', packages: [preview], status: 'dry-run' });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: true }]);
   });
 
