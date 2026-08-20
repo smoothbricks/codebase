@@ -1,7 +1,7 @@
 import type { ReleasePackageInfo, ReleaseTarget } from './core.js';
 import { planPublishActions } from './publish-plan.js';
 
-export type ReleaseVersionMode = 'new' | 'none';
+export type ReleaseVersionMode = 'new' | 'dry-run' | 'none';
 
 export interface ReleaseSummary<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   sha: string;
@@ -87,7 +87,7 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   const headBeforeVersioning = await shell.gitHead();
   const dryRunPackages = await shell.runNxReleaseVersion(versionPackages, options.bump, options.dryRun);
   if (options.dryRun) {
-    return { mode: 'none', packages: dryRunPackages, status: 'dry-run' };
+    return { mode: 'dry-run', packages: dryRunPackages, status: 'dry-run' };
   }
 
   await shell.assertCleanGitTree();
