@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
+import typia from 'typia';
 import { BlockIndex } from '../../block-index.js';
 import { createBlockDependentsTool } from '../../tools/block-dependents.js';
 import { createExpandTool } from '../../tools/expand.js';
@@ -135,7 +136,7 @@ describe('query tools', () => {
 
       expect(result.metadata.count).toBe(2);
 
-      const targets = JSON.parse(result.output) as string[];
+      const targets = typia.json.assertParse<string[]>(result.output);
       expect(targets.sort()).toEqual(['src/agent.ts', 'src/signals.ts']);
     });
 
