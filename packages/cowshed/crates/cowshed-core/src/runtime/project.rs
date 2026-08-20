@@ -1533,6 +1533,7 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn verified_recovery_facts<'a>(
     facts: &'a [crate::storage::lifecycle::StorageFact],
     pending: &[crate::storage::apfs::PendingPublicationFact],
