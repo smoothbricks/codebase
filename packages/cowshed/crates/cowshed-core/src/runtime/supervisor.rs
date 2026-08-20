@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::{fs::MetadataExt, process::ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -847,6 +847,20 @@ struct DevenvEnvSnapshot {
     vars: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DevenvInputFingerprint(Vec<(PathBuf, Option<DevenvFileFingerprint>)>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DevenvFileFingerprint {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct PrintedDevenvEnvironment {
     variables: BTreeMap<String, PrintedDevenvVariable>,
@@ -867,13 +881,14 @@ struct PrintedDevenvVariable {
 /// One long-lived watcher belongs to each mounted-workspace supervisor.
 ///
 /// Source mtimes are reconciled once when the supervisor starts, covering edits made while the
-/// daemon was down. After that, filesystem events are the only staleness signal: clean execs do no
-/// source metadata work and never invoke devenv. A process that is already running keeps the
-/// environment it launched with; the next process consumes the dirty flag and refreshes.
+/// daemon was down. After that, filesystem events are the staleness signal: clean execs do no
+/// source metadata work and never invoke devenv. A dirty exec fingerprints the tracked inputs so a
+/// delayed pre-watch event can reuse the evaluated snapshot; a new revision refreshes it.
 struct DevenvEnvironment {
     workspace_mount: PathBuf,
     dirty: Arc<AtomicBool>,
     tracked_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
+    evaluated_inputs: Option<DevenvInputFingerprint>,
     resolution: std::result::Result<Option<PathBuf>, DevenvResolutionError>,
     _watcher: RecommendedWatcher,
 }
@@ -882,10 +897,15 @@ impl DevenvEnvironment {
     fn new(workspace_mount: &Path) -> Result<Self> {
         let resolution = resolve_devenv_dir(workspace_mount);
         let resolved = resolution.as_ref().ok().and_then(|value| value.as_deref());
-        let tracked_paths = Arc::new(RwLock::new(devenv_tracked_paths(
-            workspace_mount,
-            tracked_devenv_dir(&resolution),
-        )));
+        let tracked_paths = devenv_tracked_paths(workspace_mount, tracked_devenv_dir(&resolution));
+        let snapshot_is_stale =
+            resolved.is_some_and(|dir| initial_devenv_snapshot_is_stale(workspace_mount, dir));
+        let evaluated_inputs = if resolved.is_some() && !snapshot_is_stale {
+            devenv_input_fingerprint(&tracked_paths).ok()
+        } else {
+            None
+        };
+        let tracked_paths = Arc::new(RwLock::new(tracked_paths));
         let dirty = Arc::new(AtomicBool::new(false));
         let callback_paths = Arc::clone(&tracked_paths);
         let callback_dirty = Arc::clone(&dirty);
@@ -922,13 +942,14 @@ impl DevenvEnvironment {
                     "reattach the workspace and retry",
                 )
             })?;
-        if resolved.is_some_and(|dir| initial_devenv_snapshot_is_stale(workspace_mount, dir)) {
+        if snapshot_is_stale {
             dirty.store(true, Ordering::Release);
         }
         Ok(Self {
             workspace_mount: workspace_mount.to_owned(),
             dirty,
             tracked_paths,
+            evaluated_inputs,
             resolution,
             _watcher: watcher,
         })
@@ -939,9 +960,18 @@ impl DevenvEnvironment {
         spawner: &mut dyn SpawnSink,
         controller_env: BTreeMap<String, String>,
     ) -> Result<(Option<PathBuf>, BTreeMap<String, String>)> {
-        let changed = self.dirty.swap(false, Ordering::AcqRel);
+        let mut changed = self.dirty.swap(false, Ordering::AcqRel);
         if changed {
             self.resolve_again();
+            if self
+                .input_fingerprint()
+                .is_some_and(|inputs| self.evaluated_inputs.as_ref() == Some(&inputs))
+            {
+                // FSEvents can deliver a write from before watcher registration after the
+                // evaluated snapshot is already current. The fingerprint distinguishes that
+                // delayed notification from a new source revision without losing the event.
+                changed = false;
+            }
         }
         let devenv_dir = self
             .resolution
@@ -958,11 +988,24 @@ impl DevenvEnvironment {
             ));
         }
 
+        let inputs_before = self.input_fingerprint();
         match refresh_devenv_snapshot(spawner, &devenv_dir).await {
-            Ok(vars) => Ok((
-                Some(devenv_dir),
-                merge_devenv_environment(vars, controller_env),
-            )),
+            Ok(vars) => {
+                let inputs_after = self.input_fingerprint();
+                self.evaluated_inputs = match (inputs_before, inputs_after) {
+                    (Some(before), Some(after)) if before == after => Some(after),
+                    _ => {
+                        // A source changed while devenv was evaluating, so the next process
+                        // must refresh again rather than treating this output as authoritative.
+                        self.dirty.store(true, Ordering::Release);
+                        None
+                    }
+                };
+                Ok((
+                    Some(devenv_dir),
+                    merge_devenv_environment(vars, controller_env),
+                ))
+            }
             Err(error) => {
                 // A failed refresh is never a clean state and a stale snapshot is never reused.
                 self.dirty.store(true, Ordering::Release);
@@ -980,6 +1023,32 @@ impl DevenvEnvironment {
         }
         self.resolution = resolution;
     }
+
+    fn input_fingerprint(&self) -> Option<DevenvInputFingerprint> {
+        let paths = self.tracked_paths.read().ok()?;
+        devenv_input_fingerprint(&paths).ok()
+    }
+}
+
+fn devenv_input_fingerprint(paths: &BTreeSet<PathBuf>) -> io::Result<DevenvInputFingerprint> {
+    let mut fingerprints = Vec::with_capacity(paths.len());
+    for path in paths {
+        let fingerprint = match fs::metadata(path) {
+            Ok(metadata) => Some(DevenvFileFingerprint {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.size(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        fingerprints.push((path.clone(), fingerprint));
+    }
+    Ok(DevenvInputFingerprint(fingerprints))
 }
 
 fn resolve_devenv_dir(
@@ -3648,6 +3717,19 @@ mod workspace_toolchain_tests {
         root
     }
 
+    struct NoSpawn;
+
+    #[async_trait]
+    impl SpawnSink for NoSpawn {
+        async fn spawn(
+            &mut self,
+            _request: ProcessSpawnRequest,
+            _events: mpsc::Sender<ProcessEvent>,
+        ) -> Result<Box<dyn RunningProcess>> {
+            panic!("spawn is not used by devenv environment tests")
+        }
+    }
+
     #[test]
     fn a_workspace_without_an_evaluated_profile_is_unchanged() {
         let root = scratch("absent");
@@ -3797,6 +3879,34 @@ mod workspace_toolchain_tests {
         assert!(
             environment.dirty.load(Ordering::Acquire),
             "a relevant filesystem event must dirty the next sandbox process"
+        );
+
+        drop(environment);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delayed_watcher_event_does_not_refresh_unchanged_devenv_inputs() {
+        let root = scratch("watcher-delayed");
+        let mount = root.join("workspace");
+        let snapshot = mount.join(DEVENV_SNAPSHOT_FILE);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
+        std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&snapshot, "{\"vars\":{\"FROM_SNAPSHOT\":\"yes\"}}\n")
+            .expect("fresh snapshot");
+        let mut environment = DevenvEnvironment::new(&mount).expect("watcher");
+
+        // macOS FSEvents can deliver the source write that preceded watcher registration late.
+        environment.dirty.store(true, Ordering::Release);
+        let (_, variables) = environment
+            .environment_for_spawn(&mut NoSpawn, BTreeMap::new())
+            .await
+            .expect("unchanged inputs reuse the evaluated snapshot");
+
+        assert_eq!(
+            variables.get("FROM_SNAPSHOT").map(String::as_str),
+            Some("yes")
         );
 
         drop(environment);
