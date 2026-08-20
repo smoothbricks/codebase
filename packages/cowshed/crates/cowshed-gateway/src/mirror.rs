@@ -933,7 +933,7 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut decoded = [0; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex(pair[0]).ok()? << 4) | hex(pair[1]).ok()?;
     }
     Some(decoded)

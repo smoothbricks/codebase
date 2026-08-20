@@ -64,7 +64,7 @@ describe('cowshed CLI trampoline', () => {
 
   it('uses the Node-API runner only when neither native binary exists', async () => {
     const root = await fixtureRoot();
-    const napiCalls: readonly string[][] = [];
+    const napiCalls: string[][] = [];
 
     const exitCode = await runCli(['path', 'main'], {
       packageRoot: root,
@@ -74,7 +74,7 @@ describe('cowshed CLI trampoline', () => {
         throw new Error('native spawn must not run');
       },
       async runNapi(argv) {
-        (napiCalls as string[][]).push([...argv]);
+        napiCalls.push([...argv]);
         return 9;
       },
     });
