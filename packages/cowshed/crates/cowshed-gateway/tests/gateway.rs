@@ -16,6 +16,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(target_os = "macos")]
 use base64::Engine as _;
 use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus,
@@ -249,6 +250,7 @@ fn absolute_request(host: &str, port: u16, token: &str, path: &str) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 /// The `Proxy-Authorization` value a client builds from `http://cowshed:<token>@127.0.0.1:<port>`.
 fn basic_credential(user: &str, token: &str) -> String {
     format!(
@@ -257,6 +259,7 @@ fn basic_credential(user: &str, token: &str) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn basic_absolute_request(host: &str, port: u16, credential: &str, path: &str) -> String {
     format!(
         "GET http://{host}:{port}{path} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: {credential}\r\nConnection: close\r\n\r\n"
