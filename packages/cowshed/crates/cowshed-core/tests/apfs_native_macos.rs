@@ -179,7 +179,7 @@ impl CommandRunner for FailingDetachRunner {
         if is_detach
             && self
                 .failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -4256,7 +4256,7 @@ impl CommandRunner for ResizeRunner {
             ["detach", ..] | ["eject", ..] => {
                 if self
                     .detach_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()

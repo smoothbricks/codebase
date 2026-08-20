@@ -6150,9 +6150,9 @@ fn native_restore_error(
     error: crate::storage::apfs::RestoreExecutionError<CowshedError, CowshedError>,
 ) -> CowshedError {
     match error {
-        crate::storage::apfs::RestoreExecutionError::Storage(error)
-        | crate::storage::apfs::RestoreExecutionError::Activation { source: error, .. } => {
-            native_storage_error(error)
+        crate::storage::apfs::RestoreExecutionError::Storage(error) => native_storage_error(error),
+        crate::storage::apfs::RestoreExecutionError::Activation { source: error, .. } => {
+            native_storage_error(*error)
         }
         crate::storage::apfs::RestoreExecutionError::Prepare(error)
         | crate::storage::apfs::RestoreExecutionError::Fence { source: error, .. } => error,

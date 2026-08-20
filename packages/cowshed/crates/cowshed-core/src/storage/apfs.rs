@@ -221,13 +221,13 @@ pub enum RestoreExecutionError<P, F> {
     #[error("restore fence failed with a pending forward-only publication: {source}")]
     Fence {
         source: F,
-        pending: PendingPublicationFact,
+        pending: Box<PendingPublicationFact>,
     },
     #[error("restore fence succeeded but pending publication activation failed: {source}")]
     Activation {
         #[source]
-        source: ApfsStorageError,
-        pending: PendingPublicationFact,
+        source: Box<ApfsStorageError>,
+        pending: Box<PendingPublicationFact>,
     },
 }
 
@@ -1108,7 +1108,7 @@ where
         if let Err(source) = fence(fence_input).await {
             return Err(RestoreExecutionError::Fence {
                 source,
-                pending: pending.fact,
+                pending: Box::new(pending.fact),
             });
         }
         let host = Arc::clone(&self.host);
@@ -1121,8 +1121,8 @@ where
             .await
         {
             return Err(RestoreExecutionError::Activation {
-                source,
-                pending: pending.fact,
+                source: Box::new(source),
+                pending: Box::new(pending.fact),
             });
         }
         Ok(pending.receipt)
