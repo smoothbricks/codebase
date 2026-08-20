@@ -1823,7 +1823,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::storage::bootstrap::{ApfsProvisionKind, VolumeMarker};
+    #[cfg(target_os = "macos")]
+    use crate::storage::bootstrap::ApfsProvisionKind;
+    use crate::storage::bootstrap::VolumeMarker;
 
     struct FakeEvidenceSource {
         statfs: StatFsSnapshot,
