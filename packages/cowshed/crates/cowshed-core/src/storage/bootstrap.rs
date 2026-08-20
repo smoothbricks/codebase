@@ -1514,7 +1514,6 @@ fn valid_apfs_volume_identifier(identifier: &str) -> bool {
         && slice.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-#[cfg(target_os = "macos")]
 /// Whether a newly created volume is still detached, or was mounted at the
 /// default `/Volumes/<name>` by the system before the attestation ran.
 ///
@@ -1527,6 +1526,7 @@ pub(crate) enum CreatedMountState {
     AutoMounted,
 }
 
+#[cfg(target_os = "macos")]
 fn attest_created_apfs_info(
     bytes: &[u8],
     expected_identifier: &str,
