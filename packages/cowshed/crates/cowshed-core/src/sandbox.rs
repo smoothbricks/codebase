@@ -551,14 +551,11 @@ fn push_line(profile: &mut String, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
     use std::fs;
     #[cfg(target_os = "macos")]
     use std::process::Stdio;
-    #[cfg(target_os = "macos")]
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[cfg(target_os = "macos")]
     static NEXT_SANDBOX_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn config(mode: RunSandboxMode) -> SandboxConfig {
