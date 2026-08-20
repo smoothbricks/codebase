@@ -5735,6 +5735,7 @@ fn main_name() -> WorkspaceName {
 ///
 /// Narrowed to `.git`: the workspace needs main's object store and its own administrative
 /// directory, and nothing in main's working tree.
+#[cfg(target_os = "macos")]
 fn git_worktree_repository(
     metadata: &crate::metadata::DetachedWorkspaceMetadata,
     main_mount: PathBuf,
@@ -5748,6 +5749,7 @@ fn git_worktree_repository(
 /// pointer file in the worktree and the `gitdir` file in main's administrative directory from
 /// whichever of the two is still intact, which is what makes it correct whether main moved or the
 /// workspace did.
+#[cfg(target_os = "macos")]
 async fn repair_git_worktree_link(main_mount: &Path, mount: &Path) -> Result<()> {
     crate::git::GitRepository::from_root(main_mount)
         .repair_linked_worktree(mount)
@@ -5761,6 +5763,7 @@ async fn repair_git_worktree_link(main_mount: &Path, mount: &Path) -> Result<()>
 /// worktree id main has since pruned, quietly claiming a branch another workspace may now hold.
 /// The refusal lands before any quota read or barrier, because nothing about the workspace's size
 /// or its supervisor changes the answer, and the hints name the two honest substitutes.
+#[cfg(target_os = "macos")]
 fn require_checkpointable(
     name: &WorkspaceName,
     metadata: &crate::metadata::DetachedWorkspaceMetadata,
@@ -5784,6 +5787,7 @@ fn require_checkpointable(
 /// Read from the store-side sidecar, so it answers while the workspace is detached — which is
 /// exactly when retirement and `gc` need it. A sidecar too old to carry the field describes a
 /// workspace minted before the mode existed, and those are standalone.
+#[cfg(target_os = "macos")]
 fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> bool {
     metadata
         .info_snapshot
@@ -5797,6 +5801,7 @@ fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> boo
 /// main's own mount. It is accepted only when it resolves to precisely that mount, and the
 /// identity checks then run against the resolved target. Every other symlink is an unrelated path
 /// standing where the checkout belongs, and stays a conflict — the check narrows, never inverts.
+#[cfg(target_os = "macos")]
 async fn resolve_checkout_identity_path(
     path: &Path,
     path_metadata: &std::fs::Metadata,
@@ -5888,6 +5893,7 @@ mod git_worktree_tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn checkpoint_and_restore_refuse_a_git_worktree_workspace_and_name_both_substitutes() {
         let name = WorkspaceName::new("raven").expect("workspace name");
@@ -5908,6 +5914,7 @@ mod git_worktree_tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn only_a_git_worktree_workspace_reaches_into_mains_repository() {
         let main_mount = PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/main");
@@ -5920,6 +5927,7 @@ mod git_worktree_tests {
 
     /// A sidecar written before the mode existed describes a standalone workspace, and must read
     /// as one rather than failing closed: the absent field is an answer, not a gap.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_sidecar_without_the_field_is_a_standalone_workspace() {
         let mut wire = serde_json::to_value(sidecar(false)).expect("encode sidecar");
@@ -6241,6 +6249,7 @@ mod binding_tests {
         std::fs::remove_dir_all(&root).expect("fixture cleanup");
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
         use crate::api::dto::Sha256Digest;

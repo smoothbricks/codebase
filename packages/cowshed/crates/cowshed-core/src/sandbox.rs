@@ -768,6 +768,7 @@ mod tests {
             16
         );
     }
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_daemon_socket_is_admitted_only_by_resolving_to_a_real_socket() {
         let sequence = NEXT_SANDBOX_DIR.fetch_add(1, Ordering::Relaxed);
