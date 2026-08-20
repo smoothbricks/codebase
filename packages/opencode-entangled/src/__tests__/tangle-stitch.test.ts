@@ -136,11 +136,12 @@ describe('tangle-stitch hook', () => {
     await hook({ tool: 'edit', sessionID: 's1', callID: 'c1', args: { file_path: 'docs/main.md' } }, output);
 
     expect(commands).toHaveLength(1);
-    expect(output.output).toBeDefined();
-    expect(typeof output.output).toBe('string');
-    expect(output.output as string).toContain('entangled tangle');
-    expect(output.output as string).toContain('exit 1');
-    expect(output.output as string).toContain('something broke');
+    const errorMessage = output.output;
+    expect(errorMessage).toBeDefined();
+    if (typeof errorMessage !== 'string') throw new Error('Expected hook output to be a string');
+    expect(errorMessage).toContain('entangled tangle');
+    expect(errorMessage).toContain('exit 1');
+    expect(errorMessage).toContain('something broke');
   });
 
   it('entangled stitch failure appends error info to output.output', async () => {
@@ -148,8 +149,10 @@ describe('tangle-stitch hook', () => {
     const output: Record<string, unknown> = {};
     await hook({ tool: 'edit', sessionID: 's1', callID: 'c1', args: { file_path: 'src/greet.ts' } }, output);
 
-    expect(output.output).toBeDefined();
-    expect(output.output as string).toContain('entangled stitch');
+    const errorMessage = output.output;
+    expect(errorMessage).toBeDefined();
+    if (typeof errorMessage !== 'string') throw new Error('Expected hook output to be a string');
+    expect(errorMessage).toContain('entangled stitch');
   });
 
   it('successful command does not append error info to output', async () => {
