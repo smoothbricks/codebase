@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { AnimationFrameStateBus, computed, ManualStateBus, StateBus, track, useStateTracking } from '..';
+import { AnimationFrameStateBus, computed, ManualStateBus, StateBus, track, useStateTracking } from '../index.js';
 
 declare module '@smoothbricks/statebus-core' {
   export interface States {
