@@ -111,11 +111,7 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu",
-          "env": {
-            "TARGET_CC": "clang",
-            "TARGET_CXX": "clang++"
-          }
+          "command": "napi build --release --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu"
         }
       },
       "cli-x64-linux": {
@@ -135,11 +131,7 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu",
-          "env": {
-            "TARGET_CC": "clang",
-            "TARGET_CXX": "clang++"
-          }
+          "command": "napi build --release --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu"
         }
       },
       "trampoline-test": {
