@@ -1048,7 +1048,8 @@ fn devenv_tracked_paths(workspace_mount: &Path, devenv_dir: Option<&Path>) -> BT
 }
 
 fn event_touches_devenv(event: &Event, tracked_paths: &BTreeSet<PathBuf>) -> bool {
-    event.paths.iter().any(|path| tracked_paths.contains(path))
+    !matches!(event.kind, notify::EventKind::Access(_))
+        && event.paths.iter().any(|path| tracked_paths.contains(path))
 }
 
 fn initial_devenv_snapshot_is_stale(workspace_mount: &Path, devenv_dir: &Path) -> bool {
@@ -3762,6 +3763,16 @@ mod workspace_toolchain_tests {
                 ("SNAPSHOT_ONLY".to_owned(), "yes".to_owned()),
             ])
         );
+    }
+
+    #[test]
+    fn watcher_ignores_read_events_for_devenv_inputs() {
+        let path = PathBuf::from("/workspace/devenv.nix");
+        let tracked_paths = BTreeSet::from([path.clone()]);
+        let event =
+            Event::new(notify::EventKind::Access(notify::event::AccessKind::Read)).add_path(path);
+
+        assert!(!event_touches_devenv(&event, &tracked_paths));
     }
 
     #[test]
