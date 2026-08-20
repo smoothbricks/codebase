@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { computed, ManualStateBus } from '..';
+import { computed, ManualStateBus } from '../index.js';
 
 //*
 declare module '@smoothbricks/statebus-core' {
@@ -18,8 +18,7 @@ declare module '@smoothbricks/statebus-core' {
 describe('Computed States', () => {
   it('should properly compute derived state', () => {
     const bus = new ManualStateBus({
-      // biome-ignore lint/suspicious/noExplicitAny: test uses simplified types
-      initialState: { counter: 0 } as any,
+      initialState: { counter: 0, counter1: 0, counter2: 0 },
       reducers: {
         count: (state, event) => {
           state.counter.update((v) => v + event.payload);
@@ -39,8 +38,7 @@ describe('Computed States', () => {
 
   it('should update computed values when dependencies change', () => {
     const bus = new ManualStateBus({
-      // biome-ignore lint/suspicious/noExplicitAny: test uses simplified types
-      initialState: { counter1: 0, counter2: 0 } as any,
+      initialState: { counter: 0, counter1: 0, counter2: 0 },
       reducers: (state, event) => {
         switch (event.type) {
           case 'increment1':
