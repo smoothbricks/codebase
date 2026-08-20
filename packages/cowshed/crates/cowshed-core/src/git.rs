@@ -1163,7 +1163,7 @@ mod tests {
     /// mint step under test starts from exactly what a CoW clone hands it.
     fn clone_image(main: &Path) -> PathBuf {
         let mount = main.with_extension("workspace");
-        let status = Command::new("/bin/cp")
+        let status = Command::new("cp")
             .args(["-R".as_ref(), main.as_os_str(), mount.as_os_str()])
             .status()
             .expect("clone image");
