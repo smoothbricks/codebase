@@ -251,7 +251,7 @@ fn decode_field_metadata(bytes: &[u8]) -> Result<Vec<SignalSchemaField>, SchemaE
         });
     }
     let mut fields = Vec::with_capacity(bytes.len() / 4);
-    for (field_index, raw) in bytes.chunks_exact(4).enumerate() {
+    for (field_index, raw) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let Some(arrow_type) = ArrowType::from_u8(raw[0]) else {
             return Err(SchemaError::InvalidFieldMetadata { field_index });
         };
