@@ -1,14 +1,35 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AfterAllProjectsVersioned, VersionActions } from 'nx/release';
+import type JsVersionActions from '@nx/js/src/release/version-actions';
+import type { AfterAllProjectsVersioned } from 'nx/release';
+import type { ProjectGraph, ProjectGraphDependency, ProjectGraphProjectNode } from 'nx/src/config/project-graph';
+import type { Tree } from 'nx/src/generators/tree';
 
-type VersionActionsModule = typeof VersionActions & {
-  default?: typeof VersionActions & { afterAllProjectsVersioned: AfterAllProjectsVersioned };
+// The runtime `require` is what Nx's own loader does with this path, and the concrete
+// `JsVersionActions` type is what makes subclassing it typecheck: `nx/release` only exports the
+// abstract `VersionActions`, whose members this class does not reimplement.
+type JsVersionActionsClass = typeof JsVersionActions & {
   afterAllProjectsVersioned: AfterAllProjectsVersioned;
 };
 
-const nxJsVersionActions = require('@nx/js/src/release/version-actions') as VersionActionsModule;
-const baseVersionActions = nxJsVersionActions.default ?? nxJsVersionActions;
+/** The exported shape: the base class plus the statics this module adds. */
+type SmoothbricksVersionActionsClass = JsVersionActionsClass & {
+  publishedDependencies(
+    dependencies: readonly ProjectGraphDependency[],
+    manifest: Record<string, unknown>,
+    packageNameOf: (projectName: string) => string | null,
+  ): ProjectGraphDependency[];
+};
+
+const nxJsVersionActions = require('@nx/js/src/release/version-actions') as JsVersionActionsClass & {
+  default?: JsVersionActionsClass;
+};
+const baseVersionActions: JsVersionActionsClass = nxJsVersionActions.default ?? nxJsVersionActions;
+
+// The manifest sections that survive `npm publish` as a consumer's problem. A devDependency is
+// build-time only: it never reaches an installer, so a new version of it changes nothing about
+// the published artifact and is no reason to cut a release.
+const PUBLISHED_DEPENDENCY_FIELDS = ['dependencies', 'peerDependencies', 'optionalDependencies'] as const;
 
 const afterAllProjectsVersioned: AfterAllProjectsVersioned = async (cwd, options) => {
   const result = await nxJsVersionActions.afterAllProjectsVersioned(cwd, options);
@@ -38,9 +59,86 @@ const afterAllProjectsVersioned: AfterAllProjectsVersioned = async (cwd, options
   };
 };
 
-baseVersionActions.afterAllProjectsVersioned = afterAllProjectsVersioned;
+/**
+ * Version only the dependents a release can actually reach.
+ *
+ * Nx expands a bump to every reverse edge of the project graph, and that graph cannot answer the
+ * question that matters: `@nx/js` merges `dependencies`, `devDependencies`, `peerDependencies`,
+ * and `optionalDependencies` into one edge set before the graph is built, so a package that only
+ * uses another for its own tests is indistinguishable from one that ships it. Left alone, a fix
+ * to a test-only library republishes every package that tests with it — and on macOS that means
+ * rebuilding and re-testing native binaries nothing in the release actually changed.
+ *
+ * `readDependencies` is Nx's sanctioned override for exactly this: `ReleaseGraph`'s reverse-edge
+ * map is built from its return value alone, so dropping the dev-only edges here removes those
+ * packages from the release, from the platform builds, and from the version data the CLI reads
+ * back. Specifier rewriting is unaffected: `updateProjectDependencies` reads the project graph
+ * directly, so a package that is versioned on its own merit still gets accurate devDependency
+ * pins.
+ */
+class SmoothbricksVersionActions extends baseVersionActions {
+  // Nx reads this off the exported module, not off an instance (`loaded.afterAllProjectsVersioned`).
+  static override afterAllProjectsVersioned: AfterAllProjectsVersioned = afterAllProjectsVersioned;
 
-export = baseVersionActions;
+  /**
+   * The policy itself: keep an edge only when the source manifest declares the target in a
+   * section that survives publication.
+   *
+   * `packageNameOf` returns `null` for anything that is not a workspace project with a readable
+   * name — an external `npm:` node, most commonly. Those are kept exactly as the project graph
+   * reported them: they are not release projects, so they expand nothing, and keeping them makes
+   * this override strictly subtractive on the set that matters.
+   */
+  static publishedDependencies(
+    dependencies: readonly ProjectGraphDependency[],
+    manifest: Record<string, unknown>,
+    packageNameOf: (projectName: string) => string | null,
+  ): ProjectGraphDependency[] {
+    return dependencies.filter((dependency) => {
+      const packageName = packageNameOf(dependency.target);
+      if (packageName === null) {
+        return true;
+      }
+      return PUBLISHED_DEPENDENCY_FIELDS.some((field) => {
+        const section = manifest[field];
+        return isRecord(section) && packageName in section;
+      });
+    });
+  }
+
+  override async readDependencies(tree: Tree, projectGraph: ProjectGraph): Promise<ProjectGraphDependency[]> {
+    const dependencies = await super.readDependencies(tree, projectGraph);
+    const manifest = readManifest(tree, this.projectGraphNode);
+    if (!manifest) {
+      return dependencies;
+    }
+    return SmoothbricksVersionActions.publishedDependencies(dependencies, manifest, (projectName) => {
+      const node = projectGraph.nodes[projectName];
+      const packageName = node ? readManifest(tree, node)?.name : undefined;
+      return typeof packageName === 'string' ? packageName : null;
+    });
+  }
+}
+
+// Exported as a typed value, not as the class declaration. `export =` of a class publishes every
+// static as an ESM named import TypeScript can see but Node's CJS lexer cannot, which crashes an
+// `import { publishedDependencies }` at runtime; a const has no members to publish.
+const versionActions: SmoothbricksVersionActionsClass = SmoothbricksVersionActions;
+
+export = versionActions;
+
+/**
+ * Read a project's `package.json` from the version tree, which carries writes earlier projects in
+ * this run have already staged.
+ */
+function readManifest(tree: Tree, node: ProjectGraphProjectNode): Record<string, unknown> | null {
+  const contents = tree.read(join(node.data.root, 'package.json'), 'utf-8');
+  if (contents === null) {
+    return null;
+  }
+  const parsed: unknown = JSON.parse(contents);
+  return isRecord(parsed) ? parsed : null;
+}
 
 function syncBunLockfileVersionsToPackageJson(root: string): number {
   const lockfilePath = join(root, 'bun.lock');
