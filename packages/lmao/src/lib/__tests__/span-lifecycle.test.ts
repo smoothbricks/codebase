@@ -20,6 +20,7 @@ import {
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { iterateSpanChildren } from '../traceTopology.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { createTestOpMetadata, createTestTraceRoot, createTestTracerOptions } from './test-helpers.js';
 
@@ -150,6 +151,84 @@ describe('Span Lifecycle', () => {
     });
 
     expect(result.success).toBe(true);
+  });
+
+  it('should support spanSync with an inline sync closure', async () => {
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+    const captured = 'closure-local';
+
+    const result = await tracer.trace('root-task', async (rootCtx) => {
+      const childResult = rootCtx.spanSync('sync-closure', (childCtx) => {
+        childCtx.tag.spanName('sync-closure');
+        return childCtx.ok(captured);
+      });
+
+      expect(childResult).not.toBeInstanceOf(Promise);
+      expect(childResult.success).toBe(true);
+      if (!childResult.success) throw new Error('expected closure child to succeed');
+      expect(childResult.value).toBe(captured);
+      return rootCtx.ok('root-ok');
+    });
+
+    expect(result.success).toBe(true);
+
+    const rootBuffer = tracer.rootBuffers[0];
+    if (!rootBuffer) throw new Error('expected a root buffer');
+    expect(Array.from(iterateSpanChildren(rootBuffer))).toHaveLength(1);
+  });
+
+  it('should return Err synchronously from a spanSync closure', async () => {
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+
+    const result = await tracer.trace('root-task', async (rootCtx) => {
+      const childResult = rootCtx.spanSync('sync-closure-err', (childCtx) =>
+        childCtx.err(VALIDATION_ERROR({ field: 'email', message: 'Invalid email' })),
+      );
+
+      expect(childResult).not.toBeInstanceOf(Promise);
+      expect(childResult.success).toBe(false);
+      if (childResult.success) throw new Error('expected closure child to fail');
+      expect(childResult.error.code).toBe('VALIDATION_ERROR');
+      expect(childResult.error.field).toBe('email');
+      return rootCtx.ok('root-ok');
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('should give a spanSync closure its own child context and nest further spans under it', async () => {
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+
+    const result = await tracer.trace('root-task', async (rootCtx) => {
+      const childResult = rootCtx.spanSync('sync-parent', (childCtx) => {
+        // WHY: a closure target must still receive a fresh child span context, not the
+        // enclosing one, otherwise nested spans would attach to the wrong parent.
+        expect(childCtx).not.toBe(rootCtx);
+
+        const grandchildResult = childCtx.spanSync('sync-grandchild', (grandchildCtx) => {
+          expect(grandchildCtx).not.toBe(childCtx);
+          expect(grandchildCtx).not.toBe(rootCtx);
+          return grandchildCtx.ok('grandchild-ok');
+        });
+
+        if (!grandchildResult.success) throw new Error('expected grandchild to succeed');
+        return childCtx.ok(grandchildResult.value);
+      });
+
+      if (!childResult.success) throw new Error('expected child to succeed');
+      expect(childResult.value).toBe('grandchild-ok');
+      return rootCtx.ok('root-ok');
+    });
+
+    expect(result.success).toBe(true);
+
+    const rootBuffer = tracer.rootBuffers[0];
+    if (!rootBuffer) throw new Error('expected a root buffer');
+    const children = Array.from(iterateSpanChildren(rootBuffer));
+    expect(children).toHaveLength(1);
+    const childBuffer = children[0];
+    if (!childBuffer) throw new Error('expected a child buffer');
+    expect(Array.from(iterateSpanChildren(childBuffer))).toHaveLength(1);
   });
 });
 
