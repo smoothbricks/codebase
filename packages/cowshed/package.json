@@ -50,7 +50,7 @@
           "{projectRoot}/**/Cargo.toml",
           "{projectRoot}/**/Cargo.lock",
           "{projectRoot}/**/.cargo/config.toml",
-          "{projectRoot}/scripts/macos-linker.sh",
+          "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock"
@@ -60,12 +60,7 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64",
-          "env": {
-            "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER": "./scripts/macos-linker.sh",
-            "NIX_LDFLAGS": "",
-            "NIX_LDFLAGS_FOR_BUILD": ""
-          }
+          "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
         }
       },
       "cli-x64-macos": {
@@ -76,7 +71,7 @@
           "{projectRoot}/**/Cargo.toml",
           "{projectRoot}/**/Cargo.lock",
           "{projectRoot}/**/.cargo/config.toml",
-          "{projectRoot}/scripts/macos-linker.sh",
+          "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock"
@@ -86,12 +81,7 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64",
-          "env": {
-            "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER": "./scripts/macos-linker.sh",
-            "NIX_LDFLAGS": "",
-            "NIX_LDFLAGS_FOR_BUILD": ""
-          }
+          "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
         }
       },
       "cli-arm64-linux": {
