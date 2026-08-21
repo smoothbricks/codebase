@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cowshed_core::apfs::{
-    ApfsCaseSensitivity, CreateImageRequest, CreatedImage, ImageFormatSelection, MountAccess,
+    ApfsCaseSensitivity, CreateImageRequest, CreatedImage, DetachIntent, ImageFormatSelection,
+    MountAccess,
 };
 use cowshed_core::metadata::{
     GrantSet, ImageCapacity, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName,
@@ -380,8 +381,8 @@ impl ApfsExecutionHost for FakeHost {
         self.record("validate-staged-companion");
         Ok(())
     }
-    fn detach(&self, _: Self::Attachment, force: bool) -> Result<(), ApfsStorageError> {
-        self.record(format!("detach:{force}"));
+    fn detach(&self, _: Self::Attachment, intent: DetachIntent) -> Result<(), ApfsStorageError> {
+        self.record(format!("detach:{intent:?}"));
         self.mounted_paths.lock().expect("mounted paths").clear();
         Ok(())
     }
@@ -412,9 +413,9 @@ impl ApfsExecutionHost for FakeHost {
     fn detach_mounted(
         &self,
         workspace: &LifecycleWorkspace,
-        force: bool,
+        intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
-        self.record(format!("detach-mounted:{force}"));
+        self.record(format!("detach-mounted:{intent:?}"));
         self.state
             .lock()
             .expect("fake state")
@@ -446,7 +447,7 @@ impl ApfsExecutionHost for FakeHost {
     ) -> Result<(), ApfsStorageError> {
         self.record_path(source_checkout);
         self.record_path(pre_cowshed_checkout);
-        self.detach_mounted(workspace, false)?;
+        self.detach_mounted(workspace, DetachIntent::WhenIdle)?;
         self.record("atomic-restore-checkout");
         Ok(())
     }
@@ -1011,7 +1012,7 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
             "controller-initialize",
             "validate-staged-companion",
             "validate-marker",
-            "detach:false",
+            "detach:Release",
             // Durable state first, entirely outside the user's tree...
             "atomic-adopt-mountpoint+publish",
             "attach-no-mount+fsck:Sparse",
@@ -1056,13 +1057,13 @@ async fn direct_mount_adopt_swaps_the_checkout_before_attaching_it() {
     let events = host.events();
     let tail: Vec<_> = events
         .iter()
-        .skip_while(|event| event.as_str() != "detach:false")
+        .skip_while(|event| event.as_str() != "detach:Release")
         .cloned()
         .collect();
     assert_eq!(
         tail,
         [
-            "detach:false",
+            "detach:Release",
             // The image is published on its own: there is no mountpoint to create under the store,
             // because main's mountpoint is the user's checkout path.
             "atomic-publish-image",
@@ -1119,7 +1120,7 @@ async fn initializer_failure_detaches_reclaims_and_never_publishes() {
     assert_eq!(lane.count(), 4, "abort cleanup uses the blocking lane");
     let events = host.events();
     assert!(events.contains(&"controller-rejected".to_owned()));
-    assert!(events.contains(&"detach:false".to_owned()));
+    assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
     assert!(!events.contains(&"retain-mounted".to_owned()));
@@ -1147,7 +1148,7 @@ async fn credential_mint_failure_reclaims_adopt_stage_before_publication() {
             .count(),
         1
     );
-    assert!(events.contains(&"detach:false".to_owned()));
+    assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"write-marker".to_owned()));
     assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
@@ -1317,7 +1318,7 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
     let events = host.events();
     assert!(!events.contains(&"atomic-restore-swap+undo".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
-    assert!(!events.contains(&"detach-mounted:false".to_owned()));
+    assert!(!events.contains(&"detach-mounted:Release".to_owned()));
     assert!(!events.contains(&"attach-no-mount+fsck:Sparse".to_owned()));
     assert_eq!(
         host.list(&repo()).expect("active workspace"),
@@ -1591,7 +1592,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         .unmount(&restored.workspace)
         .await
         .expect("unmount");
-    assert_eq!(host.events(), ["lock:1", "detach-mounted:false"]);
+    assert_eq!(host.events(), ["lock:1", "detach-mounted:WhenIdle"]);
 }
 
 #[tokio::test]
@@ -1808,7 +1809,7 @@ async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
     assert_no_orphan_stage(&host);
     assert!(host.list(&repo()).expect("post-cancel listing").is_empty());
     let events = host.events();
-    assert!(events.contains(&"detach:false".to_owned()));
+    assert!(events.contains(&"detach:Release".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"atomic-adopt-mountpoint+publish".to_owned()));
 }
@@ -1870,7 +1871,7 @@ async fn aborting_create_and_fork_callbacks_detaches_and_reclaims_each_stage() {
             }]
         );
         let events = host.events();
-        assert!(events.contains(&"detach:false".to_owned()));
+        assert!(events.contains(&"detach:Release".to_owned()));
         assert!(events.contains(&"idempotent-reclaim".to_owned()));
         assert!(!events.contains(&"atomic-publish-image".to_owned()));
     }
@@ -2013,7 +2014,7 @@ async fn aborting_restore_prepare_callback_cleans_replace_and_verify_mounts() {
             }]
         );
         let events = host.events();
-        assert!(events.contains(&"detach:false".to_owned()));
+        assert!(events.contains(&"detach:Release".to_owned()));
         if mode == RestoreMode::Replace {
             assert!(events.contains(&"idempotent-reclaim".to_owned()));
         }
@@ -2114,7 +2115,7 @@ async fn adoption_rollback_detaches_before_atomic_restore_and_never_copies() {
     let events = host.events();
     let detach = events
         .iter()
-        .position(|event| event == "detach-mounted:false")
+        .position(|event| event == "detach-mounted:WhenIdle")
         .expect("detach event");
     let restore = events
         .iter()

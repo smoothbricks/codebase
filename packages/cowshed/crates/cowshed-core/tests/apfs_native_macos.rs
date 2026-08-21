@@ -12,7 +12,7 @@ use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
-    CreateImageRequest, ImageFormatSelection, MountAccess,
+    CreateImageRequest, DetachIntent, ImageFormatSelection, MountAccess,
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, ImageFormat, METADATA_VERSION, Platform,
@@ -184,7 +184,8 @@ impl CommandRunner for FailingDetachRunner {
                 })
                 .is_ok()
         {
-            Ok(CommandOutput::failure(1, "busy"))
+            // `hdiutil detach` reports a holder as EBUSY and, under `-quiet`, says nothing else.
+            Ok(CommandOutput::failure(16, []))
         } else {
             Ok(successful_output(request))
         }
@@ -782,7 +783,7 @@ fn mount_registry_actor_owns_attachment_state_and_blocks_mounted_compaction() {
 
     assert_eq!(mount_id, 1);
 
-    host.detach_mounted(&workspace, false)
+    host.detach_mounted(&workspace, DetachIntent::Release)
         .expect("detach retained image");
     assert_eq!(
         runner.calls(),
@@ -1802,8 +1803,12 @@ fn sidecar_removal_does_not_hide_non_file_errors() {
     );
 }
 
+/// A `WhenIdle` detach that a holder dissents leaves the workspace exactly as it found it: the
+/// mount is still the actor's, and exactly one unforced attempt was spent. Escalation is the
+/// backend's grace, proved against `DetachGrace` where the waiting can be observed without
+/// spending it.
 #[test]
-fn failed_detach_restores_actor_state_and_force_retries_exactly_once() {
+fn dissented_when_idle_detach_restores_actor_state_after_a_single_attempt() {
     let fixture = Fixture::new("detach-retry");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let image = layout.main_image(ImageFormat::Sparse).expect("image");
@@ -1816,16 +1821,19 @@ fn failed_detach_restores_actor_state_and_force_retries_exactly_once() {
         .expect("attachment");
     host.retain_mounted(&workspace, attachment).expect("retain");
 
-    host.detach_mounted(&workspace, false)
-        .expect_err("busy detach must fail");
-
-    runner.failures_remaining.store(1, Ordering::SeqCst);
-    host.detach_mounted(&workspace, true).expect("forced retry");
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 7);
+    host.detach_mounted(&workspace, DetachIntent::WhenIdle)
+        .expect_err("a dissented WhenIdle detach must fail");
     assert_eq!(
         *runner.detach_attempts.lock().expect("detach attempts"),
-        [false, false, true],
-        "failed detach must restore actor ownership, then force retry must cross normal and forced detach targets"
+        [false],
+        "WhenIdle never forces"
+    );
+
+    host.detach_mounted(&workspace, DetachIntent::WhenIdle)
+        .expect("the workspace is still the actor's to detach");
+    assert_eq!(
+        *runner.detach_attempts.lock().expect("detach attempts"),
+        [false, false]
     );
 }
 
@@ -1841,7 +1849,8 @@ fn direct_detach_crosses_the_backend_boundary() {
         .attach_verified(image.image(), ImageFormat::Sparse)
         .expect("attachment");
 
-    host.detach(attachment, false).expect("detach");
+    host.detach(attachment, DetachIntent::Release)
+        .expect("detach");
 
     assert_eq!(
         runner.calls(),
@@ -1986,7 +1995,7 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         "mount identity is read from the in-image marker, never from the volume label"
     );
     restarted
-        .detach_mounted(&workspace(ImageFormat::Sparse), false)
+        .detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
         .expect("restart-safe detach");
     let detach = runner.requests().last().cloned().expect("detach request");
     assert_eq!(detach.program, Path::new("/usr/bin/hdiutil"));
@@ -2000,8 +2009,10 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
     );
 }
 
+/// A mount the host only knows from kernel facts is detached by mountpoint, and a `WhenIdle`
+/// detach of it reports the dissent rather than forcing a volume the user may still be in.
 #[test]
-fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
+fn restart_safe_when_idle_detach_reports_a_dissent_without_forcing() {
     let fixture = Fixture::new("kernel-restart-force");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
@@ -2015,17 +2026,17 @@ fn restart_safe_detach_honors_force_only_after_normal_detach_fails() {
         true,
     )]);
     plant_mount_marker(&fixture, &main_mount(&fixture));
-    let runner = FailingDetachRunner::new(2);
+    let runner = FailingDetachRunner::new(1);
     let host = MacOsApfsExecutionHost::with_mount_source(runner.clone(), fixture.config(), source)
         .expect("host");
 
-    host.detach_mounted(&workspace(ImageFormat::Sparse), false)
-        .expect_err("non-forced restart detach must not escalate");
-    host.detach_mounted(&workspace(ImageFormat::Sparse), true)
-        .expect("forced restart detach");
+    host.detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::WhenIdle)
+        .expect_err("a dissented WhenIdle detach must not escalate");
+    host.detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::WhenIdle)
+        .expect("the second attempt finds the mountpoint free");
     assert_eq!(
         *runner.detach_attempts.lock().expect("detach attempts"),
-        [false, false, true]
+        [false, false]
     );
 }
 
@@ -2070,7 +2081,7 @@ fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
             .contains("refusing to heal unrelated mount")
     );
     let error = host
-        .detach_mounted(&workspace(ImageFormat::Sparse), true)
+        .detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
         .expect_err("restart-safe detach must reject an impostor source");
     assert!(
         error
@@ -4533,6 +4544,6 @@ fn resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
         "the workspace returns to its own mount point: {:?}",
         argv[remounted]
     );
-    host.detach_mounted(&workspace(ImageFormat::Sparse), false)
+    host.detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
         .expect("the resized attachment is owned by the mount registry");
 }
