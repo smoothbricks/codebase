@@ -1,2 +1,17 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
+
+# Link macOS targets with Xcode's own clang instead of the Nix cc-wrapper, which resolves an SDK
+# the produced binaries must not depend on. `scripts/macos-linker.sh` re-derives DEVELOPER_DIR and
+# the SDK root from `xcode-select`/`xcrun`; because it execs Apple's clang directly, the wrapper's
+# `NIX_LDFLAGS` never reaches the link and does not need clearing.
+#
+# This belongs here rather than in the Nx targets that need it: `-C linker` is part of every
+# crate's fingerprint, so a target that sets it and a target that does not cannot share a single
+# compiled dependency. Splitting it across targets cost a full ~160-crate rebuild per macOS
+# artifact — the CLI and the NAPI library each rebuilding the same graph for the same triple.
+[target.aarch64-apple-darwin]
+linker = "scripts/macos-linker.sh"
+
+[target.x86_64-apple-darwin]
+linker = "scripts/macos-linker.sh"
