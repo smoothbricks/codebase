@@ -559,24 +559,11 @@ impl NativeGatewayInventory {
             if workspace.workspace.name().is_main() && metadata.require_info_snapshot().is_err() {
                 continue;
             }
-            // Every workspace including main mounts under the layout's mount root, so the expected
-            // path comes from the layout alone rather than from main's recorded checkout.
-            let expected_mount =
-                layout
-                    .workspace_mount(workspace.workspace.name())
-                    .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                        path: layout.project().mount_root.clone(),
-                        message: error.to_string(),
-                    })?;
-            if *mount != expected_mount {
-                return Err(GatewayInventoryError::InvalidMetadata {
-                    path: mount.clone(),
-                    message: format!(
-                        "mounted workspace path does not equal canonical path {}",
-                        expected_mount.display()
-                    ),
-                });
-            }
+            // The mount path is not re-derived here. `mount_paths` is already the checkout-layout
+            // aware expectation (`expected_mount_paths`), and `ApfsExecutionHost::mounts` only
+            // reports a volume as mounted when the kernel has it at exactly that path. Deriving it
+            // a second time from the layout alone would ignore `CheckoutLayout::DirectMount`, where
+            // main mounts at the adopted checkout instead of `mnt/<owner>/<repo>/main`.
             let port_block = metadata.grants.port_block.ok_or_else(|| {
                 GatewayInventoryError::MissingPortBlock {
                     repo: repo_id.clone(),
@@ -1042,7 +1029,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::metadata::{
-        METADATA_VERSION, Platform, WorkspaceInfoSnapshot, WorkspaceRole, write_json,
+        CheckoutLayout, METADATA_VERSION, Platform, WorkspaceInfoSnapshot, WorkspaceRole,
+        write_json,
     };
     use crate::repository::{BoundIdentity, RepositoryBinding};
     use crate::storage::bootstrap::CanonicalRoots;
@@ -1077,10 +1065,15 @@ mod tests {
     struct Fixture {
         root: PathBuf,
         storage: ValidatedHostStorage,
+        checkout_layout: CheckoutLayout,
     }
 
     impl Fixture {
         fn new(label: &str) -> Self {
+            Self::with_checkout_layout(label, CheckoutLayout::Symlink)
+        }
+
+        fn with_checkout_layout(label: &str, checkout_layout: CheckoutLayout) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "cowshed-gateway-inventory-{label}-{}",
                 uuid::Uuid::new_v4()
@@ -1094,6 +1087,7 @@ mod tests {
             Self {
                 root,
                 storage: ValidatedHostStorage::new(roots),
+                checkout_layout,
             }
         }
 
@@ -1139,13 +1133,17 @@ mod tests {
             fs::create_dir_all(image.image().parent().expect("image parent"))
                 .expect("image parent");
             fs::write(image.image(), b"fixture").expect("image");
-            // Main mounts under the layout like every other workspace; only its recorded
-            // project_root still points at the adopted checkout outside the store.
-            let mount = layout.workspace_mount(&name).expect("workspace mount");
             let checkout = self.root.join(format!("checkout-{}", repo.repo()));
             if name.is_main() && persist_main_root {
                 fs::create_dir_all(&checkout).expect("adopted checkout");
             }
+            // Same derivation production uses in `expected_mount_paths`: main follows the project's
+            // checkout layout, every other workspace mounts under `mnt/` either way.
+            let mount = if name.is_main() && self.checkout_layout.mounts_at_checkout() {
+                checkout.clone()
+            } else {
+                layout.workspace_mount(&name).expect("workspace mount")
+            };
             let mut grants =
                 GrantSet::closed_baseline(Some(PortBlock::new(40_960, 16).expect("port block")))
                     .expect("grants");
@@ -1330,6 +1328,50 @@ mod tests {
             error,
             GatewayInventoryError::DuplicatePortBlock(40_960)
         ));
+    }
+
+    /// A direct-mount project's main volume is mounted at the adopted checkout, not at
+    /// `mnt/<owner>/<repo>/main`. Re-deriving the expected path from the layout alone rejected
+    /// every such project — the whole default layout — with "mounted workspace path does not equal
+    /// canonical path", so `cowshed adopt` finished with a gateway that never came up.
+    #[tokio::test]
+    async fn a_direct_mount_project_serves_main_from_its_adopted_checkout() {
+        let fixture = Fixture::with_checkout_layout("direct-mount", CheckoutLayout::DirectMount);
+        let repo = RepoId::parse("hyperide/axe").expect("repo");
+        fixture.bind(&repo);
+        let (storage, mounted) = fixture.workspace(
+            &repo,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000001",
+            3,
+            true,
+            true,
+        );
+        let (mount, path) = mounted.expect("mounted fixture");
+        assert_eq!(path, fixture.root.join("checkout-axe"));
+        let source = Arc::new(FixtureSource::default());
+        source.projects.lock().expect("source").insert(
+            repo.clone(),
+            ProjectInventoryFacts {
+                storage: vec![storage],
+                mounts: vec![mount.clone()],
+                mount_paths: BTreeMap::from([(mount.volume_key, path.clone())]),
+            },
+        );
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        // `project_attached` is the path adopt runs, and it propagates rather than skips: the
+        // regression surfaced there as an error, not as an empty inventory.
+        let facts = inventory
+            .project_attached(&repo)
+            .await
+            .expect("direct-mount project inventory");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].mount, path);
+        assert_eq!(facts[0].mount_id, mount.mount_id);
     }
 
     #[tokio::test]
