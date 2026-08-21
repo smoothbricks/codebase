@@ -948,6 +948,49 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
+    /// A live socket in the checkout — a dev server, a language server, a nix
+    /// daemon — used to abort the whole adopt: rsync copies specials under `-a`,
+    /// and recreating one under the staging mount root overruns `sun_path`'s 104
+    /// bytes, so the copy died with `mkstempsock: Invalid argument`. Runtime
+    /// artifacts are skipped, and their presence is not a reason to fail.
+    #[test]
+    fn skips_sockets_and_fifos_instead_of_failing_the_copy() {
+        use std::os::unix::net::UnixListener;
+
+        let (root, source, destination) = copy_roots("runtime-artifacts");
+        fs::create_dir(source.join("run")).expect("create run directory");
+        fs::write(source.join("run/kept"), b"content\n").expect("write regular file");
+        // Bound under a short path and moved into place: the fixture root is
+        // already long enough that `bind` would hit `sun_path`'s 104 bytes —
+        // which is the same limit that made copying such a socket impossible.
+        let staged_socket = PathBuf::from(format!("/tmp/cowshed-t-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&staged_socket);
+        let listener = UnixListener::bind(&staged_socket).expect("bind fixture socket");
+        let socket = source.join("run/daemon.sock");
+        fs::rename(&staged_socket, &socket).expect("move socket into the fixture");
+        let fifo = source.join("run/pipe");
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+
+        let report = run(&source, &destination, 6);
+
+        assert_eq!(report.passes, 1);
+        assert_eq!(report.changed_entries, 0, "a still tree reports no churn");
+        assert!(destination.join("run/kept").is_file());
+        assert!(
+            !destination.join("run/daemon.sock").exists(),
+            "a socket is a runtime artifact, never repository content"
+        );
+        assert!(!destination.join("run/pipe").exists());
+        drop(listener);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
     #[tokio::test]
     async fn copies_content_symlinks_and_attributes_and_deletes_stale_destination_entries() {
         let (root, source, destination) = copy_roots("full-tree");
