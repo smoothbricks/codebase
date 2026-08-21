@@ -261,6 +261,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '{projectRoot}/**/Cargo.toml',
         '{projectRoot}/**/Cargo.lock',
         '{projectRoot}/**/.cargo/config.toml',
+        '{projectRoot}/scripts/*.sh',
         '!{projectRoot}/**/target/**',
       ]);
       expect(targets['cargo-lint']?.options).toMatchObject({
@@ -313,6 +314,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           '{projectRoot}/**/Cargo.toml',
           '{projectRoot}/**/Cargo.lock',
           '{projectRoot}/**/.cargo/config.toml',
+          '{projectRoot}/scripts/*.sh',
           '!{projectRoot}/**/target/**',
           '{projectRoot}/package.json',
           '{workspaceRoot}/bun.lock',
