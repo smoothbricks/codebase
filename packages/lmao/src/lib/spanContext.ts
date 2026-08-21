@@ -103,10 +103,10 @@ type SpanDispatchFn<Ctx extends OpContext, Args extends unknown[] = unknown[], S
   ...args: Args
 ) => Result<S, E> | Promise<Result<S, E>>;
 
-type SpanDispatchTarget<Ctx extends OpContext> = {
+type SpanDispatchTarget<Ctx extends OpContext, S = unknown, E = unknown> = {
   readonly callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>;
   readonly opMetadata: OpMetadata;
-  readonly fn: SpanDispatchFn<Ctx>;
+  readonly fn: SpanDispatchFn<Ctx, unknown[], S, E>;
 };
 
 function isOpLike(value: unknown): value is Op<OpContext, unknown[], unknown, unknown> {
@@ -119,14 +119,18 @@ function isOpLike(value: unknown): value is Op<OpContext, unknown[], unknown, un
   );
 }
 
-function isOpInstance<Ctx extends OpContext>(value: unknown): value is Op<Ctx, unknown[], unknown, unknown> {
+function isOpInstance<Ctx extends OpContext, S = unknown, E = unknown>(
+  value: unknown,
+): value is Op<Ctx, unknown[], S, E> {
   return isOpLike(value);
 }
 
 // WHY: resolveSpanTarget() accepts either an Op instance or a raw span
 // function. TypeScript needs an explicit predicate here to preserve the call
 // signature when the non-Op branch passes `value` through as `fn`.
-function isSpanDispatchFn<Ctx extends OpContext>(value: unknown): value is SpanDispatchFn<Ctx> {
+function isSpanDispatchFn<Ctx extends OpContext, S = unknown, E = unknown>(
+  value: unknown,
+): value is SpanDispatchFn<Ctx, unknown[], S, E> {
   return typeof value === 'function';
 }
 
@@ -156,12 +160,12 @@ function readStringArgument(args: IArguments, index: number, label: string): str
   return value;
 }
 
-function resolveSpanTarget<Ctx extends OpContext>(
+function resolveSpanTarget<Ctx extends OpContext, S = unknown, E = unknown>(
   value: unknown,
   fallbackPlan: CallsitePlan<Ctx['logSchema'], Ctx>,
   fallbackMetadata: OpMetadata,
-): SpanDispatchTarget<Ctx> {
-  if (isOpInstance<Ctx>(value)) {
+): SpanDispatchTarget<Ctx, S, E> {
+  if (isOpInstance<Ctx, S, E>(value)) {
     return {
       callsitePlan: value.callsitePlan,
       opMetadata: value.metadata,
@@ -169,7 +173,7 @@ function resolveSpanTarget<Ctx extends OpContext>(
     };
   }
 
-  if (!isSpanDispatchFn<Ctx>(value)) {
+  if (!isSpanDispatchFn<Ctx, S, E>(value)) {
     throw new TypeError('span() expects an Op or function');
   }
 
@@ -1042,10 +1046,16 @@ export function createSpanContextClass<Ctx extends OpContext>(
         };
         this.span = span;
 
-        this.spanSync = function spanSync<S, E>(name: string, op: Op<Ctx, [], S, E>): Result<S, E> {
-          const callsitePlan = op.callsitePlan;
-          const childCtx = asSpanContextInstance<Ctx>(callsitePlan.newCtx0(self));
-          return self.spanSync0(0, name, childCtx, callsitePlan, op.fn);
+        this.spanSync = function spanSync<S, E>(
+          name: string,
+          opOrFn: Op<Ctx, [], S, E> | ((ctx: SpanContext<Ctx>) => Result<S, E>),
+        ): Result<S, E> {
+          // WHY: spanSync mirrors span()'s dual dispatch. resolveSpanTarget yields the Op's own
+          // frozen callsite plan, or the enclosing span's plan when the target is an inline
+          // closure, so a sync callback that captures locals needs no module-level Op.
+          const target = resolveSpanTarget<Ctx, S, E>(opOrFn, self._physicalLayoutPlan, self._spanBuffer._opMetadata);
+          const childCtx = asSpanContextInstance<Ctx>(target.callsitePlan.newCtx0(self));
+          return self.spanSync0(0, name, childCtx, target.callsitePlan, target.fn);
         };
       }
       //#endregion smoo/lmao!n/context-flow-span-promise

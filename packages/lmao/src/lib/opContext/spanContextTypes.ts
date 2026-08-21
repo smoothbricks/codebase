@@ -229,8 +229,21 @@ export type SpanFn<Ctx extends OpContext> = {
  *
  * Use when the callback is guaranteed sync and should return immediately
  * with a Result envelope.
+ *
+ * WHY: mirrors SpanFn's dual dispatch. An Op carries its own frozen callsite
+ * plan; an inline closure borrows the enclosing span's plan, so a sync callback
+ * that captures locals does not need a module-level Op just to be traced.
+ *
+ * @example
+ * const result = ctx.spanSync('validate', (childCtx) => {
+ *   childCtx.tag.step('validation');
+ *   return childCtx.ok({ valid: true });
+ * });
  */
-export type SpanSyncFn<Ctx extends OpContext> = <S, E>(name: string, op: Op<Ctx, [], S, E>) => Result<S, E>;
+export type SpanSyncFn<Ctx extends OpContext> = {
+  <S, E>(name: string, op: Op<Ctx, [], S, E>): Result<S, E>;
+  <S, E>(name: string, fn: (ctx: SpanContext<Ctx>) => Result<S, E>): Result<S, E>;
+};
 
 // =============================================================================
 // SPAN CONTEXT TYPE
