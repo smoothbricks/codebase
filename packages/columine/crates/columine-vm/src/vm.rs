@@ -1667,7 +1667,9 @@ fn validate_struct_map2_max_i64x2(
     }
     let pairs_end = operands.row.scalar_pairs_start + operands.row.num_vals * 2;
     code[operands.row.scalar_pairs_start..pairs_end]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .all(|pair| {
             pair[1] < smap.num_fields
                 && pair[1] != operands.cmp1_field
@@ -1742,7 +1744,9 @@ fn resolve_struct_map_max_comparison(
         | StructFieldType::ArrayBool => return None,
     };
     let col = scalar_pairs
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .find_map(|pair| (pair[1] == comparison_field_idx).then_some(pair[0]))?;
     Some(StructMapMaxComparison {
         field_idx: comparison_field_idx,
@@ -3069,7 +3073,7 @@ impl Vm {
                     let scalar_pairs = &code[operands.scalar_pairs_start..scalar_pairs_end];
                     let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
                     let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    for (vi, pair) in scalar_pairs.chunks_exact(2).enumerate() {
+                    for (vi, pair) in scalar_pairs.as_chunks::<2>().0.iter().enumerate() {
                         val_cols[vi] = pair[0];
                         field_idxs[vi] = pair[1];
                     }
@@ -3138,7 +3142,9 @@ impl Vm {
                     let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
                     let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
                     for (index, pair) in code[operands.scalar_pairs_start..pairs_end]
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .enumerate()
                     {
                         val_cols[index] = pair[0];
@@ -3883,7 +3889,7 @@ impl Vm {
                     let scalar_pairs = &body[operands.scalar_pairs_start..scalar_pairs_end];
                     let mut vc = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
                     let mut fi = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
-                    for (vi, pair) in scalar_pairs.chunks_exact(2).enumerate() {
+                    for (vi, pair) in scalar_pairs.as_chunks::<2>().0.iter().enumerate() {
                         vc[vi] = pair[0];
                         fi[vi] = pair[1];
                     }
@@ -3894,7 +3900,9 @@ impl Vm {
                     let array_triples_end =
                         operands.array_triples_start + operands.num_array_vals * 3;
                     for (ai, triple) in body[operands.array_triples_start..array_triples_end]
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .enumerate()
                     {
                         aoc[ai] = triple[0];
@@ -4014,7 +4022,9 @@ impl Vm {
                     let mut val_cols = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
                     let mut field_idxs = [0u8; MAX_STRUCT_SCALAR_OPERANDS];
                     for (index, pair) in body[operands.scalar_pairs_start..pairs_end]
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .enumerate()
                     {
                         val_cols[index] = pair[0];

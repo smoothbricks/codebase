@@ -624,8 +624,8 @@ impl MiniRoaring {
             } else if card as usize <= ARRAY_MAX_CARDINALITY {
                 let raw = r.bytes(card as usize * 2)?;
                 let mut v = Vec::with_capacity(card as usize);
-                for chunk in raw.chunks_exact(2) {
-                    v.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                for chunk in raw.as_chunks::<2>().0 {
+                    v.push(u16::from_le_bytes(*chunk));
                 }
                 if v.windows(2).any(|w| w[0] >= w[1]) {
                     return Err(InvalidFormat);
@@ -634,12 +634,8 @@ impl MiniRoaring {
             } else {
                 let raw = r.bytes(BITSET_SIZE_BYTES)?;
                 let mut words = Box::new([0u64; 1024]);
-                for (k, chunk) in raw.chunks_exact(8).enumerate() {
-                    words[k] = match chunk.first_chunk::<8>() {
-                        Some(&arr) => u64::from_le_bytes(arr),
-                        // chunks_exact(8) guarantees the width.
-                        None => columine_types::die!("chunks_exact(8) yielded a short chunk"),
-                    };
+                for (k, chunk) in raw.as_chunks::<8>().0.iter().enumerate() {
+                    words[k] = u64::from_le_bytes(*chunk);
                 }
                 let actual: u32 = words.iter().map(|w| w.count_ones()).sum();
                 if actual != card {
