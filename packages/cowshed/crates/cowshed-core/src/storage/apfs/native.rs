@@ -21,7 +21,7 @@ use crate::apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage,
     DetachIntent, DetachTarget, ImageFormatSelection, MacOsApfsBackend, MountAccess,
 };
-use crate::copy::TreeCopier;
+use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
     DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, METADATA_VERSION, Platform,
     PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
@@ -2530,8 +2530,7 @@ where
 
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(destination)?;
-        TreeCopier::new(self.backend.runner())
-            .copy_until_quiescent(source, destination)
+        copy_until_quiescent_blocking(source, destination)
             .map(|_| ())
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
