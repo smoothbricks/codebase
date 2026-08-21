@@ -34,6 +34,11 @@ const CARGO_INPUTS = [
   '{projectRoot}/**/Cargo.toml',
   '{projectRoot}/**/Cargo.lock',
   '{projectRoot}/**/.cargo/config.toml',
+  // Shell scripts a `.cargo/config.toml` points at — linker, runner, and rustc wrappers — decide
+  // what the compiler produces as surely as the config naming them does. Tracking the config
+  // without its shims caches an artifact against a toolchain that has since changed. Only `*.sh`
+  // is swept: `scripts/` also holds project tooling that has nothing to do with a cargo build.
+  '{projectRoot}/scripts/*.sh',
   '!{projectRoot}/**/target/**',
 ];
 const CARGO_OUTPUT_INPUTS = [...CARGO_INPUTS, '{projectRoot}/package.json', '{workspaceRoot}/bun.lock'];
