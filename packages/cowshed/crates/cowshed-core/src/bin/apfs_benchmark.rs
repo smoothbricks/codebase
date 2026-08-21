@@ -4,8 +4,8 @@ mod macos {
     use std::time::{Duration, Instant};
 
     use cowshed_core::apfs::{
-        ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, ImageFormatSelection,
-        MacOsApfsBackend, SystemCommandRunner,
+        ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, DetachIntent,
+        ImageFormatSelection, MacOsApfsBackend, SystemCommandRunner,
     };
     use cowshed_core::metadata::{ImageCapacity, ImageFormat};
 
@@ -41,7 +41,7 @@ mod macos {
         fn detach(mut self) -> Result<(), cowshed_core::apfs::ApfsError> {
             let result = self.backend.detach(
                 self.attachment.as_ref().expect("attachment is present"),
-                false,
+                DetachIntent::Release,
             );
             if result.is_ok() {
                 self.attachment = None;
@@ -53,7 +53,7 @@ mod macos {
     impl Drop for AttachmentGuard<'_> {
         fn drop(&mut self) {
             if let Some(attachment) = self.attachment.take() {
-                let _ = self.backend.detach(&attachment, true);
+                let _ = self.backend.detach(&attachment, DetachIntent::Release);
             }
         }
     }

@@ -11,6 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const DISKUTIL: &str = "/usr/sbin/diskutil";
 const HDIUTIL: &str = "/usr/bin/hdiutil";
@@ -29,6 +30,15 @@ const SECTOR_BYTES: u64 = 512;
 /// accepted. Every other failure propagates, and the caller still reads the resulting capacity
 /// back out of the attachment inventory.
 const CONTAINER_ALREADY_SPANS_IMAGE: [&str; 2] = ["Error: -69743:", "Error: -69519:"];
+
+/// A detach fails while another process still holds the volume, and each tool spells that
+/// condition its own way. `hdiutil detach` exits with the errno — `EBUSY` — and `-quiet` keeps it
+/// from saying anything else, so the status is the only evidence. `diskutil eject` exits 1 and
+/// names the Disk Arbitration dissenter on stderr, a status it shares with every other diskutil
+/// failure, so the text is the only evidence. Observed on macOS 26.6.1 against a volume held by
+/// nothing more than another process's cwd.
+const HDIUTIL_DETACH_BUSY: i32 = 16;
+const DISKUTIL_DISSENT: [&str; 2] = ["could not be unmounted", "dissented by"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandRequest {
@@ -130,6 +140,47 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
+/// The wait an unforced detach spends before it gives up on politeness.
+///
+/// Every volume cowshed detaches was just written to, and macOS wakes `mds` and `fseventsd` on a
+/// freshly written volume whether or not it was attached `-nobrowse`. The holder is theirs, it is
+/// transient, and there is nothing to ask: waiting is the only way to let it go. Forcing is what
+/// makes the detach an obligation rather than an attempt — the volume is cowshed's own staging or
+/// retiring image, its writes are already synced by the operation that produced them, and a
+/// caller that reached a detach has no way to make progress without one.
+///
+/// Ten seconds is the retirement grace of specs/cowshed/02_workspaces.md, applied to every
+/// unforced detach for the same reason it was chosen there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DetachGrace {
+    pub total: Duration,
+    pub poll: Duration,
+}
+
+impl Default for DetachGrace {
+    fn default() -> Self {
+        Self {
+            total: Duration::from_secs(10),
+            poll: Duration::from_millis(250),
+        }
+    }
+}
+
+/// The grace's only side effect, injected so unit tests spend no wall-clock time proving the
+/// escalation order.
+pub trait Sleeper {
+    fn sleep(&self, duration: Duration);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ThreadSleeper;
+
+impl Sleeper for ThreadSleeper {
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApfsCaseSensitivity {
     Sensitive,
@@ -165,6 +216,20 @@ pub struct CreatedImage {
 pub enum DetachTarget<'a> {
     Device(&'a str),
     MountPoint(&'a Path),
+}
+
+/// What a detach may do about a volume something else still holds.
+///
+/// The distinction is not politeness, it is ownership. A volume cowshed has finished with —
+/// staging images, retiring mounts, attachments a failed step left behind — is going away
+/// whatever a stray `mds` scan thinks, so `Release` waits the holder out and then forces. A
+/// volume the user may still be working in is theirs, so `WhenIdle` reports the dissent and lets
+/// the verb refuse; `resize` and the explicit `detach`/un-adopt verbs would otherwise tear a
+/// live workspace out from under whoever is in it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetachIntent {
+    Release,
+    WhenIdle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -540,12 +605,12 @@ pub trait ApfsBackend {
         access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsError>;
-    fn detach(&self, attachment: &AttachedImage, force: bool) -> Result<(), ApfsError>;
+    fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError>;
     fn detach_target(
         &self,
         format: ImageFormat,
         target: DetachTarget<'_>,
-        force: bool,
+        intent: DetachIntent,
     ) -> Result<(), ApfsError>;
     fn delete_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError>;
     /// The capacity a detached image currently holds, read from its own resize limits.
@@ -564,20 +629,36 @@ pub trait ApfsBackend {
     fn attached_capacity(&self, image: &Path) -> Result<ImageCapacity, ApfsError>;
 }
 
-pub struct MacOsApfsBackend<R> {
+pub struct MacOsApfsBackend<R, S = ThreadSleeper> {
     runner: R,
+    sleeper: S,
+    grace: DetachGrace,
 }
 
 impl<R> MacOsApfsBackend<R> {
     pub fn new(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            sleeper: ThreadSleeper,
+            grace: DetachGrace::default(),
+        }
+    }
+}
+
+impl<R, S> MacOsApfsBackend<R, S> {
+    pub fn with_grace(runner: R, sleeper: S, grace: DetachGrace) -> Self {
+        Self {
+            runner,
+            sleeper,
+            grace,
+        }
     }
     pub fn runner(&self) -> &R {
         &self.runner
     }
 }
 
-impl<R: CommandRunner> MacOsApfsBackend<R> {
+impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     fn attached_whole_devices(&self, image: &Path) -> Result<BTreeSet<String>, ApfsError> {
         let image = attachment_inventory_path(image)?;
         // Tahoe's `diskutil image info --plist` does not expose attachment
@@ -607,7 +688,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         let new_devices: BTreeSet<_> = after.difference(before).cloned().collect();
         let mut detach = Vec::new();
         for device in &new_devices {
-            if let Err(error) = self.detach_device(format, device, false) {
+            if let Err(error) = self.detach_device(format, device, DetachIntent::Release) {
                 detach.push(AttachmentDetachFailure {
                     device: device.clone(),
                     error: Box::new(error),
@@ -671,7 +752,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
     }
 }
 
-impl<R: CommandRunner> MacOsApfsBackend<R> {
+impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     fn run_checked(
         &self,
         operation: &'static str,
@@ -773,7 +854,8 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
             ],
         );
         if let Err(primary) = self.run_checked("format ASIF APFS volume", format) {
-            return match self.detach_device(ImageFormat::Asif, &whole_device, true) {
+            return match self.detach_device(ImageFormat::Asif, &whole_device, DetachIntent::Release)
+            {
                 Ok(()) => Err(self.cleanup_failed_asif(path, primary)),
                 Err(detach) => Err(ApfsError::AsifCreationAndCleanupFailed {
                     primary: Box::new(primary),
@@ -782,7 +864,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 }),
             };
         }
-        self.detach_device(ImageFormat::Asif, &whole_device, true)?;
+        self.detach_device(ImageFormat::Asif, &whole_device, DetachIntent::Release)?;
         Ok(())
     }
 
@@ -905,7 +987,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         let volume_device = match self.resolve_apfs_volume(&candidate) {
             Ok(volume_device) => volume_device,
             Err(resolution) => {
-                return match self.detach_device(format, &whole_device, false) {
+                return match self.detach_device(format, &whole_device, DetachIntent::Release) {
                     Ok(()) => Err(resolution),
                     Err(detach) => Err(ApfsError::VolumeResolutionAndDetachFailed {
                         whole_device,
@@ -923,20 +1005,51 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         })
     }
 
+    /// Detach `target` under `intent`.
+    ///
+    /// A `Release` waits out a dissent and then forces, because the volume is cowshed's own and
+    /// is finished with; a `WhenIdle` hands the dissent straight back so its verb can refuse.
+    /// Only a dissent is retried — an invalid device or a missing tool fails immediately either
+    /// way.
     fn detach_target_checked(
         &self,
         format: ImageFormat,
         target: DetachTarget<'_>,
-        force: bool,
+        intent: DetachIntent,
     ) -> Result<(), ApfsError> {
         let target = validate_detach_target(target)?;
+        let mut waited = Duration::ZERO;
+        loop {
+            match self.detach_once(format, &target, false) {
+                Ok(()) => return Ok(()),
+                Err(error) if detach_was_dissented(format, &error) => {
+                    if intent == DetachIntent::WhenIdle {
+                        return Err(error);
+                    }
+                    if waited >= self.grace.total {
+                        return self.detach_once(format, &target, true);
+                    }
+                    self.sleeper.sleep(self.grace.poll);
+                    waited = waited.saturating_add(self.grace.poll);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn detach_once(
+        &self,
+        format: ImageFormat,
+        target: &OsStr,
+        force: bool,
+    ) -> Result<(), ApfsError> {
         let request = match format {
             ImageFormat::Asif => {
                 let mut args = vec![OsString::from("eject")];
                 if force {
                     args.push(OsString::from("force"));
                 }
-                args.push(target);
+                args.push(target.to_owned());
                 CommandRequest::new(DISKUTIL, args)
             }
             ImageFormat::Sparse => {
@@ -944,7 +1057,7 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
                 if force {
                     args.push(OsString::from("-force"));
                 }
-                args.push(target);
+                args.push(target.to_owned());
                 CommandRequest::new(HDIUTIL, args)
             }
         };
@@ -955,13 +1068,13 @@ impl<R: CommandRunner> MacOsApfsBackend<R> {
         &self,
         format: ImageFormat,
         whole_device: &str,
-        force: bool,
+        intent: DetachIntent,
     ) -> Result<(), ApfsError> {
-        self.detach_target_checked(format, DetachTarget::Device(whole_device), force)
+        self.detach_target_checked(format, DetachTarget::Device(whole_device), intent)
     }
 }
 
-impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
+impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
     fn create_staged_image(&self, request: &CreateImageRequest) -> Result<CreatedImage, ApfsError> {
         if request.staged_stem.extension().is_some() {
             return Err(ApfsError::InvalidStagedStem(request.staged_stem.clone()));
@@ -1135,7 +1248,7 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
             return Ok(attachment);
         }
 
-        match self.detach_device(format, &attachment.whole_device, false) {
+        match self.detach_device(format, &attachment.whole_device, DetachIntent::Release) {
             Ok(()) => Err(ApfsError::VerificationFailed {
                 device: attachment.volume_device,
                 output,
@@ -1181,17 +1294,17 @@ impl<R: CommandRunner> ApfsBackend for MacOsApfsBackend<R> {
         .map(|_| ())
     }
 
-    fn detach(&self, attachment: &AttachedImage, force: bool) -> Result<(), ApfsError> {
-        self.detach_device(attachment.format, &attachment.whole_device, force)
+    fn detach(&self, attachment: &AttachedImage, intent: DetachIntent) -> Result<(), ApfsError> {
+        self.detach_device(attachment.format, &attachment.whole_device, intent)
     }
 
     fn detach_target(
         &self,
         format: ImageFormat,
         target: DetachTarget<'_>,
-        force: bool,
+        intent: DetachIntent,
     ) -> Result<(), ApfsError> {
-        self.detach_target_checked(format, target, force)
+        self.detach_target_checked(format, target, intent)
     }
 
     fn delete_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsError> {
@@ -1434,6 +1547,26 @@ fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsErro
         DetachTarget::Device(device) => OsString::from(device),
         DetachTarget::MountPoint(path) => path.as_os_str().to_owned(),
     })
+}
+
+/// Whether a failed detach failed because something still holds the volume.
+///
+/// The two tools leave different evidence, so each is read where it actually speaks: `hdiutil`
+/// only in its exit status, `diskutil` only in its stderr. Anything else — a bad device, a
+/// missing tool, a spawn failure — is not a dissent and must not be waited on.
+fn detach_was_dissented(format: ImageFormat, error: &ApfsError) -> bool {
+    let ApfsError::CommandFailed { output, .. } = error else {
+        return false;
+    };
+    match format {
+        ImageFormat::Sparse => output.status == HDIUTIL_DETACH_BUSY,
+        ImageFormat::Asif => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            DISKUTIL_DISSENT
+                .iter()
+                .any(|marker| stderr.contains(marker))
+        }
+    }
 }
 
 fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
@@ -2014,6 +2147,36 @@ mod tests {
         }
     }
 
+    /// Records the grace instead of spending it, so escalation order is provable in microseconds.
+    #[derive(Default)]
+    struct RecordingSleeper(RefCell<Vec<Duration>>);
+
+    impl RecordingSleeper {
+        fn waits(&self) -> Ref<'_, Vec<Duration>> {
+            self.0.borrow()
+        }
+    }
+
+    impl Sleeper for RecordingSleeper {
+        fn sleep(&self, duration: Duration) {
+            self.0.borrow_mut().push(duration);
+        }
+    }
+
+    /// A backend whose grace admits exactly two unforced retries before it forces.
+    fn graced_backend(
+        outputs: impl IntoIterator<Item = CommandOutput>,
+    ) -> MacOsApfsBackend<RecordingRunner, RecordingSleeper> {
+        MacOsApfsBackend::with_grace(
+            RecordingRunner::with_outputs(outputs),
+            RecordingSleeper::default(),
+            DetachGrace {
+                total: Duration::from_millis(20),
+                poll: Duration::from_millis(10),
+            },
+        )
+    }
+
     fn capacity(value: &str) -> ImageCapacity {
         ImageCapacity::parse(value).expect("test capacities are well formed")
     }
@@ -2217,7 +2380,7 @@ mod tests {
 
         fn finish(mut self) -> Result<(), ApfsError> {
             if let Some(attachment) = self.attachment.as_ref() {
-                self.backend.detach(attachment, false)?;
+                self.backend.detach(attachment, DetachIntent::Release)?;
                 self.attachment = None;
             }
             let result = self.backend.delete_image(&self.image, self.format);
@@ -2231,10 +2394,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl Drop for RealImageCleanup<'_> {
         fn drop(&mut self) {
-            let detached = self
-                .attachment
-                .take()
-                .is_none_or(|attachment| self.backend.detach(&attachment, true).is_ok());
+            let detached = self.attachment.take().is_none_or(|attachment| {
+                self.backend
+                    .detach(&attachment, DetachIntent::Release)
+                    .is_ok()
+            });
             if detached && self.armed {
                 let _ = self.backend.delete_image(&self.image, self.format);
             }
@@ -2543,12 +2707,15 @@ mod tests {
 
     #[test]
     fn ambiguous_volume_and_detach_failures_preserve_both_typed_errors() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+        let backend = graced_backend([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(AMBIGUOUS_VOLUME_LIST_PLIST),
-            CommandOutput::failure(16, "busy"),
-        ]));
+            CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
+            CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
+            CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
+            CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
+        ]);
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
             .unwrap_err();
@@ -2580,9 +2747,15 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+        // The cleanup detach is a Release: it holds the volume to the full grace and then forces,
+        // and only a dissent that outlasts even that is reported beside the resolution failure.
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 7);
         assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(
+            argv(&requests[6]),
+            ["detach", "-quiet", "-force", "/dev/disk4"]
+        );
     }
 
     #[test]
@@ -3013,7 +3186,7 @@ mod tests {
             argv(&requests[4]),
             ["-U", "502", "-G", "20", "-i", "-v", "main", "/dev/disk8"]
         );
-        assert_eq!(argv(&requests[5]), ["eject", "force", "/dev/disk8"]);
+        assert_eq!(argv(&requests[5]), ["eject", "/dev/disk8"]);
     }
 
     #[test]
@@ -3108,7 +3281,7 @@ mod tests {
             argv(&requests[3]),
             ["-U", "501", "-G", "80", "-i", "-v", "main", "/dev/disk8"]
         );
-        assert_eq!(argv(&requests[4]), ["eject", "force", "/dev/disk8"]);
+        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
     }
 
     #[test]
@@ -3376,7 +3549,7 @@ mod tests {
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 5);
         assert_eq!(requests[3].program, Path::new(NEWFS_APFS));
-        assert_eq!(argv(&requests[4]), ["eject", "force", "/dev/disk8"]);
+        assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
     }
 
     #[test]
@@ -3731,18 +3904,93 @@ mod tests {
     }
 
     #[test]
-    fn public_detach_delegates_format_force_and_device() {
-        let backend =
-            MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::failure(
-                16, "busy",
-            )]));
+    fn public_detach_delegates_format_and_whole_device() {
+        let backend = graced_backend([CommandOutput::success([])]);
         let attachment = AttachedImage {
             image: PathBuf::from("session.sparseimage"),
             format: ImageFormat::Sparse,
             whole_device: "/dev/disk12".into(),
             volume_device: "/dev/disk12s1".into(),
         };
-        let error = backend.detach(&attachment, true).unwrap_err();
+
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[0]), ["detach", "-quiet", "/dev/disk12"]);
+    }
+
+    /// The dissent each tool actually emits — `hdiutil`'s EBUSY status, `diskutil`'s dissent text
+    /// — buys the volume the whole grace, and the force lands exactly once at the end of it.
+    #[test]
+    fn a_released_detach_spends_its_grace_before_forcing_once() {
+        let cases = [
+            (
+                ImageFormat::Sparse,
+                CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
+                HDIUTIL,
+                ["detach", "-quiet", "/dev/disk4"].as_slice(),
+                ["detach", "-quiet", "-force", "/dev/disk4"].as_slice(),
+            ),
+            (
+                ImageFormat::Asif,
+                CommandOutput::failure(
+                    1,
+                    "Unmount of disk4 failed: at least one volume could not be unmounted",
+                ),
+                DISKUTIL,
+                ["eject", "/dev/disk4"].as_slice(),
+                ["eject", "force", "/dev/disk4"].as_slice(),
+            ),
+        ];
+
+        for (format, dissent, program, polite_argv, forced_argv) in cases {
+            let backend = graced_backend([
+                dissent.clone(),
+                dissent.clone(),
+                dissent,
+                CommandOutput::success([]),
+            ]);
+
+            backend
+                .detach_target(
+                    format,
+                    DetachTarget::Device("/dev/disk4"),
+                    DetachIntent::Release,
+                )
+                .unwrap();
+
+            let requests = backend.runner().requests();
+            assert_eq!(requests.len(), 4, "three polite attempts, then one force");
+            for request in requests.iter() {
+                assert_eq!(request.program, Path::new(program));
+            }
+            for request in requests.iter().take(3) {
+                assert_eq!(argv(request), polite_argv);
+            }
+            assert_eq!(argv(&requests[3]), forced_argv);
+            assert_eq!(
+                *backend.sleeper.waits(),
+                [Duration::from_millis(10), Duration::from_millis(10)]
+            );
+        }
+    }
+
+    /// `WhenIdle` is the whole reason the intent exists: `resize`, `unmount`, and the adoption
+    /// rollback must hand a live workspace's dissent back to their caller instead of forcing it.
+    #[test]
+    fn a_when_idle_detach_reports_the_dissent_without_waiting_or_forcing() {
+        let backend = graced_backend([CommandOutput::failure(HDIUTIL_DETACH_BUSY, [])]);
+
+        let error = backend
+            .detach_target(
+                ImageFormat::Sparse,
+                DetachTarget::Device("/dev/disk4"),
+                DetachIntent::WhenIdle,
+            )
+            .unwrap_err();
+
         assert!(matches!(
             error,
             ApfsError::CommandFailed {
@@ -3751,52 +3999,73 @@ mod tests {
                 ..
             }
         ));
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].program, Path::new(HDIUTIL));
-        assert_eq!(
-            argv(&requests[0]),
-            ["detach", "-quiet", "-force", "/dev/disk12"]
-        );
+        assert_eq!(backend.runner().requests().len(), 1);
+        assert!(backend.sleeper.waits().is_empty());
+    }
+
+    /// Only a dissent is transient. A tool that failed for any other reason is failing now and
+    /// will fail in ten seconds, so waiting on it would only delay the report.
+    #[test]
+    fn a_detach_that_failed_for_another_reason_is_never_waited_on() {
+        for (format, output) in [
+            (
+                ImageFormat::Sparse,
+                CommandOutput::failure(1, "no such device"),
+            ),
+            (
+                ImageFormat::Asif,
+                CommandOutput::failure(1, "no such device"),
+            ),
+        ] {
+            let backend = graced_backend([output]);
+
+            backend
+                .detach_target(
+                    format,
+                    DetachTarget::Device("/dev/disk4"),
+                    DetachIntent::Release,
+                )
+                .unwrap_err();
+
+            assert_eq!(backend.runner().requests().len(), 1);
+            assert!(backend.sleeper.waits().is_empty());
+        }
     }
 
     #[test]
     fn detach_target_records_format_specific_device_and_mountpoint_commands() {
-        let cases: [(ImageFormat, DetachTarget<'_>, bool, &str, &[&str]); 4] = [
+        let cases: [(ImageFormat, DetachTarget<'_>, &str, &[&str]); 4] = [
             (
                 ImageFormat::Asif,
                 DetachTarget::Device("/dev/disk3s1"),
-                true,
                 DISKUTIL,
-                &["eject", "force", "/dev/disk3s1"],
+                &["eject", "/dev/disk3s1"],
             ),
             (
                 ImageFormat::Asif,
                 DetachTarget::MountPoint(Path::new("/Volumes/cowshed/main")),
-                false,
                 DISKUTIL,
                 &["eject", "/Volumes/cowshed/main"],
             ),
             (
                 ImageFormat::Sparse,
                 DetachTarget::Device("/dev/disk4"),
-                true,
                 HDIUTIL,
-                &["detach", "-quiet", "-force", "/dev/disk4"],
+                &["detach", "-quiet", "/dev/disk4"],
             ),
             (
                 ImageFormat::Sparse,
                 DetachTarget::MountPoint(Path::new("/Volumes/cowshed/session")),
-                false,
                 HDIUTIL,
                 &["detach", "-quiet", "/Volumes/cowshed/session"],
             ),
         ];
 
-        for (format, target, force, program, expected_argv) in cases {
-            let backend =
-                MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
-            backend.detach_target(format, target, force).unwrap();
+        for (format, target, program, expected_argv) in cases {
+            let backend = graced_backend([CommandOutput::success([])]);
+            backend
+                .detach_target(format, target, DetachIntent::Release)
+                .unwrap();
             let requests = backend.runner().requests();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].program, Path::new(program));
@@ -3832,7 +4101,7 @@ mod tests {
                 DetachTarget::MountPoint(path) => path.to_owned(),
             };
             let error = backend
-                .detach_target(ImageFormat::Sparse, target, false)
+                .detach_target(ImageFormat::Sparse, target, DetachIntent::Release)
                 .unwrap_err();
             assert!(matches!(
                 error,

@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::apfs::{
-    ApfsCaseSensitivity, ApfsError, CreateImageRequest, CreatedImage, ImageFormatSelection,
-    MountAccess,
+    ApfsCaseSensitivity, ApfsError, CreateImageRequest, CreatedImage, DetachIntent,
+    ImageFormatSelection, MountAccess,
 };
 pub use crate::metadata::CheckoutLayout;
 use crate::metadata::{
@@ -378,7 +378,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         expected: &MarkerExpectation,
     ) -> Result<(), ApfsStorageError>;
     fn validate_staged_companion(&self, path: &Path) -> Result<(), ApfsStorageError>;
-    fn detach(&self, attachment: Self::Attachment, force: bool) -> Result<(), ApfsStorageError>;
+    fn detach(
+        &self,
+        attachment: Self::Attachment,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsStorageError>;
     fn heal_mount(
         &self,
         workspace: &LifecycleWorkspace,
@@ -392,7 +396,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn detach_mounted(
         &self,
         workspace: &LifecycleWorkspace,
-        force: bool,
+        intent: DetachIntent,
     ) -> Result<(), ApfsStorageError>;
     /// Grow the workspace's image to `capacity` and restore the mount state it was found in.
     ///
@@ -1430,8 +1434,10 @@ where
             workspace.format(),
         )?];
         let workspace = workspace.clone();
+        // The volume is the user's to be working in: an explicit unmount that cannot land is a
+        // busy conflict for the caller to report, never grounds to force it out from under them.
         self.dispatch_with_locks(lock_paths, true, move |host, _| {
-            host.detach_mounted(&workspace, false)
+            host.detach_mounted(&workspace, DetachIntent::WhenIdle)
         })
         .await
     }
@@ -1935,7 +1941,7 @@ fn detach_and_reclaim_adopt<H: ApfsExecutionHost>(
     staged_image: &Path,
     format: ImageFormat,
 ) -> Result<(), ApfsStorageError> {
-    let detached = host.detach(attachment, false);
+    let detached = host.detach(attachment, DetachIntent::Release);
     let reclaimed = host.reclaim_image(staged_image, format);
     match detached {
         Ok(()) => reclaimed,
@@ -1970,7 +1976,7 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
             detach_and_reclaim_adopt(host, attachment, &staged_image, stage.workspace.format());
         return combine_cleanup("adopt post-initialization validation", primary, cleanup);
     }
-    if let Err(primary) = host.detach(attachment, false) {
+    if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
         return combine_cleanup(
             "adopt staging detach",
             primary,
@@ -2135,7 +2141,7 @@ fn detach_and_reclaim_clone<H: ApfsExecutionHost>(
     staged_image: &Path,
     format: ImageFormat,
 ) -> Result<(), ApfsStorageError> {
-    let detached = host.detach(attachment, false);
+    let detached = host.detach(attachment, DetachIntent::Release);
     let reclaimed = host.reclaim_image(staged_image, format);
     match detached {
         Ok(()) => reclaimed,
@@ -2169,7 +2175,7 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
             detach_and_reclaim_clone(host, attachment, &staged_image, stage.workspace.format()),
         );
     }
-    if let Err(primary) = host.detach(attachment, false) {
+    if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
         return combine_cleanup(
             "clone staging detach",
             primary,
@@ -2244,7 +2250,7 @@ fn prepare_checkpoint_stage<H: ApfsExecutionHost>(
             );
         }
     };
-    if let Err(primary) = host.detach(attachment, false) {
+    if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
         return combine_cleanup(
             "checkpoint verification detach",
             primary,
@@ -2404,7 +2410,9 @@ fn abort_prepared_restore<H: ApfsExecutionHost>(
     prepared: PreparedRestore<H::Attachment>,
 ) -> Result<(), ApfsStorageError> {
     match prepared {
-        PreparedRestore::Verify(prepared) => host.detach(prepared.attachment, false),
+        PreparedRestore::Verify(prepared) => {
+            host.detach(prepared.attachment, DetachIntent::Release)
+        }
         PreparedRestore::Replace(prepared) => detach_and_reclaim_restore(
             host,
             prepared.attachment,
@@ -2420,7 +2428,7 @@ fn detach_and_reclaim_restore<H: ApfsExecutionHost>(
     staged_image: &Path,
     format: ImageFormat,
 ) -> Result<(), ApfsStorageError> {
-    let detached = host.detach(attachment, false);
+    let detached = host.detach(attachment, DetachIntent::Release);
     let reclaimed = host.reclaim_image(staged_image, format);
     match detached {
         Ok(()) => reclaimed,
@@ -2436,7 +2444,7 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         let PreparedRestore::Verify(prepared) = prepared else {
             unreachable!()
         };
-        host.detach(prepared.attachment, false)?;
+        host.detach(prepared.attachment, DetachIntent::Release)?;
         return Ok(CommittedRestore::Verified(prepared.receipt));
     };
     let PreparedReplaceRestore {
@@ -2466,14 +2474,14 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
             detach_and_reclaim_restore(host, attachment, &staged_image, stage.workspace.format()),
         );
     }
-    if let Err(primary) = host.detach(attachment, false) {
+    if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
         return combine_cleanup(
             "restore staging detach",
             primary,
             host.reclaim_image(&staged_image, stage.workspace.format()),
         );
     }
-    if let Err(primary) = host.detach_mounted(&current, false) {
+    if let Err(primary) = host.detach_mounted(&current, DetachIntent::Release) {
         return combine_cleanup(
             "restore canonical detach",
             primary,
@@ -2490,7 +2498,7 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)
     {
         let cleanup = host
-            .detach_mounted(&stage.workspace, false)
+            .detach_mounted(&stage.workspace, DetachIntent::Release)
             .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
             .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
         return combine_cleanup("restore rollback", primary, cleanup);
@@ -2506,7 +2514,7 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         Ok(fact) => fact,
         Err(primary) => {
             let cleanup = host
-                .detach_mounted(&stage.workspace, false)
+                .detach_mounted(&stage.workspace, DetachIntent::Release)
                 .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
                 .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
             return combine_cleanup("restore metadata publication", primary, cleanup);
@@ -2578,7 +2586,7 @@ fn apply_retire<H: ApfsExecutionHost>(
     let current = active_expected_with_format(expected, workspace_name, format)?;
     let canonical = canonical_image_path(config, &current)?;
     let trash = retired_image_path(config, &current)?;
-    host.detach_mounted(&current, true)?;
+    host.detach_mounted(&current, DetachIntent::Release)?;
     host.retire_image(&canonical, &trash)?;
     Ok(Applied::Retired(RetiredRef::new(
         current.clone(),
@@ -2611,7 +2619,7 @@ fn detach_after_failure<H: ApfsExecutionHost, T>(
     primary: ApfsStorageError,
     operation: &'static str,
 ) -> Result<T, ApfsStorageError> {
-    match host.detach(attachment, false) {
+    match host.detach(attachment, DetachIntent::Release) {
         Ok(()) => Err(primary),
         Err(cleanup) => Err(ApfsStorageError::Cleanup {
             operation,

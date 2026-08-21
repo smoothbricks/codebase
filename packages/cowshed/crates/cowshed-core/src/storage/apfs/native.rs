@@ -19,7 +19,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::apfs::{
     ApfsBackend, ApfsError, AttachedImage, CommandRunner, CreateImageRequest, CreatedImage,
-    DetachTarget, ImageFormatSelection, MacOsApfsBackend, MountAccess,
+    DetachIntent, DetachTarget, ImageFormatSelection, MacOsApfsBackend, MountAccess,
 };
 use crate::copy::TreeCopier;
 use crate::metadata::{
@@ -1595,22 +1595,21 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             self.backend
                 .mount(&attachment, mount_point, MountAccess::ReadOnly, false)
         {
-            let cleanup = self.backend.detach(&attachment, true).map_err(Into::into);
+            let cleanup = self
+                .backend
+                .detach(&attachment, DetachIntent::Release)
+                .map_err(Into::into);
             return super::combine_cleanup("recovery marker mount", primary.into(), cleanup);
         }
         let incarnation = WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH))
             .map(|marker| marker.workspace_incarnation.to_string())
             .map_err(|error| ApfsStorageError::Host(error.to_string()));
-        let detach = match self.backend.detach(&attachment, false) {
-            Ok(()) => Ok(()),
-            Err(primary) => self.backend.detach(&attachment, true).map_err(|cleanup| {
-                ApfsStorageError::Cleanup {
-                    operation: "force recovery marker detach",
-                    primary: Box::new(primary.into()),
-                    cleanup: Box::new(cleanup.into()),
-                }
-            }),
-        };
+        // The unforced detach already spends its grace and then forces (apfs::DetachGrace), so
+        // there is nothing left for a second attempt here to try.
+        let detach = self
+            .backend
+            .detach(&attachment, DetachIntent::Release)
+            .map_err(Into::into);
         let cleanup = match (incarnation, detach) {
             (Ok(incarnation), Ok(())) => Ok(incarnation),
             (Err(primary), cleanup) => {
@@ -2361,15 +2360,15 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         attachments.sort_by_key(|entry| std::cmp::Reverse(entry.mount_id));
         let mut first_error = None;
         for entry in attachments {
-            if let Err(error) = self.backend.detach(&entry.attachment, false)
-                && let Err(force_error) = self.backend.detach(&entry.attachment, true)
+            // Teardown detaches every attachment before reporting, so the first failure is kept
+            // and the rest of the reverse order still runs. The unforced detach already escalates
+            // to force after its grace (apfs::DetachGrace).
+            if let Err(error) = self
+                .backend
+                .detach(&entry.attachment, DetachIntent::Release)
                 && first_error.is_none()
             {
-                first_error = Some(ApfsStorageError::Cleanup {
-                    operation: "reverse-order APFS teardown",
-                    primary: Box::new(error.into()),
-                    cleanup: Box::new(force_error.into()),
-                });
+                first_error = Some(error.into());
             }
         }
         match first_error {
@@ -2387,7 +2386,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         attachment: AttachedImage,
         primary: ApfsStorageError,
     ) -> ApfsStorageError {
-        match self.backend.detach(&attachment, false) {
+        match self.backend.detach(&attachment, DetachIntent::Release) {
             Ok(()) => primary,
             Err(cleanup) => ApfsStorageError::Cleanup {
                 operation: "detach the attachment a failed resize left behind",
@@ -2723,11 +2722,15 @@ where
             return Ok(());
         }
 
-        self.detach_mounted(workspace, true)
+        self.detach_mounted(workspace, DetachIntent::Release)
     }
 
-    fn detach(&self, attachment: Self::Attachment, force: bool) -> Result<(), ApfsStorageError> {
-        self.backend.detach(&attachment, force).map_err(Into::into)
+    fn detach(
+        &self,
+        attachment: Self::Attachment,
+        intent: DetachIntent,
+    ) -> Result<(), ApfsStorageError> {
+        self.backend.detach(&attachment, intent).map_err(Into::into)
     }
 
     fn retain_mounted(
@@ -2748,7 +2751,10 @@ where
                     workspace.repo(),
                     workspace.name()
                 ));
-                match self.backend.detach(&entry.attachment, false) {
+                match self
+                    .backend
+                    .detach(&entry.attachment, DetachIntent::Release)
+                {
                     Ok(()) => Err(primary),
                     Err(cleanup) => Err(ApfsStorageError::Cleanup {
                         operation: "reject duplicate mounted attachment",
@@ -2763,7 +2769,7 @@ where
     fn detach_mounted(
         &self,
         workspace: &LifecycleWorkspace,
-        force: bool,
+        intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         let key = (workspace.repo().clone(), workspace.name().clone());
         let Some(entry) = self.mounted.remove(key.clone())? else {
@@ -2796,35 +2802,26 @@ where
                     metadata.workspace_incarnation
                 )));
             }
-            return match self.backend.detach_target(
-                workspace.format(),
-                DetachTarget::MountPoint(&mount_point),
-                false,
-            ) {
-                Ok(()) => Ok(()),
-                Err(_) if force => self
-                    .backend
-                    .detach_target(
-                        workspace.format(),
-                        DetachTarget::MountPoint(&mount_point),
-                        true,
-                    )
-                    .map_err(Into::into),
-                Err(error) => Err(error.into()),
-            };
+            return self
+                .backend
+                .detach_target(
+                    workspace.format(),
+                    DetachTarget::MountPoint(&mount_point),
+                    intent,
+                )
+                .map_err(Into::into);
         };
-        let result = match self.backend.detach(&entry.attachment, false) {
-            Ok(()) => return Ok(()),
-            Err(_) if force => self.backend.detach(&entry.attachment, true),
-            Err(error) => Err(error),
-        };
+        let result = self.backend.detach(&entry.attachment, intent);
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
                 let primary = ApfsStorageError::from(error);
                 match self.mounted.restore(key, entry)? {
                     Ok(()) => Err(primary),
-                    Err(orphaned) => match self.backend.detach(&orphaned.attachment, true) {
+                    Err(orphaned) => match self
+                        .backend
+                        .detach(&orphaned.attachment, DetachIntent::Release)
+                    {
                         Ok(()) => Err(primary),
                         Err(cleanup) => Err(ApfsStorageError::Cleanup {
                             operation: "restore failed mounted attachment",
@@ -2868,7 +2865,7 @@ where
             .mounts()?
             .into_iter()
             .any(|mount| mount.mount_point == mount_point);
-        self.detach_mounted(workspace, false)?;
+        self.detach_mounted(workspace, DetachIntent::WhenIdle)?;
         self.backend.resize_image(image, format, capacity)?;
 
         let attachment = self.backend.attach_verified(image, format)?;
@@ -2890,7 +2887,7 @@ where
         }
 
         if !was_mounted {
-            self.backend.detach(&attachment, false)?;
+            self.backend.detach(&attachment, DetachIntent::Release)?;
             return Ok(ResizeOutcome {
                 previous,
                 capacity: observed,
@@ -2940,7 +2937,10 @@ where
                 "retained pre-cowshed checkout is missing",
             ));
         }
-        self.detach_mounted(workspace, false)?;
+        // The detach is this rollback's first mutation, so refusing a held main leaves the
+        // adoption exactly as it was. Forcing would strand whoever is working in the checkout
+        // that is about to be handed back to them.
+        self.detach_mounted(workspace, DetachIntent::WhenIdle)?;
         restore_adopted_checkout_paths(source_checkout, pre_cowshed_checkout, &canonical_mount)?;
         if canonical_mount == source_checkout {
             // Direct mount: the swap above already carried the stub away and removed it. There is
