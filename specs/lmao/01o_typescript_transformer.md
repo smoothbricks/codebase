@@ -6,15 +6,16 @@ speedup.
 
 > **Implementation status (system state).** The sole compiler implementation is the native ttsc/tsgo plugin in
 > `packages/lmao-ttsc/plugin/`. Bun build and runtime hosts load that plugin through the package's `@ttsc/unplugin`
-> adapters; there is no parallel TypeScript compiler-API transformer. Destructured-context rewriting (§3),
-> Promise-preserving fixed-arity span lowering, packed runtime hints, private `u16` log-template storage, and the
-> existing line, metadata, tag, log, and result transformations are implemented in the native plugin and covered by its
-> Go suite plus Bun integration. `spanAutoN` exists as an internal, explicit runtime seam, but automatic `ctx.span(...)`
-> → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return would change the public Promise
-> API's observable microtask scheduling. The running invariant is **the transformed output the tests assert**, not
-> earlier design sketches. The global vocabulary ABI in §6.2 is the clean-cutover target, not shipped behavior. The
-> shipped Op-local IDs remain lexical `u16` values, not stable IDs or `VocabularyBinding` indices. No performance
-> improvement is claimed for either representation without its phase-specific benchmark gate.
+> adapters; there is no parallel TypeScript compiler-API transformer. Promise-preserving fixed-arity span lowering,
+> packed runtime hints, private `u16` log-template storage, and the line, metadata, tag, log, and result transformations
+> are implemented in the native plugin and covered by its Go suite plus Bun integration. Destructured-context rewriting
+> (§3) is **not** implemented: a callback whose first parameter is destructured keeps the public dispatcher path
+> (`packages/lmao-ttsc/plugin/main.go:10-13`). `spanAutoN` exists as an internal, explicit runtime seam, but automatic
+> `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return would change the
+> public Promise API's observable microtask scheduling. The running invariant is **the transformed output the tests
+> assert**, not earlier design sketches. The global vocabulary ABI in §6.2 is the clean-cutover target, not shipped
+> behavior. The shipped Op-local IDs remain lexical `u16` values, not stable IDs or `VocabularyBinding` indices. No
+> performance improvement is claimed for either representation without its phase-specific benchmark gate.
 
 ## Bun integration
 
@@ -42,6 +43,40 @@ preload = ["@smoothbricks/lmao-ttsc/bun-register"]
 
 Both entrypoints read the nearest TypeScript project and apply its configured and direct-dependency ttsc plugins. The
 `./bun-register` export is intentionally marked as a package side effect; the build adapter itself is side-effect free.
+
+## Plugin Packaging and Host <a id="smoo/lmao!n/transformer-plugin-host"></a>
+
+The compiler host is the ttsc plugin protocol (upstream `samchon/ttsc`, tag `v0.28.1`). `@smoothbricks/lmao-ttsc` ships
+the transform as Go source inside the npm package; the consumer's ttsc builds it from that source:
+
+- **Discovery**: `package.json` carries the `ttsc.plugin` marker —
+  `"ttsc": { "plugin": { "transform": "@smoothbricks/lmao-ttsc/ttsc-plugin" } }`
+  (`packages/lmao-ttsc/package.json:30-34`).
+- **Descriptor**: `plugin.cjs` is a CJS factory returning
+  `{ name, source: path.resolve(context.dirname, 'plugin'), stage: 'transform' }`
+  (`packages/lmao-ttsc/plugin.cjs:13-18`).
+- **Source and build**: `plugin/` holds the Go transform. The consumer's ttsc compiles it from source, cache-keyed by
+  ttsc/tsgo/platform/Go-toolchain/source hash; the `go.work` it builds against is generated
+  (`packages/lmao-ttsc/scripts/gen-go-work.mjs`).
+- **Checker access**: the plugin reads resolved types through the typescript-go shims — `GetTypeAtLocation` and
+  `GetResolvedSignature` provenance checks (`packages/lmao-ttsc/plugin/optimization.go:814-843`) — so every proof below
+  is a checker proof, not a syntactic heuristic.
+- **Conformance**: the output-asserting suite is ordinary `go test` beside the source
+  (`packages/lmao-ttsc/plugin/template_test.go`, `plugin/tag_capability_test.go`, …). The running invariant is the
+  transformed output those tests assert.
+
+### Library Package plus Thin Main <a id="smoo/lmao!n/transformer-library-main"></a>
+
+The plugin is a Go **library package plus a thin `main`**, not an independent executable transform host. Two independent
+executable transform hosts cannot share one emit pass, and single-pass composition with sibling plugins (typia, the
+toolchain optimization suite) is a hard packaging requirement. The library form — a non-`main` package registering via
+`init()` → `driver.RegisterPlugin`, with a thin `main` beside it for standalone stock-ttsc use — is the split
+`@ttsc/banner` ships (`banner/driver/banner.go` + `banner/plugin/main.go`). Emitted output and the `go test` suite are
+unchanged by the split; only the registration seam differs.
+
+> **Implementation status.** The shipped tree is still one `package main` executable
+> (`packages/lmao-ttsc/plugin/optimization.go:1`, `plugin/main.go:25`); the library/thin-main split is a requirement of
+> this spec, not shipped behavior.
 
 ## Design Philosophy <a id="smoo/lmao!n/transformer-philosophy"></a>
 
@@ -71,13 +106,10 @@ await ctx.span('fetch-user', fetchUserOp, userId);
 await ctx.span1(
   42,
   'fetch-user',
-  Object.create(ctx),
-  fetchUserOp.SpanBufferClass,
-  fetchUserOp.remappedViewClass,
-  fetchUserOp.metadata,
+  fetchUserOp.callsitePlan.newCtx0(ctx),
+  fetchUserOp.callsitePlan,
   fetchUserOp.fn,
-  userId,
-  fetchUserOp.runtimeHint
+  userId
 );
 ```
 
@@ -87,53 +119,41 @@ never stored as a property on the context.
 
 ### 2. Monomorphic span() Rewriting <a id="smoo/lmao!n/transformer-span-rewrite"></a>
 
-`tryTransformSpanCall` conservatively lowers supported calls to the Promise-based `span0`–`span8` ABI. It requires at
-most eight trailing arguments, a stable receiver (`identifier` or `this`), and either:
-
-1. a checker-proved `Op` represented by a stable identifier, whose buffer class, remapped view, metadata, function, and
-   runtime hint can each be read once; or
-2. an inline arrow/function expression, using the receiver's buffer class and metadata and runtime hint `0`.
+The span rewrite (`trySpanRewrite`, `packages/lmao-ttsc/plugin/main.go:513-550`) conservatively lowers supported calls
+to the Promise-based `span0`–`span8` ABI. It requires at most eight trailing arguments, a stable receiver (`identifier`
+or `this`) whose checker type is a proven LMAO context, and a checker-proved `Op` represented by a stable identifier
+with LMAO declaration provenance (`plugin/optimization.go:886-896`). The Op's callsite plan and function are each read
+exactly once. An inline arrow or function expression is **not** lowered — it stays on the public variadic `span()`
+dispatcher (`plugin/main.go:525-527`).
 
 ```typescript
 // User writes:
 await ctx.span('fetch-user', fetchUserOp, userId);
-ctx.span('compute', async () => heavyComputation());
 
 // Transformer outputs:
 await ctx.span1(
   42,
   'fetch-user',
-  Object.create(ctx),
-  fetchUserOp.SpanBufferClass,
-  fetchUserOp.remappedViewClass,
-  fetchUserOp.metadata,
+  fetchUserOp.callsitePlan.newCtx0(ctx),
+  fetchUserOp.callsitePlan,
   fetchUserOp.fn,
-  userId,
-  fetchUserOp.runtimeHint
-);
-ctx.span0(
-  43,
-  'compute',
-  Object.create(ctx),
-  ctx._buffer.constructor,
-  undefined,
-  ctx._buffer._opMetadata,
-  async () => heavyComputation(),
-  0
+  userId
 );
 ```
 
-The child is exactly `Object.create(receiver)`, not `_newCtx0()` and not a copied or merged object. Because `spanN`
-remains Promise-based, the lowered call preserves the public `span()` scheduling contract.
+A proven call with a literal span name may lower its name operand to the registered vocabulary index instead of the
+string literal (`plugin/main.go:533-535`). The child context is exactly `callsitePlan.newCtx0(receiver)` — the plan's
+prototype-inheriting child constructor (`packages/lmao/src/lib/spanContext.ts:1123-1126`) — not a copied or merged
+object. Because `spanN` remains Promise-based, the lowered call preserves the public `span()` scheduling contract.
 
 #### Evaluation and safety bailouts
 
 The transformer never duplicates an unstable receiver or Op expression. Calls such as
 `getCtx().span('name', getOp(), value)` remain byte-shape calls to the public variadic `span()` dispatcher: receiver and
 Op are each evaluated once in source order, and the returned Promise retains its normal microtask boundary. Other
-bailouts include a missing checker for an Op value, unproved receiver/Op types, more than eight trailing arguments,
-override form `span(name, overrides, op, ...)`, and any unsupported function expression. Every bailout preserves the
-public runtime path.
+bailouts include a missing checker for an Op value, unproved receiver/Op types, more than eight trailing arguments, the
+override form `span(name, overrides, op, ...)`, and any inline function expression. Every bailout preserves the public
+runtime path.
 
 Automatic `spanAutoN` lowering is **not** considered safe merely because a call is directly awaited or returned from an
 `async` function. Although both `Result` and `Promise<Result>` are await-compatible, returning a synchronous `Result`
@@ -172,9 +192,9 @@ nonzero analyzed capacity is clamped to a minimum of two; zero uses the normal a
 Capability analysis is closed-world. It accepts only direct, recognized forms: calls through `tag`/known log methods,
 `ff(...)` or `ff.flag(...)`, direct `span`/`spanSync`/`ok`/`err`/`setScope` calls, and property access through `scope`
 or `deps`. It emits hint `0` if the first parameter is not a simple identifier, the context escapes or is used as a
-value, access is computed/unknown, a nested function is entered, or another use cannot be proven safe. Consequently a
-callback whose first parameter is destructured is conservatively hinted as `0` even when the separate §3 rewrite
-succeeds.
+value, access is computed/unknown, a nested function is entered, or another use cannot be proven safe. A callback whose
+first parameter is destructured is therefore conservatively hinted as `0`; because §3 rewriting is not implemented, such
+a callback also keeps the public dispatcher for its span calls.
 
 `defineOp` is annotated only when no fourth argument already exists. Its fourth argument is
 `{ runtimeHint, logTemplateIds }`; missing user metadata is represented by an inserted third argument `undefined`.
@@ -186,9 +206,7 @@ closed-world hint analysis keeps its own key with `runtimeHint: 0`. This object 
 packed-hint argument/map: the runtime normalizes both fields, installs `runtimeHint` on the Op, and copies the frozen
 template table to `OpMetadata.logTemplateIds`.
 
-Hint injection and destructured-context rewriting compose in one visitor step: the original callback is analyzed first,
-then the hint-bearing call is passed to §3 rewriting. A call may therefore receive both changes; if §3 later bails, the
-already-proved hint injection remains.
+Hint analysis reads the original callback as written; it does not depend on any body rewrite.
 
 `_spanPre` trusts specialization only when the value is an in-range integer, bit 23 is set, and reserved bits are clear.
 Otherwise it installs the full context surface. A valid hint constructs only the required own properties. Logger setup
@@ -198,11 +216,12 @@ and `_logBinding` are always rebound to the child span.
 
 ### 3. Destructured Context Rewriting <a id="smoo/lmao!n/transformer-destructured-context"></a>
 
-**Status: implemented in the TypeScript transformer.** For arrow/function literals passed to `op`, `defineOp`,
-`defineOps`, or `task`, a destructured first parameter containing `span` may be replaced with `__ctx`. Other
-destructured properties are rebound as the first body statement, preserving aliases, defaults, and nested bindings.
-Every bare `span(...)` call must support the same Promise-preserving §2 lowering; otherwise the whole function is left
-unchanged.
+**Status: not implemented.** No shipped transformer performs this rewrite (`packages/lmao-ttsc/plugin/main.go:10-13`); a
+destructured callback keeps the public dispatcher. The contract below is the normative target for the native plugin. For
+arrow/function literals passed to `op`, `defineOp`, `defineOps`, or `task`, a destructured first parameter containing
+`span` may be replaced with `__ctx`. Other destructured properties are rebound as the first body statement, preserving
+aliases, defaults, and nested bindings. Every bare `span(...)` call must support the same Promise-preserving §2
+lowering; otherwise the whole function is left unchanged.
 
 ```typescript
 // User writes:
@@ -210,19 +229,16 @@ op(async ({ span, log }, userId) => {
   await span('fetch', fetchUserOp, userId);
 });
 
-// Stable, checker-proved Op:
+// Target output for a stable, checker-proved Op:
 op(async (__ctx, userId) => {
   const { log } = __ctx;
   await __ctx.span1(
     42,
     'fetch',
-    Object.create(__ctx),
-    fetchUserOp.SpanBufferClass,
-    fetchUserOp.remappedViewClass,
-    fetchUserOp.metadata,
+    fetchUserOp.callsitePlan.newCtx0(__ctx),
+    fetchUserOp.callsitePlan,
     fetchUserOp.fn,
-    userId,
-    fetchUserOp.runtimeHint
+    userId
   );
 });
 ```
@@ -234,9 +250,10 @@ a block with an explicit `return`.
 
 ### 4. `with()` Bulk Setter Unrolling <a id="smoo/lmao!n/transformer-tag-chain-inline"></a>
 
-The `ctx.tag` chain inliner (`tagChainInliner.ts`) transforms tag setter chains — including the `with()` bulk setter —
-into **direct columnar buffer writes** (not chained setter calls). It only fires in **statement context** (an
-`ExpressionStatement` whose expression is a `ctx.tag…` chain); a tag chain assigned to a variable is left alone.
+The `ctx.tag` chain inliner (`packages/lmao-ttsc/plugin/taginline.go`) transforms tag setter chains — including the
+`with()` bulk setter — into **direct columnar buffer writes** (not chained setter calls). It only fires in **statement
+context** (an `ExpressionStatement` whose expression is a `ctx.tag…` chain); a tag chain assigned to a variable is left
+alone.
 
 ```typescript
 // User writes:
@@ -252,10 +269,9 @@ ctx.tag.with({ userId: 'user-123', requestId: 'req-456' });
 ```
 
 The same lowering applies to plain setter chains (`ctx.tag.operation('SELECT').userId('user-123')`) and to single calls.
-With a `TypeChecker` and a known tag schema, boolean fields use bit-packed `|= 1` / `&= ~1` writes and enum fields map
-to their sorted-order index via a switch IIFE; non-literal arguments are wrapped in a
-`const $$vN = expr; if ($$vN != null) { … }` null check (`generateFieldWriteStatements` and the `generate*Write`
-helpers).
+With the checker and a known tag schema, boolean fields use bit-packed `|= 1` / `&= ~1` writes and enum fields map to
+their sorted-order index via a switch IIFE; non-literal arguments are wrapped in a
+`const $$vN = expr; if ($$vN != null) { … }` null check (`taginline.go:262` and the write generators around it).
 
 **Benefits**:
 
@@ -265,9 +281,9 @@ helpers).
 
 ### 5. Metadata Injection <a id="smoo/lmao!n/transformer-metadata-inject"></a>
 
-Injects module metadata from build context. `tryTransformDefineModuleCall` rewrites `defineModule({...})` (direct or
-`x.defineModule({...})`) by prepending a `metadata` property to its first object-literal argument, and is a no-op when a
-`metadata` property already exists:
+Injects module metadata from build context. `tryDefineModuleMetadata` (`packages/lmao-ttsc/plugin/main.go:435-471`)
+rewrites `defineModule({...})` by prepending a `metadata` property to its first object-literal argument, and is a no-op
+when a `metadata` property already exists:
 
 ```typescript
 // User writes:
@@ -290,11 +306,11 @@ const myModule = defineModule({
 });
 ```
 
-**Metadata sources** (`findNearestPackage` + `getLastGitCommit`):
+**Metadata sources** (`nearestPackage` + `gitLastCommit`, `plugin/main.go:473-509`):
 
 - `package_name`: `name` from the nearest `package.json` (walking up); `'unknown'` if none.
 - `package_file`: path of the source file relative to that package dir (basename fallback).
-- `git_sha`: `git log -1 --format=%H` for the file; `'unknown'` if git is unavailable.
+- `git_sha`: `git rev-list -1 HEAD -- <file>`; `'unknown'` if git is unavailable.
 
 > **Cross-reference / known divergence.** Spec `01l §metadata-injection` (node `smoo/lmao!n/metadata-injection`)
 > describes injection at the **`defineOpContext`** call site with a `__metadata` key — that is the _consumer_ contract
@@ -386,9 +402,9 @@ testing/fact extraction, Cloudflare rows, feature-flag evaluation, and stdio tra
 public Arrow `message` values and other exported messages remain the exact cooked literal or dynamic runtime string; the
 private ID lane is not an Arrow schema change. Span names and all non-eligible messages remain ordinary strings.
 
-The TypeScript and tsgo implementations share these checker-proof, lexical-order, deduplication, saturation, structured
-metadata, and bailout rules. Their parity tests establish emitted behavior and runtime/Arrow invariants; they are not
-performance evidence. The hot-store change has no claimed speedup until a dedicated benchmark reports results.
+The native plugin implements these checker-proof, lexical-order, deduplication, saturation, structured metadata, and
+bailout rules; its Go suite establishes emitted behavior and runtime/Arrow invariants. They are not performance
+evidence. The hot-store change has no claimed speedup until a dedicated benchmark reports results.
 
 #### 6.1 Shipped versus clean-cutover status
 
@@ -628,10 +644,10 @@ module.task('processOrder', async (ctx) => {}, 42);
 | ---------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | Stable proven Op span              | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI                                                                                  |
 | Dynamic/unstable Op span           | Public variadic Promise dispatcher    | Unchanged public dispatcher; single evaluation preserved                                                                 |
-| Inline-function span               | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI with direct `Object.create` child                                                |
+| Inline-function span               | Public variadic Promise dispatcher    | Unchanged public dispatcher (inline functions are not lowered)                                                           |
 | Explicit internal `spanAutoN`      | Not applicable                        | Sync `Ok`/`Err` terminal or Promise retry/thenable fallback; never automatic                                             |
 | `with()` bulk setter               | Object allocation + iteration         | Direct columnar buffer writes                                                                                            |
-| Destructured `span`                | Closure-bound public dispatcher       | `__ctx` plus safe Promise-based fixed-arity lowering, or whole-function bailout                                          |
+| Destructured `span`                | Closure-bound public dispatcher       | Unchanged public dispatcher (§3 not implemented; target: `__ctx` plus fixed-arity lowering)                              |
 | Op setup                           | Full context setup, adaptive capacity | Structured compile metadata with packed hint and Op-local templates when analysis is valid                               |
 | Literal Op log message             | String stored per row                 | Shipped: private Op-local `u16`; target: stable message `u24` in a stable fragment, bound to a process-dense Arrow index |
 | Structured operational log         | Runtime object/string work or raw API | Target: checker-proved literal template and fixed-arity field stores; not shipped                                        |
@@ -647,16 +663,16 @@ workload.
 
 ### Detecting Op vs Function <a id="smoo/lmao!n/transformer-detect-op"></a>
 
-The transformer uses a `TypeChecker` to prove the LMAO context receiver and `Op<...>` second argument. A proven Op is
-lowered to Promise-based `spanN` only when the Op is a stable identifier, so extracting its fields cannot repeat a
-dynamic expression. Arrow and function expressions can use the same legacy `spanN` path when their receiver is stable.
-Everything else remains on `span()`; `spanAutoN` is never selected automatically.
+The transformer uses the checker to prove the LMAO context receiver and the `Op<...>` second argument. A proven Op is
+lowered to Promise-based `spanN` only when the Op is a stable identifier, so reading its `callsitePlan` and `fn` cannot
+repeat a dynamic expression. Arrow and function expressions, dynamic Op expressions, and unproved types all remain on
+`span()`; `spanAutoN` is never selected automatically.
 
 ### Synthetic Variable Naming <a id="smoo/lmao!n/transformer-synthetic-naming"></a>
 
-Destructured-context rewriting emits `__ctx` only after proving that name does not occur in the function body. The
-transform is skipped on collision. The tag-chain inliner uses `$$vN` temporaries (`generateVarName`) for non-literal tag
-values.
+Destructured-context rewriting (§3, target) emits `__ctx` only after proving that name does not occur in the function
+body; the transform is skipped on collision. The tag-chain inliner uses `$$vN` temporaries (`taginline.go:262`) for
+non-literal tag values.
 
 ### Source Maps <a id="smoo/lmao!n/transformer-source-maps"></a>
 
@@ -674,7 +690,7 @@ Without proof—or without the transformer—everything stays correct through th
 
 - `span()` always returns `Promise<Result<...>>`. It parses the optional line/override forms, resolves Op versus
   function, creates `_newCtx0()`/`_newCtx1()`, and dispatches to Promise-based `span0`–`span8`.
-- Stable proven Ops and inline functions may lower directly to the same Promise-based `spanN` methods. Dynamic Op
+- Stable proven Ops may lower directly to the same Promise-based `spanN` methods. Inline functions and dynamic Op
   expressions remain on `span()` to preserve single evaluation and Promise scheduling.
 - `spanAutoN` is an internal/explicit `Result | Promise<Result>` runtime seam and is not an automatic public-call
   replacement, even in direct await or async-return positions.
