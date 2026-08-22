@@ -1,6 +1,6 @@
 import type { PackageJson } from '../lib/json.js';
 import type { ReleasePackageInfo } from './core.js';
-import { releaseTag } from './core.js';
+import { globToRegExp, releaseTag } from './core.js';
 
 export interface AutoReleaseCandidateShell {
   gitRefExists(ref: string): Promise<boolean>;
@@ -139,37 +139,7 @@ function matchesBuildInputPattern(path: string, pattern: string): boolean {
   if (!normalized) {
     return false;
   }
-  return globPatternToRegExp(normalized).test(path);
-}
-
-function globPatternToRegExp(pattern: string): RegExp {
-  let source = '^';
-  for (let index = 0; index < pattern.length; index += 1) {
-    const char = pattern[index];
-    if (char === '*') {
-      if (pattern[index + 1] === '*') {
-        if (pattern[index + 2] === '/') {
-          source += '(?:.*/)?';
-          index += 2;
-        } else {
-          source += '.*';
-          index += 1;
-        }
-      } else {
-        source += '[^/]*';
-      }
-    } else {
-      source += escapeRegExpChar(char);
-    }
-  }
-  return new RegExp(`${source}$`);
-}
-
-function escapeRegExpChar(char: string | undefined): string {
-  if (!char) {
-    return '';
-  }
-  return /[\\^$+?.()|[\]{}]/.test(char) ? `\\${char}` : char;
+  return globToRegExp(normalized).test(path);
 }
 
 function isReleaseIgnoredBuildInputPath(path: string): boolean {

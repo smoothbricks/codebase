@@ -254,3 +254,39 @@ export function pendingReleaseTargets<Package extends ReleasePackageInfo>(
   }
   return pending.reverse();
 }
+
+/**
+ * Compile an Nx-style glob: a single `*` stops at a path separator, a doubled one crosses them,
+ * and a doubled star followed by a separator also matches zero segments, so `a/` + `**` + `/b`
+ * covers plain `a/b`. Shared by the two things release selection matches — changed file paths
+ * against build-input patterns, and `dependsOn` entries against target names.
+ */
+export function globToRegExp(pattern: string): RegExp {
+  let source = '^';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        if (pattern[index + 2] === '/') {
+          source += '(?:.*/)?';
+          index += 2;
+        } else {
+          source += '.*';
+          index += 1;
+        }
+      } else {
+        source += '[^/]*';
+      }
+    } else {
+      source += escapeRegExpChar(char);
+    }
+  }
+  return new RegExp(`${source}$`);
+}
+
+function escapeRegExpChar(char: string | undefined): string {
+  if (!char) {
+    return '';
+  }
+  return /[\\^$+?.()|[\]{}]/.test(char) ? `\\${char}` : char;
+}
