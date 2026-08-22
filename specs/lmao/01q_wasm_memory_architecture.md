@@ -74,6 +74,23 @@ One `WebAssembly.Memory` per `OpContext`:
    `RemappedBufferView`
 5. **Capacity-sized blocks** - All blocks in a freelist are identical size (capacity × element_size)
 
+## Cross-Memory Invariants and Process Coexistence <a id="smoo/lmao!n/wasm-mem.process-coexistence"></a>
+
+Each `WebAssembly.Memory` is private to its OpContext and its allocator. When many OpContexts — or other WASM-resident
+subsystems with their own memories — share one Bun or browser process, coordination is by contract, never by a shared
+allocator:
+
+- **No cross-memory pointers.** Data leaves an OpContext memory only by copy: strings live on the JS heap, and Arrow
+  conversion constructs or copies owned output. Aliasing bytes across memories is forbidden; this is what keeps
+  independently designed allocators decoupled.
+- **Footprint composes by addition.** Memory never shrinks — each OpContext is peak-sized for its own history — so a
+  process's resident footprint is the sum of per-context peaks plus each co-resident subsystem's own peak-sizing
+  behavior. Sizing a shared process adds those declared peaks; it never assumes sharing.
+- **The tier ceiling bounds block growth.** Capacity tiers stop at 512; a span that outgrows its buffer chains an
+  identity-free overflow superblock (`packages/lmao/src/lib/wasm/WasmBufferStrategy.ts:169-178`) rather than minting a
+  larger block, so one pathological trace grows by chaining instead of permanently raising a context's worst-case block
+  size.
+
 ## Memory Layout <a id="smoo/lmao!n/wasm-mem.memory-layout"></a>
 
 ### OpContext WASM Memory <a id="smoo/lmao!n/wasm-mem.opcontext-wasm-memory"></a>
