@@ -4482,12 +4482,38 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 )
                 .await?;
             let info = handle.wait(job_id).await?;
-            if !matches!(
-                info.exit,
-                Some(crate::api::dto::ExitStatus::Exited { code: 0 })
-            ) {
+            let exit_code = match info.exit {
+                Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
+                _ => None,
+            };
+            if exit_code != Some(0) {
+                // The check's own words are the diagnosis. Read them back through the
+                // supervisor's bounded log so a failing check can never report as a bare
+                // category, then decide whose fault this is: the workspace's, or an
+                // environment that refused to run it at all.
+                let stderr = read_job_stderr_tail(&handle, job_id).await;
+                if let Some(denial) = sandbox_denial_in(&stderr) {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "land check `{check}` exited {exit} inside the sandbox: {denial}",
+                            exit = exit_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "killed".into()),
+                            denial = denial,
+                        ),
+                        format!(
+                            "the sandbox refused this command (workspace grants do not cover it), not the code: run `cowshed exec {ws} -- {check}` unsandboxed-equivalent or `cowshed grant {ws} --read <path>`",
+                            ws = workspace,
+                        ),
+                    ));
+                }
                 return Err(CowshedError::conflict(
-                    format!("land check failed: {check}"),
+                    format!(
+                        "land check `{check}` failed with exit {exit}: {stderr}",
+                        exit = exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "killed".into()),
+                    ),
                     "fix the workspace and retry land",
                 ));
             }
@@ -5809,28 +5835,100 @@ fn require_expected_ref(
 #[cfg(target_os = "macos")]
 /// Turn a failed git invocation into an error whose `next:` names what actually went wrong.
 ///
-/// A single catch-all hint is worse than no hint. Telling a user to "resolve the git conflict" when
-/// git failed to resolve a ref sends them looking for conflict markers and a rebase in progress
-/// that do not exist, and the real cause — a missing remote-tracking ref, an unknown revision —
-/// is the one thing the hint hides. Only a genuine merge/rebase conflict gets the conflict hint;
-/// everything else quotes git's own diagnosis and points at the state to inspect.
+/// A single catch-all hint is worse than no hint: it covers several unrelated failures, so a
+/// reader cannot tell which situation they are in — a dirty worktree that blocks a merge, a
+/// branch pair that can no longer fast-forward, a real conflict, or something else entirely —
+/// and one of those recourses is wrong for every other cause. Git's own diagnosis is always
+/// quoted verbatim; what this classification adds is cowshed's recourse for the cause git
+/// names, in cowshed's vocabulary (`cowshed rebase`, not git's merge menu).
 fn require_git_success(operation: &str, output: &std::process::Output) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let message = format!("{operation} failed: {stderr}");
-    // Git says "CONFLICT (content):" / "Automatic merge failed" / "could not apply" when a merge or
-    // rebase actually stopped on conflicting content. Anything else is a different failure wearing
-    // the same exit code.
-    let conflicted = stderr.contains("CONFLICT")
-        || stderr.contains("Automatic merge failed")
-        || stderr.contains("could not apply")
-        || stderr.contains("needs merge");
-    Err(if conflicted {
-        CowshedError::conflict(message, "resolve the git conflict and retry")
-    } else {
-        CowshedError::conflict(message, "inspect the repository state: git status")
+    // Each marker below is git naming a distinct situation; each gets the recourse for that
+    // situation and no other. Anything unclassified keeps git's words plus the generic
+    // inspect-state fallback rather than guessing.
+    Err(
+        if stderr.contains("CONFLICT")
+            || stderr.contains("Automatic merge failed")
+            || stderr.contains("could not apply")
+            || stderr.contains("needs merge")
+        {
+            CowshedError::conflict(message, "resolve the git conflict and retry")
+        } else if stderr.contains("would be overwritten by merge")
+            || stderr.contains("would be overwritten by checkout")
+            || stderr.contains("untracked working tree files would be overwritten")
+        {
+            CowshedError::conflict(
+                message,
+                "the target tree has uncommitted work: commit or discard it there, then retry",
+            )
+        } else if stderr.contains("Not possible to fast-forward")
+            || stderr.contains("Diverging branches")
+        {
+            CowshedError::conflict(
+                message,
+                "the workspace base is behind the target: rebase first (cowshed rebase <ws>), then retry land",
+            )
+        } else {
+            CowshedError::conflict(message, "inspect the repository state: git status")
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+/// Read back the bounded tail of a finished job's stderr for diagnostic purposes.
+///
+/// Best effort by design: a check whose output cannot be read still fails with its exit
+/// status; the tail only sharpens the message. The log API bounds each read, so a chatty
+/// check cannot balloon this error.
+async fn read_job_stderr_tail(
+    handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
+    job_id: JobId,
+) -> String {
+    use crate::runtime::supervisor::OutputStream;
+    let mut collected = Vec::new();
+    let mut offset = 0_u64;
+    while let Ok(chunk) = handle
+        .log_read(job_id, OutputStream::Stderr, offset, false)
+        .await
+    {
+        collected.extend_from_slice(&chunk.bytes);
+        offset = chunk.next_offset;
+        if chunk.eof || collected.len() >= DIAGNOSTIC_STDERR_LIMIT {
+            break;
+        }
+    }
+    if collected.len() > DIAGNOSTIC_STDERR_LIMIT {
+        collected.drain(..collected.len() - DIAGNOSTIC_STDERR_LIMIT);
+    }
+    String::from_utf8_lossy(&collected).trim().to_owned()
+}
+
+/// The bound on child stderr kept in a land-check/exec diagnostic.
+const DIAGNOSTIC_STDERR_LIMIT: usize = 2048;
+
+/// Recognize a Seatbelt-class denial in a child's own stderr, quoted verbatim in the
+/// resulting diagnostic.
+///
+/// The kernel surfaces a sandboxed denial to the child as EPERM ("Operation not permitted");
+/// the same command outside the sandbox succeeds. That signature is what distinguishes "the
+/// environment refused this" from "the workspace's code failed" — the misreporting that sends
+/// callers to fix working code. Matching the child's words keeps this honest: no signature,
+/// no environment claim.
+fn sandbox_denial_in(stderr: &str) -> Option<String> {
+    const DENIAL_MARKERS: [&str; 3] = [
+        "Operation not permitted",
+        "operation not permitted",
+        "Permission denied",
+    ];
+    DENIAL_MARKERS.iter().find_map(|marker| {
+        stderr
+            .lines()
+            .find(|line| line.contains(marker))
+            .map(str::to_owned)
     })
 }
 
@@ -6629,6 +6727,77 @@ mod workspace_origin_tests {
         assert!(workspace_origin_from_marker(&checkout).await.is_err());
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// The dirty-target merge block must be distinguishable from a conflict and from the
+    /// generic fallback: its recourse is commit-or-discard in that tree, not "resolve the
+    /// conflict" and not bare `git status`.
+    #[test]
+    fn dirty_target_merge_block_names_its_own_recourse() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let failed = |stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        let error = require_git_success(
+            "git operation",
+            &failed(
+                "error: Your local changes to the following files would be overwritten by merge:\n\tREADME.md\nPlease commit your changes or stash them before you merge.",
+            ),
+        )
+        .expect_err("a blocked merge is a failure");
+        assert!(
+            error.hint.contains("commit or discard"),
+            "dirty-target hint must name the remedy: {}",
+            error.hint
+        );
+        assert!(
+            error.message.contains("would be overwritten by merge"),
+            "git's own diagnosis survives verbatim: {}",
+            error.message
+        );
+        assert_ne!(error.hint.contains("resolve the git conflict"), true);
+
+        // The diverged case routes to cowshed's own verb, not git's merge menu.
+        let error = require_git_success(
+            "git operation",
+            &failed(
+                "hint: Diverging branches can't be fast-forwarded, you need to either:\nfatal: Not possible to fast-forward, aborting.",
+            ),
+        )
+        .expect_err("diverged land is a failure");
+        assert!(
+            error.hint.contains("cowshed rebase"),
+            "divergence recourse is cowshed's vocabulary: {}",
+            error.hint
+        );
+        assert!(!error.hint.contains("git status"));
+    }
+
+    /// The sandbox-denial detector fires on the kernel's EPERM wording (the only evidence a
+    /// denied child produces) and stays silent on ordinary failures — a detector that fired
+    /// on everything would mislabel every genuine check failure as environmental.
+    #[test]
+    fn sandbox_denial_detection_fires_on_eperm_and_nothing_else() {
+        let denial = sandbox_denial_in(
+            "error: failed to run custom build command for `foo`\n  cat: /Users/danny/Dev/_fork/minigraf/Cargo.toml: Operation not permitted",
+        )
+        .expect("EPERM wording must classify as a denial");
+        assert!(denial.contains("Operation not permitted"));
+
+        assert!(sandbox_denial_in("cat: /x: Permission denied").is_some());
+        assert!(
+            sandbox_denial_in("thread 'main' panicked at src/lib.rs:1:1:\nexplicit panic")
+                .is_none(),
+            "a plain test failure is not an environment refusal"
+        );
+        assert!(
+            sandbox_denial_in("").is_none(),
+            "empty output owes no claim"
+        );
     }
 
     /// A failed git invocation must not be reported as a conflict unless git said so: the phantom
