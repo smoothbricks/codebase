@@ -894,6 +894,9 @@ func (t *fileTransformer) collectOptimizations(root *shimast.Node, emitHints boo
 					if provenOp && provenContext {
 						t.opSpans[call] = true
 					}
+					if plainFunction && provenContext {
+						t.fnSpans[call] = true
+					}
 					if provenContext && (plainFunction || provenOp) && t.vocabulary != nil {
 						if text, literal := literalVocabularyValue(call.Arguments.Nodes[0]); literal {
 							t.vocabulary.add(vocabularySpanName, text, call, t.file.FileName())
