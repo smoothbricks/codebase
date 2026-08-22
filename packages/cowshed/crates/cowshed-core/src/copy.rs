@@ -800,6 +800,17 @@ mod tests {
         (root, source, destination)
     }
 
+    /// Create a FIFO without shelling out: `mkfifo(1)` is not at a fixed path on
+    /// every platform the tests run on, and NixOS has no `/usr/bin` at all.
+    fn make_fifo(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+        // SAFETY: the C string outlives the call.
+        let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(created, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+
     fn mode_of(path: &Path) -> u32 {
         fs::symlink_metadata(path).expect("stat").mode() & 0o7777
     }
@@ -960,22 +971,22 @@ mod tests {
         let (root, source, destination) = copy_roots("runtime-artifacts");
         fs::create_dir(source.join("run")).expect("create run directory");
         fs::write(source.join("run/kept"), b"content\n").expect("write regular file");
-        // Bound under a short path and moved into place: the fixture root is
-        // already long enough that `bind` would hit `sun_path`'s 104 bytes —
-        // which is the same limit that made copying such a socket impossible.
-        let staged_socket = PathBuf::from(format!("/tmp/cowshed-t-{}.sock", std::process::id()));
+        // `bind` is the one filesystem call with a hard path-length ceiling:
+        // `sun_path` is 104 bytes, and a fixture root under the temp directory
+        // already spends most of them — the same ceiling that made copying a
+        // socket into the staging mount impossible. So bind under a short
+        // sibling of the fixture, which shares its filesystem, and rename in.
+        // A rename from a fixed `/tmp` would cross devices wherever `TMPDIR`
+        // points somewhere else.
+        let staging = std::env::temp_dir().join(format!("cs{}", std::process::id()));
+        fs::create_dir_all(&staging).expect("create socket staging directory");
+        let staged_socket = staging.join("s");
         let _ = fs::remove_file(&staged_socket);
         let listener = UnixListener::bind(&staged_socket).expect("bind fixture socket");
         let socket = source.join("run/daemon.sock");
         fs::rename(&staged_socket, &socket).expect("move socket into the fixture");
-        let fifo = source.join("run/pipe");
-        assert!(
-            std::process::Command::new("/usr/bin/mkfifo")
-                .arg(&fifo)
-                .status()
-                .expect("mkfifo")
-                .success()
-        );
+        fs::remove_dir_all(&staging).expect("remove socket staging directory");
+        make_fifo(&source.join("run/pipe"));
 
         let report = run(&source, &destination, 6);
 
