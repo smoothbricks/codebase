@@ -57,6 +57,8 @@ impl AuditSink for DiscardAudit {
     }
 }
 
+/// Deliberately `/tmp` rather than `TMPDIR`: this root holds `gateway.sock`, and a bind path is
+/// capped at `sun_path`'s 104 bytes — a per-user TMPDIR alone spends half of that on macOS.
 fn fixture_root() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let root = PathBuf::from(format!("/tmp/csctl-{}", &id[..8]));
