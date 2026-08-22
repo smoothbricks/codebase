@@ -15,7 +15,7 @@
 // running invariant is the transformed output the tests assert"): all plain
 // tag calls emit first in execution order, then .with() calls unrolled, each
 // via the same boolean/enum/direct write shapes.
-package main
+package lmao
 
 import (
 	"sort"

@@ -1,4 +1,4 @@
-package main
+package lmao
 
 import (
 	"bytes"
@@ -82,13 +82,13 @@ func TestVocabularyRegistrationEmitsExactSection6FragmentAndOrdinalOperands(t *t
 	}
 
 	emitContext := shimprinter.NewEmitContext()
-	binding, registration := vocabularyRegistrationStatements(emitContext, entries)
+	sourceFile := loadRegistrationTestSource(t, "export const untouched = 1;\n")
+	binding, registration := vocabularyRegistrationStatements(sourceFile, entries)
 	if binding == nil || len(registration) != 4 {
 		t.Fatalf("registration returned binding %v and %d statements, want a binding and import/callback/guard/call", binding, len(registration))
 	}
 	ordinals := vocabularyOrdinals(entries)
 	transformer := fileTransformer{vocabularyBinding: binding, vocabularyOrdinals: ordinals}
-	sourceFile := loadRegistrationTestSource(t, "export const untouched = 1;\n")
 	original := append([]*shimast.Node(nil), sourceFile.Statements.Nodes...)
 	original = append(original,
 		constDecl(ident("logLocalID"), transformer.staticVocabularyOperand(globalVocabularyID(entries[0].ID))),
@@ -141,11 +141,11 @@ func TestVocabularyRegistrationEmitsExactSection6FragmentAndOrdinalOperands(t *t
 
 func TestVocabularyRegistrationEmptyFragmentEmitsNothing(t *testing.T) {
 	emitContext := shimprinter.NewEmitContext()
-	binding, statements := vocabularyRegistrationStatements(emitContext, nil)
+	sourceFile := loadRegistrationTestSource(t, `"use strict"; export const value = 1;`)
+	binding, statements := vocabularyRegistrationStatements(sourceFile, nil)
 	if binding != nil || statements != nil {
 		t.Fatalf("empty fragment returned binding %v and statements %#v, want neither", binding, statements)
 	}
-	sourceFile := loadRegistrationTestSource(t, `"use strict"; export const value = 1;`)
 	before := emitRegistrationTestSource(sourceFile, emitContext)
 	prependVocabularyRegistration(sourceFile, statements)
 	after := emitRegistrationTestSource(sourceFile, emitContext)
@@ -157,11 +157,11 @@ func TestVocabularyRegistrationEmptyFragmentEmitsNothing(t *testing.T) {
 func TestPrependVocabularyRegistrationPreservesDirectivesAndImportPosition(t *testing.T) {
 	entry := vocabularyCatalogEntry{ID: 7, Kind: vocabularySpanName, Text: "work", Fields: []vocabularyField{}}
 	emitContext := shimprinter.NewEmitContext()
-	_, registration := vocabularyRegistrationStatements(emitContext, []vocabularyCatalogEntry{entry})
 	sourceFile := loadRegistrationTestSource(t, `"use client";
 import { dependency } from "./dependency";
 const body = dependency;
 `)
+	_, registration := vocabularyRegistrationStatements(sourceFile, []vocabularyCatalogEntry{entry})
 	prependVocabularyRegistration(sourceFile, registration)
 	shimast.SetParentInChildrenUnset(sourceFile.AsNode())
 	output := emitRegistrationTestSource(sourceFile, emitContext)
@@ -186,8 +186,8 @@ const body = dependency;
 func TestVocabularyRegistrationBindingAvoidsPreferredSourceName(t *testing.T) {
 	entry := vocabularyCatalogEntry{ID: 9, Kind: vocabularyLogTemplate, Text: "collision", Fields: []vocabularyField{}}
 	emitContext := shimprinter.NewEmitContext()
-	binding, registration := vocabularyRegistrationStatements(emitContext, []vocabularyCatalogEntry{entry})
 	sourceFile := loadRegistrationTestSource(t, "const $$lmaoVocabulary = 7;\n")
+	binding, registration := vocabularyRegistrationStatements(sourceFile, []vocabularyCatalogEntry{entry})
 	statements := append([]*shimast.Node(nil), sourceFile.Statements.Nodes...)
 	statements = append(statements, constDecl(ident("localID"), (&fileTransformer{
 		vocabularyBinding:  binding,

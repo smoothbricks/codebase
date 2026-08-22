@@ -5,17 +5,18 @@ is available. The optimizations below describe emitted code and runtime contract
 speedup.
 
 > **Implementation status (system state).** The sole compiler implementation is the native ttsc/tsgo plugin in
-> `packages/lmao-ttsc/plugin/`. Bun build and runtime hosts load that plugin through the package's `@ttsc/unplugin`
-> adapters; there is no parallel TypeScript compiler-API transformer. Promise-preserving fixed-arity span lowering,
-> packed runtime hints, private `u16` log-template storage, and the line, metadata, tag, log, and result transformations
-> are implemented in the native plugin and covered by its Go suite plus Bun integration. Destructured-context rewriting
-> (§3) is **not** implemented: a callback whose first parameter is destructured keeps the public dispatcher path
-> (`packages/lmao-ttsc/plugin/main.go:10-13`). `spanAutoN` exists as an internal, explicit runtime seam, but automatic
-> `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return would change the
-> public Promise API's observable microtask scheduling. The running invariant is **the transformed output the tests
-> assert**, not earlier design sketches. The global vocabulary ABI in §6.2 is the clean-cutover target, not shipped
-> behavior. The shipped Op-local IDs remain lexical `u16` values, not stable IDs or `VocabularyBinding` indices. No
-> performance improvement is claimed for either representation without its phase-specific benchmark gate.
+> `packages/lmao-ttsc/plugin/driver/`. Bun build and runtime hosts load that plugin through the package's
+> `@ttsc/unplugin` adapters; there is no parallel TypeScript compiler-API transformer. Promise-preserving fixed-arity
+> span lowering, packed runtime hints, private `u16` log-template storage, and the line, metadata, tag, log, and result
+> transformations are implemented in the native plugin and covered by its Go suite plus Bun integration.
+> Destructured-context rewriting (§3) is **not** implemented: a callback whose first parameter is destructured keeps the
+> public dispatcher path (`packages/lmao-ttsc/plugin/driver/lmao.go:21-24`). `spanAutoN` exists as an internal, explicit
+> runtime seam, but automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a
+> synchronous return would change the public Promise API's observable microtask scheduling. The running invariant is
+> **the transformed output the tests assert**, not earlier design sketches. The global vocabulary ABI in §6.2 is the
+> clean-cutover target, not shipped behavior. The shipped Op-local IDs remain lexical `u16` values, not stable IDs or
+> `VocabularyBinding` indices. No performance improvement is claimed for either representation without its
+> phase-specific benchmark gate.
 
 ## Bun integration
 
@@ -53,17 +54,19 @@ the transform as Go source inside the npm package; the consumer's ttsc builds it
   `"ttsc": { "plugin": { "transform": "@smoothbricks/lmao-ttsc/ttsc-plugin" } }`
   (`packages/lmao-ttsc/package.json:30-34`).
 - **Descriptor**: `plugin.cjs` is a CJS factory returning
-  `{ name, source: path.resolve(context.dirname, 'plugin'), stage: 'transform' }`
-  (`packages/lmao-ttsc/plugin.cjs:13-18`).
-- **Source and build**: `plugin/` holds the Go transform. The consumer's ttsc compiles it from source, cache-keyed by
+  `{ name, source: path.resolve(context.dirname, 'plugin', 'driver'), stage: 'transform' }`
+  (`packages/lmao-ttsc/plugin.cjs:17-22`). The `source` names the library package, which is what makes ttsc link the
+  transform into a shared compiler host rather than spawn a second executable transform host.
+- **Source and build**: `plugin/driver/` holds the Go transform and `plugin/host/` the standalone sidecar; `plugin/` is
+  the Go module root. The consumer's ttsc compiles the library from source, cache-keyed by
   ttsc/tsgo/platform/Go-toolchain/source hash; the `go.work` it builds against is generated
   (`packages/lmao-ttsc/scripts/gen-go-work.mjs`).
 - **Checker access**: the plugin reads resolved types through the typescript-go shims — `GetTypeAtLocation` and
-  `GetResolvedSignature` provenance checks (`packages/lmao-ttsc/plugin/optimization.go:814-843`) — so every proof below
-  is a checker proof, not a syntactic heuristic.
+  `GetResolvedSignature` provenance checks (`packages/lmao-ttsc/plugin/driver/optimization.go:814-843`) — so every proof
+  below is a checker proof, not a syntactic heuristic.
 - **Conformance**: the output-asserting suite is ordinary `go test` beside the source
-  (`packages/lmao-ttsc/plugin/template_test.go`, `plugin/tag_capability_test.go`, …). The running invariant is the
-  transformed output those tests assert.
+  (`packages/lmao-ttsc/plugin/driver/template_test.go`, `driver/tag_capability_test.go`, …). The running invariant is
+  the transformed output those tests assert.
 
 ### Library Package plus Thin Main <a id="smoo/lmao!n/transformer-library-main"></a>
 
@@ -74,9 +77,20 @@ toolchain optimization suite) is a hard packaging requirement. The library form 
 `@ttsc/banner` ships (`banner/driver/banner.go` + `banner/plugin/main.go`). Emitted output and the `go test` suite are
 unchanged by the split; only the registration seam differs.
 
-> **Implementation status.** The shipped tree is still one `package main` executable
-> (`packages/lmao-ttsc/plugin/optimization.go:1`, `plugin/main.go:25`); the library/thin-main split is a requirement of
-> this spec, not shipped behavior.
+`plugin/driver` is `package lmao`; its `init()` registers a `driver.ProgramPlugin`
+(`packages/lmao-ttsc/plugin/driver/lmao.go:55-85`). `ProgramPlugin` and not `EmitTransformPlugin`: the source-to-source
+lane that `@ttsc/unplugin` drives (`utility.RunTransform`) applies linked `ProgramPlugin` hooks and then prints the
+parse tree, and never assembles the emit-phase transform chain, so rewriting in `ApplyProgram` is the only hook every
+lane honours. Every synthesized binding therefore resolves to a plain identifier before the tree leaves the plugin
+(`generatedBindingName`, `plugin/driver/vocabulary_registration.go:84-107`): the host that prints the tree owns a
+different `EmitContext` than the plugin can register auto-generate info in, and an unresolved generated name would print
+as its raw base text and shadow a user binding. `plugin/host` is the standalone sidecar — it imports the library for the
+registration and dispatches `build`/`transform`/`check` to `utility.Run*`, the same host the linked build runs inside,
+so both lanes emit the same bytes.
+
+The tsconfig plugin entry accepts no plugin-specific keys. `validateEntryConfig` rejects any key beyond ttsc's
+`transform`/`enabled` transport keys with `LMAO1010`, naming the lowest-sorting offender so the diagnostic does not
+depend on Go's randomized map iteration (`packages/lmao-ttsc/plugin/driver/lmao.go:91-105`).
 
 ## Design Philosophy <a id="smoo/lmao!n/transformer-philosophy"></a>
 
@@ -119,12 +133,12 @@ never stored as a property on the context.
 
 ### 2. Monomorphic span() Rewriting <a id="smoo/lmao!n/transformer-span-rewrite"></a>
 
-The span rewrite (`trySpanRewrite`, `packages/lmao-ttsc/plugin/main.go:513-550`) conservatively lowers supported calls
-to the Promise-based `span0`–`span8` ABI. It requires at most eight trailing arguments, a stable receiver (`identifier`
-or `this`) whose checker type is a proven LMAO context, and a checker-proved `Op` represented by a stable identifier
-with LMAO declaration provenance (`plugin/optimization.go:886-896`). The Op's callsite plan and function are each read
-exactly once. An inline arrow or function expression is **not** lowered — it stays on the public variadic `span()`
-dispatcher (`plugin/main.go:525-527`).
+The span rewrite (`trySpanRewrite`, `packages/lmao-ttsc/plugin/driver/lmao.go:385-422`) conservatively lowers supported
+calls to the Promise-based `span0`–`span8` ABI. It requires at most eight trailing arguments, a stable receiver
+(`identifier` or `this`) whose checker type is a proven LMAO context, and a checker-proved `Op` represented by a stable
+identifier with LMAO declaration provenance (`plugin/driver/optimization.go:886-896`). The Op's callsite plan and
+function are each read exactly once. An inline arrow or function expression is **not** lowered — it stays on the public
+variadic `span()` dispatcher (`plugin/driver/lmao.go:397-399`).
 
 ```typescript
 // User writes:
@@ -142,9 +156,10 @@ await ctx.span1(
 ```
 
 A proven call with a literal span name may lower its name operand to the registered vocabulary index instead of the
-string literal (`plugin/main.go:533-535`). The child context is exactly `callsitePlan.newCtx0(receiver)` — the plan's
-prototype-inheriting child constructor (`packages/lmao/src/lib/spanContext.ts:1123-1126`) — not a copied or merged
-object. Because `spanN` remains Promise-based, the lowered call preserves the public `span()` scheduling contract.
+string literal (`plugin/driver/lmao.go:405-407`). The child context is exactly `callsitePlan.newCtx0(receiver)` — the
+plan's prototype-inheriting child constructor (`packages/lmao/src/lib/spanContext.ts:1123-1126`) — not a copied or
+merged object. Because `spanN` remains Promise-based, the lowered call preserves the public `span()` scheduling
+contract.
 
 #### Evaluation and safety bailouts
 
@@ -216,12 +231,13 @@ and `_logBinding` are always rebound to the child span.
 
 ### 3. Destructured Context Rewriting <a id="smoo/lmao!n/transformer-destructured-context"></a>
 
-**Status: not implemented.** No shipped transformer performs this rewrite (`packages/lmao-ttsc/plugin/main.go:10-13`); a
-destructured callback keeps the public dispatcher. The contract below is the normative target for the native plugin. For
-arrow/function literals passed to `op`, `defineOp`, `defineOps`, or `task`, a destructured first parameter containing
-`span` may be replaced with `__ctx`. Other destructured properties are rebound as the first body statement, preserving
-aliases, defaults, and nested bindings. Every bare `span(...)` call must support the same Promise-preserving §2
-lowering; otherwise the whole function is left unchanged.
+**Status: not implemented.** No shipped transformer performs this rewrite
+(`packages/lmao-ttsc/plugin/driver/lmao.go:21-24`); a destructured callback keeps the public dispatcher. The contract
+below is the normative target for the native plugin. For arrow/function literals passed to `op`, `defineOp`,
+`defineOps`, or `task`, a destructured first parameter containing `span` may be replaced with `__ctx`. Other
+destructured properties are rebound as the first body statement, preserving aliases, defaults, and nested bindings.
+Every bare `span(...)` call must support the same Promise-preserving §2 lowering; otherwise the whole function is left
+unchanged.
 
 ```typescript
 // User writes:
@@ -250,10 +266,10 @@ a block with an explicit `return`.
 
 ### 4. `with()` Bulk Setter Unrolling <a id="smoo/lmao!n/transformer-tag-chain-inline"></a>
 
-The `ctx.tag` chain inliner (`packages/lmao-ttsc/plugin/taginline.go`) transforms tag setter chains — including the
-`with()` bulk setter — into **direct columnar buffer writes** (not chained setter calls). It only fires in **statement
-context** (an `ExpressionStatement` whose expression is a `ctx.tag…` chain); a tag chain assigned to a variable is left
-alone.
+The `ctx.tag` chain inliner (`packages/lmao-ttsc/plugin/driver/taginline.go`) transforms tag setter chains — including
+the `with()` bulk setter — into **direct columnar buffer writes** (not chained setter calls). It only fires in
+**statement context** (an `ExpressionStatement` whose expression is a `ctx.tag…` chain); a tag chain assigned to a
+variable is left alone.
 
 ```typescript
 // User writes:
@@ -281,9 +297,9 @@ their sorted-order index via a switch IIFE; non-literal arguments are wrapped in
 
 ### 5. Metadata Injection <a id="smoo/lmao!n/transformer-metadata-inject"></a>
 
-Injects module metadata from build context. `tryDefineModuleMetadata` (`packages/lmao-ttsc/plugin/main.go:435-471`)
-rewrites `defineModule({...})` by prepending a `metadata` property to its first object-literal argument, and is a no-op
-when a `metadata` property already exists:
+Injects module metadata from build context. `tryDefineModuleMetadata`
+(`packages/lmao-ttsc/plugin/driver/lmao.go:304-343`) rewrites `defineModule({...})` by prepending a `metadata` property
+to its first object-literal argument, and is a no-op when a `metadata` property already exists:
 
 ```typescript
 // User writes:
@@ -306,7 +322,7 @@ const myModule = defineModule({
 });
 ```
 
-**Metadata sources** (`nearestPackage` + `gitLastCommit`, `plugin/main.go:473-509`):
+**Metadata sources** (`nearestPackage` + `gitLastCommit`, `plugin/driver/lmao.go:345-381`):
 
 - `package_name`: `name` from the nearest `package.json` (walking up); `'unknown'` if none.
 - `package_file`: path of the source file relative to that package dir (basename fallback).

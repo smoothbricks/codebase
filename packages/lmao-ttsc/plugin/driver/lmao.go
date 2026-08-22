@@ -1,34 +1,37 @@
-// ttsc transform plugin for LMAO — Go port of spec 01o (smoo/lmao!n/transformer).
+// Package lmao is the ttsc transform plugin for LMAO — the Go implementation of
+// spec 01o (smoo/lmao!n/transformer).
 //
-// Implements the structural (TypeChecker-free) transformations:
+// The package is a library, not a command: init() registers the transform with
+// driver.RegisterPlugin so ttsc can link it into a compiler host alongside
+// sibling transform plugins. Two independent executable transform hosts cannot
+// share one emit pass, so an executable of its own would make single-pass
+// composition impossible. `../host` is the standalone sidecar that drives the
+// same registration through ttsc's utility host.
 //
-//	§1/§2  span() line injection + monomorphic spanN rewrite (heuristic Op detection)
+// Implemented transformations:
+//
+//	§1/§2  span() line injection + monomorphic spanN rewrite (checker-proved Op detection)
+//	§4     tag-chain inlining with schema specialization (enum indices,
+//	       eager/lazy null-bitmap elision)
 //	§5     defineModule() metadata injection (git_sha, package_name, package_file)
-//	§6     .line(N) injection on log/ok/err chains
+//	§6     .line(N) injection on log/ok/err chains, literal messages encoded as
+//	       vocabulary IDs
 //	§7     task('name', fn) line injection
 //
-// NOT yet ported (staged, requires the tsgo Checker via driver shims):
+// NOT yet ported:
 //
 //	§3     destructured-context rewriting (shipped in the TS transformer;
 //	       needs identifier-binding analysis parity before porting)
-//	§4     tag-chain inlining with schema specialization (enum indices,
-//	       eager/lazy null-bitmap elision). The checker-free fallback of §4
-//	       is deliberately NOT ported either: emitting direct buffer writes
-//	       without the schema risks divergence from the TS inliner's output;
-//	       run the classic transformer for tag inlining until the Checker
-//	       port lands.
 //
-// Column-name contract (spec 01e): any future §4 port must write
+// Column-name contract (spec 01e): emitted hot-path writes always use
 // library-local (unprefixed) column names; prefix/mapColumns remapping is
 // cold-path-only via RemappedBufferView and must never appear in emitted
 // hot-path writes.
-package main
+package lmao
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,109 +45,66 @@ import (
 	"github.com/samchon/ttsc/packages/ttsc/driver"
 )
 
-const pluginName = "@smoothbricks/lmao-ttsc"
-const pluginVersion = "0.1.6"
+// PluginName is the manifest name ttsc addresses this plugin by; it is also the
+// prefix of every diagnostic the transform reports.
+const PluginName = "@smoothbricks/lmao-ttsc"
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "%s: command required\n", pluginName)
-		os.Exit(2)
+// PluginVersion is reported by the standalone sidecar's `version` command.
+const PluginVersion = "0.1.6"
+
+func init() {
+	driver.RegisterPlugin(plugin{})
+}
+
+// plugin implements driver.ProgramPlugin for @smoothbricks/lmao-ttsc.
+//
+// ProgramPlugin and not EmitTransformPlugin: the source-to-source lane that
+// @ttsc/unplugin drives (utility.RunTransform) applies linked ProgramPlugins
+// and then prints the parse tree, and never assembles the emit-phase transform
+// chain. Rewriting the tree in ApplyProgram is the only hook every lane
+// honours — the text lane, EmitAllRaw, and EmitWithPluginTransformers alike.
+type plugin struct{}
+
+// ApplyProgram rewrites every non-declaration source file of the program in
+// place, after the whole-program vocabulary catalog has been resolved.
+func (plugin) ApplyProgram(prog *driver.Program, ctx driver.PluginContext) error {
+	if err := validateEntryConfig(ctx.Entry.Config); err != nil {
+		return err
 	}
-	switch os.Args[1] {
-	case "version", "-v", "--version":
-		fmt.Printf("%s %s\n", pluginName, pluginVersion)
-	case "check":
-		os.Exit(runCheck(os.Args[2:]))
-	case "transform":
-		os.Exit(runTransform(os.Args[2:]))
-	case "build":
-		os.Exit(runBuild(os.Args[2:]))
-	default:
-		fmt.Fprintf(os.Stderr, "%s: unknown command %q\n", pluginName, os.Args[1])
-		os.Exit(2)
+	transform, err := lmaoPluginTransform(prog, compilerOptions{cwd: ctx.Cwd, tsconfig: ctx.Tsconfig})
+	if err != nil {
+		return err
 	}
+	for _, file := range prog.SourceFiles() {
+		// The emit context is unused: every synthesized binding resolves to a
+		// plain identifier (generatedBindingName) precisely so the rewrite
+		// survives printing by a host that owns a different context.
+		transform(nil, file)
+	}
+	return nil
+}
+
+// validateEntryConfig rejects any tsconfig plugin-entry key the transform does
+// not own. "transform" and "enabled" are the transport keys ttsc puts on every
+// entry. The lowest-sorting offender is named so the diagnostic is stable
+// across Go's randomized map iteration.
+func validateEntryConfig(config map[string]any) error {
+	unsupported := ""
+	for option := range config {
+		if option == "transform" || option == "enabled" {
+			continue
+		}
+		if unsupported == "" || option < unsupported {
+			unsupported = option
+		}
+	}
+	if unsupported != "" {
+		return fmt.Errorf("LMAO1010 %s unsupported configuration option %q", PluginName, unsupported)
+	}
+	return nil
 }
 
 type compilerOptions struct{ cwd, tsconfig string }
-type nativePluginConfigEntry struct {
-	Config map[string]json.RawMessage `json:"config"`
-	Name   string                     `json:"name"`
-	Stage  string                     `json:"stage"`
-}
-
-func readOptions(args []string) (compilerOptions, error) {
-	options := compilerOptions{tsconfig: "tsconfig.json"}
-	var pluginsJSON string
-	for _, argument := range args {
-		switch {
-		case strings.HasPrefix(argument, "--cwd="):
-			options.cwd = strings.TrimPrefix(argument, "--cwd=")
-		case strings.HasPrefix(argument, "--tsconfig="):
-			options.tsconfig = strings.TrimPrefix(argument, "--tsconfig=")
-		case strings.HasPrefix(argument, "--plugins-json="):
-			pluginsJSON = strings.TrimPrefix(argument, "--plugins-json=")
-		default:
-			return compilerOptions{}, fmt.Errorf("unknown argument %q", argument)
-		}
-	}
-	if strings.TrimSpace(pluginsJSON) != "" {
-		decoder := json.NewDecoder(strings.NewReader(pluginsJSON))
-		decoder.DisallowUnknownFields()
-		var entries []nativePluginConfigEntry
-		if err := decoder.Decode(&entries); err != nil {
-			return compilerOptions{}, fmt.Errorf("LMAO1010 malformed --plugins-json: %w", err)
-		}
-		var trailing any
-		if err := decoder.Decode(&trailing); err == nil {
-			return compilerOptions{}, fmt.Errorf("LMAO1010 malformed --plugins-json: trailing JSON value")
-		} else if !errors.Is(err, io.EOF) {
-			return compilerOptions{}, fmt.Errorf("LMAO1010 malformed --plugins-json: %w", err)
-		}
-		matched := false
-		for _, entry := range entries {
-			if entry.Name != pluginName {
-				continue
-			}
-			if matched {
-				return compilerOptions{}, fmt.Errorf("LMAO1010 --plugins-json contains multiple %s entries", pluginName)
-			}
-			matched = true
-			unsupported := ""
-			for option := range entry.Config {
-				if option == "transform" || option == "enabled" {
-					continue
-				}
-				if unsupported == "" || option < unsupported {
-					unsupported = option
-				}
-			}
-			if unsupported != "" {
-				return compilerOptions{}, fmt.Errorf("LMAO1010 %s unsupported configuration option %q", pluginName, unsupported)
-			}
-		}
-	}
-	if options.cwd == "" {
-		options.cwd, _ = os.Getwd()
-	}
-	options.cwd, _ = filepath.Abs(options.cwd)
-	if !filepath.IsAbs(options.tsconfig) {
-		options.tsconfig = filepath.Join(options.cwd, options.tsconfig)
-	}
-	options.tsconfig = filepath.Clean(options.tsconfig)
-	return options, nil
-}
-
-type transformResult struct {
-	TypeScript map[string]string `json:"typescript"`
-}
-
-func outputKey(cwd, fileName string) string {
-	rel, err := filepath.Rel(cwd, fileName)
-	if err != nil {
-		return fileName
-	}
-	return filepath.ToSlash(rel)
-}
 
 type collectedFile struct {
 	transformer         *fileTransformer
@@ -194,7 +154,7 @@ func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.
 	if err != nil {
 		return nil, err
 	}
-	return func(ec *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
+	return func(_ *shimprinter.EmitContext, sf *shimast.SourceFile) *shimast.SourceFile {
 		if sf == nil || sf.IsDeclarationFile {
 			return sf
 		}
@@ -203,7 +163,7 @@ func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.
 			panic("source file missing from finalized LMAO compilation")
 		}
 		t := collected.transformer
-		binding, registration := vocabularyRegistrationStatements(ec, collected.registrationEntries)
+		binding, registration := vocabularyRegistrationStatements(sf, collected.registrationEntries)
 		t.vocabularyBinding = binding
 		t.applyHintRewrites(collected.hintRewrites)
 		if t.spanBufferAotUsed {
@@ -217,97 +177,6 @@ func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.
 		shimast.SetParentInChildrenUnset(sf.AsNode())
 		return sf
 	}, nil
-}
-
-func loadCompilerProgram(options compilerOptions) (*driver.Program, error) {
-	prog, _, err := driver.LoadProgram(options.cwd, options.tsconfig, driver.LoadProgramOptions{})
-	return prog, err
-}
-func runCheck(args []string) int {
-	options, err := readOptions(args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	prog, err := loadCompilerProgram(options)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	defer prog.Close()
-	if _, err = collectProgramCompilation(prog, options); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	return 0
-}
-func runTransform(args []string) int {
-	options, err := readOptions(args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	prog, err := loadCompilerProgram(options)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	defer prog.Close()
-	transform, err := lmaoPluginTransform(prog, options)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	out := transformResult{TypeScript: map[string]string{}}
-	for _, file := range prog.SourceFiles() {
-		if file == nil || file.IsDeclarationFile {
-			continue
-		}
-		ec := shimprinter.NewEmitContext()
-		result := file
-		if next := transform(ec, result); next != nil {
-			result = next
-		}
-		printer := shimprinter.NewPrinter(shimprinter.PrinterOptions{}, shimprinter.PrintHandlers{}, ec)
-		out.TypeScript[outputKey(options.cwd, file.FileName())] = shimprinter.EmitSourceFile(printer, result)
-	}
-	data, err := json.Marshal(out)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: marshal failed: %v\n", pluginName, err)
-		return 3
-	}
-	fmt.Println(string(data))
-	return 0
-}
-func runBuild(args []string) int {
-	options, err := readOptions(args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	prog, err := loadCompilerProgram(options)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	defer prog.Close()
-	transform, err := lmaoPluginTransform(prog, options)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", pluginName, err)
-		return 2
-	}
-	emitDiags, err := prog.EmitWithPluginTransformers([]driver.PluginTransform{transform}, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: emit failed: %v\n", pluginName, err)
-		return 3
-	}
-	if len(emitDiags) > 0 {
-		for _, d := range emitDiags {
-			fmt.Fprintln(os.Stderr, d.String())
-		}
-		return 2
-	}
-	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -443,9 +312,12 @@ func (t *fileTransformer) tryDefineModuleMetadata(call *shimast.CallExpression) 
 	}
 	obj := arg.AsObjectLiteralExpression()
 	if t.seenDefineModule {
-		fmt.Fprintf(os.Stderr, "%s: invariant violation: %s contains multiple defineModule() declarations\n",
-			pluginName, t.file.FileName())
-		os.Exit(2)
+		// Panic, not os.Exit: this package is linked into a compiler host it
+		// shares with sibling transform plugins, and an exit would kill that
+		// host — and every sibling's emit — without a word on any channel the
+		// host can report through.
+		panic(fmt.Sprintf("%s: invariant violation: %s contains multiple defineModule() declarations",
+			PluginName, t.file.FileName()))
 	}
 	t.seenDefineModule = true
 	for _, prop := range obj.Properties.Nodes {

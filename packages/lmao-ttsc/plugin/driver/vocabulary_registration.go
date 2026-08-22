@@ -1,8 +1,9 @@
-package main
+package lmao
 
 import (
+	"strconv"
+
 	shimast "github.com/microsoft/typescript-go/shim/ast"
-	shimprinter "github.com/microsoft/typescript-go/shim/printer"
 )
 
 const vocabularyRegistrationSpecifier = "@smoothbricks/lmao/vocabulary/register/v1"
@@ -80,12 +81,37 @@ func vocabularyFragmentNode(entries []vocabularyCatalogEntry) *shimast.Node {
 	return factory.NewObjectLiteralExpression(factory.NewNodeList(properties), true)
 }
 
-func vocabularyRegistrationStatements(ec *shimprinter.EmitContext, entries []vocabularyCatalogEntry) (*shimast.Node, []*shimast.Node) {
+// generatedBindingName reproduces the non-optimistic unique-name generator the
+// tsgo printer applies to EmitContext.NewUniqueName identifiers
+// (NameGenerator.makeUniqueName): the base always gains a `_<n>` suffix, and n
+// is the first index neither the source file nor an earlier call already binds.
+//
+// The name is resolved here, into a plain identifier, rather than deferred to
+// the printer: the compiler host that prints this tree owns a different
+// EmitContext than any this transform could register auto-generate info in, and
+// an unresolved generated identifier falls back to printing its raw base text —
+// silently shadowing a user binding of the same name.
+func generatedBindingName(sf *shimast.SourceFile, base string, taken map[string]bool) string {
+	for index := 1; ; index++ {
+		candidate := base + "_" + strconv.Itoa(index)
+		if taken[candidate] {
+			continue
+		}
+		if _, declared := sf.Identifiers[candidate]; declared {
+			continue
+		}
+		taken[candidate] = true
+		return candidate
+	}
+}
+
+func vocabularyRegistrationStatements(sf *shimast.SourceFile, entries []vocabularyCatalogEntry) (*shimast.Node, []*shimast.Node) {
 	if len(entries) == 0 {
 		return nil, nil
 	}
-	binding := ec.Factory.NewUniqueName("$$lmaoVocabulary").AsNode()
-	register := ec.Factory.NewUniqueName("$$registerLmaoVocabulary").AsNode()
+	taken := map[string]bool{}
+	binding := ident(generatedBindingName(sf, "$$lmaoVocabulary", taken))
+	register := ident(generatedBindingName(sf, "$$registerLmaoVocabulary", taken))
 	symbol := callExpr(propAccess(ident("Symbol"), "for"), []*shimast.Node{str(vocabularyRegistrationSpecifier)})
 	callback := factory.NewElementAccessExpression(ident("globalThis"), nil, symbol, shimast.NodeFlagsNone)
 	importDeclaration := factory.NewImportDeclaration(nil, nil, str(vocabularyRegistrationSpecifier), nil)
