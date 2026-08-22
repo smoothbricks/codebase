@@ -350,7 +350,12 @@ fn authority() -> WorkspaceAuthoritySnapshot {
 }
 
 fn config() -> WorkspaceSupervisorConfig {
-    let workspace_root = PathBuf::from("/tmp/cowshed-supervisor-test-workspace");
+    // Under TMPDIR and process-unique: a fixed shared path races concurrent test binaries and,
+    // on a shared runner, inherits a directory another user owns and this process cannot write.
+    let workspace_root = std::env::temp_dir().join(format!(
+        "cowshed-supervisor-test-workspace-{}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
     WorkspaceSupervisorConfig {
         authority: authority(),
