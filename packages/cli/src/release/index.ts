@@ -13,7 +13,6 @@ import { withDevenvEnv } from '../lib/devenv.js';
 import {
   type NxJson,
   type NxProjectJson,
-  type NxTargetConfig,
   type PackageJson,
   parseNxJsonText,
   parseNxProjectJsonText,
@@ -29,6 +28,7 @@ import {
   NPM_BOOTSTRAP_DIST_TAG,
   NPM_BOOTSTRAP_VERSION,
 } from './bootstrap-npm-packages.js';
+import { resolveBuildInputPatterns } from './build-inputs.js';
 import { autoReleaseCandidatePackages } from './candidates.js';
 import {
   type ReleaseTagRecord as CoreReleaseTagRecord,
@@ -1331,73 +1331,6 @@ function readNxJson(path: string): NxJson {
   } catch {
     return {};
   }
-}
-
-function resolveBuildInputPatterns(project: NxProjectJson, nxJson: NxJson): string[] {
-  const targets = project.targets;
-  if (!targets) {
-    return [];
-  }
-  return normalizeInputPatterns(collectBuildInputs(targets), nxJson);
-}
-
-function collectBuildInputs(targets: Record<string, NxTargetConfig>): string[] {
-  const build = targets.build;
-  if (!build) {
-    return ['production'];
-  }
-  const directInputs = stringInputs(build.inputs);
-  if (directInputs.length > 0) {
-    return directInputs;
-  }
-  const inputs: string[] = [];
-  for (const dependency of build.dependsOn ?? []) {
-    if (typeof dependency !== 'string' || dependency.startsWith('^')) {
-      continue;
-    }
-    const targetName = dependency.includes(':') ? dependency.split(':')[1] : dependency;
-    if (!targetName) {
-      continue;
-    }
-    inputs.push(...stringInputs(targets[targetName]?.inputs));
-  }
-  return inputs.length > 0 ? inputs : ['production'];
-}
-
-function stringInputs(inputs: NxTargetConfig['inputs'] | undefined): string[] {
-  return Array.isArray(inputs) ? inputs.filter((entry): entry is string => typeof entry === 'string') : [];
-}
-
-function normalizeInputPatterns(inputs: string[], nxJson: NxJson): string[] {
-  const patterns: string[] = [];
-  const seen = new Set<string>();
-  for (const input of inputs) {
-    for (const pattern of expandInputPattern(input, nxJson, seen)) {
-      patterns.push(pattern);
-    }
-  }
-  return patterns;
-}
-
-function expandInputPattern(input: string, nxJson: NxJson, seen: Set<string>): string[] {
-  if (seen.has(input)) {
-    return [];
-  }
-  seen.add(input);
-  if (!input.includes('{')) {
-    const namedInput = nxJson.namedInputs?.[input];
-    if (Array.isArray(namedInput)) {
-      return namedInput.flatMap((entry) => (typeof entry === 'string' ? expandInputPattern(entry, nxJson, seen) : []));
-    }
-    return [];
-  }
-  const excluded = input.startsWith('!');
-  const rawInput = excluded ? input.slice(1) : input;
-  if (!rawInput.startsWith('{projectRoot}/')) {
-    return [];
-  }
-  const packageRelative = rawInput.slice('{projectRoot}/'.length);
-  return [`${excluded ? '!' : ''}${packageRelative}`];
 }
 
 async function packageHasHistory(root: string, packagePath: string): Promise<boolean> {
