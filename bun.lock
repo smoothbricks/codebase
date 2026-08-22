@@ -93,7 +93,7 @@
     },
     "packages/duration": {
       "name": "@smoothbricks/duration",
-      "version": "0.1.6",
+      "version": "0.1.7-next.0",
       "dependencies": {
         "@smoothbricks/time": "workspace:*",
         "tslib": "^2.8.1",
@@ -256,7 +256,7 @@
     },
     "packages/time": {
       "name": "@smoothbricks/time",
-      "version": "0.1.6",
+      "version": "0.1.7-next.0",
       "dependencies": {
         "tslib": "^2.8.1",
       },
