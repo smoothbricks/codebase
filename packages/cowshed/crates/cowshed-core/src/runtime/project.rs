@@ -5860,6 +5860,7 @@ fn require_git_success(operation: &str, output: &std::process::Output) -> Result
         } else if stderr.contains("would be overwritten by merge")
             || stderr.contains("would be overwritten by checkout")
             || stderr.contains("untracked working tree files would be overwritten")
+            || stderr.contains("cannot rebase: Your index contains uncommitted changes")
         {
             CowshedError::conflict(
                 message,
