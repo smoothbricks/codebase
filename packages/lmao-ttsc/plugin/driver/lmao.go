@@ -125,7 +125,7 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions) (*
 		if sf == nil || sf.IsDeclarationFile {
 			continue
 		}
-		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, physicalLogCalls: map[*shimast.CallExpression]callMessagePhysicalLayout{}, currentLogLocalIDs: map[*shimast.CallExpression]uint16{}, vocabulary: collector}
+		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, fnSpans: map[*shimast.CallExpression]bool{}, physicalLogCalls: map[*shimast.CallExpression]callMessagePhysicalLayout{}, currentLogLocalIDs: map[*shimast.CallExpression]uint16{}, vocabulary: collector}
 		t.collectOptimizations(sf.AsNode(), false)
 		compilation.files[sf] = &collectedFile{transformer: t}
 	}
@@ -232,7 +232,12 @@ type fileTransformer struct {
 	processed map[*shimast.CallExpression]bool
 	// opSpans is populated with Checker-proved, stable-expression Op calls in
 	// the untouched-tree collect phase. The mutation walk never queries types.
-	opSpans            map[*shimast.CallExpression]bool
+	opSpans map[*shimast.CallExpression]bool
+	// fnSpans is the same proof for an inline arrow/function-expression op
+	// position: the receiver is a proven LMAO context, so the closure inherits
+	// that receiver's callsite plan. A closure body is KNOWN at the call site,
+	// which is why it needs no Op provenance proof of its own.
+	fnSpans            map[*shimast.CallExpression]bool
 	staticLogIDs       map[*shimast.CallExpression]globalVocabularyID
 	staticSpanNameIDs  map[*shimast.CallExpression]globalVocabularyID
 	physicalLogCalls   map[*shimast.CallExpression]callMessagePhysicalLayout
@@ -395,7 +400,11 @@ func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 		return false
 	}
 	isPlainFunction := opOrFn.Kind == shimast.KindArrowFunction || opOrFn.Kind == shimast.KindFunctionExpression
-	if isPlainFunction || !t.opSpans[call] {
+	if isPlainFunction {
+		if !t.fnSpans[call] {
+			return false
+		}
+	} else if !t.opSpans[call] {
 		return false
 	}
 
@@ -405,14 +414,27 @@ func (t *fileTransformer) trySpanRewrite(call *shimast.CallExpression) bool {
 	if staticID := t.staticSpanNameIDs[call]; staticID != 0 {
 		nameOperand = t.staticVocabularyOperand(staticID)
 	}
-	callsitePlan := propAccess(opOrFn, "callsitePlan")
-	childCtx := callExpr(propAccess(callsitePlan, "newCtx0"), []*shimast.Node{recv})
+	// An Op carries its own frozen callsite plan and function; an inline closure
+	// has neither, so it inherits the RECEIVER's plan and is itself the
+	// function. That is exactly what the runtime dispatcher does for a closure
+	// target — resolveSpanTarget falls back to `self._physicalLayoutPlan`
+	// (packages/lmao/src/lib/spanContext.ts:163-185, 936-940) — so the lowered
+	// call and the variadic call construct the same child span. The plan node is
+	// shared between the newCtx0 receiver and the plan argument, matching the Op
+	// path: both positions print one pure property load.
+	plan := propAccess(opOrFn, "callsitePlan")
+	fnOperand := propAccess(opOrFn, "fn")
+	if isPlainFunction {
+		plan = propAccess(recv, "_physicalLayoutPlan")
+		fnOperand = opOrFn
+	}
+	childCtx := callExpr(propAccess(plan, "newCtx0"), []*shimast.Node{recv})
 	newArgs := []*shimast.Node{
 		num(line),
 		nameOperand,
 		childCtx,
-		callsitePlan,
-		propAccess(opOrFn, "fn"),
+		plan,
+		fnOperand,
 	}
 	newArgs = append(newArgs, rest...)
 
