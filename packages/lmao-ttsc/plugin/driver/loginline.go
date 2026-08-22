@@ -35,7 +35,7 @@
 // log-level call in the same chain, a chained method that is neither a
 // schema field nor line/with, non-single-arg links, non-object-literal
 // with(), or non-statement context.
-package main
+package lmao
 
 import (
 	"sort"

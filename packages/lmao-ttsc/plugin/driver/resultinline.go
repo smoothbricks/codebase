@@ -28,7 +28,7 @@
 // bails: receiver not Checker-proved LMAO context (TaskContext/SpanContext/
 // ModuleContext/RequestContext), chained method that is not line/message/
 // with/schema field, non-literal with(), non-single-arg links.
-package main
+package lmao
 
 import (
 	"strings"

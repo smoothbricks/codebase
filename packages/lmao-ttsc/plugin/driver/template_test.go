@@ -1,18 +1,19 @@
-package main
+package lmao
 
 import (
-	"sync"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	shimast "github.com/microsoft/typescript-go/shim/ast"
 	shimprinter "github.com/microsoft/typescript-go/shim/printer"
 	"github.com/samchon/ttsc/packages/ttsc/driver"
 )
+
 var tsgoTestMu sync.Mutex
 
 const templateFixtureDeclarations = `
