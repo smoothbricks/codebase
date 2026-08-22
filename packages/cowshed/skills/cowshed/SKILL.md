@@ -114,6 +114,16 @@ an in-progress merge, a busy mount — and deliberately cannot get past the land
 authorization for destroying unlanded commits; it bundles them into `sessions/.trash/<ws>-<tip>.bundle` first and prints
 what it destroyed.
 
+## Which project, and where main really is
+
+`cowshed --project /path/to/repo <cmd>` names the repository explicitly. Without it, cowshed infers the project from
+your current directory — which fails when you are outside any adopted checkout, so coordinators driving several
+repositories should always pass `--project`.
+
+A project's `main` workspace **is** the primary checkout — the directory you had before adopting. Editing it edits the
+shared tree everyone lands onto; landing a workspace fast-forwards that same directory. Treat `main` as shared state,
+never as your scratch space.
+
 ## Git semantics
 
 A workspace is **not** a worktree. Its `.git` is a full independent repository, not a gitdir file pointing at a shared
@@ -143,7 +153,15 @@ should receive the branch under a specific name for review instead of an immedia
 
 The division of labor is fixed: the WORKER runs `cowshed rebase` and resolves conflicts itself — it holds the
 implementation context — so `land`'s own rebase is a no-op on a well-handed-off branch. If `land` hits a rebase
-conflict, the coordinator does not resolve it: send the workspace back to its worker to rebase again.
+conflict, the coordinator does not resolve it: send the workspace back to its worker to rebase again. A coordinator
+rebasing on the worker's behalf is what produces the diverged-branch refusal in the first place.
+
+One failure is not a code problem: the sandbox admits only the workspace mount plus its explicit grants, so a check that
+reads a path outside the workspace — an out-of-tree dependency, another repository, `~/.cargo/config.toml` — dies with
+`…: Operation not permitted` even though the same command succeeds unsandboxed. When `cowshed exec` or `land --check`
+fails that way, cowshed says so (exit 5, quoting the child's denial); the fix is `cowshed grant <ws> --read <path>`, not
+editing the code. If a project cannot build inside its grants, say so in the worker brief instead of letting each agent
+rediscover it.
 
 ## Copy-on-write facts worth relying on
 
