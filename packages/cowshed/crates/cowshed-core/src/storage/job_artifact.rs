@@ -6,7 +6,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, ListArray, RecordBatch, StringArray, StructArray,
@@ -3149,7 +3149,14 @@ fn parse_state(value: &str) -> Result<JobState, ArtifactError> {
     }
 }
 
+/// The controller commitment schema is compared against every decoded segment during replay, so
+/// it is built once rather than allocating twenty-three fields per comparison.
 pub fn controller_commitment_schema() -> Arc<Schema> {
+    static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(build_controller_commitment_schema);
+    Arc::clone(&SCHEMA)
+}
+
+fn build_controller_commitment_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         field("commitment_kind", DataType::Utf8, false),
         field("commitment_version", DataType::UInt64, false),
@@ -3386,9 +3393,24 @@ pub fn controller_commitments_to_batch(
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
+/// Decode one controller commitment batch and validate it as a contiguous continuation of
+/// `prior`.
 pub fn controller_commitments_from_batch(
     batch: &RecordBatch,
     prior: &CommitmentPriorContext,
+) -> Result<Vec<ControllerCommitment>, ArtifactError> {
+    let values = decode_controller_commitments(batch)?;
+    validate_commitments(prior, &values)?;
+    Ok(values)
+}
+
+/// Decode one controller commitment batch, validating every row on its own.
+///
+/// Sequence validity (order contiguity, lineage, admission-before-terminal) is the caller's job:
+/// replay folds each decoded segment into the running context exactly once, so validating the
+/// row against a copy of that context here would make recovery quadratic in history length.
+pub fn decode_controller_commitments(
+    batch: &RecordBatch,
 ) -> Result<Vec<ControllerCommitment>, ArtifactError> {
     if batch.schema() != controller_commitment_schema() {
         return Err(ArtifactError::Arrow(
@@ -3511,7 +3533,6 @@ pub fn controller_commitments_from_batch(
         value.validate()?;
         values.push(value);
     }
-    validate_commitments(prior, &values)?;
     Ok(values)
 }
 
@@ -3671,11 +3692,27 @@ impl CommitmentPriorContext {
     }
 }
 
+/// Validate `commitments` as a contiguous continuation of `prior` and return the resulting
+/// context, leaving `prior` untouched on failure.
 pub fn validate_commitments(
     prior: &CommitmentPriorContext,
     commitments: &[ControllerCommitment],
 ) -> Result<CommitmentPriorContext, ArtifactError> {
     let mut context = prior.clone();
+    apply_commitments(&mut context, commitments)?;
+    Ok(context)
+}
+
+/// Fold `commitments` into `context` in place.
+///
+/// This is the replay primitive: recovery folds thousands of single-row segments into one
+/// accumulating context, and cloning that context per segment makes recovery quadratic in history
+/// length. A failed fold leaves `context` partially advanced, so callers that must keep a valid
+/// state on failure fold into a copy (`validate_commitments`) and discard it.
+pub(crate) fn apply_commitments(
+    context: &mut CommitmentPriorContext,
+    commitments: &[ControllerCommitment],
+) -> Result<(), ArtifactError> {
     for commitment in commitments {
         commitment.validate()?;
         let expected_order =
@@ -3894,7 +3931,7 @@ pub fn validate_commitments(
             }
         }
     }
-    Ok(context)
+    Ok(())
 }
 
 pub fn reconcile_commitments(
