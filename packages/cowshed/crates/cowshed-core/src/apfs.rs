@@ -915,7 +915,25 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.run_checked("create SPARSE image", command).map(|_| ())
     }
 
+    /// Resolve the APFS volume device behind a freshly attached image's physical store.
+    ///
+    /// Asks `diskutil info` which container the candidate belongs to and lists only that
+    /// container: the unscoped `diskutil apfs list` walks every container on the host, and since
+    /// every attached workspace image is one, that walk costs seconds per attach on a host with
+    /// dozens of warm workspaces. The scoped listing is then verified exactly as before.
     fn resolve_apfs_volume(&self, candidate: &str) -> Result<String, ApfsError> {
+        let info = self.run_checked(
+            "inspect APFS device",
+            CommandRequest::new(
+                DISKUTIL,
+                [
+                    OsString::from("info"),
+                    OsString::from("-plist"),
+                    OsString::from(candidate),
+                ],
+            ),
+        )?;
+        let container = parse_container_reference_plist(candidate, &info.stdout)?;
         let output = self.run_checked(
             "resolve APFS volume",
             CommandRequest::new(
@@ -924,6 +942,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     OsString::from("apfs"),
                     OsString::from("list"),
                     OsString::from("-plist"),
+                    OsString::from(container),
                 ],
             ),
         )?;
@@ -1833,6 +1852,35 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
     Ok((whole, candidate))
 }
 
+/// The `APFSContainerReference` that `diskutil info -plist` reports for an APFS physical store or
+/// volume. A device outside any container has no such key, which is the same "no volume" answer
+/// the full inventory would give for it.
+fn parse_container_reference_plist(candidate: &str, bytes: &[u8]) -> Result<String, ApfsError> {
+    let invalid = |message| ApfsError::VolumeResolutionFailed {
+        candidate: candidate.to_owned(),
+        reason: VolumeResolutionFailure::InvalidPlist(message),
+    };
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| invalid(error.to_string()))?;
+    let dictionary = value
+        .as_dictionary()
+        .ok_or_else(|| invalid("device info is not a dictionary".into()))?;
+    let Some(reference) = dictionary.get("APFSContainerReference") else {
+        return Err(ApfsError::VolumeResolutionFailed {
+            candidate: candidate.to_owned(),
+            reason: VolumeResolutionFailure::Missing,
+        });
+    };
+    let reference = reference
+        .as_string()
+        .ok_or_else(|| invalid("APFSContainerReference is not a string".into()))?;
+    // A container reference is a whole synthesized disk (`diskN`), never a slice.
+    let device = device_path(reference)
+        .filter(|device| device_depth(device) == 0)
+        .ok_or_else(|| invalid(format!("invalid APFSContainerReference {reference:?}")))?;
+    Ok(device.trim_start_matches("/dev/").to_owned())
+}
+
 fn parse_volume_list_plist(candidate: &str, bytes: &[u8]) -> Result<String, ApfsError> {
     let invalid = |message| ApfsError::VolumeResolutionFailed {
         candidate: candidate.to_owned(),
@@ -2056,6 +2104,17 @@ mod tests {
           <dict><key>DeviceIdentifier</key><string>disk10s1</string></dict>
         </array>
       </dict></array>
+    </dict></plist>"#;
+
+    /// `diskutil info -plist` for an attached image's APFS physical store.
+    const DEVICE_INFO_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>APFSContainerReference</key><string>disk10</string>
+      <key>Content</key><string>Apple_APFS</string>
+    </dict></plist>"#;
+
+    const SPARSE_DEVICE_INFO_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>APFSContainerReference</key><string>disk5</string>
+      <key>Content</key><string>Apple_APFS</string>
     </dict></plist>"#;
 
     const SPARSE_ATTACH_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>system-entities</key><array>
@@ -2513,6 +2572,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(PLIST),
+            CommandOutput::success(DEVICE_INFO_PLIST),
             CommandOutput::success(VOLUME_LIST_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
@@ -2538,6 +2598,7 @@ mod tests {
                 Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
                 Path::new(DISKUTIL),
+                Path::new(DISKUTIL),
                 Path::new(FSCK_APFS),
                 Path::new(DISKUTIL),
             ]
@@ -2547,10 +2608,13 @@ mod tests {
             argv(&requests[1])[..5],
             ["image", "attach", "--nobrowse", "--noMount", "--plist"]
         );
-        assert_eq!(argv(&requests[2]), ["apfs", "list", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk10s1"]);
+        // The ASIF attach reports the volume itself as the candidate; `diskutil info` names its
+        // container either way.
+        assert_eq!(argv(&requests[2]), ["info", "-plist", "/dev/disk10s1"]);
+        assert_eq!(argv(&requests[3]), ["apfs", "list", "-plist", "disk10"]);
+        assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk10s1"]);
         assert_eq!(
-            argv(&requests[4])[..5],
+            argv(&requests[5])[..5],
             [
                 "mount",
                 "nobrowse",
@@ -2559,7 +2623,7 @@ mod tests {
                 "-mountPoint"
             ]
         );
-        assert_eq!(argv(&requests[4]).last().unwrap(), "/dev/disk10s1");
+        assert_eq!(argv(&requests[5]).last().unwrap(), "/dev/disk10s1");
         let _ = fs::remove_dir(mount);
     }
 
@@ -2609,6 +2673,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
         ]));
@@ -2627,6 +2692,7 @@ mod tests {
                 Path::new(HDIUTIL),
                 Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
+                Path::new(DISKUTIL),
                 Path::new(FSCK_APFS)
             ]
         );
@@ -2643,8 +2709,10 @@ mod tests {
                 "session.sparseimage",
             ]
         );
-        assert_eq!(argv(&requests[2]), ["apfs", "list", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk5s2"]);
+        // The physical store names its container, and only that container is listed.
+        assert_eq!(argv(&requests[2]), ["info", "-plist", "/dev/disk4s1"]);
+        assert_eq!(argv(&requests[3]), ["apfs", "list", "-plist", "disk5"]);
+        assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk5s2"]);
     }
 
     #[test]
@@ -2652,6 +2720,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::failure(8, "not clean"),
             CommandOutput::success([]),
@@ -2667,11 +2736,11 @@ mod tests {
             } if device == "/dev/disk5s2"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
-        assert_eq!(requests[3].program, Path::new(FSCK_APFS));
-        assert_eq!(argv(&requests[3]), ["-q", "/dev/rdisk5s2"]);
-        assert_eq!(requests[4].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[4].program, Path::new(FSCK_APFS));
+        assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk5s2"]);
+        assert_eq!(requests[5].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[5]), ["detach", "-quiet", "/dev/disk4"]);
         assert!(
             !requests
                 .iter()
@@ -2684,6 +2753,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
         ]));
@@ -2699,10 +2769,11 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(argv(&requests[2]), ["apfs", "list", "-plist"]);
-        assert_eq!(requests[3].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(requests.len(), 5);
+        assert_eq!(argv(&requests[2]), ["info", "-plist", "/dev/disk4s1"]);
+        assert_eq!(argv(&requests[3]), ["apfs", "list", "-plist", "disk5"]);
+        assert_eq!(requests[4].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
     }
 
     #[test]
@@ -2710,6 +2781,7 @@ mod tests {
         let backend = graced_backend([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(AMBIGUOUS_VOLUME_LIST_PLIST),
             CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
             CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
@@ -2750,10 +2822,10 @@ mod tests {
         // The cleanup detach is a Release: it holds the volume to the full grace and then forces,
         // and only a dissent that outlasts even that is reported beside the resolution failure.
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 7);
-        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(requests.len(), 8);
+        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
         assert_eq!(
-            argv(&requests[6]),
+            argv(&requests[7]),
             ["detach", "-quiet", "-force", "/dev/disk4"]
         );
     }
@@ -2763,6 +2835,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::failure(3, "list failed"),
             CommandOutput::success([]),
         ]));
@@ -2779,7 +2852,63 @@ mod tests {
             }
         ));
         let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
+    }
+
+    #[test]
+    fn failed_device_inspection_detaches_and_preserves_command_error() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::failure(1, "Could not find disk"),
+            CommandOutput::success([]),
+        ]));
+        let error = backend
+            .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApfsError::CommandFailed {
+                operation: "inspect APFS device",
+                output: CommandOutput { status: 1, .. },
+                ..
+            }
+        ));
+        let requests = backend.runner().requests();
         assert_eq!(requests.len(), 4);
+        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
+    }
+
+    #[test]
+    fn a_device_outside_any_container_is_a_missing_volume_not_a_host_walk() {
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(
+                r#"<?xml version="1.0"?><plist version="1.0"><dict><key>Content</key><string>Apple_HFS</string></dict></plist>"#,
+            ),
+            CommandOutput::success([]),
+        ]));
+        let error = backend
+            .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApfsError::VolumeResolutionFailed {
+                candidate,
+                reason: VolumeResolutionFailure::Missing,
+            } if candidate == "/dev/disk4s1"
+        ));
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            !requests
+                .iter()
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "apfs")),
+            "no container inventory is walked when the device is not in a container"
+        );
         assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
     }
 
@@ -4541,6 +4670,7 @@ mod tests {
             CommandOutput::success([]),
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
@@ -4575,6 +4705,7 @@ mod tests {
                 Path::new(HDIUTIL),
                 Path::new(HDIUTIL),
                 Path::new(DISKUTIL),
+                Path::new(DISKUTIL),
                 Path::new(FSCK_APFS),
                 Path::new(DISKUTIL),
                 Path::new(HDIUTIL),
@@ -4599,10 +4730,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            argv(&requests[7]),
+            argv(&requests[8]),
             ["apfs", "resizeContainer", "/dev/disk5", "0"]
         );
-        assert_eq!(argv(&requests[8]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[9]), ["info", "-plist"]);
     }
 
     #[test]
@@ -4670,6 +4801,7 @@ mod tests {
             let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
                 CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
                 CommandOutput::success(SPARSE_ATTACH_PLIST),
+                CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
                 CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
                 CommandOutput::success([]),
                 CommandOutput::failure(1, refusal),
@@ -4689,6 +4821,7 @@ mod tests {
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
             CommandOutput::failure(1, "Error: -69620: The given file system is not supported"),
