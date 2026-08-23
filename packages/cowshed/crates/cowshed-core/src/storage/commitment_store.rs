@@ -19,8 +19,8 @@ use crate::api::dto::ControllerCommitment;
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 use crate::storage::job_artifact::{
-    CommitmentPriorContext, controller_commitments_from_batch, controller_commitments_to_batch,
-    validate_commitments,
+    CommitmentPriorContext, apply_commitments, controller_commitments_to_batch,
+    decode_controller_commitments, validate_commitments,
 };
 
 const LOCK_NAME: &[u8] = b".commitment-store.lock";
@@ -78,7 +78,8 @@ pub enum CommitmentPublicationPoint {
 /// The clock and durability operations used by [`CommitmentStore`].
 ///
 /// Production callers use [`CommitmentStore::open`]. This seam lets focused tests inject a UTC
-/// date and failures at the two crash-relevant publication boundaries.
+/// date, failures at the two crash-relevant publication boundaries, and observe which sealed
+/// segments a fold actually read.
 pub trait CommitmentStoreEnvironment: Send {
     fn utc_date(&self) -> io::Result<CommitmentDate>;
 
@@ -89,6 +90,10 @@ pub trait CommitmentStoreEnvironment: Send {
     fn publication_point(&self, _point: CommitmentPublicationPoint) -> io::Result<()> {
         Ok(())
     }
+
+    /// Called once per sealed segment the store opens, decodes, and folds. A refresh that finds
+    /// nothing beyond the last folded order reports no segments at all.
+    fn segment_folded(&self, _order: u64) {}
 }
 
 #[derive(Debug, Error)]
@@ -109,9 +114,17 @@ pub enum CommitmentStoreError {
 ///
 /// The store is deliberately not `Clone`: one runtime actor owns its validation context and writer
 /// identity. Immutable segment publication is still serialized against other controller processes.
+///
+/// Two contexts are kept on purpose. `replayed` is the pure chronological fold of every sealed
+/// segment and is exactly what a fresh process would rebuild from disk; `context` is that fold
+/// plus the opening baseline's verified-active incarnations and is what publication validates
+/// against. Keeping the pure fold lets `refresh` continue from the last folded order instead of
+/// re-reading history, and lets `publish` refuse a draft that would not survive replay before it
+/// becomes a durable segment every later process chokes on.
 pub struct CommitmentStore {
     root: File,
     baseline: CommitmentPriorContext,
+    replayed: CommitmentPriorContext,
     context: CommitmentPriorContext,
     writer_id: Uuid,
     environment: Box<dyn CommitmentStoreEnvironment>,
@@ -141,11 +154,18 @@ impl CommitmentStore {
         let root = open_or_create_directory_chain(telemetry_root.as_ref())?;
         let baseline = CommitmentPriorContext::new(repo_id, known_incarnations);
         let lock = acquire_lock(&root)?;
-        let context = recover_context(&root, &baseline)?;
+        let replayed = fold_new_segments(
+            &root,
+            &CommitmentPriorContext::empty(),
+            environment.as_ref(),
+        )?
+        .unwrap_or_else(CommitmentPriorContext::empty);
         drop(lock);
+        let context = merge_baseline(&replayed, &baseline);
         Ok(Self {
             root,
             baseline,
+            replayed,
             context,
             writer_id: Uuid::new_v4(),
             environment,
@@ -191,10 +211,27 @@ impl CommitmentStore {
         self.context.admitted_lifecycle_incarnations(repo_id)
     }
 
+    /// Fold every segment sealed since the last fold into the store's context.
+    ///
+    /// Sealed segments are immutable and named by their global order, so the full set of names is
+    /// re-enumerated under the lock (malformed, duplicate, gapped, or vanished names still fail
+    /// closed) but only segments beyond the last folded order are opened, decoded, and applied.
+    /// The publisher refreshes before every request; with a full re-read this was a scan of the
+    /// entire host history per workspace per command.
     pub fn refresh(&mut self) -> Result<(), CommitmentStoreError> {
         let lock = acquire_lock(&self.root)?;
-        self.context = recover_context(&self.root, &self.baseline)?;
+        self.refresh_locked()?;
         drop(lock);
+        Ok(())
+    }
+
+    fn refresh_locked(&mut self) -> Result<(), CommitmentStoreError> {
+        if let Some(replayed) =
+            fold_new_segments(&self.root, &self.replayed, self.environment.as_ref())?
+        {
+            self.context = merge_baseline(&replayed, &self.baseline);
+            self.replayed = replayed;
+        }
         Ok(())
     }
 
@@ -204,13 +241,18 @@ impl CommitmentStore {
     ) -> Result<(), CommitmentStoreError> {
         let order = commitment.order();
         let lock = acquire_lock(&self.root)?;
-        let recovered = recover_context(&self.root, &self.baseline)?;
-        if recovered.last_order() != self.context.last_order() {
-            self.context = recovered;
+        let folded_before = self.replayed.last_order();
+        self.refresh_locked()?;
+        if self.replayed.last_order() != folded_before {
             return Err(CommitmentStoreError::Conflict { order });
         }
 
-        let next_context = validate_commitments(&recovered, std::slice::from_ref(&commitment))
+        // The draft must be valid against the baseline-merged context (what this controller knows
+        // is active) and must replay from history alone: a segment that only the opening baseline
+        // could authorize would seal fine and then fail every later recovery.
+        validate_commitments(&self.context, std::slice::from_ref(&commitment))
+            .map_err(|error| integrity(error.to_string()))?;
+        let next_replayed = validate_commitments(&self.replayed, std::slice::from_ref(&commitment))
             .map_err(|error| integrity(error.to_string()))?;
         let batch = controller_commitments_to_batch(std::slice::from_ref(&commitment))
             .map_err(|error| integrity(error.to_string()))?;
@@ -264,7 +306,7 @@ impl CommitmentStore {
         ) {
             Ok(()) => cleanup.disarm(),
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                self.context = recover_context(&self.root, &self.baseline)?;
+                self.refresh_locked()?;
                 return Err(CommitmentStoreError::Conflict { order });
             }
             Err(source) => return Err(io_failure("publishing commitment segment", source)),
@@ -276,7 +318,8 @@ impl CommitmentStore {
             .publication_point(CommitmentPublicationPoint::AfterRenameAndDirectorySync)
             .map_err(|source| io_failure("after commitment rename", source))?;
 
-        self.context = next_context;
+        self.context = merge_baseline(&next_replayed, &self.baseline);
+        self.replayed = next_replayed;
         drop(lock);
         Ok(())
     }
@@ -305,11 +348,73 @@ impl CommitmentStoreEnvironment for SystemEnvironment {
     }
 }
 
-fn recover_context(
-    root: &File,
+/// One sealed segment located during enumeration: the date partition it lives in and its name.
+struct SegmentRef {
+    partition: usize,
+    name: OsString,
+}
+
+fn merge_baseline(
+    replayed: &CommitmentPriorContext,
     baseline: &CommitmentPriorContext,
-) -> Result<CommitmentPriorContext, CommitmentStoreError> {
-    let mut segments = BTreeMap::<u64, (File, OsString)>::new();
+) -> CommitmentPriorContext {
+    let mut context = replayed.clone();
+    context.merge_verified_active(baseline);
+    context
+}
+
+/// Enumerate every sealed segment and fold the ones beyond `folded.last_order()`.
+///
+/// Returns `None` when no segment is newer than the fold already held, so a refresh that finds
+/// nothing new costs one name enumeration and no clone. Otherwise the new segments are folded into
+/// a copy of `folded`, and that copy is returned only if every one of them validated: a failed
+/// fold leaves the caller's context exactly as it was, so the next refresh hits the same failure
+/// instead of silently continuing past it.
+fn fold_new_segments(
+    root: &File,
+    folded: &CommitmentPriorContext,
+    environment: &dyn CommitmentStoreEnvironment,
+) -> Result<Option<CommitmentPriorContext>, CommitmentStoreError> {
+    let (partitions, segments) = enumerate_segments(root)?;
+    let mut expected_order = 1_u64;
+    for order in segments.keys() {
+        if *order != expected_order {
+            return Err(integrity("controller commitment order is not contiguous"));
+        }
+        expected_order = expected_order
+            .checked_add(1)
+            .ok_or_else(|| integrity("controller commitment order overflow"))?;
+    }
+    let last_sealed = segments.keys().next_back().copied().unwrap_or(0);
+    if last_sealed < folded.last_order() {
+        return Err(integrity(
+            "sealed commitment segments disappeared behind the folded order",
+        ));
+    }
+    if last_sealed == folded.last_order() {
+        return Ok(None);
+    }
+
+    let mut context = folded.clone();
+    for (order, segment) in segments.range(folded.last_order() + 1..) {
+        let commitments = read_segment(&partitions[segment.partition], &segment.name)?;
+        if commitments.len() != 1 || commitments[0].order() != *order {
+            return Err(integrity(
+                "commitment segment name does not match its single row",
+            ));
+        }
+        apply_commitments(&mut context, &commitments)
+            .map_err(|error| integrity(error.to_string()))?;
+        environment.segment_folded(*order);
+    }
+    Ok(Some(context))
+}
+
+fn enumerate_segments(
+    root: &File,
+) -> Result<(Vec<File>, BTreeMap<u64, SegmentRef>), CommitmentStoreError> {
+    let mut partitions = Vec::new();
+    let mut segments = BTreeMap::<u64, SegmentRef>::new();
     for date_name in directory_names(root)? {
         let Some(date) = CommitmentDate::parse(date_name.as_bytes()) else {
             continue;
@@ -319,7 +424,9 @@ fn recover_context(
         }
         let date_directory = open_existing_child_directory(root, &date_name)
             .map_err(|error| integrity(format!("invalid commitment date directory: {error}")))?;
-        for name in directory_names(&date_directory)? {
+        let partition = partitions.len();
+        partitions.push(date_directory);
+        for name in directory_names(&partitions[partition])? {
             let bytes = name.as_bytes();
             let Some((order, _writer)) = parse_segment_name(bytes) else {
                 if bytes.starts_with(SEGMENT_PREFIX) {
@@ -327,61 +434,51 @@ fn recover_context(
                 }
                 continue;
             };
-            let segment = open_existing_file_at(&date_directory, &name)
-                .map_err(|error| integrity(format!("invalid commitment segment: {error}")))?;
-            let metadata = segment
-                .metadata()
-                .map_err(|source| io_failure("reading commitment metadata", source))?;
-            if !metadata.file_type().is_file() {
-                return Err(integrity("commitment segment is not a regular file"));
-            }
-            if metadata.nlink() != 1 {
-                return Err(integrity("commitment segment has more than one hard link"));
-            }
-            if metadata.len() > MAX_COMMITMENT_SEGMENT_BYTES {
-                return Err(integrity("commitment segment exceeds the size limit"));
-            }
-            if segments.insert(order, (segment, name)).is_some() {
+            if segments
+                .insert(order, SegmentRef { partition, name })
+                .is_some()
+            {
                 return Err(integrity("duplicate controller commitment order"));
             }
         }
     }
+    Ok((partitions, segments))
+}
 
-    let mut context = CommitmentPriorContext::empty();
-    let mut expected_order = 1_u64;
-    for (order, (segment, _name)) in segments {
-        if order != expected_order {
-            return Err(integrity("controller commitment order is not contiguous"));
-        }
-        let mut bytes = Vec::new();
-        segment
-            .take(MAX_COMMITMENT_SEGMENT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|source| io_failure("reading commitment segment", source))?;
-        if bytes.len() as u64 > MAX_COMMITMENT_SEGMENT_BYTES {
-            return Err(integrity("commitment segment exceeds the size limit"));
-        }
-        let batch = decode_one_batch(&bytes)?;
-        if batch.num_rows() != 1 {
-            return Err(integrity(
-                "commitment segment must contain exactly one commitment row",
-            ));
-        }
-        let commitments = controller_commitments_from_batch(&batch, &context)
-            .map_err(|error| integrity(error.to_string()))?;
-        if commitments.len() != 1 || commitments[0].order() != order {
-            return Err(integrity(
-                "commitment segment name does not match its single row",
-            ));
-        }
-        context = validate_commitments(&context, &commitments)
-            .map_err(|error| integrity(error.to_string()))?;
-        expected_order = expected_order
-            .checked_add(1)
-            .ok_or_else(|| integrity("controller commitment order overflow"))?;
+/// Open, bound, and decode one sealed segment without following links.
+fn read_segment(
+    date_directory: &File,
+    name: &OsString,
+) -> Result<Vec<ControllerCommitment>, CommitmentStoreError> {
+    let segment = open_existing_file_at(date_directory, name)
+        .map_err(|error| integrity(format!("invalid commitment segment: {error}")))?;
+    let metadata = segment
+        .metadata()
+        .map_err(|source| io_failure("reading commitment metadata", source))?;
+    if !metadata.file_type().is_file() {
+        return Err(integrity("commitment segment is not a regular file"));
     }
-    context.merge_verified_active(baseline);
-    Ok(context)
+    if metadata.nlink() != 1 {
+        return Err(integrity("commitment segment has more than one hard link"));
+    }
+    if metadata.len() > MAX_COMMITMENT_SEGMENT_BYTES {
+        return Err(integrity("commitment segment exceeds the size limit"));
+    }
+    let mut bytes = Vec::new();
+    segment
+        .take(MAX_COMMITMENT_SEGMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_failure("reading commitment segment", source))?;
+    if bytes.len() as u64 > MAX_COMMITMENT_SEGMENT_BYTES {
+        return Err(integrity("commitment segment exceeds the size limit"));
+    }
+    let batch = decode_one_batch(&bytes)?;
+    if batch.num_rows() != 1 {
+        return Err(integrity(
+            "commitment segment must contain exactly one commitment row",
+        ));
+    }
+    decode_controller_commitments(&batch).map_err(|error| integrity(error.to_string()))
 }
 
 fn decode_one_batch(bytes: &[u8]) -> Result<arrow_array::RecordBatch, CommitmentStoreError> {

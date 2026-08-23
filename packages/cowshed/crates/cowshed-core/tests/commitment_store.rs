@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
@@ -118,6 +118,40 @@ impl CommitmentStoreEnvironment for DateSequenceEnvironment {
         let index = self.next.fetch_add(1, Ordering::SeqCst).min(1);
         Ok(self.dates[index])
     }
+}
+
+/// Records every sealed segment the store opens and folds, so a test can state exactly which
+/// segments a refresh read.
+struct FoldObservingEnvironment {
+    date: CommitmentDate,
+    folded: Arc<Mutex<Vec<u64>>>,
+}
+
+impl FoldObservingEnvironment {
+    fn new(date: CommitmentDate) -> (Self, Arc<Mutex<Vec<u64>>>) {
+        let folded = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                date,
+                folded: Arc::clone(&folded),
+            },
+            folded,
+        )
+    }
+}
+
+impl CommitmentStoreEnvironment for FoldObservingEnvironment {
+    fn utc_date(&self) -> io::Result<CommitmentDate> {
+        Ok(self.date)
+    }
+
+    fn segment_folded(&self, order: u64) {
+        self.folded.lock().unwrap().push(order);
+    }
+}
+
+fn take_folded(folded: &Mutex<Vec<u64>>) -> Vec<u64> {
+    std::mem::take(&mut *folded.lock().unwrap())
 }
 
 fn repo() -> RepoId {
@@ -354,6 +388,41 @@ fn write_single_segment(
     let path = directory.join(sealed_name(order, Uuid::new_v4()));
     write_batches(&path, std::slice::from_ref(commitment));
     path
+}
+
+/// Seal one segment without the per-file fsync: a fixture that needs a long history is measuring
+/// the store's read side, not the durability of its own setup.
+fn seal_segment_unsynced(
+    root: &Path,
+    partition: CommitmentDate,
+    order: u64,
+    commitment: &ControllerCommitment,
+) {
+    let directory = root.join(partition.to_string());
+    fs::create_dir_all(&directory).unwrap();
+    let batch = controller_commitments_to_batch(std::slice::from_ref(commitment)).unwrap();
+    let mut bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+    fs::write(directory.join(sealed_name(order, Uuid::new_v4())), bytes).unwrap();
+}
+
+/// `introduced(1)` followed by one admission per order, split across two UTC partitions.
+fn seal_linear_history(root: &Path, orders: u64) {
+    let first_half = date(2026, 5, 1);
+    let second_half = date(2026, 5, 2);
+    seal_segment_unsynced(root, first_half, 1, &introduced(1));
+    for order in 2..=orders {
+        let partition = if order <= orders / 2 {
+            first_half
+        } else {
+            second_half
+        };
+        seal_segment_unsynced(root, partition, order, &admission(order, order));
+    }
 }
 
 fn assert_open_integrity(root: &Path) {
@@ -771,7 +840,7 @@ fn failure_before_rename_cleans_temporary_and_does_not_advance() {
     .unwrap();
 
     assert!(matches!(
-        store.publish(admission(1, 1)),
+        store.publish(introduced(1)),
         Err(CommitmentStoreError::Io { .. })
     ));
     assert_eq!(store.next_order().unwrap(), 1);
@@ -906,8 +975,8 @@ impl CommitmentStoreEnvironment for CollisionEnvironment {
                 .copied()
                 .ok_or_else(|| io::Error::other("writer id was not initialized"))?;
             let directory = self.root.join(self.date.to_string());
-            let segment = directory.join(sealed_name(1, writer));
-            write_batches(&segment, &[introduced(1)]);
+            let segment = directory.join(sealed_name(2, writer));
+            write_batches(&segment, &[admission(2, 1)]);
         }
         Ok(())
     }
@@ -918,7 +987,7 @@ async fn publisher_retries_a_deliberate_same_order_collision_with_the_next_order
     let root = TempRoot::new("publisher-collision");
     let writer = Arc::new(OnceLock::new());
     let collided = Arc::new(AtomicBool::new(false));
-    let store = CommitmentStore::open_with_environment(
+    let mut store = CommitmentStore::open_with_environment(
         root.path(),
         repo(),
         [incarnation()],
@@ -931,6 +1000,7 @@ async fn publisher_retries_a_deliberate_same_order_collision_with_the_next_order
     )
     .unwrap();
     writer.set(store.writer_id()).unwrap();
+    store.publish(introduced(1)).unwrap();
     let mut publisher = CommitmentPublisher::start(store, 4).unwrap();
 
     let order = publisher
@@ -944,10 +1014,139 @@ async fn publisher_retries_a_deliberate_same_order_collision_with_the_next_order
         .unwrap();
 
     assert!(collided.load(Ordering::SeqCst));
-    assert_eq!(order, 2);
-    assert_eq!(sealed_segments(root.path()).len(), 2);
+    assert_eq!(order, 3);
+    assert_eq!(sealed_segments(root.path()).len(), 3);
     assert_eq!(
         CommitmentStore::open(root.path(), repo(), [incarnation()])
+            .unwrap()
+            .next_order()
+            .unwrap(),
+        4
+    );
+}
+
+#[test]
+fn refresh_folds_only_segments_sealed_since_the_last_fold() {
+    let root = TempRoot::new("incremental-refresh");
+    let history = 300;
+    seal_linear_history(root.path(), history);
+    let (environment, folded) = FoldObservingEnvironment::new(date(2026, 5, 3));
+    let mut store = store_with_environment(root.path(), environment).unwrap();
+    assert_eq!(take_folded(&folded), (1..=history).collect::<Vec<_>>());
+    assert_eq!(store.next_order().unwrap(), history + 1);
+
+    // The publisher refreshes before every request; nothing new on disk means nothing read.
+    for _ in 0..50 {
+        store.refresh().unwrap();
+    }
+    assert!(take_folded(&folded).is_empty());
+
+    // Another controller seals two more segments in a partition this store has never seen.
+    let later = date(2026, 5, 4);
+    seal_segment_unsynced(
+        root.path(),
+        later,
+        history + 1,
+        &admission(history + 1, history + 1),
+    );
+    seal_segment_unsynced(root.path(), later, history + 2, &terminal(history + 2, 2));
+    store.refresh().unwrap();
+    assert_eq!(take_folded(&folded), vec![history + 1, history + 2]);
+    assert_eq!(store.next_order().unwrap(), history + 3);
+    store.refresh().unwrap();
+    assert!(take_folded(&folded).is_empty());
+
+    // A publication advances the fold in memory; it is not re-read from disk afterwards.
+    store.publish(terminal(history + 3, 3)).unwrap();
+    assert_eq!(store.next_order().unwrap(), history + 4);
+    store.refresh().unwrap();
+    assert!(take_folded(&folded).is_empty());
+    assert_eq!(
+        CommitmentStore::open(root.path(), repo(), [])
+            .unwrap()
+            .next_order()
+            .unwrap(),
+        history + 4
+    );
+}
+
+#[test]
+fn refresh_cost_does_not_scale_with_already_folded_history() {
+    let root = TempRoot::new("refresh-cost");
+    let history = 1500;
+    seal_linear_history(root.path(), history);
+
+    let opened = Instant::now();
+    let mut store = CommitmentStore::open(root.path(), repo(), []).unwrap();
+    let full_replay = opened.elapsed();
+    assert_eq!(store.next_order().unwrap(), history + 1);
+
+    // One project open issues one refresh per workspace; with a full replay per refresh a host
+    // holding a couple of thousand segments and a few dozen workspaces spent tens of seconds in
+    // `cowshed ls`. Ten refreshes that fold nothing must cost less than the one replay that built
+    // the context — a bound the per-request full replay misses by an order of magnitude.
+    let refreshed = Instant::now();
+    for _ in 0..10 {
+        store.refresh().unwrap();
+    }
+    let ten_refreshes = refreshed.elapsed();
+    assert!(
+        ten_refreshes < full_replay,
+        "10 refreshes over {history} folded segments took {ten_refreshes:?}; the full replay took {full_replay:?}"
+    );
+}
+
+#[test]
+fn refresh_fails_closed_when_sealed_history_changes_behind_the_fold() {
+    let root = TempRoot::new("refresh-history-drift");
+    let partition = date(2026, 6, 1);
+    seal_segment_unsynced(root.path(), partition, 1, &introduced(1));
+    seal_segment_unsynced(root.path(), partition, 2, &admission(2, 1));
+    seal_segment_unsynced(root.path(), partition, 3, &terminal(3, 1));
+    let mut store = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
+    assert_eq!(store.next_order().unwrap(), 4);
+
+    // A gap past the fold is not contiguous history, and the failed refresh leaves the fold alone.
+    seal_segment_unsynced(root.path(), partition, 5, &admission(5, 2));
+    assert!(matches!(
+        store.refresh(),
+        Err(CommitmentStoreError::Integrity { .. })
+    ));
+    assert_eq!(store.next_order().unwrap(), 4);
+    seal_segment_unsynced(root.path(), partition, 4, &admission(4, 3));
+    store.refresh().unwrap();
+    assert_eq!(store.next_order().unwrap(), 6);
+
+    // History this store already folded cannot shrink underneath it.
+    let tail = sealed_segments(root.path()).pop().unwrap();
+    fs::remove_file(tail).unwrap();
+    assert!(matches!(
+        store.refresh(),
+        Err(CommitmentStoreError::Integrity { .. })
+    ));
+    assert_eq!(store.next_order().unwrap(), 6);
+}
+
+#[test]
+fn publish_refuses_a_draft_that_history_alone_cannot_replay() {
+    let root = TempRoot::new("replay-guard");
+    let partition = date(2026, 6, 2);
+    // The opening baseline says the incarnation is active, but nothing in history introduced it:
+    // an admission sealed now would be accepted today and rejected by every later recovery.
+    let mut store = store_with_environment(root.path(), FixedEnvironment::new(partition)).unwrap();
+    let refused = store.publish(admission(1, 1)).unwrap_err();
+    assert!(
+        matches!(&refused, CommitmentStoreError::Integrity { message } if message.contains("unknown incarnation")),
+        "{refused}"
+    );
+    assert_eq!(store.next_order().unwrap(), 1);
+    assert!(sealed_segments(root.path()).is_empty());
+
+    store.publish(introduced(1)).unwrap();
+    store.publish(admission(2, 1)).unwrap();
+    drop(store);
+    assert_eq!(
+        CommitmentStore::open(root.path(), repo(), [])
             .unwrap()
             .next_order()
             .unwrap(),
