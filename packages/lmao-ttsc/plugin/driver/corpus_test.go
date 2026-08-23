@@ -376,7 +376,7 @@ export const a = op(async ({ span }) => {
   await span('too-wide', wideOp, 1, 2, 3, 4, 5, 6, 7, 8, 9);
 });
 `,
-	"destructured-bail-default-value": `
+	"destructured-default-value-preserved": `
 declare const fetchOp: Op;
 export const a = op(async ({ span, log = undefined as unknown as SpanContext['log'] }) => {
   await span('fetch', fetchOp);
