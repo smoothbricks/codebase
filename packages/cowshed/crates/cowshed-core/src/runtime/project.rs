@@ -2932,10 +2932,21 @@ impl NativeProjectRuntimeHost {
         &mut self,
         name: &WorkspaceName,
     ) -> Result<super::supervisor::WorkspaceSupervisorHandle> {
+        self.validate_binding().await?;
+        let current = self.current(name).await?;
+        self.ensure_supervisor_for(current).await
+    }
+
+    /// Start or reuse the supervisor for a workspace whose current state the caller already
+    /// read under a validated binding.
+    async fn ensure_supervisor_for(
+        &mut self,
+        mut current: NativeWorkspace,
+    ) -> Result<super::supervisor::WorkspaceSupervisorHandle> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
 
-        self.validate_binding().await?;
-        let mut current = self.current(name).await?;
+        let name = current.derived.workspace.name().clone();
+        let name = &name;
         // Every verb that runs work in a workspace arrives here, so this is where the
         // git-worktree precondition belongs: exec, sessions, and `path`'s implicit attach all get
         // the same refusal rather than a mount whose git is broken.
@@ -3169,6 +3180,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     }
 
     async fn recover(&mut self) -> Result<()> {
+        // One binding check and one inventory read for the whole recovery: the per-workspace
+        // entry point re-validates and re-lists because a verb may arrive long after open, but
+        // here every supervisor starts from the same just-validated, just-read state, and doing
+        // either per workspace made project open quadratic in workspace count (each inventory
+        // read touches every image) with four git processes per workspace on top.
         self.validate_binding().await?;
         let attached = self
             .authoritative()
@@ -3180,10 +3196,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     crate::storage::lifecycle::MountState::Mounted { .. }
                 )
             })
-            .map(|workspace| workspace.derived.workspace.name().clone())
             .collect::<Vec<_>>();
         for workspace in attached {
-            self.ensure_supervisor(&workspace).await?;
+            self.ensure_supervisor_for(workspace).await?;
         }
         Ok(())
     }
