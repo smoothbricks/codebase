@@ -1010,7 +1010,7 @@ impl Actor {
 
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
-        let endpoint_label = endpoint_label(&session.endpoint);
+        let endpoint_label = session.endpoint.to_string();
         let (accept_stop, accept_rx) = watch::channel(false);
         let (connection_stop, connection_rx) = watch::channel(false);
         let (audit_stop, audit_rx) = watch::channel(false);
@@ -1964,13 +1964,6 @@ fn remove_stale_socket(path: &Path) -> Result<(), std::io::Error> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
-    }
-}
-
-fn endpoint_label(endpoint: &WorkspaceEndpoint) -> String {
-    match endpoint {
-        WorkspaceEndpoint::Tcp(address) => address.to_string(),
-        WorkspaceEndpoint::Unix(path) => path.display().to_string(),
     }
 }
 
