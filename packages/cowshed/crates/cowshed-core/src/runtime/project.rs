@@ -6760,7 +6760,7 @@ mod workspace_origin_tests {
             "git's own diagnosis survives verbatim: {}",
             error.message
         );
-        assert_ne!(error.hint.contains("resolve the git conflict"), true);
+        assert!(!error.hint.contains("resolve the git conflict"));
 
         // The diverged case routes to cowshed's own verb, not git's merge menu.
         let error = require_git_success(
