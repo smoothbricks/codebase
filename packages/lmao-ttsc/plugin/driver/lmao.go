@@ -127,6 +127,7 @@ func collectProgramCompilation(prog *driver.Program, options compilerOptions) (*
 		}
 		t := &fileTransformer{file: sf, cwd: options.cwd, checker: prog.Checker, processed: map[*shimast.CallExpression]bool{}, opSpans: map[*shimast.CallExpression]bool{}, fnSpans: map[*shimast.CallExpression]bool{}, physicalLogCalls: map[*shimast.CallExpression]callMessagePhysicalLayout{}, currentLogLocalIDs: map[*shimast.CallExpression]uint16{}, vocabulary: collector}
 		t.collectOptimizations(sf.AsNode(), false)
+		t.destructures = t.collectDestructuredRewrites(sf.AsNode())
 		compilation.files[sf] = &collectedFile{transformer: t}
 	}
 	if err := collector.diagnosticError(); err != nil {
@@ -172,6 +173,9 @@ func lmaoPluginTransform(prog *driver.Program, options compilerOptions) (driver.
 		t.applyTagInlines(collected.tagInlines)
 		t.applyLogInlines(collected.logInlines)
 		t.applyResultInlines(collected.resultInlines)
+		// After the inline passes, which address statements by index into the
+		// original lists, and before the walk that lowers the re-rooted calls.
+		t.applyDestructuredRewrites()
 		t.walk(sf.AsNode())
 		prependVocabularyRegistration(sf, registration)
 		shimast.SetParentInChildrenUnset(sf.AsNode())
@@ -237,7 +241,10 @@ type fileTransformer struct {
 	// position: the receiver is a proven LMAO context, so the closure inherits
 	// that receiver's callsite plan. A closure body is KNOWN at the call site,
 	// which is why it needs no Op provenance proof of its own.
-	fnSpans            map[*shimast.CallExpression]bool
+	fnSpans map[*shimast.CallExpression]bool
+	// destructures holds the §3 function literals whose destructured context
+	// parameter was proven safe to re-root onto `__ctx`.
+	destructures       []destructuredRewrite
 	staticLogIDs       map[*shimast.CallExpression]globalVocabularyID
 	staticSpanNameIDs  map[*shimast.CallExpression]globalVocabularyID
 	physicalLogCalls   map[*shimast.CallExpression]callMessagePhysicalLayout
