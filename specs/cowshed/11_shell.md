@@ -243,10 +243,10 @@ Checkpoint adds `origin_incarnation, checkpoint_id, barrier_id, manifest_batch_s
 `source_checkpoint, source_incarnation, destination_incarnation`.
 
 At launch the controller supplies a dedicated write-only IPC capability that is non-inheritable before any workspace
-process starts. `order` is positive/globally monotonic. `CommitmentPriorContext` carries the prior order plus known
-admissions, terminals, checkpoints, and incarnation lineage into `validate_commitments`; validation requires admission
-before the sole terminal row and existing acyclic fork/restore/checkpoint lineage. Controller writers publish exclusive
-immutable segments. No variant contains inline bytes, protected paths, redirect sources, summaries, or raw payload.
+process starts. `order` is the writing controller's own monotone sequence. The records are audit telemetry: each is
+validated on its own row and written to the configured sink (sealed Arrow segments by default, `off`, or a host's own
+sink), and nothing replays them for a decision. No variant contains inline bytes, protected paths, redirect sources,
+summaries, or raw payload.
 
 Protected in-volume records and artifacts are authoritative captured-content evidence for their origin
 incarnation/checkpoint boundary. Controller commitments are authoritative for existence, lifecycle/status, ordering,
