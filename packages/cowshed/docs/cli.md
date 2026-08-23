@@ -21,14 +21,14 @@ Every cowshed command follows the same I/O discipline:
 | 4    | conflict                         | name in use, workspace busy, restore over unsaved state without `--force`                                                           |
 | 5    | env-missing                      | gateway, storage, mount, or executable unavailable; configured devenv refresh failed                                                |
 | 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it |
-| 7    | integrity                        | committed job content missing, mutated, rolled back, or inconsistent with its controller commitment                                 |
+| 7    | integrity                        | committed job content missing, mutated, rolled back, or from outside the workspace's lineage                                        |
 
 `cowshed exec` passes the child's exit code through **unchanged**; failures of cowshed's own exec wrapper (mount gone
 mid-run, profile generation failed, integrity verification failed, …) use 100–106 so they can never collide with a child
 that legitimately exits 1–7. Exit 6 is reported only when cowshed has authoritative evidence of a denial — the gateway
 logged the egress decision, or the kernel sandbox telemetry names the blocked operation; otherwise the child's ordinary
-exit passes through untouched. Exit 7 is reported only for an established content/commitment integrity failure, never
-for a summary mismatch or ordinary child output.
+exit passes through untouched. Exit 7 is reported only for an established content integrity failure, never for a summary
+mismatch or ordinary child output.
 
 The JSON envelope is uniform:
 
@@ -446,10 +446,11 @@ socket is permission- and peer-checked, supports concurrent clients and reconnec
 one client disconnects.
 
 Protected in-volume Arrow records, inline bytes, and spill files are captured-content authority within their origin
-incarnation/checkpoint snapshot. Controller Arrow is continuity authority for job existence, lifecycle, order, lineage,
-terminal state, byte counts, hashes, and batch digest; it carries no artifact payload or path authority and never
-duplicates raw bytes. Every shell/session/descendant is restricted from writing `.cowshed/job/**` before
-repository-controlled startup. A content/commitment mismatch is a typed integrity failure.
+incarnation/checkpoint snapshot. The image's marker carries the incarnation and its lineage, which is what authorizes
+records an ancestor wrote into a cloned image; the controller's audit records (telemetry, never read for a decision)
+carry job existence, lifecycle, order, lineage, terminal state, byte counts, hashes, and batch digest without payload or
+path. Every shell/session/descendant is restricted from writing `.cowshed/job/**` before repository-controlled startup.
+A frame from outside the workspace's lineage, or content that fails its own digests, is a typed integrity failure.
 
 MCP coordinator authority is delivered only through an inherited FD/socketpair, never stderr, argv, environment, or a
 workspace file. Worker descriptors are 256-bit, one-use, expire after 30 seconds, are atomically consumed, restart-
@@ -521,10 +522,10 @@ timestamp when you don't give one. Before publication, a supervisor barrier seal
 files; a manifest commits every checkpoint-resident job byte. Recovery may discard only incomplete trailing data.
 
 Restore swaps the current image for the checkpoint (detach → clone → reattach, ~500 ms) and mints a new workspace
-incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; compact controller
-commitments preserve lifecycle/order/lineage and hashes across the restore. Restore refuses over unsaved work without
-`--force` (exit 4), and the displaced image is kept as a `pre-restore-<ts>` checkpoint, so a restore is itself undoable.
-List checkpoints with `cowshed ls --json` or `cowshed du`.
+incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker
+records the lineage, and the controller's audit record of the restore carries the hashes. Restore refuses over unsaved
+work without `--force` (exit 4), and the displaced image is kept as a `pre-restore-<ts>` checkpoint, so a restore is
+itself undoable. List checkpoints with `cowshed ls --json` or `cowshed du`.
 
 ```
 $ cowshed checkpoint raven pre-refactor

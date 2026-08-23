@@ -89,8 +89,8 @@ Notes for harness integration:
   `cowshed restore <ws> <label>` on failure — both are milliseconds, and far cheaper than re-creating the workspace.
   Checkpoint publication first crosses a supervisor barrier: complete Arrow batches and spill files are sealed, and a
   manifest commits every checkpoint-resident job byte. A restored checkpoint starts a new workspace incarnation; the
-  captured content remains authoritative only for the snapshot that created it, while controller commitments preserve
-  existence, ordering, terminal state, hashes, and fork/restore lineage across that boundary.
+  captured content remains authoritative only for the snapshot that created it; the restored image's marker records its
+  lineage, and the controller's audit record of the restore carries the hashes for after-the-fact comparison.
 - Parallel exploration: `cowshed fork <ws> <ws>-alt` mid-task gives you two divergent futures from the same state. Forks
   start with a closed sandbox regardless of the source's grants.
 
@@ -224,8 +224,8 @@ workspace-local numeric job id to resume status, raw logs, or attachment. The du
 `(repo_id, workspace_incarnation, job_id)`. A client disconnect never unlinks the socket or stops the job.
 
 Protected in-volume Arrow records and canonical `Inline`/`File` artifacts are the captured-content authority within
-their originating incarnation and checkpoint snapshot; a `Redirect.source` never is. Controller-owned immutable Arrow
-segments carry compact continuity commitments for job existence, lifecycle, ordering, lineage, terminal state, byte
-counts, stream hashes, and terminal-batch digest. They carry no artifact payload or path authority and never duplicate
-raw stdout/stderr. Neither tier silently wins a mismatch: missing committed content or a digest disagreement is an
-integrity failure.
+their originating incarnation and checkpoint snapshot; a `Redirect.source` never is. The controller's audit records
+(sealed Arrow segments by default, or a supervising runtime's own sink) carry compact telemetry of job existence,
+lifecycle, ordering, lineage, terminal state, byte counts, stream hashes, and terminal-batch digest. They carry no
+artifact payload or path, never duplicate raw stdout/stderr, and are never read for a decision. Neither tier silently
+wins a mismatch: missing committed content or a digest disagreement is an integrity failure.

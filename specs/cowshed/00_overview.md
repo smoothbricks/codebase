@@ -110,14 +110,17 @@ in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnati
 database**. The persistent daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md),
 with the optional MCP socket server (12_mcp.md). Linux additionally has one ephemeral minimal connector per attached
 workspace; it is attachment plumbing and stores no authority. Runtime processes hold no sole authority: kill them and
-the next command rederives lifecycle from protected/controller durable tiers and the mount table. The trusted supervisor
-is nevertheless the sole live writer of protected in-volume job evidence; controller telemetry writers publish compact
-immutable continuity commitments.
+the next command rederives lifecycle from the host inventory — the images and mounts under `~/.cowshed/`, the marker
+each image carries (incarnation and lineage), the per-workspace grants files, and the controller lock — together with
+the protected in-volume job evidence. The trusted supervisor is nevertheless the sole live writer of that in-volume
+evidence; the controller emits each of its acts as a compact audit record to an optional sink.
 
 Observability is distributed tracing into Arrow columns (13_telemetry.md). Protected in-volume complete job batches and
-sealed artifacts own captured content within an origin incarnation/checkpoint boundary. Controller Arrow commitments own
-existence/status/order/lineage and hashes but never duplicate raw output. Lifecycle, gateway, and audit spans share lmao
-Arrow transport; there is no telemetry daemon or ordinary on-disk text log.
+sealed artifacts own captured content within an origin incarnation/checkpoint boundary. Controller audit records carry
+existence/status/order/lineage and hashes but never duplicate raw output, and nothing reads them for a decision — they
+are telemetry, written to Arrow segments by the standalone CLI, to a host's own durable log when a runtime supervises
+the controller, or nowhere. Lifecycle, gateway, and audit spans share lmao Arrow transport; there is no telemetry daemon
+or ordinary on-disk text log.
 
 ## Crate map
 

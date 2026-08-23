@@ -359,9 +359,9 @@ These anchors are trust configuration, not secrets, so they are exported/written
    supervisor's launch revision differs after an effective filesystem mutation, drain it as specified above and relaunch
    from this snapshot before admitting the exec; reject a targeted named session that belongs to the stale revision.
 3. Allocate the next workspace-local monotonic numeric job ID, append a complete
-   `ProtectedRecord::Job(JobArtifactRecord)` admission batch, and publish
+   `ProtectedRecord::Job(JobArtifactRecord)` admission batch, and record the audit
    `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted supervisor opens the
-   protected record stream.
+   protected record stream; the audit record is telemetry and gates nothing.
 4. Compile and install the child profile before starting an environment loader or shell. The trusted parent contributes
    identity, cache wiring (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables. A
    restricted loader child—not the supervisor—runs fail-closed `direnv export` and any workspace `.envrc`; it returns
@@ -376,7 +376,7 @@ These anchors are trust configuration, not secrets, so they are exported/written
    redirection is authoritative only when the supervisor controls the actual writable descriptor and applies the same
    exact quota boundary; polling/tailing a path is forbidden. Explicit post-terminal publication and protected redirect
    snapshots use independent clone/reflink/copy artifacts, never hardlinks (11_shell.md). Drain, fsync, seal, and
-   publish the terminal Arrow batch before the controller terminal commitment; report exit code, PIDs, hashes, and the
+   publish the terminal Arrow batch, then record the terminal audit record; report exit code, PIDs, hashes, and the
    enforced supervisor grant revision.
 
 ## Sandbox-denial evidence

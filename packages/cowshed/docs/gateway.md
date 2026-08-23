@@ -90,7 +90,11 @@ the host-global allocator hands that block to the next workspace, so reconcile a
 that holds an endpoint the current project's inventory assigns — but only after confirming no live workspace anywhere
 still claims that identity; two live workspaces on one block is an integrity refusal pointing at
 `cowshed doctor --json`, never a silent eviction. Installs are independent: one workspace that cannot be installed is
-reported, it does not abandon the rest of the project. Gateway absence is exit 5 with:
+reported, it does not abandon the rest of the project. Reconcile is a `cowshed-core` operation
+(`cowshed_core::gateway_sessions::reconcile_native_project(&repo_id)`, with `reconcile_project` /
+`reconcile_against_status` over the `GatewayControl` and `SessionInventory` seams for injected hosts); the CLI is one
+caller, and a runtime that embeds the controller calls the same function before its own installs. Gateway absence is
+exit 5 with:
 
 ```text
 next: launchctl kickstart -k gui/<uid>/dev.cowshed.gateway

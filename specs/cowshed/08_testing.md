@@ -44,8 +44,8 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Job-control encoding, storage unions, and summaries**: numeric job IDs round-trip exactly; stdout/stderr codecs
   remain separate. Goldens cover every `OutputStorage`/`ProtectedOutput` discriminant, exact counts/SHA-256, bounded
   tagged inline JSON, flattened Arrow validity, and deterministic bounded redacted summaries. Protected Arrow may carry
-  bounded inline Binary; controller commitment Arrow must contain counts/hashes/batch digests but no payload/path
-  fields. `job_id` joins standard trace identity and never substitutes for `span_id`.
+  bounded inline Binary; controller audit Arrow must contain counts/hashes/batch digests but no payload/path fields.
+  `job_id` joins standard trace identity and never substitutes for `span_id`.
 - **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe
   `ensure`/`attach`; `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant
   reads; only `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy.
@@ -81,8 +81,8 @@ No mounts, no root, no network — pure functions with table-driven cases:
   capture claim. Spies forbid regex sniffing, polling/tailing, path reopen, and every hardlink operation.
 - **Job-output quota state machine**: combined accounting includes protected plus in-flight bytes across memory,
   promotion, ordinary capture, and eligible redirect descriptors. It admits no byte beyond the exact boundary and
-  transitions once to `output-limit`; tests pin TERM→grace→KILL→drain→seal→terminal-commitment ordering and distinguish
-  timeout/signal/exit.
+  transitions once to `output-limit`; tests pin TERM→grace→KILL→drain→seal→terminal-audit-record ordering and
+  distinguish timeout/signal/exit.
 
 ## Property tests (proptest, pure, all platforms)
 
@@ -105,8 +105,9 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 - **Stateless restore recovery boundaries**: interrupt after undo-sidecar publication, each image/CA-key swap and
   rename, each canonical/undo parent fsync, pending metadata rename/fsync, staged-metadata removal, and final parent
   fsync. Restart twice from every fixture. Recovery must derive rollback/forward state only from APFS image, detached
-  metadata, grant/CA, and `.restore.json` facts; converge idempotently; publish at most one restore commitment; accept
-  only the corresponding token/incarnation; and leave no `.restore-fences`, runtime journal, or second mutable fact.
+  metadata, grant/CA, and `.restore.json` facts; converge idempotently; accept only the corresponding token/incarnation;
+  and leave no `.restore-fences`, runtime journal, or second mutable fact (the restore audit record may be emitted more
+  than once across retries — it gates nothing).
 
 ## Integration tests (real substrate)
 
@@ -153,10 +154,10 @@ Covered flows:
   not fall back to direct execution. Run the fixture after the composite action has returned and with cwd already inside
   the mount, proving neither mechanism supplies interception.
 - **workspace-local job allocation across restart**: submit multiple execs, assert each accepted submission appends a
-  protected allocation batch and controller admission commitment before spawn, receives a unique strictly increasing
-  numeric ID, and does not eagerly create `out`/`err`. Restart the supervisor, reconcile complete protected records,
-  controller commitments, and inherited spill names, then assert the next ID exceeds every prior allocation. Duplicate
-  or contradictory allocations are `Integrity`, never reused.
+  protected allocation batch and the admission audit record before spawn, receives a unique strictly increasing numeric
+  ID, and does not eagerly create `out`/`err`. Restart the supervisor, reconcile complete protected records and
+  inherited spill names, then assert the next ID exceeds every prior allocation. Duplicate or contradictory allocations
+  are `Integrity`, never reused.
 - **lazy stream representation and summary surfaces**: run below-inline-limit commands emitting distinct invalid UTF-8
   and secret fixtures independently to stdout/stderr. Assert no per-job stream files exist, protected terminal Arrow
   columns hold separate Binary values, and both `StreamInfo`s are `Captured/Inline` with exact counts/SHA-256 and
@@ -166,8 +167,8 @@ Covered flows:
 - **bounded JSON and representation-transparent reads**: core/CLI/NAPI/MCP goldens pin `{storage,bytes,sha256,summary}`
   and every captured/redirect × inline/file discriminant. Valid UTF-8 serializes as `{encoding:"utf8",data}`, other
   bytes as `{encoding:"base64",data}`; both decoders enforce the decoded inline bound and preserve bytes exactly.
-  Ordinary `JobInfo` JSON permits this bounded union, while controller commitments reject every payload/path field. File
-  variants have no inline data and inline variants invent no path. Logs/follow/reconnect/ checkpoint readers return
+  Ordinary `JobInfo` JSON permits this bounded union, while controller audit records reject every payload/path field.
+  File variants have no inline data and inline variants invent no path. Logs/follow/reconnect/ checkpoint readers return
   identical raw bytes without caller representation branches.
 - **supervisor grant-revision cutover**: start a long-running job at revision N, apply an effective filesystem grant or
   revoke, and assert the enclosing supervisor drains and is relaunched at N+1 before the next exec. The running job
@@ -217,31 +218,35 @@ Covered flows:
   one-shots, and descendants. Before any such code runs, assert the child restriction denies create/open-write/truncate/
   replace/rename/unlink/link/metadata mutation beneath `.cowshed/job/**`, inherited writable protected FDs, and symlink,
   hardlink, bind-mount, alternate-spelling, and `/proc` reach-arounds. The trusted supervisor alone can append.
-- **tiered authority and commitment channel**: prove the writer capability is close-on-exec/non-inheritable. Round-trip
-  exact Admission/Terminal/Checkpoint/Fork/Restore variants. Controller Arrow carries only the frozen identity/order/
-  lineage/state/count/hash/batch-digest fields; adding `inline_bytes`, `protected_path`, `source_path`, summary, or raw
-  payload rejects. Protected Arrow round-trips exact Job/CheckpointManifest variants and rejects tag/null mismatches.
-  Mutate/delete protected artifacts, forge controller rows, alter complete frames, contradict lineage, and remove each
-  side in turn: status/read/restore/publication returns typed `Integrity`, preserves both sides, and never picks
-  outside/newer. Only an incomplete trailing frame is discardable; its retained `batch_sha256` appears in recovery.
-- **commitment collection validation**: feed the same fixtures through constructors, Arrow, and JSON with
-  `CommitmentPriorContext`. Require positive globally unique `order`, strict contiguity across immutable segment
-  publication, admission before the sole terminal, existing checkpoint/fork/restore sources, and acyclic incarnation
-  lineage. Duplicate/regressed/gapped order, terminal-before-admission, duplicate terminal, missing source, repo
-  mismatch, and cycles are `Integrity`; derive-only decoding may not bypass collection validation.
+- **audit sink and record channel**: prove the writer capability is close-on-exec/non-inheritable. Round-trip exact
+  Admission/Terminal/Checkpoint/Fork/Restore variants through the Arrow sink (one sealed segment per record,
+  writer-local order, private mode, temporary cleaned on a crash before rename, sealed segment kept on a crash after),
+  through `off`, and through an injected sink whose refusals surface as `doctor` health, never as a failed act.
+  Controller Arrow carries only the frozen identity/order/ lineage/state/count/hash/batch-digest fields; adding
+  `inline_bytes`, `protected_path`, `source_path`, summary, or raw payload rejects. Protected Arrow round-trips exact
+  Job/CheckpointManifest variants and rejects tag/null mismatches. Mutate/delete protected artifacts, forge controller
+  rows, alter complete frames, contradict lineage, and remove each side in turn: status/read/restore/publication returns
+  typed `Integrity`, preserves both sides, and never picks outside/newer. Only an incomplete trailing frame is
+  discardable; its retained `batch_sha256` appears in recovery.
+- **lineage authorizes inherited records**: open a records file containing frames from the workspace's marker lineage
+  and assert it opens; a frame from an incarnation outside the lineage is `Integrity`; a marker written before lineage
+  was recorded is healed once from the foreign origins already in its records and is strict afterwards; fork and restore
+  write the clone source's incarnation followed by the source's own lineage into the new marker; a marker from another
+  repository is never an ancestor.
 - **checkpoint barrier and resident bytes**: checkpoint while two jobs have below-inline-limit bytes only in supervisor
   memory and another appends to a spill. Assert admission/artifact mutation pauses and every running prefix promotes and
   fsyncs. The exact
   `CheckpointManifestRecord { version,repo_id,origin_incarnation,barrier_id,visible_jobs, records_sha256 }` is the
   complete manifest batch; each visible stream has exact storage kind/count/hash/path and path iff file. Clone while
-  held, then publish matching
-  `CheckpointCommitment { version,order,repo_id,origin_incarnation,checkpoint_id,barrier_id,manifest_batch_sha256 }`.
-  Restore exposes exactly this boundary: terminal inline bytes resolve through prefix Job rows, running bytes through
-  files, and no checkpointed byte remains only in process memory.
+  held, then record the matching
+  `CheckpointCommitment { version,order,repo_id,origin_incarnation,checkpoint_id,barrier_id,manifest_batch_sha256 }`
+  audit record. Restore exposes exactly this boundary: terminal inline bytes resolve through prefix Job rows, running
+  bytes through files, and no checkpointed byte remains only in process memory.
 - **combined job-output quota**: race separate stdout/stderr writers through memory and file promotion. Assert one exact
   crossing over protected plus in-flight bytes, no post-boundary payload retention, process-group TERM/grace/KILL, both
-  pipes drained without deadlock, artifact sealing before terminal commitment, and explicit `outputLimit`. Repeat at
-  exact-limit, one-byte-over, disconnected, backgrounded, soft-timeout, hard-timeout, inline/file, and redirect edges.
+  pipes drained without deadlock, artifact sealing before the terminal audit record, and explicit `outputLimit`. Repeat
+  at exact-limit, one-byte-over, disconnected, backgrounded, soft-timeout, hard-timeout, inline/file, and redirect
+  edges.
 - **redirect and publication isolation**: AST-proven simple literal `>`/`2>` may become `Redirect` only with a
   supervisor-controlled actual writable descriptor and identical exact quota accounting. Assert post-terminal
   clone/reflink/copy creates an independent protected artifact, `source` mutation cannot change it, and polling/tailing/

@@ -96,9 +96,9 @@ a stream needs file backing, rather than once per job. Representation-transparen
 writer to the protected subtree. Every executed shell, named session, and descendant receives a child restriction before
 repository-controlled startup; complete record batches and sealed spill files are immutable.
 
-Control messages, N-API objects, MCP results, JSON envelopes, and controller Arrow commitments never duplicate unbounded
-raw output. A bounded `JobInfo` carries lifecycle metadata, `StreamInfo`, byte counts, hashes, redacted summaries, and
-may carry small `Inline.data` bytes tagged as `utf8` or `base64`. Larger or live output remains a handle. Full-fidelity
+Control messages, N-API objects, MCP results, JSON envelopes, and controller audit records never duplicate unbounded raw
+output. A bounded `JobInfo` carries lifecycle metadata, `StreamInfo`, byte counts, hashes, redacted summaries, and may
+carry small `Inline.data` bytes tagged as `utf8` or `base64`. Larger or live output remains a handle. Full-fidelity
 output of any size is available through explicit raw byte streams returned by `cowshed job logs`, `cowshed job attach`,
 or artifact-read APIs, with stdout and stderr kept separate.
 
@@ -111,10 +111,10 @@ binary calls reject missing, oversized, unsolicited, or length-mismatched frames
 base64/JSON-array allocation while the bounded actor/channel supplies backpressure.
 
 Protected in-volume Arrow records and canonical `Inline`/`File` artifacts are captured-content authority for their
-originating incarnation/checkpoint snapshot. Controller Arrow stores compact commitments to job existence, lifecycle,
-ordering, fork/restore lineage, terminal state, terminal-batch digest, stream byte counts, and stream hashes. It stores
-no artifact payload or path authority. A missing committed artifact or digest mismatch is a typed integrity failure, not
-a last-writer-wins repair.
+originating incarnation/checkpoint snapshot. The controller's audit records carry compact telemetry of job existence,
+lifecycle, ordering, fork/restore lineage, terminal state, terminal-batch digest, stream byte counts, and stream hashes;
+they store no artifact payload or path and are never read for a decision. A missing artifact or digest mismatch inside
+the image is a typed integrity failure, not a last-writer-wins repair.
 
 A configurable combined stdout-plus-stderr quota defaults to 1 GiB and counts persisted plus read-but-not-yet-persisted
 bytes. At the first crossing, the supervisor atomically stops accepting payload past the boundary, sends TERM to the
@@ -143,6 +143,17 @@ supervisor's pipes without this proven representation are not in the job handle.
 post-terminal from the canonical protected artifact through an independent clone/reflink/copy and atomic rename. They do
 not change `StreamInfo.storage` and are never used for reads or authority. Publication failure is a typed operational
 error and does not rewrite the already-established process exit or output-limit state. Neither path uses hardlinks.
+
+## Embedding the controller
+
+A Rust host that embeds `cowshed-core` directly — a supervising runtime rather than the CLI — opens a project with
+`ProjectRuntime::open_existing_with_audit(root, ContinuityAudit::External(Box::new(sink)))`, where `sink` implements
+`cowshed_core::storage::audit::AuditSink` (`record(CommitmentDraft) -> Result<(), AuditSinkError>` plus a short
+`name()`); the same typed records the Arrow sink would seal then go wherever the host keeps its durable log. The host
+never needs the Arrow files. Before installing workspace sessions it calls
+`cowshed_core::gateway_sessions::reconcile_native_project(&repo_id)` (or `reconcile_project` over its own
+`GatewayControl`/`SessionInventory`) so a stale session of a deleted project cannot hold the endpoint; authority for
+every decision is the image inventory, the grants files, and the controller lock — no log is replayed.
 
 ## MCP authority delivery
 
