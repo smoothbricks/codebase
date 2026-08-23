@@ -113,7 +113,10 @@ pub struct ArtifactConfig {
     pub supervisor_buffer_budget_bytes: usize,
     pub combined_output_quota_bytes: u64,
     pub retained_recovery_budget_bytes: usize,
-    pub admitted_historical_incarnations: BTreeSet<WorkspaceIncarnation>,
+    /// The workspace's ancestor incarnations, from its marker lineage: every fork and restore
+    /// clones the source image, so a records file legitimately holds frames the ancestors wrote.
+    /// A frame from any other incarnation is an integrity fault.
+    pub historical_incarnations: BTreeSet<WorkspaceIncarnation>,
 }
 
 impl ArtifactConfig {
@@ -144,7 +147,7 @@ impl Default for ArtifactConfig {
             supervisor_buffer_budget_bytes: 8 * 1024 * 1024,
             combined_output_quota_bytes: 1024 * 1024 * 1024,
             retained_recovery_budget_bytes: 64 * 1024 * 1024,
-            admitted_historical_incarnations: BTreeSet::new(),
+            historical_incarnations: BTreeSet::new(),
         }
     }
 }
@@ -540,13 +543,13 @@ impl ArtifactStore {
             }
             if frame.record.origin_incarnation() != &workspace_incarnation
                 && !config
-                    .admitted_historical_incarnations
+                    .historical_incarnations
                     .contains(frame.record.origin_incarnation())
             {
                 return Err(ArtifactError::Integrity {
                     offset: 0,
                     message: format!(
-                        "record incarnation {} is neither current nor controller-admitted history",
+                        "record incarnation {} is neither current nor in the workspace's lineage",
                         frame.record.origin_incarnation()
                     ),
                 });
@@ -1905,6 +1908,30 @@ fn reject_hardlink(_path: &Path, _metadata: &fs::Metadata) -> Result<(), Artifac
 
 fn records_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".cowshed/job/records.arrow")
+}
+
+/// Every incarnation other than `current` that wrote a frame into this workspace's records.
+///
+/// Only the one-time lineage heal reads this: a marker written before lineage was recorded has
+/// nothing to say about its ancestors, and the records it carries were admitted under the
+/// controller that wrote them, so their origins are exactly the lineage such a marker would have
+/// carried. New markers never need it — the clone source's marker already names the lineage.
+pub fn recorded_historical_incarnations(
+    workspace_root: &Path,
+    current: &WorkspaceIncarnation,
+    retained_recovery_budget_bytes: usize,
+) -> Result<BTreeSet<WorkspaceIncarnation>, ArtifactError> {
+    let recovery = recover_records_with_budget(
+        &records_path(workspace_root),
+        retained_recovery_budget_bytes,
+    )?;
+    Ok(recovery
+        .frames
+        .iter()
+        .map(|frame| frame.record.origin_incarnation())
+        .filter(|origin| *origin != current)
+        .cloned()
+        .collect())
 }
 fn verify_records_layout(path: &Path) -> Result<(), ArtifactError> {
     let job_root = path
@@ -3393,22 +3420,11 @@ pub fn controller_commitments_to_batch(
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
-/// Decode one controller commitment batch and validate it as a contiguous continuation of
-/// `prior`.
-pub fn controller_commitments_from_batch(
-    batch: &RecordBatch,
-    prior: &CommitmentPriorContext,
-) -> Result<Vec<ControllerCommitment>, ArtifactError> {
-    let values = decode_controller_commitments(batch)?;
-    validate_commitments(prior, &values)?;
-    Ok(values)
-}
-
-/// Decode one controller commitment batch, validating every row on its own.
+/// Decode one controller audit batch, validating every row on its own.
 ///
-/// Sequence validity (order contiguity, lineage, admission-before-terminal) is the caller's job:
-/// replay folds each decoded segment into the running context exactly once, so validating the
-/// row against a copy of that context here would make recovery quadratic in history length.
+/// The audit records are telemetry: nothing replays them for a decision, so there is no
+/// cross-row sequence validation here — a reader that wants ordering sorts by `order`
+/// within a writer and by segment name across writers.
 pub fn decode_controller_commitments(
     batch: &RecordBatch,
 ) -> Result<Vec<ControllerCommitment>, ArtifactError> {
@@ -3603,417 +3619,6 @@ fn require_variant_columns(
     Ok(())
 }
 
-#[derive(Clone, Debug, Default)]
-struct RepositoryCommitmentContext {
-    active_incarnations: BTreeSet<WorkspaceIncarnation>,
-    introduced_incarnations: BTreeSet<WorkspaceIncarnation>,
-    retired_incarnations: BTreeSet<WorkspaceIncarnation>,
-    admissions: BTreeMap<DurableJobKey, u64>,
-    terminals: BTreeSet<DurableJobKey>,
-    checkpoints: BTreeMap<String, WorkspaceIncarnation>,
-    last_barriers: BTreeMap<WorkspaceIncarnation, u64>,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DurableJobKey {
-    workspace_incarnation: WorkspaceIncarnation,
-    job_id: JobId,
-}
-
-#[derive(Clone, Debug)]
-pub struct CommitmentPriorContext {
-    last_order: u64,
-    repositories: BTreeMap<RepoId, RepositoryCommitmentContext>,
-}
-
-impl CommitmentPriorContext {
-    pub fn new(
-        repo_id: RepoId,
-        known_incarnations: impl IntoIterator<Item = WorkspaceIncarnation>,
-    ) -> Self {
-        let repository = RepositoryCommitmentContext {
-            active_incarnations: known_incarnations.into_iter().collect(),
-            ..RepositoryCommitmentContext::default()
-        };
-        Self {
-            last_order: 0,
-            repositories: BTreeMap::from([(repo_id, repository)]),
-        }
-    }
-
-    pub(crate) fn empty() -> Self {
-        Self {
-            last_order: 0,
-            repositories: BTreeMap::new(),
-        }
-    }
-
-    pub(crate) fn merge_verified_active(&mut self, baseline: &Self) {
-        for (repo_id, baseline_repository) in &baseline.repositories {
-            self.repositories
-                .entry(repo_id.clone())
-                .or_default()
-                .active_incarnations
-                .extend(baseline_repository.active_incarnations.iter().cloned());
-        }
-    }
-
-    pub fn last_order(&self) -> u64 {
-        self.last_order
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn admitted_lifecycle_incarnations(
-        &self,
-        repo_id: &RepoId,
-    ) -> BTreeSet<WorkspaceIncarnation> {
-        self.repositories
-            .get(repo_id)
-            .map(|repository| repository.introduced_incarnations.clone())
-            .unwrap_or_default()
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn is_introduced(
-        &self,
-        repo_id: &RepoId,
-        incarnation: &WorkspaceIncarnation,
-    ) -> bool {
-        self.repositories
-            .get(repo_id)
-            .is_some_and(|repository| repository.introduced_incarnations.contains(incarnation))
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn is_retired(&self, repo_id: &RepoId, incarnation: &WorkspaceIncarnation) -> bool {
-        self.repositories
-            .get(repo_id)
-            .is_some_and(|repository| repository.retired_incarnations.contains(incarnation))
-    }
-}
-
-/// Validate `commitments` as a contiguous continuation of `prior` and return the resulting
-/// context, leaving `prior` untouched on failure.
-pub fn validate_commitments(
-    prior: &CommitmentPriorContext,
-    commitments: &[ControllerCommitment],
-) -> Result<CommitmentPriorContext, ArtifactError> {
-    let mut context = prior.clone();
-    apply_commitments(&mut context, commitments)?;
-    Ok(context)
-}
-
-/// Fold `commitments` into `context` in place.
-///
-/// This is the replay primitive: recovery folds thousands of single-row segments into one
-/// accumulating context, and cloning that context per segment makes recovery quadratic in history
-/// length. A failed fold leaves `context` partially advanced, so callers that must keep a valid
-/// state on failure fold into a copy (`validate_commitments`) and discard it.
-pub(crate) fn apply_commitments(
-    context: &mut CommitmentPriorContext,
-    commitments: &[ControllerCommitment],
-) -> Result<(), ArtifactError> {
-    for commitment in commitments {
-        commitment.validate()?;
-        let expected_order =
-            context
-                .last_order
-                .checked_add(1)
-                .ok_or_else(|| ArtifactError::Integrity {
-                    offset: 0,
-                    message: "controller commitment order overflow".into(),
-                })?;
-        if commitment.order() != expected_order {
-            return Err(ArtifactError::Integrity {
-                offset: 0,
-                message: "controller commitment order is not contiguous".into(),
-            });
-        }
-        context.last_order = commitment.order();
-        let repository = context
-            .repositories
-            .entry(commitment.repo_id().clone())
-            .or_default();
-        match commitment {
-            ControllerCommitment::WorkspaceIntroduced(value) => {
-                if repository
-                    .introduced_incarnations
-                    .contains(&value.workspace_incarnation)
-                    || repository
-                        .retired_incarnations
-                        .contains(&value.workspace_incarnation)
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message:
-                            "workspace incarnation is introduced more than once or after retirement"
-                                .into(),
-                    });
-                }
-                repository
-                    .introduced_incarnations
-                    .insert(value.workspace_incarnation.clone());
-                repository
-                    .active_incarnations
-                    .insert(value.workspace_incarnation.clone());
-            }
-            ControllerCommitment::WorkspaceRetired(value) => {
-                if repository
-                    .retired_incarnations
-                    .contains(&value.workspace_incarnation)
-                    || !repository
-                        .active_incarnations
-                        .remove(&value.workspace_incarnation)
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "workspace retirement has no active source or is duplicated"
-                            .into(),
-                    });
-                }
-                repository
-                    .retired_incarnations
-                    .insert(value.workspace_incarnation.clone());
-            }
-            ControllerCommitment::Admission(value) => {
-                if !repository
-                    .active_incarnations
-                    .contains(&value.workspace_incarnation)
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "job admission references an unknown incarnation".into(),
-                    });
-                }
-                let key = DurableJobKey {
-                    workspace_incarnation: value.workspace_incarnation.clone(),
-                    job_id: value.job_id,
-                };
-                if repository
-                    .admissions
-                    .insert(key, value.grant_revision)
-                    .is_some()
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "job has more than one admission commitment".into(),
-                    });
-                }
-            }
-            ControllerCommitment::Terminal(value) => {
-                if !repository
-                    .active_incarnations
-                    .contains(&value.workspace_incarnation)
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "terminal commitment references an unknown or retired workspace"
-                            .into(),
-                    });
-                }
-                let key = DurableJobKey {
-                    workspace_incarnation: value.workspace_incarnation.clone(),
-                    job_id: value.job_id,
-                };
-                let Some(grant_revision) = repository.admissions.get(&key) else {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "terminal commitment precedes job admission".into(),
-                    });
-                };
-                if *grant_revision != value.grant_revision {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "terminal grant revision differs from admission".into(),
-                    });
-                }
-                if !repository.terminals.insert(key) {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "job has more than one terminal commitment".into(),
-                    });
-                }
-            }
-            ControllerCommitment::Checkpoint(value) => {
-                if !repository
-                    .active_incarnations
-                    .contains(&value.origin_incarnation)
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "checkpoint references an unknown origin incarnation".into(),
-                    });
-                }
-                let previous = repository
-                    .last_barriers
-                    .entry(value.origin_incarnation.clone())
-                    .or_insert(0);
-                if value.barrier_id <= *previous {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "checkpoint barrier is not monotonic for its origin".into(),
-                    });
-                }
-                *previous = value.barrier_id;
-                if repository
-                    .checkpoints
-                    .insert(
-                        value.checkpoint_id.clone(),
-                        value.origin_incarnation.clone(),
-                    )
-                    .is_some()
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "checkpoint id is not unique within its repository".into(),
-                    });
-                }
-            }
-            ControllerCommitment::Fork(value) => {
-                if !repository
-                    .active_incarnations
-                    .contains(&value.source_incarnation)
-                    || repository
-                        .introduced_incarnations
-                        .contains(&value.destination_incarnation)
-                    || repository
-                        .retired_incarnations
-                        .contains(&value.destination_incarnation)
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "fork lineage parent is absent or destination already exists"
-                            .into(),
-                    });
-                }
-                repository
-                    .introduced_incarnations
-                    .insert(value.destination_incarnation.clone());
-                repository
-                    .active_incarnations
-                    .insert(value.destination_incarnation.clone());
-            }
-            ControllerCommitment::Restore(value) => {
-                if repository.checkpoints.get(&value.source_checkpoint)
-                    != Some(&value.source_incarnation)
-                    || !repository
-                        .active_incarnations
-                        .contains(&value.replaced_incarnation)
-                    || repository
-                        .active_incarnations
-                        .contains(&value.destination_incarnation)
-                    || repository
-                        .introduced_incarnations
-                        .contains(&value.destination_incarnation)
-                    || repository
-                        .retired_incarnations
-                        .contains(&value.destination_incarnation)
-                {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message:
-                            "restore lineage checkpoint is absent, replaced incarnation is not active, or destination already exists"
-                                .into(),
-                    });
-                }
-                repository
-                    .active_incarnations
-                    .remove(&value.replaced_incarnation);
-                repository
-                    .retired_incarnations
-                    .insert(value.replaced_incarnation.clone());
-                repository
-                    .introduced_incarnations
-                    .insert(value.destination_incarnation.clone());
-                repository
-                    .active_incarnations
-                    .insert(value.destination_incarnation.clone());
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn reconcile_commitments(
-    recovery: &RecoveryReport,
-    prior: &CommitmentPriorContext,
-    commitments: &[ControllerCommitment],
-) -> Result<CommitmentPriorContext, ArtifactError> {
-    let context = validate_commitments(prior, commitments)?;
-    for commitment in commitments {
-        match commitment {
-            ControllerCommitment::Admission(value) => {
-                let matched = recovery.frames.iter().any(|frame| {
-                    matches!(
-                        &frame.record,
-                        ProtectedRecord::Job(record)
-                            if record.repo_id == value.repo_id
-                                && record.workspace_incarnation == value.workspace_incarnation
-                                && record.job_id == value.job_id
-                                && record.grant_revision == value.grant_revision
-                                && record.state == JobState::Running
-                    )
-                });
-                if !matched {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "admission commitment has no protected admission record".into(),
-                    });
-                }
-            }
-            ControllerCommitment::Terminal(value) => {
-                let matched = recovery.frames.iter().any(|frame| {
-                    matches!(
-                        &frame.record,
-                        ProtectedRecord::Job(record)
-                            if frame.batch_sha256 == value.batch_sha256
-                                && record.repo_id == value.repo_id
-                                && record.workspace_incarnation == value.workspace_incarnation
-                                && record.job_id == value.job_id
-                                && record.state == value.state
-                                && record.grant_revision == value.grant_revision
-                                && record.stdout.bytes == value.stdout_bytes
-                                && record.stdout.sha256 == value.stdout_sha256
-                                && record.stderr.bytes == value.stderr_bytes
-                                && record.stderr.sha256 == value.stderr_sha256
-                                && record.output_limit == value.output_limit
-                    )
-                });
-                if !matched {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "terminal commitment does not match protected batch and streams"
-                            .into(),
-                    });
-                }
-            }
-            ControllerCommitment::Checkpoint(value) => {
-                let matched = recovery.frames.iter().any(|frame| {
-                    matches!(
-                        &frame.record,
-                        ProtectedRecord::CheckpointManifest(record)
-                            if frame.batch_sha256 == value.manifest_batch_sha256
-                                && record.repo_id == value.repo_id
-                                && record.origin_incarnation == value.origin_incarnation
-                                && record.barrier_id == value.barrier_id
-                    )
-                });
-                if !matched {
-                    return Err(ArtifactError::Integrity {
-                        offset: 0,
-                        message: "checkpoint commitment does not match protected manifest".into(),
-                    });
-                }
-            }
-            ControllerCommitment::WorkspaceIntroduced(_)
-            | ControllerCommitment::WorkspaceRetired(_)
-            | ControllerCommitment::Fork(_)
-            | ControllerCommitment::Restore(_) => {}
-        }
-    }
-    Ok(context)
-}
-
 fn require_job_columns(batch: &RecordBatch, row: usize) -> Result<(), ArtifactError> {
     const REQUIRED: &[usize] = &[
         3, 4, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 25, 32,
@@ -4058,9 +3663,6 @@ fn require_protected_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::dto::{
-        AdmissionCommitment, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment, RestoreCommitment,
-    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn repo() -> RepoId {
@@ -4399,7 +4001,7 @@ mod tests {
             repo(),
             incarnation(),
             ArtifactConfig {
-                admitted_historical_incarnations: BTreeSet::from([historical]),
+                historical_incarnations: BTreeSet::from([historical]),
                 ..ArtifactConfig::default()
             },
         )
@@ -4420,6 +4022,64 @@ mod tests {
         reopened.checkpoint(8).unwrap();
         drop(reopened);
         fs::remove_dir_all(current_root).unwrap();
+    }
+
+    #[test]
+    fn recorded_historical_incarnations_names_every_foreign_origin_once_and_never_current() {
+        let ancestor = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let older = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let root = temp_root("recorded-origins");
+        // Frames arrive the way a clone's records file accumulates them: each ancestor ran jobs
+        // under its own incarnation, then the image was cloned and the next incarnation ran more.
+        let mut lineage = BTreeSet::new();
+        for origin in [&older, &ancestor, &ancestor] {
+            let mut store = ArtifactStore::open(
+                &root,
+                repo(),
+                origin.clone(),
+                ArtifactConfig {
+                    historical_incarnations: lineage.clone(),
+                    ..ArtifactConfig::default()
+                },
+            )
+            .unwrap();
+            let next = store.next_job_id().unwrap();
+            let token = store
+                .begin_job(next, 1, &["true".into()], OutputTargets::default())
+                .unwrap();
+            store.finish(token, JobState::Exited).unwrap();
+            lineage.insert(origin.clone());
+        }
+        let recorded = recorded_historical_incarnations(
+            &root,
+            &incarnation(),
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap();
+        assert_eq!(recorded, BTreeSet::from([ancestor.clone(), older]));
+        let own = recorded_historical_incarnations(
+            &root,
+            &ancestor,
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap();
+        assert!(
+            !own.contains(&ancestor),
+            "the current incarnation is never its own ancestor"
+        );
+        let empty_root = temp_root("recorded-origins-empty");
+        assert!(
+            recorded_historical_incarnations(
+                &empty_root,
+                &incarnation(),
+                ArtifactConfig::default().retained_recovery_budget_bytes,
+            )
+            .unwrap()
+            .is_empty(),
+            "a workspace without records has no recorded ancestors"
+        );
+        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(empty_root);
     }
 
     #[test]
@@ -4535,33 +4195,6 @@ mod tests {
             Err(ArtifactError::Io { .. })
         ));
         fs::remove_dir_all(root).unwrap();
-    }
-
-    fn admission(order: u64) -> ControllerCommitment {
-        ControllerCommitment::Admission(AdmissionCommitment {
-            version: CONTROLLER_COMMITMENT_VERSION,
-            order,
-            repo_id: repo(),
-            workspace_incarnation: incarnation(),
-            job_id: JobId::new(1).unwrap(),
-            grant_revision: 1,
-        })
-    }
-
-    #[test]
-    fn commitment_order_rejects_gaps_and_overflow() {
-        let prior = CommitmentPriorContext::new(repo(), [incarnation()]);
-        assert!(matches!(
-            validate_commitments(&prior, &[admission(2)]),
-            Err(ArtifactError::Integrity { .. })
-        ));
-
-        let mut exhausted = prior;
-        exhausted.last_order = u64::MAX;
-        assert!(matches!(
-            validate_commitments(&exhausted, &[admission(u64::MAX)]),
-            Err(ArtifactError::Integrity { .. })
-        ));
     }
 
     #[test]
@@ -4868,84 +4501,5 @@ mod tests {
         assert!(!records_path(&root).exists());
         drop(store);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn commitment_validation_rejects_missing_ids_and_checkpoint_lineage() {
-        let prior = CommitmentPriorContext::new(repo(), [incarnation()]);
-        let digest = Sha256Digest::compute(b"digest");
-        let terminal = ControllerCommitment::Terminal(TerminalCommitment {
-            version: CONTROLLER_COMMITMENT_VERSION,
-            order: 1,
-            repo_id: repo(),
-            workspace_incarnation: incarnation(),
-            job_id: JobId::new(1).unwrap(),
-            state: JobState::Exited,
-            grant_revision: 1,
-            stdout_bytes: 0,
-            stdout_sha256: Sha256Digest::compute(&[]),
-            stderr_bytes: 0,
-            stderr_sha256: Sha256Digest::compute(&[]),
-            batch_sha256: digest,
-            output_limit: None,
-        });
-        assert!(matches!(
-            validate_commitments(&prior, &[terminal]),
-            Err(ArtifactError::Integrity { .. })
-        ));
-
-        let invalid_id = ControllerCommitment::Checkpoint(CheckpointCommitment {
-            version: CONTROLLER_COMMITMENT_VERSION,
-            order: 1,
-            repo_id: repo(),
-            origin_incarnation: incarnation(),
-            checkpoint_id: String::new(),
-            barrier_id: 1,
-            manifest_batch_sha256: digest,
-        });
-        assert!(matches!(
-            validate_commitments(&prior, &[invalid_id]),
-            Err(ArtifactError::Dto(_))
-        ));
-
-        let destination = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let missing_lineage = ControllerCommitment::Restore(RestoreCommitment {
-            version: CONTROLLER_COMMITMENT_VERSION,
-            order: 1,
-            repo_id: repo(),
-            source_checkpoint: "absent".into(),
-            source_incarnation: incarnation(),
-            replaced_incarnation: incarnation(),
-            destination_incarnation: destination,
-        });
-        assert!(matches!(
-            validate_commitments(&prior, &[missing_lineage]),
-            Err(ArtifactError::Integrity { .. })
-        ));
-
-        let checkpoints = [
-            ControllerCommitment::Checkpoint(CheckpointCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order: 1,
-                repo_id: repo(),
-                origin_incarnation: incarnation(),
-                checkpoint_id: "one".into(),
-                barrier_id: 2,
-                manifest_batch_sha256: digest,
-            }),
-            ControllerCommitment::Checkpoint(CheckpointCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order: 2,
-                repo_id: repo(),
-                origin_incarnation: incarnation(),
-                checkpoint_id: "two".into(),
-                barrier_id: 2,
-                manifest_batch_sha256: digest,
-            }),
-        ];
-        assert!(matches!(
-            validate_commitments(&prior, &checkpoints),
-            Err(ArtifactError::Integrity { .. })
-        ));
     }
 }
