@@ -9,14 +9,13 @@ speedup.
 > `@ttsc/unplugin` adapters; there is no parallel TypeScript compiler-API transformer. Promise-preserving fixed-arity
 > span lowering, packed runtime hints, private `u16` log-template storage, and the line, metadata, tag, log, and result
 > transformations are implemented in the native plugin and covered by its Go suite plus Bun integration.
-> Destructured-context rewriting (§3) is **not** implemented: a callback whose first parameter is destructured keeps the
-> public dispatcher path (`packages/lmao-ttsc/plugin/driver/lmao.go:21-24`). `spanAutoN` exists as an internal, explicit
-> runtime seam, but automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a
-> synchronous return would change the public Promise API's observable microtask scheduling. The running invariant is
-> **the transformed output the tests assert**, not earlier design sketches. The global vocabulary ABI in §6.2 is the
-> clean-cutover target, not shipped behavior. The shipped Op-local IDs remain lexical `u16` values, not stable IDs or
-> `VocabularyBinding` indices. No performance improvement is claimed for either representation without its
-> phase-specific benchmark gate.
+> Destructured-context rewriting (§3) is implemented: a first parameter that destructures `span` becomes `__ctx`
+> (`packages/lmao-ttsc/plugin/driver/destructured.go`). `spanAutoN` exists as an internal, explicit runtime seam, but
+> automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return would
+> change the public Promise API's observable microtask scheduling. The running invariant is **the transformed output the
+> tests assert**, not earlier design sketches. The global vocabulary ABI in §6.2 is the clean-cutover target, not
+> shipped behavior. The shipped Op-local IDs remain lexical `u16` values, not stable IDs or `VocabularyBinding` indices.
+> No performance improvement is claimed for either representation without its phase-specific benchmark gate.
 
 ## Bun integration
 
@@ -133,12 +132,19 @@ never stored as a property on the context.
 
 ### 2. Monomorphic span() Rewriting <a id="smoo/lmao!n/transformer-span-rewrite"></a>
 
-The span rewrite (`trySpanRewrite`, `packages/lmao-ttsc/plugin/driver/lmao.go:385-422`) conservatively lowers supported
-calls to the Promise-based `span0`–`span8` ABI. It requires at most eight trailing arguments, a stable receiver
-(`identifier` or `this`) whose checker type is a proven LMAO context, and a checker-proved `Op` represented by a stable
-identifier with LMAO declaration provenance (`plugin/driver/optimization.go:886-896`). The Op's callsite plan and
-function are each read exactly once. An inline arrow or function expression is **not** lowered — it stays on the public
-variadic `span()` dispatcher (`plugin/driver/lmao.go:397-399`).
+The span rewrite (`trySpanRewrite`, `packages/lmao-ttsc/plugin/driver/lmao.go`) conservatively lowers supported calls to
+the Promise-based `span0`–`span8` ABI. It requires at most eight trailing arguments, a stable receiver (`identifier` or
+`this`) whose checker type is a proven LMAO context, and an op position that is one of exactly two proven forms
+(`plugin/driver/optimization.go`, `opSpans`/`fnSpans`):
+
+- a checker-proved `Op` represented by a stable identifier with LMAO declaration provenance. Its callsite plan and
+  function are read from the Op: `op.callsitePlan` and `op.fn`.
+- an inline arrow or function expression. A literal has no callsite plan of its own, so it inherits the RECEIVER's —
+  `receiver._physicalLayoutPlan` — and is itself the function operand. That is what the runtime dispatcher does for a
+  closure target: `resolveSpanTarget` falls back to `self._physicalLayoutPlan` when the target is not an Op
+  (`packages/lmao/src/lib/spanContext.ts:163-185`), and dispatches to the same `spanN`.
+
+A receiver whose checker type is a SUBCLASS of a context type is not a proven context, so both forms decline it.
 
 ```typescript
 // User writes:
@@ -155,6 +161,21 @@ await ctx.span1(
 );
 ```
 
+```typescript
+// User writes:
+await ctx.span('validate', async (child) => child.ok(1), userId);
+
+// Transformer outputs:
+await ctx.span1(
+  42,
+  'validate',
+  ctx._physicalLayoutPlan.newCtx0(ctx),
+  ctx._physicalLayoutPlan,
+  async (child) => child.ok(1),
+  userId
+);
+```
+
 A proven call with a literal span name may lower its name operand to the registered vocabulary index instead of the
 string literal (`plugin/driver/lmao.go:405-407`). The child context is exactly `callsitePlan.newCtx0(receiver)` — the
 plan's prototype-inheriting child constructor (`packages/lmao/src/lib/spanContext.ts:1123-1126`) — not a copied or
@@ -166,9 +187,9 @@ contract.
 The transformer never duplicates an unstable receiver or Op expression. Calls such as
 `getCtx().span('name', getOp(), value)` remain byte-shape calls to the public variadic `span()` dispatcher: receiver and
 Op are each evaluated once in source order, and the returned Promise retains its normal microtask boundary. Other
-bailouts include a missing checker for an Op value, unproved receiver/Op types, more than eight trailing arguments, the
-override form `span(name, overrides, op, ...)`, and any inline function expression. Every bailout preserves the public
-runtime path.
+bailouts include a missing checker for an Op value, unproved receiver/Op types, more than eight trailing arguments, and
+the override form `span(name, overrides, op, ...)` — whose second argument is an object literal and so is neither a
+proven Op nor a closure. Every bailout preserves the public runtime path.
 
 Automatic `spanAutoN` lowering is **not** considered safe merely because a call is directly awaited or returned from an
 `async` function. Although both `Result` and `Promise<Result>` are await-compatible, returning a synchronous `Result`
@@ -208,8 +229,8 @@ Capability analysis is closed-world. It accepts only direct, recognized forms: c
 `ff(...)` or `ff.flag(...)`, direct `span`/`spanSync`/`ok`/`err`/`setScope` calls, and property access through `scope`
 or `deps`. It emits hint `0` if the first parameter is not a simple identifier, the context escapes or is used as a
 value, access is computed/unknown, a nested function is entered, or another use cannot be proven safe. A callback whose
-first parameter is destructured is therefore conservatively hinted as `0`; because §3 rewriting is not implemented, such
-a callback also keeps the public dispatcher for its span calls.
+first parameter is destructured is therefore conservatively hinted as `0`, and stays hinted `0` after §3 rewrites it:
+hint analysis reads the callback as written, so the hint does not depend on the rewrite. Its span calls do lower.
 
 `defineOp` is annotated only when no fourth argument already exists. Its fourth argument is
 `{ runtimeHint, logTemplateIds }`; missing user metadata is represented by an inserted third argument `undefined`.
@@ -231,13 +252,15 @@ and `_logBinding` are always rebound to the child span.
 
 ### 3. Destructured Context Rewriting <a id="smoo/lmao!n/transformer-destructured-context"></a>
 
-**Status: not implemented.** No shipped transformer performs this rewrite
-(`packages/lmao-ttsc/plugin/driver/lmao.go:21-24`); a destructured callback keeps the public dispatcher. The contract
-below is the normative target for the native plugin. For arrow/function literals passed to `op`, `defineOp`,
-`defineOps`, or `task`, a destructured first parameter containing `span` may be replaced with `__ctx`. Other
-destructured properties are rebound as the first body statement, preserving aliases, defaults, and nested bindings.
-Every bare `span(...)` call must support the same Promise-preserving §2 lowering; otherwise the whole function is left
-unchanged.
+The destructured-context pass (`packages/lmao-ttsc/plugin/driver/destructured.go`) replaces a first parameter that
+destructures `span` with `__ctx`, rebinds the remaining properties as the first body statement, and re-roots each bare
+`span(...)` onto `__ctx` so the §2 lowering applies. The pass decides only the receiver; `trySpanRewrite` still emits
+the call, so there is exactly one span lowering in the transform and the two forms cannot drift.
+
+A parameter qualifies when its CHECKER TYPE is a proven LMAO context — not when the literal is passed to a particular
+callee. That is stronger than an `op`/`defineOp`/`defineOps`/`task` whitelist: it cannot admit a same-named foreign
+function, and it admits a proven context a whitelist would miss. Other destructured properties keep their aliases,
+defaults, and nested bindings verbatim, because the binding pattern node is reused minus `span` rather than rebuilt.
 
 ```typescript
 // User writes:
@@ -245,7 +268,7 @@ op(async ({ span, log }, userId) => {
   await span('fetch', fetchUserOp, userId);
 });
 
-// Target output for a stable, checker-proved Op:
+// Transformer outputs, for a stable, checker-proved Op:
 op(async (__ctx, userId) => {
   const { log } = __ctx;
   await __ctx.span1(
@@ -259,10 +282,30 @@ op(async (__ctx, userId) => {
 });
 ```
 
-The whole function is left unchanged if `span` is passed or otherwise used as a value, is shadowed, a rest binding is
-present, `__ctx` would collide, any bare span call cannot be lowered safely, or no `span` binding exists. This all-or-
-nothing preflight prevents a mixed rewrite from changing destructuring semantics. Concise arrow bodies are converted to
-a block with an explicit `return`.
+The whole function is left unchanged if any of these hold. The preflight is all-or-nothing because a partial rewrite
+would change destructuring semantics:
+
+- `span` occurs anywhere other than as the CALLEE of a call — passed as a value, aliased to a local, returned, or
+  re-declared in an inner scope. Shadowing needs no separate rule: a re-declaration's own identifier is not a callee.
+- a rest binding is present. Removing `span` from the pattern would silently move it INTO the rest object.
+- the `span` binding has a default or is a nested pattern, or the context parameter itself has a default or is a rest
+  parameter.
+- `__ctx` already occurs anywhere in the function.
+- any bare `span(...)` call fails the §2 proof — more than eight trailing arguments, or an op position that is neither a
+  checker-proved `Op` identifier nor an inline closure.
+- no `span` binding exists.
+
+Soundness of the re-rooting: the runtime installs `span` as an own property holding a closure over `self`, never over
+`this` (`packages/lmao/src/lib/spanContext.ts:895-1047`), so a callee-position `span(a, b)` is exactly `ctx.span(a, b)`.
+
+A concise arrow body is converted to a block with an explicit `return` only when a rebinding statement must be
+prepended; with no residual properties the body stays concise. Only a destructured PARAMETER is rewritten — a body-level
+`const { span } = ctx` is left alone.
+
+A re-rooted call emits its span name as the string literal, not as a vocabulary index: the whole-program vocabulary
+registers span names only for the member form, so a bare `span(...)` name is never interned. The `spanN` name operand is
+typed `string | number` and accepts either, so this costs the interning, not the lowering. Interning them is a target;
+it moves catalog ordinals, so it is not a free change.
 
 ### 4. `with()` Bulk Setter Unrolling <a id="smoo/lmao!n/transformer-tag-chain-inline"></a>
 
@@ -660,10 +703,10 @@ module.task('processOrder', async (ctx) => {}, 42);
 | ---------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | Stable proven Op span              | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI                                                                                  |
 | Dynamic/unstable Op span           | Public variadic Promise dispatcher    | Unchanged public dispatcher; single evaluation preserved                                                                 |
-| Inline-function span               | Public variadic Promise dispatcher    | Unchanged public dispatcher (inline functions are not lowered)                                                           |
+| Inline-closure span                | Public variadic Promise dispatcher    | Promise-based fixed `span0`–`span8` ABI on the receiver's `_physicalLayoutPlan`                                          |
 | Explicit internal `spanAutoN`      | Not applicable                        | Sync `Ok`/`Err` terminal or Promise retry/thenable fallback; never automatic                                             |
 | `with()` bulk setter               | Object allocation + iteration         | Direct columnar buffer writes                                                                                            |
-| Destructured `span`                | Closure-bound public dispatcher       | Unchanged public dispatcher (§3 not implemented; target: `__ctx` plus fixed-arity lowering)                              |
+| Destructured `span`                | Closure-bound public dispatcher       | `__ctx` parameter plus the same fixed-arity lowering; residual properties rebound in the body                            |
 | Op setup                           | Full context setup, adaptive capacity | Structured compile metadata with packed hint and Op-local templates when analysis is valid                               |
 | Literal Op log message             | String stored per row                 | Shipped: private Op-local `u16`; target: stable message `u24` in a stable fragment, bound to a process-dense Arrow index |
 | Structured operational log         | Runtime object/string work or raw API | Target: checker-proved literal template and fixed-arity field stores; not shipped                                        |
@@ -679,16 +722,17 @@ workload.
 
 ### Detecting Op vs Function <a id="smoo/lmao!n/transformer-detect-op"></a>
 
-The transformer uses the checker to prove the LMAO context receiver and the `Op<...>` second argument. A proven Op is
-lowered to Promise-based `spanN` only when the Op is a stable identifier, so reading its `callsitePlan` and `fn` cannot
-repeat a dynamic expression. Arrow and function expressions, dynamic Op expressions, and unproved types all remain on
-`span()`; `spanAutoN` is never selected automatically.
+The transformer uses the checker to prove the LMAO context receiver and the op position. A proven Op is lowered to
+Promise-based `spanN` only when the Op is a stable identifier, so reading its `callsitePlan` and `fn` cannot repeat a
+dynamic expression. An inline arrow or function expression lowers too, taking its plan from the proven receiver instead
+of the target. Dynamic Op expressions and unproved types remain on `span()`; `spanAutoN` is never selected
+automatically.
 
 ### Synthetic Variable Naming <a id="smoo/lmao!n/transformer-synthetic-naming"></a>
 
-Destructured-context rewriting (§3, target) emits `__ctx` only after proving that name does not occur in the function
-body; the transform is skipped on collision. The tag-chain inliner uses `$$vN` temporaries (`taginline.go:262`) for
-non-literal tag values.
+Destructured-context rewriting (§3) emits `__ctx` only after proving that name does not occur in the function; the
+rewrite is skipped on collision. The tag-chain inliner uses `$$vN` temporaries (`taginline.go:262`) for non-literal tag
+values.
 
 ### Source Maps <a id="smoo/lmao!n/transformer-source-maps"></a>
 

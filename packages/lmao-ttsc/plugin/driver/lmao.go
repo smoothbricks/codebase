@@ -10,18 +10,16 @@
 //
 // Implemented transformations:
 //
-//	§1/§2  span() line injection + monomorphic spanN rewrite (checker-proved Op detection)
+//	§1/§2  span() line injection + monomorphic spanN rewrite, for a checker-proved
+//	       Op reference or an inline closure on a proven context receiver
+//	§3     destructured-context rewriting: a first parameter destructuring `span`
+//	       becomes __ctx, with the remaining properties rebound in the body
 //	§4     tag-chain inlining with schema specialization (enum indices,
 //	       eager/lazy null-bitmap elision)
 //	§5     defineModule() metadata injection (git_sha, package_name, package_file)
 //	§6     .line(N) injection on log/ok/err chains, literal messages encoded as
 //	       vocabulary IDs
 //	§7     task('name', fn) line injection
-//
-// NOT yet ported:
-//
-//	§3     destructured-context rewriting (shipped in the TS transformer;
-//	       needs identifier-binding analysis parity before porting)
 //
 // Column-name contract (spec 01e): emitted hot-path writes always use
 // library-local (unprefixed) column names; prefix/mapColumns remapping is
