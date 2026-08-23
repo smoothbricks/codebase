@@ -49,13 +49,25 @@ publication, and recovery may truncate only an incomplete trailing frame. Sealed
 recovery debris. Missing committed content, an invalid complete frame, or a digest mismatch is an explicit integrity
 failure.
 
-Controller Arrow is the cross-incarnation continuity authority. Its immutable per-writer segments commit job existence,
-lifecycle and terminal state, ordering, fork/restore/checkpoint lineage, grant revision, byte counts, stream SHA-256
-digests, and terminal-batch digest. It never stores inline bytes, spill paths as authority, or duplicated raw payload.
-The content tier and continuity tier therefore complement one another; neither silently overwrites the other on a
-mismatch. Every controller process replays the whole segment history once when it opens the store and afterwards folds
-only segments sealed since its last fold: the history is never pruned into an order gap, so a host that has been running
-for weeks pays for its history once per command, not once per workspace per command.
+Authority is the host inventory, not a log. What workspaces exist, which incarnation each is, which are retired, and
+which ancestors an image was cloned from are read from the images and mounts under `~/.cowshed/`, the marker each image
+carries (`.cowshed/workspace.json`: incarnation and `lineage`, nearest ancestor first — written by the controller when
+it mints the incarnation, because a fork or restore clones the source image together with the job records its ancestors
+wrote, and the lineage is what authorizes those records), the per-workspace grants files, and the controller lock. A
+controller opening a project reads the inventory once and starts; per-command cost does not grow with history.
+
+Controller audit records are telemetry. Every controller act — workspace introduced/retired, job admission and terminal
+state, checkpoint, fork, restore — is emitted as one typed record carrying existence, lifecycle/status, a writer-local
+order, lineage, grant revision, byte counts, stream SHA-256 digests, and terminal-batch digest, never inline bytes,
+spill paths, or duplicated raw payload. Nothing reads them for a decision. The sink is chosen when the project opens
+(`COWSHED_CONTINUITY_AUDIT`): `arrow` (the standalone default) writes one sealed Arrow IPC segment per record under
+`~/.cowshed/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — private mode, fsync, create-new rename,
+directory sync, no lock and no global order because names are unique per writer; `off` writes nothing; and a runtime
+that supervises the controller (Containium) injects its own sink through `ProjectRuntime::open_existing_with_audit`,
+routing the same records into its durable log instead of files. A sink that refuses a record is an `audit-sink` finding
+in `cowshed doctor`, never a failed act. Rollback and omission are therefore after-the-fact questions for the audit
+trail: a restore is a controller verb a workspace cannot perform on itself, so no decision waits on proving one did not
+happen.
 
 Checkpoint publication crosses a supervisor barrier that seals complete batches and spill files and writes a manifest
 covering every checkpoint-resident job byte. Restoring that snapshot mints a new workspace incarnation; controller

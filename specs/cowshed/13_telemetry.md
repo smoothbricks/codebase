@@ -92,37 +92,45 @@ Under interception (05_gateway.md), most granted traffic is request-visible, so 
 Interception makes tier 3 richer than a tunnel would: an intercepted request is workspace-exact **with request-level
 detail** (verb, path, bytes) and an outbound-injected `traceparent`, even when the inbound client is silent.
 
-## Storage: two authority tiers, one Arrow substrate
+## Storage: one authority tier, one audit trail, one Arrow substrate
 
-Cowshed uses Arrow IPC for both tiers, but placement and authority differ:
+Cowshed uses Arrow IPC for both, but placement and authority differ:
 
 - **Protected in-volume evidence** — `.cowshed/job/records.arrow` contains allocation/lifecycle batches, terminal exec
   records, checkpoint manifests, bounded summaries, and small terminal stdout/stderr as Arrow Binary. Larger or
   checkpoint-forced streams spill lazily to protected `.cowshed/job/<job_id>/out|err` files. Complete batches and sealed
   files are authoritative captured-content evidence only within their recorded origin incarnation/checkpoint boundary.
   They are not workspace-writable: the supervisor is the sole live writer and the mandatory child profile denies every
-  mutation beneath `.cowshed/job/**` before repository-controlled startup (04_sandbox.md/11_shell.md).
-- **Controller continuity commitments and telemetry** — lifecycle spans, compact job commitments,
-  checkpoint/fork/restore lineage, gateway audit, grant mutations, autosave/gc/doctor, and debug events flush under
-  `~/.cowshed/telemetry/`. Controller job commitments own existence, lifecycle/status, ordering, lineage, byte counts,
-  and expected hashes. They never contain inline output, a protected artifact path, a redirect source, or any other raw
-  stdout/stderr payload duplication.
-- **Controller immutable per-writer segments** — all projects on a host share one controller commitment segment
-  namespace; it is not partitioned by repository. Authoritative commitments use exactly one Arrow IPC batch containing
-  one row per segment at `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC
-  partition is an exact calendar date and `writer_uuid` is lowercase hyphenated UUID text owned by that controller
-  session. A completed segment is mode `0600`, sealed by create-new atomic rename, parent-directory-fsynced, and never
-  reopened, replaced, or shared for append. Recovery no-follow enumerates exact date partitions and commitment names,
-  rejects links, malformed or duplicate names/orders, and accepts only one globally contiguous order across every
-  repository and date partition. Validation applies each row to the context selected by its `repo_id`; a valid
-  foreign-repository row is not corruption. Unrelated telemetry names and unsealed dot-prefixed temporary names are not
-  commitment authority. Partitioning by day is a query/retention layout, not shared-file append. This rule does not
-  describe the separately locked protected `.cowshed/job/records.arrow` framed stream above.
+  mutation beneath `.cowshed/job/**` before repository-controlled startup (04_sandbox.md/11_shell.md). The workspace
+  marker the image carries (`.cowshed/workspace.json`) names the incarnation and its **lineage** — the ancestor
+  incarnations the image was cloned from, nearest first, written by the controller when it mints the incarnation — and
+  that lineage is what authorizes records an ancestor wrote into a cloned image.
+- **Authority is the host inventory.** What workspaces exist, which incarnation each is, which are retired, which
+  lineage an image carries, and which port block and grants belong to a workspace are read from the images and mounts
+  under `~/.cowshed/`, the per-workspace grants files, and the controller lock. No log is replayed for any of these
+  decisions; a controller that opens a project reads the inventory once and starts.
+- **Controller audit records** — every controller act (workspace introduced/retired, job admission and terminal state,
+  checkpoint, fork, restore) is emitted as one typed `ControllerCommitment` record to an audit sink. The records carry
+  existence, lifecycle/status, a writer-local order, lineage, byte counts, and expected hashes; they never contain
+  inline output, a protected artifact path, a redirect source, or any other raw stdout/stderr payload duplication.
+  **Nothing reads them for a decision.** The sink is selected when the project opens (`COWSHED_CONTINUITY_AUDIT`):
+  `arrow` (default for the standalone CLI) writes sealed per-writer segments under `~/.cowshed/telemetry/`, `off`
+  discards, and a supervising runtime injects its own sink through `ProjectRuntime::open_existing_with_audit`
+  (Containium routes the same records into PTMCART). A sink that refuses a record is a `doctor` finding (`audit-sink`),
+  never a reason to fail the act it describes.
+- **Arrow audit segments** — one Arrow IPC batch containing one row per segment at
+  `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC partition is an exact
+  calendar date, `writer_uuid` is the lowercase hyphenated UUID of the controller process that wrote it, and `order` is
+  that writer's own monotone sequence from 1. A completed segment is mode `0600`, sealed by create-new atomic rename,
+  parent-directory-fsynced, and never reopened, replaced, or shared for append; a crash leaves at most an unsealed
+  dot-prefixed temporary that nothing reads. Concurrent controllers never contend: names are unique by writer, so no
+  lock and no global order exist. Partitioning by day is a query/retention layout, not shared-file append. This rule
+  does not describe the separately locked protected `.cowshed/job/records.arrow` framed stream above.
 - **Controller producer capability delivery** — each controller telemetry producer receives a dedicated IPC channel or
   inherited write-only capability/FD. It is close-on-exec/non-inheritable before any workspace child starts and is never
-  named by a workspace-readable path or token. Admission and terminal/checkpoint commitments are flushed and atomically
-  published before their corresponding operation is acknowledged. The short-timer one-batch crash window applies only to
-  non-commitment diagnostic/audit events; gateway decision boundaries retain the flush policy below.
+  named by a workspace-readable path or token. Audit records are recorded in the order the controller performed the
+  acts, each acknowledged by the sink before the next; the short-timer one-batch crash window applies to diagnostic
+  events; gateway decision boundaries retain the flush policy below.
 - **The one text-file survivor** — `~/Library/Logs/cowshed/daemon-stderr.log`, the launchd `StandardErrorPath` target,
   exists only for crashes before tracer initialization. It lives off the `~/.cowshed` mountpoint so reboot remount
   cannot be masked. `doctor` flags it when non-empty.
@@ -197,9 +205,9 @@ CheckpointManifest row instead uses `origin_incarnation, barrier_id, visible_job
 null and validators reject every other null combination. Job recovery validates non-null raw argv elements, the
 non-empty first argument, NUL exclusion, the 128 KiB element limit, and the 1 MiB total before allocating OS strings.
 
-## Controller commitment schema
+## Controller audit record schema
 
-Controller continuity version 2 is the exact tagged/versioned union:
+Controller audit version 2 is the exact tagged/versioned union (the `order` is the writing controller's own sequence):
 
 ```rust
 enum ControllerCommitment {
@@ -250,21 +258,13 @@ variant-selected
 Non-selected fields are null and the tag controls required fields. Version 1 segments are intentionally incompatible
 with this clean schema cutover; no optional-field or legacy parser path exists.
 
-`order` is positive and belongs to one host-global, strictly increasing, gap-free sequence across all repositories.
-`CommitmentPriorContext` therefore splits into a global `last_order` and a component-safe map from `RepoId` to that
-repository's admissions, terminals, checkpoints, and incarnation lineage. Recovery first validates every global segment
-chronologically from an empty per-repository active history. Only after replay succeeds does it merge the opening
-repository's verified current storage incarnations into that repository's active set. A current storage incarnation
-absent from commitment history is active-but-not-introduced, so `ensure_workspace_introduced` persists exactly one
-`WorkspaceIntroduced`; an opening baseline can neither authorize foreign history nor make a chronological destination
-look duplicated. A foreign repository must establish each incarnation through `WorkspaceIntroduced`, `Fork`, or
-`Restore`. Identical incarnation bytes in different repositories remain independent because every lookup is
-repository-scoped. Admission, terminal, checkpoint, and fork sources reject unknown or retired incarnations. A restore
-instead requires an existing retained checkpoint whose immutable recorded origin equals `source_incarnation`, an
-independently specified `replaced_incarnation` that is currently active, and a fresh destination. It retires the
-replaced generation, not the checkpoint origin; therefore the same retained checkpoint can restore successive active
-generations without resurrecting or repeatedly retiring its origin. Constructors and Arrow/JSON encode/decode invoke the
-same row and collection validator; no derive-only path bypasses it.
+`order` is the writing controller's own positive, strictly increasing sequence from 1; across writers a segment is
+identified by `(order, writer_uuid)`, and nothing requires a host-global order because nothing replays the segments.
+What the records used to prove — which incarnations exist, which retired, which lineage an image carries, which jobs
+were admitted — is read from the inventory: the images and mounts, the marker each image carries (incarnation and
+`lineage`, the ancestor incarnations nearest first), the grants files, and the protected records inside the image. A
+records file may hold frames from its lineage and from no other incarnation; the supervisor refuses anything else as
+`Integrity`.
 
 Immutable publication uses the filesystem lock only to recover the complete segment set and append one create-new
 segment. A publisher refreshes under that lock before assigning an order to a draft. A refresh re-enumerates every
@@ -280,11 +280,12 @@ must validate both against the baseline-merged context and against replayed hist
 baseline could authorize is refused as `Integrity` before any segment is written, because it would seal and then fail
 every later recovery. A draft is acknowledged exactly once only after its immutable segment is durable.
 
-No commitment variant contains `inline_bytes`, `protected_path`, `source_path`, summary text, or output payload.
-`reconcile_commitments` compares protected content counts/hashes plus Job `batch_sha256` and checkpoint
-`manifest_batch_sha256`; missing/altered content, invalid complete frames, or order/lineage/digest contradiction is
-typed `Integrity`. Neither tier overwrites the other. An incomplete trailing frame alone is successful reported recovery
-with its `batch_sha256` retained for diagnosis.
+No commitment variant contains `inline_bytes`, `protected_path`, `source_path`, summary text, or output payload. The
+protected records are self-validating — frame digests, the manifest's `records_sha256`, stream hashes — and recovery
+types missing/altered content or an invalid complete frame as `Integrity`; an incomplete trailing frame alone is
+successful reported recovery with its `batch_sha256` retained for diagnosis. The audit records repeat the counts and
+hashes so an after-the-fact query can compare them against what the image holds, but no controller decision performs
+that comparison.
 
 ## Inspection
 
@@ -304,12 +305,13 @@ events for long `--json` operations, are wire formats on a pipe to a live consum
 ## Querying
 
 - **Capability-scoped**, mirroring the coordinator/worker split (07_api.md, 12_mcp.md): a coordinator queries controller
-  continuity commitments and telemetry. A worker queries one workspace's reconciled lifecycle view and reads captured
-  bytes representation-transparently from protected in-volume artifacts. Controller rows never serve raw output, and
-  protected rows alone never claim cross-incarnation completeness.
+  audit records and telemetry. A worker queries one workspace's reconciled lifecycle view and reads captured bytes
+  representation-transparently from protected in-volume artifacts. Controller rows never serve raw output, and protected
+  rows alone never claim cross-incarnation completeness.
 - **`lmao-query` selectors are the assertion surface** for 08_testing.md. Escape/integration tiers assert over traces
-  and commitments with `never`/`count` selectors rather than scraping text. Integrity joins explicitly require the
-  protected terminal/manifest batch digests, counts, and stream hashes to match controller commitments.
+  and commitments with `never`/`count` selectors rather than scraping text. Integrity joins can require the protected
+  terminal/manifest batch digests, counts, and stream hashes to match the audit records — an after-the-fact query over
+  telemetry, not a gate.
 - **`cowshed doctor --bench`** reports real p50/p99 from accumulated lifecycle spans, turning the 08_testing.md budgets
   into SLOs monitored over actual usage.
 
@@ -322,7 +324,8 @@ events for long `--json` operations, are wire formats on a pipe to a live consum
 - **Fleet questions, zero infra** — egress-denial hot spots, mirror hit rates, image-growth trajectories, grant churn,
   per-task cost — as queries over local files.
 - **Cheap diagnostic retention** — dictionary + zstd columnar spans are far smaller than NDJSON; gc may drop ordinary
-  diagnostic segments. Controller commitment segments are continuity authority and may not be pruned into an order gap.
+  diagnostic segments. Controller audit segments are telemetry too: retention is the operator's policy, and no reader
+  depends on their completeness.
 - **Checkpoint evidence diffing** — "diff the job histories of these two forks" is a query; a coordinator can select the
   winning fork of a `land --check` by its trace.
 
@@ -346,6 +349,8 @@ crash window is the accepted cost, bounded by the decision-boundary/short-timer 
 **Tiered job authority.** Protected in-volume records and artifacts are not editable convenience projections: the child
 profile makes them supervisor-only, and complete batches/sealed files are authoritative captured-content evidence inside
 their origin incarnation/checkpoint boundary. They cannot prove that a later job or incarnation was not omitted by
-restoring the entire image. Compact controller commitments therefore own existence/status/order/lineage and the hashes
-that detect rollback, while never duplicating raw output. Any disagreement is typed `Integrity`; no blanket “outside
-wins” or “newer wins” rule exists.
+restoring the entire image — and cowshed does not try to: a restore is a controller verb the workspace cannot perform on
+itself, so "was something rolled back" is a question for the audit trail after the fact, not a fact any decision depends
+on. The compact audit records carry existence/status/order/lineage and the hashes such a query needs, never raw output.
+Within the image, disagreement between a frame and its digests is typed `Integrity`; no blanket “outside wins” or “newer
+wins” rule exists.

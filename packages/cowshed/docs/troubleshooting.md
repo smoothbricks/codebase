@@ -99,11 +99,11 @@ and the gateway audit events for egress (`cowshed audit --denied | tail`). Commo
 
 ## Artifact integrity (exit 7)
 
-Exit 7 means protected content is missing, mutated, rolled back, or inconsistent with its controller commitment for
-`(repo_id, workspace_incarnation, job_id)`. It is not a child exit, sandbox denial, or summary mismatch, and retries or
-grants do not repair it. Preserve the workspace/checkpoint and follow the `cowshed doctor` integrity report; cowshed
-fails closed rather than choosing the caller-visible redirect source, a publication copy, or whichever record looks
-newer.
+Exit 7 means protected content is missing, mutated, rolled back, or written by an incarnation outside the workspace's
+lineage for `(repo_id, workspace_incarnation, job_id)`. It is not a child exit, sandbox denial, or summary mismatch, and
+retries or grants do not repair it. Preserve the workspace/checkpoint and follow the `cowshed doctor` integrity report;
+cowshed fails closed rather than choosing the caller-visible redirect source, a publication copy, or whichever record
+looks newer.
 
 **Checkpoint was not pruned.** GC keeps the union of three sets: explicit pins, every checkpoint younger than 14 days,
 and the newest five checkpoints per workspace. A user label and `cowshed checkpoint --keep` both pin; age or count does
@@ -215,11 +215,11 @@ the error names every failed identity.
 
 ## `cowshed ls` takes tens of seconds; `cowshed new` or `doctor` takes a minute
 
-Per-command cost does not grow with history or with the number of warm workspaces: the controller commitment log under
-`~/.cowshed/telemetry/` is replayed once per process and then folded only for segments sealed since; the host APFS
-inventory is queried only for the container that holds `~`, and attaching an image lists only that image's container;
-one project open validates the repository binding and reads the inventory once for every workspace it recovers. When a
-command is still slow, the wait is in a host process, not in cowshed — while it runs,
+Per-command cost does not grow with history or with the number of warm workspaces: no command reads the audit segments
+under `~/.cowshed/telemetry/` (they are write-only telemetry; authority is the image inventory); the host APFS inventory
+is queried only for the container that holds `~`, and attaching an image lists only that image's container; one project
+open validates the repository binding and reads the inventory once for every workspace it recovers. When a command is
+still slow, the wait is in a host process, not in cowshed — while it runs,
 `ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'` names it. The first `diskutil mount` of a freshly
 cloned image takes seconds on a host with dozens of attached images (the same volume re-mounts in a fraction of that
 after publication); that is DiskArbitration's cost per attached image, so `cowshed rm` what you no longer need and

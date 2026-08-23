@@ -277,8 +277,11 @@ checkpoint/background/replay requirement forces residency; no per-job path is pr
 SHA-256, bounded summary, and exact captured/redirect plus inline/file discriminants. Checkpoint manifests carry
 `version, repo_id, origin_incarnation, barrier_id, visible_jobs, records_sha256`; the visible stream commitment is
 `storage_kind, bytes, sha256, protected_path` with path present iff file. Complete Arrow batches and sealed spills are
-immutable. Compact controller Admission/Terminal/Checkpoint/Fork/Restore commitments own existence/status/order/lineage
-and expected hashes/digests, never raw payload or artifact paths (02_workspaces.md/07_api.md/13_telemetry.md).
+immutable. A records file legitimately holds frames its ancestor incarnations wrote, because fork and restore clone the
+source image; the image's marker lineage (02_workspaces.md) is what authorizes them, and a frame from any other
+incarnation is an integrity fault. The controller additionally emits compact Admission/Terminal/Checkpoint/Fork/Restore
+audit records — existence/status/order/lineage and expected hashes/digests, never raw payload or artifact paths — to an
+optional sink that nothing reads for a decision (07_api.md/13_telemetry.md).
 
 ### Grant files live outside the volume
 
@@ -298,10 +301,10 @@ publication. Its exact v2, unknown-field-denying schema is
 `sourceCheckpoint` and `sourceIncarnation` identify the retained checkpoint and must match its detached metadata;
 `replacedIncarnation` must match the displaced image/grant/CA generation; and `destinationIncarnation` must match both
 the canonical pending metadata and the `pre-restore-<destinationIncarnation>` undo name. The fact is fsynced before
-pending metadata publication and removed, with a parent-directory fsync, only after the controller commitment is durably
-published and detached metadata is activated. Recovery uses that complete identity tuple to ignore retained older undo
-generations and choose rollback or idempotent completion. There is no runtime restore journal, `.restore-fences`
-directory, database row, or second mutable source of truth.
+pending metadata publication and removed, with a parent-directory fsync, only after detached metadata is activated (the
+restore's audit record is emitted on the way, and gates nothing). Recovery uses that complete identity tuple to ignore
+retained older undo generations and choose rollback or idempotent completion. There is no runtime restore journal,
+`.restore-fences` directory, database row, or second mutable source of truth.
 
 ## Retention
 

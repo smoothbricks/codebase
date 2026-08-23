@@ -234,7 +234,8 @@ pub enum ProtectedRecord {
     CheckpointManifest(CheckpointManifestRecord),
 }
 
-/// Compact controller continuity schema. Every event struct flattens identity and carries `version` + `order`.
+/// Compact controller audit schema — telemetry, never read for a decision. Every record flattens identity and carries
+/// `version` + `order` (the writing controller's own sequence).
 pub struct AdmissionCommitment {
     pub version: u16, pub order: u64, pub repo_id: RepoId,
     pub workspace_incarnation: WorkspaceIncarnation, pub job_id: JobId, pub grant_revision: u64,
@@ -668,9 +669,9 @@ impl Session {
 `Session::close` uses the same identity and immutable repo/workspace/incarnation fence.
 
 `JobArtifactRecord` is the protected content record consumed by CLI, MCP, NAPI, and CI. It is not the richer `JobInfo`:
-the latter remains the live/result API projection. Record and commitment constructors, serializers, and deserializers
-run the same validation. `CommitmentPriorContext` plus `validate_commitments` enforce positive global order,
-admission-before-single-terminal, known checkpoints, and acyclic incarnation lineage across batches.
+the latter remains the live/result API projection. Record and audit-record constructors, serializers, and deserializers
+run the same per-row validation; the audit records are telemetry, so there is no cross-record sequence validation — the
+facts they describe are held by the image inventory and the protected records themselves.
 
 Every foreground and background submission is the same durable job: attachment is a client state, not a second exec
 kind. The allocator commits `JobId` before spawn, so even a pre-spawn failure has a queryable terminal `JobInfo`.
