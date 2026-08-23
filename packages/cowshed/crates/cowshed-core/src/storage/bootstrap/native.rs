@@ -482,7 +482,16 @@ fn gather_existing_apfs_evidence(
         });
     }
     let mount_device = exact_device_identifier(&snapshot.mount_source)?;
-    let command = HostCommand::new(DISKUTIL, ["apfs", "list", "-plist"]);
+    // Ask for the one container that can hold the home volume rather than every container on
+    // the host: each mounted workspace image is its own APFS container, so the unscoped listing
+    // grows with the number of warm workspaces and costs seconds per CLI invocation on a busy
+    // host. An APFS volume's BSD name is `<container>s<n>`, so the container is known before
+    // asking; `containing_container` still verifies that the answer really lists the device.
+    let container_reference = container_reference_of(&mount_device);
+    let command = HostCommand::new(
+        DISKUTIL,
+        ["apfs", "list", "-plist", container_reference.as_str()],
+    );
     let output = source.run_command(&command)?;
     if !output.success {
         return Err(NativeBootstrapError::CommandFailed {
@@ -538,6 +547,16 @@ fn exact_device_identifier(path: &Path) -> Result<String, NativeBootstrapError> 
     } else {
         Err(NativeBootstrapError::InvalidMountSource(path.to_owned()))
     }
+}
+
+/// The synthesized APFS container (`diskN`) that a validated volume identifier (`diskNs…`) lives
+/// in.
+fn container_reference_of(volume_identifier: &str) -> String {
+    let digits = volume_identifier["disk".len()..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    volume_identifier[.."disk".len() + digits].to_owned()
 }
 
 fn valid_container_identifier(value: &[u8]) -> bool {
@@ -2188,7 +2207,10 @@ mod tests {
         ));
         assert_eq!(source.commands.len(), 1);
         assert_eq!(source.commands[0].program(), "/usr/sbin/diskutil");
-        assert_eq!(source.commands[0].args(), ["apfs", "list", "-plist"]);
+        assert_eq!(
+            source.commands[0].args(),
+            ["apfs", "list", "-plist", "disk3"]
+        );
     }
 
     #[test]
@@ -2555,7 +2577,10 @@ mod tests {
                 .any(|operation| matches!(operation, HostOperation::ProvisionApfsVolumes { .. }))
         );
         assert_eq!(source.commands.len(), 1);
-        assert_eq!(source.commands[0].args(), ["apfs", "list", "-plist"]);
+        assert_eq!(
+            source.commands[0].args(),
+            ["apfs", "list", "-plist", "disk3"]
+        );
     }
 
     #[test]
@@ -3465,6 +3490,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn container_reference_is_the_synthesized_disk_of_the_volume_identifier() {
+        assert_eq!(container_reference_of("disk3s5"), "disk3");
+        assert_eq!(container_reference_of("disk13s1"), "disk13");
+        // A sealed system snapshot mounts as `<volume>s<snapshot>`; the container is unchanged.
+        assert_eq!(container_reference_of("disk3s1s1"), "disk3");
+    }
+
     #[tokio::test]
     async fn existing_host_storage_returns_roots_and_queries_only_home_without_mutation() {
         let mut source = healthy_existing_source();
@@ -3474,7 +3507,10 @@ mod tests {
         assert_eq!(source.statfs_paths, [PathBuf::from("/Users/alice")]);
         assert_eq!(source.commands.len(), 1);
         assert_eq!(source.commands[0].program(), DISKUTIL);
-        assert_eq!(source.commands[0].args(), ["apfs", "list", "-plist"]);
+        assert_eq!(
+            source.commands[0].args(),
+            ["apfs", "list", "-plist", "disk3"]
+        );
         assert!(
             plan.operations()
                 .iter()
