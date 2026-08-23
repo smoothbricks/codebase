@@ -18,11 +18,9 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{
-    AdmissionCommitment, BinaryData, CONTROLLER_COMMITMENT_VERSION, CheckpointCommitment,
-    CommandArg, ControllerCommitment, ExecRequest, ExitStatus, JobId, JobInfo, JobState,
-    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput,
-    Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
-    UtcTimestamp, WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
+    BinaryData, CommandArg, ExecRequest, ExitStatus, JobId, JobInfo, JobState, OutputLimitInfo,
+    OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, Sha256Digest, StdinInfo,
+    StdinKind, StdinSource, StreamInfo, TraceContext, TraceId, UtcTimestamp, WorkspacePath,
     validate_command_argv,
 };
 use crate::error::{CowshedError, Result};
@@ -32,7 +30,7 @@ use crate::exec::{
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
 use crate::sandbox::{SandboxConfig, SandboxProfileRole, seatbelt_profile};
-use crate::storage::commitment_store::{CommitmentStore, CommitmentStoreError};
+use crate::storage::audit::AuditSinkError;
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, OutputTargets,
     SealedCheckpointManifest, StreamKind,
@@ -43,7 +41,6 @@ const DEFAULT_EVENT_CAPACITY: usize = 64;
 const PROCESS_IO_CHUNK: usize = 64 * 1024;
 const MAX_LOG_READ: usize = 64 * 1024;
 const MAX_PENDING_STDIN_BYTES: usize = 256 * 1024;
-const MAX_COMMITMENT_CONFLICT_RETRIES: usize = 8;
 
 /// Exact immutable authority carried by every cheap supervisor handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -300,166 +297,15 @@ pub trait ArtifactSink: Send {
     fn checkpoint(&mut self, barrier_id: u64) -> Result<CheckpointBarrier>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CommitmentDraft {
-    WorkspaceIntroduced {
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-    },
-    WorkspaceRetired {
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-    },
-    Admission {
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-        job_id: JobId,
-        grant_revision: u64,
-    },
-    Terminal {
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-        job_id: JobId,
-        state: JobState,
-        grant_revision: u64,
-        stdout_bytes: u64,
-        stdout_sha256: Sha256Digest,
-        stderr_bytes: u64,
-        stderr_sha256: Sha256Digest,
-        batch_sha256: Sha256Digest,
-        output_limit: Option<OutputLimitInfo>,
-    },
-    Checkpoint {
-        repo_id: RepoId,
-        origin_incarnation: WorkspaceIncarnation,
-        checkpoint_id: String,
-        barrier_id: u64,
-        manifest_batch_sha256: Sha256Digest,
-    },
-    Fork {
-        repo_id: RepoId,
-        source_incarnation: WorkspaceIncarnation,
-        destination_incarnation: WorkspaceIncarnation,
-    },
-    Restore {
-        repo_id: RepoId,
-        source_checkpoint: String,
-        source_incarnation: WorkspaceIncarnation,
-        replaced_incarnation: WorkspaceIncarnation,
-        destination_incarnation: WorkspaceIncarnation,
-    },
-}
+pub use crate::storage::audit::CommitmentDraft;
 
-impl CommitmentDraft {
-    pub fn into_commitment(self, order: u64) -> ControllerCommitment {
-        match self {
-            Self::WorkspaceIntroduced {
-                repo_id,
-                workspace_incarnation,
-            } => ControllerCommitment::WorkspaceIntroduced(WorkspaceIntroducedCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                workspace_incarnation,
-            }),
-            Self::WorkspaceRetired {
-                repo_id,
-                workspace_incarnation,
-            } => ControllerCommitment::WorkspaceRetired(WorkspaceRetiredCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                workspace_incarnation,
-            }),
-            Self::Admission {
-                repo_id,
-                workspace_incarnation,
-                job_id,
-                grant_revision,
-            } => ControllerCommitment::Admission(AdmissionCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                workspace_incarnation,
-                job_id,
-                grant_revision,
-            }),
-            Self::Terminal {
-                repo_id,
-                workspace_incarnation,
-                job_id,
-                state,
-                grant_revision,
-                stdout_bytes,
-                stdout_sha256,
-                stderr_bytes,
-                stderr_sha256,
-                batch_sha256,
-                output_limit,
-            } => ControllerCommitment::Terminal(crate::api::dto::TerminalCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                workspace_incarnation,
-                job_id,
-                state,
-                grant_revision,
-                stdout_bytes,
-                stdout_sha256,
-                stderr_bytes,
-                stderr_sha256,
-                batch_sha256,
-                output_limit,
-            }),
-            Self::Checkpoint {
-                repo_id,
-                origin_incarnation,
-                checkpoint_id,
-                barrier_id,
-                manifest_batch_sha256,
-            } => ControllerCommitment::Checkpoint(CheckpointCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                origin_incarnation,
-                checkpoint_id,
-                barrier_id,
-                manifest_batch_sha256,
-            }),
-            Self::Fork {
-                repo_id,
-                source_incarnation,
-                destination_incarnation,
-            } => ControllerCommitment::Fork(crate::api::dto::ForkCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                source_incarnation,
-                destination_incarnation,
-            }),
-            Self::Restore {
-                repo_id,
-                source_checkpoint,
-                source_incarnation,
-                replaced_incarnation,
-                destination_incarnation,
-            } => ControllerCommitment::Restore(crate::api::dto::RestoreCommitment {
-                version: CONTROLLER_COMMITMENT_VERSION,
-                order,
-                repo_id,
-                source_checkpoint,
-                source_incarnation,
-                replaced_incarnation,
-                destination_incarnation,
-            }),
-        }
-    }
-}
-
+/// Where a supervisor sends its audit records. Recording is best effort by contract: the act a
+/// record describes has already happened, and a sink that cannot write is a `doctor` finding
+/// ([`AuditHealth`]), never a reason to fail a job. `Err` here means the publisher itself is
+/// gone, which is the project detaching — not a sink fault.
 #[async_trait]
 pub trait CommitmentSink: Send {
-    /// Atomically allocates the repo-wide order and durably publishes the draft.
-    async fn publish(&mut self, draft: CommitmentDraft) -> Result<u64>;
+    async fn record(&mut self, draft: CommitmentDraft) -> Result<()>;
 }
 
 /// Production artifact adapter. One supervisor actor owns the store and every token.
@@ -590,45 +436,45 @@ impl ArtifactSink for ArtifactStoreSink {
 }
 
 enum CommitmentRequest {
-    Publish {
-        draft: CommitmentDraft,
-        reply: oneshot::Sender<Result<u64>>,
+    Record {
+        draft: Box<CommitmentDraft>,
+        reply: oneshot::Sender<()>,
     },
-    #[cfg(any(target_os = "macos", test))]
-    AdmittedLifecycleIncarnations {
-        repo_id: RepoId,
-        reply: oneshot::Sender<Result<BTreeSet<WorkspaceIncarnation>>>,
-    },
-    #[cfg(any(target_os = "macos", test))]
-    EnsureWorkspaceIntroduced {
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-        reply: oneshot::Sender<Result<Option<u64>>>,
-    },
-    #[cfg(any(target_os = "macos", test))]
-    EnsureWorkspaceRetired {
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-        reply: oneshot::Sender<Result<Option<u64>>>,
+    Health {
+        reply: oneshot::Sender<AuditHealth>,
     },
 }
 
-/// Dedicated controller owner for globally ordered commitment publication.
+/// What `doctor` reports about the audit sink: which sink, how many records it refused, and the
+/// last refusal's message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AuditHealth {
+    pub sink: &'static str,
+    pub recorded: u64,
+    pub failed: u64,
+    pub last_failure: Option<String>,
+}
+
+/// Dedicated owner of the audit sink: one actor serializes records in the order the controller
+/// performed the acts and absorbs sink failures into [`AuditHealth`].
 pub struct CommitmentPublisher;
 
 impl CommitmentPublisher {
     pub fn open(
         telemetry_root: impl AsRef<Path>,
-        repo_id: RepoId,
-        known_incarnations: impl IntoIterator<Item = WorkspaceIncarnation>,
+        continuity: crate::storage::audit::ContinuityAudit,
         capacity: usize,
     ) -> Result<CommitmentPublisherHandle> {
-        let store = CommitmentStore::open(telemetry_root, repo_id, known_incarnations)
-            .map_err(map_commitment_error)?;
-        Self::start(store, capacity)
+        let sink = continuity
+            .into_sink(telemetry_root.as_ref())
+            .map_err(map_audit_error)?;
+        Self::start(sink, capacity)
     }
 
-    pub fn start(store: CommitmentStore, capacity: usize) -> Result<CommitmentPublisherHandle> {
+    pub fn start(
+        sink: Box<dyn crate::storage::audit::AuditSink>,
+        capacity: usize,
+    ) -> Result<CommitmentPublisherHandle> {
         if capacity == 0 {
             return Err(CowshedError::usage(
                 "commitment publisher capacity must be positive",
@@ -637,98 +483,31 @@ impl CommitmentPublisher {
         }
         let (sender, mut receiver) = mpsc::channel::<CommitmentRequest>(capacity);
         tokio::spawn(async move {
-            let mut store = store;
+            let mut sink = sink;
+            let mut health = AuditHealth {
+                sink: sink.name(),
+                ..AuditHealth::default()
+            };
             while let Some(request) = receiver.recv().await {
                 match request {
-                    CommitmentRequest::Publish { draft, reply } => {
-                        let _ = reply.send(publish_draft(&mut store, draft));
+                    CommitmentRequest::Record { draft, reply } => {
+                        match sink.record(*draft) {
+                            Ok(()) => health.recorded = health.recorded.saturating_add(1),
+                            Err(error) => {
+                                health.failed = health.failed.saturating_add(1);
+                                health.last_failure = Some(error.to_string());
+                            }
+                        }
+                        let _ = reply.send(());
                     }
-                    #[cfg(any(target_os = "macos", test))]
-                    CommitmentRequest::AdmittedLifecycleIncarnations { repo_id, reply } => {
-                        let result = store
-                            .refresh()
-                            .map_err(map_commitment_error)
-                            .map(|()| store.admitted_lifecycle_incarnations(&repo_id));
-                        let _ = reply.send(result);
-                    }
-                    #[cfg(any(target_os = "macos", test))]
-                    CommitmentRequest::EnsureWorkspaceIntroduced {
-                        repo_id,
-                        workspace_incarnation,
-                        reply,
-                    } => {
-                        let result = store
-                            .refresh()
-                            .map_err(map_commitment_error)
-                            .and_then(|()| {
-                                if store
-                                    .workspace_is_retired(&repo_id, &workspace_incarnation)
-                                {
-                                    Err(CowshedError::integrity(
-                                        "active storage fact references a retired workspace incarnation",
-                                        "cowshed doctor --json",
-                                    ))
-                                } else if store
-                                    .workspace_is_introduced(&repo_id, &workspace_incarnation)
-                                {
-                                    Ok(None)
-                                } else {
-                                    publish_draft(
-                                        &mut store,
-                                        CommitmentDraft::WorkspaceIntroduced {
-                                            repo_id,
-                                            workspace_incarnation,
-                                        },
-                                    )
-                                    .map(Some)
-                                }
-                            });
-                        let _ = reply.send(result);
-                    }
-                    #[cfg(any(target_os = "macos", test))]
-                    CommitmentRequest::EnsureWorkspaceRetired {
-                        repo_id,
-                        workspace_incarnation,
-                        reply,
-                    } => {
-                        let result = store
-                            .refresh()
-                            .map_err(map_commitment_error)
-                            .and_then(|()| {
-                                if store.workspace_is_retired(&repo_id, &workspace_incarnation) {
-                                    Ok(None)
-                                } else {
-                                    publish_draft(
-                                        &mut store,
-                                        CommitmentDraft::WorkspaceRetired {
-                                            repo_id,
-                                            workspace_incarnation,
-                                        },
-                                    )
-                                    .map(Some)
-                                }
-                            });
-                        let _ = reply.send(result);
+                    CommitmentRequest::Health { reply } => {
+                        let _ = reply.send(health.clone());
                     }
                 }
             }
         });
         Ok(CommitmentPublisherHandle { sender })
     }
-}
-
-fn publish_draft(store: &mut CommitmentStore, draft: CommitmentDraft) -> Result<u64> {
-    for attempt in 0..=MAX_COMMITMENT_CONFLICT_RETRIES {
-        store.refresh().map_err(map_commitment_error)?;
-        let order = store.next_order().map_err(map_commitment_error)?;
-        match store.publish(draft.clone().into_commitment(order)) {
-            Ok(()) => return Ok(order),
-            Err(CommitmentStoreError::Conflict { .. })
-                if attempt < MAX_COMMITMENT_CONFLICT_RETRIES => {}
-            Err(error) => return Err(map_commitment_error(error)),
-        }
-    }
-    unreachable!("bounded conflict loop returns on its final attempt")
 }
 
 #[derive(Clone)]
@@ -745,47 +524,10 @@ impl std::fmt::Debug for CommitmentPublisherHandle {
 }
 
 impl CommitmentPublisherHandle {
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) async fn ensure_workspace_introduced(
-        &mut self,
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-    ) -> Result<Option<u64>> {
+    pub async fn health(&self) -> Result<AuditHealth> {
         let (reply, receive) = oneshot::channel();
-        self.send(CommitmentRequest::EnsureWorkspaceIntroduced {
-            repo_id,
-            workspace_incarnation,
-            reply,
-        })
-        .await?;
-        receive_commitment_reply(receive).await
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) async fn ensure_workspace_retired(
-        &mut self,
-        repo_id: RepoId,
-        workspace_incarnation: WorkspaceIncarnation,
-    ) -> Result<Option<u64>> {
-        let (reply, receive) = oneshot::channel();
-        self.send(CommitmentRequest::EnsureWorkspaceRetired {
-            repo_id,
-            workspace_incarnation,
-            reply,
-        })
-        .await?;
-        receive_commitment_reply(receive).await
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    pub(crate) async fn admitted_lifecycle_incarnations(
-        &self,
-        repo_id: RepoId,
-    ) -> Result<BTreeSet<WorkspaceIncarnation>> {
-        let (reply, receive) = oneshot::channel();
-        self.send(CommitmentRequest::AdmittedLifecycleIncarnations { repo_id, reply })
-            .await?;
-        receive_commitment_reply(receive).await
+        self.send(CommitmentRequest::Health { reply }).await?;
+        receive.await.map_err(|_| publisher_stopped())
     }
 
     async fn send(&self, request: CommitmentRequest) -> Result<()> {
@@ -798,22 +540,23 @@ impl CommitmentPublisherHandle {
     }
 }
 
-async fn receive_commitment_reply<T>(receive: oneshot::Receiver<Result<T>>) -> Result<T> {
-    receive.await.map_err(|_| {
-        CowshedError::environment_missing(
-            "repo commitment publisher stopped before durable acknowledgement",
-            "reattach the project",
-        )
-    })?
+fn publisher_stopped() -> CowshedError {
+    CowshedError::environment_missing(
+        "repo commitment publisher stopped before acknowledging the record",
+        "reattach the project",
+    )
 }
 
 #[async_trait]
 impl CommitmentSink for CommitmentPublisherHandle {
-    async fn publish(&mut self, draft: CommitmentDraft) -> Result<u64> {
+    async fn record(&mut self, draft: CommitmentDraft) -> Result<()> {
         let (reply, receive) = oneshot::channel();
-        self.send(CommitmentRequest::Publish { draft, reply })
-            .await?;
-        receive_commitment_reply(receive).await
+        self.send(CommitmentRequest::Record {
+            draft: Box::new(draft),
+            reply,
+        })
+        .await?;
+        receive.await.map_err(|_| publisher_stopped())
     }
 }
 
@@ -2680,7 +2423,7 @@ impl SupervisorActor {
         self.next_job_id = expected_next;
         let admission = self
             .commitments
-            .publish(CommitmentDraft::Admission {
+            .record(CommitmentDraft::Admission {
                 repo_id: self.authority.repo_id.clone(),
                 workspace_incarnation: self.authority.workspace_incarnation.clone(),
                 job_id,
@@ -3020,7 +2763,7 @@ impl SupervisorActor {
         let mut barrier = self.artifacts.checkpoint(barrier_id)?;
         barrier.checkpoint_id = checkpoint_id.clone();
         self.commitments
-            .publish(CommitmentDraft::Checkpoint {
+            .record(CommitmentDraft::Checkpoint {
                 repo_id: self.authority.repo_id.clone(),
                 origin_incarnation: self.authority.workspace_incarnation.clone(),
                 checkpoint_id,
@@ -3260,7 +3003,7 @@ impl SupervisorActor {
         };
         let commitment = self
             .commitments
-            .publish(CommitmentDraft::Terminal {
+            .record(CommitmentDraft::Terminal {
                 repo_id: self.authority.repo_id.clone(),
                 workspace_incarnation: self.authority.workspace_incarnation.clone(),
                 job_id,
@@ -3651,17 +3394,13 @@ fn map_artifact_error(error: ArtifactError) -> CowshedError {
     CowshedError::integrity(error.to_string(), "cowshed doctor --json")
 }
 
-fn map_commitment_error(error: CommitmentStoreError) -> CowshedError {
+fn map_audit_error(error: AuditSinkError) -> CowshedError {
     match error {
-        CommitmentStoreError::Conflict { .. } => CowshedError::conflict(
+        AuditSinkError::Io { .. } => CowshedError::environment_missing(
             error.to_string(),
-            "reattach and retry against the current commitment order",
+            "verify telemetry storage or set COWSHED_CONTINUITY_AUDIT=off",
         ),
-        CommitmentStoreError::Io { .. } => CowshedError::environment_missing(
-            error.to_string(),
-            "verify telemetry storage and retry",
-        ),
-        CommitmentStoreError::Integrity { .. } => {
+        AuditSinkError::Integrity { .. } => {
             CowshedError::integrity(error.to_string(), "cowshed doctor --json")
         }
     }
@@ -4004,58 +3743,62 @@ mod lifecycle_commitment_tests {
     use super::*;
 
     #[tokio::test]
-    async fn publisher_recovers_lifecycle_idempotently_before_reclaim() {
+    async fn publisher_records_every_act_and_reports_sink_health() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-lifecycle-publisher-{}",
             Uuid::new_v4().simple()
         ));
         let repo_id = RepoId::parse("acme/widget").unwrap();
         let incarnation = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let store = CommitmentStore::open(&root, repo_id.clone(), [incarnation.clone()]).unwrap();
-        let mut publisher = CommitmentPublisher::start(store, 4).unwrap();
-
-        assert_eq!(
-            publisher
-                .ensure_workspace_introduced(repo_id.clone(), incarnation.clone())
-                .await
-                .unwrap(),
-            Some(1)
-        );
-        assert_eq!(
-            publisher
-                .ensure_workspace_introduced(repo_id.clone(), incarnation.clone())
-                .await
-                .unwrap(),
-            None
-        );
-        drop(publisher);
         let mut publisher =
-            CommitmentPublisher::open(&root, repo_id.clone(), [incarnation.clone()], 4).unwrap();
-        assert_eq!(
-            publisher
-                .ensure_workspace_introduced(repo_id.clone(), incarnation.clone())
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            publisher
-                .ensure_workspace_retired(repo_id.clone(), incarnation.clone())
-                .await
-                .unwrap(),
-            Some(2)
-        );
-        assert_eq!(
-            publisher
-                .ensure_workspace_retired(repo_id.clone(), incarnation)
-                .await
-                .unwrap(),
-            None
-        );
+            CommitmentPublisher::open(&root, crate::storage::audit::ContinuityAudit::Arrow, 4)
+                .unwrap();
+        publisher
+            .record(CommitmentDraft::WorkspaceIntroduced {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: incarnation.clone(),
+            })
+            .await
+            .unwrap();
+        publisher
+            .record(CommitmentDraft::WorkspaceRetired {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: incarnation.clone(),
+            })
+            .await
+            .unwrap();
+        let health = publisher.health().await.unwrap();
+        assert_eq!(health.sink, "arrow");
+        assert_eq!((health.recorded, health.failed), (2, 0));
+        let sealed = std::fs::read_dir(&root)
+            .unwrap()
+            .flat_map(|date| std::fs::read_dir(date.unwrap().path()).unwrap())
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("commitment-")
+            })
+            .count();
+        assert_eq!(sealed, 2, "one sealed segment per record");
         drop(publisher);
 
-        let reopened = CommitmentStore::open(&root, repo_id, []).unwrap();
-        assert_eq!(reopened.next_order().unwrap(), 3);
+        let mut silent =
+            CommitmentPublisher::open(&root, crate::storage::audit::ContinuityAudit::Off, 4)
+                .unwrap();
+        silent
+            .record(CommitmentDraft::WorkspaceIntroduced {
+                repo_id,
+                workspace_incarnation: incarnation,
+            })
+            .await
+            .unwrap();
+        let health = silent.health().await.unwrap();
+        assert_eq!((health.sink, health.recorded, health.failed), ("off", 1, 0));
+        drop(silent);
+        tokio::task::yield_now().await;
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4066,7 +3809,7 @@ mod lifecycle_commitment_tests {
         sealed: &crate::storage::job_artifact::SealedJobArtifacts,
     ) {
         publisher
-            .publish(CommitmentDraft::Admission {
+            .record(CommitmentDraft::Admission {
                 repo_id: repo_id.clone(),
                 workspace_incarnation: incarnation.clone(),
                 job_id: sealed.record.job_id,
@@ -4075,7 +3818,7 @@ mod lifecycle_commitment_tests {
             .await
             .unwrap();
         publisher
-            .publish(CommitmentDraft::Terminal {
+            .record(CommitmentDraft::Terminal {
                 repo_id: repo_id.clone(),
                 workspace_incarnation: incarnation.clone(),
                 job_id: sealed.record.job_id,
@@ -4093,7 +3836,7 @@ mod lifecycle_commitment_tests {
     }
 
     #[tokio::test]
-    async fn committed_restore_history_opens_and_restarts_a_replacement_supervisor() {
+    async fn lineage_history_opens_and_restarts_a_replacement_supervisor() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-restored-supervisor-{}",
             Uuid::new_v4().simple()
@@ -4111,15 +3854,14 @@ mod lifecycle_commitment_tests {
             WorkspaceIncarnation::new("4198f2c0b7e34dc795f17b238b331c80").unwrap();
         let foreign_only = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
         let baseline_only = WorkspaceIncarnation::new("3198f2c0b7e34dc795f17b238b331c80").unwrap();
-        let store = CommitmentStore::open(
-            &telemetry,
-            repo_id.clone(),
-            [source.clone(), baseline_only.clone()],
-        )
-        .unwrap();
-        let mut publisher = CommitmentPublisher::start(store, 8).unwrap();
+        let mut publisher =
+            CommitmentPublisher::open(&telemetry, crate::storage::audit::ContinuityAudit::Arrow, 8)
+                .unwrap();
         publisher
-            .ensure_workspace_introduced(repo_id.clone(), source.clone())
+            .record(CommitmentDraft::WorkspaceIntroduced {
+                repo_id: repo_id.clone(),
+                workspace_incarnation: source.clone(),
+            })
             .await
             .unwrap();
 
@@ -4142,7 +3884,7 @@ mod lifecycle_commitment_tests {
         publish_sealed_job(&mut publisher, &repo_id, &source, &first).await;
         let checkpoint = artifacts.checkpoint(1).unwrap();
         publisher
-            .publish(CommitmentDraft::Checkpoint {
+            .record(CommitmentDraft::Checkpoint {
                 repo_id: repo_id.clone(),
                 origin_incarnation: source.clone(),
                 checkpoint_id: "baseline".into(),
@@ -4164,7 +3906,7 @@ mod lifecycle_commitment_tests {
         publish_sealed_job(&mut publisher, &repo_id, &source, &later).await;
         drop(artifacts);
         publisher
-            .publish(CommitmentDraft::Restore {
+            .record(CommitmentDraft::Restore {
                 repo_id: repo_id.clone(),
                 source_checkpoint: "baseline".into(),
                 source_incarnation: source.clone(),
@@ -4174,7 +3916,7 @@ mod lifecycle_commitment_tests {
             .await
             .unwrap();
         publisher
-            .publish(CommitmentDraft::Restore {
+            .record(CommitmentDraft::Restore {
                 repo_id: repo_id.clone(),
                 source_checkpoint: "baseline".into(),
                 source_incarnation: source.clone(),
@@ -4184,20 +3926,19 @@ mod lifecycle_commitment_tests {
             .await
             .unwrap();
         publisher
-            .publish(CommitmentDraft::WorkspaceIntroduced {
+            .record(CommitmentDraft::WorkspaceIntroduced {
                 repo_id: foreign_repo,
                 workspace_incarnation: foreign_only.clone(),
             })
             .await
             .unwrap();
 
-        let admitted = publisher
-            .admitted_lifecycle_incarnations(repo_id.clone())
-            .await
-            .unwrap();
-        assert!(admitted.contains(&source));
-        assert!(admitted.contains(&destination));
-        assert!(admitted.contains(&second_destination));
+        // The lineage a marker carries after restore → restore: nearest ancestor first. The
+        // records file under `workspace_root` was written by `source`, so it opens under any
+        // incarnation whose lineage names `source`; nothing names `foreign_only` or
+        // `baseline_only`, and a records file from them is an integrity fault.
+        let admitted: BTreeSet<WorkspaceIncarnation> =
+            BTreeSet::from([destination.clone(), source.clone()]);
         assert!(!admitted.contains(&foreign_only));
         assert!(!admitted.contains(&baseline_only));
 
@@ -4217,7 +3958,7 @@ mod lifecycle_commitment_tests {
                 ..defaults.sandbox
             },
             artifacts: ArtifactConfig {
-                admitted_historical_incarnations: admitted.clone(),
+                historical_incarnations: admitted.clone(),
                 ..ArtifactConfig::default()
             },
             term_grace: defaults.term_grace,
@@ -4256,7 +3997,7 @@ mod lifecycle_commitment_tests {
                 repo_id,
                 destination,
                 ArtifactConfig {
-                    admitted_historical_incarnations: admitted,
+                    historical_incarnations: admitted,
                     ..ArtifactConfig::default()
                 },
             ),

@@ -304,7 +304,7 @@ struct FakeCommitments {
 
 #[async_trait]
 impl CommitmentSink for FakeCommitments {
-    async fn publish(&mut self, draft: CommitmentDraft) -> Result<u64> {
+    async fn record(&mut self, draft: CommitmentDraft) -> Result<()> {
         let order = self.next_order;
         let commitment = draft.into_commitment(order);
         assert_eq!(commitment.version(), CONTROLLER_COMMITMENT_VERSION);
@@ -324,7 +324,7 @@ impl CommitmentSink for FakeCommitments {
         self.observations
             .send(commitment)
             .expect("commitment observer");
-        Ok(order)
+        Ok(())
     }
 }
 
