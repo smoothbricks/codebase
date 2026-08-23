@@ -28,6 +28,7 @@ pub enum MetadataError {
     },
     InvalidWorkspaceName(String),
     ReservedSessionName,
+    InvalidLineage,
     InvalidWorkspaceIncarnation(String),
     UnsupportedVersion {
         kind: &'static str,
@@ -78,6 +79,9 @@ impl fmt::Display for MetadataError {
             Self::ReservedSessionName => {
                 f.write_str("workspace name \"main\" is reserved and cannot name a session")
             }
+            Self::InvalidLineage => f.write_str(
+                "workspace marker lineage must list each ancestor incarnation once and never the marker's own",
+            ),
             Self::InvalidWorkspaceIncarnation(value) => {
                 write!(
                     f,
@@ -685,6 +689,15 @@ pub struct WorkspaceMarker {
     pub created_at: String,
     pub forked_from: Option<WorkspaceName>,
     pub created_trace: String,
+    /// The ancestor incarnations this image was cloned from, nearest first: a fork or restore
+    /// copies the source image — including the job records its ancestors wrote — so the
+    /// lineage is what authorizes those records when the supervisor opens the workspace. It
+    /// lives in the image because it is a property of the image: the controller writes it when
+    /// it mints the incarnation, and a host log has nothing to add. `None` marks a marker written
+    /// before lineage was recorded; the controller heals it once from the records the image
+    /// already carries and rewrites the marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Vec<WorkspaceIncarnation>>,
 }
 
 #[derive(Deserialize)]
@@ -701,6 +714,8 @@ struct WorkspaceMarkerWire {
     created_at: String,
     forked_from: Option<WorkspaceName>,
     created_trace: String,
+    #[serde(default)]
+    lineage: Option<Vec<WorkspaceIncarnation>>,
 }
 
 impl<'de> Deserialize<'de> for WorkspaceMarker {
@@ -721,6 +736,7 @@ impl<'de> Deserialize<'de> for WorkspaceMarker {
             created_at: wire.created_at,
             forked_from: wire.forked_from,
             created_trace: wire.created_trace,
+            lineage: wire.lineage,
         };
         marker.validate().map_err(serde::de::Error::custom)?;
         Ok(marker)
@@ -741,7 +757,26 @@ impl WorkspaceMarker {
         {
             return Err(MetadataError::ReservedSessionName);
         }
+        if let Some(lineage) = &self.lineage {
+            let mut seen = std::collections::BTreeSet::new();
+            for ancestor in lineage {
+                if ancestor == &self.workspace_incarnation || !seen.insert(ancestor) {
+                    return Err(MetadataError::InvalidLineage);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The lineage a clone of this image inherits: this incarnation, then this image's own
+    /// ancestors. A marker without recorded lineage contributes only itself.
+    pub fn clone_lineage(&self) -> Vec<WorkspaceIncarnation> {
+        let mut lineage = Vec::with_capacity(1 + self.lineage.as_ref().map_or(0, Vec::len));
+        lineage.push(self.workspace_incarnation.clone());
+        if let Some(ancestors) = &self.lineage {
+            lineage.extend(ancestors.iter().cloned());
+        }
+        lineage
     }
 
     pub fn read_from(path: &Path) -> Result<Self, MetadataError> {
@@ -1341,6 +1376,36 @@ mod tests {
         let marker: WorkspaceMarker = serde_json::from_value(expected.clone()).unwrap();
         marker.validate().unwrap();
         assert_eq!(serde_json::to_value(marker).unwrap(), expected);
+    }
+
+    #[test]
+    fn marker_lineage_round_trips_and_rejects_self_and_duplicates() {
+        let ancestor = "1198f2c0b7e34dc795f17b238b331c80";
+        let older = "2198f2c0b7e34dc795f17b238b331c80";
+        let mut with_lineage = serde_json::to_value(marker_from_json()).unwrap();
+        with_lineage["lineage"] = json!([ancestor, older]);
+        let marker: WorkspaceMarker = serde_json::from_value(with_lineage.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&marker).unwrap(), with_lineage);
+        assert_eq!(
+            marker
+                .clone_lineage()
+                .iter()
+                .map(WorkspaceIncarnation::as_str)
+                .collect::<Vec<_>>(),
+            vec!["0198f2c0b7e34dc795f17b238b331c80", ancestor, older],
+            "a clone inherits this incarnation first, then its ancestors"
+        );
+        assert!(
+            marker_from_json().clone_lineage().len() == 1,
+            "a legacy marker contributes only itself"
+        );
+
+        let mut self_in_lineage = serde_json::to_value(marker_from_json()).unwrap();
+        self_in_lineage["lineage"] = json!(["0198f2c0b7e34dc795f17b238b331c80"]);
+        assert!(serde_json::from_value::<WorkspaceMarker>(self_in_lineage).is_err());
+        let mut duplicated = serde_json::to_value(marker_from_json()).unwrap();
+        duplicated["lineage"] = json!([ancestor, ancestor]);
+        assert!(serde_json::from_value::<WorkspaceMarker>(duplicated).is_err());
     }
 
     #[test]

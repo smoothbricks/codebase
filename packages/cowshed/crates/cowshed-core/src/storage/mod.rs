@@ -15,8 +15,8 @@ use crate::metadata::{
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
 pub mod apfs;
+pub mod audit;
 pub mod bootstrap;
-pub mod commitment_store;
 pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;

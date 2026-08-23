@@ -187,6 +187,7 @@ mod tests {
                 created_at: "2026-07-13T00:00:00Z".to_owned(),
                 forked_from: None,
                 created_trace: "fixture".to_owned(),
+                lineage: Some(Vec::new()),
             },
         )
         .expect("write marker");

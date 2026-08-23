@@ -2627,6 +2627,10 @@ where
         identity: &OperationIdentity,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(mount_point)?;
+        let marker_path = mount_point.join(WORKSPACE_MARKER_PATH);
+        // A cloned image arrives with its source's marker still in place: that marker is the
+        // lineage. A fresh image (adopt) has none and starts a lineage of its own.
+        let lineage = clone_lineage_from(&marker_path, workspace.repo());
         let marker = WorkspaceMarker {
             version: METADATA_VERSION,
             repo_id: workspace.repo().clone(),
@@ -2639,11 +2643,11 @@ where
             created_at: identity.created_at.clone(),
             forked_from: forked_from.cloned(),
             created_trace: identity.created_trace.clone(),
+            lineage: Some(lineage),
         };
         marker
             .validate()
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        let marker_path = mount_point.join(WORKSPACE_MARKER_PATH);
         let parent = marker_path.parent().ok_or(ApfsStorageError::InvalidPlan(
             "workspace marker has no parent",
         ))?;
@@ -4780,9 +4784,75 @@ fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
     }
 }
 
+/// The lineage a newly minted incarnation inherits from the marker already present at
+/// `marker_path` — the clone source's — or an empty lineage when there is none to inherit.
+///
+/// A marker from another repository is not an ancestor: `adopt` copies a checkout tree that may
+/// carry a stale `.cowshed/` from somewhere else, and a foreign marker must not smuggle its
+/// incarnations into this repository's lineage.
+fn clone_lineage_from(marker_path: &Path, repo: &RepoId) -> Vec<WorkspaceIncarnation> {
+    match WorkspaceMarker::read_from(marker_path) {
+        Ok(existing) if &existing.repo_id == repo => existing.clone_lineage(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clone_inherits_the_source_markers_lineage_and_ignores_foreign_or_absent_markers() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-clone-lineage-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let marker_path = root.join(WORKSPACE_MARKER_PATH);
+        std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        let repo = RepoId::parse("acme/widget").unwrap();
+        let source = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap();
+        let ancestor = WorkspaceIncarnation::new("1198f2c0b7e34dc795f17b238b331c80").unwrap();
+        assert!(
+            clone_lineage_from(&marker_path, &repo).is_empty(),
+            "no marker: a lineage of its own"
+        );
+        let marker = WorkspaceMarker {
+            version: crate::metadata::METADATA_VERSION,
+            repo_id: repo.clone(),
+            project_root: root.clone(),
+            workspace: WorkspaceName::new("raven").unwrap(),
+            workspace_incarnation: source.clone(),
+            role: crate::metadata::WorkspaceRole::Workspace,
+            image_format: crate::metadata::ImageFormat::Sparse,
+            base_commit: "8f31c2d".into(),
+            created_at: "2026-08-23T00:00:00Z".into(),
+            forked_from: None,
+            created_trace: "trace".into(),
+            lineage: Some(vec![ancestor.clone()]),
+        };
+        crate::metadata::write_json(&marker_path, &marker).unwrap();
+        assert_eq!(
+            clone_lineage_from(&marker_path, &repo),
+            vec![source.clone(), ancestor.clone()],
+            "the source first, then its ancestors"
+        );
+        assert!(
+            clone_lineage_from(&marker_path, &RepoId::parse("other/repo").unwrap()).is_empty(),
+            "a foreign repository's marker is not an ancestor"
+        );
+        let legacy = WorkspaceMarker {
+            lineage: None,
+            ..marker
+        };
+        crate::metadata::write_json(&marker_path, &legacy).unwrap();
+        assert_eq!(
+            clone_lineage_from(&marker_path, &repo),
+            vec![source],
+            "a legacy source contributes only itself"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn native_flag_and_result_tables_are_exact() {

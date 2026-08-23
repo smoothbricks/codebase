@@ -230,6 +230,15 @@ pub struct ProjectRuntime {
     actor: JoinHandle<()>,
 }
 
+fn continuity_from_environment() -> Result<crate::storage::audit::ContinuityAudit> {
+    crate::storage::audit::ContinuityAudit::from_environment().map_err(|error| {
+        CowshedError::usage(
+            error.to_string(),
+            "unset COWSHED_CONTINUITY_AUDIT or set it to arrow|off",
+        )
+    })
+}
+
 impl ProjectRuntime {
     /// Opens the production runtime with foreground provisioning authority.
     ///
@@ -242,6 +251,7 @@ impl ProjectRuntime {
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
             requested_repo_id,
+            continuity_from_environment()?,
         )
         .await
     }
@@ -249,12 +259,23 @@ impl ProjectRuntime {
     /// Opens the production runtime without storage provisioning authority.
     ///
     /// Ordinary commands and background services must use this entrypoint. Missing or incorrectly
-    /// mounted storage fails closed without creating or mounting anything.
+    /// mounted storage fails closed without creating or mounting anything. The audit sink is the
+    /// standalone default (`COWSHED_CONTINUITY_AUDIT`, §[`crate::storage::audit`]).
     pub async fn open_existing(project_root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_existing_with_audit(project_root, continuity_from_environment()?).await
+    }
+
+    /// [`Self::open_existing`] with the host's own audit sink — the entrypoint a supervising
+    /// runtime uses to route controller audit records into its durable log instead of Arrow files.
+    pub async fn open_existing_with_audit(
+        project_root: impl AsRef<Path>,
+        continuity: crate::storage::audit::ContinuityAudit,
+    ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
             None,
+            continuity,
         )
         .await
     }
@@ -263,17 +284,22 @@ impl ProjectRuntime {
         project_root: &Path,
         mode: crate::storage::bootstrap::native::NativeBootstrapMode,
         requested_repo_id: Option<RepoId>,
+        continuity: crate::storage::audit::ContinuityAudit,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
-            let host =
-                NativeProjectRuntimeHost::open(project_root, mode, requested_repo_id.as_ref())
-                    .await?;
+            let host = NativeProjectRuntimeHost::open(
+                project_root,
+                mode,
+                requested_repo_id.as_ref(),
+                continuity,
+            )
+            .await?;
             Self::start(host).await
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (project_root, mode, requested_repo_id);
+            let _ = (project_root, mode, requested_repo_id, continuity);
             Err(CowshedError::environment_missing(
                 "the native cowshed project runtime requires macOS APFS",
                 "run the controller on macOS or use an injected test host",
@@ -1554,6 +1580,7 @@ impl NativeProjectRuntimeHost {
         project_root: &Path,
         bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
         requested_repo_id: Option<&RepoId>,
+        continuity: crate::storage::audit::ContinuityAudit,
     ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::lifecycle::Substrate;
@@ -1668,40 +1695,38 @@ impl NativeProjectRuntimeHost {
             CowshedError::internal(format!("retired workspace recovery task failed: {error}"))
         })??;
         let verified_facts = verified_recovery_facts(&facts, &pending);
-        let known_incarnations = verified_facts
-            .iter()
-            .map(|fact| fact.workspace.incarnation().clone())
-            .chain(
-                retired
-                    .iter()
-                    .map(|fact| fact.workspace().incarnation().clone()),
-            )
-            .collect::<Vec<_>>();
+        // Authority is the inventory itself: an incarnation that is both an active storage fact
+        // and a retired (trashed) one is a host-side integrity fault, found here in one pass —
+        // no log replay has anything to add to what the images say.
+        {
+            let retired_incarnations = retired
+                .iter()
+                .map(|fact| fact.workspace().incarnation())
+                .collect::<std::collections::BTreeSet<_>>();
+            if let Some(conflict) = verified_facts
+                .iter()
+                .find(|fact| retired_incarnations.contains(fact.workspace.incarnation()))
+            {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "active storage fact references a retired workspace incarnation {}",
+                        conflict.workspace.incarnation()
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
+        }
         let telemetry_root = bootstrap.roots().store().join("telemetry");
         let mut commitments = super::supervisor::CommitmentPublisher::open(
             &telemetry_root,
-            repo_id.clone(),
-            known_incarnations,
+            continuity,
             ROUTER_CAPACITY,
         )?;
-        for retirement in &retired {
-            commitments
-                .ensure_workspace_retired(
-                    repo_id.clone(),
-                    retirement.workspace().incarnation().clone(),
-                )
-                .await?;
-        }
-        for fact in verified_facts {
-            commitments
-                .ensure_workspace_introduced(repo_id.clone(), fact.workspace.incarnation().clone())
-                .await?;
-        }
         for publication in &pending {
             use super::supervisor::{CommitmentDraft, CommitmentSink};
 
             commitments
-                .publish(CommitmentDraft::Restore {
+                .record(CommitmentDraft::Restore {
                     repo_id: repo_id.clone(),
                     source_checkpoint: publication.source_checkpoint.clone(),
                     source_incarnation: publication.source_incarnation.clone(),
@@ -1714,7 +1739,7 @@ impl NativeProjectRuntimeHost {
         }
         let substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
         for retirement in retired {
-            // The retirement commitment is durable before any best-effort trash reclamation.
+            // Trash reclamation is best effort; the retirement is already a fact of the inventory.
             let _ = substrate.reclaim(retirement).await;
         }
         let descriptor = ProjectDescriptor {
@@ -3028,10 +3053,11 @@ impl NativeProjectRuntimeHost {
                 self.workspace_mount_path(&main_name())?,
             ),
         };
-        let admitted_historical_incarnations = self
-            .commitments
-            .admitted_lifecycle_incarnations(self.descriptor.repo_id.clone())
-            .await?;
+        let historical_incarnations = workspace_lineage(
+            &mount,
+            current.derived.workspace.incarnation(),
+            crate::storage::job_artifact::ArtifactConfig::default().retained_recovery_budget_bytes,
+        )?;
         let config = super::supervisor::WorkspaceSupervisorConfig {
             authority: super::supervisor::WorkspaceAuthoritySnapshot {
                 repo_id: self.descriptor.repo_id.clone(),
@@ -3044,7 +3070,7 @@ impl NativeProjectRuntimeHost {
             default_cwd: None,
             sandbox,
             artifacts: crate::storage::job_artifact::ArtifactConfig {
-                admitted_historical_incarnations,
+                historical_incarnations,
                 ..crate::storage::job_artifact::ArtifactConfig::default()
             },
             term_grace: std::time::Duration::from_secs(2),
@@ -3067,6 +3093,7 @@ impl NativeProjectRuntimeHost {
     }
 
     async fn retire_workspace(&mut self, current: NativeWorkspace) -> Result<()> {
+        use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::{LifecyclePlanner, Substrate};
 
         let plan = self
@@ -3079,9 +3106,11 @@ impl NativeProjectRuntimeHost {
             .substrate
             .execute_retire_staged(plan, move |retired| async move {
                 commitments
-                    .ensure_workspace_retired(repo_id, retired.workspace().incarnation().clone())
+                    .record(super::supervisor::CommitmentDraft::WorkspaceRetired {
+                        repo_id,
+                        workspace_incarnation: retired.workspace().incarnation().clone(),
+                    })
                     .await
-                    .map(|_| ())
             })
             .await
             .map_err(native_retire_error)?;
@@ -3101,6 +3130,7 @@ impl NativeProjectRuntimeHost {
     }
 
     async fn retire_restored_main(&mut self, current: NativeWorkspace) -> Result<()> {
+        use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::Substrate;
 
         let mut commitments = self.commitments.clone();
@@ -3111,12 +3141,11 @@ impl NativeProjectRuntimeHost {
                 &current.derived.workspace,
                 move |retired| async move {
                     commitments
-                        .ensure_workspace_retired(
+                        .record(super::supervisor::CommitmentDraft::WorkspaceRetired {
                             repo_id,
-                            retired.workspace().incarnation().clone(),
-                        )
+                            workspace_incarnation: retired.workspace().incarnation().clone(),
+                        })
                         .await
-                        .map(|_| ())
                 },
             )
             .await
@@ -3213,6 +3242,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     }
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
+        use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
 
         self.validate_binding().await?;
@@ -3290,10 +3320,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .await
             .map_err(native_staged_error)?;
         self.commitments
-            .ensure_workspace_introduced(
-                self.descriptor.repo_id.clone(),
-                receipt.workspace.incarnation().clone(),
-            )
+            .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
+                repo_id: self.descriptor.repo_id.clone(),
+                workspace_incarnation: receipt.workspace.incarnation().clone(),
+            })
             .await?;
         let name = receipt.workspace.name().clone();
         self.ensure_supervisor(&name).await?;
@@ -3305,6 +3335,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         workspace: WorkspaceName,
         options: CreateOptions,
     ) -> Result<WorkspaceSnapshot> {
+        use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
 
         self.validate_binding().await?;
@@ -3412,10 +3443,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 self.register_workspace_in_main(&workspace).await?;
             }
             self.commitments
-                .ensure_workspace_introduced(
-                    self.descriptor.repo_id.clone(),
-                    receipt.workspace.incarnation().clone(),
-                )
+                .record(super::supervisor::CommitmentDraft::WorkspaceIntroduced {
+                    repo_id: self.descriptor.repo_id.clone(),
+                    workspace_incarnation: receipt.workspace.incarnation().clone(),
+                })
                 .await?;
             self.ensure_supervisor(&workspace).await?;
             self.snapshot_named(&workspace).await
@@ -3561,7 +3592,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .await
             .map_err(native_staged_error)?;
         self.commitments
-            .publish(CommitmentDraft::Fork {
+            .record(CommitmentDraft::Fork {
                 repo_id: self.descriptor.repo_id.clone(),
                 source_incarnation: source_fact.derived.workspace.incarnation().clone(),
                 destination_incarnation: receipt.workspace.incarnation().clone(),
@@ -3983,7 +4014,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 |_stage| async { Ok::<_, CowshedError>(()) },
                 move |fence| async move {
                     commitments
-                        .publish(CommitmentDraft::Restore {
+                        .record(CommitmentDraft::Restore {
                             repo_id: fence.pending.workspace.repo().clone(),
                             source_checkpoint: fence.pending.source_checkpoint,
                             source_incarnation: fence.pending.source_incarnation,
@@ -4685,6 +4716,28 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 error,
             ));
         }
+        match self.commitments.health().await {
+            Ok(health) if health.failed > 0 => findings.push(crate::api::dto::Finding {
+                code: "audit-sink".into(),
+                severity: crate::api::dto::FindingSeverity::Warning,
+                message: format!(
+                    "the {} audit sink refused {} of {} records; last: {}",
+                    health.sink,
+                    health.failed,
+                    health.failed.saturating_add(health.recorded),
+                    health.last_failure.as_deref().unwrap_or("(no message)")
+                ),
+                hint: "verify telemetry storage, or set COWSHED_CONTINUITY_AUDIT=off — the audit trail gates nothing"
+                    .into(),
+                path: Some(self.telemetry_root.clone()),
+            }),
+            Ok(_) => {}
+            Err(error) => findings.push(native_finding(
+                "audit-sink",
+                crate::api::dto::FindingSeverity::Error,
+                error,
+            )),
+        }
         match self.pending_metadata().await {
             Ok(pending) => {
                 for (image, metadata) in pending {
@@ -4695,7 +4748,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             "workspace {} is pending its restore fence",
                             metadata.workspace
                         ),
-                        hint: "retry restore after repairing commitment or gateway evidence".into(),
+                        hint: "retry restore after repairing the image or gateway evidence".into(),
                         path: Some(image),
                     });
                 }
@@ -6291,6 +6344,48 @@ fn parse_capacity(value: &str) -> Result<crate::metadata::ImageCapacity> {
     })
 }
 
+/// The ancestor incarnations a workspace's records may carry, read from the marker the image
+/// itself holds (the clone source's lineage plus the source, written when the incarnation was
+/// minted). A marker from before lineage was recorded is healed once: its ancestors are exactly
+/// the foreign origins already in its records — every one was admitted by the controller that
+/// wrote it — so the marker is rewritten with them and is strict from then on.
+#[cfg(target_os = "macos")]
+fn workspace_lineage(
+    mount: &Path,
+    current: &WorkspaceIncarnation,
+    retained_recovery_budget_bytes: usize,
+) -> Result<std::collections::BTreeSet<WorkspaceIncarnation>> {
+    let marker_path = mount.join(crate::storage::WORKSPACE_MARKER_PATH);
+    let mut marker = crate::metadata::WorkspaceMarker::read_from(&marker_path)
+        .map_err(|error| CowshedError::integrity(error.to_string(), "cowshed doctor --json"))?;
+    if marker.workspace_incarnation != *current {
+        return Err(CowshedError::integrity(
+            format!(
+                "workspace marker names incarnation {} but the inventory says {current}",
+                marker.workspace_incarnation
+            ),
+            "cowshed doctor --json",
+        ));
+    }
+    if marker.lineage.is_none() {
+        let recorded = crate::storage::job_artifact::recorded_historical_incarnations(
+            mount,
+            current,
+            retained_recovery_budget_bytes,
+        )
+        .map_err(|error| CowshedError::integrity(error.to_string(), "cowshed doctor --json"))?;
+        marker.lineage = Some(recorded.into_iter().collect());
+        marker
+            .validate()
+            .map_err(|error| CowshedError::integrity(error.to_string(), "cowshed doctor --json"))?;
+        // Persisting the healed marker is an optimization — the next open recomputes the same
+        // lineage from the same records — so a write failure (a full disk, a read-only mount)
+        // must not take the workspace down with it.
+        let _ = crate::metadata::write_json(&marker_path, &marker);
+    }
+    Ok(marker.lineage.unwrap_or_default().into_iter().collect())
+}
+
 #[cfg(target_os = "macos")]
 fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
     match error {
@@ -6303,7 +6398,7 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
         ),
         crate::storage::apfs::ApfsStorageError::PendingPublication(path) => CowshedError::conflict(
             format!("restore publication is pending at {}", path.display()),
-            "repair commitment/gateway evidence and retry restore",
+            "repair the image or gateway evidence and retry restore",
         ),
         // Asking to shrink, or to resize to the size it already is, is a mistake in the request,
         // not a broken host: report it as usage so the caller is told to name a larger capacity.
@@ -6684,6 +6779,7 @@ mod workspace_origin_tests {
                 created_at: "2026-07-13T00:00:00Z".to_owned(),
                 forked_from: None,
                 created_trace: "fixture".to_owned(),
+                lineage: Some(Vec::new()),
             },
         )
         .expect("write marker");
@@ -7025,7 +7121,6 @@ mod binding_tests {
 
     #[tokio::test]
     async fn startup_pending_restore_destination_is_absent_until_restore_fence() {
-        use crate::api::dto::Sha256Digest;
         use crate::metadata::{ImageFormat, WorkspaceRole};
         use crate::runtime::supervisor::{CommitmentDraft, CommitmentPublisher, CommitmentSink};
         use crate::storage::apfs::PendingPublicationFact;
@@ -7084,69 +7179,24 @@ mod binding_tests {
         assert_eq!(verified.len(), 1);
         assert_eq!(verified[0].workspace.incarnation(), &source);
 
-        let mut commitments = CommitmentPublisher::open(
-            &telemetry,
-            repo.clone(),
-            verified
-                .iter()
-                .map(|fact| fact.workspace.incarnation().clone()),
-            8,
-        )
-        .expect("open commitment publisher");
+        // The pending destination is not an active fact until its restore fence activates the
+        // image; the audit record of the restore is telemetry and gates nothing.
+        let mut commitments =
+            CommitmentPublisher::open(&telemetry, crate::storage::audit::ContinuityAudit::Arrow, 8)
+                .expect("open audit publisher");
         commitments
-            .ensure_workspace_introduced(repo.clone(), source.clone())
-            .await
-            .expect("introduce source");
-        commitments
-            .publish(CommitmentDraft::Checkpoint {
-                repo_id: repo.clone(),
-                origin_incarnation: source.clone(),
-                checkpoint_id: "baseline".to_owned(),
-                barrier_id: 1,
-                manifest_batch_sha256: Sha256Digest::compute(b"baseline manifest"),
-            })
-            .await
-            .expect("publish checkpoint");
-        assert!(
-            !commitments
-                .admitted_lifecycle_incarnations(repo.clone())
-                .await
-                .expect("pre-fence incarnations")
-                .contains(&destination)
-        );
-        commitments
-            .publish(CommitmentDraft::Restore {
-                repo_id: repo.clone(),
+            .record(CommitmentDraft::Restore {
+                repo_id: repo,
                 source_checkpoint: pending.source_checkpoint.clone(),
                 source_incarnation: pending.source_incarnation.clone(),
                 replaced_incarnation: pending.replaced_incarnation.clone(),
                 destination_incarnation: pending.destination_incarnation.clone(),
             })
             .await
-            .expect("publish recovered restore");
-        assert!(
-            commitments
-                .admitted_lifecycle_incarnations(repo.clone())
-                .await
-                .expect("post-fence incarnations")
-                .contains(&destination)
-        );
-        assert!(
-            commitments
-                .publish(CommitmentDraft::Restore {
-                    repo_id: repo,
-                    source_checkpoint: "unknown".to_owned(),
-                    source_incarnation: source,
-                    replaced_incarnation: destination,
-                    destination_incarnation: WorkspaceIncarnation::new(
-                        "2198f2c0b7e34dc795f17b238b331c80"
-                    )
-                    .expect("unknown destination"),
-                })
-                .await
-                .is_err(),
-            "an unknown pending checkpoint must remain rejected"
-        );
+            .expect("record recovered restore");
+        let health = commitments.health().await.expect("audit health");
+        assert_eq!((health.recorded, health.failed), (1, 0));
+        drop(destination);
         drop(commitments);
         let _ = std::fs::remove_dir_all(root);
     }
