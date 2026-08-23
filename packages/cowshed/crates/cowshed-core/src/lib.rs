@@ -7,6 +7,7 @@ pub mod copy;
 pub mod error;
 pub mod exec;
 mod gateway_inventory;
+pub mod gateway_sessions;
 pub mod git;
 pub mod metadata;
 pub mod repository;
