@@ -267,11 +267,18 @@ generations without resurrecting or repeatedly retiring its origin. Constructors
 same row and collection validator; no derive-only path bypasses it.
 
 Immutable publication uses the filesystem lock only to recover the complete segment set and append one create-new
-segment. A publisher refreshes under that lock before assigning an order to a draft. If another valid writer advances
-the global sequence or deliberately wins the same-order destination, the stale store adopts the recovered context and
-the publisher retries the unchanged draft at the new next order with a bounded conflict count. Such a known concurrent
-advance is an operational conflict, not integrity failure; malformed, duplicate, gapped, or lineage-invalid history
-still fails closed as `Integrity`. A draft is acknowledged exactly once only after its immutable segment is durable.
+segment. A publisher refreshes under that lock before assigning an order to a draft. A refresh re-enumerates every
+sealed name — malformed, duplicate, gapped, or vanished history still fails closed — but opens, decodes, and folds only
+segments beyond the store's last folded order: sealed segments are immutable, so history already folded in this process
+is never re-read, and a refresh that finds nothing new costs one name enumeration. The publisher refreshes before every
+request, so a refresh that finds nothing new must not cost a replay: a full replay per refresh scales every command with
+host history times workspace count. If another valid writer advances the global sequence or deliberately wins the
+same-order destination, the stale store adopts the recovered context and the publisher retries the unchanged draft at
+the new next order with a bounded conflict count. Such a known concurrent advance is an operational conflict, not
+integrity failure; malformed, duplicate, gapped, or lineage-invalid history still fails closed as `Integrity`. A draft
+must validate both against the baseline-merged context and against replayed history alone; a draft only the opening
+baseline could authorize is refused as `Integrity` before any segment is written, because it would seal and then fail
+every later recovery. A draft is acknowledged exactly once only after its immutable segment is durable.
 
 No commitment variant contains `inline_bytes`, `protected_path`, `source_path`, summary text, or output payload.
 `reconcile_commitments` compares protected content counts/hashes plus Job `batch_sha256` and checkpoint

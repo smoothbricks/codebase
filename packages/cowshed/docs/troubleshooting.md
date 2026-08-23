@@ -198,6 +198,33 @@ For cache-volume corruption specifically there is a bigger, equally safe hammer:
 mirror refetches, sccache and registries rebuild. `cowshed doctor` suggests it when the caches volume fails its checks.
 (Never do this to `cowshed.store` — that volume holds your images.)
 
+## Every verb prints `could not install gateway session …: (EndpointConflict)`
+
+`EndpointConflict` means the gateway already has a session on the port block this project's inventory assigns to one of
+its workspaces, under a different workspace identity. The gateway's session table is a cache of host inventory, never an
+authority: the owner is a session left behind by a project that was deleted out of band
+(`rm -rf ~/.cowshed/<owner>/ <repo>` without ever running a verb against it again), and the host-global port-block
+allocator has since handed that block to a new workspace. Reconcile — which every `exec`, `ensure`, and `doctor` runs
+first — evicts such a session itself once the host inventory confirms no live workspace anywhere still carries that
+identity, then installs the workspace; the message does not recur. If `cowshed doctor --json` instead refuses with
+`gateway endpoint 127.0.0.1:<base> is assigned to workspace <id> by this project and still claimed by live workspace <id> of another project`,
+two live workspaces hold one block: that is an inventory fault, not a stale session, and cowshed never resolves it by
+evicting a live session. Retire one of the two (`cowshed rm`, or `detach` and re-create it so it takes a fresh block)
+and rerun `doctor`. One workspace that cannot be installed no longer stops the rest of the project from being installed;
+the error names every failed identity.
+
+## `cowshed ls` takes tens of seconds; `cowshed new` or `doctor` takes a minute
+
+Per-command cost does not grow with history or with the number of warm workspaces: the controller commitment log under
+`~/.cowshed/telemetry/` is replayed once per process and then folded only for segments sealed since; the host APFS
+inventory is queried only for the container that holds `~`, and attaching an image lists only that image's container;
+one project open validates the repository binding and reads the inventory once for every workspace it recovers. When a
+command is still slow, the wait is in a host process, not in cowshed — while it runs,
+`ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'` names it. The first `diskutil mount` of a freshly
+cloned image takes seconds on a host with dozens of attached images (the same volume re-mounts in a fraction of that
+after publication); that is DiskArbitration's cost per attached image, so `cowshed rm` what you no longer need and
+`cowshed gc` the trash.
+
 ## "cowshed volumes owned by another user"
 
 The cowshed volumes belong to exactly one uid. If `doctor` reports a foreign-uid volume, you are running cowshed as the
