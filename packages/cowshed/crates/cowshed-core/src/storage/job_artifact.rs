@@ -3422,6 +3422,46 @@ pub fn controller_commitments_to_batch(
 
 /// Decode one controller audit batch, validating every row on its own.
 ///
+/// One commitment as a self-contained Arrow IPC stream — the byte form an
+/// external [`crate::storage::audit::AuditSink`] stores. Owned here beside
+/// the batch codec so the schema and the encoding drift together or not at
+/// all; a host that carried its own Arrow dependency would fork the version.
+pub fn encode_controller_commitment(
+    commitment: &ControllerCommitment,
+) -> Result<Vec<u8>, ArtifactError> {
+    let batch = controller_commitments_to_batch(std::slice::from_ref(commitment))?;
+    let mut out = Vec::with_capacity(512);
+    {
+        let mut writer = StreamWriter::try_new(&mut out, batch.schema_ref())
+            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+        writer
+            .finish()
+            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    }
+    Ok(out)
+}
+
+/// The inverse of [`encode_controller_commitment`]: exactly one commitment.
+pub fn decode_controller_commitment(bytes: &[u8]) -> Result<ControllerCommitment, ArtifactError> {
+    let mut batches = StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    let batch = batches
+        .next()
+        .ok_or_else(|| ArtifactError::Arrow("commitment bytes hold no Arrow batch".into()))?
+        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    let mut commitments = decode_controller_commitments(&batch)?;
+    if commitments.len() != 1 {
+        return Err(ArtifactError::Arrow(format!(
+            "commitment bytes hold {} rows, wanted exactly one",
+            commitments.len()
+        )));
+    }
+    Ok(commitments.remove(0))
+}
+
 /// The audit records are telemetry: nothing replays them for a decision, so there is no
 /// cross-row sequence validation here — a reader that wants ordering sorts by `order`
 /// within a writer and by segment name across writers.
