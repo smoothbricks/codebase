@@ -84,7 +84,13 @@ retired workspaces are never installed. SIGTERM and SIGINT stop admissions and d
 
 Every ordinary `exec`, `ensure`, and `doctor` invocation reconciles the current project before use. Attach, detach,
 restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed
-revisions/tokens and removing stale project sessions. Gateway absence is exit 5 with:
+revisions/tokens and removing stale project sessions. The gateway's session table is a cache of host inventory, never an
+authority of its own: a session left behind by a project deleted out of band keeps its port block in the gateway while
+the host-global allocator hands that block to the next workspace, so reconcile also evicts a foreign-project session
+that holds an endpoint the current project's inventory assigns — but only after confirming no live workspace anywhere
+still claims that identity; two live workspaces on one block is an integrity refusal pointing at
+`cowshed doctor --json`, never a silent eviction. Installs are independent: one workspace that cannot be installed is
+reported, it does not abandon the rest of the project. Gateway absence is exit 5 with:
 
 ```text
 next: launchctl kickstart -k gui/<uid>/dev.cowshed.gateway

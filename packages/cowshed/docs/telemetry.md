@@ -53,7 +53,9 @@ Controller Arrow is the cross-incarnation continuity authority. Its immutable pe
 lifecycle and terminal state, ordering, fork/restore/checkpoint lineage, grant revision, byte counts, stream SHA-256
 digests, and terminal-batch digest. It never stores inline bytes, spill paths as authority, or duplicated raw payload.
 The content tier and continuity tier therefore complement one another; neither silently overwrites the other on a
-mismatch.
+mismatch. Every controller process replays the whole segment history once when it opens the store and afterwards folds
+only segments sealed since its last fold: the history is never pruned into an order gap, so a host that has been running
+for weeks pays for its history once per command, not once per workspace per command.
 
 Checkpoint publication crosses a supervisor barrier that seals complete batches and spill files and writes a manifest
 covering every checkpoint-resident job byte. Restoring that snapshot mints a new workspace incarnation; controller
