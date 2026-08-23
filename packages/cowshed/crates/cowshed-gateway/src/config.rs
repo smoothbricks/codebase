@@ -28,6 +28,17 @@ pub enum WorkspaceEndpoint {
     Unix(PathBuf),
 }
 
+/// The label the gateway reports for a session's endpoint in [`crate::SessionStatus`]; a
+/// controller compares the endpoint it intends to install against this exact rendering.
+impl fmt::Display for WorkspaceEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(address) => write!(formatter, "{address}"),
+            Self::Unix(path) => write!(formatter, "{}", path.display()),
+        }
+    }
+}
+
 impl WorkspaceEndpoint {
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self {

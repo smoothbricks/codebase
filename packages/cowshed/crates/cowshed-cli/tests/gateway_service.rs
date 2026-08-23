@@ -33,11 +33,15 @@ fn workspace_id(repo: &RepoId, workspace: &str, incarnation: u8) -> String {
 }
 
 fn session(identity: &str, revision: u64, token_byte: u8) -> WorkspaceSession {
+    session_at(identity, revision, token_byte, 40_960)
+}
+
+fn session_at(identity: &str, revision: u64, token_byte: u8, port: u16) -> WorkspaceSession {
     WorkspaceSession {
         workspace_id: identity.to_owned(),
         repo_id: "project".to_owned(),
         revision,
-        endpoint: WorkspaceEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 40_960))),
+        endpoint: WorkspaceEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
         token: WorkspaceToken::from_bytes([token_byte; 32]),
         ca: WorkspaceCa::new(
             "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----".to_owned(),
@@ -58,12 +62,30 @@ fn status(sessions: Vec<SessionStatus>) -> GatewayStatus {
 }
 
 fn installed(identity: &str, revision: u64) -> SessionStatus {
+    installed_at(identity, revision, 40_960)
+}
+
+fn installed_at(identity: &str, revision: u64, port: u16) -> SessionStatus {
     SessionStatus {
         workspace_id: identity.to_owned(),
         revision,
-        endpoint: "127.0.0.1:40960".to_owned(),
+        endpoint: format!("127.0.0.1:{port}"),
         active: 0,
         queued: 0,
+    }
+}
+
+/// A host inventory that must not be consulted: reconcile only reads it when a foreign session
+/// holds an endpoint this project claims.
+fn untouched_host() -> FakeInventory {
+    FakeInventory {
+        all: Mutex::new(None),
+    }
+}
+
+fn host_with(live: Vec<WorkspaceSession>) -> FakeInventory {
+    FakeInventory {
+        all: Mutex::new(Some(live)),
     }
 }
 
@@ -72,6 +94,7 @@ struct FakeControl {
     status: Mutex<Option<std::result::Result<GatewayStatus, String>>>,
     installs: Mutex<Vec<(String, u64)>>,
     removes: Mutex<Vec<(String, u64)>>,
+    refuse_installs: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -85,6 +108,14 @@ impl GatewayControl for FakeControl {
     }
 
     async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String> {
+        if self
+            .refuse_installs
+            .lock()
+            .expect("refusal lock")
+            .contains(&session.workspace_id)
+        {
+            return Err("gateway control rejected operation (EndpointConflict)".to_owned());
+        }
         self.installs
             .lock()
             .expect("install lock")
@@ -138,12 +169,13 @@ async fn reconcile_rotates_workspace_incarnation_and_removes_stale_project_sessi
 
     let report = reconcile_against_status(
         &control,
+        &untouched_host(),
         &prefix_a,
         vec![session(&current, 8, 9)],
         status(vec![
             installed(&prior, 7),
             installed(&stale, 3),
-            installed(&sibling, 5),
+            installed_at(&sibling, 5, 40_976),
         ]),
     )
     .await
@@ -168,6 +200,7 @@ async fn empty_attached_inventory_removes_detached_session() {
     let control = FakeControl::default();
     let report = reconcile_against_status(
         &control,
+        &untouched_host(),
         &project_session_prefix(&repo),
         Vec::new(),
         status(vec![installed(&identity, 11)]),
@@ -189,6 +222,7 @@ async fn unchanged_revision_is_idempotent() {
     let control = FakeControl::default();
     let report = reconcile_against_status(
         &control,
+        &untouched_host(),
         &project_session_prefix(&repo),
         vec![session(&identity, 4, 1)],
         status(vec![installed(&identity, 4)]),
@@ -208,15 +242,144 @@ async fn absent_gateway_is_exit_five_and_guides_the_install() {
         status: Mutex::new(Some(Err("not found".to_owned()))),
         ..FakeControl::default()
     };
-    let error = reconcile_project(&control, &project_session_prefix(&repo), Vec::new(), 501)
-        .await
-        .expect_err("gateway absence fails");
+    let error = reconcile_project(
+        &control,
+        &untouched_host(),
+        &project_session_prefix(&repo),
+        Vec::new(),
+        501,
+    )
+    .await
+    .expect_err("gateway absence fails");
     assert_eq!(error.exit_code(), 5);
     // `cowshed gateway start` installs the launch agent as well as starting it,
     // so it is correct on a host where the agent was never installed — which is
     // where this error is reached from first. `launchctl kickstart` fails there
     // with "service not found".
     assert_eq!(error.hint, "cowshed gateway start");
+}
+
+#[tokio::test]
+async fn stale_foreign_session_holding_a_claimed_endpoint_is_evicted_before_install() {
+    // `local/diag` was deleted out of band; its gateway session kept port block 41536, which the
+    // host-global allocator then handed to this project's `lock-contracts`. Every reconcile hit
+    // EndpointConflict on that install and abandoned the rest of the project.
+    let repo = RepoId::parse("hyperide/axe").expect("repo");
+    let deleted = RepoId::parse("local/diag").expect("deleted repo");
+    let prefix = project_session_prefix(&repo);
+    let claimant = workspace_id(&repo, "lock-contracts", 1);
+    let sibling = workspace_id(&repo, "ring-path", 1);
+    let leaked = workspace_id(&deleted, "ws", 1);
+    let control = FakeControl::default();
+
+    let report = reconcile_against_status(
+        &control,
+        &host_with(vec![
+            session_at(&claimant, 2, 1, 41_536),
+            session_at(&sibling, 2, 2, 41_088),
+        ]),
+        &prefix,
+        vec![
+            session_at(&claimant, 2, 1, 41_536),
+            session_at(&sibling, 2, 2, 41_088),
+        ],
+        status(vec![
+            installed_at(&leaked, 1, 41_536),
+            installed_at(&sibling, 2, 41_088),
+        ]),
+    )
+    .await
+    .expect("reconcile succeeds");
+
+    assert_eq!(report.removed, 1);
+    assert_eq!(report.installed, 1);
+    assert_eq!(
+        *control.removes.lock().expect("remove lock"),
+        vec![(leaked, 1)]
+    );
+    assert_eq!(
+        *control.installs.lock().expect("install lock"),
+        vec![(claimant, 2)]
+    );
+}
+
+#[tokio::test]
+async fn live_foreign_session_on_a_claimed_endpoint_is_an_inventory_fault_not_an_eviction() {
+    let repo = RepoId::parse("hyperide/axe").expect("repo");
+    let other = RepoId::parse("axe-scale/minigraf").expect("other repo");
+    let claimant = workspace_id(&repo, "lock-contracts", 1);
+    let live_owner = workspace_id(&other, "board-wave", 1);
+    let control = FakeControl::default();
+
+    let error = reconcile_against_status(
+        &control,
+        &host_with(vec![
+            session_at(&claimant, 2, 1, 41_536),
+            session_at(&live_owner, 3, 2, 41_536),
+        ]),
+        &project_session_prefix(&repo),
+        vec![session_at(&claimant, 2, 1, 41_536)],
+        status(vec![installed_at(&live_owner, 3, 41_536)]),
+    )
+    .await
+    .expect_err("two live workspaces on one port block is an inventory fault");
+
+    assert_eq!(error.hint, "cowshed doctor --json");
+    assert!(
+        error.message.contains("127.0.0.1:41536"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains(&live_owner), "{}", error.message);
+    assert!(control.removes.lock().expect("remove lock").is_empty());
+    assert!(control.installs.lock().expect("install lock").is_empty());
+}
+
+#[tokio::test]
+async fn one_refused_install_does_not_abandon_the_other_workspaces() {
+    let repo = RepoId::parse("hyperide/axe").expect("repo");
+    let refused = workspace_id(&repo, "lock-contracts", 1);
+    let first = workspace_id(&repo, "abi-reconcile", 1);
+    let last = workspace_id(&repo, "ttsc-gate", 1);
+    let control = FakeControl {
+        refuse_installs: Mutex::new(vec![refused.clone()]),
+        ..FakeControl::default()
+    };
+    let mut desired = vec![
+        session_at(&first, 2, 1, 41_296),
+        session_at(&refused, 2, 2, 41_536),
+        session_at(&last, 2, 3, 41_264),
+    ];
+    desired.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+
+    let error = reconcile_against_status(
+        &control,
+        &untouched_host(),
+        &project_session_prefix(&repo),
+        desired,
+        status(Vec::new()),
+    )
+    .await
+    .expect_err("the refused install is still reported");
+
+    assert!(
+        error
+            .message
+            .contains(&format!("could not install gateway session {refused}")),
+        "{}",
+        error.message
+    );
+    let mut installed: Vec<_> = control
+        .installs
+        .lock()
+        .expect("install lock")
+        .iter()
+        .map(|(identity, _)| identity.clone())
+        .collect();
+    installed.sort();
+    let mut expected = vec![first, last];
+    expected.sort();
+    assert_eq!(installed, expected);
 }
 
 struct FakeInventory {

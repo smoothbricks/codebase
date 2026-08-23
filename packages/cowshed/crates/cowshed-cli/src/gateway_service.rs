@@ -334,22 +334,43 @@ pub fn sessions_from_facts(
     facts.into_iter().map(session_from_fact).collect()
 }
 
-pub async fn reconcile_project<C: GatewayControl + ?Sized>(
+pub async fn reconcile_project<C, I>(
     control: &C,
+    host: &I,
     project_prefix: &str,
     desired: Vec<WorkspaceSession>,
     uid: u32,
-) -> Result<ReconcileReport> {
+) -> Result<ReconcileReport>
+where
+    C: GatewayControl + ?Sized,
+    I: SessionInventory + ?Sized,
+{
     let status = control.status().await.map_err(|_| gateway_absent(uid))?;
-    reconcile_against_status(control, project_prefix, desired, status).await
+    reconcile_against_status(control, host, project_prefix, desired, status).await
 }
 
-pub async fn reconcile_against_status<C: GatewayControl + ?Sized>(
+/// Bring the gateway's sessions for one project in line with that project's inventory.
+///
+/// The gateway's session table is a cache of host inventory, never an authority of its own. The
+/// project's own stale sessions are removed by identity. A session from *another* project that
+/// holds an endpoint this project's inventory assigns to one of its workspaces is the leak left
+/// behind when a project is deleted out of band (its sessions outlive its store directory while
+/// the host-global port-block allocator hands the block to the next workspace); it is removed
+/// only once `host` confirms no live workspace anywhere still claims that identity, so a genuine
+/// two-projects-one-block inventory fault is reported instead of papered over. The host lookup
+/// runs only when such a conflict exists. Installs are independent, so one workspace that cannot
+/// be installed does not abandon the rest: every failure is reported together.
+pub async fn reconcile_against_status<C, I>(
     control: &C,
+    host: &I,
     project_prefix: &str,
     desired: Vec<WorkspaceSession>,
     status: GatewayStatus,
-) -> Result<ReconcileReport> {
+) -> Result<ReconcileReport>
+where
+    C: GatewayControl + ?Sized,
+    I: SessionInventory + ?Sized,
+{
     let mut desired_by_id = BTreeMap::new();
     for session in desired {
         let identity = session.workspace_id.clone();
@@ -393,20 +414,69 @@ pub async fn reconcile_against_status<C: GatewayControl + ?Sized>(
             report.removed += 1;
         }
     }
+    let desired_endpoints: BTreeMap<String, &str> = desired_by_id
+        .iter()
+        .map(|(identity, session)| (session.endpoint.to_string(), identity.as_str()))
+        .collect();
+    let foreign_owners: Vec<_> = status
+        .sessions
+        .iter()
+        .filter(|session| !session.workspace_id.starts_with(project_prefix))
+        .filter_map(|session| {
+            desired_endpoints
+                .get(&session.endpoint)
+                .map(|claimant| (session, *claimant))
+        })
+        .collect();
+    if !foreign_owners.is_empty() {
+        let live: BTreeSet<String> = host
+            .all_sessions()
+            .await?
+            .into_iter()
+            .map(|session| session.workspace_id)
+            .collect();
+        for (owner, claimant) in foreign_owners {
+            if live.contains(&owner.workspace_id) {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "gateway endpoint {} is assigned to workspace {claimant} by this project and still claimed by live workspace {} of another project",
+                        owner.endpoint, owner.workspace_id
+                    ),
+                    "cowshed doctor --json",
+                ));
+            }
+            control
+                .remove(&owner.workspace_id, owner.revision)
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!(
+                        "could not remove stale gateway session {} holding endpoint {}: {error}",
+                        owner.workspace_id, owner.endpoint
+                    ))
+                })?;
+            report.removed += 1;
+        }
+    }
+    let mut failures = Vec::new();
     for (identity, session) in &desired_by_id {
         let unchanged = installed_by_id
             .get(identity.as_str())
             .is_some_and(|installed| installed.revision == session.revision);
-        if !unchanged {
-            control.install(session).await.map_err(|error| {
-                CowshedError::internal(format!(
-                    "could not install gateway session {identity}: {error}"
-                ))
-            })?;
-            report.installed += 1;
+        if unchanged {
+            continue;
+        }
+        match control.install(session).await {
+            Ok(()) => report.installed += 1,
+            Err(error) => failures.push(format!(
+                "could not install gateway session {identity}: {error}"
+            )),
         }
     }
-    Ok(report)
+    if failures.is_empty() {
+        Ok(report)
+    } else {
+        Err(CowshedError::internal(failures.join("; ")))
+    }
 }
 
 fn launch_agent_is_loaded<F, C>(
@@ -474,6 +544,7 @@ where
 {
     reconcile_project(
         control,
+        inventory,
         &project_session_prefix(repo_id),
         inventory.project_sessions(repo_id).await?,
         uid,
