@@ -115,12 +115,14 @@ export type OpContext<
 // OP CONTEXT CONFIGURATION
 // =============================================================================
 
+import type { AnyResult, ExtractError, ExtractSuccess } from '../result.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { ValidateUserContext } from './contextTypes.js';
 import type { FeatureFlagSchema } from './featureFlagTypes.js';
 import type { DepsConfig, OpGroup } from './opGroupTypes.js';
 import type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
+import type { SpanContext } from './spanContextTypes.js';
 
 /**
  * Configuration for defineOpContext
@@ -347,12 +349,12 @@ export interface OpContextFactory<
    * const result = await ctx.span('get-user', fetchUser, 'user-123');
    * ```
    */
-  defineOp<Args extends unknown[], S, E>(
+  defineOp<Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     name: string,
-    fn: OpFn<OpContext<T, FF, Deps, UserCtx>, Args, S, E>,
+    fn: (ctx: SpanContext<OpContext<T, FF, Deps, UserCtx>>, ...args: Args) => R,
     metadata?: Partial<OpMetadata>,
     compileMetadata?: OpCompileMetadata,
-  ): Op<OpContext<T, FF, Deps, UserCtx>, Args, S, E>;
+  ): Op<OpContext<T, FF, Deps, UserCtx>, Args, ExtractSuccess<R>, ExtractError<R>, R>;
 
   /**
    * Define multiple Ops at once and create an OpGroup.

@@ -70,7 +70,7 @@ import {
   type PhysicalLayoutPlan,
   sealCallsitePlan,
 } from './physicalLayoutPlan.js';
-import { Err, Ok, type Result } from './result.js';
+import { type AnyResult, Err, Ok, type Result } from './result.js';
 import { createFeatureFlagEvaluator, type FlagEvaluator, InMemoryFlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 import { EMPTY_SCOPE, getSpanBufferClass } from './spanBuffer.js';
@@ -179,23 +179,23 @@ export type TraceFn<Ctx extends OpContext> = {
   /**
    * Trace Op with line + name + args.
    */
-  <S, E, Args extends unknown[]>(
+  <S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     line: number,
     name: string,
-    op: Op<Ctx, Args, S, E>,
+    op: Op<Ctx, Args, S, E, R>,
     ...args: Args
-  ): Promise<Result<S, E>>;
+  ): R;
 
   /**
    * Trace Op with line + name + overrides + args.
    */
-  <S, E, Args extends unknown[]>(
+  <S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     line: number,
     name: string,
     overrides: TraceOverrides<Ctx['userCtx']>,
-    op: Op<Ctx, Args, S, E>,
+    op: Op<Ctx, Args, S, E, R>,
     ...args: Args
-  ): Promise<Result<S, E>>;
+  ): R;
 
   /**
    * Trace inline function with line + name.
@@ -214,17 +214,21 @@ export type TraceFn<Ctx extends OpContext> = {
   /**
    * Trace Op with name + args.
    */
-  <S, E, Args extends unknown[]>(name: string, op: Op<Ctx, Args, S, E>, ...args: Args): Promise<Result<S, E>>;
+  <S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
+    name: string,
+    op: Op<Ctx, Args, S, E, R>,
+    ...args: Args
+  ): R;
 
   /**
    * Trace Op with name + overrides + args.
    */
-  <S, E, Args extends unknown[]>(
+  <S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     name: string,
     overrides: TraceOverrides<Ctx['userCtx']>,
-    op: Op<Ctx, Args, S, E>,
+    op: Op<Ctx, Args, S, E, R>,
     ...args: Args
-  ): Promise<Result<S, E>>;
+  ): R;
 
   /**
    * Trace inline function with name.
@@ -399,23 +403,20 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
    * - (name, overrides, fn)
    * - (name, op, ...args)
    * - (name, overrides, op, ...args)
-   * - Plus line number prefix variants for transformer
-   *
-   * @see TraceFn for type-level documentation of all overloads
    */
-  trace<S, E, Args extends unknown[]>(
+  trace<S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     line: number,
     name: string,
-    op: Op<OpContextOf<B>, Args, S, E>,
+    op: Op<OpContextOf<B>, Args, S, E, R>,
     ...args: Args
-  ): Promise<Result<S, E>>;
-  trace<S, E, Args extends unknown[]>(
+  ): R;
+  trace<S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     line: number,
     name: string,
     overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
-    op: Op<OpContextOf<B>, Args, S, E>,
+    op: Op<OpContextOf<B>, Args, S, E, R>,
     ...args: Args
-  ): Promise<Result<S, E>>;
+  ): R;
   trace<R>(line: number, name: string, fn: (ctx: SpanContext<OpContextOf<B>>) => R): R;
   trace<R>(
     line: number,
@@ -423,17 +424,17 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
     fn: (ctx: SpanContext<OpContextOf<B>>) => R,
   ): R;
-  trace<S, E, Args extends unknown[]>(
+  trace<S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     name: string,
-    op: Op<OpContextOf<B>, Args, S, E>,
+    op: Op<OpContextOf<B>, Args, S, E, R>,
     ...args: Args
-  ): Promise<Result<S, E>>;
-  trace<S, E, Args extends unknown[]>(
+  ): R;
+  trace<S, E, Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     name: string,
     overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
-    op: Op<OpContextOf<B>, Args, S, E>,
+    op: Op<OpContextOf<B>, Args, S, E, R>,
     ...args: Args
-  ): Promise<Result<S, E>>;
+  ): R;
   trace<R>(name: string, fn: (ctx: SpanContext<OpContextOf<B>>) => R): R;
   trace<R>(
     name: string,

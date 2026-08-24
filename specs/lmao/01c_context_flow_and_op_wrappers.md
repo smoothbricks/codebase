@@ -47,6 +47,15 @@ When a child span callback is guaranteed synchronous, use `spanSync(name, fn)`.
 - Lifecycle semantics: same span-start/span-end/span-exception envelope as `span()`
 - Retry behavior: no async retry/backoff loop
 
+### `trace()` Returns the Op's Own Result Kind
+
+Root traces carry no retry machinery, so `tracer.trace(name, op, ...args)` returns exactly what the op body returns:
+`Result<S, E>` for a sync op body, `Promise<Result<S, E>>` for an async one (`Op`'s fifth type parameter carries this
+kind). The Promise envelope of `span()` exists for its retry-aware execution loop; roots have no such loop, so
+enveloping them would only add an allocation and a microtask while hiding the real result kind from callers.
+Inline-function overloads always passed through verbatim; Op invocations now match them. Consumers that do not know the
+op is sync must still `await` — awaiting a plain Result is a no-op wrapper.
+
 ## Context Hierarchy <a id="smoo/lmao!n/context-flow-hierarchy"></a>
 
 ```
