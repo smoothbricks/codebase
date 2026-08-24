@@ -12,7 +12,7 @@ use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
-    CreateImageRequest, DetachIntent, ImageFormatSelection, MountAccess, ProcessStatus,
+    CreateImageRequest, DetachIntent, ImageFormatSelection, MountAccess,
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, ImageFormat, METADATA_VERSION, Platform,
@@ -189,8 +189,11 @@ impl CommandRunner for FailingDetachRunner {
                 })
                 .is_ok()
         {
-            // `hdiutil detach` reports a holder as EBUSY and, under `-quiet`, says nothing else.
-            Ok(CommandOutput::failure(16, []))
+            // `hdiutil detach` reports a holder as EBUSY and names the busy target in its output.
+            Ok(CommandOutput::failure(
+                16,
+                "couldn't unmount disk17 - Resource busy\n",
+            ))
         } else {
             Ok(successful_output(request))
         }
@@ -2008,7 +2011,6 @@ fn kernel_mount_facts_survive_host_restart_and_prevent_detached_compaction() {
         detach.args,
         [
             std::ffi::OsString::from("detach"),
-            std::ffi::OsString::from("-quiet"),
             main_mount(&fixture).into_os_string(),
         ]
     );
@@ -2213,7 +2215,6 @@ fn wrong_kernel_mount_flags_are_detected_and_healed_by_mountpoint() {
         detach.args,
         [
             std::ffi::OsString::from("detach"),
-            std::ffi::OsString::from("-quiet"),
             main_mount(&fixture).into_os_string(),
         ]
     );
@@ -4282,11 +4283,7 @@ impl CommandRunner for ResizeRunner {
                     })
                     .is_ok()
                 {
-                    CommandOutput::failure_with_streams(
-                        ProcessStatus::Exit(16),
-                        "Resource busy: held by pid 4321\n",
-                        [],
-                    )
+                    CommandOutput::failure(16, "couldn't unmount disk17 - Resource busy\n")
                 } else {
                     self.attached.store(false, Ordering::SeqCst);
                     CommandOutput::success([])
@@ -4404,7 +4401,6 @@ fn resizing_a_detached_workspace_grows_the_image_then_the_container_and_verifies
             vec![
                 "/usr/bin/hdiutil".to_owned(),
                 "detach".into(),
-                "-quiet".into(),
                 "/dev/disk9".into(),
             ],
         ],
@@ -4495,7 +4491,7 @@ fn resize_refuses_a_busy_workspace_before_growing_the_image() {
     assert_eq!(
         error.to_string(),
         format!(
-            "APFS operation failed: detach image failed: executable \"/usr/bin/hdiutil\", argv [\"detach\", \"-quiet\", {:?}], exit status 16; stdout: Resource busy: held by pid 4321; stderr: <empty>",
+            "APFS operation failed: detach image failed: executable \"/usr/bin/hdiutil\", argv [\"detach\", {:?}], exit status 16; stdout: <empty>; stderr: couldn't unmount disk17 - Resource busy",
             mount.as_os_str()
         )
     );
