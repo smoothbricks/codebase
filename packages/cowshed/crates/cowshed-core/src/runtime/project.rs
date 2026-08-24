@@ -5976,9 +5976,11 @@ async fn read_job_stderr_tail(
     String::from_utf8_lossy(&collected).trim().to_owned()
 }
 
+#[cfg(target_os = "macos")]
 /// The bound on child stderr kept in a land-check/exec diagnostic.
 const DIAGNOSTIC_STDERR_LIMIT: usize = 2048;
 
+#[cfg(target_os = "macos")]
 /// Recognize a Seatbelt-class denial in a child's own stderr, quoted verbatim in the
 /// resulting diagnostic.
 ///
