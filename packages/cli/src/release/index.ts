@@ -22,6 +22,7 @@ import { decode, run, runInteractiveStatus, runResult } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
+import { withPublishManifest } from '../monorepo/publish-manifest.js';
 import {
   type BootstrapNpmPackagesOptions,
   bootstrapNpmPackages,
@@ -548,7 +549,13 @@ async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: stri
   syncBunLockfileVersions(root, { mode: 'publish', log: true });
   try {
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
-    await run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path));
+    // bun pm pack never applies publishConfig field overrides (exports, main,
+    // …) the way pnpm does, so apply them around the pack.
+    await withPublishManifest(
+      join(root, pkg.path),
+      () => run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path)),
+      { log: true },
+    );
     await assertPackedWorkspaceDependencies(root, tarball, pkg);
     // npm CLI owns authentication here: trusted publishing OIDC when configured.
     // Bun still produces the tarball so workspace:* dependencies are resolved the
