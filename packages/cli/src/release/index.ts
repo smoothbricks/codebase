@@ -549,8 +549,8 @@ async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: stri
   syncBunLockfileVersions(root, { mode: 'publish', log: true });
   try {
     console.log(`${pkg.name}@${pkg.version}: packing with bun pm pack`);
-    // bun pm pack never applies publishConfig field overrides (exports, main,
-    // …) the way pnpm does, so apply them around the pack.
+    // Published exports must not point at workspace TypeScript source; the
+    // wrapper prunes those entries around the pack.
     await withPublishManifest(
       join(root, pkg.path),
       () => run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, pkg.path)),

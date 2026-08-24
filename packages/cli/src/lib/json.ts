@@ -19,18 +19,6 @@ export interface PackageNxConfig {
 
 export interface PackagePublishConfig {
   access?: string;
-  /**
-   * pnpm-style publish-time field overrides. `bun pm pack` ignores these, so
-   * smoo rewrites the manifest around pack to apply them — see
-   * monorepo/publish-manifest.ts.
-   */
-  main?: string;
-  module?: string;
-  types?: string;
-  browser?: string;
-  bin?: string | StringMap;
-  exports?: PackageExports;
-  imports?: PackageExportMap;
 }
 
 export interface PackageSmooGithub {
@@ -56,15 +44,11 @@ export interface PackageJson {
   version?: string;
   private?: boolean;
   license?: string;
-  main?: string;
-  module?: string;
   types?: string;
-  browser?: string;
   packageManager?: string;
   files?: string[];
   bin?: string | StringMap;
   exports?: PackageExports;
-  imports?: PackageExportMap;
   workspaces?: string[] | PackageWorkspacesObject;
   dependencies?: StringMap;
   devDependencies?: StringMap;

@@ -1,68 +1,109 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { type PackageJson, type PackagePublishConfig, parsePackageJsonText } from '../lib/json.js';
+import { type PackageExports, type PackageJson, parsePackageJsonText } from '../lib/json.js';
 
 /**
- * Apply pnpm-style publishConfig field overrides to a manifest: each override
- * replaces its top-level field and is removed from publishConfig, so the
- * packed artifact carries the published shape and no dangling override.
- * `access` and other publisher directives are not manifest fields and stay put.
- * Returns the input untouched when there is nothing to apply.
+ * TypeScript source (not declarations) — what a published exports map should
+ * not offer runtimes: a consumer whose runtime activates the matching
+ * condition (Nx forces `development` onto its plugin worker; bun enables it
+ * outside production) resolves raw TS out of node_modules and either crashes
+ * (Node refuses to strip types there) or silently runs unbuilt source.
  */
-export function applyPublishConfigOverrides(pkg: PackageJson): { manifest: PackageJson; applied: string[] } {
-  const overrides = pkg.publishConfig;
-  const applied: string[] = [];
-  if (!overrides) {
-    return { manifest: pkg, applied };
+function isTypeScriptSourceTarget(target: string): boolean {
+  return /\.(?:[mc]?ts|tsx)$/.test(target) && !/\.d\.[mc]?ts$/.test(target);
+}
+
+function pruneEntry(value: PackageExports, path: string, pruned: string[]): PackageExports {
+  if (typeof value === 'string') {
+    if (isTypeScriptSourceTarget(value)) {
+      pruned.push(path);
+      return undefined;
+    }
+    return value;
   }
-  const publishConfig: PackagePublishConfig = { ...overrides };
-  const manifest: PackageJson = { ...pkg, publishConfig };
-  // One branch per overridable field keeps every assignment fully typed —
-  // PackageJson and PackagePublishConfig deliberately share these signatures.
-  if (overrides.main !== undefined) {
-    manifest.main = overrides.main;
-    delete publishConfig.main;
-    applied.push('main');
+  if (value === null || value === undefined) {
+    return value;
   }
-  if (overrides.module !== undefined) {
-    manifest.module = overrides.module;
-    delete publishConfig.module;
-    applied.push('module');
+  const result: Record<string, PackageExports> = {};
+  for (const [condition, target] of Object.entries(value)) {
+    // The `types` condition is resolved by TypeScript only — a .ts target
+    // there is valid ("source as types") and poses no runtime hazard.
+    if (condition === 'types') {
+      result[condition] = target;
+      continue;
+    }
+    const kept = pruneEntry(target, `${path}[${condition}]`, pruned);
+    if (kept !== undefined) {
+      result[condition] = kept;
+    }
   }
-  if (overrides.types !== undefined) {
-    manifest.types = overrides.types;
-    delete publishConfig.types;
-    applied.push('types');
+  return result;
+}
+
+/** Whether an entry still offers runtimes a target to resolve (`types` alone is not one). */
+function hasRuntimeTarget(value: PackageExports): boolean {
+  if (typeof value === 'string') {
+    return true;
   }
-  if (overrides.browser !== undefined) {
-    manifest.browser = overrides.browser;
-    delete publishConfig.browser;
-    applied.push('browser');
+  if (value === null || value === undefined) {
+    return false;
   }
-  if (overrides.bin !== undefined) {
-    manifest.bin = overrides.bin;
-    delete publishConfig.bin;
-    applied.push('bin');
+  return Object.entries(value).some(([condition, target]) => condition !== 'types' && hasRuntimeTarget(target));
+}
+
+function pruneSubpath(value: PackageExports, path: string, pruned: string[]): PackageExports {
+  if (!hasRuntimeTarget(value)) {
+    return value;
   }
-  if (overrides.exports !== undefined) {
-    manifest.exports = overrides.exports;
-    delete publishConfig.exports;
-    applied.push('exports');
+  const candidates: string[] = [];
+  const result = pruneEntry(value, path, candidates);
+  // A subpath whose every runtime target is TypeScript source is published
+  // that way on purpose (a source-only package has no built alternative) —
+  // leave it exactly as authored rather than breaking resolution.
+  if (!hasRuntimeTarget(result)) {
+    return value;
   }
-  if (overrides.imports !== undefined) {
-    manifest.imports = overrides.imports;
-    delete publishConfig.imports;
-    applied.push('imports');
+  pruned.push(...candidates);
+  return result;
+}
+
+/**
+ * The workspace convention maps conditions like `development` and `bun` at
+ * `./src/*.ts` so the repo itself loads live source; published manifests
+ * should resolve to built artifacts instead. Per subpath, conditions whose
+ * target is TypeScript source are dropped as long as a built runtime target
+ * remains. `types` conditions and subpaths with no built alternative
+ * (deliberately source-only packages) stay untouched. Returns the input when
+ * nothing changes.
+ */
+export function prunePublishedExports(pkg: PackageJson): { manifest: PackageJson; pruned: string[] } {
+  const pruned: string[] = [];
+  const exports = pkg.exports;
+  if (exports === undefined || exports === null || typeof exports === 'string') {
+    return { manifest: pkg, pruned };
   }
-  return { manifest, applied };
+  const isSubpathMap = Object.keys(exports).some((key) => key.startsWith('.'));
+  const next = isSubpathMap
+    ? Object.fromEntries(
+        Object.entries(exports).map(([subpath, value]) => [
+          subpath,
+          pruneSubpath(value, `exports[${subpath}]`, pruned),
+        ]),
+      )
+    : // A bare condition object is the sugar form of a single "." subpath.
+      pruneSubpath(exports, 'exports', pruned);
+  if (pruned.length === 0) {
+    return { manifest: pkg, pruned };
+  }
+  return { manifest: { ...pkg, exports: next }, pruned };
 }
 
 /**
  * Run `fn` (a `bun pm pack`) with the package's on-disk manifest rewritten to
  * its published shape, restoring the original bytes afterwards — the same
  * rewrite-around-pack pattern syncBunLockfileVersions uses for bun.lock.
- * Needed because `bun pm pack` (unlike pnpm) never applies publishConfig
- * field overrides itself.
+ * A manifest transform (rather than a bun feature) because `bun pm pack`
+ * offers no publish-time manifest hook.
  */
 export async function withPublishManifest<T>(
   packageDir: string,
@@ -76,12 +117,12 @@ export async function withPublishManifest<T>(
     // A manifest smoo cannot parse: pack anyway and let bun report it.
     return fn();
   }
-  const { manifest, applied } = applyPublishConfigOverrides(parsed);
-  if (applied.length === 0) {
+  const { manifest, pruned } = prunePublishedExports(parsed);
+  if (pruned.length === 0) {
     return fn();
   }
   if (options.log) {
-    console.log(`${manifest.name}: applying publishConfig overrides for pack: ${applied.join(', ')}`);
+    console.log(`${manifest.name}: pruning TypeScript-source export entries for pack: ${pruned.join(', ')}`);
   }
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   try {
