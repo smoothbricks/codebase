@@ -11,6 +11,7 @@ import { printCommandOutput, runResult } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
 import { listPublicPackages } from '../lib/workspace.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from './packed-manifest.js';
+import { withPublishManifest } from './publish-manifest.js';
 
 export async function validatePackedPublicPackages(root: string): Promise<number> {
   return (
@@ -286,10 +287,10 @@ async function packPackage(root: string, pkg: PackageInfo): Promise<{ path: stri
   const tarballName = `.smoo-${process.pid}-${Date.now()}.tgz`;
   const tarballPath = join(root, tarballName);
   try {
-    const result = await runResult(
-      'bun',
-      ['pm', 'pack', '--filename', tarballName, '--ignore-scripts', '--quiet'],
-      packageDir,
+    // Overrides applied here too, so publint/attw/manifest checks validate the
+    // exact shape a release would publish.
+    const result = await withPublishManifest(packageDir, () =>
+      runResult('bun', ['pm', 'pack', '--filename', tarballName, '--ignore-scripts', '--quiet'], packageDir),
     );
     if (result.exitCode !== 0) {
       printCommandOutput(result.stdout, result.stderr);
