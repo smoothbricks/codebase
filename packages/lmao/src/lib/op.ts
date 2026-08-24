@@ -24,7 +24,7 @@ import type {
   PhysicalAppenders,
 } from './physicalLayoutPlan.js';
 import { getPhysicalLayoutPlan, sealCallsitePlan } from './physicalLayoutPlan.js';
-import type { Result } from './result.js';
+import type { AnyResult } from './result.js';
 import { decodeRuntimeHint } from './runtimeHint.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
@@ -123,16 +123,25 @@ export interface OpMetadata<T extends LogSchema = LogSchema> {
  * @typeParam S - Success type of the Result
  * @typeParam E - Error type of the Result
  */
-export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
+export class Op<
+  Ctx extends OpContext,
+  Args extends unknown[],
+  S,
+  E,
+  /** The op body's declared return kind: Result for sync bodies, Promise<Result> for async. */
+  R extends AnyResult | Promise<AnyResult> = AnyResult | Promise<AnyResult>,
+> {
   readonly metadata: OpMetadata;
   readonly callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>;
-  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
+  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => R;
+  /** Type-only S/E witness so inference sites reading Op's slots keep their success/error types. Erased at runtime. */
+  declare readonly _resultTypes?: readonly [S, E];
   readonly _opContextBinding?: OpContextBinding<Ctx['logSchema'], Ctx['flags'], Ctx['deps'], Ctx['userCtx']>;
 
   constructor(
     metadata: OpMetadata,
     SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
-    fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
+    fn: (ctx: SpanContext<Ctx>, ...args: Args) => R,
     remapDescriptor?: RemapDescriptor,
     opContextBinding?: OpContextBinding<Ctx['logSchema'], Ctx['flags'], Ctx['deps'], Ctx['userCtx']>,
     runtimeHint = 0,

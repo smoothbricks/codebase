@@ -11,11 +11,12 @@ speedup.
 > transformations are implemented in the native plugin and covered by its Go suite plus Bun integration.
 > Destructured-context rewriting (§3) is implemented: a first parameter that destructures `span` becomes `__ctx`
 > (`packages/lmao-ttsc/plugin/driver/destructured.go`). `spanAutoN` exists as an internal, explicit runtime seam, but
-> automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because a synchronous return would
-> change the public Promise API's observable microtask scheduling. The running invariant is **the transformed output the
-> tests assert**, not earlier design sketches. The global vocabulary ABI in §6.2 is the clean-cutover target, not
-> shipped behavior. The shipped Op-local IDs remain lexical `u16` values, not stable IDs or `VocabularyBinding` indices.
-> No performance improvement is claimed for either representation without its phase-specific benchmark gate.
+> automatic `ctx.span(...)` → `spanAutoN(...)` lowering is intentionally disabled because `span()`'s retry-aware
+> envelope must not silently degrade to a synchronous return (01c). Root `trace()` callsites keep the op's own result
+> kind for the same reason. The running invariant is **the transformed output the tests assert**, not earlier design
+> sketches. The global vocabulary ABI in §6.2 is the clean-cutover target, not shipped behavior. The shipped Op-local
+> IDs remain lexical `u16` values, not stable IDs or `VocabularyBinding` indices. No performance improvement is claimed
+> for either representation without its phase-specific benchmark gate.
 
 ## Bun integration
 

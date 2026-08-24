@@ -13,7 +13,7 @@
  * - Depended on by: opGroupTypes (Layer 4)
  */
 
-import type { ExtractError, ExtractSuccess, Result } from '../result.js';
+import type { AnyResult, ExtractError, ExtractSuccess, Result } from '../result.js';
 import type { SpanContext } from './spanContextTypes.js';
 import type { OpContext } from './types.js';
 
@@ -56,10 +56,12 @@ import type { Op } from '../op.js';
  * Uses ExtractSuccess/ExtractError from result.ts to infer types from return value.
  */
 type DefToOp<Ctx extends OpContext, Def> =
-  Def extends Op<Ctx, infer Args, infer S, infer E>
-    ? Op<Ctx, Args, S, E>
+  Def extends Op<Ctx, infer Args, infer S, infer E, infer R>
+    ? Op<Ctx, Args, S, E, R>
     : Def extends (ctx: SpanContext<Ctx>, ...args: infer Args) => infer R
-      ? Op<Ctx, Args, ExtractSuccess<R>, ExtractError<R>>
+      ? R extends AnyResult | Promise<AnyResult>
+        ? Op<Ctx, Args, ExtractSuccess<R>, ExtractError<R>, R>
+        : never
       : never;
 
 /**
