@@ -12,7 +12,7 @@ use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use cowshed_core::apfs::{
     ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunError, CommandRunner,
-    CreateImageRequest, DetachIntent, ImageFormatSelection, MountAccess,
+    CreateImageRequest, DetachIntent, ImageFormatSelection, MountAccess, ProcessStatus,
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, ImageFormat, METADATA_VERSION, Platform,
@@ -4282,7 +4282,11 @@ impl CommandRunner for ResizeRunner {
                     })
                     .is_ok()
                 {
-                    CommandOutput::failure(1, "Resource busy")
+                    CommandOutput::failure_with_streams(
+                        ProcessStatus::Exit(16),
+                        "Resource busy: held by pid 4321\n",
+                        [],
+                    )
                 } else {
                     self.attached.store(false, Ordering::SeqCst);
                     CommandOutput::success([])
@@ -4467,25 +4471,34 @@ fn resize_refuses_a_busy_workspace_before_growing_the_image() {
         ImageCapacity::from_gibibytes(200),
     )
     .failing_detach(1);
+    let mount = main_mount(&fixture);
     let host = resize_host(
         &fixture,
         runner.clone(),
         vec![KernelMountSnapshot::new(
             7,
-            main_mount(&fixture),
+            mount.clone(),
             "/dev/disk10s1",
             true,
             true,
         )],
     );
 
-    host.resize(
-        &workspace(ImageFormat::Sparse),
-        image.image(),
-        &main_mount(&fixture),
-        ImageCapacity::from_gibibytes(200),
-    )
-    .expect_err("a busy volume refuses the resize rather than being torn out");
+    let error = host
+        .resize(
+            &workspace(ImageFormat::Sparse),
+            image.image(),
+            &mount,
+            ImageCapacity::from_gibibytes(200),
+        )
+        .expect_err("a busy volume refuses the resize rather than being torn out");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "APFS operation failed: detach image failed: executable \"/usr/bin/hdiutil\", argv [\"detach\", \"-quiet\", {:?}], exit status 16; stdout: Resource busy: held by pid 4321; stderr: <empty>",
+            mount.as_os_str()
+        )
+    );
 
     assert!(
         runner

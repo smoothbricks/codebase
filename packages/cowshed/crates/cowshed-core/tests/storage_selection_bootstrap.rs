@@ -960,11 +960,7 @@ impl BootstrapHost for SpyHost {
         } else {
             Vec::new()
         };
-        Ok(HostCommandOutput {
-            success: true,
-            stdout,
-            stderr: Vec::new(),
-        })
+        Ok(HostCommandOutput::success(stdout))
     }
 
     fn provision_apfs_volumes(
@@ -1058,10 +1054,7 @@ impl BootstrapHost for TransitionHost {
         if line.contains("org.cowshed:") {
             self.relabels.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(HostCommandOutput {
-            success: true,
-            ..HostCommandOutput::default()
-        })
+        Ok(HostCommandOutput::default())
     }
 
     fn provision_apfs_volumes(

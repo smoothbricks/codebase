@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -7,6 +8,8 @@ use async_trait::async_trait;
 use plist::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::process::fmt_command_failure;
 
 pub mod native;
 
@@ -1338,11 +1341,30 @@ pub enum MountpointState {
     },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct HostCommandOutput {
-    pub success: bool,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+pub type HostCommandOutput = crate::process::CommandOutput;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostCommandFailure {
+    command: HostCommand,
+    output: HostCommandOutput,
+}
+
+impl HostCommandFailure {
+    pub fn new(command: HostCommand, output: HostCommandOutput) -> Self {
+        Self { command, output }
+    }
+}
+
+impl fmt::Display for HostCommandFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_command_failure(
+            f,
+            "command",
+            OsStr::new(self.command.program()),
+            self.command.args(),
+            &self.output,
+        )
+    }
 }
 
 /// Narrow synchronous host boundary. Implementations may block and therefore must only be called
@@ -1510,13 +1532,12 @@ fn run_host_command(
     let output = host
         .run_command(command)
         .map_err(BootstrapExecutionError::Host)?;
-    if output.success {
+    if output.succeeded() {
         Ok(output)
     } else {
-        Err(BootstrapExecutionError::CommandFailed {
-            command: command.clone(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        Err(BootstrapExecutionError::CommandFailed(
+            HostCommandFailure::new(command.clone(), output),
+        ))
     }
 }
 
@@ -1651,11 +1672,8 @@ pub enum BootstrapExecutionError {
         path: PathBuf,
         source: MountGuardError,
     },
-    #[error("command {command:?} failed: {stderr}")]
-    CommandFailed {
-        command: HostCommand,
-        stderr: String,
-    },
+    #[error("{0}")]
+    CommandFailed(HostCommandFailure),
     #[error(transparent)]
     Marker(MarkerError),
     #[error("APFS mount operation reached execution without an exact DeviceIdentifier")]

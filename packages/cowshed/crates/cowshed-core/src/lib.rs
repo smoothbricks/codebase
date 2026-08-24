@@ -10,6 +10,7 @@ mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;
 pub mod metadata;
+mod process;
 pub mod repository;
 pub mod runtime;
 pub mod sandbox;

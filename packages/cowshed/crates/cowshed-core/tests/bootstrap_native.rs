@@ -70,10 +70,7 @@ impl BootstrapHost for ValidationHost {
 
     fn run_command(&self, _command: &HostCommand) -> Result<HostCommandOutput, HostError> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
-        Ok(HostCommandOutput {
-            success: true,
-            ..HostCommandOutput::default()
-        })
+        Ok(HostCommandOutput::default())
     }
 
     fn provision_apfs_volumes(
@@ -128,11 +125,9 @@ impl BootstrapHost for RecordingHost {
                     .starts_with(&["apfs".to_owned(), "addVolume".to_owned()]) =>
             {
                 let slice = self.creations.fetch_add(1, Ordering::SeqCst) + 8;
-                Ok(HostCommandOutput {
-                    success: true,
-                    stdout: format!("Created new APFS Volume disk3s{slice}\n").into_bytes(),
-                    stderr: Vec::new(),
-                })
+                Ok(HostCommandOutput::success(
+                    format!("Created new APFS Volume disk3s{slice}\n").into_bytes(),
+                ))
             }
             CommandBehavior::CreatedIdentifiers { info_container }
                 if command
@@ -145,16 +140,13 @@ impl BootstrapHost for RecordingHost {
                 } else {
                     "cowshed.caches"
                 };
-                Ok(HostCommandOutput {
-                    success: true,
-                    stdout: info_plist(identifier, info_container, name),
-                    stderr: Vec::new(),
-                })
+                Ok(HostCommandOutput::success(info_plist(
+                    identifier,
+                    info_container,
+                    name,
+                )))
             }
-            CommandBehavior::CreatedIdentifiers { .. } => Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            CommandBehavior::CreatedIdentifiers { .. } => Ok(HostCommandOutput::default()),
         }
     }
 

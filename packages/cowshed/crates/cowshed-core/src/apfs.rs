@@ -4,6 +4,8 @@
 //! as an executable plus an argument vector; this module never invokes a shell.
 
 use crate::metadata::{ImageCapacity, ImageFormat};
+pub use crate::process::{CommandOutput, ProcessStatus};
+use crate::process::{fmt_command_failure, fmt_command_spawn};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -58,35 +60,6 @@ impl CommandRequest {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CommandOutput {
-    pub status: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-impl CommandOutput {
-    pub fn success(stdout: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status: 0,
-            stdout: stdout.into(),
-            stderr: Vec::new(),
-        }
-    }
-
-    pub fn failure(status: i32, stderr: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status,
-            stdout: Vec::new(),
-            stderr: stderr.into(),
-        }
-    }
-
-    pub fn succeeded(&self) -> bool {
-        self.status == 0
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MountAccess {
     ReadWrite,
@@ -95,17 +68,17 @@ pub enum MountAccess {
 
 #[derive(Debug)]
 pub struct CommandRunError {
-    pub program: PathBuf,
+    pub request: CommandRequest,
     pub source: io::Error,
 }
 
 impl fmt::Display for CommandRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
+        fmt_command_spawn(
             f,
-            "could not run {}: {}",
-            self.program.display(),
-            self.source
+            self.request.program.as_os_str(),
+            &self.request.args,
+            &self.source,
         )
     }
 }
@@ -129,14 +102,10 @@ impl CommandRunner for SystemCommandRunner {
             .args(&request.args)
             .output()
             .map_err(|source| CommandRunError {
-                program: request.program.clone(),
+                request: request.clone(),
                 source,
             })?;
-        Ok(CommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        Ok(output.into())
     }
 }
 
@@ -385,6 +354,28 @@ pub struct AttachmentCleanupFailure {
     pub remaining_devices: Vec<String>,
 }
 
+impl fmt::Display for AttachmentCleanupFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut separator = "";
+        if let Some(inventory) = self.inventory.as_ref() {
+            write!(f, "inventory: {inventory}")?;
+            separator = "; ";
+        }
+        for failure in &self.detach {
+            write!(f, "{separator}detach {}: {}", failure.device, failure.error)?;
+            separator = "; ";
+        }
+        if !self.remaining_devices.is_empty() {
+            write!(
+                f,
+                "{separator}devices still attached: {}",
+                self.remaining_devices.join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum ApfsError {
     InvalidImagePath {
@@ -429,11 +420,11 @@ pub enum ApfsError {
         detach: Box<ApfsError>,
     },
     VerificationFailed {
-        device: String,
+        request: CommandRequest,
         output: CommandOutput,
     },
     VerificationAndDetachFailed {
-        device: String,
+        request: CommandRequest,
         verification: CommandOutput,
         detach: Box<ApfsError>,
     },
@@ -484,13 +475,15 @@ impl fmt::Display for ApfsError {
             }
             Self::CommandSpawn(error) => error.fmt(f),
             Self::CommandFailed {
-                operation, output, ..
-            } => write!(
-                f,
-                "{} failed with status {}: {}",
                 operation,
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
+                request,
+                output,
+            } => fmt_command_failure(
+                f,
+                operation,
+                request.program.as_os_str(),
+                &request.args,
+                output,
             ),
             Self::UnsupportedMacOsVersion(version) => {
                 write!(f, "could not parse macOS version: {version}")
@@ -501,9 +494,13 @@ impl fmt::Display for ApfsError {
             Self::InvalidAttachmentInventory(message) => {
                 write!(f, "invalid attachment inventory: {message}")
             }
-            Self::AttachmentCleanupFailed { image, .. } => write!(
+            Self::AttachmentCleanupFailed {
+                image,
+                primary,
+                cleanup,
+            } => write!(
                 f,
-                "attachment failed for {}, and cleaning up newly attached devices also failed",
+                "attachment failed for {}, and cleaning up newly attached devices also failed: primary={primary}; cleanup={cleanup}",
                 image.display()
             ),
             Self::VolumeResolutionFailed { candidate, reason } => {
@@ -515,27 +512,54 @@ impl fmt::Display for ApfsError {
                     "could not resolve APFS volume name for {device}: {reason}"
                 )
             }
-            Self::VolumeResolutionAndDetachFailed { whole_device, .. } => write!(
+            Self::VolumeResolutionAndDetachFailed {
+                whole_device,
+                resolution,
+                detach,
+            } => write!(
                 f,
-                "resolving the APFS volume attached from {whole_device} failed, and detaching it also failed"
+                "resolving the APFS volume attached from {whole_device} failed: {resolution}; detaching it failed: {detach}"
             ),
-            Self::VerificationFailed { device, output } => write!(
+            Self::VerificationFailed { request, output } => fmt_command_failure(
                 f,
-                "fsck_apfs failed for {device} with status {}",
-                output.status
+                "verify APFS volume",
+                request.program.as_os_str(),
+                &request.args,
+                output,
             ),
-            Self::VerificationAndDetachFailed { device, .. } => write!(
-                f,
-                "fsck_apfs failed for {device}, and detaching the failed attachment also failed"
-            ),
+            Self::VerificationAndDetachFailed {
+                request,
+                verification,
+                detach,
+            } => {
+                fmt_command_failure(
+                    f,
+                    "verify APFS volume",
+                    request.program.as_os_str(),
+                    &request.args,
+                    verification,
+                )?;
+                write!(f, "; detaching the failed attachment also failed: {detach}")
+            }
             Self::FileOperation {
                 operation,
                 path,
                 source,
             } => write!(f, "{} {} failed: {}", operation, path.display(), source),
             Self::Clone(error) => error.fmt(f),
-            Self::AsifCreationAndCleanupFailed { .. } => {
-                f.write_str("ASIF creation failed, and staged-image cleanup also failed")
+            Self::AsifCreationAndCleanupFailed {
+                primary,
+                detach,
+                remove,
+            } => {
+                write!(f, "ASIF creation failed: {primary}")?;
+                if let Some(detach) = detach {
+                    write!(f, "; detach cleanup failed: {detach}")?;
+                }
+                if let Some(remove) = remove {
+                    write!(f, "; file cleanup failed: {remove}")?;
+                }
+                Ok(())
             }
             Self::InvalidResizeLimits(message) => {
                 write!(f, "invalid image resize limits: {message}")
@@ -1268,12 +1292,9 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         }
 
         match self.detach_device(format, &attachment.whole_device, DetachIntent::Release) {
-            Ok(()) => Err(ApfsError::VerificationFailed {
-                device: attachment.volume_device,
-                output,
-            }),
+            Ok(()) => Err(ApfsError::VerificationFailed { request, output }),
             Err(detach) => Err(ApfsError::VerificationAndDetachFailed {
-                device: attachment.volume_device,
+                request,
                 verification: output,
                 detach: Box::new(detach),
             }),
@@ -1455,14 +1476,17 @@ fn capacity_argument(capacity: ImageCapacity) -> String {
 }
 
 fn container_already_spans_image(output: &CommandOutput) -> bool {
-    let message = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    CONTAINER_ALREADY_SPANS_IMAGE
-        .iter()
-        .any(|code| message.contains(code))
+    CONTAINER_ALREADY_SPANS_IMAGE.iter().any(|code| {
+        contains_bytes(&output.stdout, code.as_bytes())
+            || contains_bytes(&output.stderr, code.as_bytes())
+    })
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// `hdiutil resize -limits -plist` reports the image's own extent as `content-length`, counted in
@@ -1578,13 +1602,10 @@ fn detach_was_dissented(format: ImageFormat, error: &ApfsError) -> bool {
         return false;
     };
     match format {
-        ImageFormat::Sparse => output.status == HDIUTIL_DETACH_BUSY,
-        ImageFormat::Asif => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            DISKUTIL_DISSENT
-                .iter()
-                .any(|marker| stderr.contains(marker))
-        }
+        ImageFormat::Sparse => output.status == ProcessStatus::Exit(HDIUTIL_DETACH_BUSY),
+        ImageFormat::Asif => DISKUTIL_DISSENT
+            .iter()
+            .any(|marker| contains_bytes(&output.stderr, marker.as_bytes())),
     }
 }
 
@@ -2484,14 +2505,14 @@ mod tests {
                 ["-c", "printf stdout; printf stderr >&2; exit 7"],
             ))
             .unwrap();
-        assert_eq!(output.status, 7);
+        assert_eq!(output.status, ProcessStatus::Exit(7));
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
 
         let signaled = SystemCommandRunner
             .run(&CommandRequest::new("/bin/sh", ["-c", "kill -TERM $$"]))
             .unwrap();
-        assert_eq!(signaled.status, -1);
+        assert_eq!(signaled.status, ProcessStatus::Signal(libc::SIGTERM));
 
         let missing = temp_path("missing-command", "bin");
         let error = SystemCommandRunner
@@ -2500,9 +2521,65 @@ mod tests {
                 std::iter::empty::<OsString>(),
             ))
             .unwrap_err();
-        assert_eq!(error.program, missing);
+        assert_eq!(error.request.program, missing);
         assert!(error.to_string().contains("could not run"));
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn failed_command_diagnostics_preserve_status_argv_and_both_raw_streams() {
+        let cases = [
+            (
+                ProcessStatus::Exit(16),
+                b"  holder reported on stdout\n".as_slice(),
+                b"".as_slice(),
+                "exit status 16; stdout: holder reported on stdout; stderr: <empty>",
+            ),
+            (
+                ProcessStatus::Exit(16),
+                b"".as_slice(),
+                b"\n holder reported on stderr \n".as_slice(),
+                "exit status 16; stdout: <empty>; stderr: holder reported on stderr",
+            ),
+            (
+                ProcessStatus::Exit(16),
+                b" stdout detail \n".as_slice(),
+                b" stderr detail \n".as_slice(),
+                "exit status 16; stdout: stdout detail; stderr: stderr detail",
+            ),
+            (
+                ProcessStatus::Exit(16),
+                b"".as_slice(),
+                b"".as_slice(),
+                "exit status 16; stdout: <empty>; stderr: <empty>",
+            ),
+            (
+                ProcessStatus::Exit(16),
+                b" holder \xff pid \n".as_slice(),
+                b"\x80 busy ".as_slice(),
+                r"exit status 16; stdout: holder \xff pid; stderr: \x80 busy",
+            ),
+            (
+                ProcessStatus::Signal(libc::SIGKILL),
+                b" partial output ".as_slice(),
+                b"".as_slice(),
+                "signal 9; stdout: partial output; stderr: <empty>",
+            ),
+        ];
+
+        for (status, stdout, stderr, detail) in cases {
+            let error = ApfsError::CommandFailed {
+                operation: "detach image",
+                request: CommandRequest::new(HDIUTIL, ["detach", "-quiet", "/dev/disk9"]),
+                output: CommandOutput::failure_with_streams(status, stdout, stderr),
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "detach image failed: executable \"/usr/bin/hdiutil\", argv [\"detach\", \"-quiet\", \"/dev/disk9\"], {detail}"
+                )
+            );
+        }
     }
 
     #[test]
@@ -2519,7 +2596,7 @@ mod tests {
         );
 
         let spawn = ApfsError::CommandSpawn(CommandRunError {
-            program: PathBuf::from("/missing"),
+            request: CommandRequest::new("/missing", ["--flag"]),
             source: io::Error::new(io::ErrorKind::NotFound, "missing"),
         });
         assert!(spawn.to_string().contains("/missing"));
@@ -2545,7 +2622,7 @@ mod tests {
             output: CommandOutput::failure(1, "busy"),
         };
         let combined = ApfsError::VerificationAndDetachFailed {
-            device: "/dev/disk4s1".into(),
+            request: CommandRequest::new(FSCK_APFS, ["-q", "/dev/rdisk4s1"]),
             verification: CommandOutput::failure(8, "not clean"),
             detach: Box::new(detach),
         };
@@ -2731,9 +2808,13 @@ mod tests {
         assert!(matches!(
             error,
             ApfsError::VerificationFailed {
-                device,
-                output: CommandOutput { status: 8, .. },
-            } if device == "/dev/disk5s2"
+                request,
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(8),
+                    ..
+                },
+            } if request.program == Path::new(FSCK_APFS)
+                && argv(&request) == ["-q", "/dev/rdisk5s2"]
         ));
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 6);
@@ -2812,7 +2893,10 @@ mod tests {
                     *detach,
                     ApfsError::CommandFailed {
                         operation: "detach image",
-                        output: CommandOutput { status: 16, .. },
+                        output: CommandOutput {
+                            status: ProcessStatus::Exit(16),
+                            ..
+                        },
                         ..
                     }
                 ));
@@ -2847,7 +2931,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "resolve APFS volume",
-                output: CommandOutput { status: 3, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(3),
+                    ..
+                },
                 ..
             }
         ));
@@ -2872,7 +2959,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "inspect APFS device",
-                output: CommandOutput { status: 1, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(1),
+                    ..
+                },
                 ..
             }
         ));
@@ -3086,7 +3176,10 @@ mod tests {
                     cleanup.detach[0].error.as_ref(),
                     ApfsError::CommandFailed {
                         operation: "detach image",
-                        output: CommandOutput { status: 16, .. },
+                        output: CommandOutput {
+                            status: ProcessStatus::Exit(16),
+                            ..
+                        },
                         ..
                     }
                 ));
@@ -3181,7 +3274,10 @@ mod tests {
                             *inventory,
                             ApfsError::CommandFailed {
                                 operation: "inventory attached disk images",
-                                output: CommandOutput { status: 5, .. },
+                                output: CommandOutput {
+                                    status: ProcessStatus::Exit(5),
+                                    ..
+                                },
                                 ..
                             }
                         ));
@@ -3481,7 +3577,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "create ASIF image",
-                output: CommandOutput { status: 1, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(1),
+                    ..
+                },
                 ..
             }
         ));
@@ -3513,7 +3612,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "create SPARSE image",
-                output: CommandOutput { status: 9, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(9),
+                    ..
+                },
                 ..
             }
         ));
@@ -3635,7 +3737,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "attach blank ASIF image",
-                output: CommandOutput { status: 9, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(9),
+                    ..
+                },
                 ..
             }
         ));
@@ -3670,7 +3775,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "format ASIF APFS volume",
-                output: CommandOutput { status: 70, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(70),
+                    ..
+                },
                 ..
             }
         ));
@@ -3722,7 +3830,10 @@ mod tests {
                 *detach,
                 ApfsError::CommandFailed {
                     operation: "detach image",
-                    output: CommandOutput { status: 16, .. },
+                    output: CommandOutput {
+                        status: ProcessStatus::Exit(16),
+                        ..
+                    },
                     ..
                 }
             )
@@ -3806,7 +3917,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "detach image",
-                output: CommandOutput { status: 16, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(16),
+                    ..
+                },
                 ..
             }
         ));
@@ -3883,7 +3997,10 @@ mod tests {
             ApfsError::CommandFailed {
                 operation: "compact SPARSE image",
                 request,
-                output: CommandOutput { status: 9, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(9),
+                    ..
+                },
             } if request.program == Path::new(HDIUTIL)
                 && argv(&request) == ["compact", "-quiet", "main.sparseimage"]
         ));
@@ -3961,7 +4078,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "create ASIF image",
-                output: CommandOutput { status: 77, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(77),
+                    ..
+                },
                 ..
             }
         ));
@@ -4124,7 +4244,10 @@ mod tests {
             error,
             ApfsError::CommandFailed {
                 operation: "detach image",
-                output: CommandOutput { status: 16, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(16),
+                    ..
+                },
                 ..
             }
         ));
@@ -4357,7 +4480,10 @@ mod tests {
             ApfsError::CommandFailed {
                 operation: "rename APFS volume",
                 request,
-                output: CommandOutput { status: 7, .. },
+                output: CommandOutput {
+                    status: ProcessStatus::Exit(7),
+                    ..
+                },
             } if request.program == Path::new(DISKUTIL)
                 && argv(&request) == ["renameVolume", "/Volumes/cowshed-stage", "main"]
         ));
