@@ -34,11 +34,11 @@ const SECTOR_BYTES: u64 = 512;
 const CONTAINER_ALREADY_SPANS_IMAGE: [&str; 2] = ["Error: -69743:", "Error: -69519:"];
 
 /// A detach fails while another process still holds the volume, and each tool spells that
-/// condition its own way. `hdiutil detach` exits with the errno — `EBUSY` — and `-quiet` keeps it
-/// from saying anything else, so the status is the only evidence. `diskutil eject` exits 1 and
-/// names the Disk Arbitration dissenter on stderr, a status it shares with every other diskutil
-/// failure, so the text is the only evidence. Observed on macOS 26.6.1 against a volume held by
-/// nothing more than another process's cwd.
+/// condition its own way. `hdiutil detach` exits with the errno — `EBUSY` — and reports the busy
+/// target in its output; the status remains the authoritative evidence even if a macOS release
+/// emits no text. `diskutil eject` exits 1 and names the Disk Arbitration dissenter on stderr, a
+/// status it shares with every other diskutil failure, so the text is the only evidence. Observed
+/// on macOS 26.6.1 against a volume held by nothing more than another process's cwd.
 const HDIUTIL_DETACH_BUSY: i32 = 16;
 const DISKUTIL_DISSENT: [&str; 2] = ["could not be unmounted", "dissented by"];
 
@@ -1096,7 +1096,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                 CommandRequest::new(DISKUTIL, args)
             }
             ImageFormat::Sparse => {
-                let mut args = vec![OsString::from("detach"), OsString::from("-quiet")];
+                let mut args = vec![OsString::from("detach")];
                 if force {
                     args.push(OsString::from("-force"));
                 }
@@ -2383,7 +2383,7 @@ mod tests {
                 }
                 ImageFormat::Sparse => {
                     request.program == Path::new(HDIUTIL)
-                        && args == ["detach", "-quiet", self.new_device.as_str()]
+                        && args == ["detach", self.new_device.as_str()]
                 }
             };
             assert!(is_detach, "unexpected command: {request:?}");
@@ -2538,8 +2538,8 @@ mod tests {
             (
                 ProcessStatus::Exit(16),
                 b"".as_slice(),
-                b"\n holder reported on stderr \n".as_slice(),
-                "exit status 16; stdout: <empty>; stderr: holder reported on stderr",
+                b"\ncouldn't unmount disk17 - Resource busy\n".as_slice(),
+                "exit status 16; stdout: <empty>; stderr: couldn't unmount disk17 - Resource busy",
             ),
             (
                 ProcessStatus::Exit(16),
@@ -2570,13 +2570,13 @@ mod tests {
         for (status, stdout, stderr, detail) in cases {
             let error = ApfsError::CommandFailed {
                 operation: "detach image",
-                request: CommandRequest::new(HDIUTIL, ["detach", "-quiet", "/dev/disk9"]),
+                request: CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"]),
                 output: CommandOutput::failure_with_streams(status, stdout, stderr),
             };
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "detach image failed: executable \"/usr/bin/hdiutil\", argv [\"detach\", \"-quiet\", \"/dev/disk9\"], {detail}"
+                    "detach image failed: executable \"/usr/bin/hdiutil\", argv [\"detach\", \"/dev/disk9\"], {detail}"
                 )
             );
         }
@@ -2821,7 +2821,7 @@ mod tests {
         assert_eq!(requests[4].program, Path::new(FSCK_APFS));
         assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk5s2"]);
         assert_eq!(requests[5].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[5]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk4"]);
         assert!(
             !requests
                 .iter()
@@ -2854,7 +2854,7 @@ mod tests {
         assert_eq!(argv(&requests[2]), ["info", "-plist", "/dev/disk4s1"]);
         assert_eq!(argv(&requests[3]), ["apfs", "list", "-plist", "disk5"]);
         assert_eq!(requests[4].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -2907,11 +2907,8 @@ mod tests {
         // and only a dissent that outlasts even that is reported beside the resolution failure.
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 8);
-        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
-        assert_eq!(
-            argv(&requests[7]),
-            ["detach", "-quiet", "-force", "/dev/disk4"]
-        );
+        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
+        assert_eq!(argv(&requests[7]), ["detach", "-force", "/dev/disk4"]);
     }
 
     #[test]
@@ -2940,7 +2937,7 @@ mod tests {
         ));
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 5);
-        assert_eq!(argv(&requests[4]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -2968,7 +2965,7 @@ mod tests {
         ));
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 4);
-        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(argv(&requests[3]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -2999,7 +2996,7 @@ mod tests {
                 .any(|request| argv(request).first().is_some_and(|arg| arg == "apfs")),
             "no container inventory is walked when the device is not in a container"
         );
-        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk4"]);
+        assert_eq!(argv(&requests[3]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -3122,7 +3119,7 @@ mod tests {
             ]
         );
         assert_eq!(argv(&requests[2]), ["info", "-plist"]);
-        assert_eq!(argv(&requests[3]), ["detach", "-quiet", "/dev/disk9"]);
+        assert_eq!(argv(&requests[3]), ["detach", "/dev/disk9"]);
         assert_eq!(argv(&requests[4]), ["info", "-plist"]);
     }
 
@@ -4167,7 +4164,7 @@ mod tests {
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[0]), ["detach", "-quiet", "/dev/disk12"]);
+        assert_eq!(argv(&requests[0]), ["detach", "/dev/disk12"]);
     }
 
     /// The dissent each tool actually emits — `hdiutil`'s EBUSY status, `diskutil`'s dissent text
@@ -4179,8 +4176,8 @@ mod tests {
                 ImageFormat::Sparse,
                 CommandOutput::failure(HDIUTIL_DETACH_BUSY, []),
                 HDIUTIL,
-                ["detach", "-quiet", "/dev/disk4"].as_slice(),
-                ["detach", "-quiet", "-force", "/dev/disk4"].as_slice(),
+                ["detach", "/dev/disk4"].as_slice(),
+                ["detach", "-force", "/dev/disk4"].as_slice(),
             ),
             (
                 ImageFormat::Asif,
@@ -4303,13 +4300,13 @@ mod tests {
                 ImageFormat::Sparse,
                 DetachTarget::Device("/dev/disk4"),
                 HDIUTIL,
-                &["detach", "-quiet", "/dev/disk4"],
+                &["detach", "/dev/disk4"],
             ),
             (
                 ImageFormat::Sparse,
                 DetachTarget::MountPoint(Path::new("/Volumes/cowshed/session")),
                 HDIUTIL,
-                &["detach", "-quiet", "/Volumes/cowshed/session"],
+                &["detach", "/Volumes/cowshed/session"],
             ),
         ];
 
