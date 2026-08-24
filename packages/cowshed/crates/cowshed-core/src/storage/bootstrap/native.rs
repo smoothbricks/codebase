@@ -32,9 +32,9 @@ use uuid::Uuid;
 use super::{
     APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsVolumeProvision, BlockingLane, BootstrapEvidence,
     BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL, ExistingStorage, HostCommand,
-    HostCommandOutput, HostError, HostOperation, MountpointState, PlanError, SelectionError,
-    StatFsEvidence, SubstrateKind, TokioBlockingLane, ValidatedHostStorage, VolumeRole,
-    execute_bootstrap, plan_bootstrap, require_mounted_marker, select_substrate,
+    HostCommandFailure, HostCommandOutput, HostError, HostOperation, MountpointState, PlanError,
+    SelectionError, StatFsEvidence, SubstrateKind, TokioBlockingLane, ValidatedHostStorage,
+    VolumeRole, execute_bootstrap, plan_bootstrap, require_mounted_marker, select_substrate,
 };
 #[cfg(target_os = "macos")]
 use super::{ApfsProvisionKind, VOLUME_MARKER_FILE, VolumeMarker};
@@ -311,11 +311,8 @@ pub enum NativeBootstrapError {
     InvalidMountSource(PathBuf),
     #[error("native bootstrap host operation failed: {0}")]
     Host(#[from] HostError),
-    #[error("command {command:?} failed: {stderr}")]
-    CommandFailed {
-        command: HostCommand,
-        stderr: String,
-    },
+    #[error("{0}")]
+    CommandFailed(HostCommandFailure),
     #[error("diskutil APFS inventory is malformed: {0}")]
     MalformedPlist(String),
     #[error("kernel device {device:?} belongs to no APFS container in diskutil evidence")]
@@ -493,11 +490,10 @@ fn gather_existing_apfs_evidence(
         ["apfs", "list", "-plist", container_reference.as_str()],
     );
     let output = source.run_command(&command)?;
-    if !output.success {
-        return Err(NativeBootstrapError::CommandFailed {
-            command,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
+    if !output.succeeded() {
+        return Err(NativeBootstrapError::CommandFailed(
+            HostCommandFailure::new(command, output),
+        ));
     }
     let inventory = parse_apfs_inventory(&output.stdout)?;
     let container = inventory.containing_container(&mount_device)?;
@@ -835,11 +831,7 @@ fn run_command_with(
             command.args()
         ))
     })?;
-    Ok(HostCommandOutput {
-        success: output.status.success(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
+    Ok(output.into())
 }
 
 #[cfg(target_os = "macos")]
@@ -1172,13 +1164,10 @@ fn run_privileged_command(
     command: &HostCommand,
 ) -> Result<HostCommandOutput, HostError> {
     let output = session.execute(command)?;
-    if !output.success {
-        return Err(HostError::new(format!(
-            "authorized command {:?} with argv {:?} failed: {}",
-            command.program(),
-            command.args(),
-            String::from_utf8_lossy(&output.stderr)
-        )));
+    if !output.succeeded() {
+        return Err(HostError::new(
+            HostCommandFailure::new(command.clone(), output).to_string(),
+        ));
     }
     Ok(output)
 }
@@ -1325,11 +1314,7 @@ impl PrivilegedCommandSession for MacAuthorizationSession {
             ));
         }
         let stdout = read_authorized_output(pipe)?;
-        Ok(HostCommandOutput {
-            success: true,
-            stdout,
-            stderr: Vec::new(),
-        })
+        Ok(HostCommandOutput::success(stdout))
     }
 }
 
@@ -1936,11 +1921,7 @@ mod tests {
             },
             statfs_overrides: BTreeMap::new(),
             statfs_paths: Vec::new(),
-            command_output: HostCommandOutput {
-                success: true,
-                stdout: inventory,
-                stderr: Vec::new(),
-            },
+            command_output: HostCommandOutput::success(inventory),
             mountpoints: BTreeMap::from([
                 (
                     PathBuf::from("/Users/alice/.cowshed"),
@@ -2624,7 +2605,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn command_runner_uses_argv_and_preserves_stderr() {
+    fn command_runner_uses_argv_and_preserves_failure_status_and_streams() {
         let seen = RefCell::new(VecDeque::new());
         let command = HostCommand::new(
             "/usr/sbin/diskutil",
@@ -2640,8 +2621,12 @@ mod tests {
             })
         })
         .unwrap();
-        assert!(!output.success);
+        assert!(!output.succeeded());
         assert_eq!(output.stderr, b"diskutil exact failure\n");
+        assert_eq!(
+            HostCommandFailure::new(command, output).to_string(),
+            "command failed: executable \"/usr/sbin/diskutil\", argv [\"apfs\", \"list\", \"-plist\", \"literal;not-shell\"], exit status 1; stdout: ignored; stderr: diskutil exact failure"
+        );
         assert_eq!(
             seen.into_inner().pop_front().unwrap(),
             (
@@ -2661,62 +2646,40 @@ mod tests {
     fn one_authorization_session_wraps_fixed_argv_for_all_new_volumes() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: b"Created new APFS Volume disk3s8\n".to_vec(),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info("disk3s8", "disk3", APFS_STORE_VOLUME, ""),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s8",
-                    "disk3",
-                    APFS_STORE_VOLUME,
-                    "/Users/alice/.cowshed",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: b"Created new APFS Volume disk3s9\n".to_vec(),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info("disk3s9", "disk3", APFS_CACHES_VOLUME, ""),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s9",
-                    "disk3",
-                    APFS_CACHES_VOLUME,
-                    "/Users/alice/.cowshed/caches",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            Ok(HostCommandOutput::success(
+                b"Created new APFS Volume disk3s8\n".to_vec(),
+            )),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s8",
+                "disk3",
+                APFS_STORE_VOLUME,
+                "",
+            ))),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s8",
+                "disk3",
+                APFS_STORE_VOLUME,
+                "/Users/alice/.cowshed",
+            ))),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::success(
+                b"Created new APFS Volume disk3s9\n".to_vec(),
+            )),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "",
+            ))),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "/Users/alice/.cowshed/caches",
+            ))),
+            Ok(HostCommandOutput::default()),
         ]);
         let volumes = [
             ApfsVolumeProvision {
@@ -2840,20 +2803,13 @@ mod tests {
     fn markerless_exact_mount_is_repaired_without_create_or_mount() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s9",
-                    "disk3",
-                    APFS_CACHES_VOLUME,
-                    "/Users/alice/.cowshed/caches",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "/Users/alice/.cowshed/caches",
+            ))),
+            Ok(HostCommandOutput::default()),
         ]);
         let volume = ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
@@ -2916,29 +2872,20 @@ mod tests {
     fn detached_exact_volume_is_reattested_and_recovered_without_recreation() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info("disk3s9", "disk3", APFS_CACHES_VOLUME, ""),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s9",
-                    "disk3",
-                    APFS_CACHES_VOLUME,
-                    "/Users/alice/.cowshed/caches",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "",
+            ))),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "/Users/alice/.cowshed/caches",
+            ))),
+            Ok(HostCommandOutput::default()),
         ]);
         let volume = ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
@@ -3029,38 +2976,21 @@ mod tests {
     fn mismounted_volume_is_unmounted_and_repaired_inside_one_session() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s9",
-                    "disk3",
-                    APFS_CACHES_VOLUME,
-                    "/Volumes/cowshed-wrong",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s9",
-                    "disk3",
-                    APFS_CACHES_VOLUME,
-                    "/Users/alice/.cowshed/caches",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "/Volumes/cowshed-wrong",
+            ))),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "/Users/alice/.cowshed/caches",
+            ))),
+            Ok(HostCommandOutput::default()),
         ]);
         let volume = ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
@@ -3181,46 +3111,27 @@ mod tests {
     fn an_auto_mounted_new_volume_is_detached_before_its_private_mount() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: b"Created new APFS Volume disk3s8\n".to_vec(),
-                stderr: Vec::new(),
-            }),
+            Ok(HostCommandOutput::success(
+                b"Created new APFS Volume disk3s8\n".to_vec(),
+            )),
             // The system mounted it at the default location despite -nomount.
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s8",
-                    "disk3",
-                    APFS_STORE_VOLUME,
-                    "/Volumes/cowshed.store",
-                ),
-                stderr: Vec::new(),
-            }),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s8",
+                "disk3",
+                APFS_STORE_VOLUME,
+                "/Volumes/cowshed.store",
+            ))),
             // unmount
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            Ok(HostCommandOutput::default()),
             // mount at the private mountpoint
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s8",
-                    "disk3",
-                    APFS_STORE_VOLUME,
-                    "/Users/alice/.cowshed",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s8",
+                "disk3",
+                APFS_STORE_VOLUME,
+                "/Users/alice/.cowshed",
+            ))),
+            Ok(HostCommandOutput::default()),
         ]);
         let volumes = [ApfsVolumeProvision {
             name: APFS_STORE_VOLUME,
@@ -3293,39 +3204,22 @@ mod tests {
     fn a_detached_volume_found_auto_mounted_is_detached_before_recovery() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s9",
-                    "disk3",
-                    APFS_CACHES_VOLUME,
-                    "/Volumes/cowshed.caches",
-                ),
-                stderr: Vec::new(),
-            }),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "/Volumes/cowshed.caches",
+            ))),
             // unmount, then mount at the private mountpoint
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                stdout: provision_info(
-                    "disk3s9",
-                    "disk3",
-                    APFS_CACHES_VOLUME,
-                    "/Users/alice/.cowshed/caches",
-                ),
-                stderr: Vec::new(),
-            }),
-            Ok(HostCommandOutput {
-                success: true,
-                ..HostCommandOutput::default()
-            }),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::default()),
+            Ok(HostCommandOutput::success(provision_info(
+                "disk3s9",
+                "disk3",
+                APFS_CACHES_VOLUME,
+                "/Users/alice/.cowshed/caches",
+            ))),
+            Ok(HostCommandOutput::default()),
         ]);
         let volumes = [ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
@@ -3462,11 +3356,7 @@ mod tests {
                 acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
                 Ok(FakePrivilegedSession {
                     events: Rc::clone(&acquire_events),
-                    outputs: VecDeque::from([Ok(HostCommandOutput {
-                        success: false,
-                        stdout: Vec::new(),
-                        stderr: b"child failed\n".to_vec(),
-                    })]),
+                    outputs: VecDeque::from([Ok(HostCommandOutput::failure(1, "child failed\n"))]),
                 })
             },
             &FakeProvisionIo {
