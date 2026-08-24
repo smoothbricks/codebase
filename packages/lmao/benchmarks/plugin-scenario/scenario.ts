@@ -30,19 +30,23 @@ export const scenarioSchema = defineLogSchema({
   outcome: S.enum(['failure', 'success']),
 });
 
-export type ScenarioTraceRootFactory = TraceRootFactory<typeof scenarioSchema>;
-export type ScenarioSchema = typeof scenarioSchema;
+const scenarioContext = defineOpContext({
+  logSchema: scenarioSchema,
+});
+export type ScenarioTracer = TestTracer<typeof scenarioContext>;
+
+// Runtime factories MUST be keyed by the schema instance the tracer binds to
+// (`logBinding.logSchema`), not `typeof scenarioSchema`: defineOpContext widens
+// validated schemas to plain LogSchema, so a ValidatedLogSchema-keyed factory is
+// contravariance-incompatible with TracerOptions<LogSchema<F>>.
+export type ScenarioSchema = typeof scenarioContext.logBinding.logSchema;
+export type ScenarioTraceRootFactory = TraceRootFactory<ScenarioSchema>;
 export type ScenarioBackend = 'js' | 'wasm';
 export interface ScenarioRuntime {
   readonly backend: ScenarioBackend;
   readonly bufferStrategy: BufferStrategy<ScenarioSchema>;
   readonly createTraceRoot: ScenarioTraceRootFactory;
 }
-
-const scenarioContext = defineOpContext({
-  logSchema: scenarioSchema,
-});
-export type ScenarioTracer = TestTracer<typeof scenarioContext>;
 
 const { defineOp } = scenarioContext;
 
@@ -160,7 +164,7 @@ export function generateCanonicalSemanticSnapshot(runtime: ScenarioRuntime): str
 
   const result = executeScenario(tracer);
   if (!result.success) {
-    throw new Error(`Scenario result invariant failed: ${String(result.error)}`);
+    throw new Error(`Scenario result invariant failed: ${String(result)}`);
   }
   assertEqual(result.value, 61, 'Scenario result');
   assertEqual(tracer.rootBuffers.length, 1, 'Root buffer count');
