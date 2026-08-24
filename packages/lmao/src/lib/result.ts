@@ -409,6 +409,22 @@ export class Err<E, T extends LogSchema = LogSchema> {
 /** Union type for Result - either Ok or Err. */
 export type Result<V, E, T extends LogSchema = LogSchema> = Ok<V, T> | Err<E, T>;
 
+/**
+ * Schema-brand-wildcard Result for conditional inference positions (`infer S` / `infer E`)
+ * where the LogSchema brand must not participate in constraint solving. Same rationale as
+ * AnyResult: the `any` keeps variance open so per-op success/error types flow through.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: inference wildcard by design; see doc above.
+export type InferResult<S, E> = Result<S, E, any>;
+
+/**
+ * Wildcard Result for inference positions (Op/trace/span result kinds) where the
+ * schema brand must not participate in constraint solving. The `any`s are the point:
+ * they keep variance open so per-op success/error types flow through untouched.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: inference wildcard by design; see doc above.
+export type AnyResult = Result<any, any, any>;
+
 // =============================================================================
 // CODE ERROR FACTORY
 // =============================================================================
@@ -508,13 +524,13 @@ export function hasErrorCode(error: unknown): error is { code: string } {
  * Extract success type from a Result type.
  * Returns `never` if R is not a Result.
  */
-export type ResultSuccess<R> = R extends Result<infer S, unknown, LogSchema> ? S : never;
+export type ResultSuccess<R> = R extends InferResult<infer S, unknown> ? S : never;
 
 /**
  * Extract success type from a Promise<Result> type.
  * Returns `never` if R is not a Promise<Result>.
  */
-export type PromiseResultSuccess<R> = R extends Promise<Result<infer S, unknown, LogSchema>> ? S : never;
+export type PromiseResultSuccess<R> = R extends Promise<InferResult<infer S, unknown>> ? S : never;
 
 /**
  * Extract success type from either Result or Promise<Result>.
@@ -526,13 +542,13 @@ export type ExtractSuccess<R> = ResultSuccess<R> | PromiseResultSuccess<R>;
  * Extract error type from a Result type.
  * Returns `never` if R is not a Result.
  */
-export type ResultError<R> = R extends Result<unknown, infer E, LogSchema> ? E : never;
+export type ResultError<R> = R extends InferResult<unknown, infer E> ? E : never;
 
 /**
  * Extract error type from a Promise<Result> type.
  * Returns `never` if R is not a Promise<Result>.
  */
-export type PromiseResultError<R> = R extends Promise<Result<unknown, infer E, LogSchema>> ? E : never;
+export type PromiseResultError<R> = R extends Promise<InferResult<unknown, infer E>> ? E : never;
 
 /**
  * Extract error type from either Result or Promise<Result>.

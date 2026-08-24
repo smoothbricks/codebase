@@ -102,7 +102,7 @@ const { trace } = new StdioTracer(opContext, {
 async function main(): Promise<void> {
   console.log('=== 1. Success ===');
   const created = await trace('createUser', createUser, 'john@example.com', 'John Doe');
-  console.log(created.success ? created.value : created.error);
+  console.log('value:', created.value);
 
   console.log('\n=== 2. Validation error ===');
   const invalid = await trace('validateEmail', validateEmail, 'not-an-email');

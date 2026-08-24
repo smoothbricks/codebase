@@ -19,7 +19,7 @@
  */
 
 import type { FluentLogEntry as FluentLogEntryFromGenerator } from '../codegen/spanLoggerGenerator.js';
-import type { Err, Ok, Result } from '../result.js';
+import type { AnyResult, Err, ExtractError, ExtractSuccess, Ok, Result } from '../result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { InferSchema } from '../schema/types.js';
@@ -241,8 +241,11 @@ export type SpanFn<Ctx extends OpContext> = {
  * });
  */
 export type SpanSyncFn<Ctx extends OpContext> = {
-  <S, E>(name: string, op: Op<Ctx, [], S, E>): Result<S, E>;
-  <S, E>(name: string, fn: (ctx: SpanContext<Ctx>) => Result<S, E>): Result<S, E>;
+  <R extends AnyResult | Promise<AnyResult>>(
+    name: string,
+    op: Op<Ctx, [], ExtractSuccess<R>, ExtractError<R>, R>,
+  ): Awaited<R>;
+  <R extends AnyResult>(name: string, fn: (ctx: SpanContext<Ctx>) => R): Awaited<R>;
 };
 
 // =============================================================================

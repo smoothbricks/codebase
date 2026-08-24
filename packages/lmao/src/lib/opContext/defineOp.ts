@@ -10,10 +10,12 @@
 import { intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import { Op as OpClass } from '../op.js';
 import { resolveEagerColumns } from '../physicalLayoutPlan.js';
+import type { AnyResult, ExtractError, ExtractSuccess } from '../result.js';
 import { runtimeHintMessageLayoutFamily, runtimeHintMessagePhysicalLayout } from '../runtimeHint.js';
 import { getSpanBufferClass } from '../spanBuffer.js';
 import type { OpGroup, OpGroupOps } from './opGroupTypes.js';
 import type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
+import type { SpanContext } from './spanContextTypes.js';
 import type { OpContext } from './types.js';
 
 //#region smoo/lmao!n/metadata-injection
@@ -208,18 +210,18 @@ type CreateOpGroupFn<Ctx extends OpContext> = <Ops extends OpGroupOps<Ctx>>(
  */
 export function createDefineOp<Ctx extends OpContext>(
   factoryConfig: DefineOpFactoryConfig<Ctx>,
-): <Args extends unknown[], S, E>(
+): <Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
   name: string,
-  fn: OpFn<Ctx, Args, S, E>,
+  fn: (ctx: SpanContext<Ctx>, ...args: Args) => R,
   metadata?: Partial<OpMetadata>,
   compileMetadata?: OpCompileMetadata,
-) => Op<Ctx, Args, S, E> {
-  return function defineOpImpl<Args extends unknown[], S, E>(
+) => Op<Ctx, Args, ExtractSuccess<R>, ExtractError<R>, R> {
+  return function defineOpImpl<Args extends unknown[], R extends AnyResult | Promise<AnyResult>>(
     name: string,
-    fn: OpFn<Ctx, Args, S, E>,
+    fn: (ctx: SpanContext<Ctx>, ...args: Args) => R,
     metadata?: Partial<OpMetadata>,
     compileMetadata?: OpCompileMetadata,
-  ): Op<Ctx, Args, S, E> {
+  ): Op<Ctx, Args, ExtractSuccess<R>, ExtractError<R>, R> {
     const normalizedCompileMetadata = normalizeCompileMetadata(compileMetadata);
     normalizedCompileMetadata.materializeSpanBufferClass?.(factoryConfig.logSchema);
     const eagerColumns = resolveEagerColumns(
