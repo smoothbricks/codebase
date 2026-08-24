@@ -153,7 +153,7 @@ function runColdScenario(options: PlatformScenarioOptions): ColdPlatformScenario
   const firstResult = executeScenario(tracer);
   const firstLifecycleMs = elapsedMilliseconds(options.now, lifecycleStartedAt, 'First lifecycle');
   options.onProgress?.('first-lifecycle-end');
-  if (!firstResult.success) throw new Error(`Cold scenario failed: ${String(firstResult.error)}`);
+  if (!firstResult.success) throw new Error(`Cold scenario failed: ${String(firstResult)}`);
 
   const rootBuffer = tracer.rootBuffers[0];
   if (!rootBuffer) throw new Error('Cold scenario did not capture a root buffer');
