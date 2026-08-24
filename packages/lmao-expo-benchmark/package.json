@@ -33,11 +33,20 @@
     "name": "lmao-expo-benchmark",
     "sourceRoot": "packages/lmao-expo-benchmark/src",
     "projectType": "application",
+    "namedInputs": {
+      "pluginScenarioSources": [
+        "{workspaceRoot}/packages/lmao/benchmarks/plugin-scenario/**/*"
+      ]
+    },
     "targets": {
       "typecheck": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "^build"
+        ],
+        "inputs": [
+          "default",
+          "pluginScenarioSources"
         ],
         "options": {
           "command": "ttsc --noEmit -p tsconfig.json",
@@ -46,10 +55,20 @@
           "killAfterMs": 10000
         }
       },
+      "typecheck-tests": {
+        "inputs": [
+          "default",
+          "pluginScenarioSources"
+        ]
+      },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "^build"
+        ],
+        "inputs": [
+          "default",
+          "pluginScenarioSources"
         ],
         "options": {
           "command": "bun test --timeout=30000 src",
