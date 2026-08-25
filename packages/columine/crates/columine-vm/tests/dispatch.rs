@@ -1461,6 +1461,45 @@ fn empty_batch_with_no_column_pointers_is_ok() {
     vm.undo_commit();
 }
 
+/// A non-empty batch whose program references columns the batch does not
+/// carry (or carries short) is a malformed batch: every batch-driven op
+/// refuses with COLUMN_UNDERRUN. Found live by the containium runtime gate —
+/// a scenario batch with `batch_len == 1` and zero columns drove FOR_EACH's
+/// AGG_COUNT off an empty type column, and the panic aborted the host process
+/// through its extern "C" entry. Same program as
+/// `empty_batch_with_no_column_pointers_is_ok`; the batch length is the only
+/// difference between "clean no-op" and "named refusal".
+#[test]
+fn nonempty_batch_with_missing_columns_is_column_underrun() {
+    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000006000c00100002020000e00101010000000200410000";
+    let prog: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let mut vm = Vm::default();
+    let size = calculate_state_size(&prog);
+    let mut state = vec![0u8; size as usize];
+    init_state(&mut state, &prog).expect("init_state");
+
+    let underrun = ErrorCode::ColumnUnderrun as u32;
+
+    // No columns at all.
+    let cols: Vec<&[u8]> = Vec::new();
+    assert_eq!(underrun, vm.execute_batch(&mut state, &prog, &cols, 1));
+
+    // Type column (index 1) present but one cell short of the batch.
+    let keys = [0u32, 0];
+    let short_types = [1u32];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&short_types)];
+    assert_eq!(underrun, vm.execute_batch(&mut state, &prog, &cols, 2));
+
+    // Fully covered batch still counts.
+    let keys = [0u32];
+    let types_col = [1u32];
+    let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&types_col)];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
+}
+
 /// Parity regression (reducer-vm-integration.test.ts "Scalar Slot — latest()"):
 /// exec_scalar_latest matched AggType 5/6/7, but the registry says SCALAR_U32=8,
 /// SCALAR_F64=9, SCALAR_I64=10 (types.zig:214-216; 6-7 reserved) — every scalar

@@ -285,6 +285,9 @@ pub enum ErrorCode {
     NeedsGrowth = 5,
     ArenaOverflow = 6,
     InvalidKey = 7,
+    /// A batch-driven op referenced a column that cannot cover `batch_len`
+    /// cells. Named refusal instead of the Zig-era read-garbage/panic split.
+    ColumnUnderrun = 8,
 }
 
 #[cfg(test)]
@@ -343,7 +346,8 @@ mod tests {
         );
         assert_discriminants!(ErrorCode, u32;
             Ok = 0, CapacityExceeded = 1, InvalidProgram = 2, InvalidSlot = 3,
-            InvalidState = 4, NeedsGrowth = 5, ArenaOverflow = 6
+            InvalidState = 4, NeedsGrowth = 5, ArenaOverflow = 6, InvalidKey = 7,
+            ColumnUnderrun = 8
         );
     }
 

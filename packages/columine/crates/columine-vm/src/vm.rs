@@ -116,6 +116,44 @@ pub fn col_i64(col: &[u8], batch_len: u32) -> &[i64] {
     cells
 }
 
+/// Batch-extent views: the op indexes rows `0..batch_len`, so the column MUST
+/// cover the whole batch. `None` is a malformed batch — the caller answers
+/// with `ErrorCode::ColumnUnderrun` instead of the clamped view's panic. The
+/// clamped `col_*` views above stay for section columns, whose extent is the
+/// op's own (`ForEach` array offsets, scatter sources); the two contracts are
+/// separate functions so a call site names which one it means.
+pub fn col_u32_exact(col: &[u8], batch_len: u32) -> Option<&[u32]> {
+    let cells = col_u32(col, batch_len);
+    (cells.len() >= batch_len as usize).then_some(cells)
+}
+
+pub fn col_f64_exact(col: &[u8], batch_len: u32) -> Option<&[f64]> {
+    let cells = col_f64(col, batch_len);
+    (cells.len() >= batch_len as usize).then_some(cells)
+}
+
+pub fn col_i64_exact(col: &[u8], batch_len: u32) -> Option<&[i64]> {
+    let cells = col_i64(col, batch_len);
+    (cells.len() >= batch_len as usize).then_some(cells)
+}
+
+/// Take a batch-extent view inside a `-> u32` VM dispatch body, refusing the
+/// batch with `ColumnUnderrun` when the column cannot cover it.
+macro_rules! batch_col {
+    ($view:expr) => {
+        match $view {
+            Some(cells) => cells,
+            None => return ErrorCode::ColumnUnderrun as u32,
+        }
+    };
+}
+
+/// A raw comparison/timestamp column checked to cover `batch_len` values at
+/// `cmp_type`'s stride, so `read_cmp_value` stays in bounds by construction.
+fn cmp_col_exact(col: &[u8], batch_len: u32, cmp_type: CmpType) -> Option<&[u8]> {
+    (col.len() >= batch_len as usize * cmp_type.stride()).then_some(col)
+}
+
 /// vm.zig `getCol*` never bounds-checks the column-pointer table: with
 /// `batch_len == 0` the TS side legitimately passes FEWER column pointers than
 /// the program references (empty batches ship an empty column array), and the
@@ -2344,6 +2382,17 @@ fn exec_scalar_latest(
     if meta.slot_type() != SlotType::Scalar || !matches!(scalar_type, 8..=10) {
         return ErrorCode::InvalidProgram;
     }
+    // Every arm indexes val/cmp/type data with row indices up to batch_len;
+    // a column that cannot cover the batch is a malformed batch, refused
+    // here rather than a panic mid-loop.
+    if cmp_vals.len() < batch_len as usize {
+        return ErrorCode::ColumnUnderrun;
+    }
+    if let Some((td, _)) = type_mask
+        && td.len() < batch_len as usize
+    {
+        return ErrorCode::ColumnUnderrun;
+    }
     let prev_value = bytes::read_u64(state, data);
     let prev_ts = bytes::read_f64(state, data + 8);
 
@@ -2354,7 +2403,9 @@ fn exec_scalar_latest(
     let matches = |i: usize| type_mask.is_none_or(|(td, id)| td[i] == id);
     match scalar_type {
         8 => {
-            let vals = col_u32(val_col, batch_len);
+            let Some(vals) = col_u32_exact(val_col, batch_len) else {
+                return ErrorCode::ColumnUnderrun;
+            };
             for i in 0..batch_len as usize {
                 let ts = cmp_vals[i];
                 if matches(i) && ts > bytes::read_f64(state, data + 8) && vals[i] != EMPTY_KEY {
@@ -2365,7 +2416,9 @@ fn exec_scalar_latest(
             }
         }
         9 => {
-            let vals = col_f64(val_col, batch_len);
+            let Some(vals) = col_f64_exact(val_col, batch_len) else {
+                return ErrorCode::ColumnUnderrun;
+            };
             for i in 0..batch_len as usize {
                 let ts = cmp_vals[i];
                 if matches(i) && ts > bytes::read_f64(state, data + 8) {
@@ -2376,7 +2429,9 @@ fn exec_scalar_latest(
             }
         }
         10 => {
-            let vals = col_i64(val_col, batch_len);
+            let Some(vals) = col_i64_exact(val_col, batch_len) else {
+                return ErrorCode::ColumnUnderrun;
+            };
             for i in 0..batch_len as usize {
                 let ts = cmp_vals[i];
                 if matches(i) && ts > bytes::read_f64(state, data + 8) {
@@ -2673,9 +2728,13 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, key_col as usize), batch_len),
-                        col_u32(col_at(cols, val_col as usize), batch_len),
-                        Some(col_at(cols, ts_col as usize)),
+                        batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
+                        batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
+                        Some(batch_col!(cmp_col_exact(
+                            col_at(cols, ts_col as usize),
+                            batch_len,
+                            cmp_type
+                        ))),
                         cmp_type,
                         &mut self.ctx(),
                     );
@@ -2694,8 +2753,8 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, key_col as usize), batch_len),
-                        col_u32(col_at(cols, val_col as usize), batch_len),
+                        batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
+                        batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
                         None,
                         CmpType::F64,
                         &mut self.ctx(),
@@ -2710,7 +2769,11 @@ impl Vm {
                     pc += 3;
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
-                        Some(col_at(cols, meta.timestamp_field_idx(state) as usize))
+                        Some(batch_col!(cmp_col_exact(
+                            col_at(cols, meta.timestamp_field_idx(state) as usize),
+                            batch_len,
+                            CmpType::F64
+                        )))
                     } else {
                         None
                     };
@@ -2720,8 +2783,8 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, key_col as usize), batch_len),
-                        col_u32(col_at(cols, val_col as usize), batch_len),
+                        batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
+                        batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
                         ts,
                         CmpType::F64,
                         &mut self.ctx(),
@@ -2742,9 +2805,13 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, key_col as usize), batch_len),
-                        col_u32(col_at(cols, val_col as usize), batch_len),
-                        Some(col_at(cols, ts_col as usize)),
+                        batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
+                        batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
+                        Some(batch_col!(cmp_col_exact(
+                            col_at(cols, ts_col as usize),
+                            batch_len,
+                            CmpType::F64
+                        ))),
                         CmpType::F64,
                         &mut self.ctx(),
                     );
@@ -2762,7 +2829,7 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, key_col as usize), batch_len),
+                        batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
                         &mut self.ctx(),
                     );
                 }
@@ -2786,9 +2853,13 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, key_col as usize), batch_len),
-                        col_u32(col_at(cols, val_col as usize), batch_len),
-                        Some(col_at(cols, cmp_col as usize)),
+                        batch_col!(col_u32_exact(col_at(cols, key_col as usize), batch_len)),
+                        batch_col!(col_u32_exact(col_at(cols, val_col as usize), batch_len)),
+                        Some(batch_col!(cmp_col_exact(
+                            col_at(cols, cmp_col as usize),
+                            batch_len,
+                            cmp_type
+                        ))),
                         cmp_type,
                         &mut self.ctx(),
                     );
@@ -2802,10 +2873,10 @@ impl Vm {
                     pc += 2;
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
-                        Some(col_f64(
+                        Some(batch_col!(col_f64_exact(
                             col_at(cols, meta.timestamp_field_idx(state) as usize),
-                            batch_len,
-                        ))
+                            batch_len
+                        )))
                     } else {
                         None
                     };
@@ -2814,7 +2885,7 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, elem_col as usize), batch_len),
+                        batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         ts,
                         &mut self.ctx(),
                     );
@@ -2832,8 +2903,11 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, elem_col as usize), batch_len),
-                        Some(col_f64(col_at(cols, ts_col as usize), batch_len)),
+                        batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
+                        Some(batch_col!(col_f64_exact(
+                            col_at(cols, ts_col as usize),
+                            batch_len
+                        ))),
                         &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
@@ -2850,7 +2924,7 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, elem_col as usize), batch_len),
+                        batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         &mut self.ctx(),
                     );
                 }
@@ -2860,10 +2934,10 @@ impl Vm {
                     pc += 2;
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
-                        Some(col_f64(
+                        Some(batch_col!(col_f64_exact(
                             col_at(cols, meta.timestamp_field_idx(state) as usize),
-                            batch_len,
-                        ))
+                            batch_len
+                        )))
                     } else {
                         None
                     };
@@ -2879,7 +2953,7 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, elem_col as usize), batch_len),
+                        batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         ts,
                     );
                     if result != ErrorCode::Ok {
@@ -2903,7 +2977,7 @@ impl Vm {
                         state,
                         &meta,
                         slot,
-                        col_u32(col_at(cols, elem_col as usize), batch_len),
+                        batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                     );
                 }
 
@@ -3001,7 +3075,7 @@ impl Vm {
                         state,
                         slot,
                         kind,
-                        col_f64(col_at(cols, val_col as usize), batch_len),
+                        batch_col!(col_f64_exact(col_at(cols, val_col as usize), batch_len)),
                         None,
                         None,
                     );
@@ -3033,7 +3107,7 @@ impl Vm {
                         state,
                         slot,
                         kind,
-                        col_i64(col_at(cols, val_col as usize), batch_len),
+                        batch_col!(col_i64_exact(col_at(cols, val_col as usize), batch_len)),
                         None,
                         None,
                     );
@@ -3042,7 +3116,8 @@ impl Vm {
                 Opcode::BatchScalarLatest => {
                     let (slot, val_col, cmp_col) = (code[pc], code[pc + 1], code[pc + 2]);
                     pc += 3;
-                    let cmp_vals = col_f64(col_at(cols, cmp_col as usize), batch_len);
+                    let cmp_vals =
+                        batch_col!(col_f64_exact(col_at(cols, cmp_col as usize), batch_len));
                     let result = exec_scalar_latest(
                         &mut self.undo,
                         delta_mode,
@@ -3096,7 +3171,10 @@ impl Vm {
                         None => None,
                     };
 
-                    let keys = col_u32(col_at(cols, usize::from(operands.key_col)), batch_len);
+                    let keys = batch_col!(col_u32_exact(
+                        col_at(cols, usize::from(operands.key_col)),
+                        batch_len
+                    ));
                     for i in 0..batch_len {
                         let key = keys[usize::try_from(i).expect("batch index fits usize")];
                         let should_write = match op {
@@ -3150,8 +3228,14 @@ impl Vm {
                         val_cols[index] = pair[0];
                         field_idxs[index] = pair[1];
                     }
-                    let keys1 = col_u32(col_at(cols, usize::from(operands.key1_col)), batch_len);
-                    let keys2 = col_u32(col_at(cols, usize::from(operands.key2_col)), batch_len);
+                    let keys1 = batch_col!(col_u32_exact(
+                        col_at(cols, usize::from(operands.key1_col)),
+                        batch_len
+                    ));
+                    let keys2 = batch_col!(col_u32_exact(
+                        col_at(cols, usize::from(operands.key2_col)),
+                        batch_len
+                    ));
                     for i in 0..batch_len {
                         let index = usize::try_from(i).expect("batch index fits usize");
                         let result = single_struct_map2_upsert_last(
@@ -3184,10 +3268,14 @@ impl Vm {
                     if !validate_struct_map2_max_i64x2(state, &smap, code, operands) {
                         return INVALID_PROGRAM;
                     }
-                    let keys1 =
-                        col_u32(col_at(cols, usize::from(operands.row.key1_col)), batch_len);
-                    let keys2 =
-                        col_u32(col_at(cols, usize::from(operands.row.key2_col)), batch_len);
+                    let keys1 = batch_col!(col_u32_exact(
+                        col_at(cols, usize::from(operands.row.key1_col)),
+                        batch_len
+                    ));
+                    let keys2 = batch_col!(col_u32_exact(
+                        col_at(cols, usize::from(operands.row.key2_col)),
+                        batch_len
+                    ));
                     for i in 0..batch_len {
                         let index = usize::try_from(i).expect("batch index fits usize");
                         let result = single_struct_map2_upsert_max_i64x2(
@@ -3213,8 +3301,14 @@ impl Vm {
                 Opcode::BatchStructMap2Remove => {
                     let (slot, key1_col, key2_col) = (code[pc], code[pc + 1], code[pc + 2]);
                     pc += 3;
-                    let keys1 = col_u32(col_at(cols, usize::from(key1_col)), batch_len);
-                    let keys2 = col_u32(col_at(cols, usize::from(key2_col)), batch_len);
+                    let keys1 = batch_col!(col_u32_exact(
+                        col_at(cols, usize::from(key1_col)),
+                        batch_len
+                    ));
+                    let keys2 = batch_col!(col_u32_exact(
+                        col_at(cols, usize::from(key2_col)),
+                        batch_len
+                    ));
                     for index in 0..batch_len as usize {
                         let result = single_struct_map2_remove(
                             &mut self.undo,
@@ -3264,6 +3358,9 @@ impl Vm {
                     pc = body_end;
 
                     let type_col = col_at(cols, col_idx as usize);
+                    // Both passes index the type column with row indices up
+                    // to batch_len; a short column is a malformed batch.
+                    let type_data = batch_col!(col_u32_exact(type_col, batch_len));
 
                     // Pass 1: batch aggregates, once per match id (vm.zig:1806).
                     for mi in 0..match_count {
@@ -3278,7 +3375,6 @@ impl Vm {
                     }
 
                     // Pass 2: per-element scalar ops (vm.zig:1827).
-                    let type_data = col_u32(type_col, batch_len);
                     for ei in 0..batch_len {
                         let val = type_data[ei as usize];
                         let mut matched = false;
@@ -3321,7 +3417,7 @@ impl Vm {
         type_col: &[u8],
         type_id: u32,
     ) -> u32 {
-        let type_data = col_u32(type_col, batch_len);
+        let type_data = batch_col!(col_u32_exact(type_col, batch_len));
         let mut bpc = 0usize;
         while bpc < body.len() {
             let op_byte = body[bpc];
@@ -3347,7 +3443,7 @@ impl Vm {
                         state,
                         slot,
                         kind,
-                        col_f64(col_at(cols, val_col as usize), batch_len),
+                        batch_col!(col_f64_exact(col_at(cols, val_col as usize), batch_len)),
                         Some(TypeMask {
                             data: type_data,
                             id: type_id,
@@ -3358,8 +3454,7 @@ impl Vm {
                 0x41 => {
                     let slot = body[bpc + 1];
                     bpc += 2;
-                    let matched =
-                        aggregates::masked_agg_count(type_data, type_id, batch_len as usize);
+                    let matched = aggregates::masked_agg_count(type_data, type_id);
                     exec_agg_count(&mut self.undo, delta_mode, state, slot, u64::from(matched));
                 }
                 0x44 | 0x46 | 0x47 => {
@@ -3376,18 +3471,22 @@ impl Vm {
                         state,
                         slot,
                         kind,
-                        col_f64(col_at(cols, val_col as usize), batch_len),
+                        batch_col!(col_f64_exact(col_at(cols, val_col as usize), batch_len)),
                         Some(TypeMask {
                             data: type_data,
                             id: type_id,
                         }),
-                        Some(col_u32(col_at(cols, pred_col as usize), batch_len)),
+                        Some(batch_col!(col_u32_exact(
+                            col_at(cols, pred_col as usize),
+                            batch_len
+                        ))),
                     );
                 }
                 0x45 => {
                     let (slot, pred_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
-                    let preds = col_u32(col_at(cols, pred_col as usize), batch_len);
+                    let preds =
+                        batch_col!(col_u32_exact(col_at(cols, pred_col as usize), batch_len));
                     let mut matched = 0u64;
                     for i in 0..batch_len as usize {
                         if type_data[i] == type_id && preds[i] != 0 {
@@ -3399,7 +3498,8 @@ impl Vm {
                 0x48 => {
                     let (slot, val_col, cmp_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
-                    let cmp_vals = col_f64(col_at(cols, cmp_col as usize), batch_len);
+                    let cmp_vals =
+                        batch_col!(col_f64_exact(col_at(cols, cmp_col as usize), batch_len));
                     let result = exec_scalar_latest(
                         &mut self.undo,
                         delta_mode,
@@ -3428,7 +3528,7 @@ impl Vm {
                         state,
                         slot,
                         kind,
-                        col_i64(col_at(cols, val_col as usize), batch_len),
+                        batch_col!(col_i64_exact(col_at(cols, val_col as usize), batch_len)),
                         Some(TypeMask {
                             data: type_data,
                             id: type_id,
