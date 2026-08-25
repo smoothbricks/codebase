@@ -39,8 +39,14 @@ never reuses a stale snapshot. Existing long-running processes keep their launch
 (`.env*`, key files, known token prefixes, `.envrc` secret exports). For adopt: move each value into the gateway
 Keychain (see gateway.md) and delete the file, or `cowshed adopt --quarantine` to relocate findings outside the image so
 dependent tooling fails loudly. For push: the offending hunks are named — remove the secret and push again; autosave
-meanwhile skips (never propagates findings) and warns. False positive? Add a reasoned waiver (shown by `cowshed doctor`
-forever after) rather than working around the gate.
+meanwhile skips (never propagates findings) and warns.
+
+False positive on adopt? The refusal itself prints the exact controller-owned `waivers.json` path and a valid entry
+example. Entries form a JSON array whose `path` matches the finding's repository-relative path exactly and whose
+`reason` must be non-empty; malformed, blank-reason, or duplicate entries fail closed with the same pointer. Waivers
+exist only for intentionally committed synthetic or public detector fixtures that can never hold live credentials —
+never for live, temporary, copied, developer-local, deployment, or recoverable credentials — and a waiver suppresses
+blocking while every waived finding remains retained for audit.
 
 **Attach fails.** `cowshed doctor` distinguishes: image/dataset missing, image verification failure on macOS, occupied
 mountpoint, or Linux attachment wiring failure. On Linux an attachment is healthy only when its private netns contains
