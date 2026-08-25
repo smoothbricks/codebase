@@ -559,6 +559,9 @@ pub enum ErrorCode {
     ArenaOverflow = 6,
     /// Reserved StructMap2 lane-1 sentinel supplied as reducer data.
     InvalidKey = 7,
+    /// A batch-driven op referenced a column that cannot cover `batch_len`
+    /// cells. Named refusal instead of the Zig-era read-garbage/panic split.
+    ColumnUnderrun = 8,
 }
 
 pub const fn hash_key(key: u32, cap: u32) -> u32 {
@@ -949,7 +952,8 @@ mod tests {
     fn error_code_discriminants_match_zig() {
         assert_discriminants!(ErrorCode, u32;
             Ok = 0, CapacityExceeded = 1, InvalidProgram = 2, InvalidSlot = 3,
-            InvalidState = 4, NeedsGrowth = 5, ArenaOverflow = 6
+            InvalidState = 4, NeedsGrowth = 5, ArenaOverflow = 6, InvalidKey = 7,
+            ColumnUnderrun = 8
         );
     }
 

@@ -297,8 +297,11 @@ pub fn masked_agg_sum(vals: &[f64], type_data: &[u32], type_id: u32) -> f64 {
     result
 }
 
-/// aggregates.zig:89 `maskedAggCount`.
-pub fn masked_agg_count(type_data: &[u32], type_id: u32, batch_len: usize) -> u32 {
+/// aggregates.zig:89 `maskedAggCount`. The slice's length IS the batch
+/// extent: callers hand a batch-covering view (`col_u32_exact`), so a
+/// separate `batch_len` parameter was only an invitation to disagree with it.
+pub fn masked_agg_count(type_data: &[u32], type_id: u32) -> u32 {
+    let batch_len = type_data.len();
     let mut count: u32 = 0;
     let mut i = 0;
     while i + 4 <= batch_len {

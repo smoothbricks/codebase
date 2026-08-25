@@ -67,6 +67,14 @@ impl CmpType {
             _ => None,
         }
     }
+
+    /// Input-column stride in bytes (`read_cmp_value`'s access pattern).
+    pub const fn stride(self) -> usize {
+        match self {
+            Self::U32 => 4,
+            Self::F64 | Self::I64 => 8,
+        }
+    }
 }
 
 /// hashmap_ops.zig:83 `readCmpValue` — read the i-th comparison value from a
