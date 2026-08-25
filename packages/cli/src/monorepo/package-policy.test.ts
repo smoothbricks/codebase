@@ -703,6 +703,41 @@ describe('workspace package script policy', () => {
       const projectTsconfig = await readJson(join(root, 'packages/app/tsconfig.json'));
       expect(projectTsconfig.references).toEqual([{ path: './tsconfig.lib.json' }]);
       expect(validateWorkspaceDependencies(root)).toBe(0);
+      const firstPackage = await readFile(join(root, 'packages/app/package.json'), 'utf8');
+      const firstProjectConfig = await readFile(join(root, 'packages/app/tsconfig.json'), 'utf8');
+      const firstTestConfig = await readFile(join(root, 'packages/app/tsconfig.test.json'), 'utf8');
+      applyWorkspaceDependencyDefaults(root);
+      expect(await readFile(join(root, 'packages/app/package.json'), 'utf8')).toBe(firstPackage);
+      expect(await readFile(join(root, 'packages/app/tsconfig.json'), 'utf8')).toBe(firstProjectConfig);
+      expect(await readFile(join(root, 'packages/app/tsconfig.test.json'), 'utf8')).toBe(firstTestConfig);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('detects canonical test-config drift before monorepo update repairs it', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app', scripts: { test: 'bun test' } }],
+    });
+    try {
+      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { rootDir: 'src' },
+      });
+      applyWorkspaceDependencyDefaults(root);
+      expect(validateWorkspaceDependencies(root)).toBe(0);
+
+      await writeJson(join(root, 'packages/app/tsconfig.lib.json'), {
+        extends: '../../tsconfig.base.json',
+        compilerOptions: { rootDir: 'src', lib: ['es2024'] },
+      });
+      expect(validateWorkspaceDependencies(root)).toBe(1);
+
+      applyWorkspaceDependencyDefaults(root);
+      const repaired = await readJson(join(root, 'packages/app/tsconfig.test.json'));
+      expect(repaired).toMatchObject({ compilerOptions: { lib: ['es2024'] } });
+      expect(validateWorkspaceDependencies(root)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

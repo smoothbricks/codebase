@@ -346,6 +346,7 @@ export function applyTypecheckTestPolicyTree(tree: Tree): boolean {
  */
 export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
   const issues: NxPolicyIssue[] = [];
+  const workspaceNames = getWorkspacePackageNames(root);
   for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
     const pkg = readJsonObject(packageJsonPath);
     if (!pkg) {
@@ -372,12 +373,33 @@ export function checkTypecheckTestPolicy(root: string): NxPolicyIssue[] {
       continue;
     }
 
-    // tsconfig.test.json must have correct settings
+    // The checker and updater share one normalization function. Detailed invariant
+    // diagnostics win; otherwise report any subtler missing canonical field so
+    // `smoo monorepo check` cannot be green immediately before update rewrites it.
     const tsconfig = readJsonObject(tsconfigTestPath);
     if (tsconfig) {
-      // Use absolute path for filesystem layer
       const absoluteIssues = checkTypecheckTestConfig(tsconfig, join(root, packagePath));
       issues.push(...absoluteIssues);
+      if (absoluteIssues.length === 0) {
+        const libTsconfig = readJsonObject(join(root, packagePath, 'tsconfig.lib.json'));
+        const tsconfigLibExtends = stringProperty(libTsconfig ?? {}, 'extends') ?? '../../tsconfig.base.json';
+        const libCompilerOptions = libTsconfig ? recordProperty(libTsconfig, 'compilerOptions') : null;
+        const referencePaths = collectTsconfigTestReferencePaths(root, packagePath, pkg, workspaceNames);
+        const normalized = structuredClone(tsconfig);
+        if (
+          applyTypecheckTestDefaults(normalized, {
+            testRunners,
+            tsconfigLibExtends,
+            libCompilerOptions: libCompilerOptions ?? undefined,
+            referencePaths,
+          })
+        ) {
+          issues.push({
+            path: tsconfigTestPath,
+            message: 'must match the canonical no-emit test typecheck configuration',
+          });
+        }
+      }
     }
 
     // tsconfig.json must NOT reference ./tsconfig.test.json
