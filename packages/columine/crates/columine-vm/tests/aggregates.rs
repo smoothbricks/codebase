@@ -50,8 +50,8 @@ fn masked_agg_sum_type_filtered() {
 fn masked_agg_count_simd() {
     // aggregates.zig:383
     let types_col = [1u32, 2, 1, 1, 2, 1, 2, 1];
-    assert_eq!(masked_agg_count(&types_col, 1, 8), 5);
-    assert_eq!(masked_agg_count(&types_col, 2, 8), 3);
+    assert_eq!(masked_agg_count(&types_col, 1), 5);
+    assert_eq!(masked_agg_count(&types_col, 2), 3);
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn masked_agg_count_parametric() {
     // aggregates.zig:516
     let type_ids = param_type_ids();
     for &n in &PARAMETRIC_MASKED_SIZES {
-        assert_eq!(masked_agg_count(&type_ids[..n], 1, n), n.div_ceil(2) as u32);
+        assert_eq!(masked_agg_count(&type_ids[..n], 1), n.div_ceil(2) as u32);
     }
 }
 
