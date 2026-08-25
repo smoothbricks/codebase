@@ -17,6 +17,25 @@ pub struct SecretWaiver {
     pub reason: String,
 }
 
+/// A copyable single-entry example of the controller-owned waivers file, valid against
+/// [`SecretWaiver`] and the validator rules.
+pub const WAIVER_EXAMPLE: &str = r#"[{"path": "fixtures/synthetic.env", "reason": "intentionally committed synthetic detector fixture"}]"#;
+
+/// The operator-facing waiver contract for one resolved `waivers.json` location: where the
+/// file lives, its entry schema, when waiving is legitimate, and what a waiver does and
+/// does not do. Refusal hints embed this verbatim so the printed path is always the real,
+/// resolved one rather than prose about where it usually lives.
+pub fn waiver_guidance(waivers_path: &Path) -> String {
+    format!(
+        "write {WAIVER_EXAMPLE} to {} — each entry carries an exact repository-relative path \
+and a non-empty reason; waivers are only for intentionally committed synthetic or public \
+detector fixtures that can never hold live credentials, never for live, temporary, copied, \
+developer-local, deployment, or recoverable credentials; a waiver suppresses blocking while \
+every waived finding remains retained for audit",
+        waivers_path.display(),
+    )
+}
+
 /// A scanner match. `context` is always a redacted projection, never source bytes.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -601,9 +620,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        LineMatch, SecretScanError, SecretWaiver, find_auth_config, find_aws_access_keys,
-        find_pem_marker, find_prefixed_token, find_shell_secret, github_token_byte, redact_line,
-        scan_tree, secret_key_byte, slack_token_byte,
+        LineMatch, SecretScanError, SecretWaiver, WAIVER_EXAMPLE, find_auth_config,
+        find_aws_access_keys, find_pem_marker, find_prefixed_token, find_shell_secret,
+        github_token_byte, redact_line, scan_tree, secret_key_byte, slack_token_byte,
+        waiver_guidance,
     };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -842,6 +862,71 @@ mod tests {
             Err(SecretScanError::DuplicateWaiver { path })
                 if path == Path::new("fixture.txt")
         ));
+    }
+
+    #[test]
+    fn waiver_guidance_prints_the_resolved_path_and_a_valid_example() {
+        let tree = TestDir::new();
+        let waivers_path = tree.path().join("waivers.json");
+        let guidance = waiver_guidance(&waivers_path);
+
+        assert!(
+            guidance.contains(&waivers_path.display().to_string()),
+            "guidance must name the resolved waivers file: {guidance}"
+        );
+        assert!(
+            !guidance.contains('~'),
+            "never print tilde prose: {guidance}"
+        );
+
+        let parsed: Vec<SecretWaiver> =
+            serde_json::from_str(WAIVER_EXAMPLE).expect("example is valid JSON");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, Path::new("fixtures/synthetic.env"));
+        assert!(!parsed[0].reason.trim().is_empty());
+        scan_tree(tree.path(), &parsed)
+            .expect("the printed example must satisfy the waiver validator");
+    }
+
+    #[test]
+    fn waiver_guidance_states_the_complete_policy() {
+        let guidance = waiver_guidance(Path::new("/store/acme/widget/waivers.json"));
+        for phrase in [
+            "exact repository-relative path",
+            "non-empty reason",
+            "intentionally committed synthetic or public detector fixtures",
+            "can never hold live credentials",
+            "live, temporary, copied, developer-local, deployment, or recoverable credentials",
+            "suppresses blocking",
+            "retained for audit",
+        ] {
+            assert!(
+                guidance.contains(phrase),
+                "guidance must state {phrase:?}: {guidance}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_exact_path_waiver_suppresses_a_finding() {
+        let tree = TestDir::new();
+        tree.write("fixtures/.env.test", "documented=fake");
+
+        let near_miss = SecretWaiver {
+            path: PathBuf::from(".env.test"),
+            reason: "same suffix, different file".to_owned(),
+        };
+        let scan = scan_tree(tree.path(), &[near_miss]).expect("scan succeeds");
+        assert_eq!(scan.findings.len(), 1);
+        assert!(scan.waived_findings.is_empty());
+
+        let exact = SecretWaiver {
+            path: PathBuf::from("fixtures/.env.test"),
+            reason: "intentionally committed synthetic detector fixture".to_owned(),
+        };
+        let scan = scan_tree(tree.path(), &[exact]).expect("scan succeeds");
+        assert!(scan.findings.is_empty());
+        assert_eq!(scan.waived_findings.len(), 1);
     }
 
     #[test]
