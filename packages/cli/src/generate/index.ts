@@ -42,6 +42,12 @@ export const variants: Record<string, GenerateVariant> = {
     args: (name) => ['--name', name, '--variant', 'ts-lib'],
     options: [{ flag: '--public', description: 'configure for npm publication' }],
   },
+  'rust-crate': {
+    generator: 'create-package',
+    description: 'Create a Rust workspace package',
+    args: (name) => ['--name', name, '--variant', 'rust-crate'],
+    options: [{ flag: '--wasm', description: 'add wasm-bindgen web and Node.js output families' }],
+  },
   'make-public': {
     generator: 'make-public',
     description: 'Promote a private package to npm publication',

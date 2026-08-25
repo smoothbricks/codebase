@@ -11,12 +11,17 @@
     "variant": {
       "type": "string",
       "description": "Package variant to scaffold.",
-      "enum": ["ts-lib"],
+      "enum": ["ts-lib", "rust-crate"],
       "default": "ts-lib"
     },
     "public": {
       "type": "boolean",
-      "description": "Configure for npm publication (license, publishConfig, npm:public tag).",
+      "description": "Configure a TypeScript package for npm publication (license, publishConfig, npm:public tag).",
+      "default": false
+    },
+    "wasm": {
+      "type": "boolean",
+      "description": "For rust-crate, scaffold wasm-bindgen metadata for web and Node.js output families.",
       "default": false
     }
   },

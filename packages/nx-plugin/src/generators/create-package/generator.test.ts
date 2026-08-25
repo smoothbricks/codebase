@@ -13,6 +13,7 @@ function setupTree(rootName = '@smoothbricks/codebase'): Tree {
         name: rootName,
         version: '0.0.0',
         private: true,
+        license: 'MIT',
         repository: { type: 'git', url: 'git+https://github.com/smoothbricks/codebase.git' },
         workspaces: ['packages/*'],
       },
@@ -121,6 +122,54 @@ describe('create-package generator', () => {
 
       const pkg = readJson(tree, 'packages/mylib/package.json');
       expect(pkg.name).toBe('mylib');
+    });
+  });
+
+  describe('rust-crate variant', () => {
+    it('creates a Cargo workspace whose generic targets are inferred by the plugin', async () => {
+      const tree = setupTree();
+      await generator(tree, { name: 'ferris', variant: 'rust-crate' });
+
+      const pkg = readJson(tree, 'packages/ferris/package.json');
+      expect(pkg).toEqual({
+        name: '@smoothbricks/ferris',
+        version: '0.0.0',
+        private: true,
+        scripts: { test: 'nx run ferris:test --outputStyle=stream' },
+        nx: { name: 'ferris' },
+      });
+
+      const workspace = tree.read('packages/ferris/Cargo.toml', 'utf-8');
+      expect(workspace).toContain('[workspace]');
+      expect(workspace).toContain('members = ["crates/ferris"]');
+      expect(workspace).toContain('edition = "2024"');
+      expect(workspace).toContain('license = "MIT"');
+      expect(workspace).toContain('repository = "git+https://github.com/smoothbricks/codebase.git"');
+
+      const crate = tree.read('packages/ferris/crates/ferris/Cargo.toml', 'utf-8');
+      expect(crate).toContain('[package]');
+      expect(crate).toContain('name = "ferris"');
+      expect(crate).toContain('version.workspace = true');
+      expect(tree.read('packages/ferris/crates/ferris/src/lib.rs', 'utf-8')).toBe('#![forbid(unsafe_code)]\n');
+      expect(tree.exists('packages/ferris/tsconfig.json')).toBe(false);
+    });
+
+    it('declares tool-native wasm metadata for cross-platform output inference', async () => {
+      const tree = setupTree();
+      await generator(tree, { name: 'ferris', variant: 'rust-crate', wasm: true });
+
+      const crate = tree.read('packages/ferris/crates/ferris/Cargo.toml', 'utf-8');
+      expect(crate).toContain('crate-type = ["cdylib", "rlib"]');
+      expect(crate).toContain('[package.metadata.smoothbricks.wasm-bindgen]');
+      expect(crate).toContain('targets = ["web", "nodejs"]');
+      expect(crate).toContain('out-dir = "dist-wasm"');
+    });
+
+    it('refuses npm publication flags on Cargo packages', async () => {
+      const tree = setupTree();
+      await expect(generator(tree, { name: 'ferris', variant: 'rust-crate', public: true })).rejects.toThrow(
+        'rust-crate does not use npm publication metadata',
+      );
     });
   });
 
