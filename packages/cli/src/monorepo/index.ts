@@ -2,12 +2,26 @@ import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { $ } from 'bun';
 import { decode, run } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
+import { readProjectTargets } from '../nx/index.js';
 import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
 import { applyManagedFiles, printResults, warnOnManagedFileDrift } from './managed-files.js';
-import { listValidCommitScopes, validatePublicTags } from './package-policy.js';
-import { runInitPacks, runValidatePacks } from './packs/index.js';
+import {
+  applyFixableMonorepoDefaults,
+  applyNxReleaseDefaults,
+  applyPublicPackageDefaults,
+  applyWorkspaceDependencyDefaults,
+  listValidCommitScopes,
+  validateNxProjectNames,
+  validateNxReleaseConfig,
+  validatePublicPackageMetadata,
+  validatePublicTags,
+  validateRootPackagePolicy,
+  validateTestFileLocations,
+  validateWorkspaceDependencies,
+} from './package-policy.js';
+import { resolvedTargetsByProject, runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
 import { applyToolConfigDefaults } from './tool-validation.js';
 
@@ -77,6 +91,12 @@ export async function validateMonorepo(root: string, options: ValidateOptions = 
 
 export async function updateManagedFiles(root: string): Promise<void> {
   printResults(await applyManagedFiles(root, 'update'));
+  applyFixableMonorepoDefaults(root);
+  applyNxReleaseDefaults(root);
+  applyPublicPackageDefaults(root);
+  applyWorkspaceDependencyDefaults(root, {
+    resolvedTargetsByProject: resolvedTargetsByProject(await readProjectTargets(root)),
+  });
   // Tool dependency policy (typescript API 6, @typescript/native for ttsc, nx, …)
   // lives next to managed templates — update must install them, not only rewrite files.
   await applyToolConfigDefaults(root);
@@ -97,8 +117,17 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
   }
   const results = await applyManagedFiles(root, 'check');
   printResults(results);
-  if (results.some((result) => result.action === 'drifted')) {
-    throw new Error('Managed monorepo files are out of date. Run: smoo monorepo update');
+  const resolvedTargets = resolvedTargetsByProject(await readProjectTargets(root));
+  const packageFailures =
+    validateRootPackagePolicy(root) +
+    validateNxProjectNames(root) +
+    validateNxReleaseConfig(root) +
+    validatePublicTags(root) +
+    validatePublicPackageMetadata(root) +
+    validateTestFileLocations(root) +
+    validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets });
+  if (results.some((result) => result.action === 'drifted') || packageFailures > 0) {
+    throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
   }
 }
 
