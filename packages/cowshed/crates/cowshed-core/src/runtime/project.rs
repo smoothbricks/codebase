@@ -5902,29 +5902,41 @@ async fn enforce_adopt_secret_policy(
     quarantine: bool,
 ) -> Result<()> {
     crate::storage::lifecycle::dispatch_blocking(move || {
-        let waivers =
-            match crate::metadata::read_json::<Vec<crate::secrets::SecretWaiver>>(&waivers_path) {
-                Ok(waivers) => waivers,
-                Err(crate::metadata::MetadataError::Io { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    Vec::new()
-                }
-                Err(error) => return Err(native_integrity_error(error)),
-            };
-        let scan = crate::secrets::scan_tree(&root, &waivers).map_err(secret_scan_error)?;
+        let waivers = match crate::metadata::read_json::<Vec<crate::secrets::SecretWaiver>>(
+            &waivers_path,
+        ) {
+            Ok(waivers) => waivers,
+            Err(crate::metadata::MetadataError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Vec::new()
+            }
+            Err(error @ crate::metadata::MetadataError::Json { .. }) => {
+                return Err(CowshedError::integrity(
+                    error.to_string(),
+                    format!(
+                        "repair the waivers file first (or delete it to start without waivers): {}",
+                        crate::secrets::waiver_guidance(&waivers_path),
+                    ),
+                ));
+            }
+            Err(error) => return Err(native_integrity_error(error)),
+        };
+        let scan = crate::secrets::scan_tree(&root, &waivers)
+            .map_err(|error| secret_scan_error(&waivers_path, error))?;
         if scan.findings.is_empty() {
             return Ok(());
         }
         if !quarantine {
-            return Err(secret_findings_error(&scan.findings));
+            return Err(secret_findings_error(&scan.findings, &waivers_path));
         }
         quarantine_secret_files(&root, &quarantine_root, &scan.findings)?;
-        let remaining = crate::secrets::scan_tree(&root, &waivers).map_err(secret_scan_error)?;
+        let remaining = crate::secrets::scan_tree(&root, &waivers)
+            .map_err(|error| secret_scan_error(&waivers_path, error))?;
         if remaining.findings.is_empty() {
             Ok(())
         } else {
-            Err(secret_findings_error(&remaining.findings))
+            Err(secret_findings_error(&remaining.findings, &waivers_path))
         }
     })
     .await
@@ -5932,12 +5944,15 @@ async fn enforce_adopt_secret_policy(
 }
 
 #[cfg(target_os = "macos")]
-fn secret_scan_error(error: crate::secrets::SecretScanError) -> CowshedError {
+fn secret_scan_error(waivers_path: &Path, error: crate::secrets::SecretScanError) -> CowshedError {
     match error {
         crate::secrets::SecretScanError::InvalidWaiver { .. }
         | crate::secrets::SecretScanError::DuplicateWaiver { .. } => CowshedError::integrity(
             error.to_string(),
-            "repair the controller-owned waivers file",
+            format!(
+                "repair the controller-owned waivers file first: {}",
+                crate::secrets::waiver_guidance(waivers_path),
+            ),
         ),
         crate::secrets::SecretScanError::InvalidRoot { .. }
         | crate::secrets::SecretScanError::Walk { .. }
@@ -5949,7 +5964,10 @@ fn secret_scan_error(error: crate::secrets::SecretScanError) -> CowshedError {
 }
 
 #[cfg(target_os = "macos")]
-fn secret_findings_error(findings: &[crate::secrets::SecretFinding]) -> CowshedError {
+fn secret_findings_error(
+    findings: &[crate::secrets::SecretFinding],
+    waivers_path: &Path,
+) -> CowshedError {
     let paths = findings
         .iter()
         .map(|finding| finding.path.display().to_string())
@@ -5959,7 +5977,10 @@ fn secret_findings_error(findings: &[crate::secrets::SecretFinding]) -> CowshedE
         .join(", ");
     CowshedError::conflict(
         format!("repository contains secrets in: {paths}"),
-        "remove the files, add reasoned controller waivers, or retry adopt with quarantine",
+        format!(
+            "remove the files, or waive a false positive: {}; otherwise retry adopt with --quarantine",
+            crate::secrets::waiver_guidance(waivers_path),
+        ),
     )
 }
 
@@ -8343,5 +8364,189 @@ mod terminal_project_cleanup_tests {
         assert_eq!(std::fs::read(&image).expect("image preserved"), b"image");
         assert!(binding.is_file());
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod adopt_secret_policy_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::enforce_adopt_secret_policy;
+    use crate::error::ErrorCode;
+    use crate::secrets::WAIVER_EXAMPLE;
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    /// A throwaway repository tree plus the controller-owned paths the policy reads.
+    struct PolicyTree(PathBuf);
+
+    impl PolicyTree {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "cowshed-adopt-policy-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("temporary policy tree is created");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn waivers_path(&self) -> PathBuf {
+            self.0.join("waivers.json")
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent exists"))
+                .expect("fixture parent is created");
+            std::fs::write(path, contents).expect("fixture is written");
+        }
+
+        fn write_waivers(&self, contents: &str) {
+            std::fs::write(self.waivers_path(), contents).expect("waivers file is written");
+        }
+    }
+
+    impl Drop for PolicyTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn policy(tree: &PolicyTree, quarantine: bool) -> Result<(), crate::error::CowshedError> {
+        enforce_adopt_secret_policy(
+            tree.path().to_path_buf(),
+            tree.waivers_path(),
+            tree.path().join("quarantine"),
+            quarantine,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn clean_tree_without_a_waivers_file_is_accepted() {
+        let tree = PolicyTree::new("clean");
+        policy(&tree, false)
+            .await
+            .expect("no findings and no waivers file means no refusal");
+    }
+
+    #[tokio::test]
+    async fn findings_refusal_prints_the_complete_waiver_contract() {
+        let tree = PolicyTree::new("refusal");
+        tree.write(".env.local", "DATABASE_PASSWORD=hunter2");
+
+        let error = policy(&tree, false)
+            .await
+            .expect_err("findings must refuse adoption without a waiver");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains(".env.local"), "{}", error.message);
+        for expected in [
+            tree.waivers_path().display().to_string(),
+            WAIVER_EXAMPLE.to_owned(),
+            "exact repository-relative path".to_owned(),
+            "non-empty reason".to_owned(),
+            "can never hold live credentials".to_owned(),
+            "developer-local".to_owned(),
+            "retained for audit".to_owned(),
+            "--quarantine".to_owned(),
+        ] {
+            assert!(
+                error.hint.contains(&expected),
+                "hint must contain {expected:?}: {}",
+                error.hint
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_reasoned_waiver_suppresses_blocking() {
+        let tree = PolicyTree::new("waived");
+        tree.write(".env.local", "DATABASE_PASSWORD=hunter2");
+        tree.write_waivers(
+            r#"[{"path": ".env.local", "reason": "intentionally committed synthetic detector fixture"}]"#,
+        );
+
+        policy(&tree, false)
+            .await
+            .expect("an exact, reasoned waiver unblocks adoption");
+    }
+
+    #[tokio::test]
+    async fn malformed_waivers_file_fails_closed_with_the_contract() {
+        let tree = PolicyTree::new("malformed");
+        tree.write(".env.local", "DATABASE_PASSWORD=hunter2");
+        tree.write_waivers("{not json");
+
+        let error = policy(&tree, false)
+            .await
+            .expect_err("a malformed waivers file must fail closed");
+        assert_eq!(error.code, ErrorCode::Integrity);
+        assert!(
+            error
+                .message
+                .contains(&tree.waivers_path().display().to_string()),
+            "{}",
+            error.message
+        );
+        assert!(error.hint.contains(WAIVER_EXAMPLE), "{}", error.hint);
+        assert!(error.hint.contains("delete it"), "{}", error.hint);
+    }
+
+    #[tokio::test]
+    async fn empty_reason_waiver_names_the_file_and_the_contract() {
+        let tree = PolicyTree::new("blank-reason");
+        tree.write(".env.local", "DATABASE_PASSWORD=hunter2");
+        tree.write_waivers(r#"[{"path": ".env.local", "reason": "   "}]"#);
+
+        let error = policy(&tree, false)
+            .await
+            .expect_err("a blank reason must not waive anything");
+        assert_eq!(error.code, ErrorCode::Integrity);
+        assert!(
+            error.message.contains("reason is required"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .hint
+                .contains(&tree.waivers_path().display().to_string()),
+            "{}",
+            error.hint
+        );
+        assert!(error.hint.contains(WAIVER_EXAMPLE), "{}", error.hint);
+    }
+
+    #[tokio::test]
+    async fn duplicate_waiver_names_the_file_and_the_contract() {
+        let tree = PolicyTree::new("duplicate");
+        tree.write(".env.local", "DATABASE_PASSWORD=hunter2");
+        tree.write_waivers(
+            r#"[{"path": ".env.local", "reason": "one"}, {"path": ".env.local", "reason": "two"}]"#,
+        );
+
+        let error = policy(&tree, false)
+            .await
+            .expect_err("a duplicate waiver entry must be refused");
+        assert_eq!(error.code, ErrorCode::Integrity);
+        assert!(
+            error.message.contains("duplicate waiver"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .hint
+                .contains(&tree.waivers_path().display().to_string()),
+            "{}",
+            error.hint
+        );
+        assert!(error.hint.contains(WAIVER_EXAMPLE), "{}", error.hint);
     }
 }
