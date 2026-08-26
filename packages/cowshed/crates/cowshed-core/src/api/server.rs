@@ -424,7 +424,6 @@ pub const CAPABILITY_METHODS: &[&str] = &[
     "project.workspaceAt",
     "project.list",
     "workspace.info",
-    "workspace.ensure",
     "workspace.attach",
     "workspace.grants",
     "coordinator.adopt",

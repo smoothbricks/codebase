@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, CreateOptions, DoctorReport, EnsureAction, EnsureReport, Finding,
-    FindingSeverity, GcOptions, GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId,
-    JobInfo, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
+    CheckpointResult, CommandArg, CreateOptions, DoctorReport, Finding, FindingSeverity, GcOptions,
+    GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId, JobInfo, LandOptions, LandReport,
+    MirrorInfo, PortBlock, PushOptions, PushReport,
     RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
@@ -469,34 +469,16 @@ impl ProjectRuntimeHost for FakeHost {
         Ok(self.snapshot(current))
     }
 
-    async fn ensure(
-        &mut self,
-        workspace: WorkspaceName,
-        observed: Option<PathBuf>,
-    ) -> Result<EnsureReport> {
+
+    async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {
         // Convergence, in miniature: an observed main checkout that differs from the recorded one
         // replaces it. Sessions never converge — only main's checkout has a recorded path.
-        if let Some(observed) = observed
+        if let Some(observed) = options.observed_path
             && workspace.is_main()
             && observed != self.descriptor.git_root
         {
             self.descriptor.git_root = observed;
         }
-        let current = self.workspace(&workspace)?;
-        let mount = self.snapshot(current).info.mount;
-        Ok(EnsureReport {
-            workspace,
-            go_env: mount.join(".cowshed/cache/go/env"),
-            sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
-            sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
-            workspace_token: mount.join(".cowshed/token"),
-            port_block: current.grants.port_block,
-            mount,
-            action: EnsureAction::AlreadyMounted,
-        })
-    }
-
-    async fn attach(&mut self, workspace: WorkspaceName, _options: AttachOptions) -> Result<()> {
         self.workspace_mut(&workspace)?.attached = true;
         self.persist()
     }
@@ -1387,7 +1369,7 @@ async fn adopt_then_create_list_and_path_use_one_immutable_snapshot() {
 }
 
 #[tokio::test]
-async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_env_fields() {
+async fn workspace_at_uses_active_mount_facts_and_attach_preserves_exec_mount() {
     let root = test_root();
     let (_runtime, router, repo, mut events) = start(&root, false, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
@@ -1405,25 +1387,6 @@ async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_e
     .expect("nested path resolution");
     assert_eq!(resolved["info"]["workspace"], "main");
 
-    let ensured = route(
-        &router,
-        coordinator(repo.clone()),
-        "workspace.ensure",
-        json!({ "repoId": repo, "workspace": "main" }),
-    )
-    .await
-    .expect("ensure");
-    assert_eq!(
-        ensured["goEnv"],
-        mount
-            .join(".cowshed/cache/go/env")
-            .to_string_lossy()
-            .as_ref()
-    );
-    assert_eq!(
-        ensured["workspaceToken"],
-        mount.join(".cowshed/token").to_string_lossy().as_ref()
-    );
 
     let created = route(
         &router,
@@ -1433,22 +1396,19 @@ async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_e
     )
     .await
     .expect("create session");
-    let session_ensure = route(
+    route(
         &router,
         coordinator(repo.clone()),
-        "workspace.ensure",
-        json!({ "repoId": repo, "workspace": "task" }),
+        "workspace.attach",
+        json!({
+            "repoId": repo,
+            "workspace": "task",
+            "options": AttachOptions::default(),
+        }),
     )
     .await
-    .expect("ensure session");
+    .expect("attach session");
     let session_mount = root.join("store/mnt/task");
-    assert_eq!(
-        session_ensure["goEnv"],
-        session_mount
-            .join(".cowshed/cache/go/env")
-            .to_string_lossy()
-            .as_ref()
-    );
     while events.try_recv().is_ok() {}
     route(
         &router,
@@ -1482,7 +1442,6 @@ async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_e
     };
     assert_eq!(workspace, WorkspaceName::new("task").expect("task"));
     assert_eq!(exec_mount, session_mount);
-    assert_eq!(ensured["portBlock"], json!({"base": 49152, "size": 16}));
 
     let marker_only = root.join("marker-only");
     std::fs::create_dir_all(marker_only.join(".cowshed")).expect("marker directory");
@@ -1522,12 +1481,12 @@ async fn workspace_at_uses_active_mount_facts_and_ensure_returns_authoritative_e
     assert_eq!(error.code, ErrorCode::NotFound);
 }
 
-/// `mv main` and `ensure` are the two ways the project's checkout path changes, and both are
-/// routed rather than inferred: the coordinator carries a destination path, and ensure carries the
-/// caller's observation. Main's mount is derived from the recorded checkout, so the mount each call
-/// reports back is the witness that the new path actually landed in the host.
+/// `mv main` and `attach` are the two ways the project's checkout path changes, and both are
+/// routed rather than inferred: the coordinator carries a destination path, and attach carries the
+/// caller's observation. Main's mount is derived from the recorded checkout, so querying it after
+/// each call witnesses that the new path actually landed in the host.
 #[tokio::test]
-async fn moving_the_checkout_and_ensuring_from_an_alias_both_move_the_recorded_path() {
+async fn moving_the_checkout_and_attaching_from_an_alias_both_move_the_recorded_path() {
     let root = test_root();
     let (_runtime, router, repo, _events) = start(&root, false, false, Vec::new()).await;
     let adopted = adopt(&router, &repo).await;
@@ -1564,33 +1523,57 @@ async fn moving_the_checkout_and_ensuring_from_an_alias_both_move_the_recorded_p
         .is_err()
     );
 
-    // Ensure converges onto the checkout the caller observed, which is how a hand-moved checkout
+    // Attach converges onto the checkout the caller observed, which is how a hand-moved checkout
     // gets its record repaired without a `mv`.
     let observed = root.join("alias");
-    let ensured = route(
+    route(
         &router,
         coordinator(repo.clone()),
-        "workspace.ensure",
-        json!({ "repoId": repo, "workspace": "main", "observedPath": observed }),
+        "workspace.attach",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "options": {"browse": false, "observedPath": observed},
+        }),
     )
     .await
-    .expect("ensure with an observation");
-    assert_eq!(
-        ensured["mount"].as_str().expect("mount"),
-        observed.to_string_lossy()
-    );
-
-    // An ensure with no observation offers nothing to converge onto and must leave the record be.
-    let ensured = route(
+    .expect("attach with an observation");
+    let attached = route(
         &router,
         coordinator(repo.clone()),
-        "workspace.ensure",
+        "workspace.info",
         json!({ "repoId": repo, "workspace": "main" }),
     )
     .await
-    .expect("ensure without an observation");
+    .expect("info after observed attach");
     assert_eq!(
-        ensured["mount"].as_str().expect("mount"),
+        attached["mount"].as_str().expect("mount"),
+        observed.to_string_lossy()
+    );
+
+    // An attach with no observation offers nothing to converge onto and must leave the record be.
+    route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.attach",
+        json!({
+            "repoId": repo,
+            "workspace": "main",
+            "options": AttachOptions::default(),
+        }),
+    )
+    .await
+    .expect("attach without an observation");
+    let attached = route(
+        &router,
+        coordinator(repo.clone()),
+        "workspace.info",
+        json!({ "repoId": repo, "workspace": "main" }),
+    )
+    .await
+    .expect("info after unobserved attach");
+    assert_eq!(
+        attached["mount"].as_str().expect("mount"),
         observed.to_string_lossy()
     );
 }

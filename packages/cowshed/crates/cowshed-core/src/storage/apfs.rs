@@ -68,7 +68,7 @@ impl ApfsSubstrateConfig {
     /// The same project, checked out somewhere else.
     ///
     /// The checkout path and the layout are the only two fields a live project can change — that
-    /// is what `cowshed mv main` does, and what `cowshed ensure` converges onto after a checkout is
+    /// is what `cowshed mv main` does, and what `cowshed attach` converges onto after a checkout is
     /// rearranged by hand. Everything else (store root, caches root, capacity, case sensitivity) is
     /// fixed for the project's lifetime.
     ///
@@ -362,7 +362,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn mint_workspace_credentials(
         &self,
         workspace: &LifecycleWorkspace,
+        image_path: &Path,
         mount_point: &Path,
+        workspace_mount: &Path,
         private_key_path: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn write_marker(
@@ -1899,7 +1901,13 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                 host.chown_volume_root(&mount_point)?;
             }
             host.copy_tree(source_checkout, &mount_point)?;
-            host.mint_workspace_credentials(&workspace, &mount_point, &staged_companion)?;
+            host.mint_workspace_credentials(
+                &workspace,
+                &created.path,
+                &mount_point,
+                &canonical_mount,
+                &staged_companion,
+            )?;
             host.write_marker(&mount_point, &workspace, None, identity)?;
             host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))
         });
@@ -2091,7 +2099,13 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
                 &staging_mount,
                 &volume_label(workspace.repo(), workspace.name()),
             )?;
-            host.mint_workspace_credentials(&workspace, &staging_mount, &staged_companion)?;
+            host.mint_workspace_credentials(
+                &workspace,
+                &staged_image,
+                &staging_mount,
+                &canonical_mount,
+                &staged_companion,
+            )?;
             host.write_marker(
                 &staging_mount,
                 &workspace,
@@ -2373,7 +2387,13 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
                 &staging_mount,
                 &volume_label(replacement.repo(), replacement.name()),
             )?;
-            host.mint_workspace_credentials(&replacement, &staging_mount, &staged_companion)?;
+            host.mint_workspace_credentials(
+                &replacement,
+                &staged_image,
+                &staging_mount,
+                &canonical_mount,
+                &staged_companion,
+            )?;
             host.write_marker(&staging_mount, &replacement, None, identity)?;
             host.validate_marker(
                 &staging_mount,
