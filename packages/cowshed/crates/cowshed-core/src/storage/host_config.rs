@@ -73,12 +73,11 @@ impl HostConfig {
             Err(source) => return Err(io_error("read host configuration", path, source)),
         };
         require_private_file(&path)?;
-        let config: Self = serde_json::from_slice(&bytes).map_err(|source| {
-            HostConfigError::InvalidConfig {
+        let config: Self =
+            serde_json::from_slice(&bytes).map_err(|source| HostConfigError::InvalidConfig {
                 path: path.clone(),
                 message: source.to_string(),
-            }
-        })?;
+            })?;
         if config.version != HOST_CONFIG_VERSION {
             return Err(HostConfigError::UnsupportedVersion {
                 path,
@@ -153,7 +152,9 @@ pub fn plan_mount_root_change(
     attached.sort();
     attached.dedup();
     if !attached.is_empty() {
-        return Err(HostConfigError::WorkspacesAttached { workspaces: attached });
+        return Err(HostConfigError::WorkspacesAttached {
+            workspaces: attached,
+        });
     }
     Ok(MountRootChangePlan {
         store_root: store_root.to_path_buf(),
@@ -197,10 +198,14 @@ impl RetiredLayoutRecord {
     }
 }
 
-/// Find detached metadata that still records an absolute path beneath the retired `<store>/mnt`
-/// layout. Invalid metadata remains the ordinary metadata doctor's responsibility; this detector
-/// only reports valid JSON files containing an unmistakable retired absolute path.
-pub fn retired_layout_paths(store_root: &Path) -> Result<Vec<RetiredLayoutRecord>, HostConfigError> {
+/// Find detached metadata in validated `<store>/<owner>/<repo>` projects that still records an
+/// absolute path beneath the retired `<store>/mnt` layout. Store neighbours and unreadable APFS
+/// metadata directories are excluded by project discovery before this recursive scan begins.
+/// Invalid grants remain the ordinary metadata doctor's responsibility; this detector only reports
+/// valid JSON files containing an unmistakable retired absolute path.
+pub fn retired_layout_paths(
+    store_root: &Path,
+) -> Result<Vec<RetiredLayoutRecord>, HostConfigError> {
     validate_absolute_path(store_root)?;
     let retired_root = store_root.join(RETIRED_MOUNT_DIRECTORY);
     if HostConfig::load_for_store(store_root)?.mount_root() == retired_root {
@@ -210,33 +215,50 @@ pub fn retired_layout_paths(store_root: &Path) -> Result<Vec<RetiredLayoutRecord
     if !store_root.exists() {
         return Ok(Vec::new());
     }
-    for entry in WalkDir::new(store_root).follow_links(false) {
-        let entry = entry.map_err(|source| HostConfigError::Scan {
-            path: source
-                .path()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| store_root.to_path_buf()),
-            message: source.to_string(),
+    let repositories =
+        crate::gateway_inventory::discover_repositories(store_root).map_err(|source| {
+            HostConfigError::Scan {
+                path: store_root.to_path_buf(),
+                message: source.to_string(),
+            }
         })?;
-        if !entry.file_type().is_file()
-            || !entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".grants.json")
-        {
-            continue;
+    for repo_id in repositories {
+        let project_root = crate::storage::StorageLayout::new(store_root, &repo_id)
+            .map_err(|source| HostConfigError::Scan {
+                path: store_root.to_path_buf(),
+                message: source.to_string(),
+            })?
+            .project()
+            .project_root
+            .clone();
+        for entry in WalkDir::new(&project_root).follow_links(false) {
+            let entry = entry.map_err(|source| HostConfigError::Scan {
+                path: source
+                    .path()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| project_root.clone()),
+                message: source.to_string(),
+            })?;
+            if !entry.file_type().is_file()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".grants.json")
+            {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).map_err(|source| {
+                io_error(
+                    "read detached workspace metadata",
+                    entry.path().to_path_buf(),
+                    source,
+                )
+            })?;
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            collect_retired_paths(&value, &retired_root, entry.path(), &mut records);
         }
-        let bytes = fs::read(entry.path()).map_err(|source| {
-            io_error(
-                "read detached workspace metadata",
-                entry.path().to_path_buf(),
-                source,
-            )
-        })?;
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        collect_retired_paths(&value, &retired_root, entry.path(), &mut records);
     }
     Ok(records.into_iter().collect())
 }
@@ -297,7 +319,10 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), HostConfigError
     })?;
     fs::create_dir_all(parent)
         .map_err(|source| io_error("create host configuration directory", parent, source))?;
-    let temporary = parent.join(format!(".{HOST_CONFIG_FILE}.{}.tmp", Uuid::new_v4().simple()));
+    let temporary = parent.join(format!(
+        ".{HOST_CONFIG_FILE}.{}.tmp",
+        Uuid::new_v4().simple()
+    ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -320,7 +345,11 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), HostConfigError
     })();
     if let Err(source) = written {
         let _ = fs::remove_file(&temporary);
-        return Err(io_error("write temporary host configuration", temporary, source));
+        return Err(io_error(
+            "write temporary host configuration",
+            temporary,
+            source,
+        ));
     }
     drop(file);
     fs::rename(&temporary, path).map_err(|source| {
@@ -364,7 +393,11 @@ fn sync_directory(path: &Path) -> Result<(), HostConfigError> {
         .map_err(|source| io_error("sync host configuration directory", path, source))
 }
 
-fn io_error(operation: &'static str, path: impl Into<PathBuf>, source: io::Error) -> HostConfigError {
+fn io_error(
+    operation: &'static str,
+    path: impl Into<PathBuf>,
+    source: io::Error,
+) -> HostConfigError {
     HostConfigError::Io {
         operation,
         path: path.into(),
@@ -375,10 +408,7 @@ fn io_error(operation: &'static str, path: impl Into<PathBuf>, source: io::Error
 #[derive(Debug, Error)]
 pub enum HostConfigError {
     #[error("invalid host path {path}: {reason}")]
-    InvalidPath {
-        path: PathBuf,
-        reason: &'static str,
-    },
+    InvalidPath { path: PathBuf, reason: &'static str },
     #[error("HOME is unavailable while resolving the default workspace mount root")]
     HomeUnavailable,
     #[error("host configuration {path} has unsupported version {version}")]
@@ -415,6 +445,25 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn bind_repository(store: &Path, repo_id: &str) -> PathBuf {
+        let repo_id = RepoId::parse(repo_id).expect("repository identity");
+        let paths = crate::storage::StorageLayout::new(store, &repo_id)
+            .expect("project paths")
+            .project()
+            .clone();
+        fs::create_dir_all(&paths.project_root).expect("project root");
+        let binding =
+            crate::repository::RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+                repo_id,
+                remote_name: None,
+                remote_url: None,
+                primary: true,
+            }])
+            .expect("repository binding");
+        crate::metadata::write_json(&paths.repository_binding, &binding).expect("binding file");
+        paths.project_root
     }
 
     #[test]
@@ -514,7 +563,10 @@ mod tests {
             panic!("unexpected error: {error}");
         };
         assert_eq!(
-            workspaces.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            workspaces
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             ["zeta/widget/raven"]
         );
         assert!(!mount_root.exists());
@@ -526,10 +578,10 @@ mod tests {
     fn retired_layout_detection_reports_metadata_and_recorded_path() {
         let root = temp_directory("retired");
         let store = root.join("store");
-        let metadata = store.join("acme/widget/sessions/raven.asif.grants.json");
+        let project = bind_repository(&store, "acme/widget");
+        let metadata = project.join("sessions/raven.asif.grants.json");
         fs::create_dir_all(metadata.parent().unwrap()).unwrap();
-        let plan =
-            plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
+        let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
         execute_mount_root_change(&plan).unwrap();
         let recorded = store.join("mnt/acme/widget/raven");
         fs::write(
@@ -563,7 +615,8 @@ mod tests {
     fn active_default_mount_layout_is_not_reported_as_retired() {
         let root = temp_directory("active-default");
         let store = root.join("store");
-        let metadata = store.join("acme/widget/sessions/raven.asif.grants.json");
+        let project = bind_repository(&store, "acme/widget");
+        let metadata = project.join("sessions/raven.asif.grants.json");
         fs::create_dir_all(metadata.parent().unwrap()).unwrap();
         fs::write(
             &metadata,
@@ -575,6 +628,30 @@ mod tests {
         .unwrap();
 
         assert!(retired_layout_paths(&store).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_layout_detection_skips_unreadable_apfs_system_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_directory("retired-system-directory");
+        let store = root.join("store");
+        bind_repository(&store, "acme/widget");
+        let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
+        execute_mount_root_change(&plan).unwrap();
+        let spotlight = store.join(".Spotlight-V100");
+        fs::create_dir_all(&spotlight).unwrap();
+        fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = retired_layout_paths(&store);
+        fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.unwrap().is_empty(),
+            "an unrelated APFS system directory must not become a retired-layout scan failure"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
