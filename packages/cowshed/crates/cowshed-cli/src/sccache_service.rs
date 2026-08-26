@@ -24,13 +24,20 @@ use cowshed_core::metadata::ImageCapacity;
 use cowshed_core::sandbox::{sccache_cache_directory, sccache_server_socket};
 use cowshed_core::storage::bootstrap::{STORE_ROOT, ValidatedHostStorage};
 use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
+use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const START_DEADLINE: Duration = Duration::from_secs(10);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Where the absolute path of the `sccache` this host installed is written down.
+///
+/// Beside the host-stable binaries, on the volume that also carries the plists: whatever launchd
+/// can read the agent definition from, it can read this from too.
+const SCCACHE_SOURCE_RECORD: &str = "sccache-source";
 
 /// No host gets a smaller cache than this, whatever the store currently holds.
 ///
@@ -113,12 +120,14 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
     };
     let socket = sccache_server_socket();
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    let source = resolve_sccache_source(&home)?;
     let executable = install_host_stable_executable(
         &mut executor,
         &home,
         SCCACHE_BINARY_NAME,
-        &resolve_sccache_executable()?,
+        &source,
     )?;
+    record_sccache_source(&executable, &source);
     let spec = LaunchAgentSpec::sccache(
         &executable,
         &socket,
@@ -153,7 +162,7 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
             return Ok(SccacheStatus {
                 installed: true,
                 running: true,
-                stats: read_stats(&socket).await,
+                stats: read_stats(&home, &socket).await,
                 socket,
             });
         }
@@ -251,7 +260,7 @@ pub(crate) async fn service_status() -> Result<SccacheStatus> {
     };
     let running = socket_answers(&socket).await;
     let stats = if running {
-        read_stats(&socket).await
+        read_stats(&home, &socket).await
     } else {
         None
     };
@@ -271,8 +280,10 @@ pub(crate) async fn service_status() -> Result<SccacheStatus> {
 /// reason: it is the only way to see whether the server actually took `SCCACHE_BASEDIRS`.
 ///
 /// A stats read that fails is absence, not an error: the verb's job is to report health, and a
-/// daemon that answers its socket but not a stats request is still installed and running.
-async fn read_stats(socket: &Path) -> Option<SccacheStats> {
+/// daemon that answers its socket but not a stats request is still installed and running. The
+/// client binary is resolved the same way the install resolves it, so `doctor` reports stats under
+/// launchd — where there is no `PATH` — instead of reporting a running daemon with no statistics.
+async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
     #[derive(serde::Deserialize)]
     struct Counted {
         counts: std::collections::BTreeMap<String, u64>,
@@ -292,7 +303,7 @@ async fn read_stats(socket: &Path) -> Option<SccacheStats> {
         stats: Counters,
     }
 
-    let output = tokio::process::Command::new(resolve_sccache_executable().ok()?)
+    let output = tokio::process::Command::new(resolve_sccache_source(home).ok()?)
         .args(["--show-stats", "--stats-format", "json"])
         .env("SCCACHE_SERVER_UDS", socket)
         .output()
@@ -340,31 +351,118 @@ pub(crate) fn sccache_launch_agent(
     Ok((executable, spec, sccache_server_socket()))
 }
 
-fn resolve_sccache_executable() -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").ok_or_else(|| {
+/// The record naming the `sccache` this host installed.
+fn sccache_source_record(home: &Path) -> Result<PathBuf> {
+    Ok(HostStableExecutable::new(home, SCCACHE_BINARY_NAME)
+        .map_err(launchd_error)?
+        .support_directory()
+        .join(SCCACHE_SOURCE_RECORD))
+}
+
+/// The `sccache` binary to install, preferring the absolute path this host already recorded.
+///
+/// launchd hands a LaunchAgent none of the user's `PATH`, so the gateway's startup heal — itself a
+/// LaunchAgent — can never find a devenv- or nix-provided `sccache` by name. It only ever resolved
+/// because `sccache start` had been run from a user shell, which is why a host with sccache
+/// installed all along reported "sccache is not on PATH" on every single boot. The absolute path is
+/// therefore recorded when an install succeeds and read back here; `PATH` remains the fallback for
+/// the first install on a host that has no record yet.
+fn resolve_sccache_source(home: &Path) -> Result<PathBuf> {
+    resolve_sccache_source_in(home, std::env::var_os("PATH").as_deref())
+}
+
+/// `search_path` is passed rather than read so the resolution order is testable without mutating
+/// the process environment, and so the launchd case — no `PATH` at all — is reachable as `None`.
+fn resolve_sccache_source_in(home: &Path, search_path: Option<&OsStr>) -> Result<PathBuf> {
+    let recorded = recorded_sccache_source(home)?;
+    // A record naming a binary that has gone is not an error: a devenv or nix upgrade moves the
+    // path, and PATH is where the replacement is found.
+    if let Some(path) = recorded.as_deref().filter(|path| path.is_file()) {
+        return canonical_sccache(path);
+    }
+    search_sccache_on_path(search_path).map_err(|error| match recorded {
+        // Name the stale record, or the only symptom is PATH being blamed on a host that has had
+        // sccache installed the whole time.
+        Some(stale) => CowshedError::environment_missing(
+            format!(
+                "sccache is not on PATH, and the recorded install path {} no longer exists",
+                stale.display()
+            ),
+            error.hint,
+        ),
+        None => error,
+    })
+}
+
+/// The recorded path, or `None` when this host has no usable record.
+///
+/// A record that cannot be read, or does not name an absolute path, is reported and then ignored:
+/// the `PATH` fallback still has a chance of working, and a startup heal must not die on a note.
+fn recorded_sccache_source(home: &Path) -> Result<Option<PathBuf>> {
+    let record = sccache_source_record(home)?;
+    let recorded = match fs::read_to_string(&record) {
+        Ok(recorded) => recorded,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            eprintln!("cowshed: could not read {}: {error}", record.display());
+            return Ok(None);
+        }
+    };
+    let recorded = Path::new(recorded.trim());
+    if !recorded.is_absolute() {
+        eprintln!(
+            "cowshed: ignoring {}: {} is not an absolute path",
+            record.display(),
+            recorded.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(recorded.to_path_buf()))
+}
+
+/// Write the source down so the next heal needs no `PATH`.
+///
+/// Best effort: an install that succeeded is not undone because a note could not be written. The
+/// failure is still said out loud, because what it costs is a PATH complaint on every boot.
+fn record_sccache_source(executable: &HostStableExecutable, source: &Path) {
+    let record = executable.support_directory().join(SCCACHE_SOURCE_RECORD);
+    if let Err(error) = fs::write(&record, format!("{}\n", source.display())) {
+        eprintln!(
+            "cowshed: could not record the sccache path in {}: {error}",
+            record.display()
+        );
+    }
+}
+
+fn search_sccache_on_path(search_path: Option<&OsStr>) -> Result<PathBuf> {
+    let search_path = search_path.ok_or_else(|| {
         CowshedError::environment_missing(
             "PATH is not set",
             "run from a shell with sccache on PATH",
         )
     })?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join("sccache");
+    for directory in std::env::split_paths(search_path) {
+        let candidate = directory.join(SCCACHE_BINARY_NAME);
         if candidate.is_file() {
-            return fs::canonicalize(&candidate).map_err(|error| {
-                CowshedError::environment_missing(
-                    format!("could not resolve {}: {error}", candidate.display()),
-                    format!(
-                        "reinstall sccache with devenv or nix so {} is a real executable, then retry cowshed sccache start",
-                        candidate.display()
-                    ),
-                )
-            });
+            return canonical_sccache(&candidate);
         }
     }
     Err(CowshedError::environment_missing(
         "sccache is not on PATH",
         "install sccache (devenv/nix) and run cowshed sccache start from that shell",
     ))
+}
+
+fn canonical_sccache(path: &Path) -> Result<PathBuf> {
+    fs::canonicalize(path).map_err(|error| {
+        CowshedError::environment_missing(
+            format!("could not resolve {}: {error}", path.display()),
+            format!(
+                "reinstall sccache with devenv or nix so {} is a real executable, then retry cowshed sccache start",
+                path.display()
+            ),
+        )
+    })
 }
 
 async fn socket_answers(socket: &Path) -> bool {
@@ -392,4 +490,165 @@ pub fn emit_sccache_status<W: Write, E: Write>(
             .map_err(output_error)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A canonical absolute home, as `HostStableExecutable` requires.
+    fn scratch_home(label: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "cowshed-cli-sccache-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("Library/Application Support/dev.cowshed/bin"))
+            .expect("scratch support directory");
+        home.canonicalize().expect("canonical scratch home")
+    }
+
+    /// An executable file standing in for a devenv- or nix-provided sccache.
+    fn fake_sccache(directory: &Path) -> PathBuf {
+        fs::create_dir_all(directory).expect("candidate directory");
+        let binary = directory.join(SCCACHE_BINARY_NAME);
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").expect("candidate binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("candidate mode");
+        binary
+    }
+
+    fn installed(home: &Path) -> HostStableExecutable {
+        HostStableExecutable::new(home, SCCACHE_BINARY_NAME).expect("host-stable sccache")
+    }
+
+    /// The defect: launchd carries no PATH, so the gateway's startup heal reported "sccache is not
+    /// on PATH" on every boot of a host that had sccache all along. With the install-time path
+    /// recorded, resolution succeeds with no PATH whatsoever.
+    #[test]
+    fn the_recorded_path_resolves_sccache_without_any_path() {
+        let home = scratch_home("recorded");
+        let binary = fake_sccache(&home.join("nix/bin"));
+        record_sccache_source(&installed(&home), &binary);
+
+        assert_eq!(
+            resolve_sccache_source_in(&home, None).expect("recorded sccache resolves"),
+            binary.canonicalize().expect("canonical candidate")
+        );
+    }
+
+    /// The record wins over PATH, so the heal installs the sccache this host was set up with
+    /// rather than whatever a shell happened to expose.
+    #[test]
+    fn the_record_is_preferred_over_a_path_candidate() {
+        let home = scratch_home("preferred");
+        let recorded = fake_sccache(&home.join("recorded/bin"));
+        let on_path = fake_sccache(&home.join("shell/bin"));
+        record_sccache_source(&installed(&home), &recorded);
+
+        let resolved = resolve_sccache_source_in(
+            &home,
+            Some(OsStr::new(
+                on_path.parent().expect("path directory").to_str().expect("utf-8"),
+            )),
+        )
+        .expect("recorded sccache resolves");
+
+        assert_eq!(resolved, recorded.canonicalize().expect("canonical recorded"));
+        assert_ne!(resolved, on_path);
+    }
+
+    /// First install on a host with no record: PATH is still the way sccache is found, and the
+    /// path it found is written down so the next heal does not need a shell.
+    #[test]
+    fn a_host_without_a_record_falls_back_to_path_and_then_records_it() {
+        let home = scratch_home("fallback");
+        let binary = fake_sccache(&home.join("shell/bin"));
+        let directory = binary.parent().expect("path directory");
+
+        let resolved = resolve_sccache_source_in(
+            &home,
+            Some(OsStr::new(directory.to_str().expect("utf-8"))),
+        )
+        .expect("path sccache resolves");
+        assert_eq!(resolved, binary.canonicalize().expect("canonical candidate"));
+
+        record_sccache_source(&installed(&home), &resolved);
+        assert_eq!(
+            resolve_sccache_source_in(&home, None).expect("recorded sccache resolves"),
+            resolved
+        );
+    }
+
+    /// A devenv or nix upgrade moves the binary. That is not a broken host: the stale record is
+    /// ignored and PATH re-resolves it.
+    #[test]
+    fn a_stale_record_falls_back_to_path() {
+        let home = scratch_home("stale");
+        record_sccache_source(&installed(&home), &home.join("gone/bin/sccache"));
+        let binary = fake_sccache(&home.join("shell/bin"));
+
+        let resolved = resolve_sccache_source_in(
+            &home,
+            Some(OsStr::new(
+                binary.parent().expect("path directory").to_str().expect("utf-8"),
+            )),
+        )
+        .expect("path sccache resolves");
+
+        assert_eq!(resolved, binary.canonicalize().expect("canonical candidate"));
+    }
+
+    /// When both the record and PATH come up empty, the error names the stale record: blaming PATH
+    /// alone sends the operator looking for a shell problem on a host that had sccache installed.
+    #[test]
+    fn a_stale_record_with_no_path_candidate_names_the_record() {
+        let home = scratch_home("stale-empty");
+        let missing = home.join("gone/bin/sccache");
+        record_sccache_source(&installed(&home), &missing);
+
+        let error =
+            resolve_sccache_source_in(&home, None).expect_err("no sccache anywhere is an error");
+
+        assert_eq!(error.code.as_str(), "environment-missing");
+        assert!(
+            error.message.contains(&missing.display().to_string()),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("no longer exists"), "{}", error.message);
+    }
+
+    /// A record cowshed cannot make sense of must not strand the fallback: the heal reports it and
+    /// carries on with PATH.
+    #[test]
+    fn a_malformed_record_is_ignored_rather_than_fatal() {
+        let home = scratch_home("malformed");
+        let record = sccache_source_record(&home).expect("record path");
+        fs::write(&record, b"sccache\n").expect("relative record");
+        let binary = fake_sccache(&home.join("shell/bin"));
+
+        let resolved = resolve_sccache_source_in(
+            &home,
+            Some(OsStr::new(
+                binary.parent().expect("path directory").to_str().expect("utf-8"),
+            )),
+        )
+        .expect("path sccache resolves");
+
+        assert_eq!(resolved, binary.canonicalize().expect("canonical candidate"));
+        assert_eq!(recorded_sccache_source(&home).expect("record read"), None);
+    }
+
+    /// The record lives beside the host-stable binaries, which is what makes it readable by a
+    /// LaunchAgent: the same volume carries the plist launchd already read.
+    #[test]
+    fn the_record_sits_beside_the_host_stable_binaries() {
+        let home = scratch_home("location");
+
+        assert_eq!(
+            sccache_source_record(&home).expect("record path"),
+            home.join("Library/Application Support/dev.cowshed/sccache-source")
+        );
+    }
 }
