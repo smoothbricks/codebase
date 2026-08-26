@@ -960,6 +960,65 @@ async fn attach_all_reattaches_every_detached_session_store_wide() {
 }
 
 #[tokio::test]
+async fn detach_all_detaches_every_attached_session_store_wide() {
+    let mut service = FakeService {
+        listed_projects: vec![
+            ProjectWorkspaces {
+                repo_id: RepoId::parse("zeta/tool").unwrap(),
+                workspaces: vec![
+                    workspace_for("zeta/tool", "main", WorkspaceState::Attached),
+                    workspace_for("zeta/tool", "warp", WorkspaceState::Attached),
+                ],
+            },
+            ProjectWorkspaces {
+                repo_id: RepoId::parse("alpha/widget").unwrap(),
+                workspaces: vec![
+                    workspace_for("alpha/widget", "main", WorkspaceState::Attached),
+                    workspace_for("alpha/widget", "raven", WorkspaceState::Attached),
+                    workspace_for("alpha/widget", "fox", WorkspaceState::Detached),
+                ],
+            },
+        ],
+        ..FakeService::default()
+    };
+    let (_, stdout, stderr) = run(&mut service, ["detach", "--all"]).await;
+    assert!(stdout.is_empty(), "detach has no machine answer");
+    assert!(stderr.is_empty());
+    assert_eq!(
+        service.events,
+        ["ls-all", "detach:warp", "detach:raven"]
+    );
+}
+
+#[tokio::test]
+async fn detach_all_skips_mains_and_refuses_when_no_attached_session() {
+    let mut service = FakeService {
+        listed_projects: vec![ProjectWorkspaces {
+            repo_id: RepoId::parse("acme/widget").unwrap(),
+            workspaces: vec![
+                workspace("main", WorkspaceState::Attached),
+                workspace("fox", WorkspaceState::Detached),
+            ],
+        }],
+        ..FakeService::default()
+    };
+    let cli = parse_args(["detach", "--all", "--json"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut service, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound);
+    assert_eq!(error.message, "no attached session workspace found");
+    assert!(output.into_inner().0.is_empty());
+    assert!(
+        !service
+            .events
+            .iter()
+            .any(|event| event.starts_with("detach:main") || event.starts_with("detach:fox"))
+    );
+}
+
+#[tokio::test]
 async fn attach_reports_no_workspace_when_the_scope_has_no_detached_session() {
     let mut service = FakeService {
         cwd_workspace: Some("main".into()),
