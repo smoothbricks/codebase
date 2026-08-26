@@ -40,7 +40,7 @@ pub struct ApfsSubstrateConfig {
     /// The adopted checkout's original path — the place in the user's source tree that adoption
     /// took over. Under `CheckoutLayout::DirectMount` it is main's mountpoint; under
     /// `CheckoutLayout::Symlink` it is not a mountpoint at all and holds a symlink into main's
-    /// mount under `mnt/<owner>/<repo>/main`.
+    /// mount under `<mount-root>/<owner>/<repo>/main`.
     pub checkout_path: PathBuf,
     pub checkout_layout: CheckoutLayout,
     pub case_sensitivity: ApfsCaseSensitivity,
@@ -2889,8 +2889,8 @@ fn retired_image_path(
 
 /// Main's mountpoint is the one place the checkout layout is visible to the substrate: under
 /// `DirectMount` it is the user's checkout path, under `Symlink` it is the uniform
-/// `mnt/<owner>/<repo>/main` and the checkout path holds a symlink to it. Every other workspace
-/// mounts under `mnt/` in both layouts.
+/// `<mount-root>/<owner>/<repo>/main` and the checkout path holds a symlink to it. Every other
+/// workspace mounts under the same host-configured root in both layouts.
 fn mount_point(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,

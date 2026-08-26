@@ -528,6 +528,7 @@ mod tests {
         fn sandbox(&self) -> SandboxConfig {
             SandboxConfig {
                 home: PathBuf::from("/Users/tester"),
+                mount_root: self.root.clone(),
                 workspace_mount: self.workspace.clone(),
                 exec_temp_dir: self.root.join("tmp"),
                 port_block: PortBlock::new(40_960, 16).unwrap(),

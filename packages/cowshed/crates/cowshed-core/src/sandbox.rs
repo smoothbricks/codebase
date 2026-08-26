@@ -119,6 +119,8 @@ pub fn host_cargo_registry(home: &Path) -> PathBuf {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,
+    /// Host-configured root containing every project workspace mount tree.
+    pub mount_root: PathBuf,
     pub workspace_mount: PathBuf,
     pub exec_temp_dir: PathBuf,
     pub port_block: PortBlock,
@@ -184,6 +186,7 @@ pub fn seatbelt_profile(
     role: SandboxProfileRole,
 ) -> Result<String, SandboxError> {
     validate_path(&config.home)?;
+    validate_path(&config.mount_root)?;
     validate_path(&config.workspace_mount)?;
     validate_path(&config.exec_temp_dir)?;
     config
@@ -197,7 +200,11 @@ pub fn seatbelt_profile(
     if let Some(repository) = &config.git_worktree_repository {
         validate_path(repository)?;
     }
-    let hard_denies = hard_denies(&config.home, &config.additional_denies)?;
+    let hard_denies = hard_denies(
+        &config.home,
+        &config.mount_root,
+        &config.additional_denies,
+    )?;
     let read_grants = normalized_paths(&config.grants.read)?;
     let write_grants = normalized_paths(&config.grants.write)?;
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
@@ -307,11 +314,18 @@ pub fn seatbelt_profile(
         ),
     );
 
-    // The store-wide deny intentionally precedes only narrow controller-owned carve-backs.
+    // Controller state and the host-configured mount tree are separate protected roots. The
+    // latter may live anywhere on Data, so deriving this deny from `~/.cowshed` would expose every
+    // sibling workspace as soon as the operator selected a custom root.
     push_subpath_rule(&mut profile, "deny file-read* file-write*", &cowshed)?;
-    // `getcwd(2)` and path resolution need read access to every exact ancestor.
-    // Literal rules reveal no sibling subtree and are emitted after the store-wide
-    // deny so an own workspace nested under ~/.cowshed remains reachable.
+    push_subpath_rule(
+        &mut profile,
+        "deny file-read* file-write*",
+        &config.mount_root,
+    )?;
+    // `getcwd(2)` and path resolution need read access to every exact ancestor. Literal rules
+    // reveal no sibling subtree and are emitted after both broad denies, while the own-workspace
+    // subpath grant below carves back only this workspace.
     push_readable_ancestors(&mut profile, &config.workspace_mount)?;
     push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
     for path in read_grants.iter().chain(write_grants.iter()) {
@@ -369,18 +383,16 @@ pub fn seatbelt_profile(
     let job_artifacts = workspace_metadata.join("job");
 
     // SBPL is last-match-wins: immutable secrets and policy denies close the shared profile.
-    for deny in hard_denies
-        .into_iter()
-        .filter(|path| path.as_ref() != cowshed.as_path())
-    {
+    for deny in hard_denies.into_iter().filter(|path| {
+        path.as_ref() != cowshed.as_path() && path.as_ref() != config.mount_root.as_path()
+    }) {
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
 
-    // After every deny that would otherwise close it: the store-wide `~/.cowshed` deny covers
-    // main's mount under the symlink layout, and policy denies the project root under direct
-    // mount. SBPL is last-match-wins, so the carve-back has to be stated last to be real — and it
-    // is narrowed to `.git`, never main's working tree, which stays as unreachable as any other
-    // workspace's.
+    // After every deny that would otherwise close it: the configured mount-root deny covers
+    // main under the symlink layout, and policy denies the project root under direct mount. SBPL
+    // is last-match-wins, so the carve-back has to be stated last to be real — and it is narrowed
+    // to `.git`, never main's working tree, which stays as unreachable as any sibling workspace.
     if let Some(repository) = &config.git_worktree_repository {
         push_readable_ancestors(&mut profile, repository)?;
         push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", repository)?;
@@ -390,6 +402,7 @@ pub fn seatbelt_profile(
         crate::storage::WORKSPACE_MARKER_PATH,
         crate::workspace_credentials::CA_CERTIFICATE_PATH,
         crate::workspace_credentials::WORKSPACE_TOKEN_PATH,
+        crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH,
     ] {
         push_literal_rule(
             &mut profile,
@@ -424,10 +437,12 @@ pub fn seatbelt_profile(
 
 fn hard_denies<'a>(
     home: &Path,
+    mount_root: &'a Path,
     additional: &'a [PathBuf],
 ) -> Result<Vec<Cow<'a, Path>>, SandboxError> {
     let mut denies = vec![
         Cow::Owned(home.join(".cowshed")),
+        Cow::Borrowed(mount_root),
         Cow::Owned(home.join(".ssh")),
         Cow::Owned(home.join(".gnupg")),
         Cow::Owned(home.join(".aws")),
@@ -561,6 +576,7 @@ mod tests {
     fn config(mode: RunSandboxMode) -> SandboxConfig {
         SandboxConfig {
             home: PathBuf::from("/Users/tester"),
+            mount_root: PathBuf::from("/Users/tester/.cowshed/mnt"),
             workspace_mount: PathBuf::from(
                 "/Users/tester/.cowshed/acme/widget/workspaces/raven/mount",
             ),
@@ -658,6 +674,30 @@ mod tests {
                 reason: "path is not absolute",
             })
         );
+    }
+
+    #[test]
+    fn custom_mount_root_denies_siblings_and_carves_back_only_own_workspace() {
+        let mut custom = config(RunSandboxMode::ReadWrite);
+        custom.mount_root = PathBuf::from("/Users/tester/Dev/.cowshed-mounts");
+        custom.workspace_mount =
+            PathBuf::from("/Users/tester/Dev/.cowshed-mounts/acme/widget/raven");
+        let profile = seatbelt_profile(&custom, SandboxProfileRole::ExecutedChild).unwrap();
+
+        let root_deny = profile
+            .find("(deny file-read* file-write* (subpath \"/Users/tester/Dev/.cowshed-mounts\"))")
+            .expect("configured mount-root deny");
+        let own_read = profile
+            .find("(allow file-read* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/raven\"))")
+            .expect("own workspace read carve-back");
+        let own_write = profile
+            .find("(allow file-write* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/raven\"))")
+            .expect("own workspace write carve-back");
+        assert!(root_deny < own_read);
+        assert!(root_deny < own_write);
+        assert!(!profile.contains(
+            "(allow file-read* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/swift\"))"
+        ));
     }
 
     #[test]
@@ -875,6 +915,7 @@ mod tests {
         let ancestor_deny = "(deny file-write-create file-write-unlink (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed\"))";
         let protected_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
         let token_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/token\"))";
+        let environment_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/env\"))";
 
         assert_eq!(supervisor.lines().last(), Some(protected_allow));
         assert!(!supervisor.contains(ancestor_deny));
@@ -883,6 +924,8 @@ mod tests {
         assert!(child.rfind("(allow ").unwrap() < child.find(ancestor_deny).unwrap());
         assert!(supervisor.contains(token_deny));
         assert!(child.contains(token_deny));
+        assert!(supervisor.contains(environment_deny));
+        assert!(child.contains(environment_deny));
         assert!(child.find("allow file-write*").unwrap() < child.find(token_deny).unwrap());
 
         let common_supervisor = supervisor
