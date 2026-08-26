@@ -91,6 +91,7 @@ impl Command {
     pub const fn project_discovery(&self) -> ProjectDiscovery {
         match self {
             Self::Attach(args) if args.all => ProjectDiscovery::NotUsed,
+            Self::Detach(_) => ProjectDiscovery::NotUsed,
             Self::Adopt(_)
             | Self::New(_)
             | Self::Fork(_)
@@ -101,7 +102,6 @@ impl Command {
             | Self::Exec(_)
             | Self::Remove(_)
             | Self::Attach(_)
-            | Self::Detach(_)
             | Self::Resize(_)
             | Self::Gc(_)
             | Self::Push(_)
@@ -295,7 +295,8 @@ pub struct AttachArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetachArgs {
-    pub workspace: String,
+    pub workspace: Option<String>,
+    pub all: bool,
 }
 
 /// `resize <ws|main> <size>` — grow one workspace's image.
@@ -599,7 +600,11 @@ fn cli_command() -> ClapCommand {
                 .arg(positional("workspace", 0..=1))
                 .args([flag("all"), flag("browse")]),
         )
-        .subcommand(leaf("detach").arg(positional("workspace", 0..=1)))
+        .subcommand(
+            leaf("detach")
+                .arg(positional("workspace", 0..=1))
+                .arg(flag("all")),
+        )
         .subcommand(
             leaf("resize")
                 .arg(positional("workspace", 0..=1))
@@ -1707,26 +1712,38 @@ fn parse_attach(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const DETACH: CommandSpec = CommandSpec {
     name: "detach",
-    args: "<ws>",
+    args: "[ws]",
     trailing: "",
-    summary: "detach a workspace",
+    summary: "detach session workspace(s)",
     about: &[
-        "Unmounts the workspace and stops its supervisor without destroying anything. `attach` and `path` bring it back.",
+        "<ws> one, resolved from the store without cwd or git discovery; cwd/--project still override. --all store-wide attached sessions. Mains are never detach targets.",
     ],
-    options: &[],
+    options: &[Opt {
+        spelling: "--all",
+        meaning: "every attached session workspace store-wide",
+    }],
 };
 
 fn parse_detach(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &DETACH;
-    Ok(Command::Detach(DetachArgs {
-        workspace: require_workspace(
-            matches,
-            "workspace",
-            false,
+    let workspace = optional_workspace(matches, "workspace", false, USAGE)?;
+    let all = flagged(matches, "all");
+    if all && workspace.is_some() {
+        return Err(UsageError::new(
+            "detach --all cannot name a workspace",
             USAGE,
-            "detach requires a workspace",
-        )?,
-    }))
+        ));
+    }
+    if workspace.as_deref() == Some("main") {
+        return Err(UsageError::new(
+            "mains are always mounted; detach targets session workspaces",
+            USAGE,
+        ));
+    }
+    if !all && workspace.is_none() {
+        return Err(UsageError::new("detach requires a workspace", USAGE));
+    }
+    Ok(Command::Detach(DetachArgs { workspace, all }))
 }
 
 
@@ -2061,6 +2078,43 @@ mod tests {
         assert_eq!(
             main.message,
             "mains are always mounted; attach targets session workspaces"
+        );
+    }
+
+    #[test]
+    fn detach_accepts_one_workspace_or_store_wide() {
+        let Command::Detach(named) = parse_args(["detach", "raven"]).unwrap().command else {
+            panic!("expected detach")
+        };
+        assert_eq!(named.workspace.as_deref(), Some("raven"));
+        assert!(!named.all);
+
+        let Command::Detach(all) = parse_args(["detach", "--all"]).unwrap().command else {
+            panic!("expected detach")
+        };
+        assert_eq!(all.workspace, None);
+        assert!(all.all);
+
+        let named_all = parse_args(["detach", "raven", "--all"]).unwrap_err();
+        assert_eq!(named_all.message, "detach --all cannot name a workspace");
+        assert!(named_all.hint.contains("cowshed detach [ws]"));
+
+        let main = parse_args(["detach", "main"]).unwrap_err();
+        assert_eq!(
+            main.message,
+            "mains are always mounted; detach targets session workspaces"
+        );
+
+        let missing = parse_args(["detach"]).unwrap_err();
+        assert_eq!(missing.message, "detach requires a workspace");
+
+        assert_eq!(
+            parse_args(["detach", "--all"]).unwrap().command.project_discovery(),
+            ProjectDiscovery::NotUsed
+        );
+        assert_eq!(
+            parse_args(["detach", "raven"]).unwrap().command.project_discovery(),
+            ProjectDiscovery::NotUsed
         );
     }
 
@@ -2648,7 +2702,8 @@ mod tests {
             (&["exec", "raven", "--", "true"], Required),
             (&["rm", "raven"], Required),
             (&["attach", "raven"], Required),
-            (&["detach", "raven"], Required),
+            (&["detach", "raven"], NotUsed),
+            (&["detach", "--all"], NotUsed),
             (&["resize", "raven", "32GiB"], Required),
             (&["gc"], Required),
             (&["push", "raven"], Required),

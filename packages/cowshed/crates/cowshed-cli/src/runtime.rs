@@ -4,6 +4,7 @@ use crate::args::{
 };
 use crate::gateway_service;
 use crate::output::Output;
+use crate::probe;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -21,7 +22,8 @@ use cowshed_core::api::{
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
-    ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation,
+    WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
@@ -30,6 +32,7 @@ use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, STORE_ROOT,
     execute_host_setup, plan_host_setup,
 };
+use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, retired_layout_paths,
 };
@@ -38,6 +41,7 @@ use cowshed_core::{
     validate_existing_host_storage,
 };
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
@@ -235,6 +239,24 @@ impl ActorBridge {
         self.runtime
             .as_ref()
             .map(|runtime| &runtime.descriptor().repo_id)
+            .ok_or_else(|| {
+                CowshedError::internal("the CLI project runtime has already been shut down")
+            })
+    }
+
+    fn git_root(&self) -> Result<&Path> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.descriptor().git_root.as_path())
+            .ok_or_else(|| {
+                CowshedError::internal("the CLI project runtime has already been shut down")
+            })
+    }
+
+    fn store_root(&self) -> Result<&Path> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.descriptor().store_root.as_path())
             .ok_or_else(|| {
                 CowshedError::internal("the CLI project runtime has already been shut down")
             })
@@ -926,7 +948,17 @@ where
             Ok(success())
         }
         Command::Detach(args) => {
-            service.detach(&args.workspace).await?;
+            if args.all {
+                detach_scoped_sessions(service).await?;
+            } else {
+                let workspace = args.workspace.ok_or_else(|| {
+                    usage(
+                        "detach requires a workspace",
+                        "cowshed detach <ws>; cowshed detach --all",
+                    )
+                })?;
+                service.detach(&workspace).await?;
+            }
             service.reconcile_gateway().await?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
@@ -1517,6 +1549,284 @@ async fn attach_project_sessions(
         );
     }
     Ok(attached)
+}
+
+fn is_attached_session(info: &WorkspaceInfo) -> bool {
+    info.role != WorkspaceRole::Main && info.state == WorkspaceState::Attached
+}
+
+fn no_attached_sessions() -> CowshedError {
+    CowshedError::not_found(
+        "no attached session workspace found",
+        "cowshed ls; cowshed detach <ws>; cowshed detach --all",
+    )
+}
+
+async fn detach_scoped_sessions(service: &mut dyn CliService) -> Result<()> {
+    let targets: Vec<WorkspaceInfo> = service
+        .list_all()
+        .await?
+        .into_iter()
+        .flat_map(|project| project.workspaces)
+        .filter(is_attached_session)
+        .collect();
+    if targets.is_empty() {
+        return Err(no_attached_sessions());
+    }
+    for target in targets {
+        service.detach(target.workspace.as_str()).await?;
+    }
+    Ok(())
+}
+
+async fn detach_store_wide() -> Result<()> {
+    let mut detached = 0usize;
+    for project in adopted_projects().await? {
+        let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
+        let primary = detach_project_sessions(&mut bridge).await;
+        let teardown = bridge.shutdown().await.err();
+        match primary {
+            Ok(count) => {
+                if let Some(error) = teardown {
+                    return Err(error);
+                }
+                detached += count;
+            }
+            Err(primary) => return Err(merge_primary(primary, teardown)),
+        }
+    }
+    if detached == 0 {
+        return Err(no_attached_sessions());
+    }
+    Ok(())
+}
+
+async fn detach_project_sessions(service: &mut dyn CliService) -> Result<usize> {
+    let targets: Vec<WorkspaceInfo> = service
+        .list()
+        .await?
+        .into_iter()
+        .filter(is_attached_session)
+        .collect();
+    for target in &targets {
+        service.detach(target.workspace.as_str()).await?;
+    }
+    Ok(targets.len())
+}
+
+/// Resolve a session workspace's owning checkout from the store readdir.
+///
+/// Identity is the image sidecar's `infoSnapshot.projectRoot` (the same project root the
+/// in-image marker records). Remotes and cwd git discovery are not consulted.
+pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Result<PathBuf> {
+    let wanted = WorkspaceName::session(workspace).map_err(|error| {
+        usage(error.to_string(), "cowshed detach <ws>; cowshed ls --all")
+    })?;
+    let mut found: Vec<(RepoId, PathBuf)> = Vec::new();
+    let owners = fs::read_dir(store).map_err(|error| {
+        CowshedError::environment_missing(
+            format!("could not read cowshed store {}: {error}", store.display()),
+            "cowshed setup",
+        )
+    })?;
+    for owner in owners {
+        let owner = owner.map_err(|error| {
+            CowshedError::environment_missing(
+                format!("could not read cowshed store {}: {error}", store.display()),
+                "cowshed setup",
+            )
+        })?;
+        if !dirent_is_plain_dir(&owner) {
+            continue;
+        }
+        let repos = fs::read_dir(owner.path()).map_err(|error| {
+            CowshedError::environment_missing(
+                format!("could not read {}: {error}", owner.path().display()),
+                "cowshed setup",
+            )
+        })?;
+        for repo in repos {
+            let repo = repo.map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("could not read {}: {error}", owner.path().display()),
+                    "cowshed setup",
+                )
+            })?;
+            if !dirent_is_plain_dir(&repo) {
+                continue;
+            }
+            let sessions = repo.path().join("sessions");
+            let Ok(entries) = fs::read_dir(&sessions) else {
+                continue;
+            };
+            let images = discover_session_images(entries.filter_map(|entry| {
+                entry.ok().map(|entry| entry.path())
+            }))
+            .map_err(|error| {
+                CowshedError::conflict(
+                    error.to_string(),
+                    "cowshed --project <git-root> detach <ws>",
+                )
+            })?;
+            for image in images {
+                if image.workspace() != &wanted {
+                    continue;
+                }
+                let metadata = DetachedWorkspaceMetadata::read_for_image(image.path()).map_err(
+                    |error| {
+                        CowshedError::integrity(
+                            format!(
+                                "workspace {wanted} sidecar at {} is unreadable: {error}",
+                                image.path().display()
+                            ),
+                            "cowshed doctor",
+                        )
+                    },
+                )?;
+                let snapshot = metadata.require_info_snapshot().map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "workspace {wanted} sidecar at {} has no project identity: {error}",
+                            image.path().display()
+                        ),
+                        "cowshed doctor",
+                    )
+                })?;
+                found.push((metadata.repo_id.clone(), snapshot.project_root.clone()));
+            }
+        }
+    }
+    match found.as_slice() {
+        [] => Err(CowshedError::not_found(
+            format!("no session workspace {workspace} in the store"),
+            "cowshed ls --all; cowshed --project <git-root> detach <ws>",
+        )),
+        [(_, root)] => Ok(root.clone()),
+        many => {
+            let projects = many
+                .iter()
+                .map(|(repo_id, _)| repo_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CowshedError::conflict(
+                format!(
+                    "workspace {workspace} exists in more than one project ({projects})"
+                ),
+                "cowshed --project <git-root> detach <ws>",
+            ))
+        }
+    }
+}
+
+fn dirent_is_plain_dir(entry: &fs::DirEntry) -> bool {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if name.starts_with('.') {
+        return false;
+    }
+    entry.file_type().is_ok_and(|kind| kind.is_dir())
+}
+
+fn report_new_git_identity<W: Write, E: Write>(
+    bridge: &ActorBridge,
+    name: &str,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    let (candidate, mount_root) = identity_probe_target(bridge, Some(name))?;
+    let gaps = probe::probe_git_identity(bridge.git_root()?, &candidate)?;
+    for gap in &gaps {
+        output
+            .guidance(&gap.message(&mount_root))
+            .map_err(output_error)?;
+    }
+    if !gaps.is_empty() {
+        output
+            .hint("cowshed setup --mount-root <dir>")
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn git_identity_findings(bridge: &ActorBridge) -> Result<Vec<Finding>> {
+    let (candidate, mount_root) = identity_probe_target(bridge, None)?;
+    let gaps = probe::probe_git_identity(bridge.git_root()?, &candidate)?;
+    Ok(gaps
+        .iter()
+        .map(|gap| gap.finding(&mount_root))
+        .collect())
+}
+
+fn identity_probe_target(
+    bridge: &ActorBridge,
+    workspace: Option<&str>,
+) -> Result<(PathBuf, PathBuf)> {
+    let layout = StorageLayout::new(bridge.store_root()?, bridge.repo_id()?).map_err(|error| {
+        CowshedError::environment_missing(error.to_string(), "cowshed setup --mount-root <dir>")
+    })?;
+    let mount_root = layout.project().host_mount_root.clone();
+    let candidate = match workspace {
+        Some(name) => {
+            let workspace = WorkspaceName::session(name).map_err(|error| {
+                usage(error.to_string(), "use a valid workspace name")
+            })?;
+            layout.workspace_mount(&workspace).map_err(|error| {
+                CowshedError::environment_missing(
+                    error.to_string(),
+                    "cowshed setup --mount-root <dir>",
+                )
+            })?
+        }
+        None => unused_identity_candidate(&layout)?,
+    };
+    Ok((candidate, mount_root))
+}
+
+fn unused_identity_candidate(layout: &StorageLayout) -> Result<PathBuf> {
+    for index in 0..8 {
+        let name = if index == 0 {
+            "identity-probe".to_owned()
+        } else {
+            format!("identity-probe-{index}")
+        };
+        let workspace = WorkspaceName::session(name).map_err(|error| {
+            CowshedError::internal(error.to_string())
+        })?;
+        let path = layout.workspace_mount(&workspace).map_err(|error| {
+            CowshedError::environment_missing(
+                error.to_string(),
+                "cowshed setup --mount-root <dir>",
+            )
+        })?;
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(CowshedError::environment_missing(
+        "could not allocate a throwaway path for the git-identity probe",
+        "cowshed setup --mount-root <dir>",
+    ))
+}
+
+async fn resolve_detach_root(cli: &Cli) -> Result<PathBuf> {
+    if cli.global.project.is_some() {
+        return resolve_project_root(cli).await;
+    }
+    let Command::Detach(args) = &cli.command else {
+        return Err(CowshedError::internal(
+            "detach project resolution ran for a non-detach command",
+        ));
+    };
+    let workspace = args.workspace.as_deref().ok_or_else(|| {
+        usage(
+            "detach requires a workspace",
+            "cowshed detach <ws>; cowshed detach --all",
+        )
+    })?;
+    let home = gateway_service::canonical_home()?;
+    let storage = validate_existing_host_storage(&home).await?;
+    resolve_session_project_root(storage.store(), workspace)
 }
 
 fn emit_gc_candidates<W: Write, E: Write>(
@@ -2208,8 +2518,19 @@ where
         if let Some(root) = project_root {
             match ActorBridge::open_existing(&root).await {
                 Ok(mut bridge) => {
+                    let identity = git_identity_findings(&bridge);
                     let project = bridge.doctor().await;
                     let teardown = bridge.shutdown().await.err();
+                    match identity {
+                        Ok(findings) => diagnosis.findings.extend(findings),
+                        Err(error) => diagnosis.findings.push(Finding {
+                            code: "git-identity".into(),
+                            severity: FindingSeverity::Warning,
+                            message: error.message,
+                            hint: error.hint,
+                            path: Some(root.clone()),
+                        }),
+                    }
                     match project {
                         Ok(report) => diagnosis.findings.extend(report.findings),
                         Err(error) => diagnosis.findings.push(Finding {
@@ -2280,6 +2601,13 @@ where
     if matches!(&cli.command, Command::Doctor) {
         return run_doctor_command(cli, output).await;
     }
+    if let Command::Detach(args) = &cli.command
+        && !args.all
+    {
+        let root = resolve_detach_root(&cli).await?;
+        let bridge = ActorBridge::open_existing(&root).await?;
+        return dispatch_and_shutdown(bridge, cli, stdin, output).await;
+    }
     let discovery = cli.command.project_discovery();
     if discovery == ProjectDiscovery::NotUsed {
         return dispatch_host_command(cli, output, false).await;
@@ -2311,6 +2639,13 @@ where
         }
         Err(error) => return Err(error),
     };
+    if let Command::New(args) = &cli.command
+        && let Err(error) = report_new_git_identity(&bridge, &args.name, output)
+    {
+        output
+            .guidance(&format!("git identity probe skipped: {}", error.message))
+            .map_err(output_error)?;
+    }
     dispatch_and_shutdown(bridge, cli, stdin, output).await
 }
 
@@ -2327,6 +2662,13 @@ where
         Command::Attach(args) if args.all && args.workspace.is_none() => {
             let infos = attach_store_wide(args.browse).await?;
             emit_attached(output, cli.global.json, &infos)?;
+            Ok(success())
+        }
+        Command::Detach(args) if args.all && args.workspace.is_none() => {
+            detach_store_wide().await?;
+            if cli.global.json {
+                output.success(EmptyResult {}).map_err(output_error)?;
+            }
             Ok(success())
         }
         Command::List(_) => {
@@ -2891,5 +3233,89 @@ mod tests {
         assert!(!doctor_report(findings).healthy);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn store_readdir_resolves_a_session_in_another_project_without_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-detach-store-readdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = root.join("store");
+        let other_checkout = PathBuf::from("/other/project");
+        write_session_image(
+            &store,
+            "acme",
+            "widget",
+            "fox",
+            Path::new("/cwd/project"),
+        );
+        write_session_image(&store, "zeta", "tool", "raven", &other_checkout);
+
+        let resolved = resolve_session_project_root(&store, "raven").expect("found raven");
+        assert_eq!(resolved, other_checkout);
+
+        let missing = resolve_session_project_root(&store, "absent").unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
+
+        write_session_image(
+            &store,
+            "acme",
+            "widget",
+            "raven",
+            Path::new("/cwd/project"),
+        );
+        let conflict = resolve_session_project_root(&store, "raven").unwrap_err();
+        assert_eq!(conflict.code, ErrorCode::Conflict);
+        assert!(conflict.message.contains("zeta/tool"));
+        assert!(conflict.message.contains("acme/widget"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_session_image(
+        store: &Path,
+        owner: &str,
+        repo: &str,
+        workspace: &str,
+        project_root: &Path,
+    ) {
+        let sessions = store.join(owner).join(repo).join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let image = sessions.join(format!("{workspace}.asif"));
+        std::fs::write(&image, b"image").unwrap();
+        let mut sidecar = serde_json::json!({
+            "version": 1,
+            "repoId": format!("{owner}/{repo}"),
+            "workspace": workspace,
+            "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+            "publicationState": "active",
+            "imageFormat": "asif",
+            "platform": "macos",
+            "updatedAt": "2026-07-11T12:34:56Z",
+            "revision": 1,
+            "portBlock": { "base": 40976, "size": 16 },
+            "infoSnapshot": {
+                "projectRoot": project_root,
+                "role": "workspace",
+                "baseCommit": "8f31c2d",
+                "createdAt": "2026-07-11T12:00:00Z",
+                "capturedAt": "2026-07-11T12:34:00Z",
+                "stale": false
+            }
+        });
+        if !cfg!(target_os = "macos") {
+            sidecar["platform"] = serde_json::json!("linux");
+            sidecar.as_object_mut().unwrap().remove("portBlock");
+        }
+        std::fs::write(
+            format!("{}.grants.json", image.display()),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
     }
 }
