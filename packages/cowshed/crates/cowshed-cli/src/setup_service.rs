@@ -26,9 +26,10 @@ use crate::output::Output;
 use crate::sccache_service::{remove_stale_socket, sccache_launch_agent};
 use async_trait::async_trait;
 use cowshed_core::storage::bootstrap::{
-    FstabOutcome, HostAction, HostSetupPlan, HostSetupReport, HostUninstallPlan,
-    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeRole,
-    VolumeState, execute_host_setup, execute_host_uninstall, plan_host_setup, plan_host_uninstall,
+    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
+    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
+    VolumeOutcome, VolumeRole, VolumeState, execute_host_setup, execute_host_uninstall,
+    plan_host_setup, plan_host_uninstall,
 };
 use cowshed_core::metadata::ImageFormat;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
@@ -320,10 +321,24 @@ where
     let plan = setup.plan().await?;
     announce_setup(&plan, output)?;
     let report = setup.execute().await.map_err(declined_authorization)?;
+    // A run that stopped partway is a failure, and core reports it as a *successful report
+    // carrying a failure* so the progress is not lost with the error. Both halves have to reach
+    // the caller: the per-action rows say what happened, and the taxonomy says it did not work.
+    // Exiting 0 here would tell every script the host was set up.
+    let failure = report.failure().cloned();
     if json {
-        output.success(report).map_err(output_error)?;
+        // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
+        // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
+        // answering `ok:true` over a failure is the one thing this must not do.
+        match &failure {
+            None => output.success(report).map_err(output_error)?,
+            Some(_) => render_repair(&plan, &report, output)?,
+        }
     } else {
         render_repair(&plan, &report, output)?;
+    }
+    if let Some(failure) = failure {
+        return Err(partial_setup_failure(failure));
     }
     output.hint("cowshed doctor").map_err(output_error)?;
     if matches!(
@@ -387,6 +402,23 @@ fn declined_authorization(error: CowshedError) -> CowshedError {
     }
     CowshedError::sandbox_denied(
         "administrator authorization was declined, so nothing on this host was changed",
+        "cowshed setup",
+    )
+}
+
+/// The failure that stopped the sequence, as this command's own outcome.
+///
+/// Core's taxonomy and hint are kept — it knows why the action failed and what fixes it — but a
+/// denial noticed mid-sequence must not inherit [`declined_authorization`]'s sentence: earlier
+/// actions had already succeeded, so "nothing on this host was changed" would be false. The state
+/// of the host is stated once, by the status line above these rows, and never twice with two
+/// different answers.
+fn partial_setup_failure(failure: CowshedError) -> CowshedError {
+    if failure.code != ErrorCode::SandboxDenied {
+        return failure;
+    }
+    CowshedError::sandbox_denied(
+        "administrator authorization was declined partway through the sequence above",
         "cowshed setup",
     )
 }
@@ -570,6 +602,16 @@ fn render_repair<W: Write, E: Write>(
     report: &HostSetupReport,
     output: &mut Output<W, E>,
 ) -> Result<()> {
+    // The per-action outcomes come first and only when there is something to say: they are the
+    // answer to "what actually happened to each thing you were told about", and on a run that
+    // completed they would only repeat the volume rows below.
+    if report.failure().is_some() {
+        for outcome in &report.action_outcomes {
+            output
+                .guidance(&action_outcome_row(outcome))
+                .map_err(output_error)?;
+        }
+    }
     for volume in &report.volumes {
         output.guidance(&volume_row(volume)).map_err(output_error)?;
         if let Some(guidance) = state_guidance(&volume.state_before) {
@@ -583,6 +625,22 @@ fn render_repair<W: Write, E: Write>(
         .guidance(&repair_status(plan, report))
         .map_err(output_error)?;
     Ok(())
+}
+
+/// `cowshed.store exists (…) and will be mounted at …: failed — <why>`.
+///
+/// The intent sentence is reused verbatim rather than reworded in the past tense, so the line a
+/// person consented to and the line reporting it are recognisably the same action. No default
+/// branch: an outcome core adds stops compiling here rather than being reported as a success.
+fn action_outcome_row(outcome: &HostActionOutcome) -> String {
+    let intent = action_intent(&outcome.action);
+    match &outcome.outcome {
+        HostActionResult::Done => format!("{intent}: done"),
+        HostActionResult::Failed { error } => format!("{intent}: FAILED — {}", error.message),
+        // "not attempted" rather than "skipped": the sequence stopped, so this was never reached,
+        // and "skipped" reads as a decision cowshed made about it.
+        HostActionResult::Skipped => format!("{intent}: not attempted"),
+    }
 }
 
 fn render_uninstall<W: Write, E: Write>(
@@ -708,12 +766,32 @@ fn uninstall_fstab_phrase(fstab: &UninstallFstabOutcome) -> String {
 
 /// The last line, and the one a healthy host is run for.
 ///
+/// Order matters: a run that stopped partway is reported as such before anything else, because
+/// every other sentence here is a claim of completeness and would be false. Core reports partial
+/// progress as a successful report carrying a failure rather than as an error, so this is the one
+/// place the difference is visible to a person.
+///
 /// "Changed nothing" is read off the *plan*, not the per-volume action tokens: the plan is what
 /// decided whether anything would happen, so a host with an empty plan and no escalation is the
 /// exact definition of already set up. A volume left alone because it lives somewhere else is
 /// reported separately, because claiming "everything already set up" over an unresolved finding
 /// would be the comfortable answer rather than the true one.
 fn repair_status(plan: &HostSetupPlan, report: &HostSetupReport) -> String {
+    if report.failure().is_some() {
+        let done = count_outcomes(report, |result| {
+            matches!(result, HostActionResult::Done)
+        });
+        let failed = count_outcomes(report, |result| {
+            matches!(result, HostActionResult::Failed { .. })
+        });
+        let not_attempted = count_outcomes(report, |result| {
+            matches!(result, HostActionResult::Skipped)
+        });
+        return format!(
+            "host storage is NOT set up: {done} {} done, {failed} failed, {not_attempted} not attempted",
+            plural(done, "action", "actions"),
+        );
+    }
     let unresolved = report
         .volumes
         .iter()
@@ -732,6 +810,17 @@ fn repair_status(plan: &HostSetupPlan, report: &HostSetupReport) -> String {
         return String::from("host storage is set up (one administrator authorization was used)");
     }
     String::from("host storage is set up")
+}
+
+fn count_outcomes(
+    report: &HostSetupReport,
+    predicate: impl Fn(&HostActionResult) -> bool,
+) -> usize {
+    report
+        .action_outcomes
+        .iter()
+        .filter(|outcome| predicate(&outcome.outcome))
+        .count()
 }
 
 /// What teardown left behind, said plainly.
