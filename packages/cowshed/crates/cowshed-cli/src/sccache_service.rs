@@ -237,7 +237,7 @@ pub(crate) fn remove_stale_socket(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn service_status() -> Result<SccacheStatus> {
+pub(crate) async fn service_status() -> Result<SccacheStatus> {
     let home = canonical_home()?;
     let socket = sccache_server_socket(&home);
     let spec = control_spec(&home)?;
@@ -355,7 +355,10 @@ fn resolve_sccache_executable() -> Result<PathBuf> {
             return fs::canonicalize(&candidate).map_err(|error| {
                 CowshedError::environment_missing(
                     format!("could not resolve {}: {error}", candidate.display()),
-                    "repair the sccache installation and retry",
+                    format!(
+                        "reinstall sccache with devenv or nix so {} is a real executable, then retry cowshed sccache start",
+                        candidate.display()
+                    ),
                 )
             });
         }

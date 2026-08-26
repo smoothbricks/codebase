@@ -93,6 +93,8 @@ fn binary_entrypoint_returns_usage_and_command_map() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("a command is required"));
+    assert!(stderr.contains("warm git workspaces — a copy-on-write checkout"));
+    assert!(stderr.contains("first time here? run cowshed setup, then cowshed adopt"));
     assert!(stderr.contains("commands:"));
 }
 

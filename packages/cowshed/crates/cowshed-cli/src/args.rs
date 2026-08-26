@@ -391,7 +391,7 @@ impl UsageError {
 
     pub fn command_map(&self) -> Option<&'static str> {
         match self.kind {
-            UsageErrorKind::MissingCommand => Some(help::command_map()),
+            UsageErrorKind::MissingCommand => Some(help::bare_invocation()),
             UsageErrorKind::InvalidArguments => None,
         }
     }
@@ -797,10 +797,7 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
         | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         | ErrorKind::MissingSubcommand => match spec {
             None => UsageError::missing_command(),
-            Some(spec) if matches!(spec.name, "gateway" | "sccache" | "skill") => {
-                UsageError::new(format!("{} action is required", spec.name), spec)
-            }
-            Some(spec) => UsageError::new(format!("{} requires an argument", spec.name), spec),
+            Some(spec) => UsageError::new(missing_required_message(spec), spec),
         },
         ErrorKind::InvalidSubcommand => {
             let name = context_string(&error, ContextKind::InvalidSubcommand)
@@ -865,6 +862,27 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
 
     }
 }
+
+/// Clap's missing-argument fallback must say the same thing as the hand-written
+/// `require_*` checks, so `cowshed new` never answers with two different sentences
+/// depending on which path noticed the gap.
+fn missing_required_message(spec: &CommandSpec) -> String {
+    match spec.name {
+        "gateway" | "sccache" | "skill" => format!("{} action is required", spec.name),
+        "new" => String::from("new requires a workspace name"),
+        "fork" => String::from("fork requires a source workspace"),
+        "mv" => String::from("mv requires a workspace"),
+        "restore" => String::from("restore requires a workspace"),
+        "exec" => String::from("exec requires a workspace"),
+        "rm" => String::from("rm requires a workspace"),
+        "attach" => String::from("attach requires a workspace"),
+        "detach" => String::from("detach requires a workspace"),
+        "resize" => String::from("resize requires a workspace"),
+        "land" => String::from("land requires a workspace"),
+        _ => format!("{} requires an argument", spec.name),
+    }
+}
+
 
 fn error_head(error: &clap::Error) -> String {
     error
@@ -1164,7 +1182,7 @@ const SETUP: CommandSpec = CommandSpec {
     name: "setup",
     args: "",
     trailing: "",
-    summary: "set up or repair host storage and pin mounts",
+    summary: "create or repair host storage",
     about: &[
         "Brings this host's two dedicated volumes to their canonical state and pins them in `/etc/fstab`: absent volumes are created; existing volumes are never deleted. Detached or mis-mounted ones are remounted where they belong, markers are validated, and the fstab lines that survive a reboot are written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
         "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
@@ -1344,7 +1362,7 @@ const CHECKPOINT: CommandSpec = CommandSpec {
     ],
     options: &[Opt {
         spelling: "--keep",
-        meaning: "pin the checkpoint so expiry pruning never reclaims it; an explicit label pins it too",
+        meaning: "pin the checkpoint so expiry pruning never deletes it; an explicit label pins it too",
     }],
 };
 
@@ -1389,7 +1407,7 @@ const ENSURE: CommandSpec = CommandSpec {
     name: "ensure",
     args: "",
     trailing: "",
-    summary: "heal the current workspace",
+    summary: "repair the current workspace",
     about: &[
         "The fast auto-fix, and the one command safe to run on every prompt: a healthy workspace costs a marker read and a statfs, and says nothing. Otherwise it reattaches images after a reboot or a Finder eject, repairs mount flags, re-arms the autosave agent, and reconciles whatever drifted — synchronously, so when it returns you are standing in a valid workspace.",
     ],
@@ -1450,7 +1468,7 @@ const PATH: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--no-attach",
-            meaning: "skip the healing and print the would-be path of a detached workspace",
+            meaning: "skip the remount and print the would-be path of a detached workspace",
         },
     ],
 };
@@ -1480,7 +1498,7 @@ const EXEC: CommandSpec = CommandSpec {
     summary: "run an argv command",
     about: &[
         "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
-        "Long commands auto-background at the soft timeout and keep running under the workspace supervisor, where `cowshed job` reaches them.",
+        "Long commands auto-background at the soft timeout and keep running under the workspace supervisor. Reattach with `cowshed exec --session` or `--background`.",
     ],
     options: &[
         Opt {
@@ -1601,7 +1619,7 @@ const REMOVE: CommandSpec = CommandSpec {
     name: "rm",
     args: "<ws>",
     trailing: "",
-    summary: "retire a workspace",
+    summary: "remove a workspace",
     about: &[
         "Retires one workspace, deleting the image its commits live in. The gate is therefore ancestry, not preservation: `rm` refuses unless the project's main branch already contains the workspace's HEAD, read out of main's own repository. The workspace is marked deleted immediately; detach and image deletion finish in the background.",
         "The two overrides authorize different losses and neither substitutes for the other, so a script carrying one has not acquired the other.",
@@ -1733,13 +1751,13 @@ const GC: CommandSpec = CommandSpec {
     name: "gc",
     args: "",
     trailing: "",
-    summary: "reclaim storage",
+    summary: "free storage",
     about: &[
-        "Deletes orphaned images and stale mountpoint directories, prunes expired checkpoints, compacts detached images, and reports what it reclaimed. Safe at any time; other commands run it opportunistically.",
+        "Deletes orphaned images and stale mountpoint directories, prunes expired checkpoints, compacts detached images, and reports what it freed. Safe at any time; `rm`, `land`, and `restore` run it opportunistically.",
     ],
     options: &[Opt {
         spelling: "--dry-run",
-        meaning: "report what would be reclaimed without deleting anything",
+        meaning: "report what would be deleted without deleting anything",
     }],
 };
 
@@ -1766,7 +1784,7 @@ const PUSH: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--expected-workspace-incarnation <id>",
-            meaning: "refuse unless the workspace is still this incarnation",
+            meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
         },
         Opt {
             spelling: "--expected-source-head <oid>",
@@ -1810,7 +1828,7 @@ const REBASE: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--expected-workspace-incarnation <id>",
-            meaning: "refuse unless the workspace is still this incarnation",
+            meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
         },
         Opt {
             spelling: "--expected-source-head <oid>",
@@ -1864,7 +1882,7 @@ const LAND: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--expected-workspace-incarnation <id>",
-            meaning: "refuse unless the workspace is still this incarnation",
+            meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
         },
         Opt {
             spelling: "--expected-source-head <oid>",
@@ -1908,7 +1926,7 @@ const DOCTOR: CommandSpec = CommandSpec {
     trailing: "",
     summary: "check invariants",
     about: &[
-        "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh. Exit 0 when healthy, otherwise the code of the most severe finding.",
+        "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh. Exit 0 when healthy, otherwise 5.",
     ],
     options: &[],
 };
@@ -2613,4 +2631,53 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn missing_positionals_use_the_same_words_as_require_helpers() {
+        let cases = [
+            (["new"].as_slice(), "new requires a workspace name"),
+            (&["fork"], "fork requires a source workspace"),
+            (&["mv"], "mv requires a workspace"),
+            (&["restore"], "restore requires a workspace"),
+            (&["exec", "--", "true"], "exec requires a workspace"),
+            (&["rm"], "rm requires a workspace"),
+            (&["attach"], "attach requires a workspace"),
+            (&["detach"], "detach requires a workspace"),
+            (&["resize"], "resize requires a workspace"),
+            (&["land"], "land requires a workspace"),
+            (&["gateway"], "gateway action is required"),
+            (&["sccache"], "sccache action is required"),
+            (&["skill"], "skill action is required"),
+        ];
+        for (arguments, message) in cases {
+            let error = parse_args(arguments.iter().copied()).unwrap_err();
+            assert_eq!(error.message, message, "{arguments:?}");
+            assert_eq!(
+                missing_required_message(help::command_named(arguments[0]).unwrap()),
+                message,
+                "{arguments:?} clap fallback drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn no_help_page_contains_provision_or_a_phantom_job_verb() {
+        for spec in COMMANDS {
+            let page = spec.page();
+            assert!(
+                !page.contains("provision"),
+                "{} help must not say provision:\n{page}",
+                spec.name
+            );
+            assert!(
+                !page.contains("cowshed job"),
+                "{} help must not name a job verb:\n{page}",
+                spec.name
+            );
+        }
+        let exec = help::command_named("exec").unwrap().page();
+        assert!(exec.contains("exec --session") || exec.contains("`--session`"));
+        assert!(help::command_named("setup").unwrap().summary.contains("create or repair"));
+    }
+
 }

@@ -1453,7 +1453,7 @@ impl fmt::Display for LaunchdError {
                 write!(formatter, "invalid environment variable {name:?}: {reason}")
             }
             Self::PrivilegedProvisioning => formatter
-                .write_str("launchd services may not invoke foreground storage provisioning"),
+                .write_str("launchd services may not create host storage in the foreground"),
         }
     }
 }

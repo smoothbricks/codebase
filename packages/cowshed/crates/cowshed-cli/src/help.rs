@@ -151,6 +151,23 @@ pub fn command_map() -> &'static str {
     MAP.as_str()
 }
 
+/// Two-line onboarding a first-time caller sees above the command map.
+pub fn onboarding_preamble() -> &'static str {
+    "warm git workspaces — a copy-on-write checkout for each agent.\n\
+     first time here? run cowshed setup, then cowshed adopt in your checkout.\n"
+}
+
+/// Bare `cowshed` prints the preamble, then the command map.
+pub fn bare_invocation() -> &'static str {
+    static PAGE: LazyLock<String> = LazyLock::new(|| {
+        let mut page = String::from(onboarding_preamble());
+        page.push('\n');
+        page.push_str(command_map());
+        page
+    });
+    PAGE.as_str()
+}
+
 /// The whole of `cowshed --help`: how to invoke it, every command, and the global options.
 #[must_use]
 pub fn overview() -> String {
@@ -160,7 +177,8 @@ pub fn overview() -> String {
     page.push_str(command_map());
     page.push_str("\nglobal options:\n");
     render_options(&mut page, GLOBALS);
-    page.push_str("\nrun `cowshed <command> --help` for one command's flags and what they mean\n");
+    page.push_str("\nfirst time here? run cowshed setup, then cowshed adopt in your checkout\n");
+    page.push_str("run `cowshed <command> --help` for one command's flags and what they mean\n");
     page
 }
 
@@ -377,7 +395,6 @@ mod tests {
         // Nothing within two edits of a word that is not a near miss of any verb.
         assert_eq!(nearest_commands("zzzzzz"), Vec::<&str>::new());
     }
-
     #[test]
     fn prose_wraps_and_the_overview_carries_the_map_and_the_globals() {
         let overview = overview();
@@ -385,9 +402,23 @@ mod tests {
         assert!(overview.contains(command_map()));
         assert!(overview.contains("--project <git-root>"));
         assert!(overview.contains("cowshed <command> --help"));
+        assert!(overview.contains(
+            "first time here? run cowshed setup, then cowshed adopt in your checkout"
+        ));
 
         let page = command_named("rm").unwrap().page();
         assert!(page.lines().all(|line| line.len() <= WIDTH), "{page}");
         assert!(page.contains("--abandon"));
+        assert!(page.contains("remove a workspace"));
+    }
+
+    #[test]
+    fn bare_invocation_prints_onboarding_above_the_command_map() {
+        let page = bare_invocation();
+        assert!(page.starts_with(onboarding_preamble()));
+        let rest = page.strip_prefix(onboarding_preamble()).unwrap();
+        assert!(rest.starts_with('\n'));
+        assert!(rest[1..].starts_with(command_map()));
+        assert!(page.find("warm git workspaces").unwrap() < page.find("commands:").unwrap());
     }
 }
