@@ -363,6 +363,7 @@ fn config() -> WorkspaceSupervisorConfig {
         default_cwd: Some(WorkspacePath::new("packages/app").unwrap()),
         sandbox: SandboxConfig {
             home: PathBuf::from("/Users/tester"),
+            mount_root: workspace_root.parent().expect("temp root").to_path_buf(),
             workspace_mount: workspace_root,
             exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
             port_block: PortBlock::new(49_152, 16).unwrap(),

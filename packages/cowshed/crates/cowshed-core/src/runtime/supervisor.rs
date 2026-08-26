@@ -112,6 +112,7 @@ impl Default for WorkspaceSupervisorConfig {
             default_cwd: Some(WorkspacePath::new("work").expect("static cwd")),
             sandbox: SandboxConfig {
                 home: PathBuf::from("/tmp/cowshed-home"),
+                mount_root: PathBuf::from("/tmp/cowshed-mounts"),
                 workspace_mount: workspace_root,
                 exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
                 port_block: crate::metadata::PortBlock::new(49_152, 16).expect("static port block"),
@@ -3434,6 +3435,7 @@ mod workspace_toolchain_tests {
     fn sandbox_at(mount: &Path) -> SandboxConfig {
         SandboxConfig {
             home: mount.parent().expect("root").join("home"),
+            mount_root: mount.parent().expect("root").to_path_buf(),
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),

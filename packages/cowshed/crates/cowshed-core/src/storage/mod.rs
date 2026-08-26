@@ -18,6 +18,7 @@ pub mod apfs;
 pub mod audit;
 pub mod bootstrap;
 pub mod fstab;
+pub mod host_config;
 pub mod job_artifact;
 pub mod lifecycle;
 pub mod recovery;
@@ -122,8 +123,18 @@ pub struct StorageLayout {
 
 impl StorageLayout {
     pub fn new(store_root: impl AsRef<Path>, repo_id: &RepoId) -> Result<Self, StorageLayoutError> {
+        let store_root = store_root.as_ref();
+        let host_config = host_config::HostConfig::load_for_store(store_root)?;
+        Self::with_mount_root(store_root, host_config.mount_root(), repo_id)
+    }
+
+    pub fn with_mount_root(
+        store_root: impl AsRef<Path>,
+        host_mount_root: impl AsRef<Path>,
+        repo_id: &RepoId,
+    ) -> Result<Self, StorageLayoutError> {
         Ok(Self {
-            project: ProjectPaths::new(store_root, repo_id)?,
+            project: ProjectPaths::with_mount_root(store_root, host_mount_root, repo_id)?,
         })
     }
 
@@ -201,10 +212,11 @@ impl StorageLayout {
     ///
     /// The record adopt wrote is the authority. Without one there is exactly one inference worth
     /// making and it is conclusive in the direction it fires: only the symlink layout ever creates
-    /// `mnt/<owner>/<repo>/main`, because under direct mount main mounts at the checkout path and
-    /// that directory is never made. A project with no record and no `mnt/.../main` is either not
-    /// adopted yet — in which case the answer is whatever adopt is about to choose — or it is a
-    /// detached symlink-layout project whose mountpoint `gc` has since removed, and guessing
+    /// `<mount-root>/<owner>/<repo>/main`, because under direct mount main mounts at the checkout
+    /// path and that directory is never made. A project with no record and no configured main
+    /// mountpoint is either not adopted yet — in which case the answer is whatever adopt is about
+    /// to choose — or it is a detached symlink-layout project whose mountpoint `gc` has since
+    /// removed, and guessing
     /// between those would silently point every resolver at the wrong path. That case is an error,
     /// not a default. Callers record whatever they resolve, so the inference runs at most once.
     pub fn checkout_layout(&self) -> Result<CheckoutLayout, StorageLayoutError> {
@@ -430,6 +442,8 @@ pub enum StorageLayoutError {
     #[error(transparent)]
     PathLayout(#[from] PathLayoutError),
     #[error(transparent)]
+    HostConfig(#[from] host_config::HostConfigError),
+    #[error(transparent)]
     Metadata(#[from] MetadataError),
 }
 
@@ -571,6 +585,29 @@ mod tests {
             Path::new("/Users/test/.cowshed/mnt/acme/widget/raven")
         );
         assert_eq!(WORKSPACE_MARKER_PATH, ".cowshed/workspace.json");
+    }
+
+    #[test]
+    fn configured_host_root_changes_only_workspace_mount_derivation() {
+        let root = temp_store("configured-mount-root");
+        let mount_root = root.parent().unwrap().join(format!(
+            "cowshed-custom-mounts-{}",
+            std::process::id()
+        ));
+        let plan = host_config::plan_mount_root_change(&root, &mount_root, []).unwrap();
+        host_config::execute_mount_root_change(&plan).unwrap();
+
+        let layout = layout_under(&root);
+        let raven = WorkspaceName::session("raven").unwrap();
+        assert_eq!(
+            layout.workspace_mount(&raven).unwrap(),
+            mount_root.join("acme/widget/raven")
+        );
+        assert_eq!(layout.project().host_mount_root, mount_root);
+        assert_eq!(layout.project().project_root, root.join("acme/widget"));
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(layout.project().host_mount_root.clone()).unwrap();
     }
 
     #[test]
