@@ -28,7 +28,7 @@ cowshed trace <trace-id>                                                        
 
 Human tables by default; `--json` (one envelope) or `--ndjson` (one event per line) to pipe into `jq`. **NDJSON only
 ever exists on the pipe** — nothing writes it to disk. Under the hood these wrap the generic `lmao-inspect` reader over
-controller-owned Arrow segments in `~/.cowshed/telemetry/`. Those segments are compact continuity records, not a second
+controller-owned Arrow segments in `/private/cowshed/store/telemetry/`. Those segments are compact continuity records, not a second
 copy of job stdout/stderr.
 
 ## Tiered job authority and writers
@@ -50,7 +50,7 @@ recovery debris. Missing committed content, an invalid complete frame, or a dige
 failure.
 
 Authority is the host inventory, not a log. What workspaces exist, which incarnation each is, which are retired, and
-which ancestors an image was cloned from are read from the images and mounts under `~/.cowshed/`, the marker each image
+which ancestors an image was cloned from are read from the images and mounts under `/private/cowshed/store/`, the marker each image
 carries (`.cowshed/workspace.json`: incarnation and `lineage`, nearest ancestor first — written by the controller when
 it mints the incarnation, because a fork or restore clones the source image together with the job records its ancestors
 wrote, and the lineage is what authorizes those records), the per-workspace grants files, and the controller lock. A
@@ -61,7 +61,7 @@ state, checkpoint, fork, restore — is emitted as one typed record carrying exi
 order, lineage, grant revision, byte counts, stream SHA-256 digests, and terminal-batch digest, never inline bytes,
 spill paths, or duplicated raw payload. Nothing reads them for a decision. The sink is chosen when the project opens
 (`COWSHED_CONTINUITY_AUDIT`): `arrow` (the standalone default) writes one sealed Arrow IPC segment per record under
-`~/.cowshed/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — private mode, fsync, create-new rename,
+`/private/cowshed/store/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — private mode, fsync, create-new rename,
 directory sync, no lock and no global order because names are unique per writer; `off` writes nothing; and a runtime
 that supervises the controller (Containium) injects its own sink through `ProjectRuntime::open_existing_with_audit`,
 routing the same records into its durable log instead of files. A sink that refuses a record is an `audit-sink` finding

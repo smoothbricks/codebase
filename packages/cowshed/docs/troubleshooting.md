@@ -7,7 +7,7 @@ the truth.
 
 ## Mounts
 
-**Workspace missing after reboot.** Mounts don't survive reboots; images do. Direnv repositories normally heal when
+**Workspace missing after reboot.** Mounts don't survive reboots; images do. Direnv repositories normally reattach when
 their allowed `.envrc` runs:
 
 ```sh
@@ -51,7 +51,7 @@ exactly one trusted connector bound to `127.0.0.1:7644` and that connector can o
 `repo_id`. If the URL no longer normalizes to that identity, open fails instead of mounting another repository's data.
 Fix the remote or explicitly select/rebind the intended identity; discovery only proposes candidates. Local-only
 repositories must be adopted with `--repo-id owner/repo`. Moving a checkout is not a conflict. Trusted policy is read
-only from `~/.cowshed/<owner>/<repo>/policy.json`, never from the checkout.
+only from `/private/cowshed/store/<owner>/<repo>/policy.json`, never from the checkout.
 
 ## Sandbox denials (exit 6)
 
@@ -123,11 +123,11 @@ next: cowshed ls   # nothing live was touched
 
 Attribution: `du` on the images directory tells you per-workspace cost; _inside_ a mounted workspace, normal `du` works
 — it's just APFS. Remember clones share extents: ten fresh workspaces cost ~zero until they diverge, so "sum of image
-sizes" overstates real usage. `df -h ~/.cowshed/caches` covers the shared cache volume; it shares the container's free
+sizes" overstates real usage. `df -h /private/cowshed/caches` covers the shared cache volume; it shares the container's free
 space with everything else.
 
-Cargo's shared writable caches are `~/.cowshed/caches/cargo/{registry,git}`; gateway-owned bare repository mirrors are
-separate at `~/.cowshed/caches/repo-mirrors` and must remain sandbox-read-only.
+Cargo's shared writable caches are `/private/cowshed/caches/cargo/{registry,git}`; gateway-owned bare repository mirrors are
+separate at `/private/cowshed/caches/repo-mirrors` and must remain sandbox-read-only.
 
 **A sandbox refetches a crate the host already has.** `$CARGO_HOME` follows the private `HOME`, so each workspace has
 its own `.cargo`. Its `registry/index` and `registry/cache` are symlinks to the host's, read-only, and `registry/src` —
@@ -137,7 +137,7 @@ the next `cowshed exec` plants them. A real directory sitting where a link belon
 workspace's own registry state, and cowshed will not delete it to share the host's.
 
 **Nix cache/state points at the host filesystem.** On declarative hosts the module must own
-`~/.cache/nix → ~/.cowshed/caches/nix/cache` and `~/.local/state/nix → ~/.cowshed/caches/nix/state`; `adopt` and
+`~/.cache/nix → /private/cowshed/caches/nix/cache` and `~/.local/state/nix → /private/cowshed/caches/nix/state`; `adopt` and
 `doctor` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
 `cowshed adopt --imperative-host-setup` fallback is only for a host with no supported declarative owner; it is never an
 automatic recovery from mixed or broken ownership.
@@ -172,8 +172,8 @@ reflink, or copy, never a hardlink to protected content.
 
 ## ZFS pool and hierarchy
 
-A ZFS host uses exactly three sibling datasets under the configured root: `<pool>/cowshed/store` at `~/.cowshed`,
-`<pool>/cowshed/caches` at `~/.cowshed/caches`, and `<pool>/cowshed/projects` for `<owner>/<repo>/{main,ws/...}`. If
+A ZFS host uses exactly three sibling datasets under the configured root: `<pool>/cowshed/store` at `/private/cowshed/store`,
+`<pool>/cowshed/caches` at `/private/cowshed/caches`, and `<pool>/cowshed/projects` for `<owner>/<repo>/{main,ws/...}`. If
 `statfs` does not locate a suitable delegated ZFS dataset, configure `[substrate] kind = "zfs"` and `pool = "<pool>"`;
 cowshed deliberately refuses to scan pools or guess. `cowshed doctor` reports the selected pool and any missing sibling,
 mountpoint, or delegation.
@@ -203,7 +203,7 @@ mirror refetches, sccache and registries rebuild. `cowshed doctor` suggests it w
 `EndpointConflict` means the gateway already has a session on the port block this project's inventory assigns to one of
 its workspaces, under a different workspace identity. The gateway's session table is a cache of host inventory, never an
 authority: the owner is a session left behind by a project that was deleted out of band
-(`rm -rf ~/.cowshed/<owner>/ <repo>` without ever running a verb against it again), and the host-global port-block
+(`rm -rf /private/cowshed/store/<owner>/<repo>` without ever running a verb against it again), and the host-global port-block
 allocator has since handed that block to a new workspace. Reconcile — which every `exec`, `attach`, and `doctor` runs
 first — evicts such a session itself once the host inventory confirms no live workspace anywhere still carries that
 identity, then installs the workspace; the message does not recur. If `cowshed doctor --json` instead refuses with
@@ -216,8 +216,8 @@ the error names every failed identity.
 ## `cowshed ls` takes tens of seconds; `cowshed new` or `doctor` takes a minute
 
 Per-command cost does not grow with history or with the number of warm workspaces: no command reads the audit segments
-under `~/.cowshed/telemetry/` (they are write-only telemetry; authority is the image inventory); the host APFS inventory
-is queried only for the container that holds `~`, and attaching an image lists only that image's container; one project
+under `/private/cowshed/store/telemetry/` (they are write-only telemetry; authority is the image inventory); the host APFS
+inventory is queried only for the cowshed container, and attaching an image lists only that image's container; one project
 open validates the repository binding and reads the inventory once for every workspace it recovers. When a command is
 still slow, the wait is in a host process, not in cowshed — while it runs,
 `ps -o pid,ppid,etime,args -ax | grep -E 'diskutil|hdiutil|git'` names it. The first `diskutil mount` of a freshly
