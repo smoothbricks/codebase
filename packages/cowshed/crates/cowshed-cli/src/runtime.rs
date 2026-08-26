@@ -27,7 +27,8 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
 use cowshed_core::storage::bootstrap::{
-    CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, execute_host_setup, plan_host_setup,
+    CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, STORE_ROOT,
+    execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, retired_layout_paths,
@@ -1799,11 +1800,23 @@ fn host_action_evidence(action: &HostAction) -> String {
     }
 }
 
+/// Per-volume findings, reporting the mountpoint that was *observed* and carrying the one that is
+/// *expected*.
+///
+/// The distinction is the whole point of the finding. A volume mounted somewhere other than its
+/// canonical root is the case an operator has to see, and rendering the canonical root in the
+/// message tells them their bytes are at a path they are not — so every message names
+/// `mounted_at`, the place the volume actually is, and `path` carries the canonical root, which is
+/// what a repair works towards.
+///
+/// The expected roots come from [`STORE_ROOT`] and [`CACHES_ROOT`] rather than from literals here:
+/// the actions in the plan carry core's canonical mountpoint, and a second copy of it in the CLI
+/// is a copy that can disagree with the volume the planner actually looked at.
 fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (name, expected) in [
-        ("cowshed.store", Path::new("/private/cowshed/store")),
-        ("cowshed.caches", Path::new("/private/cowshed/caches")),
+        ("cowshed.store", Path::new(STORE_ROOT)),
+        ("cowshed.caches", Path::new(CACHES_ROOT)),
     ] {
         let action = plan.actions.iter().find(|action| {
             matches!(
@@ -1815,6 +1828,9 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
             )
         });
         let finding = match action {
+            // No action for this volume means `MountedValid`, which is only reached for a volume
+            // mounted at its canonical root — so here, and only here, observed and expected are
+            // the same path by construction rather than by assumption.
             None => Finding {
                 code: "host-volume".into(),
                 severity: FindingSeverity::Info,
@@ -2472,6 +2488,80 @@ mod tests {
                 && finding.message.contains("stale.sock")
         }));
         assert!(findings.iter().all(|finding| !finding.message.is_empty()));
+    }
+
+    /// A mis-mounted volume is the case the distinction exists for: the message has to name where
+    /// the bytes actually are, because that is what looks wrong, while the JSON `path` carries the
+    /// canonical root a repair works towards. Rendering the canonical root as the observed
+    /// mountpoint would tell an operator their store is somewhere it is not.
+    #[test]
+    fn a_mis_mounted_volume_reports_the_observed_mountpoint_and_expects_the_canonical_root() {
+        let observed = PathBuf::from("/Volumes/cowshed.store");
+        let plan = HostSetupPlan {
+            actions: vec![HostAction::RepairMounted {
+                name: "cowshed.store".into(),
+                uuid: "STORE-UUID".into(),
+                size_bytes: 4096,
+                mounted_at: observed.clone(),
+                mount_at: PathBuf::from(STORE_ROOT),
+            }],
+            requires_authorization: true,
+            non_destructive: true,
+        };
+
+        let findings = host_storage_findings(&plan);
+        let store = findings
+            .iter()
+            .find(|finding| finding.message.starts_with("cowshed.store:"))
+            .expect("a finding for the store");
+
+        assert_eq!(store.code, "mount");
+        assert_eq!(store.path.as_deref(), Some(Path::new(STORE_ROOT)));
+        assert!(
+            store.message.contains(&format!("mounted at {}", observed.display())),
+            "{}",
+            store.message
+        );
+        assert!(
+            store.message.contains(&format!("expected {STORE_ROOT}")),
+            "{}",
+            store.message
+        );
+    }
+
+    /// The expected roots are core's, not a second copy in the CLI: a copy can disagree with the
+    /// volume the planner actually looked at, and then the finding describes a host nobody has.
+    #[test]
+    fn expected_volume_roots_come_from_the_canonical_constants() {
+        let findings = host_storage_findings(&HostSetupPlan {
+            actions: Vec::new(),
+            requires_authorization: false,
+            non_destructive: true,
+        });
+
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.path.clone().expect("a path per volume"))
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from(STORE_ROOT), PathBuf::from(CACHES_ROOT)]
+        );
+        assert_eq!(
+            CanonicalRoots::global().store(),
+            Path::new(STORE_ROOT),
+            "the canonical roots and the doctor's expected roots must be one definition"
+        );
+        for finding in &findings {
+            assert_eq!(finding.code, "host-volume");
+            let expected = finding.path.as_deref().expect("a path per volume");
+            assert!(
+                finding
+                    .message
+                    .contains(&format!("mounted at {}", expected.display())),
+                "{}",
+                finding.message
+            );
+        }
     }
 
     #[test]
