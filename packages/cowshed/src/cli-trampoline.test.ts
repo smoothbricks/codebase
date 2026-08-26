@@ -2,7 +2,7 @@
 /// <reference types="node" />
 
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -88,6 +88,48 @@ describe('cowshed CLI trampoline', () => {
 
     expect(packageRootFromModule(pathToFileURL(join(root, 'src', 'cli.ts')).href)).toBe(root);
     expect(packageRootFromModule(pathToFileURL(join(root, 'dist', 'ts', 'cli.js')).href)).toBe(root);
+  });
+
+  it('re-chmods a packaged binary denied by permissions and retries the spawn once', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    await mkdir(dirname(packaged), { recursive: true });
+    // The healed retry fails with ENOENT (missing shebang interpreter), so a
+    // surfaced EACCES proves the original error won over the retry's.
+    await writeFile(packaged, '#!/nonexistent-cowshed-interpreter\n');
+    await chmod(packaged, 0o644);
+
+    await expect(runCli(['ls', '--all'], { packageRoot: root, platform: 'darwin', arch: 'arm64' })).rejects.toMatchObject({
+      code: 'EACCES',
+    });
+    expect((await stat(packaged)).mode & 0o111).toBe(0o111);
+  });
+
+  it('spawns healthy packaged binaries without touching their permissions', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    await mkdir(dirname(packaged), { recursive: true });
+    await writeFile(packaged, '#!/bin/sh\nexit 17\n');
+    await chmod(packaged, 0o755);
+
+    const exitCode = await runCli(['ls', '--all'], { packageRoot: root, platform: 'darwin', arch: 'arm64' });
+
+    expect(exitCode).toBe(17);
+    expect((await stat(packaged)).mode & 0o777).toBe(0o755);
+  });
+
+  it('surfaces non-permission spawn failures without healing', async () => {
+    const root = await fixtureRoot();
+
+    // exists() selects the packaged native backend without materializing its file.
+    await expect(
+      runCli(['ls', '--all'], {
+        packageRoot: root,
+        platform: 'darwin',
+        arch: 'arm64',
+        exists: (path) => path === join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed'),
+      }),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
 

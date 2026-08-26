@@ -1,7 +1,7 @@
 /// <reference types="node" />
 
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { chmodSync, existsSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -76,40 +76,60 @@ async function runNapiFallback(argv: readonly string[]): Promise<number> {
 
 function spawnBinary(executable: string, argv: readonly string[]): Promise<number> {
   const { promise, resolve: resolveExit, reject } = Promise.withResolvers<number>();
-  const child = spawn(executable, [...argv], { stdio: 'inherit' });
-  const signalHandlers = FORWARDED_SIGNALS.map((signal) => {
-    const handler = () => {
-      child.kill(signal);
-    };
-    process.once(signal, handler);
-    return [signal, handler] as const;
-  });
+  // The first EACCES is kept as the surfaced outcome when the heal cannot
+  // revive the spawn: the retry's failure (often ENOEXEC on a healed but
+  // non-binary file) would only restate that the permission was the cause.
+  let permissionError: Error | null = null;
 
-  const cleanup = () => {
-    for (const [signal, handler] of signalHandlers) {
-      process.off(signal, handler);
-    }
-    child.off('error', onError);
-    child.off('exit', onExit);
-  };
-  const onError = (error: Error) => {
-    cleanup();
-    reject(error);
-  };
-  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-    cleanup();
-    if (signal !== null) {
-      try {
-        process.kill(process.pid, signal);
-      } catch (error) {
-        reject(error);
+  const startChild = () => {
+    const child = spawn(executable, [...argv], { stdio: 'inherit' });
+    const signalHandlers = FORWARDED_SIGNALS.map((signal) => {
+      const handler = () => {
+        child.kill(signal);
+      };
+      process.once(signal, handler);
+      return [signal, handler] as const;
+    });
+
+    const cleanup = () => {
+      for (const [signal, handler] of signalHandlers) {
+        process.off(signal, handler);
       }
-      return;
-    }
-    resolveExit(code ?? 1);
+      child.off('error', onError);
+      child.off('exit', onExit);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      if (permissionError === null && (error as NodeJS.ErrnoException).code === 'EACCES') {
+        // Packaged binaries can ship without the exec bit; restore it once and retry.
+        permissionError = error;
+        try {
+          chmodSync(executable, 0o755);
+        } catch {
+          // Unwritable target: the retry fails with EACCES and surfaces the original error.
+        }
+        startChild();
+        return;
+      }
+      reject(permissionError ?? error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      if (signal !== null) {
+        try {
+          process.kill(process.pid, signal);
+        } catch (error) {
+          reject(error);
+        }
+        return;
+      }
+      resolveExit(code ?? 1);
+    };
+
+    child.once('error', onError);
+    child.once('exit', onExit);
   };
 
-  child.once('error', onError);
-  child.once('exit', onExit);
+  startChild();
   return promise;
 }
