@@ -2,9 +2,11 @@
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "macos")]
 use std::ffi::{OsString, c_void};
-use std::fs::{self, OpenOptions};
+use std::fs;
 #[cfg(unix)]
 use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::fs::OpenOptions;
 use std::io;
 #[cfg(target_os = "macos")]
 use std::io::Read;
@@ -12,16 +14,18 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 /// How long a read-only diskutil probe may run before the disk arbitration daemon counts as
 /// unresponsive, and how long a mutating mount may take once it answers. These are behavioral
 /// deadlines, not output parsing: a wedged `diskarbitrationd` never answers at all.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const KILLALL: &str = "/usr/bin/killall";
@@ -30,9 +34,13 @@ const MKDIR: &str = "/bin/mkdir";
 #[cfg(target_os = "macos")]
 const RM: &str = "/bin/rm";
 
+#[cfg(target_os = "macos")]
 fn is_diskutil_mount(command: &HostCommand) -> bool {
     command.program() == DISKUTIL
-        && command.args().first().is_some_and(|argument| argument == "mount")
+        && command
+            .args()
+            .first()
+            .is_some_and(|argument| argument == "mount")
 }
 
 #[cfg(unix)]
@@ -79,6 +87,7 @@ fn arbitration_probe(device: &str) -> Result<(), HostError> {
 
 use crate::error::CowshedError;
 use plist::{Dictionary, Value};
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
@@ -89,7 +98,6 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
 #[cfg(unix)]
@@ -103,11 +111,11 @@ use super::{
     VolumeRole, execute_bootstrap, execute_bootstrap_operation, plan_bootstrap,
     require_mounted_marker, select_substrate,
 };
+#[cfg(target_os = "macos")]
+use super::{ApfsProvisionKind, VOLUME_MARKER_FILE, VolumeMarker};
 #[cfg(test)]
 use super::{CACHES_ROOT, STORE_ROOT};
 use crate::storage::fstab::{FstabPin, build_fstab};
-#[cfg(target_os = "macos")]
-use super::{ApfsProvisionKind, VOLUME_MARKER_FILE, VolumeMarker};
 
 #[cfg(unix)]
 const MARKER_MODE: libc::mode_t = 0o600;
@@ -300,6 +308,7 @@ impl BootstrapHost for SystemBootstrapHost {
 
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
         ensure_supported_host()?;
+        #[cfg(target_os = "macos")]
         if is_diskutil_mount(command) {
             let device = command.args().last().expect("mount argv carries a device");
             arbitration_probe(device).map_err(|_| {
@@ -426,9 +435,7 @@ impl BootstrapHost for AuthorizedBootstrapHost {
                 self.session()?.execute(&restart)?;
                 std::thread::sleep(Duration::from_secs(3));
                 arbitration_probe(device).map_err(|_| {
-                    HostError::new(
-                        "disk arbitration daemon remained unresponsive after a restart",
-                    )
+                    HostError::new("disk arbitration daemon remained unresponsive after a restart")
                 })?;
             }
         }
@@ -467,7 +474,6 @@ impl BootstrapHost for AuthorizedBootstrapHost {
         pin_volumes_in_fstab_with(&mut *self.session()?, pins).map(|_| ())
     }
 }
-
 
 /// Gather authoritative APFS evidence, plan bootstrap purely, then execute it according to the
 /// explicit capability mode.
@@ -664,8 +670,7 @@ fn volume_state(storage: &ExistingStorage) -> VolumeState {
             VolumeState::Detached
         }
         ExistingStorage::MisMountedIncomplete {
-            current_mountpoint,
-            ..
+            current_mountpoint, ..
         } => VolumeState::MisMounted {
             mounted_at: current_mountpoint.clone(),
         },
@@ -703,8 +708,7 @@ fn volume_action(storage: &ExistingStorage) -> &'static str {
 fn repair_mountpoint(storage: &ExistingStorage) -> Option<&Path> {
     match storage {
         ExistingStorage::MisMountedIncomplete {
-            current_mountpoint,
-            ..
+            current_mountpoint, ..
         } => Some(current_mountpoint),
         ExistingStorage::FoundElsewhere {
             mounted_at: Some(mounted_at),
@@ -713,7 +717,6 @@ fn repair_mountpoint(storage: &ExistingStorage) -> Option<&Path> {
         _ => None,
     }
 }
-
 
 fn build_host_actions(
     volumes: &[ClassifiedVolume],
@@ -795,8 +798,7 @@ fn build_host_actions(
                 });
             }
             ExistingStorage::MisMountedIncomplete {
-                current_mountpoint,
-                ..
+                current_mountpoint, ..
             } => {
                 let (uuid, size_bytes) = existing_identity()?;
                 actions.push(HostAction::RepairMounted {
@@ -882,15 +884,9 @@ fn storage_device(storage: &ExistingStorage) -> Option<&str> {
     }
 }
 
-fn operations_for_volume(
-    plan: &BootstrapPlan,
-    volume: &ClassifiedVolume,
-) -> Vec<HostOperation> {
+fn operations_for_volume(plan: &BootstrapPlan, volume: &ClassifiedVolume) -> Vec<HostOperation> {
     for operation in plan.operations() {
-        if let HostOperation::ProvisionApfsVolumes {
-            container,
-            volumes,
-        } = operation
+        if let HostOperation::ProvisionApfsVolumes { container, volumes } = operation
             && let Some(provision) = volumes
                 .iter()
                 .find(|provision| provision.name() == volume.name)
@@ -911,12 +907,9 @@ fn operations_for_volume(
             HostOperation::EnsureDirectory(path) | HostOperation::ReclaimMountpoint(path) => {
                 path == &volume.mountpoint
             }
-            HostOperation::MountApfsVolume { mountpoint, .. } => {
-                mountpoint == &volume.mountpoint
-            }
-            HostOperation::RunCommand(command) => device.is_some_and(|device| {
-                command.args().iter().any(|argument| argument == device)
-            }),
+            HostOperation::MountApfsVolume { mountpoint, .. } => mountpoint == &volume.mountpoint,
+            HostOperation::RunCommand(command) => device
+                .is_some_and(|device| command.args().iter().any(|argument| argument == device)),
             HostOperation::ReportVolumeIssue { name, .. } => *name == volume.name,
             HostOperation::VerifyZfsDelegation { .. }
             | HostOperation::ProvisionApfsVolumes { .. }
@@ -969,22 +962,17 @@ async fn execute_snapshot_actions(
             HostAction::PinFstab { .. } => {
                 let pin_indices = (index..outcomes.len())
                     .filter(|candidate| {
-                        matches!(
-                            outcomes[*candidate].action,
-                            HostAction::PinFstab { .. }
-                        )
+                        matches!(outcomes[*candidate].action, HostAction::PinFstab { .. })
                     })
                     .collect::<Vec<_>>();
-                let operation = snapshot.plan.operations().iter().find(|operation| {
-                    matches!(operation, HostOperation::PinVolumesInFstab { .. })
-                });
+                let operation =
+                    snapshot.plan.operations().iter().find(|operation| {
+                        matches!(operation, HostOperation::PinVolumesInFstab { .. })
+                    });
                 let result = match operation {
                     Some(operation) => {
-                        execute_setup_operations(
-                            std::slice::from_ref(operation),
-                            Arc::clone(&host),
-                        )
-                        .await
+                        execute_setup_operations(std::slice::from_ref(operation), Arc::clone(&host))
+                            .await
                     }
                     None => Err(CowshedError::internal(
                         "setup pin action has no fstab operation",
@@ -1149,9 +1137,12 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
                     });
                 }
             };
-            if post.plan.operations().iter().any(|operation| {
-                matches!(operation, HostOperation::ProvisionApfsVolumes { .. })
-            }) {
+            if post
+                .plan
+                .operations()
+                .iter()
+                .any(|operation| matches!(operation, HostOperation::ProvisionApfsVolumes { .. }))
+            {
                 let error = CowshedError::internal(
                     "post-setup evidence still proposes APFS volume creation; refusing a second create",
                 );
@@ -1299,10 +1290,7 @@ fn setup_execution_error(error: NativeBootstrapError, hint: &'static str) -> Cow
         _ => false,
     };
     if authorization_denied {
-        CowshedError::sandbox_denied(
-            "authorization was declined; nothing was changed",
-            hint,
-        )
+        CowshedError::sandbox_denied("authorization was declined; nothing was changed", hint)
     } else {
         existing_host_storage_error(error)
     }
@@ -1576,7 +1564,10 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
         identifier: &str,
     ) -> Result<Option<PathBuf>, NativeBootstrapError> {
         let command = HostCommand::new(DISKUTIL, ["info", "-plist", identifier]);
-        let output = self.host.run_command(&command).map_err(NativeBootstrapError::Host)?;
+        let output = self
+            .host
+            .run_command(&command)
+            .map_err(NativeBootstrapError::Host)?;
         if !output.succeeded() {
             return Err(NativeBootstrapError::CommandFailed(
                 HostCommandFailure::new(command, output),
@@ -1694,18 +1685,8 @@ fn gather_existing_apfs_evidence(
             source,
             HostCommand::new(DISKUTIL, ["apfs", "list", "-plist"]),
         )?;
-        guard_absent_volume_globally(
-            source,
-            &global,
-            APFS_STORE_VOLUME,
-            &mut store.storage,
-        )?;
-        guard_absent_volume_globally(
-            source,
-            &global,
-            APFS_CACHES_VOLUME,
-            &mut caches.storage,
-        )?;
+        guard_absent_volume_globally(source, &global, APFS_STORE_VOLUME, &mut store.storage)?;
+        guard_absent_volume_globally(source, &global, APFS_CACHES_VOLUME, &mut caches.storage)?;
     }
 
     let classified = [
@@ -2057,9 +2038,7 @@ fn classify_volume(
         });
     }
     let (state, reclaimable_stubs) = match source.inspect_mountpoint(expected_mountpoint)? {
-        MountpointState::ReclaimableStub { paths } => {
-            (MountpointState::EmptyDirectory, paths)
-        }
+        MountpointState::ReclaimableStub { paths } => (MountpointState::EmptyDirectory, paths),
         state => (state, Vec::new()),
     };
     let storage = if let Some(volume) = matches.first() {
@@ -2084,10 +2063,7 @@ fn classify_volume(
                     )?;
                 }
                 if !mounted.nobrowse {
-                    ExistingStorage::mis_mounted_incomplete(
-                        &volume.identifier,
-                        expected_mountpoint,
-                    )
+                    ExistingStorage::mis_mounted_incomplete(&volume.identifier, expected_mountpoint)
                 } else {
                     let (uid, gid) = source.invoking_identity();
                     if marker_missing || mounted.uid != uid || mounted.gid != gid {
@@ -2575,8 +2551,7 @@ fn pin_volumes_in_fstab_with(
         return Ok(false);
     }
 
-    let temporary_path =
-        PathBuf::from(format!("/private/tmp/cowshed-fstab-{}", Uuid::new_v4()));
+    let temporary_path = PathBuf::from(format!("/private/tmp/cowshed-fstab-{}", Uuid::new_v4()));
     let result = (|| {
         let mut temporary = OpenOptions::new()
             .write(true)
@@ -3551,20 +3526,15 @@ mod tests {
             );
         let mut source = healthy_existing_source();
         source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
-        source.mountpoints.insert(
-            PathBuf::from(super::STORE_ROOT),
-            MountpointState::Missing,
-        );
-        source.mountpoints.insert(
-            PathBuf::from(super::CACHES_ROOT),
-            MountpointState::Missing,
-        );
+        source
+            .mountpoints
+            .insert(PathBuf::from(super::STORE_ROOT), MountpointState::Missing);
+        source
+            .mountpoints
+            .insert(PathBuf::from(super::CACHES_ROOT), MountpointState::Missing);
         source.mounted_volumes.remove(Path::new(super::STORE_ROOT));
         source.mounted_volumes.remove(Path::new(super::CACHES_ROOT));
-        for (path, identifier) in [
-            (retired_store, "disk3s8"),
-            (retired_caches, "disk3s9"),
-        ] {
+        for (path, identifier) in [(retired_store, "disk3s8"), (retired_caches, "disk3s9")] {
             source.mounted_volumes.insert(
                 path.clone(),
                 MountedVolumeEvidence {
@@ -3726,10 +3696,7 @@ mod tests {
                 return Err(HostError::new("setup action was not split by volume"));
             };
             if volume.name() == self.fail_volume {
-                return Err(HostError::new(format!(
-                    "{} action failed",
-                    volume.name()
-                )));
+                return Err(HostError::new(format!("{} action failed", volume.name())));
             }
             self.completed
                 .lock()
@@ -4331,10 +4298,12 @@ mod tests {
                 .count(),
             2
         );
-        assert!(!snapshot.actions.iter().any(|action| matches!(
-            action,
-            HostAction::CreateVolume { .. }
-        )));
+        assert!(
+            !snapshot
+                .actions
+                .iter()
+                .any(|action| matches!(action, HostAction::CreateVolume { .. }))
+        );
         assert!(
             HostSetupPlan::new(snapshot.actions, true).non_destructive,
             "mounting existing volumes and reclaiming known stubs is non-destructive"
@@ -4498,10 +4467,7 @@ mod tests {
                 ),
                 &(
                     CHOWN,
-                    &vec![
-                        "501:20".to_owned(),
-                        "/private/cowshed/caches".to_owned()
-                    ]
+                    &vec!["501:20".to_owned(), "/private/cowshed/caches".to_owned()]
                 ),
             ]
         );
@@ -4548,11 +4514,7 @@ mod tests {
             &(container("disk3", &volume("Data", "disk3s5", None))
                 + &container(
                     "disk7",
-                    &volume(
-                        APFS_STORE_VOLUME,
-                        "disk7s2",
-                        Some("/Volumes/cowshed.store"),
-                    ),
+                    &volume(APFS_STORE_VOLUME, "disk7s2", Some("/Volumes/cowshed.store")),
                 )),
         );
         let volume = ApfsVolumeProvision {
@@ -5196,10 +5158,7 @@ mod tests {
             let host = authorization_status("preauthorize privileged execution", status)
                 .expect_err("decline must be typed");
             assert!(host.is_authorization_denied());
-            let error = setup_execution_error(
-                NativeBootstrapError::Host(host),
-                "cowshed setup",
-            );
+            let error = setup_execution_error(NativeBootstrapError::Host(host), "cowshed setup");
             assert_eq!(error.code, crate::error::ErrorCode::SandboxDenied);
             assert_eq!(error.exit_code(), 6);
             assert_eq!(
@@ -5348,11 +5307,7 @@ mod tests {
                 &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
             ) + &container(
                 "disk7",
-                &volume(
-                    APFS_STORE_VOLUME,
-                    "disk7s2",
-                    Some("/Volumes/cowshed.store"),
-                ),
+                &volume(APFS_STORE_VOLUME, "disk7s2", Some("/Volumes/cowshed.store")),
             )),
         );
         let mut source = source(scoped.clone());
@@ -5419,10 +5374,13 @@ mod tests {
         let mut source = healthy_existing_source();
         let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
             .expect("healthy manually-created volumes plan");
-        assert!(!snapshot.plan.operations().iter().any(|operation| matches!(
-            operation,
-            HostOperation::ProvisionApfsVolumes { .. }
-        )));
+        assert!(
+            !snapshot
+                .plan
+                .operations()
+                .iter()
+                .any(|operation| matches!(operation, HostOperation::ProvisionApfsVolumes { .. }))
+        );
         assert!(snapshot.plan.operations().iter().any(|operation| matches!(
             operation,
             HostOperation::PinVolumesInFstab { pins }
@@ -5469,17 +5427,14 @@ mod tests {
             &snapshot.plan,
             NativeBootstrapMode::Provision,
             Arc::clone(&host),
-
             &ValidationLane::default(),
         )
         .await
         .expect("provision lane applies fstab pin");
         assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 1);
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 1);
-        let action_host: Arc<dyn BootstrapHost> =
-            Arc::new(ReadOnlyValidationHost::default());
-        let (outcomes, failure) =
-            execute_snapshot_actions(&snapshot, action_host).await;
+        let action_host: Arc<dyn BootstrapHost> = Arc::new(ReadOnlyValidationHost::default());
+        let (outcomes, failure) = execute_snapshot_actions(&snapshot, action_host).await;
         assert!(failure.is_none());
         assert!(
             outcomes
@@ -5507,8 +5462,7 @@ mod tests {
             fail_volume: APFS_CACHES_VOLUME,
         });
 
-        let (outcomes, failure) =
-            execute_snapshot_actions(&snapshot, Arc::clone(&host)).await;
+        let (outcomes, failure) = execute_snapshot_actions(&snapshot, Arc::clone(&host)).await;
         let failure = failure.expect("second volume fails");
         assert!(failure.message.contains("cowshed.caches action failed"));
         assert!(matches!(outcomes[0].outcome, HostActionResult::Done));
@@ -5530,19 +5484,14 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert_eq!(
             plan,
             HostUninstallPlan {
-                pins_to_remove: vec![
-                    "cowshed.store".to_owned(),
-                    "cowshed.caches".to_owned()
-                ],
+                pins_to_remove: vec!["cowshed.store".to_owned(), "cowshed.caches".to_owned()],
                 requires_authorization: true,
             }
         );
 
-        let clean = host_uninstall_plan_from_text(
-            Path::new("/Users/alice"),
-            "LABEL=nix /nix apfs rw\n",
-        )
-        .expect("clean uninstall plan");
+        let clean =
+            host_uninstall_plan_from_text(Path::new("/Users/alice"), "LABEL=nix /nix apfs rw\n")
+                .expect("clean uninstall plan");
         assert_eq!(
             clean,
             HostUninstallPlan {
@@ -5665,10 +5614,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
         assert_eq!(validated.home(), Path::new("/Users/alice"));
         assert_eq!(validated.store(), Path::new("/private/cowshed/store"));
-        assert_eq!(
-            validated.caches(),
-            Path::new("/private/cowshed/caches")
-        );
+        assert_eq!(validated.caches(), Path::new("/private/cowshed/caches"));
         assert_eq!(
             validated.telemetry(),
             Path::new("/private/cowshed/store/telemetry")
@@ -5795,7 +5741,6 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
     }
-
 
     #[cfg(target_os = "macos")]
     #[test]
