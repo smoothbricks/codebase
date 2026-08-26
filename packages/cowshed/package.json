@@ -152,11 +152,20 @@
           "killAfterMs": 10000
         }
       },
+      "verify-packaging": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "cwd": "packages/cowshed",
+          "command": "bun scripts/verify-packaged-bin-bits.ts"
+        }
+      },
       "test": {
         "executor": "nx:noop",
         "dependsOn": [
           "napi-test",
-          "trampoline-test"
+          "trampoline-test",
+          "verify-packaging"
         ]
       },
       "integration-apfs": {
