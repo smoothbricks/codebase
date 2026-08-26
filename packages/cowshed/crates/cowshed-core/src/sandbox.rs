@@ -3,6 +3,9 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 pub use crate::metadata::PortBlock;
+use crate::storage::bootstrap::{CACHES_ROOT, STORE_ROOT};
+
+const COWSHED_ROOT: &str = "/private/cowshed";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressGrant {
@@ -71,14 +74,14 @@ fn nix_daemon_socket_at(entry: &Path) -> Option<PathBuf> {
 /// `SCCACHE_SERVER_UDS`; the profile admits exactly this path.
 ///
 /// Unlike [`nix_daemon_socket`], the path is admitted without requiring a live
-/// socket: it is a cowshed-owned constant under `~/.cowshed`, where the
-/// store-wide deny leaves sandboxes unable to create, unlink, or bind anything,
-/// so naming the path grants nothing a sandbox could conjure — and it keeps
-/// profiles correct when the daemon is (re)started after a supervisor launched.
-/// The same deny is what makes a client's auto-spawned fallback server fail
-/// fast in-sandbox: binding here needs write-create, which no workspace holds.
-pub fn sccache_server_socket(home: &Path) -> PathBuf {
-    home.join(".cowshed/sccache.sock")
+/// socket: it is a cowshed-owned constant inside the machine-global store, where
+/// the `/private/cowshed` deny leaves sandboxes unable to create, unlink, or bind
+/// anything, so naming the path grants nothing a sandbox could conjure — and it
+/// keeps profiles correct when the daemon is (re)started after a supervisor launched.
+/// The same deny is what makes a client's auto-spawned fallback server fail fast
+/// in-sandbox: binding here needs write-create, which no workspace holds.
+pub fn sccache_server_socket() -> PathBuf {
+    Path::new(STORE_ROOT).join("sccache.sock")
 }
 
 /// The host-owned sccache cache directory beneath the cowshed store root.
@@ -87,8 +90,8 @@ pub fn sccache_server_socket(home: &Path) -> PathBuf {
 /// per-workspace cache would have nothing to reuse. The daemon owns it, but clients export it too
 /// — a client that finds no daemon spawns its own server, and that fallback must land in this cache
 /// rather than sccache's user-default directory.
-pub fn sccache_cache_directory(home: &Path) -> PathBuf {
-    home.join(".cowshed/caches/sccache")
+pub fn sccache_cache_directory() -> PathBuf {
+    Path::new(CACHES_ROOT).join("sccache")
 }
 
 /// The host cargo registry subdirectories every sandbox reads.
@@ -221,9 +224,8 @@ pub fn seatbelt_profile(
         }
     }
 
-    let home = &config.home;
-    let cowshed = home.join(".cowshed");
-    let caches = cowshed.join("caches");
+    let cowshed = Path::new(COWSHED_ROOT);
+    let caches = Path::new(CACHES_ROOT);
     let mut profile = String::new();
 
     push_line(&mut profile, "(version 1)");
@@ -314,10 +316,10 @@ pub fn seatbelt_profile(
         ),
     );
 
-    // Controller state and the host-configured mount tree are separate protected roots. The
-    // latter may live anywhere on Data, so deriving this deny from `~/.cowshed` would expose every
-    // sibling workspace as soon as the operator selected a custom root.
-    push_subpath_rule(&mut profile, "deny file-read* file-write*", &cowshed)?;
+    // The machine-global evidence layer and the host-configured mount tree are separate protected
+    // roots. The latter may live anywhere on Data, so it must keep its own deny rather than relying
+    // on the fixed `/private/cowshed` boundary.
+    push_subpath_rule(&mut profile, "deny file-read* file-write*", cowshed)?;
     push_subpath_rule(
         &mut profile,
         "deny file-read* file-write*",
@@ -334,14 +336,14 @@ pub fn seatbelt_profile(
     // Connecting to an allowed socket resolves its path, so every ancestor must
     // be traversable. Socket directories are not under the immutable roots
     // granted above — the nix daemon socket resolves into `/private/var/run`,
-    // and the sccache server socket lives under `~/.cowshed` itself — so the
-    // literals must land here, after the store-wide deny, or last-match-wins
+    // while the sccache socket is itself behind the `/private/cowshed` deny — so
+    // the literals must land here, after the store-wide deny, or last-match-wins
     // re-denies them and the connect fails on path resolution before the
     // outbound rule is ever consulted.
     for socket in &sockets {
         push_readable_ancestors(&mut profile, socket)?;
     }
-    push_subpath_rule(&mut profile, "allow file-read*", &caches)?;
+    push_subpath_rule(&mut profile, "allow file-read*", caches)?;
     for suffix in [
         "cargo/registry",
         "cargo/git",
@@ -384,7 +386,7 @@ pub fn seatbelt_profile(
 
     // SBPL is last-match-wins: immutable secrets and policy denies close the shared profile.
     for deny in hard_denies.into_iter().filter(|path| {
-        path.as_ref() != cowshed.as_path() && path.as_ref() != config.mount_root.as_path()
+        path.as_ref() != cowshed && path.as_ref() != config.mount_root.as_path()
     }) {
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
@@ -441,7 +443,7 @@ fn hard_denies<'a>(
     additional: &'a [PathBuf],
 ) -> Result<Vec<Cow<'a, Path>>, SandboxError> {
     let mut denies = vec![
-        Cow::Owned(home.join(".cowshed")),
+        Cow::Borrowed(Path::new(COWSHED_ROOT)),
         Cow::Borrowed(mount_root),
         Cow::Owned(home.join(".ssh")),
         Cow::Owned(home.join(".gnupg")),
@@ -578,7 +580,7 @@ mod tests {
             home: PathBuf::from("/Users/tester"),
             mount_root: PathBuf::from("/Users/tester/.cowshed/mnt"),
             workspace_mount: PathBuf::from(
-                "/Users/tester/.cowshed/acme/widget/workspaces/raven/mount",
+                "/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount",
             ),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             port_block: PortBlock::new(40_960, 16).unwrap(),
@@ -687,14 +689,25 @@ mod tests {
         let root_deny = profile
             .find("(deny file-read* file-write* (subpath \"/Users/tester/Dev/.cowshed-mounts\"))")
             .expect("configured mount-root deny");
+        let global_deny = profile
+            .find("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
+            .expect("machine-global cowshed deny");
+        let root_traversal = profile
+            .find("(allow file-read* (literal \"/Users/tester/Dev/.cowshed-mounts\"))")
+            .expect("mount-root traversal carve-back");
         let own_read = profile
             .find("(allow file-read* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/raven\"))")
             .expect("own workspace read carve-back");
         let own_write = profile
             .find("(allow file-write* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/raven\"))")
             .expect("own workspace write carve-back");
+        assert!(global_deny < root_traversal);
+        assert!(root_deny < root_traversal);
         assert!(root_deny < own_read);
         assert!(root_deny < own_write);
+        assert!(!profile.contains(
+            "(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))"
+        ));
         assert!(!profile.contains(
             "(allow file-read* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/swift\"))"
         ));
@@ -734,7 +747,7 @@ mod tests {
             .find("(allow file-read* file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/main/.git\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/main/.git\"))")
             .expect("git-worktree repository carve-back");
         let store_deny = profile
-            .find("(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))")
+            .find("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
             .unwrap();
         let policy_deny = profile
             .rfind("(deny file-read* file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/main\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/main\"))")
@@ -762,27 +775,30 @@ mod tests {
     #[test]
     fn sccache_store_is_daemon_write_only_and_its_socket_outlives_the_store_deny() {
         let mut with_socket = config(RunSandboxMode::ReadWrite);
-        let socket = sccache_server_socket(&with_socket.home);
-        assert_eq!(socket, PathBuf::from("/Users/tester/.cowshed/sccache.sock"));
+        let socket = sccache_server_socket();
+        assert_eq!(
+            socket,
+            PathBuf::from("/private/cowshed/store/sccache.sock")
+        );
         with_socket.allowed_unix_sockets.push(socket.clone());
         let profile = seatbelt_profile(&with_socket, SandboxProfileRole::ExecutedChild).unwrap();
 
         // Daemon-only writes: caches-wide read stays, the write carve-back is gone.
-        assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/.cowshed/caches\"))"));
+        assert!(profile.contains("(allow file-read* (subpath \"/private/cowshed/caches\"))"));
         assert!(!profile.contains(
-            "(allow file-read* file-write* (subpath \"/Users/tester/.cowshed/caches/sccache\"))"
+            "(allow file-read* file-write* (subpath \"/private/cowshed/caches/sccache\"))"
         ));
 
         assert!(profile.contains(
-            "(allow network-outbound (remote unix-socket (path-literal \"/Users/tester/.cowshed/sccache.sock\")))"
+            "(allow network-outbound (remote unix-socket (path-literal \"/private/cowshed/store/sccache.sock\")))"
         ));
         // SBPL is last-match-wins: the ancestor literals that make the connect's
         // path resolution work must be emitted after the store-wide deny.
         let store_deny = profile
-            .find("(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))")
+            .find("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
             .unwrap();
         let socket_literal = profile
-            .rfind("(allow file-read* (literal \"/Users/tester/.cowshed/sccache.sock\"))")
+            .rfind("(allow file-read* (literal \"/private/cowshed/store/sccache.sock\"))")
             .expect("socket path literal");
         assert!(store_deny < socket_literal);
     }
@@ -848,10 +864,10 @@ mod tests {
             SandboxProfileRole::ExecutedChild,
         )
         .unwrap();
-        let workspace_write = "(allow file-write* (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount\"))";
+        let workspace_write = "(allow file-write* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount\"))";
         assert!(read_write.contains(workspace_write));
         assert!(!read_only.contains(workspace_write));
-        assert!(read_only.contains("(allow file-read* (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount\"))"));
+        assert!(read_only.contains("(allow file-read* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount\"))"));
     }
 
     #[test]
@@ -868,11 +884,11 @@ mod tests {
         assert!(!profile.contains("(allow file-read* (literal \"/Users\") (subpath \"/Users\"))"));
 
         let store_deny = profile
-            .find("(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))")
+            .find("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
             .unwrap();
         let mount_parent = profile
             .find(
-                "(allow file-read* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven\"))",
+                "(allow file-read* (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven\"))",
             )
             .unwrap();
         let secret_deny = profile.rfind("/Users/tester/.ssh").unwrap();
@@ -911,11 +927,11 @@ mod tests {
         let config = config(RunSandboxMode::ReadOnly);
         let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor).unwrap();
         let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-        let protected_allow = "(allow file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
-        let ancestor_deny = "(deny file-write-create file-write-unlink (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed\"))";
-        let protected_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
-        let token_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/token\"))";
-        let environment_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/acme/widget/workspaces/raven/mount/.cowshed/env\"))";
+        let protected_allow = "(allow file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
+        let ancestor_deny = "(deny file-write-create file-write-unlink (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed\"))";
+        let protected_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
+        let token_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/token\"))";
+        let environment_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/env\"))";
 
         assert_eq!(supervisor.lines().last(), Some(protected_allow));
         assert!(!supervisor.contains(ancestor_deny));

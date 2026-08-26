@@ -454,8 +454,9 @@ mod tests {
     use proptest::prelude::*;
 
     fn layout() -> StorageLayout {
-        StorageLayout::new(
-            "/Users/test/.cowshed",
+        StorageLayout::with_mount_root(
+            "/private/cowshed/store",
+            "/Users/test/.cowshed/mnt",
             &RepoId::parse("acme/widget").unwrap(),
         )
         .unwrap()
@@ -540,19 +541,19 @@ mod tests {
             assert_eq!(
                 paths.sidecar,
                 PathBuf::from(format!(
-                    "/Users/test/.cowshed/acme/widget/sessions/raven{extension}.grants.json"
+                    "/private/cowshed/store/acme/widget/sessions/raven{extension}.grants.json"
                 ))
             );
             assert_eq!(
                 paths.lock,
                 PathBuf::from(format!(
-                    "/Users/test/.cowshed/acme/widget/sessions/raven{extension}.lock"
+                    "/private/cowshed/store/acme/widget/sessions/raven{extension}.lock"
                 ))
             );
             assert_eq!(
                 paths.ca_private_key,
                 PathBuf::from(format!(
-                    "/Users/test/.cowshed/acme/widget/sessions/raven{extension}.ca.key"
+                    "/private/cowshed/store/acme/widget/sessions/raven{extension}.ca.key"
                 ))
             );
             assert_eq!(ImageFormat::from_image_path(&paths.image).unwrap(), format);
@@ -567,18 +568,18 @@ mod tests {
         let label = CheckpointLabel::new("ci-fail.2026-07-11").unwrap();
         assert_eq!(
             layout.main_image(ImageFormat::Asif).unwrap().image,
-            Path::new("/Users/test/.cowshed/acme/widget/main.asif")
+            Path::new("/private/cowshed/store/acme/widget/main.asif")
         );
         assert_eq!(
             layout.staged_main_image(ImageFormat::Sparse).unwrap().image,
-            Path::new("/Users/test/.cowshed/acme/widget/.staging/main.sparseimage")
+            Path::new("/private/cowshed/store/acme/widget/.staging/main.sparseimage")
         );
         assert_eq!(
             layout
                 .checkpoint_image(&raven, &label, ImageFormat::Asif)
                 .unwrap()
                 .image,
-            Path::new("/Users/test/.cowshed/acme/widget/checkpoints/raven/ci-fail.2026-07-11.asif")
+            Path::new("/private/cowshed/store/acme/widget/checkpoints/raven/ci-fail.2026-07-11.asif")
         );
         assert_eq!(
             layout.workspace_mount(&raven).unwrap(),

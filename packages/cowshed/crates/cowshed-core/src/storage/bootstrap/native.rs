@@ -25,6 +25,10 @@ const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const KILLALL: &str = "/usr/bin/killall";
+#[cfg(target_os = "macos")]
+const MKDIR: &str = "/bin/mkdir";
+#[cfg(target_os = "macos")]
+const RM: &str = "/bin/rm";
 
 fn is_diskutil_mount(command: &HostCommand) -> bool {
     command.program() == DISKUTIL
@@ -99,6 +103,8 @@ use super::{
     VolumeRole, execute_bootstrap, execute_bootstrap_operation, plan_bootstrap,
     require_mounted_marker, select_substrate,
 };
+#[cfg(test)]
+use super::{CACHES_ROOT, STORE_ROOT};
 use crate::storage::fstab::{FstabPin, build_fstab};
 #[cfg(target_os = "macos")]
 use super::{ApfsProvisionKind, VOLUME_MARKER_FILE, VolumeMarker};
@@ -333,12 +339,16 @@ impl BootstrapHost for SystemBootstrapHost {
         {
             let uid = unsafe { libc::getuid() };
             let gid = unsafe { libc::getgid() };
-            provision_apfs_volumes_with(
+            let mut session = MacAuthorizationSession::acquire()?;
+            for volume in volumes {
+                create_authorized_directory(&mut session, volume.mountpoint())?;
+            }
+            provision_apfs_volumes_in_session(
                 container,
                 volumes,
                 uid,
                 gid,
-                MacAuthorizationSession::acquire,
+                &mut session,
                 &SystemApfsProvisionIo,
             )
         }
@@ -398,11 +408,11 @@ impl BootstrapHost for AuthorizedBootstrapHost {
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError> {
-        SystemBootstrapHost.create_dir_all(path)
+        create_authorized_directory(&mut *self.session()?, path)
     }
 
     fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError> {
-        SystemBootstrapHost.reclaim_mountpoint(path)
+        reclaim_authorized_mountpoint(&mut *self.session()?, path)
     }
 
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
@@ -435,12 +445,16 @@ impl BootstrapHost for AuthorizedBootstrapHost {
     ) -> Result<(), HostError> {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+        let mut session = self.session()?;
+        for volume in volumes {
+            create_authorized_directory(&mut *session, volume.mountpoint())?;
+        }
         provision_apfs_volumes_in_session(
             container,
             volumes,
             uid,
             gid,
-            &mut *self.session()?,
+            &mut *session,
             &SystemApfsProvisionIo,
         )
     }
@@ -558,7 +572,10 @@ where
             },
         ));
     }
-    Ok(ValidatedHostStorage::new(plan.roots().clone()))
+    Ok(ValidatedHostStorage::new(
+        plan.home().to_owned(),
+        plan.roots().clone(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -683,6 +700,20 @@ fn volume_action(storage: &ExistingStorage) -> &'static str {
         } => "mounted",
     }
 }
+fn repair_mountpoint(storage: &ExistingStorage) -> Option<&Path> {
+    match storage {
+        ExistingStorage::MisMountedIncomplete {
+            current_mountpoint,
+            ..
+        } => Some(current_mountpoint),
+        ExistingStorage::FoundElsewhere {
+            mounted_at: Some(mounted_at),
+            ..
+        } => Some(mounted_at),
+        _ => None,
+    }
+}
+
 
 fn build_host_actions(
     volumes: &[ClassifiedVolume],
@@ -703,7 +734,24 @@ fn build_host_actions(
             paths: reclaimable_stubs,
         });
     }
-    for volume in volumes {
+    // The retired layout mounted caches beneath store. Unmount descendants before ancestors so
+    // one authorization session can migrate both volumes without a nested mount blocking store.
+    let mut ordered_volumes = volumes.iter().collect::<Vec<_>>();
+    ordered_volumes.sort_by(|left, right| {
+        match (
+            repair_mountpoint(&left.storage),
+            repair_mountpoint(&right.storage),
+        ) {
+            (Some(left), Some(right)) if left != right && left.starts_with(right) => {
+                std::cmp::Ordering::Less
+            }
+            (Some(left), Some(right)) if left != right && right.starts_with(left) => {
+                std::cmp::Ordering::Greater
+            }
+            _ => std::cmp::Ordering::Equal,
+        }
+    });
+    for volume in ordered_volumes {
         let existing_identity = || {
             let uuid = volume.volume_uuid.clone().ok_or_else(|| {
                 NativeBootstrapError::MalformedPlist(format!(
@@ -1337,7 +1385,8 @@ fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
             | HostOperation::GuardMountpoint { .. }
             | HostOperation::EnsureDirectory(_)
             | HostOperation::ReclaimMountpoint(_)
-            | HostOperation::MountApfsVolume { .. } => None,
+            | HostOperation::MountApfsVolume { .. }
+            | HostOperation::ReportVolumeIssue { .. } => None,
             HostOperation::RunCommand(command) => {
                 remount_setup_action(command).map(|action| action.to_owned())
             }
@@ -1355,7 +1404,6 @@ fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
             HostOperation::PinVolumesInFstab { .. } => {
                 Some("pin cowshed APFS volumes in /etc/fstab".to_owned())
             }
-            HostOperation::ReportVolumeIssue { detail, .. } => Some(detail.clone()),
         })
         .collect()
 }
@@ -1624,7 +1672,7 @@ fn gather_existing_apfs_evidence(
         ),
     )?;
     let container = inventory.containing_container(&mount_device)?;
-    let roots = super::CanonicalRoots::for_home(home)?;
+    let roots = super::CanonicalRoots::global();
     let mut store = classify_volume(
         source,
         container,
@@ -2235,7 +2283,7 @@ where
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn provision_apfs_volumes_with<S>(
     container: &str,
     volumes: &[ApfsVolumeProvision],
@@ -3005,12 +3053,65 @@ fn is_reclaimable_telemetry_dir(path: &Path) -> Result<bool, HostError> {
 fn reclaim_system_mountpoint(path: &Path) -> Result<(), HostError> {
     require_host_canonical(path)?;
     match inspect_system_mountpoint(path)? {
-        MountpointState::Missing | MountpointState::EmptyDirectory => Ok(()),
+        MountpointState::Missing => fs::create_dir_all(path)
+            .map_err(|source| host_io_error("create APFS mountpoint", path, source)),
+        MountpointState::EmptyDirectory => Ok(()),
         MountpointState::ReclaimableStub { .. } => {
             fs::remove_dir_all(path)
                 .map_err(|source| host_io_error("reclaim launchd mount stub", path, source))?;
             fs::create_dir_all(path)
                 .map_err(|source| host_io_error("recreate APFS mountpoint", path, source))
+        }
+        MountpointState::NonEmptyDirectoryWithoutMount | MountpointState::Mounted { .. } => {
+            Err(HostError::new(format!(
+                "refusing to reclaim non-empty or mounted path {path:?}"
+            )))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn create_authorized_directory(
+    session: &mut impl PrivilegedCommandSession,
+    path: &Path,
+) -> Result<(), HostError> {
+    require_host_canonical(path)?;
+    let path_argument = path_argument(path)?;
+    run_privileged_command(
+        session,
+        &HostCommand::new(MKDIR, ["-p", path_argument.as_str()]),
+    )?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| host_io_error("inspect authorized directory", path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(HostError::new(format!(
+            "authorized mountpoint is not a no-follow directory: {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn reclaim_authorized_mountpoint(
+    session: &mut impl PrivilegedCommandSession,
+    path: &Path,
+) -> Result<(), HostError> {
+    require_host_canonical(path)?;
+    match inspect_system_mountpoint(path)? {
+        MountpointState::Missing => create_authorized_directory(session, path),
+        MountpointState::EmptyDirectory => Ok(()),
+        MountpointState::ReclaimableStub { .. } => {
+            let path_argument = path_argument(path)?;
+            run_privileged_command(
+                session,
+                &HostCommand::new(RM, ["-rf", path_argument.as_str()]),
+            )?;
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(HostError::new(format!(
+                    "authorized reclaim left the mountpoint in place: {path:?}"
+                )));
+            }
+            create_authorized_directory(session, path)
         }
         MountpointState::NonEmptyDirectoryWithoutMount | MountpointState::Mounted { .. } => {
             Err(HostError::new(format!(
@@ -3366,30 +3467,30 @@ mod tests {
             command_outputs: VecDeque::new(),
             mountpoints: BTreeMap::from([
                 (
-                    PathBuf::from("/Users/alice/.cowshed"),
+                    PathBuf::from("/private/cowshed/store"),
                     MountpointState::EmptyDirectory,
                 ),
                 (
-                    PathBuf::from("/Users/alice/.cowshed/caches"),
+                    PathBuf::from("/private/cowshed/caches"),
                     MountpointState::Missing,
                 ),
             ]),
             mounted_volumes: BTreeMap::from([
                 (
-                    PathBuf::from("/Users/alice/.cowshed"),
+                    PathBuf::from("/private/cowshed/store"),
                     MountedVolumeEvidence {
                         exact_identifier: "disk3s8".to_owned(),
-                        mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+                        mountpoint: PathBuf::from("/private/cowshed/store"),
                         nobrowse: true,
                         uid: 501,
                         gid: 20,
                     },
                 ),
                 (
-                    PathBuf::from("/Users/alice/.cowshed/caches"),
+                    PathBuf::from("/private/cowshed/caches"),
                     MountedVolumeEvidence {
                         exact_identifier: "disk3s9".to_owned(),
-                        mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+                        mountpoint: PathBuf::from("/private/cowshed/caches"),
                         nobrowse: true,
                         uid: 501,
                         gid: 20,
@@ -3404,15 +3505,15 @@ mod tests {
 
     fn healthy_existing_source() -> FakeEvidenceSource {
         let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
-            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/Users/alice/.cowshed"))
+            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store"))
             + &volume(
                 APFS_CACHES_VOLUME,
                 "disk3s9",
-                Some("/Users/alice/.cowshed/caches"),
+                Some("/private/cowshed/caches"),
             );
         let mut source = source(plist(&container("disk3", &volumes)));
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
                 marker: Some(
                     VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
@@ -3422,7 +3523,7 @@ mod tests {
             },
         );
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed/caches"),
+            PathBuf::from("/private/cowshed/caches"),
             MountpointState::Mounted {
                 marker: Some(
                     VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Apfs)
@@ -3434,36 +3535,80 @@ mod tests {
         source
     }
 
+    fn retired_home_source() -> FakeEvidenceSource {
+        let retired_store = PathBuf::from("/Users/alice/.cowshed");
+        let retired_caches = retired_store.join("caches");
+        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
+            + &volume(
+                APFS_STORE_VOLUME,
+                "disk3s8",
+                Some(retired_store.to_str().unwrap()),
+            )
+            + &volume(
+                APFS_CACHES_VOLUME,
+                "disk3s9",
+                Some(retired_caches.to_str().unwrap()),
+            );
+        let mut source = healthy_existing_source();
+        source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
+        source.mountpoints.insert(
+            PathBuf::from(super::STORE_ROOT),
+            MountpointState::Missing,
+        );
+        source.mountpoints.insert(
+            PathBuf::from(super::CACHES_ROOT),
+            MountpointState::Missing,
+        );
+        source.mounted_volumes.remove(Path::new(super::STORE_ROOT));
+        source.mounted_volumes.remove(Path::new(super::CACHES_ROOT));
+        for (path, identifier) in [
+            (retired_store, "disk3s8"),
+            (retired_caches, "disk3s9"),
+        ] {
+            source.mounted_volumes.insert(
+                path.clone(),
+                MountedVolumeEvidence {
+                    exact_identifier: identifier.to_owned(),
+                    mountpoint: path,
+                    nobrowse: true,
+                    uid: 501,
+                    gid: 20,
+                },
+            );
+        }
+        source
+    }
+
     fn source_with_caches_inventory_mountpoint_omitted(
         volume_mountpoint: Option<&str>,
     ) -> FakeEvidenceSource {
         let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
-            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/Users/alice/.cowshed"))
+            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/private/cowshed/store"))
             + &volume(APFS_CACHES_VOLUME, "disk3s9", None);
         let mut source = healthy_existing_source();
         source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed/caches"),
+            PathBuf::from("/private/cowshed/caches"),
             MountpointState::Missing,
         );
         source
             .mounted_volumes
-            .remove(Path::new("/Users/alice/.cowshed/caches"));
-        source.mounted_volumes.insert(
-            PathBuf::from("/Volumes/cowshed.caches"),
-            MountedVolumeEvidence {
-                exact_identifier: "disk3s9".to_owned(),
-                mountpoint: PathBuf::from("/Volumes/cowshed.caches"),
-                nobrowse: false,
-                uid: 501,
-                gid: 20,
-            },
-        );
+            .remove(Path::new("/private/cowshed/caches"));
         if let Some(mountpoint) = volume_mountpoint {
-            source.volume_mountpoints.insert(
-                "disk3s9".to_owned(),
-                Some(PathBuf::from(mountpoint)),
+            let mountpoint = PathBuf::from(mountpoint);
+            source.mounted_volumes.insert(
+                mountpoint.clone(),
+                MountedVolumeEvidence {
+                    exact_identifier: "disk3s9".to_owned(),
+                    mountpoint: mountpoint.clone(),
+                    nobrowse: false,
+                    uid: 501,
+                    gid: 20,
+                },
             );
+            source
+                .volume_mountpoints
+                .insert("disk3s9".to_owned(), Some(mountpoint));
         }
         source
     }
@@ -3486,9 +3631,9 @@ mod tests {
 
         fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError> {
             self.inspections.fetch_add(1, Ordering::SeqCst);
-            let role = if path == Path::new("/Users/alice/.cowshed") {
+            let role = if path == Path::new("/private/cowshed/store") {
                 VolumeRole::Store
-            } else if path == Path::new("/Users/alice/.cowshed/caches") {
+            } else if path == Path::new("/private/cowshed/caches") {
                 VolumeRole::Caches
             } else {
                 return Err(HostError::new(format!(
@@ -3760,7 +3905,7 @@ mod tests {
             },
         );
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
                 marker: Some(
                     VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
@@ -3770,7 +3915,7 @@ mod tests {
             },
         );
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed/caches"),
+            PathBuf::from("/private/cowshed/caches"),
             MountpointState::Mounted {
                 marker: Some(
                     VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Apfs)
@@ -3846,7 +3991,7 @@ mod tests {
         let inventory = plist(&container("disk3", &volumes));
         let mut valid = source(inventory.clone());
         valid.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
                 marker: Some(marker.clone()),
             },
@@ -3865,14 +4010,14 @@ mod tests {
 
         let mut wrong_owner = source(inventory.clone());
         wrong_owner.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
                 marker: Some(marker.clone()),
             },
         );
         wrong_owner
             .mounted_volumes
-            .get_mut(Path::new("/Users/alice/.cowshed"))
+            .get_mut(Path::new("/private/cowshed/store"))
             .unwrap()
             .uid = 0;
         let gathered = gather_apfs_evidence(
@@ -3891,14 +4036,14 @@ mod tests {
 
         let mut wrong_group = source(inventory.clone());
         wrong_group.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
                 marker: Some(marker.clone()),
             },
         );
         wrong_group
             .mounted_volumes
-            .get_mut(Path::new("/Users/alice/.cowshed"))
+            .get_mut(Path::new("/private/cowshed/store"))
             .unwrap()
             .gid = 0;
         let gathered = gather_apfs_evidence(
@@ -3917,14 +4062,14 @@ mod tests {
 
         let mut wrong_flags = source(inventory.clone());
         wrong_flags.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
                 marker: Some(marker.clone()),
             },
         );
         wrong_flags
             .mounted_volumes
-            .get_mut(Path::new("/Users/alice/.cowshed"))
+            .get_mut(Path::new("/private/cowshed/store"))
             .unwrap()
             .nobrowse = false;
         let gathered = gather_apfs_evidence(
@@ -3942,12 +4087,12 @@ mod tests {
                 },
                 ..
             } if exact_identifier == "disk3s8"
-                && current_mountpoint == Path::new("/Users/alice/.cowshed")
+                && current_mountpoint == Path::new("/private/cowshed/store")
         ));
 
         let mut incomplete = source(inventory.clone());
         incomplete.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted { marker: None },
         );
         let gathered = gather_apfs_evidence(
@@ -3981,7 +4126,7 @@ mod tests {
 
         let mut invalid = source(inventory);
         invalid.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted {
                 marker: Some(b"{}".to_vec()),
             },
@@ -4017,7 +4162,7 @@ mod tests {
         ));
         let mut source = source(inventory);
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::NonEmptyDirectoryWithoutMount,
         );
         assert!(matches!(
@@ -4041,9 +4186,9 @@ mod tests {
             + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
         let mut source = source(plist(&container("disk3", &volumes)));
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
-                paths: vec![PathBuf::from("/Users/alice/.cowshed/telemetry")],
+                paths: vec![PathBuf::from("/private/cowshed/store/telemetry")],
             },
         );
         source.mounted_volumes.insert(
@@ -4078,7 +4223,7 @@ mod tests {
             operations.iter().any(|operation| matches!(
                 operation,
                 HostOperation::ReclaimMountpoint(path)
-                    if path == Path::new("/Users/alice/.cowshed")
+                    if path == Path::new("/private/cowshed/store")
             )),
             "{operations:?}"
         );
@@ -4116,9 +4261,9 @@ mod tests {
             + &volume("Data", "disk3s5", Some("/System/Volumes/Data"));
         let mut source = source(plist(&container("disk3", &volumes)));
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
-                paths: vec![PathBuf::from("/Users/alice/.cowshed/telemetry")],
+                paths: vec![PathBuf::from("/private/cowshed/store/telemetry")],
             },
         );
         source.mounted_volumes.insert(
@@ -4158,11 +4303,11 @@ mod tests {
             + &volume(APFS_CACHES_VOLUME, "disk3s9", None);
         let mut source = source(plist(&container("disk3", &volumes)));
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::ReclaimableStub {
                 paths: vec![
-                    PathBuf::from("/Users/alice/.cowshed/caches"),
-                    PathBuf::from("/Users/alice/.cowshed/telemetry"),
+                    PathBuf::from("/private/cowshed/caches"),
+                    PathBuf::from("/private/cowshed/store/telemetry"),
                 ],
             },
         );
@@ -4173,8 +4318,8 @@ mod tests {
             snapshot.actions.first(),
             Some(&HostAction::ReclaimStubs {
                 paths: vec![
-                    PathBuf::from("/Users/alice/.cowshed/caches"),
-                    PathBuf::from("/Users/alice/.cowshed/telemetry"),
+                    PathBuf::from("/private/cowshed/caches"),
+                    PathBuf::from("/private/cowshed/store/telemetry"),
                 ],
             })
         );
@@ -4257,7 +4402,7 @@ mod tests {
                 "disk3s8",
                 "disk3",
                 APFS_STORE_VOLUME,
-                "/Users/alice/.cowshed",
+                "/private/cowshed/store",
             ))),
             Ok(HostCommandOutput::default()),
             Ok(HostCommandOutput::success(
@@ -4274,20 +4419,20 @@ mod tests {
                 "disk3s9",
                 "disk3",
                 APFS_CACHES_VOLUME,
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
             ))),
             Ok(HostCommandOutput::default()),
         ]);
         let volumes = [
             ApfsVolumeProvision {
                 name: APFS_STORE_VOLUME,
-                mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+                mountpoint: PathBuf::from("/private/cowshed/store"),
                 role: VolumeRole::Store,
                 kind: ApfsProvisionKind::Create,
             },
             ApfsVolumeProvision {
                 name: APFS_CACHES_VOLUME,
-                mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+                mountpoint: PathBuf::from("/private/cowshed/caches"),
                 role: VolumeRole::Caches,
                 kind: ApfsProvisionKind::Create,
             },
@@ -4349,20 +4494,20 @@ mod tests {
             [
                 &(
                     CHOWN,
-                    &vec!["501:20".to_owned(), "/Users/alice/.cowshed".to_owned()]
+                    &vec!["501:20".to_owned(), "/private/cowshed/store".to_owned()]
                 ),
                 &(
                     CHOWN,
                     &vec![
                         "501:20".to_owned(),
-                        "/Users/alice/.cowshed/caches".to_owned()
+                        "/private/cowshed/caches".to_owned()
                     ]
                 ),
             ]
         );
         for root in [
-            Path::new("/Users/alice/.cowshed"),
-            Path::new("/Users/alice/.cowshed/caches"),
+            Path::new("/private/cowshed/store"),
+            Path::new("/private/cowshed/caches"),
         ] {
             let chown = events
                 .iter()
@@ -4412,7 +4557,7 @@ mod tests {
         );
         let volume = ApfsVolumeProvision {
             name: APFS_STORE_VOLUME,
-            mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+            mountpoint: PathBuf::from("/private/cowshed/store"),
             role: VolumeRole::Store,
             kind: ApfsProvisionKind::Create,
         };
@@ -4459,13 +4604,13 @@ mod tests {
                 "disk3s9",
                 "disk3",
                 APFS_CACHES_VOLUME,
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
             ))),
             Ok(HostCommandOutput::default()),
         ]);
         let volume = ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
-            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            mountpoint: PathBuf::from("/private/cowshed/caches"),
             role: VolumeRole::Caches,
             kind: ApfsProvisionKind::RepairMounted {
                 exact_identifier: "disk3s9".to_owned(),
@@ -4504,7 +4649,7 @@ mod tests {
         assert_eq!(commands[1].0, CHOWN);
         assert_eq!(
             commands[1].1.as_slice(),
-            ["502:80", "/Users/alice/.cowshed/caches"]
+            ["502:80", "/private/cowshed/caches"]
         );
         let mounted = events
             .iter()
@@ -4535,13 +4680,13 @@ mod tests {
                 "disk3s9",
                 "disk3",
                 APFS_CACHES_VOLUME,
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
             ))),
             Ok(HostCommandOutput::default()),
         ]);
         let volume = ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
-            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            mountpoint: PathBuf::from("/private/cowshed/caches"),
             role: VolumeRole::Caches,
             kind: ApfsProvisionKind::RecoverDetached {
                 exact_identifier: "disk3s9".to_owned(),
@@ -4584,7 +4729,7 @@ mod tests {
                 "mount",
                 "-nobrowse",
                 "-mountPoint",
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
                 "disk3s9",
             ]
         );
@@ -4593,7 +4738,7 @@ mod tests {
         assert_eq!(commands[3].0, CHOWN);
         assert_eq!(
             commands[3].1.as_slice(),
-            ["503:20", "/Users/alice/.cowshed/caches"]
+            ["503:20", "/private/cowshed/caches"]
         );
         assert!(
             !commands.iter().any(|(_, args)| {
@@ -4640,13 +4785,13 @@ mod tests {
                 "disk3s9",
                 "disk3",
                 APFS_CACHES_VOLUME,
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
             ))),
             Ok(HostCommandOutput::default()),
         ]);
         let volume = ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
-            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            mountpoint: PathBuf::from("/private/cowshed/caches"),
             role: VolumeRole::Caches,
             kind: ApfsProvisionKind::RepairMisMounted {
                 exact_identifier: "disk3s9".to_owned(),
@@ -4703,7 +4848,7 @@ mod tests {
                 "mount",
                 "-nobrowse",
                 "-mountPoint",
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
                 "disk3s9",
             ]
         );
@@ -4711,7 +4856,7 @@ mod tests {
         assert_eq!(commands[4].0, CHOWN);
         assert_eq!(
             commands[4].1.as_slice(),
-            ["504:20", "/Users/alice/.cowshed/caches"]
+            ["504:20", "/private/cowshed/caches"]
         );
         let pre_attestation = events
             .iter()
@@ -4740,7 +4885,7 @@ mod tests {
                 matches!(
                     event,
                     ProvisionEvent::AttestMounted(path, identifier, true)
-                        if path == Path::new("/Users/alice/.cowshed/caches")
+                        if path == Path::new("/private/cowshed/caches")
                             && identifier == "disk3s9"
                 )
             })
@@ -4785,13 +4930,13 @@ mod tests {
                 "disk3s8",
                 "disk3",
                 APFS_STORE_VOLUME,
-                "/Users/alice/.cowshed",
+                "/private/cowshed/store",
             ))),
             Ok(HostCommandOutput::default()),
         ]);
         let volumes = [ApfsVolumeProvision {
             name: APFS_STORE_VOLUME,
-            mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+            mountpoint: PathBuf::from("/private/cowshed/store"),
             role: VolumeRole::Store,
             kind: ApfsProvisionKind::Create,
         }];
@@ -4851,7 +4996,7 @@ mod tests {
                 "mount",
                 "-nobrowse",
                 "-mountPoint",
-                "/Users/alice/.cowshed",
+                "/private/cowshed/store",
                 "disk3s8",
             ]
         );
@@ -4878,13 +5023,13 @@ mod tests {
                 "disk3s9",
                 "disk3",
                 APFS_CACHES_VOLUME,
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
             ))),
             Ok(HostCommandOutput::default()),
         ]);
         let volumes = [ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
-            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            mountpoint: PathBuf::from("/private/cowshed/caches"),
             role: VolumeRole::Caches,
             kind: ApfsProvisionKind::RecoverDetached {
                 exact_identifier: "disk3s9".to_owned(),
@@ -4927,7 +5072,7 @@ mod tests {
                 "mount",
                 "-nobrowse",
                 "-mountPoint",
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
                 "disk3s9",
             ]
         );
@@ -4981,7 +5126,7 @@ mod tests {
     fn authorization_denial_and_child_failure_propagate_without_marker_publication() {
         let volume = ApfsVolumeProvision {
             name: APFS_CACHES_VOLUME,
-            mountpoint: PathBuf::from("/Users/alice/.cowshed/caches"),
+            mountpoint: PathBuf::from("/private/cowshed/caches"),
             role: VolumeRole::Caches,
             kind: ApfsProvisionKind::Create,
         };
@@ -5106,6 +5251,56 @@ mod tests {
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
     }
+    #[test]
+    fn retired_home_mounts_are_remounted_child_first_and_repin_global_roots() {
+        let mut source = retired_home_source();
+        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
+            .expect("retired home layout has one-session migration plan");
+
+        let repairs = snapshot
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                HostAction::RepairMounted {
+                    name,
+                    mounted_at,
+                    mount_at,
+                    ..
+                } => Some((name.as_str(), mounted_at.as_path(), mount_at.as_path())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repairs,
+            [
+                (
+                    APFS_CACHES_VOLUME,
+                    Path::new("/Users/alice/.cowshed/caches"),
+                    Path::new(CACHES_ROOT),
+                ),
+                (
+                    APFS_STORE_VOLUME,
+                    Path::new("/Users/alice/.cowshed"),
+                    Path::new(STORE_ROOT),
+                ),
+            ]
+        );
+        assert!(matches!(
+            &snapshot.fstab,
+            PlannedFstab::NeedsPin(pins)
+                if pins.iter().any(|pin| pin.mountpoint == Path::new(STORE_ROOT))
+                    && pins.iter().any(|pin| pin.mountpoint == Path::new(CACHES_ROOT))
+        ));
+
+        let findings = read_only_validation_actions(&snapshot.plan).join("\n");
+        assert!(findings.contains(
+            "cowshed.store is mounted at /Users/alice/.cowshed instead of /private/cowshed/store"
+        ));
+        assert!(findings.contains(
+            "cowshed.caches is mounted at /Users/alice/.cowshed/caches instead of /private/cowshed/caches"
+        ));
+        assert!(findings.contains("cowshed setup will remount it and rewrite its /etc/fstab pin"));
+    }
 
     #[test]
     fn volume_absent_from_inventory_and_mountpoint_info_requires_provisioning() {
@@ -5186,7 +5381,7 @@ mod tests {
             } if name == APFS_STORE_VOLUME
                 && uuid == "disk7s2-UUID"
                 && mounted_at == Path::new("/Volumes/cowshed.store")
-                && mount_at == Path::new("/Users/alice/.cowshed")
+                && mount_at == Path::new("/private/cowshed/store")
         )));
         assert!(!plan.operations().iter().any(|operation| matches!(
             operation,
@@ -5209,7 +5404,7 @@ mod tests {
             HostAction::CreateVolume { name, container, mount_at }
                 if name == APFS_CACHES_VOLUME
                     && container == "disk3"
-                    && mount_at == Path::new("/Users/alice/.cowshed/caches")
+                    && mount_at == Path::new("/private/cowshed/caches")
         )));
         let public_plan = HostSetupPlan::new(
             snapshot.actions.clone(),
@@ -5241,11 +5436,11 @@ mod tests {
             vec![
                 HostAction::PinFstab {
                     uuid: "disk3s8-UUID".to_owned(),
-                    mount_at: PathBuf::from("/Users/alice/.cowshed"),
+                    mount_at: PathBuf::from("/private/cowshed/store"),
                 },
                 HostAction::PinFstab {
                     uuid: "disk3s9-UUID".to_owned(),
-                    mount_at: PathBuf::from("/Users/alice/.cowshed/caches"),
+                    mount_at: PathBuf::from("/private/cowshed/caches"),
                 },
             ]
         );
@@ -5297,8 +5492,8 @@ mod tests {
     async fn mid_sequence_failure_reports_done_failed_and_skipped_actions() {
         let mut source = healthy_existing_source();
         for path in [
-            PathBuf::from("/Users/alice/.cowshed"),
-            PathBuf::from("/Users/alice/.cowshed/caches"),
+            PathBuf::from("/private/cowshed/store"),
+            PathBuf::from("/private/cowshed/caches"),
         ] {
             source
                 .mountpoints
@@ -5394,17 +5589,17 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             uuid: "STORE-UUID".to_owned(),
             size_bytes: 1_000_000_000_000,
             mounted_at: PathBuf::from("/Volumes/cowshed.store"),
-            mount_at: PathBuf::from("/Users/alice/.cowshed"),
+            mount_at: PathBuf::from("/private/cowshed/store"),
         };
         assert_eq!(
             serde_json::to_string(&action).expect("host action"),
-            "{\"repairMounted\":{\"name\":\"cowshed.store\",\"uuid\":\"STORE-UUID\",\"sizeBytes\":1000000000000,\"mountedAt\":\"/Volumes/cowshed.store\",\"mountAt\":\"/Users/alice/.cowshed\"}}"
+            "{\"repairMounted\":{\"name\":\"cowshed.store\",\"uuid\":\"STORE-UUID\",\"sizeBytes\":1000000000000,\"mountedAt\":\"/Volumes/cowshed.store\",\"mountAt\":\"/private/cowshed/store\"}}"
         );
 
         let failed = HostActionOutcome {
             action: HostAction::PinFstab {
                 uuid: "STORE-UUID".to_owned(),
-                mount_at: PathBuf::from("/Users/alice/.cowshed"),
+                mount_at: PathBuf::from("/private/cowshed/store"),
             },
             outcome: HostActionResult::Failed {
                 error: CowshedError::internal("install failed"),
@@ -5412,7 +5607,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         };
         assert_eq!(
             serde_json::to_string(&failed).expect("failed outcome"),
-            "{\"action\":{\"pinFstab\":{\"uuid\":\"STORE-UUID\",\"mountAt\":\"/Users/alice/.cowshed\"}},\"outcome\":{\"failed\":{\"error\":{\"code\":\"internal\",\"message\":\"install failed\",\"hint\":\"cowshed doctor --json\"}}}}"
+            "{\"action\":{\"pinFstab\":{\"uuid\":\"STORE-UUID\",\"mountAt\":\"/private/cowshed/store\"}},\"outcome\":{\"failed\":{\"error\":{\"code\":\"internal\",\"message\":\"install failed\",\"hint\":\"cowshed doctor --json\"}}}}"
         );
 
         let uninstall = crate::api::JsonEnvelope::success(UninstallReport {
@@ -5469,14 +5664,14 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             .expect("existing storage validates");
 
         assert_eq!(validated.home(), Path::new("/Users/alice"));
-        assert_eq!(validated.store(), Path::new("/Users/alice/.cowshed"));
+        assert_eq!(validated.store(), Path::new("/private/cowshed/store"));
         assert_eq!(
             validated.caches(),
-            Path::new("/Users/alice/.cowshed/caches")
+            Path::new("/private/cowshed/caches")
         );
         assert_eq!(
             validated.telemetry(),
-            Path::new("/Users/alice/.cowshed/telemetry")
+            Path::new("/private/cowshed/store/telemetry")
         );
         assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
@@ -5488,11 +5683,11 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     async fn missing_marker_is_setup_required_before_executor_dispatch() {
         let mut source = healthy_existing_source();
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/private/cowshed/store"),
             MountpointState::Mounted { marker: None },
         );
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed/caches"),
+            PathBuf::from("/private/cowshed/caches"),
             MountpointState::Mounted { marker: None },
         );
         let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
@@ -5522,7 +5717,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     fn wrong_marker_is_an_operational_setup_error() {
         let mut source = healthy_existing_source();
         source.mountpoints.insert(
-            PathBuf::from("/Users/alice/.cowshed/caches"),
+            PathBuf::from("/private/cowshed/caches"),
             MountpointState::Mounted {
                 marker: Some(
                     VolumeMarker::new(VolumeRole::Store, SubstrateKind::Apfs)
@@ -5548,8 +5743,8 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         for unsafe_evidence in ["owner", "flags"] {
             let mut source = healthy_existing_source();
             for path in [
-                Path::new("/Users/alice/.cowshed"),
-                Path::new("/Users/alice/.cowshed/caches"),
+                Path::new("/private/cowshed/store"),
+                Path::new("/private/cowshed/caches"),
             ] {
                 let mounted = source
                     .mounted_volumes

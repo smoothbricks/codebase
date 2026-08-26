@@ -48,10 +48,10 @@ impl HostConfig {
 
     /// Resolve configuration for callers that only possess the canonical store root.
     ///
-    /// The current per-user substrate stores data at `~/.cowshed`, where the default is its `mnt`
-    /// child. The dedicated-volume spelling cannot reveal the invoking user's home, so that one
-    /// canonical path consults `HOME` only for the absent-config fallback. Persisted configuration
-    /// is always authoritative and does not depend on process environment.
+    /// Workspace mounts remain a per-user presentation layer even though the evidence volumes are
+    /// machine-global. The fixed store path cannot reveal the invoking user's home, so the absent
+    /// configuration fallback consults `HOME` only to derive `~/.cowshed/mnt`. Persisted
+    /// configuration is always authoritative and does not depend on process environment.
     pub fn load_for_store(store_root: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
         let default = if store_root == Path::new("/private/cowshed/store") {
