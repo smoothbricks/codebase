@@ -121,12 +121,8 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
     let socket = sccache_server_socket();
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let source = resolve_sccache_source(&home)?;
-    let executable = install_host_stable_executable(
-        &mut executor,
-        &home,
-        SCCACHE_BINARY_NAME,
-        &source,
-    )?;
+    let executable =
+        install_host_stable_executable(&mut executor, &home, SCCACHE_BINARY_NAME, &source)?;
     record_sccache_source(&executable, &source);
     let spec = LaunchAgentSpec::sccache(
         &executable,
@@ -549,12 +545,19 @@ mod tests {
         let resolved = resolve_sccache_source_in(
             &home,
             Some(OsStr::new(
-                on_path.parent().expect("path directory").to_str().expect("utf-8"),
+                on_path
+                    .parent()
+                    .expect("path directory")
+                    .to_str()
+                    .expect("utf-8"),
             )),
         )
         .expect("recorded sccache resolves");
 
-        assert_eq!(resolved, recorded.canonicalize().expect("canonical recorded"));
+        assert_eq!(
+            resolved,
+            recorded.canonicalize().expect("canonical recorded")
+        );
         assert_ne!(resolved, on_path);
     }
 
@@ -566,12 +569,13 @@ mod tests {
         let binary = fake_sccache(&home.join("shell/bin"));
         let directory = binary.parent().expect("path directory");
 
-        let resolved = resolve_sccache_source_in(
-            &home,
-            Some(OsStr::new(directory.to_str().expect("utf-8"))),
-        )
-        .expect("path sccache resolves");
-        assert_eq!(resolved, binary.canonicalize().expect("canonical candidate"));
+        let resolved =
+            resolve_sccache_source_in(&home, Some(OsStr::new(directory.to_str().expect("utf-8"))))
+                .expect("path sccache resolves");
+        assert_eq!(
+            resolved,
+            binary.canonicalize().expect("canonical candidate")
+        );
 
         record_sccache_source(&installed(&home), &resolved);
         assert_eq!(
@@ -591,12 +595,19 @@ mod tests {
         let resolved = resolve_sccache_source_in(
             &home,
             Some(OsStr::new(
-                binary.parent().expect("path directory").to_str().expect("utf-8"),
+                binary
+                    .parent()
+                    .expect("path directory")
+                    .to_str()
+                    .expect("utf-8"),
             )),
         )
         .expect("path sccache resolves");
 
-        assert_eq!(resolved, binary.canonicalize().expect("canonical candidate"));
+        assert_eq!(
+            resolved,
+            binary.canonicalize().expect("canonical candidate")
+        );
     }
 
     /// When both the record and PATH come up empty, the error names the stale record: blaming PATH
@@ -616,7 +627,11 @@ mod tests {
             "{}",
             error.message
         );
-        assert!(error.message.contains("no longer exists"), "{}", error.message);
+        assert!(
+            error.message.contains("no longer exists"),
+            "{}",
+            error.message
+        );
     }
 
     /// A record cowshed cannot make sense of must not strand the fallback: the heal reports it and
@@ -631,12 +646,19 @@ mod tests {
         let resolved = resolve_sccache_source_in(
             &home,
             Some(OsStr::new(
-                binary.parent().expect("path directory").to_str().expect("utf-8"),
+                binary
+                    .parent()
+                    .expect("path directory")
+                    .to_str()
+                    .expect("utf-8"),
             )),
         )
         .expect("path sccache resolves");
 
-        assert_eq!(resolved, binary.canonicalize().expect("canonical candidate"));
+        assert_eq!(
+            resolved,
+            binary.canonicalize().expect("canonical candidate")
+        );
         assert_eq!(recorded_sccache_source(&home).expect("record read"), None);
     }
 

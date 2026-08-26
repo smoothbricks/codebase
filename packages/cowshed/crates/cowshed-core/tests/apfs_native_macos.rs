@@ -2096,11 +2096,7 @@ fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
     let error = host
         .heal_mount(&workspace(ImageFormat::Sparse), &main_mount(&fixture))
         .expect_err("impostor must not be healed destructively");
-    assert!(
-        error
-            .to_string()
-            .contains("cannot use unrelated mount")
-    );
+    assert!(error.to_string().contains("cannot use unrelated mount"));
     let error = host
         .detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
         .expect_err("restart-safe detach must reject an impostor source");
@@ -3201,7 +3197,11 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
         let new_credential_mount = fixture.root.join("new-credential-mount");
         std::fs::create_dir_all(&old_credential_mount).expect("old credential mount");
         std::fs::create_dir_all(&new_credential_mount).expect("new credential mount");
-        mint_credentials(&workspace(ImageFormat::Sparse), &old_credential_mount, &ca_key_path(canonical.image()))
+        mint_credentials(
+            &workspace(ImageFormat::Sparse),
+            &old_credential_mount,
+            &ca_key_path(canonical.image()),
+        )
         .expect("old credentials");
         mint_credentials(&replacement, &new_credential_mount, &ca_key_path(&staged))
             .expect("replacement credentials");
@@ -3888,7 +3888,11 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
     create_image(&staged, ImageFormat::Sparse);
     let credential_mount = fixture.root.join("credential-mount");
     std::fs::create_dir_all(&credential_mount).expect("credential mount");
-    mint_credentials(&workspace(ImageFormat::Sparse), &credential_mount, &ca_key_path(&staged))
+    mint_credentials(
+        &workspace(ImageFormat::Sparse),
+        &credential_mount,
+        &ca_key_path(&staged),
+    )
     .expect("valid staged credentials");
     std::fs::write(&staged, b"complete adopted image").expect("staged bytes");
     std::fs::create_dir_all(&config.checkout_path).expect("source checkout");

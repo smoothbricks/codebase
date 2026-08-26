@@ -6,9 +6,7 @@ use cowshed_cli::runtime::{
     dispatch_and_shutdown,
 };
 use cowshed_core::api::*;
-use cowshed_core::metadata::{
-    ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
-};
+use cowshed_core::metadata::{ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use std::collections::HashSet;
@@ -697,7 +695,6 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
     );
     assert_eq!(stderr, b"next: cowshed exec raven -- git status\n");
 
-
     let (_, stdout, stderr) = run(&mut service, ["gc", "--dry-run"]).await;
     assert_eq!(stdout, b"0\n");
     assert_eq!(
@@ -984,10 +981,7 @@ async fn detach_all_detaches_every_attached_session_store_wide() {
     let (_, stdout, stderr) = run(&mut service, ["detach", "--all"]).await;
     assert!(stdout.is_empty(), "detach has no machine answer");
     assert!(stderr.is_empty());
-    assert_eq!(
-        service.events,
-        ["ls-all", "detach:warp", "detach:raven"]
-    );
+    assert_eq!(service.events, ["ls-all", "detach:warp", "detach:raven"]);
 }
 
 #[tokio::test]
@@ -1063,7 +1057,6 @@ async fn attach_refuses_an_ambiguous_project_without_partial_output() {
             .any(|event| event.starts_with("attach:"))
     );
 }
-
 
 #[tokio::test]
 async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
@@ -1515,21 +1508,14 @@ fn every_next_hint_verb_in_source_is_a_registered_command() {
                 error.message.starts_with("unknown command")
                     || error.message.starts_with("unknown flag")
             });
-            assert!(
-                !unknown,
-                "hint `{hint}` does not parse: {parsed:?}"
-            );
+            assert!(!unknown, "hint `{hint}` does not parse: {parsed:?}");
         }
     }
 }
 
 fn is_hint_placeholder(token: &str) -> bool {
-    token.starts_with('<')
-        || token.starts_with('[')
-        || token.contains("{}")
-        || token == "{}"
+    token.starts_with('<') || token.starts_with('[') || token.contains("{}") || token == "{}"
 }
-
 
 fn collect_rust_source(path: &std::path::Path, out: &mut String) {
     if path.is_dir() {
@@ -1543,5 +1529,3 @@ fn collect_rust_source(path: &std::path::Path, out: &mut String) {
         out.push('\n');
     }
 }
-
-

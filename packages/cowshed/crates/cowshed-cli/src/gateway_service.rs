@@ -28,9 +28,8 @@ pub use cowshed_core::gateway_sessions::{
     GATEWAY_START_HINT, GatewayControl, GatewayInstaller, NativeSessionInventory, ReconcileReport,
     SessionInventory, canonical_home, control_error, control_socket_path, effective_uid,
     gateway_absent, install_all_sessions, policy_from_grants, project_session_prefix,
-    reconcile_against_status,
-    reconcile_inventory_project, reconcile_native_project, reconcile_project, session_from_fact,
-    sessions_from_facts, stable_workspace_id,
+    reconcile_against_status, reconcile_inventory_project, reconcile_native_project,
+    reconcile_project, session_from_fact, sessions_from_facts, stable_workspace_id,
 };
 
 /// How long `gateway start` waits for the daemon's control socket.
@@ -250,12 +249,7 @@ where
     let started = tokio::time::Instant::now();
     loop {
         if let Ok(status) = client.status().await {
-            return Ok(cli_status(
-                true,
-                true,
-                paths.control_socket,
-                Some(&status),
-            ));
+            return Ok(cli_status(true, true, paths.control_socket, Some(&status)));
         }
         let waited = started.elapsed();
         if waited >= START_DEADLINE {
@@ -909,15 +903,22 @@ mod tests {
         let mut progress = StartProgress::new(Some(7));
 
         assert_eq!(progress.line(Duration::from_secs(0)), None);
-        assert_eq!(progress.line(START_PROGRESS_INTERVAL - Duration::from_millis(1)), None);
+        assert_eq!(
+            progress.line(START_PROGRESS_INTERVAL - Duration::from_millis(1)),
+            None
+        );
         assert_eq!(
             progress.line(START_PROGRESS_INTERVAL),
-            Some(String::from("waited 5s for the gateway: mounting 7 adopted projects…"))
+            Some(String::from(
+                "waited 5s for the gateway: mounting 7 adopted projects…"
+            ))
         );
         assert_eq!(progress.line(START_PROGRESS_INTERVAL), None);
         assert_eq!(
             progress.line(START_PROGRESS_INTERVAL * 2),
-            Some(String::from("waited 10s for the gateway: mounting 7 adopted projects…"))
+            Some(String::from(
+                "waited 10s for the gateway: mounting 7 adopted projects…"
+            ))
         );
     }
 
@@ -929,12 +930,16 @@ mod tests {
 
         assert_eq!(
             progress.line(Duration::from_secs(90)),
-            Some(String::from("waited 90s for the gateway: mounting 2 adopted projects…"))
+            Some(String::from(
+                "waited 90s for the gateway: mounting 2 adopted projects…"
+            ))
         );
         assert_eq!(progress.line(Duration::from_secs(93)), None);
         assert_eq!(
             progress.line(Duration::from_secs(95)),
-            Some(String::from("waited 95s for the gateway: mounting 2 adopted projects…"))
+            Some(String::from(
+                "waited 95s for the gateway: mounting 2 adopted projects…"
+            ))
         );
     }
 
@@ -943,9 +948,18 @@ mod tests {
     #[test]
     fn the_start_wait_never_overstates_what_it_counted() {
         for (projects, expected) in [
-            (None, "waited 5s for the gateway: mounting adopted projects…"),
-            (Some(0), "waited 5s for the gateway: no adopted projects to mount"),
-            (Some(1), "waited 5s for the gateway: mounting 1 adopted project…"),
+            (
+                None,
+                "waited 5s for the gateway: mounting adopted projects…",
+            ),
+            (
+                Some(0),
+                "waited 5s for the gateway: no adopted projects to mount",
+            ),
+            (
+                Some(1),
+                "waited 5s for the gateway: mounting 1 adopted project…",
+            ),
         ] {
             assert_eq!(
                 StartProgress::new(projects).line(START_PROGRESS_INTERVAL),

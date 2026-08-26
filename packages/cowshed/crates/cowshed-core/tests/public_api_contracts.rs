@@ -259,7 +259,6 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
 
 #[test]
 fn doctor_gc_and_empty_results_have_exact_shapes() {
-
     let doctor = DoctorReport {
         healthy: false,
         findings: vec![Finding {

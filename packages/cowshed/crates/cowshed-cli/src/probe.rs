@@ -72,7 +72,12 @@ fn probe_git_identity_with_env(
     let probe = ProbeRepo::create(candidate)?;
     let checkout_list = git_config_list(checkout, extra_env)?;
     let probe_list = git_config_list(&probe.path, extra_env)?;
-    Ok(diff_identity(checkout, &probe.path, &checkout_list, &probe_list))
+    Ok(diff_identity(
+        checkout,
+        &probe.path,
+        &checkout_list,
+        &probe_list,
+    ))
 }
 
 fn diff_identity(
@@ -236,9 +241,8 @@ fn git_at<const N: usize>(
             "cowshed doctor",
         ));
     }
-    String::from_utf8(output.stdout).map_err(|_| {
-        CowshedError::internal("git config --list --show-origin is not valid UTF-8")
-    })
+    String::from_utf8(output.stdout)
+        .map_err(|_| CowshedError::internal("git config --list --show-origin is not valid UTF-8"))
 }
 
 struct ProbeRepo {
@@ -301,11 +305,7 @@ mod tests {
         let extra = root.join("dev.gitconfig");
         let global = root.join("global.gitconfig");
         fs::create_dir_all(&checkout).unwrap();
-        fs::write(
-            &extra,
-            "[user]\n    email = cowshed-probe@example.com\n",
-        )
-        .unwrap();
+        fs::write(&extra, "[user]\n    email = cowshed-probe@example.com\n").unwrap();
         fs::write(
             &global,
             format!(
@@ -344,9 +344,11 @@ mod tests {
         assert_eq!(finding.severity, FindingSeverity::Warning);
         assert!(finding.message.contains(extra.to_str().unwrap()));
         assert!(finding.message.contains("includeIf gitdir:"));
-        assert!(finding.message.contains(
-            "add pattern covering /Users/dev/.cowshed/mnt or rerun setup --mount-root"
-        ));
+        assert!(
+            finding.message.contains(
+                "add pattern covering /Users/dev/.cowshed/mnt or rerun setup --mount-root"
+            )
+        );
         assert_eq!(finding.hint, HINT);
 
         let _ = fs::remove_dir_all(root);
@@ -388,10 +390,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "cowshed-{label}-{}-{nonce}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("cowshed-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         path
     }
