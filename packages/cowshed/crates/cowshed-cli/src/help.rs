@@ -172,9 +172,12 @@ pub fn bare_invocation() -> &'static str {
 #[must_use]
 pub fn overview() -> String {
     let mut page = String::from(
-        "cowshed — warm git workspaces\n\nusage: cowshed [--json] [-q] [--project <git-root>] <command> [arguments]\n\n",
+        "cowshed — warm git workspaces\n\nusage: cowshed --version | cowshed [--json] [-q] [--project <git-root>] <command> [arguments]\n\n",
     );
     page.push_str(command_map());
+    page.push_str(
+        "\nroot options:\n  -V, --version                print the npm package version\n",
+    );
     page.push_str("\nglobal options:\n");
     render_options(&mut page, GLOBALS);
     page.push_str("\nfirst time here? run cowshed setup, then cowshed adopt in your checkout\n");
@@ -402,9 +405,11 @@ mod tests {
         assert!(overview.contains(command_map()));
         assert!(overview.contains("--project <git-root>"));
         assert!(overview.contains("cowshed <command> --help"));
-        assert!(overview.contains(
-            "first time here? run cowshed setup, then cowshed adopt in your checkout"
-        ));
+        assert!(
+            overview.contains(
+                "first time here? run cowshed setup, then cowshed adopt in your checkout"
+            )
+        );
 
         let page = command_named("rm").unwrap().page();
         assert!(page.lines().all(|line| line.len() <= WIDTH), "{page}");

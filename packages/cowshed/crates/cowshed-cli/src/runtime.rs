@@ -145,6 +145,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Gateway(_)
         | Command::Sccache(_)
         | Command::Skill(_)
+        | Command::Version
         | Command::Help(_)
         | Command::Doctor => RuntimeOpenMode::ExistingOnly,
     }
@@ -1095,6 +1096,9 @@ where
         )),
         Command::Help(_) => Err(CowshedError::internal(
             "help is answered before the runtime bridge",
+        )),
+        Command::Version => Err(CowshedError::internal(
+            "version is answered before the runtime bridge",
         )),
     }
 }
