@@ -58,7 +58,7 @@ Five jobs:
    `install` (drop-directory artifact, human-gated). Personal-device `list` and `boot` remain dev-side controller
    actions; dev-side headless simulators never use the gateway.
 
-Every decision is auditable in Arrow telemetry under `~/.cowshed/telemetry/`; read it with `cowshed audit`.
+Every decision is auditable in Arrow telemetry under `/private/cowshed/store/telemetry/`; read it with `cowshed audit`.
 
 ## Start at login (launchd)
 
@@ -79,7 +79,7 @@ would exit 78 in a `KeepAlive` loop. `stop` and `status` derive the same path ra
 
 `start` then atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with that binary
 followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures
-go only to `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `~/.cowshed` mountpoint. The CLI uses fixed
+go only to `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `/private/cowshed/store` mountpoint. The CLI uses fixed
 `/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
 already-loaded/not-loaded states idempotently. A plist this run rewrote is booted out and bootstrapped again rather than
 kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits for the
@@ -87,7 +87,7 @@ authenticated Unix control socket before returning success. `cowshed gateway sto
 plist; the installed binary stays, as host state rather than agent state.
 
 The internal `cowshed gateway run` entrypoint first remounts already-created host volumes if macOS auto-mounted them at
-`/Volumes` or if a leftover launchd stub occupies `~/.cowshed`. It never creates volumes or opens an authorization
+`/Volumes` or if a leftover launchd stub occupies `/private/cowshed/store`. It never creates volumes or opens an authorization
 prompt. After the store is mounted at the canonical path it starts the gateway and restores all canonical attached
 sessions from repository bindings, mount/incarnation facts, grants, and validated workspace credentials. Detached and
 retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before exit.
@@ -160,7 +160,7 @@ Main gets identical platform wiring and warms the same validated artifact cache.
 Policy is monotonic. `repo_id` is stable lowercase `owner/repo`, normalized from a chosen remote URL; its binding
 records and validates that remote. Multiple identities may be bound with exactly one primary. Local-only repositories
 require an explicit identifier, and discovery may propose but never silently mint one. Effective filesystem denies are
-the canonical-path union of built-ins, trusted operator policy at `~/.cowshed/<owner>/<repo>/policy.json`, and
+the canonical-path union of built-ins, trusted operator policy at `/private/cowshed/store/<owner>/<repo>/policy.json`, and
 repository-added denies; repository config can add protection but cannot remove or carve back earlier entries. The
 trusted path is formed from separately validated `owner` and `repo` segments—never by accepting separators, `.`, `..`,
 encoded separators, or a repository-relative path. Malformed trusted policy fails closed.
