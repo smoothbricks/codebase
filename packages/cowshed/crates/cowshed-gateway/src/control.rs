@@ -1096,10 +1096,6 @@ pub enum ControlError {
     Io(#[from] std::io::Error),
 }
 
-pub fn control_socket_path(home: &Path) -> PathBuf {
-    home.join(".cowshed/gateway.sock")
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;

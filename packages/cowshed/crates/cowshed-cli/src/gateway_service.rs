@@ -16,7 +16,7 @@ use cowshed_core::{
 };
 use cowshed_gateway::{
     ArrowAuditConfig, Gateway, GatewayConfig, GatewayControlClient, GatewayStatus,
-    MirrorCacheConfig, control_socket_path,
+    MirrorCacheConfig,
 };
 use std::fs;
 use std::io::{self, Read as _, Write};
@@ -26,8 +26,9 @@ use std::time::Duration;
 
 pub use cowshed_core::gateway_sessions::{
     GATEWAY_START_HINT, GatewayControl, GatewayInstaller, NativeSessionInventory, ReconcileReport,
-    SessionInventory, canonical_home, control_error, effective_uid, gateway_absent,
-    install_all_sessions, policy_from_grants, project_session_prefix, reconcile_against_status,
+    SessionInventory, canonical_home, control_error, control_socket_path, effective_uid,
+    gateway_absent, install_all_sessions, policy_from_grants, project_session_prefix,
+    reconcile_against_status,
     reconcile_inventory_project, reconcile_native_project, reconcile_project, session_from_fact,
     sessions_from_facts, stable_workspace_id,
 };
@@ -60,7 +61,7 @@ impl GatewayPaths {
             store: storage.store().to_path_buf(),
             cache: storage.caches().join("mirror"),
             telemetry: storage.telemetry().join("gateway"),
-            control_socket: control_socket_path(storage.home()),
+            control_socket: control_socket_path(),
         }
     }
 
@@ -399,7 +400,7 @@ fn stop_service(purge: bool) -> Result<RemovalOutcome> {
 
 pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     let home = canonical_home()?;
-    let socket = control_socket_path(&home);
+    let socket = control_socket_path();
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
