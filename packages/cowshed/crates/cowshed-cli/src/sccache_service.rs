@@ -144,8 +144,8 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
         },
     );
     let uid = effective_uid();
-    executor.execute_install(&plan).map_err(launchd_error)?;
-    activate_launch_agent(&mut executor, uid, &spec)?;
+    let written = executor.execute_install(&plan).map_err(launchd_error)?;
+    activate_launch_agent(&mut executor, uid, &spec, written)?;
 
     let deadline = tokio::time::Instant::now() + START_DEADLINE;
     loop {

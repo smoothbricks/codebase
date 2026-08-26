@@ -1,8 +1,8 @@
 use crate::args::GatewayCommand;
 use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableInstallState, ExecutableSource, ExistingPlist,
-    HostStableExecutable, InstallState, InstalledExecutable, LaunchAgentSpec, LaunchctlCommand,
-    LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
+    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
+    LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
     NativeLaunchctlCommand, classify_executable_source, containing_mount_point,
     plan_executable_install, plan_install, plan_remove,
 };
@@ -107,14 +107,24 @@ where
         .map_err(launchd_error)
 }
 
+/// Load the agent and leave launchd running *this* plist.
+///
+/// A rewritten plist is only a file. launchd keeps the definition it bootstrapped, so a kickstart
+/// on its own restarts the program the agent was loaded with — which, for a plist rewritten to
+/// name the host-stable binary, is exactly the vanished path the rewrite exists to stop naming.
+/// A changed plist is therefore booted out first, and the bootstrap that follows reads it.
 pub fn activate_launch_agent<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     uid: u32,
     spec: &LaunchAgentSpec,
+    plist: InstallOutcome,
 ) -> Result<()>
 where
     C: LaunchctlCommand,
 {
+    if plist == InstallOutcome::Changed {
+        deactivate_launch_agent(executor, uid, spec)?;
+    }
     if !launch_agent_is_loaded(executor, uid, spec)?
         && let Err(error) =
             executor.execute_control(&crate::launchd::ControlPlan::bootstrap(uid, spec))
@@ -204,8 +214,8 @@ async fn start_service() -> Result<CliGatewayStatus> {
         },
     );
     let uid = effective_uid();
-    executor.execute_install(&plan).map_err(launchd_error)?;
-    activate_launch_agent(&mut executor, uid, &spec)?;
+    let written = executor.execute_install(&plan).map_err(launchd_error)?;
+    activate_launch_agent(&mut executor, uid, &spec, written)?;
 
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     let deadline = tokio::time::Instant::now() + START_DEADLINE;

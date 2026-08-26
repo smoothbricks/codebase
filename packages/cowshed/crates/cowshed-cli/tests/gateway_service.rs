@@ -5,8 +5,8 @@ use cowshed_cli::gateway_service::{
     install_host_stable_executable,
 };
 use cowshed_cli::launchd::{
-    COWSHED_BINARY_NAME, CommandOutput, CommandStatus, HostStableExecutable, LaunchAgentSpec,
-    LaunchctlCommand, LaunchdExecutor, NativeFilesystem, NativeLaunchctlCommand,
+    COWSHED_BINARY_NAME, CommandOutput, CommandStatus, HostStableExecutable, InstallOutcome,
+    LaunchAgentSpec, LaunchctlCommand, LaunchdExecutor, NativeFilesystem, NativeLaunchctlCommand,
     STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
@@ -86,7 +86,8 @@ fn launch_agent_activation_bootstraps_only_when_not_loaded() {
         Ok(CommandOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, &launch_spec()).expect("activation succeeds");
+    activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
+        .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(command.argv.len(), 3);
     assert_eq!(command.argv[0][0], "print");
@@ -100,7 +101,8 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
     let command =
         RecordingLaunchctl::new([Ok(CommandOutput::success()), Ok(CommandOutput::success())]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, &launch_spec()).expect("activation succeeds");
+    activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
+        .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(command.argv.len(), 2);
     assert_eq!(command.argv[0][0], "print");
@@ -111,7 +113,40 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
         "launchctl missing",
     ))]);
     let mut executor = LaunchdExecutor::new((), command);
-    assert!(activate_launch_agent(&mut executor, 501, &launch_spec()).is_err());
+    assert!(
+        activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
+            .is_err()
+    );
+}
+
+/// A rewritten plist is only a file: launchd runs the definition it bootstrapped, so the agent
+/// has to be booted out and bootstrapped again or the kickstart restarts the old program — the
+/// path the rewrite exists to stop naming.
+#[test]
+fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
+    let command = RecordingLaunchctl::new([
+        Ok(CommandOutput::success()),
+        Ok(CommandOutput::success()),
+        Ok(CommandOutput {
+            status: CommandStatus::ExitCode(3),
+            stdout: Vec::new(),
+            stderr: b"not loaded".to_vec(),
+        }),
+        Ok(CommandOutput::success()),
+        Ok(CommandOutput::success()),
+    ]);
+    let mut executor = LaunchdExecutor::new((), command);
+    activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::Changed)
+        .expect("activation succeeds");
+    let (_, command) = executor.into_parts();
+    assert_eq!(
+        command
+            .argv
+            .iter()
+            .map(|argv| argv[0].to_str().expect("utf-8 argv"))
+            .collect::<Vec<_>>(),
+        ["print", "bootout", "print", "bootstrap", "kickstart"]
+    );
 }
 
 #[test]
