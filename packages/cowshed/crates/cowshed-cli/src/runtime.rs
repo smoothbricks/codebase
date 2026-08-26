@@ -1977,6 +1977,28 @@ fn gateway_findings(status: &GatewayStatus) -> Vec<Finding> {
     findings
 }
 
+/// An unmounted main is critical, not informational.
+///
+/// Mains are always-mounted (02_workspaces.md): the gateway mounts every one across every adopted
+/// project before it serves, so this is the user's own checkout missing from their shell, editor,
+/// and Finder — not a workspace they chose to detach. Both paths are named because they answer
+/// different questions: the mountpoint is the directory that looks wrong, the image is the volume
+/// that belongs there. The remedy is the gateway's startup pass, which is what mounts mains.
+fn main_mount_finding(main: &UnreachableMain) -> Finding {
+    Finding {
+        code: "main-not-mounted".into(),
+        severity: FindingSeverity::Error,
+        message: format!(
+            "{}: main is not mounted at {} (image {}): {}",
+            main.repo_id,
+            main.mountpoint.display(),
+            main.image.display(),
+            main.reason
+        ),
+        hint: "cowshed gateway start".into(),
+        path: Some(main.mountpoint.clone()),
+    }
+}
 
 fn sccache_finding(status: &SccacheStatus) -> Finding {
     let (severity, hint) = if status.running {
@@ -2078,6 +2100,20 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
             }),
             Err(error) => diagnosis.findings.push(Finding {
                 code: "workspace-inventory".into(),
+                severity: FindingSeverity::Error,
+                message: error.message,
+                hint: error.hint,
+                path: None,
+            }),
+        }
+        // Every adopted project, not whichever one the cwd sits in: mains are always-mounted, and
+        // the same host state has to yield the same verdict from any directory (06_cli.md rule 4).
+        match unmounted_mains().await {
+            Ok(mains) => diagnosis
+                .findings
+                .extend(mains.iter().map(main_mount_finding)),
+            Err(error) => diagnosis.findings.push(Finding {
+                code: "main-mounts".into(),
                 severity: FindingSeverity::Error,
                 message: error.message,
                 hint: error.hint,
@@ -2664,5 +2700,37 @@ mod tests {
             .await
             .expect("router actor leaked")
             .unwrap();
+    }
+
+    /// An unmounted main is a critical finding: it names both paths, carries a remedy, and makes
+    /// the report unhealthy. Mains are always-mounted (02_workspaces.md), so `healthy: true` over
+    /// a checkout the user cannot open would be the one verdict doctor must never give.
+    #[test]
+    fn an_unmounted_main_is_a_critical_doctor_finding() {
+        use cowshed_core::repository::RepoId;
+
+        let main = UnreachableMain {
+            repo_id: RepoId::parse("acme/widget").expect("repo"),
+            image: PathBuf::from("/private/cowshed/store/acme/widget/main.asif"),
+            mountpoint: PathBuf::from("/Users/dev/src/widget"),
+            reason: String::from("main's volume is not mounted"),
+        };
+
+        let finding = main_mount_finding(&main);
+
+        assert_eq!(finding.code, "main-not-mounted");
+        assert_eq!(finding.severity, FindingSeverity::Error);
+        assert_eq!(
+            finding.message,
+            "acme/widget: main is not mounted at /Users/dev/src/widget \
+             (image /private/cowshed/store/acme/widget/main.asif): main's volume is not mounted"
+        );
+        assert_eq!(finding.hint, "cowshed gateway start");
+        assert_eq!(finding.path.as_deref(), Some(main.mountpoint.as_path()));
+        let report = doctor_report(vec![finding]);
+        assert!(
+            !report.healthy,
+            "a project whose checkout is not mounted is not a healthy host"
+        );
     }
 }

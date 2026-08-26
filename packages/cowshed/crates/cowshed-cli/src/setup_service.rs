@@ -34,7 +34,8 @@ use cowshed_core::storage::bootstrap::{
 use cowshed_core::metadata::ImageFormat;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
-    CowshedError, ErrorCode, NativeGatewayInventory, Result, validate_existing_host_storage,
+    CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
+    validate_existing_host_storage,
 };
 use std::fs;
 use std::io::{self, Write};
@@ -77,6 +78,20 @@ pub enum WorkspaceCensus {
         repo_ids: Vec<String>,
         workspaces: usize,
     },
+    Unknown { reason: String },
+}
+
+/// What setup could observe about the always-mounted mains.
+///
+/// Mirrors [`WorkspaceCensus`] deliberately, including its second case: "nobody could check" is
+/// its own answer and must never render as "every main is mounted". Mains are always-mounted
+/// (02_workspaces.md), so a host with one missing is not a host setup can call ready — but the
+/// verdict itself belongs to `doctor`, so this only ever downgrades a sentence, never the exit
+/// code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MainMounts {
+    /// Every adopted project was checked; these are the ones whose main is not mounted.
+    Checked(Vec<UnreachableMain>),
     Unknown { reason: String },
 }
 
@@ -127,6 +142,8 @@ pub trait HostSetup: Send {
     async fn execute_uninstall(&mut self) -> Result<UninstallReport>;
     /// What the volumes hold right now, for the teardown refusal.
     async fn census(&mut self) -> Result<WorkspaceCensus>;
+    /// Which adopted projects have no mounted main, for the readiness sentence.
+    async fn unmounted_mains(&mut self) -> Result<MainMounts>;
     /// Deactivate and delete the host services and the binaries they ran.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>>;
 }
@@ -215,6 +232,28 @@ impl HostSetup for NativeHostSetup {
                 .collect(),
             workspaces,
         })
+    }
+
+    /// Observe the always-mounted mains, or say why nobody could.
+    ///
+    /// Never an error, for the same reason the census is not: setup reports the host it found, and
+    /// a store that cannot be enumerated must not turn a successful repair into a failed command.
+    /// `doctor` is where an unmounted main becomes a verdict.
+    async fn unmounted_mains(&mut self) -> Result<MainMounts> {
+        let storage = match validate_existing_host_storage(&self.home).await {
+            Ok(storage) => storage,
+            Err(error) => {
+                return Ok(MainMounts::Unknown {
+                    reason: error.message,
+                });
+            }
+        };
+        match NativeGatewayInventory::new(storage).unmounted_mains().await {
+            Ok(mains) => Ok(MainMounts::Checked(mains)),
+            Err(error) => Ok(MainMounts::Unknown {
+                reason: format!("could not check main workspace mounts: {error}"),
+            }),
+        }
     }
 
     /// Remove both agents, then both binaries.
@@ -326,21 +365,34 @@ where
     // the caller: the per-action rows say what happened, and the taxonomy says it did not work.
     // Exiting 0 here would tell every script the host was set up.
     let failure = report.failure().cloned();
+    // Observed only on a run that finished. A run that stopped partway has its own headline and its
+    // own remedy, and a main-mount observation on top of a failed caches mount would aim the reader
+    // at the wrong problem.
+    let mains = match &failure {
+        Some(_) => None,
+        None => Some(setup.unmounted_mains().await?),
+    };
     if json {
         // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
         // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
         // answering `ok:true` over a failure is the one thing this must not do.
         match &failure {
             None => output.success(report).map_err(output_error)?,
-            Some(_) => render_repair(&plan, &report, output)?,
+            Some(_) => render_repair(&plan, &report, mains.as_ref(), output)?,
         }
     } else {
-        render_repair(&plan, &report, output)?;
+        render_repair(&plan, &report, mains.as_ref(), output)?;
     }
     if let Some(failure) = failure {
         return Err(partial_setup_failure(failure));
     }
     output.hint("cowshed doctor").map_err(output_error)?;
+    // The gateway's startup pass is what mounts mains, so restarting it is the remedy — and it is
+    // the remedy whether or not the volumes needed repairing, which is why this hint is not tied to
+    // anything the plan did.
+    if matches!(&mains, Some(MainMounts::Checked(unmounted)) if !unmounted.is_empty()) {
+        output.hint("cowshed gateway start").map_err(output_error)?;
+    }
     if matches!(
         setup.census().await?,
         WorkspaceCensus::Counted { workspaces: 0, .. }
@@ -600,6 +652,7 @@ fn decimal_size(bytes: u64) -> String {
 fn render_repair<W: Write, E: Write>(
     plan: &HostSetupPlan,
     report: &HostSetupReport,
+    mains: Option<&MainMounts>,
     output: &mut Output<W, E>,
 ) -> Result<()> {
     // The per-action outcomes come first and only when there is something to say: they are the
@@ -622,7 +675,7 @@ fn render_repair<W: Write, E: Write>(
         .guidance(&fstab_phrase(&report.fstab))
         .map_err(output_error)?;
     output
-        .guidance(&repair_status(plan, report))
+        .guidance(&repair_status(plan, report, mains))
         .map_err(output_error)?;
     Ok(())
 }
@@ -776,7 +829,18 @@ fn uninstall_fstab_phrase(fstab: &UninstallFstabOutcome) -> String {
 /// exact definition of already set up. A volume left alone because it lives somewhere else is
 /// reported separately, because claiming "everything already set up" over an unresolved finding
 /// would be the comfortable answer rather than the true one.
-fn repair_status(plan: &HostSetupPlan, report: &HostSetupReport) -> String {
+///
+/// The always-mounted mains qualify whichever readiness sentence was chosen rather than replacing
+/// it: the volumes really are set up, and an unmounted main really is a host that is not serving
+/// the user's own checkout (02_workspaces.md). It qualifies both healthy sentences because it
+/// falsifies both — "everything already set up" over a missing checkout is the flattest lie of the
+/// two, and is the branch a host with healthy volumes actually reaches. It never touches the
+/// failure or FoundElsewhere sentences, which return above with headlines of their own.
+fn repair_status(
+    plan: &HostSetupPlan,
+    report: &HostSetupReport,
+    mains: Option<&MainMounts>,
+) -> String {
     if report.failure().is_some() {
         let done = count_outcomes(report, |result| {
             matches!(result, HostActionResult::Done)
@@ -803,13 +867,30 @@ fn repair_status(plan: &HostSetupPlan, report: &HostSetupReport) -> String {
             plural(unresolved, "volume lives", "volumes live"),
         );
     }
-    if plan.actions.is_empty() && !plan.requires_authorization {
-        return String::from("everything already set up");
+    let ready = if plan.actions.is_empty() && !plan.requires_authorization {
+        String::from("everything already set up")
+    } else if report.authorized {
+        String::from("host storage is set up (one administrator authorization was used)")
+    } else {
+        String::from("host storage is set up")
+    };
+    match mains {
+        None => ready,
+        Some(MainMounts::Checked(unmounted)) if unmounted.is_empty() => ready,
+        Some(MainMounts::Checked(unmounted)) => format!(
+            "{ready}, but {} main {} not mounted: {}",
+            unmounted.len(),
+            plural(unmounted.len(), "workspace is", "workspaces are"),
+            unmounted
+                .iter()
+                .map(|main| main.repo_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        Some(MainMounts::Unknown { reason }) => {
+            format!("{ready}; main workspace mounts could not be checked: {reason}")
+        }
     }
-    if report.authorized {
-        return String::from("host storage is set up (one administrator authorization was used)");
-    }
-    String::from("host storage is set up")
 }
 
 fn count_outcomes(
