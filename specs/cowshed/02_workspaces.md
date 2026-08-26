@@ -91,11 +91,11 @@ not a best-effort script:
 ## Checkout layouts
 
 Where `main` mounts is a per-project choice recorded in project metadata. Both layouts are supported, both use the same
-publication transaction, and every workspace other than `main` mounts at `<project-root>/.cowshed/<workspace>` under
-either layout. The host-side `.cowshed/` directory is created with the first workspace, holds only mountpoint
-directories (empty when detached), and `gc` removes it when empty. It is excluded from Git via `.git/info/exclude`
-written at adopt; adopt also appends a `.cowshed/` pattern to `.gitignore` when no such pattern exists, so clones and
-collaborators stay clean once that one-line change is committed.
+publication transaction, and every workspace other than `main` mounts at `<mount-root>/<owner>/<repo>/<workspace>`,
+where the mount root is host configuration (default `~/.cowshed/mnt`, set via `cowshed setup --mount-root`; see
+01_storage.md). The root holds only mountpoint directories (empty when detached) and is plain per-user directories on
+Data; nothing is written inside any checkout, so no Git exclusion is required for them. Changing the root requires
+every workspace detached and is refused otherwise.
 
 **Direct mount** (default). `main` mounts at the checkout's original path. Publication renames the original tree to
 `<root>.pre-cowshed`, recreates the emptied directory as the mountpoint with the stub `.envrc` inside it, and attaches
@@ -114,21 +114,17 @@ appears. Ordering the mount before the handoff is what "symlink last" protects; 
 than a move-aside followed by a link is what removes the window in which the user's familiar path would not exist at
 all.
 
-Nested mounting carries one ordering invariant: `main`'s volume cannot detach while workspaces are mounted inside it,
-so detach order is strictly children first — `rm`/`detach` of main refuses with guidance while any sibling is attached,
-and the gateway's heal sequence attaches main before sessions and detaches them before main.
+Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Rules anchored at an ancestor shared by both
+the checkout and the mount root (for example `gitdir:~/Dev/` when checkouts live in `~/Dev` and the root is
+`~/Dev/.cowshed`) match workspaces with zero additional configuration — the expected setup. Rules anchored exactly at a
+project root do not reach into the mount root; cowshed surfaces that divergence instead of letting identities silently
+drift: `cowshed new` runs `git config --list --show-origin` in the checkout and in a throwaway probe repository at the
+candidate workspace path, and any config file included only in the checkout is reported by name with the pattern that
+would restore it. `doctor` reports the same finding for existing projects.
 
-The layouts differ in exactly one user-visible way beyond `pwd -P`, and it decides the default: **path-conditional Git
-configuration follows the physical path.** Git resolves a `gitdir:` condition against the resolved gitdir, so an
-`includeIf "gitdir:~/Dev/"` scoping a work identity keeps matching for main under direct mount and stops matching under
-the symlink layout, whose real gitdir lives inside the store. Workspaces inherit by construction under direct mount:
-their gitdirs sit beneath `<project-root>`, so every rule matching the project path covers them. Under the symlink
-layout they resolve into the store instead, and absolute-pattern rules are required for them.
-
-Cowshed does not compensate. Capturing the effective identity at adopt time and stamping it as repo-local config would
-snapshot one moment of a configuration the user keeps editing, and would then silently diverge from it; honoring the
-path condition by putting the gitdir where the condition expects it is the only faithful behavior. A user whose config
-is path-conditional wants the direct-mount layout.
+Cowshed does not compensate beyond reporting. Capturing the effective identity at adopt time and stamping it as
+repo-local config would snapshot one moment of a configuration the user keeps editing, and would then silently diverge
+from it; honoring the path condition by telling the user exactly which rule to extend is the only faithful behavior.
 
 6. Print the mount path on stdout.
 
@@ -158,7 +154,7 @@ The checkout path is written down in three places, and no two of them can be der
 at main's mount root, the `infoSnapshot.projectRoot` in the sidecar beside main's canonical image, and the layout record
 that says whether the checkout _is_ the mountpoint. Every move carries all three.
 
-**Symlink layout.** Main stays mounted at `mnt/<owner>/<repo>/main` throughout. The checkout path is only a symlink into
+**Symlink layout.** Main stays mounted in the store's session namespace throughout. The checkout path is only a symlink into
 it and nothing about the mount depends on where that symlink sits, so there is no unmount and no remount — the move is
 the relink alone. Gaplessness therefore costs nothing: the destination link is created before the source link is
 removed, and the tree answers to at least one name at every instant. A crash between the two steps leaves both names,
@@ -210,7 +206,7 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    `sparseimage` according to main's validated detached `imageFormat` — ~2 ms regardless of content size. Create the
    complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach without mounting, run `fsck_apfs -q` against the clone's APFS volume device, then mount at
-   `/private/cowshed/store/mnt/<owner>/<repo>/<name>` — extension and detached `imageFormat` must agree, then attach dispatches to
+   `<mount-root>/<owner>/<repo>/<name>` — extension and detached `imageFormat` must agree, then attach dispatches to
    `diskutil image attach --noMount` for ASIF or `hdiutil attach -nomount` for SPARSE (flags per 01_storage.md) —
    ~235–400 ms typical. Verification precedes the first mount; a clone never mounts unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
@@ -248,7 +244,7 @@ as what they do, and an agent that knows nothing about cowshed guesses it correc
 
 The URL is the canonical mount, never the recorded checkout path, and the two differ by checkout layout (see "Checkout
 layouts"): under direct mount they are the same directory, and under the symlink layout the checkout path is a symlink
-into `/private/cowshed/store/mnt/<owner>/<repo>/main`. Recording the symlink would put a path outside the workspace's read grants
+into the store's session namespace for main. Recording the symlink would put a path outside the workspace's read grants
 into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate owns,
 the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
 workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
@@ -306,7 +302,7 @@ gains three steps between attach and publication:
    makes cloning an already-linked worktree wrong (see the prototype report).
 2. Register the worktree against main's repository and plant the pointer file, using **main's canonical mount** as the
    repository path. Under direct mount that is the checkout path; under the symlink layout it is
-   `/private/cowshed/store/mnt/<owner>/<repo>/main`, and the registration must name it rather than the symlink for the same reason
+   the store's session namespace path for main, and the registration must name it rather than the symlink for the same reason
    the `main` remote does — a registration recorded through the checkout symlink breaks the moment the checkout moves,
    and `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already
    present from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto
