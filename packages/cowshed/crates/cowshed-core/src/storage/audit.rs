@@ -3,9 +3,9 @@
 //! Every lifecycle act the controller performs (introduce / retire a workspace, admit a job and
 //! seal its terminal state, checkpoint, fork, restore) is emitted as one typed
 //! [`ControllerCommitment`] record to an [`AuditSink`]. Nothing reads the sink back for a
-//! decision: authority is the image inventory under `~/.cowshed/` (the sparseimages, their
-//! mounts, and the marker each image carries — incarnation, lineage), the host-side grant policy
-//! files, and the controller lock. The sink exists so an operator can ask "what did the controller
+//! decision: authority is the image inventory under `/private/cowshed/store` (the sparseimages,
+//! their mounts, and the marker each image carries — incarnation, lineage), the host-side grant
+//! policy files, and the controller lock. The sink exists so an operator can ask "what did the controller
 //! do" after the fact, and so a supervising runtime can route the same records into its own
 //! durable log.
 //!

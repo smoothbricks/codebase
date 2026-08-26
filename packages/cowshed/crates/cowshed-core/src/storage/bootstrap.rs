@@ -25,6 +25,13 @@ pub use native::{
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
 pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
+/// Machine-global evidence roots shared by every user in the herd.
+///
+/// Bootstrap volumes cannot follow `$HOME`: doing so gives each user a different view of the
+/// same machine-global herd and leaves the evidence layer outside the dedicated volumes.
+pub const STORE_ROOT: &str = "/private/cowshed/store";
+/// Machine-global rebuildable-cache volume root; see [`STORE_ROOT`] for the `$HOME` invariant.
+pub const CACHES_ROOT: &str = "/private/cowshed/caches";
 pub const ZFS_COWSHED_ROOT: &str = "cowshed";
 pub const ZFS_STORE_CHILD: &str = "store";
 pub const ZFS_CACHES_CHILD: &str = "caches";
@@ -562,34 +569,29 @@ pub enum MountGuardError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalRoots {
-    home: PathBuf,
     store: PathBuf,
     caches: PathBuf,
     telemetry: PathBuf,
 }
 
 impl CanonicalRoots {
-    pub fn for_home(home: &Path) -> Result<Self, PlanError> {
-        if !home.is_absolute()
-            || home
-                .components()
-                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-        {
-            return Err(PlanError::NonCanonicalHome(home.to_owned()));
+    pub fn global() -> Self {
+        let store = PathBuf::from(STORE_ROOT);
+        Self {
+            caches: PathBuf::from(CACHES_ROOT),
+            telemetry: store.join("telemetry"),
+            store,
         }
-        let store = home.join(".cowshed");
-        let caches = store.join("caches");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(store: PathBuf, caches: PathBuf) -> Self {
         let telemetry = store.join("telemetry");
-        Ok(Self {
-            home: home.to_owned(),
+        Self {
             store,
             caches,
             telemetry,
-        })
-    }
-
-    pub fn home(&self) -> &Path {
-        &self.home
+        }
     }
 
     pub fn store(&self) -> &Path {
@@ -611,16 +613,17 @@ impl CanonicalRoots {
 /// therefore attests that no provisioning was needed to use the returned machine-global roots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedHostStorage {
+    home: PathBuf,
     roots: CanonicalRoots,
 }
 
 impl ValidatedHostStorage {
-    pub(crate) fn new(roots: CanonicalRoots) -> Self {
-        Self { roots }
+    pub(crate) fn new(home: PathBuf, roots: CanonicalRoots) -> Self {
+        Self { home, roots }
     }
 
     pub fn home(&self) -> &Path {
-        self.roots.home()
+        &self.home
     }
 
     pub fn store(&self) -> &Path {
@@ -861,6 +864,7 @@ pub enum HostOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapPlan {
     substrate: SelectedSubstrate,
+    home: PathBuf,
     roots: CanonicalRoots,
     operations: Vec<HostOperation>,
 }
@@ -868,6 +872,10 @@ pub struct BootstrapPlan {
 impl BootstrapPlan {
     pub fn substrate(&self) -> &SelectedSubstrate {
         &self.substrate
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
     }
 
     pub fn roots(&self) -> &CanonicalRoots {
@@ -889,7 +897,14 @@ pub fn plan_bootstrap(
     home: &Path,
     evidence: BootstrapEvidence,
 ) -> Result<BootstrapPlan, PlanError> {
-    let roots = CanonicalRoots::for_home(home)?;
+    let roots = CanonicalRoots::global();
+    if !home.is_absolute()
+        || home
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(PlanError::NonCanonicalHome(home.to_owned()));
+    }
     let operations = match (&substrate, evidence) {
         (SelectedSubstrate::Apfs { container, .. }, BootstrapEvidence::Apfs { store, caches }) => {
             plan_apfs(container, &roots, &store, &caches)?
@@ -918,6 +933,7 @@ pub fn plan_bootstrap(
     };
     Ok(BootstrapPlan {
         substrate,
+        home: home.to_owned(),
         roots,
         operations,
     })
@@ -929,22 +945,9 @@ fn plan_apfs(
     store: &ExistingStorage,
     caches: &ExistingStorage,
 ) -> Result<Vec<HostOperation>, PlanError> {
-    validate_nested_topology(store, caches)?;
     validate_existing_marker(store, VolumeRole::Store, SubstrateKind::Apfs)?;
     validate_existing_marker(caches, VolumeRole::Caches, SubstrateKind::Apfs)?;
 
-    let store_is_batched = matches!(
-        store,
-        ExistingStorage::Absent
-            | ExistingStorage::MountedIncomplete { .. }
-            | ExistingStorage::DetachedIncomplete { .. }
-    ) || matches!(
-        store,
-        ExistingStorage::MisMountedIncomplete {
-            current_mountpoint,
-            ..
-        } if current_mountpoint == roots.store()
-    );
     let mut operations = Vec::new();
     let mut volumes = Vec::new();
 
@@ -962,8 +965,7 @@ fn plan_apfs(
         store,
     );
 
-    if !store_is_batched
-        && !mounted_but_unpublished_at(caches, roots.caches())
+    if !mounted_but_unpublished_at(caches, roots.caches())
         && !remounting_from_elsewhere(caches, roots.caches())
     {
         operations.push(guard(
@@ -1062,8 +1064,17 @@ fn plan_apfs_volume(
             });
         }
         ExistingStorage::MisMountedIncomplete {
-            exact_identifier, ..
+            exact_identifier,
+            current_mountpoint,
         } => {
+            operations.push(HostOperation::ReportVolumeIssue {
+                name: volume_name,
+                detail: format!(
+                    "{volume_name} is mounted at {} instead of {}; cowshed setup will remount it and rewrite its /etc/fstab pin",
+                    current_mountpoint.display(),
+                    mountpoint.display()
+                ),
+            });
             operations.push(HostOperation::ReclaimMountpoint(mountpoint.to_owned()));
             operations.push(HostOperation::RunCommand(HostCommand::new(
                 DISKUTIL,
@@ -1181,24 +1192,6 @@ fn plan_zfs(
     Ok(operations)
 }
 
-fn validate_nested_topology(
-    store: &ExistingStorage,
-    caches: &ExistingStorage,
-) -> Result<(), PlanError> {
-    if matches!(store, ExistingStorage::Absent) && !matches!(caches, ExistingStorage::Absent) {
-        return Err(PlanError::ImpossibleStorageTopology(
-            "caches cannot exist when store is absent",
-        ));
-    }
-    if !matches!(store, ExistingStorage::MountedValid { .. })
-        && matches!(caches, ExistingStorage::MountedValid { .. })
-    {
-        return Err(PlanError::ImpossibleStorageTopology(
-            "caches cannot be mounted while store is unmounted",
-        ));
-    }
-    Ok(())
-}
 
 fn validate_zfs_topology(
     root: &ExistingStorage,
@@ -1215,7 +1208,7 @@ fn validate_zfs_topology(
             "ZFS root cannot be absent when a child dataset exists",
         ));
     }
-    validate_nested_topology(store, caches)
+    Ok(())
 }
 
 fn validate_existing_marker(
