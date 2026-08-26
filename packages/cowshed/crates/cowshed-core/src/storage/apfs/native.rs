@@ -44,8 +44,8 @@ use super::super::{
 };
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingPublicationFact, PublicationError, companion_path, layout,
-    main_aware_mount_point, volume_key,
+    MetadataPolicy, PendingPublicationFact, PublicationError, ResumableStage, companion_path,
+    layout, main_aware_mount_point, volume_key,
 };
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
@@ -2527,6 +2527,54 @@ where
             .sync_and_clone(source, destination, format)
             .map_err(Into::into)
     }
+    fn resumable_staged_adopt(
+        &self,
+        config: &ApfsSubstrateConfig,
+        repo: &RepoId,
+        identity: &OperationIdentity,
+    ) -> Result<Option<ResumableStage>, ApfsStorageError> {
+        let staging = layout(config, repo)?
+            .project()
+            .project_root
+            .join(super::STAGING_NAMESPACE);
+        let mut resumable = None;
+        for sidecar in regular_file_children(&staging)? {
+            if !sidecar
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".grants.json"))
+            {
+                continue;
+            }
+            let image = image_from_sidecar(&sidecar)?;
+            if !image.exists() || companion_path(&image).exists() {
+                continue;
+            }
+            let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
+                .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            let Some(info) = metadata.info_snapshot.as_ref() else {
+                continue;
+            };
+            if metadata.repo_id != *repo
+                || !metadata.workspace.is_main()
+                || info.project_root != identity.project_root
+                || info.base_commit != identity.base_commit
+            {
+                continue;
+            }
+            let candidate = ResumableStage {
+                image,
+                format: metadata.image_format,
+            };
+            if resumable.replace(candidate).is_some() {
+                return Err(ApfsStorageError::MarkerMismatch(format!(
+                    "multiple incomplete adoption stages match {}",
+                    identity.project_root.display()
+                )));
+            }
+        }
+        Ok(resumable)
+    }
 
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(destination)?;
@@ -4209,6 +4257,12 @@ where
                         // comes into existence with the final swap, and reaching this point means
                         // that swap has not happened yet.
                         let canonical_mount = storage.workspace_mount(&metadata.workspace)?;
+                        if staged.exists() && !companion_path(&staged).exists() {
+                            // The durable lifecycle intent re-enters adoption and clone-copies this
+                            // partial image before the convergent tree copier resumes it. Publishing
+                            // now would expose a checkout whose copy never reached its marker fence.
+                            continue;
+                        }
                         if staged.exists() {
                             self.recovery_companion(&staged, "staged main publication image")?;
                         }

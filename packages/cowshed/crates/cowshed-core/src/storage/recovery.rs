@@ -1,13 +1,220 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::Path;
+use std::sync::LazyLock;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::metadata::WorkspaceIncarnation;
+use crate::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
+use crate::error::{CowshedError, Result as CowshedResult};
+use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
 
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const CHECKPOINT_NAMESPACE: &str = ".checkpoints";
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
+pub const LIFECYCLE_INTENTS_FILE: &str = "lifecycle-intents.json";
+const LIFECYCLE_INTENT_VERSION: u32 = 1;
+
+/// Durable user intent written before a lifecycle verb's first mutation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LifecycleIntent {
+    Adopt {
+        options: AdoptOptions,
+    },
+    Create {
+        workspace: WorkspaceName,
+        options: CreateOptions,
+    },
+    Fork {
+        source: WorkspaceName,
+        destination: WorkspaceName,
+    },
+    Retire {
+        workspace: WorkspaceName,
+        options: RemoveOptions,
+    },
+}
+
+impl LifecycleIntent {
+    pub fn target(&self) -> &WorkspaceName {
+        match self {
+            Self::Adopt { .. } => main_name(),
+            Self::Create { workspace, .. } | Self::Retire { workspace, .. } => workspace,
+            Self::Fork { destination, .. } => destination,
+        }
+    }
+}
+
+/// The result needed to make an idempotent re-issue indistinguishable from the first call.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "result",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+pub enum LifecycleIntentCompletion {
+    Workspace(WorkspaceIncarnation),
+    Retire(RemoveReport),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleIntentRecord {
+    pub operation: LifecycleIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<LifecycleIntentCompletion>,
+}
+
+impl LifecycleIntentRecord {
+    pub fn pending(operation: LifecycleIntent) -> Self {
+        Self {
+            operation,
+            completion: None,
+        }
+    }
+}
+
+/// One bounded record per logical workspace. A later lifecycle supersedes the prior record for the
+/// same name, so retry evidence cannot grow without bound.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleIntentJournal {
+    version: u32,
+    entries: BTreeMap<WorkspaceName, LifecycleIntentRecord>,
+}
+
+impl Default for LifecycleIntentJournal {
+    fn default() -> Self {
+        Self {
+            version: LIFECYCLE_INTENT_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl LifecycleIntentJournal {
+    pub fn load(path: &Path) -> CowshedResult<Self> {
+        let journal = match read_json(path) {
+            Ok(journal) => journal,
+            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Self::default()
+            }
+            Err(error) => {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "cannot read lifecycle intent journal {}: {error}",
+                        path.display()
+                    ),
+                    "repair the lifecycle intent journal, then reopen cowshed",
+                ));
+            }
+        };
+        journal.validate()?;
+        Ok(journal)
+    }
+
+    pub fn persist(&self, path: &Path) -> CowshedResult<()> {
+        self.validate()?;
+        write_json(path, self).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot persist lifecycle intent journal {}: {error}",
+                    path.display()
+                ),
+                "repair cowshed storage and retry the lifecycle operation",
+            )
+        })
+    }
+
+    pub fn get(&self, workspace: &WorkspaceName) -> Option<&LifecycleIntentRecord> {
+        self.entries.get(workspace)
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = (&WorkspaceName, &LifecycleIntentRecord)> {
+        self.entries.iter()
+    }
+
+    pub fn begin(&mut self, operation: LifecycleIntent) {
+        self.entries.insert(
+            operation.target().clone(),
+            LifecycleIntentRecord::pending(operation),
+        );
+    }
+
+    pub fn complete(
+        &mut self,
+        workspace: &WorkspaceName,
+        completion: LifecycleIntentCompletion,
+    ) -> CowshedResult<()> {
+        let record = self.entries.get_mut(workspace).ok_or_else(|| {
+            CowshedError::integrity(
+                format!("lifecycle intent for {workspace} disappeared before completion"),
+                "reopen cowshed to reconcile lifecycle state",
+            )
+        })?;
+        record.completion = Some(completion);
+        self.validate()
+    }
+
+    pub fn clear(&mut self, workspace: &WorkspaceName) {
+        self.entries.remove(workspace);
+    }
+
+    fn validate(&self) -> CowshedResult<()> {
+        if self.version != LIFECYCLE_INTENT_VERSION {
+            return Err(CowshedError::integrity(
+                format!(
+                    "unsupported lifecycle intent journal version {}",
+                    self.version
+                ),
+                "upgrade cowshed or repair the lifecycle intent journal",
+            ));
+        }
+        for (workspace, record) in &self.entries {
+            if record.operation.target() != workspace {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "lifecycle intent key {workspace} disagrees with target {}",
+                        record.operation.target()
+                    ),
+                    "repair the lifecycle intent journal, then reopen cowshed",
+                ));
+            }
+            let valid_completion = matches!(
+                (&record.operation, &record.completion),
+                (_, None)
+                    | (
+                        LifecycleIntent::Adopt { .. }
+                            | LifecycleIntent::Create { .. }
+                            | LifecycleIntent::Fork { .. },
+                        Some(LifecycleIntentCompletion::Workspace(_))
+                    )
+                    | (
+                        LifecycleIntent::Retire { .. },
+                        Some(LifecycleIntentCompletion::Retire(_))
+                    )
+            );
+            if !valid_completion {
+                return Err(CowshedError::integrity(
+                    format!("lifecycle intent for {workspace} has an incompatible completion"),
+                    "repair the lifecycle intent journal, then reopen cowshed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+static MAIN_NAME: LazyLock<WorkspaceName> =
+    LazyLock::new(|| WorkspaceName::new("main").expect("fixed main workspace name"));
+
+fn main_name() -> &'static WorkspaceName {
+    &MAIN_NAME
+}
 
 /// The lifecycle mutations that share the publication and recovery protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
