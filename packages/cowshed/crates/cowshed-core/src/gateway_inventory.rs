@@ -419,9 +419,7 @@ impl NativeGatewayInventory {
                     project_root,
                 }),
                 Ok(None) | Err(_) => {
-                    eprintln!(
-                        "cowshed: skipping {repo_id}: it records no adopted checkout path"
-                    );
+                    eprintln!("cowshed: skipping {repo_id}: it records no adopted checkout path");
                 }
             }
         }
@@ -465,9 +463,7 @@ impl NativeGatewayInventory {
     /// cannot be healed must not cost every other project its gateway. A project that cannot even
     /// be opened reports that error as its main outcome, because an unopenable project is exactly a
     /// project whose main is unreachable.
-    pub async fn heal_all(
-        &self,
-    ) -> Result<Vec<ProjectHealOutcome>, GatewayInventoryError> {
+    pub async fn heal_all(&self) -> Result<Vec<ProjectHealOutcome>, GatewayInventoryError> {
         let store = self.storage.store().to_owned();
         let repositories =
             crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
@@ -892,7 +888,9 @@ fn is_not_a_project_namespace(path: &Path, name: &str) -> bool {
 /// showing a running process while status and doctor reported nothing started and eager heal never
 /// ran. A candidate that cannot be read is skipped; a candidate that reads as a real but broken
 /// project still raises, because that is cowshed's own state and hiding it would hide corruption.
-fn discover_repositories(store_root: &Path) -> Result<Vec<RepoId>, GatewayInventoryError> {
+pub(crate) fn discover_repositories(
+    store_root: &Path,
+) -> Result<Vec<RepoId>, GatewayInventoryError> {
     ensure_directory(store_root, "opening validated store root")?;
     let mut repositories = BTreeSet::new();
     for owner in read_directory(store_root, "enumerating store owners")? {
@@ -1166,9 +1164,7 @@ fn workspace_mountpoint(
 ///
 /// The store holds at most one: `authoritative_checkout_path` rejects a project carrying both, so
 /// the first hit is the answer rather than a candidate.
-fn existing_main_image(
-    layout: &StorageLayout,
-) -> Result<Option<PathBuf>, GatewayInventoryError> {
+fn existing_main_image(layout: &StorageLayout) -> Result<Option<PathBuf>, GatewayInventoryError> {
     for format in [ImageFormat::Asif, ImageFormat::Sparse] {
         let paths =
             layout
@@ -2147,7 +2143,10 @@ mod tests {
             source as Arc<dyn InventorySource>,
         );
 
-        let unreachable = inventory.unmounted_mains().await.expect("main reachability");
+        let unreachable = inventory
+            .unmounted_mains()
+            .await
+            .expect("main reachability");
 
         let layout = StorageLayout::new(fixture.storage.store(), &detached).expect("layout");
         let image = layout

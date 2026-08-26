@@ -485,7 +485,6 @@ impl ProjectActor {
         json_response(&snapshot.info)
     }
 
-
     async fn workspace_attach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
         let params: WorkspaceOptionsParams<AttachOptions> =
@@ -1055,7 +1054,6 @@ struct ForkParams {
     source: WorkspaceName,
     destination: WorkspaceName,
 }
-
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2304,7 +2302,6 @@ impl NativeProjectRuntimeHost {
             topology_revision: workspace.derived.workspace.topology_revision().get(),
         })
     }
-
 
     async fn checkpoint_quota(&self, workspace: &WorkspaceName) -> Result<Option<CheckpointQuota>> {
         let path = self.layout.project().policy.clone();
@@ -3739,7 +3736,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.snapshot_named(&main).await
     }
 
-
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
         self.validate_binding().await?;
@@ -4655,11 +4651,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ));
         }
         let gateway_socket = crate::gateway_sessions::control_socket_path();
-        let gateway_status = match cowshed_gateway::GatewayControlClient::new(gateway_socket.clone())
-        {
-            Ok(client) => client.status().await.map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
-        };
+        let gateway_status =
+            match cowshed_gateway::GatewayControlClient::new(gateway_socket.clone()) {
+                Ok(client) => client.status().await.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
         if let Err(error) = gateway_status {
             findings.push(crate::api::dto::Finding {
                 code: "gateway-down".into(),
@@ -7106,6 +7102,31 @@ mod binding_tests {
         assert_eq!(
             primary.remote_url.as_deref(),
             Some("https://example.com/acme/widget.git")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn matching_repository_identity_with_a_renamed_remote_is_a_binding_mismatch() {
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("smoothbricks/codebase"),
+            remote_name: Some("codebase".to_owned()),
+            remote_url: Some("https://github.com/smoothbricks/codebase.git".to_owned()),
+            primary: true,
+        }])
+        .expect("recorded binding");
+        let remotes = [remote(
+            "origin",
+            "https://github.com/smoothbricks/codebase.git",
+        )];
+
+        let error = validate_binding_against_remotes(&binding, &remotes)
+            .expect_err("the recorded remote name is part of the binding");
+
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            error.message,
+            "repository binding remote codebase does not match Git configuration"
         );
     }
     #[cfg(target_os = "macos")]
