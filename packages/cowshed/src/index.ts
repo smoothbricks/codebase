@@ -12,10 +12,12 @@ import {
 import {
   type AdoptOptions,
   type AttachOptions,
+  type CheckpointOptions,
   type Coordinator,
   type CoordinatorEndpoint,
   CowshedError,
   type CreateOptions,
+  type DoctorReport,
   type ErrorCode,
   type ExecRequest,
   type GcOptions,
@@ -27,11 +29,14 @@ import {
   type JobInfo,
   type LandOptions,
   type LandReport,
+  type PathOptions,
   type Project,
   type PushOptions,
   type PushReport,
   type RebaseOptions,
   type RemoveOptions,
+  type RemoveReport,
+  type ResizeResult,
   type Session,
   type WorkspaceHandle,
   type WorkspaceInfo,
@@ -39,17 +44,22 @@ import {
 } from './types.js';
 
 export {
+  type AbandonedWork,
   type AdoptOptions,
   type AttachOptions,
   type CheckpointInfo,
+  type CheckpointOptions,
   type Coordinator,
   type CoordinatorEndpoint,
   CowshedError,
+  type DoctorReport,
   type EgressMode,
   type EgressRule,
   type ErrorCode,
   type ExecRequest,
   type ExpectedRefHead,
+  type Finding,
+  type FindingSeverity,
   type GcCandidate,
   type GcOptions,
   type GcReport,
@@ -64,12 +74,15 @@ export {
   type LandOptions,
   type LandReport,
   type OutputPublication,
+  type PathOptions,
   type PortBlock,
   type Project,
   type PushOptions,
   type PushReport,
   type RebaseOptions,
   type RemoveOptions,
+  type RemoveReport,
+  type ResizeResult,
   type RevisionTarget,
   type RunSandboxMode,
   type Session,
@@ -96,6 +109,9 @@ const parseGcReport = typia.json.createAssertParse<GcReport>();
 const parsePushReport = typia.json.createAssertParse<PushReport>();
 const parseJobInfo = typia.json.createAssertParse<JobInfo>();
 const parseJobInfos = typia.json.createAssertParse<JobInfo[]>();
+const parseResizeResult = typia.json.createAssertParse<ResizeResult>();
+const parseDoctorReport = typia.json.createAssertParse<DoctorReport>();
+const parseRemoveReport = typia.json.createAssertParse<RemoveReport>();
 const assertAttachOptions = typia.createAssertEquals<AttachOptions>();
 const NEXT_HINT_MARKER = '\nnext: ';
 
@@ -163,6 +179,10 @@ function encodeCreateOptions(options: CreateOptions | undefined): string {
   return encodeJson('create options', typia.assert<CreateOptions>(options ?? {}));
 }
 
+function encodeCheckpointOptions(options: CheckpointOptions | undefined): string {
+  return encodeJson('checkpoint options', typia.assert<CheckpointOptions>(options ?? {}));
+}
+
 function encodeGrantDelta(delta: GrantDelta): string {
   return encodeJson('grant delta', typia.assert<GrantDelta>(delta));
 }
@@ -212,6 +232,14 @@ class ProjectImpl implements Project {
 
   async workspace(name: string): Promise<WorkspaceRef> {
     return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.workspace(name)));
+  }
+  async workspaceAt(path: string): Promise<WorkspaceRef> {
+    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.workspaceAt(path)));
+  }
+
+  async path(name: string, options?: PathOptions): Promise<WorkspaceInfo> {
+    const parsed = typia.assert<PathOptions>(options ?? {});
+    return parseWorkspaceInfo(await callNativeAsync(() => this.#native.path(name, parsed.noAttach ?? false)));
   }
 
   async listWorkspaces(): Promise<readonly WorkspaceInfo[]> {
@@ -265,6 +293,13 @@ class CoordinatorImpl implements Coordinator {
   async fork(source: string, destination: string): Promise<WorkspaceRef> {
     return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.fork(source, destination)));
   }
+  async rename(source: string, destination: string): Promise<WorkspaceRef> {
+    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.rename(source, destination)));
+  }
+
+  async moveCheckout(destination: string): Promise<WorkspaceRef> {
+    return new WorkspaceRefImpl(await callNativeAsync(() => this.#native.moveCheckout(destination)));
+  }
 
   async grant(workspace: string, delta: GrantDelta): Promise<GrantSet> {
     return parseGrantSet(await callNativeAsync(() => this.#native.grant(workspace, encodeGrantDelta(delta))));
@@ -289,13 +324,19 @@ class CoordinatorImpl implements Coordinator {
   async detach(workspace: string): Promise<void> {
     await callNativeAsync(() => this.#native.detach(workspace));
   }
+  async resize(workspace: string, capacity: string): Promise<ResizeResult> {
+    return parseResizeResult(await callNativeAsync(() => this.#native.resize(workspace, capacity)));
+  }
 
-  async destroy(workspace: string, options?: RemoveOptions): Promise<void> {
-    await callNativeAsync(() => this.#native.destroy(workspace, encodeRemoveOptions(options)));
+  async remove(workspace: string, options?: RemoveOptions): Promise<RemoveReport> {
+    return parseRemoveReport(await callNativeAsync(() => this.#native.remove(workspace, encodeRemoveOptions(options))));
   }
 
   async gc(options?: GcOptions): Promise<GcReport> {
     return parseGcReport(await callNativeAsync(() => this.#native.gc(encodeGcOptions(options))));
+  }
+  async doctor(): Promise<DoctorReport> {
+    return parseDoctorReport(await callNativeAsync(() => this.#native.doctor()));
   }
 
   async worker(workspace: string): Promise<WorkspaceHandle> {
@@ -332,6 +373,9 @@ class WorkspaceHandleImpl implements WorkspaceHandle {
 
   async job(id: number): Promise<JobHandle> {
     return new JobHandleImpl(await callNativeAsync(() => this.#native.job(id)));
+  }
+  async checkpoint(options?: CheckpointOptions): Promise<string> {
+    return callNativeAsync(() => this.#native.checkpoint(encodeCheckpointOptions(options)));
   }
 
   async push(options?: PushOptions): Promise<PushReport> {
@@ -426,4 +470,13 @@ export async function openProject(endpoint: CoordinatorEndpoint, path: string): 
  */
 export async function connectCoordinator(endpoint: CoordinatorEndpoint, path: string): Promise<Coordinator> {
   return new CoordinatorImpl(await callNativeAsync(() => native.connectCoordinator(endpoint, path)));
+}
+
+/**
+ * Runs any CLI verb in-process with the exact argv, stdout/stderr, and exit-code contract of the
+ * standalone binary. This is the parity escape hatch for host-management verbs such as gateway,
+ * sccache, skill, setup, version, and help that do not belong to a project capability.
+ */
+export async function runCli(argv: readonly string[]): Promise<number> {
+  return callNativeAsync(() => native.runCli(typia.assert<readonly string[]>(argv)));
 }

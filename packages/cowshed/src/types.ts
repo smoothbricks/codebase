@@ -79,6 +79,9 @@ export interface AttachOptions {
   readonly browse?: boolean;
   readonly observedPath?: string;
 }
+export interface PathOptions {
+  readonly noAttach?: boolean;
+}
 
 export interface AdoptOptions {
   readonly path?: string;
@@ -93,6 +96,8 @@ export interface CreateOptions {
   readonly fromWorkspace?: string;
   readonly browse?: boolean;
   readonly slot?: number;
+  readonly register?: boolean;
+  readonly gitWorktree?: boolean;
 }
 
 export interface GrantDelta {
@@ -125,6 +130,45 @@ export interface LandOptions {
 export interface RemoveOptions {
   readonly force?: boolean;
   readonly restore?: boolean;
+  readonly abandon?: boolean;
+}
+
+export interface CheckpointOptions {
+  readonly label?: string;
+  readonly keep?: boolean;
+}
+
+export interface ResizeResult {
+  readonly workspace: string;
+  readonly previousCapacity: string;
+  readonly capacity: string;
+}
+
+export type FindingSeverity = 'info' | 'warning' | 'error';
+
+export interface Finding {
+  readonly code: string;
+  readonly severity: FindingSeverity;
+  readonly message: string;
+  readonly hint: string;
+  readonly path?: string;
+}
+
+export interface DoctorReport {
+  readonly healthy: boolean;
+  readonly findings: readonly Finding[];
+}
+
+export interface AbandonedWork {
+  readonly head: string;
+  readonly targetBranch: string;
+  readonly targetHead?: string;
+  readonly unlandedCommits: number;
+  readonly bundle: string;
+}
+
+export interface RemoveReport {
+  readonly abandoned?: AbandonedWork;
 }
 
 export interface GcOptions {
@@ -224,6 +268,8 @@ export interface Project {
   readonly gitRoot: string;
   main(): Promise<WorkspaceRef>;
   workspace(name: string): Promise<WorkspaceRef>;
+  workspaceAt(path: string): Promise<WorkspaceRef>;
+  path(name: string, options?: PathOptions): Promise<WorkspaceInfo>;
   listWorkspaces(): Promise<readonly WorkspaceInfo[]>;
 }
 
@@ -232,14 +278,18 @@ export interface Coordinator {
   adopt(options?: AdoptOptions): Promise<WorkspaceRef>;
   create(name: string, options?: CreateOptions): Promise<WorkspaceRef>;
   fork(source: string, destination: string): Promise<WorkspaceRef>;
+  rename(source: string, destination: string): Promise<WorkspaceRef>;
+  moveCheckout(destination: string): Promise<WorkspaceRef>;
   grant(workspace: string, delta: GrantDelta): Promise<GrantSet>;
   revoke(workspace: string, delta: GrantDelta): Promise<GrantSet>;
   rebase(workspace: string, options?: RebaseOptions): Promise<string>;
   land(workspace: string, options?: LandOptions): Promise<LandReport>;
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
-  destroy(workspace: string, options?: RemoveOptions): Promise<void>;
+  resize(workspace: string, capacity: string): Promise<ResizeResult>;
+  remove(workspace: string, options?: RemoveOptions): Promise<RemoveReport>;
   gc(options?: GcOptions): Promise<GcReport>;
+  doctor(): Promise<DoctorReport>;
   worker(workspace: string): Promise<WorkspaceHandle>;
 }
 
@@ -250,6 +300,7 @@ export interface WorkspaceHandle {
   shell(session?: string): Promise<Session>;
   listJobs(): Promise<readonly JobInfo[]>;
   job(id: number): Promise<JobHandle>;
+  checkpoint(options?: CheckpointOptions): Promise<string>;
   push(options?: PushOptions): Promise<PushReport>;
   grants(): Promise<GrantSet>;
 }
