@@ -46,6 +46,7 @@ layout root:
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     policy.json                      # trusted project policy; controller-owned, mode 0600
+    lifecycle-intents.json             # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     main{.asif|.sparseimage}          # adopted main image; exactly one format-specific extension exists
     main{.asif|.sparseimage}.grants.json  # controller-owned grants + detached metadata
     sessions/

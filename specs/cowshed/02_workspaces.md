@@ -69,14 +69,16 @@ not a best-effort script:
    exist: lazily create and mount `cowshed.store` (at `/private/cowshed/store`) then `cowshed.caches` (nested; ordering and the
    volume marker in 01_storage.md) before any image is created.
 2. Select the supported format, then create the image under a staged, non-enumerated, format-specific name:
-   `<owner>/<repo>/.staging/main.asif` for ASIF or `<owner>/<repo>/.staging/main.sparseimage` for SPARSE. Both
-   components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md.
-   Create its complete sibling host sidecar with the matching `imageFormat` before the first attach; the readdir
-   registry never sees staged objects. Attach at a staging mountpoint, refusing any extension/metadata mismatch as
-   specified in 01_storage.md.
-3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent: re-run rsync-style delta
-   copies while the source keeps changing; refuse (exit 4) if the tree fails to quiesce within the pass budget, naming
-   the churning paths.
+   `<owner>/<repo>/.staging/main-<incarnation>.asif` for ASIF or
+   `<owner>/<repo>/.staging/main-<incarnation>.sparseimage` for SPARSE. Both components come from the validated primary
+   `repo_id` and are encoded independently as specified in 01_storage.md. Create its complete sibling host sidecar with
+   the matching `imageFormat` before the first attach; the readdir registry never sees staged objects. Attach at a
+   staging mountpoint, refusing any extension/metadata mismatch as specified in 01_storage.md.
+3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent. A bounded worker pool
+   sized to available cores processes independent leaves. Each leaf first requests an APFS metadata clone and falls back
+   only that leaf to `copyfile` data copy on `EXDEV`/`ENOTSUP`, so one cross-volume subtree never aborts completed
+   siblings. Re-run delta passes while the source keeps changing; refuse (exit 4) if the tree fails to quiesce within
+   the pass budget, naming the churning paths.
 4. Write `.cowshed/workspace.json` (`role: "main"`), mint `.cowshed/token`, mint main's per-workspace CA (private key
    controller-side next to the grant file; CA cert placed in-image as a trust anchor with the tool anchors wired —
    04_sandbox.md/05_gateway.md), create in-image cache roots, and write platform endpoint plus shared-cache wiring into
@@ -122,10 +124,13 @@ from it; honoring the path condition by telling the user exactly which rule to e
 
 6. Print the mount path on stdout.
 
-Every step is idempotent to re-run. `cowshed doctor`/`cowshed gc` recognize each crash point and resume or roll back.
-Because the durable half completes first, the resumable state is _mount and image published, checkout still the original
-directory, swap pending_ — recovery needs nothing from the user's tree to finish it, and `<root>.pre-cowshed` does not
-exist yet. `<root>.pre-cowshed` is retained until the user deletes it; cowshed never auto-deletes it.
+Every step is idempotent to re-run. Intent is fsynced before image mutation. If adoption dies during the tree copy, the
+next open clone-copies the partial staged image under a fresh incarnation and the delta copier skips every completed
+leaf before resuming; it does not start the repository copy over. At later crash points `cowshed doctor`/`cowshed gc`
+resume or roll back from the image, companion, and checkout-swap facts. Because the durable half completes first, the
+post-copy resumable state is _mount and image published, checkout still the original directory, swap pending_ — recovery
+needs nothing from the user's tree to finish it, and `<root>.pre-cowshed` does not exist yet. `<root>.pre-cowshed` is
+retained until the user deletes it; cowshed never auto-deletes it.
 
 Adopting is reversible, and reverses the same way: `cowshed rm main --restore` detaches, swaps the retained
 `<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied
@@ -221,6 +226,11 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    the new marker carries `lineage` = main's incarnation followed by main's own lineage, which is what authorizes the
    job records the clone inherited.
 8. Print the mount path on stdout; guidance and `next:` hints on stderr.
+
+Before the first slot, image, grant-reservation, or Git mutation, `new` and `fork` fsync their complete operation into
+the project lifecycle-intent journal. Startup first reconciles a pending destination against canonical inventory: an
+already-published incarnation becomes the recorded result; an absent destination reruns the operation. Reissuing the
+same call returns that incarnation instead of creating a second workspace or reporting a false conflict.
 
 Flags: `--ref <rev>` (after branching, `git switch -c cowshed/<name> <rev>` instead of main's state),
 `--from <workspace>` (clone a session instead of main — sugar over `cowshed fork`), `--register` (see "The `main`
@@ -645,6 +655,11 @@ The full born-from-host-return-to-host close-out, as one primitive. The target d
    and companions, every checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact,
    then the empty checkpoint and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc`
    only from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
+
+Removal likewise persists its exact options before attachment or retirement. If a process dies after canonical
+retirement but before acknowledging the call, startup observes the workspace absent, records the first removal result,
+and a retry returns it without applying retirement twice. If the canonical workspace remains, the pending intent reruns
+the safety fences and retirement.
 
 `cowshed rm main --restore` is the adoption rollback described above and maps to `RemoveOptions.restore`; plain
 `cowshed rm main` requires `--force` and a clean `git status` (exit 4 otherwise).

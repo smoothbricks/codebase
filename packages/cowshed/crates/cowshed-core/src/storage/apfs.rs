@@ -182,6 +182,11 @@ pub struct PendingPublicationFact {
     pub replaced_incarnation: WorkspaceIncarnation,
     pub destination_incarnation: WorkspaceIncarnation,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumableStage {
+    pub image: PathBuf,
+    pub format: ImageFormat,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreFence {
@@ -344,6 +349,15 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsStorageError>;
+    fn resumable_staged_adopt(
+        &self,
+        config: &ApfsSubstrateConfig,
+        repo: &RepoId,
+        identity: &OperationIdentity,
+    ) -> Result<Option<ResumableStage>, ApfsStorageError> {
+        let _ = (config, repo, identity);
+        Ok(None)
+    }
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError>;
     fn attach_verified(
         &self,
@@ -1825,19 +1839,32 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
     let topology = absent_expected(expected)?;
     let incarnation = incarnations.mint()?;
     let staged_stem = staging_stem(config, repo, &main_name(), &incarnation)?;
-    let request = CreateImageRequest {
-        staged_stem,
-        capacity,
-        volume_name: volume_label(repo, &main_name()),
-        case_sensitivity: config.case_sensitivity,
-        owner_uid: unsafe { libc::getuid() },
-        owner_gid: unsafe { libc::getgid() },
-        image_format: match requested_format {
-            ImageFormat::Asif => ImageFormatSelection::Auto,
-            ImageFormat::Sparse => ImageFormatSelection::Exact(ImageFormat::Sparse),
-        },
+    let resumable = host.resumable_staged_adopt(config, repo, identity)?;
+    let created = match resumable {
+        Some(resumable) => {
+            let path = staged_stem.with_extension(resumable.format.extension());
+            host.clone_image(&resumable.image, &path, resumable.format)?;
+            CreatedImage {
+                path,
+                format: resumable.format,
+            }
+        }
+        None => {
+            let request = CreateImageRequest {
+                staged_stem,
+                capacity,
+                volume_name: volume_label(repo, &main_name()),
+                case_sensitivity: config.case_sensitivity,
+                owner_uid: unsafe { libc::getuid() },
+                owner_gid: unsafe { libc::getgid() },
+                image_format: match requested_format {
+                    ImageFormat::Asif => ImageFormatSelection::Auto,
+                    ImageFormat::Sparse => ImageFormatSelection::Exact(ImageFormat::Sparse),
+                },
+            };
+            host.create_staged(&request, requested_format)?
+        }
     };
-    let created = host.create_staged(&request, requested_format)?;
     let workspace = LifecycleWorkspace::new(
         repo.clone(),
         main_name(),

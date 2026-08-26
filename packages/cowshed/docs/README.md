@@ -127,7 +127,9 @@ The `owner` and `repo` components are validated and encoded independently; cowsh
 filesystem path. `policy.json` is trusted host policy, not repository content, and is never read from a workspace.
 
 There is no mutable state database. Images/datasets, repository bindings, the kernel mount table, and in-image markers
-_are_ the state; every command derives the world by looking at them.
+remain authoritative. A bounded `lifecycle-intents.json` journal records the latest create/fork/remove intent for each
+logical workspace before mutation; startup reconciles it against that authoritative inventory so a killed caller can
+retry without duplicating or wedging the operation.
 
 ## The cache model in one paragraph
 

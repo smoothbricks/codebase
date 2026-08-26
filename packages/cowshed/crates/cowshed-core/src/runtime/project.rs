@@ -1355,6 +1355,8 @@ struct NativeProjectRuntimeHost {
     >,
     home: PathBuf,
     telemetry_root: PathBuf,
+    lifecycle_intents_path: PathBuf,
+    lifecycle_intents: crate::storage::recovery::LifecycleIntentJournal,
 }
 
 #[cfg(target_os = "macos")]
@@ -1657,17 +1659,29 @@ impl NativeProjectRuntimeHost {
             config.clone(),
         )
         .map_err(native_storage_error)?;
+        let lifecycle_intents_path = layout
+            .project()
+            .project_root
+            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+        let recovery_intents_path = lifecycle_intents_path.clone();
         let recovery_config = config.clone();
         let recovery_repo = repo_id.clone();
-        let (host, facts, pending) = crate::storage::lifecycle::dispatch_blocking(move || {
-            host.recover_pending(&recovery_config, &[])?;
-            let facts = host.list(&recovery_repo)?;
-            let pending = host.pending_publications(&recovery_repo)?;
-            Ok::<_, crate::storage::apfs::ApfsStorageError>((host, facts, pending))
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("APFS recovery task failed: {error}")))?
-        .map_err(native_storage_error)?;
+        let (host, facts, pending, lifecycle_intents) =
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                let lifecycle_intents =
+                    crate::storage::recovery::LifecycleIntentJournal::load(&recovery_intents_path)?;
+                host.recover_pending(&recovery_config, &[])
+                    .map_err(native_storage_error)?;
+                let facts = host.list(&recovery_repo).map_err(native_storage_error)?;
+                let pending = host
+                    .pending_publications(&recovery_repo)
+                    .map_err(native_storage_error)?;
+                Ok::<_, CowshedError>((host, facts, pending, lifecycle_intents))
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("APFS recovery task failed: {error}"))
+            })??;
         let retired_project_root = layout.project().project_root.clone();
         let retired_repo = repo_id.clone();
         let retired = crate::storage::lifecycle::dispatch_blocking(move || {
@@ -1745,7 +1759,165 @@ impl NativeProjectRuntimeHost {
             sessions: std::collections::BTreeMap::new(),
             home,
             telemetry_root,
+            lifecycle_intents_path,
+            lifecycle_intents,
         })
+    }
+    async fn replace_lifecycle_intents(
+        &mut self,
+        next: crate::storage::recovery::LifecycleIntentJournal,
+    ) -> Result<()> {
+        let path = self.lifecycle_intents_path.clone();
+        self.lifecycle_intents = crate::storage::lifecycle::dispatch_blocking(move || {
+            next.persist(&path)?;
+            Ok::<_, CowshedError>(next)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("lifecycle intent persistence task failed: {error}"))
+        })??;
+        Ok(())
+    }
+
+    async fn begin_lifecycle_intent(
+        &mut self,
+        operation: crate::storage::recovery::LifecycleIntent,
+    ) -> Result<()> {
+        let mut next = self.lifecycle_intents.clone();
+        next.begin(operation);
+        self.replace_lifecycle_intents(next).await
+    }
+
+    async fn complete_lifecycle_intent(
+        &mut self,
+        workspace: &WorkspaceName,
+        completion: crate::storage::recovery::LifecycleIntentCompletion,
+    ) -> Result<()> {
+        let mut next = self.lifecycle_intents.clone();
+        next.complete(workspace, completion)?;
+        self.replace_lifecycle_intents(next).await
+    }
+
+    fn completed_workspace_intent(
+        &self,
+        operation: &crate::storage::recovery::LifecycleIntent,
+    ) -> Option<&WorkspaceIncarnation> {
+        let record = self.lifecycle_intents.get(operation.target())?;
+        if record.operation != *operation {
+            return None;
+        }
+        match record.completion.as_ref()? {
+            crate::storage::recovery::LifecycleIntentCompletion::Workspace(incarnation) => {
+                Some(incarnation)
+            }
+            crate::storage::recovery::LifecycleIntentCompletion::Retire(_) => None,
+        }
+    }
+
+    fn completed_retire_intent(
+        &self,
+        operation: &crate::storage::recovery::LifecycleIntent,
+    ) -> Option<&RemoveReport> {
+        let record = self.lifecycle_intents.get(operation.target())?;
+        if record.operation != *operation {
+            return None;
+        }
+        match record.completion.as_ref()? {
+            crate::storage::recovery::LifecycleIntentCompletion::Retire(report) => Some(report),
+            crate::storage::recovery::LifecycleIntentCompletion::Workspace(_) => None,
+        }
+    }
+
+    /// Finishes the create/fork/remove/adopt work a crash left pending, then records the exact
+    /// result so a later start does not repeat it. Reports whether any intent was acted on: the
+    /// completions mutate images and mounts, so a caller holding a host inventory read before
+    /// this call must discard it when the answer is `true`.
+    async fn recover_lifecycle_intents(&mut self) -> Result<bool> {
+        use crate::storage::recovery::{LifecycleIntent, LifecycleIntentCompletion};
+
+        let pending = self
+            .lifecycle_intents
+            .records()
+            .filter(|(_, record)| record.completion.is_none())
+            .map(|(_, record)| record.operation.clone())
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        async {
+            for operation in pending {
+                match operation {
+                    LifecycleIntent::Adopt { options } => match self.current(&main_name()).await {
+                        Ok(current) => {
+                            self.complete_lifecycle_intent(
+                                current.derived.workspace.name(),
+                                LifecycleIntentCompletion::Workspace(
+                                    current.derived.workspace.incarnation().clone(),
+                                ),
+                            )
+                            .await?;
+                        }
+                        Err(error) if error.code == ErrorCode::NotFound => {
+                            self.adopt(options).await?;
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    LifecycleIntent::Create { workspace, options } => {
+                        match self.current(&workspace).await {
+                            Ok(current) => {
+                                self.complete_lifecycle_intent(
+                                    &workspace,
+                                    LifecycleIntentCompletion::Workspace(
+                                        current.derived.workspace.incarnation().clone(),
+                                    ),
+                                )
+                                .await?;
+                            }
+                            Err(error) if error.code == ErrorCode::NotFound => {
+                                self.create(workspace, options).await?;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    LifecycleIntent::Fork {
+                        source,
+                        destination,
+                    } => match self.current(&destination).await {
+                        Ok(current) => {
+                            self.complete_lifecycle_intent(
+                                &destination,
+                                LifecycleIntentCompletion::Workspace(
+                                    current.derived.workspace.incarnation().clone(),
+                                ),
+                            )
+                            .await?;
+                        }
+                        Err(error) if error.code == ErrorCode::NotFound => {
+                            self.fork(source, destination).await?;
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    LifecycleIntent::Retire { workspace, options } => {
+                        match self.current(&workspace).await {
+                            Ok(_) => {
+                                self.remove(workspace, options).await?;
+                            }
+                            Err(error) if error.code == ErrorCode::NotFound => {
+                                self.complete_lifecycle_intent(
+                                    &workspace,
+                                    LifecycleIntentCompletion::Retire(RemoveReport::default()),
+                                )
+                                .await?;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await?;
+        Ok(true)
     }
 
     async fn validate_binding(&self) -> Result<()> {
@@ -3436,6 +3608,16 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if !detached_direct_main {
             self.validate_binding().await?;
         }
+        // Intent recovery finishes interrupted create/fork/remove work by creating and destroying
+        // images, so the read above describes the host from before those mutations. Re-read only
+        // when recovery actually acted: with no pending intent — every start that did not follow a
+        // crash — the first read still describes the host, so open stays linear in workspace count.
+        let authoritative = if self.recover_lifecycle_intents().await? {
+            self.authoritative_allowing_detached_main_relocation()
+                .await?
+        } else {
+            authoritative
+        };
         let attached = authoritative
             .into_iter()
             .filter(|workspace| {
@@ -3463,8 +3645,16 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
-
         self.validate_binding().await?;
+        let intent = crate::storage::recovery::LifecycleIntent::Adopt {
+            options: options.clone(),
+        };
+        if let Some(expected) = self.completed_workspace_intent(&intent).cloned() {
+            let current = self.current(&main_name()).await?;
+            Self::require_exact_incarnation(&current, &expected)?;
+            return self.snapshot(&current);
+        }
+
         if !self.authoritative().await?.is_empty() {
             return Err(CowshedError::conflict(
                 "repository is already adopted",
@@ -3488,13 +3678,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             options.quarantine,
         )
         .await?;
-
-        let reservation = self.fresh_grants().await?;
-        let mut grants = reservation.grants.clone();
-        grants.revision = 0;
-        let identity = self
-            .operation_identity(grants, self.git.current_branch().await?, None, false)
-            .await?;
         let format = options
             .image_format
             .unwrap_or(crate::metadata::ImageFormat::Asif);
@@ -3505,6 +3688,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             None => self.substrate_config.capacity,
         };
         let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
+        self.begin_lifecycle_intent(intent).await?;
+
+        let reservation = self.fresh_grants().await?;
+        let mut grants = reservation.grants.clone();
+        grants.revision = 0;
+        let identity = self
+            .operation_identity(grants, self.git.current_branch().await?, None, false)
+            .await?;
         let plan = self
             .substrate
             .plan_adopt(crate::storage::lifecycle::AdoptRequest {
@@ -3547,6 +3738,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 workspace_incarnation: receipt.workspace.incarnation().clone(),
             })
             .await?;
+        self.complete_lifecycle_intent(
+            receipt.workspace.name(),
+            crate::storage::recovery::LifecycleIntentCompletion::Workspace(
+                receipt.workspace.incarnation().clone(),
+            ),
+        )
+        .await?;
         let name = receipt.workspace.name().clone();
         self.ensure_supervisor(&name).await?;
         self.snapshot_named(&name).await
@@ -3559,8 +3757,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
-
         self.validate_binding().await?;
+        let intent = crate::storage::recovery::LifecycleIntent::Create {
+            workspace: workspace.clone(),
+            options: options.clone(),
+        };
+        if let Some(expected) = self.completed_workspace_intent(&intent).cloned() {
+            let current = self.current(&workspace).await?;
+            Self::require_exact_incarnation(&current, &expected)?;
+            return self.snapshot(&current);
+        }
+
         if self
             .authoritative()
             .await?
@@ -3604,6 +3811,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     "choose a slot within the project's range",
                 )
             })?;
+        self.begin_lifecycle_intent(intent).await?;
         if let Some(slot) = slot {
             self.bind_slot(&workspace, slot).await?;
         }
@@ -3671,6 +3879,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     workspace_incarnation: receipt.workspace.incarnation().clone(),
                 })
                 .await?;
+            self.complete_lifecycle_intent(
+                &workspace,
+                crate::storage::recovery::LifecycleIntentCompletion::Workspace(
+                    receipt.workspace.incarnation().clone(),
+                ),
+            )
+            .await?;
             self.ensure_supervisor(&workspace).await?;
             self.snapshot_named(&workspace).await
         }
@@ -3757,8 +3972,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::lifecycle::LifecyclePlanner;
-
         self.validate_binding().await?;
+        let intent = crate::storage::recovery::LifecycleIntent::Fork {
+            source: source.clone(),
+            destination: destination.clone(),
+        };
+        if let Some(expected) = self.completed_workspace_intent(&intent).cloned() {
+            let current = self.current(&destination).await?;
+            Self::require_exact_incarnation(&current, &expected)?;
+            return self.snapshot(&current);
+        }
+
         let source_fact = self.current(&source).await?;
         if self
             .authoritative()
@@ -3779,6 +4003,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             self.require_main_mounted_for_git_worktree(&destination)
                 .await?;
         }
+        self.begin_lifecycle_intent(intent).await?;
         let reservation = self.fresh_grants().await?;
         let identity = self
             .operation_identity(
@@ -3823,6 +4048,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 destination_incarnation: receipt.workspace.incarnation().clone(),
             })
             .await?;
+        self.complete_lifecycle_intent(
+            &destination,
+            crate::storage::recovery::LifecycleIntentCompletion::Workspace(
+                receipt.workspace.incarnation().clone(),
+            ),
+        )
+        .await?;
         self.ensure_supervisor(&destination).await?;
         self.snapshot_named(&destination).await
     }
@@ -4347,28 +4579,63 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if workspace.is_main() && !options.restore && !options.force {
             return Err(main_removal_mode_refusal());
         }
-
         self.validate_binding().await?;
+        let intent = crate::storage::recovery::LifecycleIntent::Retire {
+            workspace: workspace.clone(),
+            options,
+        };
+        let was_pending = self
+            .lifecycle_intents
+            .get(&workspace)
+            .is_some_and(|record| record.operation == intent && record.completion.is_none());
+        if let Some(report) = self.completed_retire_intent(&intent).cloned()
+            && self
+                .current(&workspace)
+                .await
+                .is_err_and(|error| error.code == ErrorCode::NotFound)
+        {
+            return Ok(report);
+        }
+
         let mut current = match self.current(&workspace).await {
+            Err(error) if error.code == ErrorCode::NotFound && was_pending => {
+                let report = RemoveReport::default();
+                self.complete_lifecycle_intent(
+                    &workspace,
+                    crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+                )
+                .await?;
+                return Ok(report);
+            }
             Ok(current) => current,
             Err(error) if options.restore && error.code == ErrorCode::NotFound => {
                 let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
-                if tokio::fs::symlink_metadata(&pre_cowshed).await.is_err()
+                let restored = tokio::fs::symlink_metadata(&pre_cowshed).await.is_err()
                     && self
                         .verify_checkout_identity(
                             &self.descriptor.git_root,
                             "restored project checkout",
                         )
                         .await
-                        .is_ok()
-                {
+                        .is_ok();
+                if restored {
+                    if !was_pending {
+                        self.begin_lifecycle_intent(intent.clone()).await?;
+                    }
                     self.remove_project_binding_after_restore().await?;
-                    return Ok(RemoveReport::default());
+                    let report = RemoveReport::default();
+                    self.complete_lifecycle_intent(
+                        &workspace,
+                        crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+                    )
+                    .await?;
+                    return Ok(report);
                 }
                 return Err(error);
             }
             Err(error) => return Err(error),
         };
+        self.begin_lifecycle_intent(intent).await?;
 
         if options.restore {
             let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
@@ -4418,7 +4685,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             self.retire_restored_main(current).await?;
             self.remove_project_binding_after_restore().await?;
-            return Ok(RemoveReport::default());
+            let report = RemoveReport::default();
+            self.complete_lifecycle_intent(
+                &workspace,
+                crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+            )
+            .await?;
+            return Ok(report);
         }
 
         let initially_detached = matches!(current.derived.mount_state, MountState::Detached);
@@ -4497,6 +4770,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 };
             }
         };
+        self.complete_lifecycle_intent(
+            &workspace,
+            crate::storage::recovery::LifecycleIntentCompletion::Retire(report.clone()),
+        )
+        .await?;
         Ok(report)
     }
 
