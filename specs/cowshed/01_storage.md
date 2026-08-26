@@ -64,14 +64,17 @@ layout root:
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
   caches/                            # ← cowshed.caches volume, NESTED mount (mirror, git mirrors, layer-3 caches)
-  (workspace mounts live in each project checkout — `<project-root>/.cowshed/<workspace>`; see 02_workspaces.md)
+  (workspaces mount under a host-configured mount root — default `~/.cowshed/mnt`; see 02_workspaces.md)
 
-Workspace mountpoints live inside the project's own checkout at `<project-root>/.cowshed/<workspace>`: path-conditional
-Git configuration (`includeIf "gitdir:…"`) inherits into every workspace exactly as it does for main, `$HOME` hosts only
-plain per-user directories, and the store volume holds bytes only. Main cannot detach while workspaces are mounted
-inside it; detach order is strictly children first, and `gc` removes the host-side `.cowshed/` directory when it is
-empty. This directory is distinct from the in-image `.cowshed/` namespace above and from the same-named directory
-inside every clone.
+Workspace mountpoints live under one host-configured **mount root** (default `~/.cowshed/mnt`, settable via
+`cowshed setup --mount-root <dir>`), laid out `<mount-root>/<owner>/<repo>/<workspace>`. The root is a plain directory
+on Data: no volume mounts there, so the masked-mountpoint failure class cannot exist. Git identity inheritance follows
+the anchor of each `includeIf gitdir:` rule — rules anchored at an ancestor of the mount root (for example
+`gitdir:~/Dev/`) match workspaces with no additional configuration; rules anchored exactly at a project root do not,
+and `cowshed new`/`doctor` detect that divergence empirically by diffing `git config --show-origin` between the
+checkout and a probe repository at the candidate workspace path. Changing the root requires every workspace detached;
+`setup` refuses while any are attached because absolute paths are baked into detached metadata and sandbox profiles.
+This directory is distinct from the in-image `.cowshed/` namespace inside every clone.
 
 ~/Library/LaunchAgents/dev.cowshed.*.plist   # launchd service definitions (gateway daemonizes to a system
                                              # LaunchDaemon; sccache stays per-user); home-manager-owned on nix hosts
@@ -140,21 +143,23 @@ in-image marker's `imageFormat` to match. The two formats have disjoint attach t
 ASIF outright with _"use 'diskutil image attach'"_):
 
 - **ASIF (`.asif`)**: `diskutil image attach --nobrowse --noMount --plist <image>`.
-- Session workspaces mount at `<project-root>/.cowshed/<workspace>` — inside the project checkout, nested on main's
-  mounted volume. `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and the sidebar regardless of
-  Finder preferences.
-- The **main workspace mounts where its project's checkout layout says** (02_workspaces.md): at the repository's
-  original path (written `<project-root>` below) under direct mount, or at the store's session namespace with a symlink
-  at the original path under the symlink layout. Either way the user keeps working at the path they know, and in both
-  layouts sibling workspaces nest under `<project-root>/.cowshed/`.
+- **SPARSE (`.sparseimage`, fallback)**: `hdiutil attach -nobrowse -owners on -nomount -plist <image>`.
+
+Both commands return machine-readable attachment data from which cowshed selects the APFS volume device. Before the
+first mount, cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and fails without exposing a
+workspace mount. It then mounts explicitly with `diskutil mount nobrowse -mountPoint <path> <device>` (`--browse` omits
+`nobrowse`). ASIF and SPARSE therefore share the same verify-before-mount safety boundary even though their image
+attachment tools remain disjoint. Ownership is also guaranteed by the ASIF chown-at-create step above.
 
 For every mounted attachment:
 
-- Session workspaces mount at `/private/cowshed/store/mnt/<owner>/<repo>/<workspace>`. `-nobrowse` keeps every cowshed volume out of
-  Finder, the Desktop, and the sidebar regardless of Finder preferences.
+- Session workspaces mount under the host-configured mount root at
+  `<mount-root>/<owner>/<repo>/<workspace>`. `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and
+  the sidebar regardless of Finder preferences.
 - The **main workspace mounts where its project's checkout layout says** (02_workspaces.md): at the repository's
-  original path (written `<project-root>` below) under direct mount, or at `/private/cowshed/store/mnt/<owner>/<repo>/main` with a
-  symlink at the original path under the symlink layout. Either way the user keeps working at the path they know.
+  original path (written `<project-root>` below) under direct mount, or inside the store's session namespace with a
+  symlink at the original path under the symlink layout. Either way the user keeps working at the path they know, and
+  in both layouts sibling workspaces live under the shared mount root.
 - Mountpoint directories are created before attach and removed by `cowshed gc`; an empty mountpoint dir is the defined
   "detached" state, and the underlying dir holds a stub `.envrc` used for self-healing (see 02_workspaces.md).
 - Cwd resolution is granted only when the canonical input path is contained in exactly one currently mounted,
@@ -263,7 +268,7 @@ There is one cowshed per machine, anchored to no account. `/private/cowshed/{sto
 Data created once at provision; they exist only as mountpoints and fstab targets. Per-user conveniences are
 unprivileged symlinks (`~/.cowshed → /private/cowshed/store`) written by `cowshed ensure` purely for muscle memory;
 no cowshed evidence, sandbox profile, or metadata derives a path from `$HOME`. Workspace images remain separate
-volumes mounted under `store/mnt/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by
+workspace images live under `<mount-root>/…`'s sibling layout on the store, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by
 sharing; concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and
 cross-user `gc` policy is deliberately blunt: any user may retire any shed, because `noowners` already made the
 trust model explicit.
@@ -408,8 +413,8 @@ ASIF measures decisively better on I/O and metadata (2–5.6×) at the cost of ~
 path (`diskutil image attach`).
 
 **`/Volumes` mount root rejected.** DiskArbitration-managed mountpoints save a mkdir/rmdir pair but put cowshed paths in
-a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). `/private/cowshed/store/mnt` gives
-short, stable, hidden paths cowshed fully owns.
+a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). The configured mount root
+gives short, stable, hidden paths cowshed fully owns.
 
 **`~/Library/Application Support` rejected.** The Apple-idiomatic location puts multi-GB churning images on the Data
 volume, where local snapshots pin their rewritten blocks and backup policy needs per-path exclusion machinery. Two
