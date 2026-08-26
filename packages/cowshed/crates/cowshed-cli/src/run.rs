@@ -12,9 +12,7 @@ use std::io;
 use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
-use crate::{
-    args, gateway_service, help, output, runtime, sccache_service, setup_service, skill,
-};
+use crate::{args, gateway_service, help, output, runtime, sccache_service, setup_service, skill};
 
 /// Run one CLI invocation. `arguments` excludes argv[0].
 ///
@@ -74,6 +72,17 @@ async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
             None => help::overview(),
         };
         return match output.bare(page.as_bytes()) {
+            Ok(()) => 0,
+            Err(write_error) => {
+                eprintln!("cowshed: failed to write command result: {write_error}");
+                1
+            }
+        };
+    }
+
+    if matches!(parsed.command, args::Command::Version) {
+        let version = format!("cowshed {}\n", args::package_version());
+        return match output.bare(version.as_bytes()) {
             Ok(()) => 0,
             Err(write_error) => {
                 eprintln!("cowshed: failed to write command result: {write_error}");
@@ -255,9 +264,6 @@ mod tests {
         );
 
         let detach_all = args::parse_args(["detach", "--all"]).expect("detach --all parses");
-        assert_eq!(
-            runtime_dispatch(&detach_all.command),
-            RuntimeDispatch::Host
-        );
+        assert_eq!(runtime_dispatch(&detach_all.command), RuntimeDispatch::Host);
     }
 }

@@ -1,12 +1,11 @@
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
-
-use clap::error::{ContextKind, ContextValue, ErrorKind};
-use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
+use std::sync::LazyLock;
 
 use crate::help::{self, CommandSpec, Opt};
-
 
 /// Every command, in the order the command map lists them.
 ///
@@ -76,6 +75,8 @@ pub enum Command {
     Gateway(GatewayCommand),
     Sccache(SccacheCommand),
     Skill(SkillArgs),
+    /// `--version` or `-V`: the npm package version.
+    Version,
     /// `--help`, `-h`, or `help`: the command map, or one command's page.
     Help(Option<&'static CommandSpec>),
 }
@@ -114,6 +115,7 @@ impl Command {
             | Self::Gateway(_)
             | Self::Sccache(_)
             | Self::Skill(_)
+            | Self::Version
             | Self::Help(_) => ProjectDiscovery::NotUsed,
         }
     }
@@ -233,7 +235,6 @@ pub struct RestoreArgs {
     pub workspace: String,
     pub label: OsString,
 }
-
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ListArgs {
@@ -413,6 +414,10 @@ where
     }
     match cli_command().try_get_matches_from(&args) {
         Ok(matches) => cli_from_matches(matches),
+        Err(error) if error.kind() == ErrorKind::DisplayVersion => Ok(Cli {
+            global: GlobalOptions::default(),
+            command: Command::Version,
+        }),
         Err(error) => Err(translate_clap(error, &args)),
     }
 }
@@ -465,7 +470,6 @@ fn parse_help_request(args: &[OsString]) -> Result<Option<Cli>, UsageError> {
     Ok(None)
 }
 
-
 /// `help [<command>]`, and the `--help`/`-h` spellings of the same request.
 fn parse_help(args: &[OsString], mut index: usize) -> Result<Command, UsageError> {
     const HINT: &str = "cowshed help [<command>]";
@@ -515,14 +519,28 @@ fn unknown_command(name: &str) -> UsageError {
     UsageError::with_hint(message, "cowshed --help")
 }
 
+/// The package manifest is embedded in every native CLI artifact, so `--version` reports the npm
+/// release version even when no package tree exists beside the extracted binary.
+pub fn package_version() -> &'static str {
+    #[derive(serde::Deserialize)]
+    struct PackageManifest {
+        version: String,
+    }
+
+    static VERSION: LazyLock<String> = LazyLock::new(|| {
+        serde_json::from_str::<PackageManifest>(include_str!("../../../package.json"))
+            .expect("cowshed package.json must contain a string version")
+            .version
+    });
+    VERSION.as_str()
+}
+
 fn cli_command() -> ClapCommand {
     ClapCommand::new("cowshed")
         .no_binary_name(true)
         .disable_help_flag(true)
         .disable_help_subcommand(true)
-        .disable_version_flag(true)
-
-        .subcommand_required(true)
+        .version(package_version())
         .args(global_args())
         .subcommand(leaf("adopt").arg(positional("path", 0..=1)).args([
             value("capacity"),
@@ -579,7 +597,6 @@ fn cli_command() -> ClapCommand {
                     flag("background"),
                     value_once("stdout-copy"),
                     value_once("stderr-copy"),
-
                     flag("replace-output"),
                 ])
                 .arg(
@@ -633,7 +650,6 @@ fn cli_command() -> ClapCommand {
             value("expected-source-head"),
             value("expected-target-head"),
         ]))
-
         .subcommand(leaf("doctor"))
         .subcommand(
             leaf("gateway")
@@ -655,7 +671,6 @@ fn cli_command() -> ClapCommand {
                 .subcommand_required(true)
                 .subcommand(leaf("install").arg(append_value("harness"))),
         )
-
 }
 
 fn global_args() -> [Arg; 3] {
@@ -714,14 +729,12 @@ fn append_value(name: &'static str) -> Arg {
         .action(ArgAction::Append)
 }
 
-
 fn positional(name: &'static str, _range: std::ops::RangeInclusive<usize>) -> Arg {
     Arg::new(name)
         .value_parser(value_parser!(OsString))
         .required(false)
         .num_args(1)
 }
-
 
 fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
     let Some((name, leaf)) = matches.subcommand() else {
@@ -819,10 +832,9 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                     format!("setup takes no arguments, only flags; got `{token}`"),
                     spec,
                 ),
-                Some(spec) if spec.name == "exec" && !token.starts_with('-') => UsageError::new(
-                    "exec requires `--` before the child argv",
-                    spec,
-                ),
+                Some(spec) if spec.name == "exec" && !token.starts_with('-') => {
+                    UsageError::new("exec requires `--` before the child argv", spec)
+                }
                 Some(spec) if token.starts_with('-') => unknown_flag(&token, spec),
                 Some(spec) => UsageError::new(
                     format!("{} accepts no positional arguments", spec.name),
@@ -858,7 +870,6 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                 UsageError::with_hint(message, "cowshed --help")
             }
         }
-
     }
 }
 
@@ -880,7 +891,6 @@ fn missing_required_message(spec: &CommandSpec) -> String {
         _ => format!("{} requires an argument", spec.name),
     }
 }
-
 
 fn error_head(error: &clap::Error) -> String {
     error
@@ -975,7 +985,10 @@ fn optional_workspace(
         .transpose()
 }
 
-fn parse_slot_value(matches: &ArgMatches, usage: &'static CommandSpec) -> Result<Option<u32>, UsageError> {
+fn parse_slot_value(
+    matches: &ArgMatches,
+    usage: &'static CommandSpec,
+) -> Result<Option<u32>, UsageError> {
     let Some(value) = os(matches, "slot") else {
         return Ok(None);
     };
@@ -986,14 +999,16 @@ fn parse_slot_value(matches: &ArgMatches, usage: &'static CommandSpec) -> Result
         .ok_or_else(|| UsageError::new("--slot must be an unsigned integer", usage))
 }
 
-fn reject_project(global: &GlobalOptions, usage: &'static CommandSpec, message: &str) -> Result<(), UsageError> {
+fn reject_project(
+    global: &GlobalOptions,
+    usage: &'static CommandSpec,
+    message: &str,
+) -> Result<(), UsageError> {
     if global.project.is_some() {
         return Err(UsageError::new(message, usage));
     }
     Ok(())
 }
-
-
 
 const GATEWAY: CommandSpec = CommandSpec {
     name: "gateway",
@@ -1003,7 +1018,6 @@ const GATEWAY: CommandSpec = CommandSpec {
     about: &[
         "The gateway is the one trusted process outside every sandbox: workspaces reach the network, main's repository, and each other only through its authenticated Unix socket. `start` installs and loads the per-user LaunchAgent and waits until that socket answers; `stop` boots it out; `status` reports health without starting anything. Both mutations are idempotent.",
         "`run` is the LaunchAgent's own foreground entrypoint. It validates already-mounted storage and never creates any, so a background start can report missing setup but can never raise an authorization prompt.",
-
         "An ordinary `stop` leaves the host-stable binary copy the agent ran, because that copy is host state rather than agent state and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes it, for a host that is done with the gateway rather than pausing it.",
     ],
     options: &[Opt {
@@ -1015,9 +1029,9 @@ const GATEWAY: CommandSpec = CommandSpec {
 fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &GATEWAY;
     reject_project(global, USAGE, "--project is not valid for gateway commands")?;
-    let (action, child) = matches.subcommand().ok_or_else(|| {
-        UsageError::new("gateway action is required", USAGE)
-    })?;
+    let (action, child) = matches
+        .subcommand()
+        .ok_or_else(|| UsageError::new("gateway action is required", USAGE))?;
     let command = match action {
         "start" => GatewayCommand::Start,
         "stop" => GatewayCommand::Stop {
@@ -1034,7 +1048,6 @@ fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
     };
     Ok(Command::Gateway(command))
 }
-
 
 const SCCACHE: CommandSpec = CommandSpec {
     name: "sccache",
@@ -1054,9 +1067,9 @@ const SCCACHE: CommandSpec = CommandSpec {
 fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SCCACHE;
     reject_project(global, USAGE, "--project is not valid for sccache commands")?;
-    let (action, child) = matches.subcommand().ok_or_else(|| {
-        UsageError::new("sccache action is required", USAGE)
-    })?;
+    let (action, child) = matches
+        .subcommand()
+        .ok_or_else(|| UsageError::new("sccache action is required", USAGE))?;
     let command = match action {
         "start" => SccacheCommand::Start {
             capacity: os(child, "capacity"),
@@ -1072,7 +1085,6 @@ fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
     };
     Ok(Command::Sccache(command))
 }
-
 
 const SKILL: CommandSpec = CommandSpec {
     name: "skill",
@@ -1091,9 +1103,9 @@ const SKILL: CommandSpec = CommandSpec {
 
 fn parse_skill(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SKILL;
-    let (action, child) = matches.subcommand().ok_or_else(|| {
-        UsageError::new("skill action is required", USAGE)
-    })?;
+    let (action, child) = matches
+        .subcommand()
+        .ok_or_else(|| UsageError::new("skill action is required", USAGE))?;
     if action != "install" {
         return Err(UsageError::new(
             format!("unknown skill action `{action}`"),
@@ -1103,9 +1115,9 @@ fn parse_skill(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     let mut harnesses = Vec::new();
     if let Some(values) = child.get_many::<OsString>("harness") {
         for value in values {
-            let name = value.to_str().ok_or_else(|| {
-                UsageError::new("--harness requires a UTF-8 harness name", USAGE)
-            })?;
+            let name = value
+                .to_str()
+                .ok_or_else(|| UsageError::new("--harness requires a UTF-8 harness name", USAGE))?;
             if !harnesses.iter().any(|existing| existing == name) {
                 harnesses.push(name.to_owned());
             }
@@ -1148,7 +1160,6 @@ fn parse_adopt(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-
 const ADOPT: CommandSpec = CommandSpec {
     name: "adopt",
     args: "[path]",
@@ -1156,7 +1167,6 @@ const ADOPT: CommandSpec = CommandSpec {
     summary: "adopt a checkout",
     about: &[
         "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and one of only two commands that may create host storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no ordinary command ever can.",
-
         "`cowshed setup` is the other, and the one every storage error points at: it repairs a host without needing a checkout to adopt. Reach for adopt when you have a repository to bring in, and for setup when the machine itself is wrong.",
     ],
     options: &[
@@ -1174,7 +1184,6 @@ const ADOPT: CommandSpec = CommandSpec {
         },
     ],
 };
-
 
 const SETUP: CommandSpec = CommandSpec {
     name: "setup",
@@ -1236,7 +1245,6 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     }))
 }
 
-
 const NEW: CommandSpec = CommandSpec {
     name: "new",
     args: "<name>",
@@ -1282,7 +1290,13 @@ fn parse_new(matches: &ArgMatches) -> Result<Command, UsageError> {
         return Err(UsageError::new("--ref conflicts with --from", USAGE));
     }
     Ok(Command::New(NewArgs {
-        name: require_workspace(matches, "name", true, USAGE, "new requires a workspace name")?,
+        name: require_workspace(
+            matches,
+            "name",
+            true,
+            USAGE,
+            "new requires a workspace name",
+        )?,
         reference,
         from,
         browse: flagged(matches, "browse"),
@@ -1291,7 +1305,6 @@ fn parse_new(matches: &ArgMatches) -> Result<Command, UsageError> {
         git_worktree: flagged(matches, "git-worktree"),
     }))
 }
-
 
 const FORK: CommandSpec = CommandSpec {
     name: "fork",
@@ -1323,7 +1336,6 @@ fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
         )?,
     }))
 }
-
 
 const MOVE: CommandSpec = CommandSpec {
     name: "mv",
@@ -1363,7 +1375,6 @@ fn absolute_mount_root(value: &OsStr, usage: &'static CommandSpec) -> Result<Pat
     Ok(path)
 }
 
-
 /// A checkout destination is a path, and the only thing the parser can decide about it is that it
 /// is spelt absolutely. Whether it exists, is occupied, or overlaps cowshed storage is the
 /// coordinator's to refuse, with the project state in hand to say why.
@@ -1401,7 +1412,6 @@ fn parse_checkpoint(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-
 const RESTORE: CommandSpec = CommandSpec {
     name: "restore",
     args: "<ws> <label>",
@@ -1428,9 +1438,6 @@ fn parse_restore(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-
-
-
 const LIST: CommandSpec = CommandSpec {
     name: "ls",
     args: "",
@@ -1450,8 +1457,6 @@ fn parse_list(matches: &ArgMatches) -> Result<Command, UsageError> {
         all: flagged(matches, "all"),
     }))
 }
-
-
 
 const PATH: CommandSpec = CommandSpec {
     name: "path",
@@ -1489,7 +1494,6 @@ fn parse_path(matches: &ArgMatches) -> Result<Command, UsageError> {
         no_attach: flagged(matches, "no-attach"),
     }))
 }
-
 
 const EXEC: CommandSpec = CommandSpec {
     name: "exec",
@@ -1611,7 +1615,6 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-
 /// Usage text is where the destructive flags are documented: a human reads options here
 /// deliberately, whereas a refusal message is what an agent pattern-matches into a retry — which
 /// is why no refusal names the flag that would override it.
@@ -1642,7 +1645,13 @@ const REMOVE: CommandSpec = CommandSpec {
 
 fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &REMOVE;
-    let workspace = require_workspace(matches, "workspace", false, USAGE, "rm requires a workspace")?;
+    let workspace = require_workspace(
+        matches,
+        "workspace",
+        false,
+        USAGE,
+        "rm requires a workspace",
+    )?;
     let restore = flagged(matches, "restore");
     let abandon = flagged(matches, "abandon");
     if restore && workspace != "main" {
@@ -1664,7 +1673,6 @@ fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
         abandon,
     }))
 }
-
 
 const ATTACH: CommandSpec = CommandSpec {
     name: "attach",
@@ -1709,7 +1717,6 @@ fn parse_attach(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-
 const DETACH: CommandSpec = CommandSpec {
     name: "detach",
     args: "[ws]",
@@ -1746,7 +1753,6 @@ fn parse_detach(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Detach(DetachArgs { workspace, all }))
 }
 
-
 const RESIZE: CommandSpec = CommandSpec {
     name: "resize",
     args: "<ws|main> <size>",
@@ -1773,7 +1779,6 @@ fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-
 const GC: CommandSpec = CommandSpec {
     name: "gc",
     args: "",
@@ -1793,7 +1798,6 @@ fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
         dry_run: flagged(matches, "dry-run"),
     }))
 }
-
 
 const PUSH: CommandSpec = CommandSpec {
     name: "push",
@@ -1834,7 +1838,6 @@ fn parse_push(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_destination_head: os(matches, "expected-destination-head"),
     }))
 }
-
 
 const REBASE: CommandSpec = CommandSpec {
     name: "rebase",
@@ -1879,7 +1882,6 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_onto_head: os(matches, "expected-onto-head"),
     }))
 }
-
 
 const LAND: CommandSpec = CommandSpec {
     name: "land",
@@ -1946,7 +1948,6 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
-
 const DOCTOR: CommandSpec = CommandSpec {
     name: "doctor",
     args: "",
@@ -1965,8 +1966,6 @@ fn parse_empty(
 ) -> Result<Command, UsageError> {
     Ok(parsed)
 }
-
-
 
 fn set_stdin(
     target: &mut Option<StdinSource>,
@@ -2025,6 +2024,15 @@ mod tests {
         assert_eq!(short, long);
         assert!(short.global.quiet);
         assert!(short.global.json);
+    }
+
+    #[test]
+    fn version_is_a_root_clap_flag_backed_by_the_npm_package_manifest() {
+        for flag in ["--version", "-V"] {
+            let cli = parse_args([flag]).expect("version flag parses");
+            assert_eq!(cli.command, Command::Version);
+            assert_eq!(cli.command.project_discovery(), ProjectDiscovery::NotUsed);
+        }
     }
 
     #[test]
@@ -2109,11 +2117,17 @@ mod tests {
         assert_eq!(missing.message, "detach requires a workspace");
 
         assert_eq!(
-            parse_args(["detach", "--all"]).unwrap().command.project_discovery(),
+            parse_args(["detach", "--all"])
+                .unwrap()
+                .command
+                .project_discovery(),
             ProjectDiscovery::NotUsed
         );
         assert_eq!(
-            parse_args(["detach", "raven"]).unwrap().command.project_discovery(),
+            parse_args(["detach", "raven"])
+                .unwrap()
+                .command
+                .project_discovery(),
             ProjectDiscovery::NotUsed
         );
     }
@@ -2718,11 +2732,7 @@ mod tests {
 
         for (arguments, expected) in cases {
             let cli = parse_args(arguments.iter().copied()).expect("representative command parses");
-            assert_eq!(
-                cli.command.project_discovery(),
-                *expected,
-                "{arguments:?}"
-            );
+            assert_eq!(cli.command.project_discovery(), *expected, "{arguments:?}");
         }
     }
 
@@ -2794,7 +2804,11 @@ mod tests {
         }
         let exec = help::command_named("exec").unwrap().page();
         assert!(exec.contains("exec --session") || exec.contains("`--session`"));
-        assert!(help::command_named("setup").unwrap().summary.contains("create or repair"));
+        assert!(
+            help::command_named("setup")
+                .unwrap()
+                .summary
+                .contains("create or repair")
+        );
     }
-
 }
