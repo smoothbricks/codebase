@@ -5,14 +5,15 @@ use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
+    CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
-use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
+use crate::repository::{RepoId, RepositoryBinding};
 use crate::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
@@ -21,8 +22,8 @@ use crate::storage::apfs::{
 };
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::lifecycle::{
-    DerivationError, KernelMountFact, MountIntent, MountState, StorageFact, Substrate,
-    derive_workspaces,
+    DerivationError, KernelMountFact, LifecycleWorkspace, MountIntent, MountState, StorageFact,
+    Substrate, derive_workspaces,
 };
 use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
@@ -50,6 +51,43 @@ pub struct GatewaySessionFact {
 pub struct AdoptedProject {
     pub repo_id: RepoId,
     pub project_root: PathBuf,
+}
+
+/// A project whose main workspace is not mounted where its checkout layout puts it.
+///
+/// Mains are always-mounted (02_workspaces.md): the gateway mounts every one across every adopted
+/// project before it serves, so a main that is not mounted is a host defect rather than a state a
+/// user chose — `doctor` reports it as critical and `setup` refuses to call the host set up over
+/// it. Both paths are named because neither is guessable from the other: the image is what should
+/// be mounted, the mountpoint is the directory the user's shell, editor, and Finder are looking at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnreachableMain {
+    pub repo_id: RepoId,
+    pub image: PathBuf,
+    pub mountpoint: PathBuf,
+    /// What was observed instead, in the words a finding shows.
+    pub reason: String,
+}
+
+/// What eager heal achieved for one project.
+///
+/// Main and sessions are reported apart because they are not equally load-bearing: main is the
+/// user's own checkout and an unmounted one is critical, while a session that fails to mount costs
+/// only that session. Each result is kept rather than counted so the failure names itself.
+#[derive(Debug)]
+pub struct ProjectHealOutcome {
+    pub repo_id: RepoId,
+    /// Main's mountpoint, or why the project's checkout is not reachable there.
+    pub main: Result<PathBuf, GatewayInventoryError>,
+    /// One entry per recorded session workspace, in inventory order. Empty when the project could
+    /// not be opened at all — there was nothing to attempt.
+    pub sessions: Vec<SessionHealOutcome>,
+}
+
+#[derive(Debug)]
+pub struct SessionHealOutcome {
+    pub workspace: WorkspaceName,
+    pub mount: Result<PathBuf, GatewayInventoryError>,
 }
 
 impl fmt::Debug for GatewaySessionFact {
@@ -101,6 +139,8 @@ pub enum GatewayInventoryError {
         repo: RepoId,
         workspace: WorkspaceName,
     },
+    #[error("adopted project {0} records no main workspace to mount")]
+    MissingMainWorkspace(RepoId),
     #[error(transparent)]
     Apfs(#[from] ApfsStorageError),
     #[error(transparent)]
@@ -158,20 +198,7 @@ impl InventorySource for NativeInventorySource {
                 .join("gateway")
                 .join(UNRESOLVED_CHECKOUT_PATH)
         });
-        let checkout_layout =
-            layout
-                .checkout_layout()
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().project_root.clone(),
-                    message: error.to_string(),
-                })?;
-        let config = ApfsSubstrateConfig::new(
-            storage.store(),
-            storage.caches(),
-            checkout_path,
-            checkout_layout,
-            ApfsCaseSensitivity::Sensitive,
-        );
+        let config = project_substrate_config(storage, &layout, checkout_path)?;
         let captured = SystemKernelMountSource.mounts()?;
         let host = MacOsApfsExecutionHost::with_mount_source(
             SystemCommandRunner,
@@ -192,11 +219,142 @@ impl InventorySource for NativeInventorySource {
     }
 }
 
+/// The substrate configuration for one project, read from the project's own records.
+///
+/// One builder for both sides of the inventory: the read-only fact pass and eager heal have to
+/// agree about where every workspace of a project mounts, and a second copy of this derivation is
+/// how they would stop agreeing.
+fn project_substrate_config(
+    storage: &ValidatedHostStorage,
+    layout: &StorageLayout,
+    checkout_path: PathBuf,
+) -> Result<ApfsSubstrateConfig, GatewayInventoryError> {
+    let checkout_layout =
+        layout
+            .checkout_layout()
+            .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                path: layout.project().project_root.clone(),
+                message: error.to_string(),
+            })?;
+    Ok(ApfsSubstrateConfig::new(
+        storage.store(),
+        storage.caches(),
+        checkout_path,
+        checkout_layout,
+        ApfsCaseSensitivity::Sensitive,
+    ))
+}
+
+/// One project's mount side, opened once and mounting nothing on its own.
+///
+/// Separate from [`InventorySource`] because the two answer different questions — what the store
+/// records versus what the kernel can be made to hold — and because opening a project starts a
+/// mount registry thread, which the two-pass heal order would otherwise pay for twice per project.
+#[async_trait]
+trait ProjectMounts: Send + Sync {
+    /// Every workspace the project records, main included, with nothing mounted.
+    async fn workspaces(&self) -> Result<Vec<LifecycleWorkspace>, GatewayInventoryError>;
+    /// Mount one workspace where this project's checkout layout puts it.
+    async fn mount(&self, workspace: &LifecycleWorkspace)
+    -> Result<PathBuf, GatewayInventoryError>;
+}
+
+#[async_trait]
+trait HealSource: Send + Sync {
+    async fn open(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+    ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeHealSource;
+
+#[async_trait]
+impl HealSource for NativeHealSource {
+    /// A project with no adopted checkout path is refused rather than defaulted.
+    ///
+    /// Heal exists to put main where the user's tree expects it; without that path there is no
+    /// such place, and mounting main anywhere else would create the dangling checkout this pass is
+    /// here to prevent.
+    async fn open(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+    ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
+        let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: storage.store().to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let checkout_path = authoritative_checkout_path(&layout, repo)?.ok_or_else(|| {
+            GatewayInventoryError::InvalidMetadata {
+                path: layout.project().project_root.clone(),
+                message: "project records no adopted checkout path".to_owned(),
+            }
+        })?;
+        let config = project_substrate_config(storage, &layout, checkout_path)?;
+        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
+        Ok(Arc::new(NativeProjectMounts {
+            repo: repo.clone(),
+            substrate: ApfsSubstrate::new(config, host),
+        }))
+    }
+}
+
+struct NativeProjectMounts {
+    repo: RepoId,
+    substrate: ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+}
+
+#[async_trait]
+impl ProjectMounts for NativeProjectMounts {
+    async fn workspaces(&self) -> Result<Vec<LifecycleWorkspace>, GatewayInventoryError> {
+        Ok(self
+            .substrate
+            .list(&self.repo)
+            .await?
+            .into_iter()
+            .map(|derived| derived.workspace)
+            .collect())
+    }
+
+    async fn mount(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<PathBuf, GatewayInventoryError> {
+        Ok(self
+            .substrate
+            .ensure_mounted(workspace, MountIntent { browse: false })
+            .await?)
+    }
+}
+
+/// One project prepared for heal, with nothing mounted yet.
+struct OpenProject {
+    mounts: Arc<dyn ProjectMounts>,
+    /// The project's main. Absent only when its store records none, which for an adopted project
+    /// means its main image was retired without a replacement.
+    main: Option<LifecycleWorkspace>,
+    sessions: Vec<LifecycleWorkspace>,
+}
+
+/// One project between the two heal passes: its main settled, its sessions still to mount.
+struct HealedMain {
+    repo_id: RepoId,
+    /// Absent when the project could not be opened, so there is nothing left to attempt.
+    project: Option<OpenProject>,
+    main: Result<PathBuf, GatewayInventoryError>,
+}
+
 /// Read-only native inventory rooted in an already existing-only validated host store.
 #[derive(Clone)]
 pub struct NativeGatewayInventory {
     storage: ValidatedHostStorage,
     source: Arc<dyn InventorySource>,
+    heal: Arc<dyn HealSource>,
 }
 
 impl fmt::Debug for NativeGatewayInventory {
@@ -213,12 +371,26 @@ impl NativeGatewayInventory {
         Self {
             storage,
             source: Arc::new(NativeInventorySource),
+            heal: Arc::new(NativeHealSource),
         }
     }
 
     #[cfg(test)]
     fn with_source(storage: ValidatedHostStorage, source: Arc<dyn InventorySource>) -> Self {
-        Self { storage, source }
+        Self {
+            storage,
+            source,
+            heal: Arc::new(NativeHealSource),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_heal_source(storage: ValidatedHostStorage, heal: Arc<dyn HealSource>) -> Self {
+        Self {
+            storage,
+            source: Arc::new(NativeInventorySource),
+            heal,
+        }
     }
 
     pub async fn adopted_projects(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
@@ -272,7 +444,8 @@ impl NativeGatewayInventory {
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
-    /// Attach and mount every recorded project's workspaces, main included.
+
+    /// Attach and mount every recorded project's workspaces, mains before sessions.
     ///
     /// This runs at gateway startup, before serving, because the gateway is `RunAtLoad` and a
     /// reboot is the one window adoption's "the checkout path is never absent and never dangling"
@@ -280,61 +453,147 @@ impl NativeGatewayInventory {
     /// under direct mount, a bare stub directory — visible in the user's shell, editor, and Finder
     /// until something happened to touch it.
     ///
+    /// Mains go first across every project, not per project in inventory order: a main is the
+    /// user's own checkout and is always-mounted (02_workspaces.md), so no project's session
+    /// mount — which may attach, fsck, and mount a multi-gigabyte image — is allowed to stand
+    /// between another project's checkout and the gateway serving.
+    ///
     /// Failures are per-project and returned rather than raised: one project whose store or image
-    /// cannot be healed must not cost every other project its gateway.
+    /// cannot be healed must not cost every other project its gateway. A project that cannot even
+    /// be opened reports that error as its main outcome, because an unopenable project is exactly a
+    /// project whose main is unreachable.
     pub async fn heal_all(
         &self,
-    ) -> Result<Vec<(RepoId, Result<usize, GatewayInventoryError>)>, GatewayInventoryError> {
+    ) -> Result<Vec<ProjectHealOutcome>, GatewayInventoryError> {
         let store = self.storage.store().to_owned();
         let repositories =
             crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
                 .await
                 .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))??;
-        let mut outcomes = Vec::with_capacity(repositories.len());
+        let mut opened = Vec::with_capacity(repositories.len());
         for repo in repositories {
-            let healed = self.heal_project(&repo).await;
-            outcomes.push((repo, healed));
+            let project = self.open_project(&repo).await;
+            opened.push((repo, project));
+        }
+        let mut healed_mains = Vec::with_capacity(opened.len());
+        for (repo_id, project) in opened {
+            let (project, main) = match project {
+                Ok(project) => {
+                    let main = match &project.main {
+                        Some(main) => project.mounts.mount(main).await,
+                        None => Err(GatewayInventoryError::MissingMainWorkspace(repo_id.clone())),
+                    };
+                    (Some(project), main)
+                }
+                Err(error) => (None, Err(error)),
+            };
+            healed_mains.push(HealedMain {
+                repo_id,
+                project,
+                main,
+            });
+        }
+        let mut outcomes = Vec::with_capacity(healed_mains.len());
+        for healed in healed_mains {
+            let mut sessions = Vec::new();
+            if let Some(project) = healed.project {
+                sessions.reserve(project.sessions.len());
+                for workspace in &project.sessions {
+                    sessions.push(SessionHealOutcome {
+                        workspace: workspace.name().clone(),
+                        mount: project.mounts.mount(workspace).await,
+                    });
+                }
+            }
+            outcomes.push(ProjectHealOutcome {
+                repo_id: healed.repo_id,
+                main: healed.main,
+                sessions,
+            });
         }
         Ok(outcomes)
     }
 
-    async fn heal_project(&self, repo: &RepoId) -> Result<usize, GatewayInventoryError> {
-        let layout = StorageLayout::new(self.storage.store(), repo).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: self.storage.store().to_owned(),
-                message: error.to_string(),
-            }
-        })?;
-        let checkout_path = authoritative_checkout_path(&layout, repo)?.ok_or_else(|| {
-            GatewayInventoryError::InvalidMetadata {
-                path: layout.project().project_root.clone(),
-                message: "project records no adopted checkout path".to_owned(),
-            }
-        })?;
-        let checkout_layout =
-            layout
-                .checkout_layout()
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().project_root.clone(),
-                    message: error.to_string(),
+    /// Open one project's mount side and split its workspaces by class.
+    ///
+    /// Opening is separated from mounting so the whole store is prepared before the first mount:
+    /// the main pass is only "mains first" if no project's preparation happens between two other
+    /// projects' mains.
+    async fn open_project(&self, repo: &RepoId) -> Result<OpenProject, GatewayInventoryError> {
+        let mounts = self.heal.open(&self.storage, repo).await?;
+        let (mains, sessions): (Vec<_>, Vec<_>) = mounts
+            .workspaces()
+            .await?
+            .into_iter()
+            .partition(|workspace| workspace.name().is_main());
+        Ok(OpenProject {
+            mounts,
+            main: mains.into_iter().next(),
+            sessions,
+        })
+    }
+
+    /// Every adopted project whose main is not mounted where its checkout layout puts it.
+    ///
+    /// Observation only — nothing is mounted, because `doctor` never mutates (06_cli.md) and
+    /// `setup` reports the host it found rather than the host it wishes for. A project whose facts
+    /// cannot be read at all is reported as unreachable with that failure as its reason: "cannot
+    /// tell" is not "mounted", and an invariant nobody can check is not an invariant that holds.
+    pub async fn unmounted_mains(&self) -> Result<Vec<UnreachableMain>, GatewayInventoryError> {
+        let inventory = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || inventory.unmounted_mains_blocking())
+            .await
+            .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
+    fn unmounted_mains_blocking(&self) -> Result<Vec<UnreachableMain>, GatewayInventoryError> {
+        let mut unreachable = Vec::new();
+        for project in self.adopted_projects_blocking()? {
+            let layout =
+                StorageLayout::new(self.storage.store(), &project.repo_id).map_err(|error| {
+                    GatewayInventoryError::InvalidMetadata {
+                        path: self.storage.store().to_owned(),
+                        message: error.to_string(),
+                    }
                 })?;
-        let config = ApfsSubstrateConfig::new(
-            self.storage.store(),
-            self.storage.caches(),
-            checkout_path,
-            checkout_layout,
-            ApfsCaseSensitivity::Sensitive,
-        );
-        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;
-        let substrate = ApfsSubstrate::new(config, host);
-        let mut healed = 0;
-        for workspace in substrate.list(repo).await? {
-            substrate
-                .ensure_mounted(&workspace.workspace, MountIntent { browse: false })
-                .await?;
-            healed += 1;
+            // An adopted project holds exactly one main image — reading it is how its checkout
+            // path was resolved. None means the image was retired between that read and this one,
+            // which is a race rather than a defect and belongs to whoever is retiring it.
+            let Some(image) = existing_main_image(&layout)? else {
+                continue;
+            };
+            let main = WorkspaceName::new("main").expect("fixed main");
+            // A project that never recorded its checkout layout cannot say where its main belongs,
+            // and that unresolved record is itself the defect — not grounds to skip the project and
+            // report the host as healthy. The adopted checkout is the path named for it, because
+            // direct mount is what adopt writes and puts main exactly there.
+            let (mountpoint, unresolved_layout) = match layout.checkout_layout() {
+                Ok(checkout_layout) => (
+                    workspace_mountpoint(&layout, checkout_layout, &project.project_root, &main)?,
+                    None,
+                ),
+                Err(error) => (
+                    project.project_root.clone(),
+                    Some(format!("the project records no checkout layout: {error}")),
+                ),
+            };
+            let reason = match unresolved_layout {
+                Some(unresolved) => Some(unresolved),
+                None => match self.source.project_facts(&self.storage, &project.repo_id) {
+                    Ok(facts) => main_mount_defect(facts)?,
+                    Err(error) => Some(error.to_string()),
+                },
+            };
+            if let Some(reason) = reason {
+                unreachable.push(UnreachableMain {
+                    repo_id: project.repo_id,
+                    image,
+                    mountpoint,
+                    reason,
+                });
+            }
         }
-        Ok(healed)
+        Ok(unreachable)
     }
 
     pub async fn all_reserved_port_bases(&self) -> Result<BTreeSet<u16>, GatewayInventoryError> {
@@ -670,12 +929,12 @@ fn validate_requested_repository(
     store_root: &Path,
     repo_id: &RepoId,
 ) -> Result<bool, GatewayInventoryError> {
-    let paths = ProjectPaths::new(store_root, repo_id).map_err(|error| {
-        GatewayInventoryError::InvalidBinding {
+    let paths = StorageLayout::new(store_root, repo_id)
+        .map(|layout| layout.project().clone())
+        .map_err(|error| GatewayInventoryError::InvalidBinding {
             path: store_root.to_owned(),
             message: error.to_string(),
-        }
-    })?;
+        })?;
     let binding_path = paths.repository_binding.clone();
     if !binding_path_exists(&binding_path)? {
         return Ok(false);
@@ -728,12 +987,12 @@ fn load_binding_candidate(
         })?
         .repo_id
         .clone();
-    let expected_paths = ProjectPaths::new(store_root, &actual).map_err(|error| {
-        GatewayInventoryError::InvalidBinding {
+    let expected_paths = StorageLayout::new(store_root, &actual)
+        .map(|layout| layout.project().clone())
+        .map_err(|error| GatewayInventoryError::InvalidBinding {
             path: binding_path.to_owned(),
             message: error.to_string(),
-        }
-    })?;
+        })?;
     if expected_paths.project_root != project_root {
         let expected = project_root_identity(project_root).unwrap_or_else(|| actual.clone());
         return Err(GatewayInventoryError::ForeignBinding {
@@ -857,23 +1116,88 @@ fn expected_mount_paths(
 ) -> Result<BTreeMap<String, PathBuf>, GatewayInventoryError> {
     let mut paths = BTreeMap::new();
     for fact in storage {
-        // Main's expected path follows the project's checkout layout — the checkout itself under
-        // direct mount, the uniform `mnt/` path under the symlink layout. Every other workspace
-        // mounts under `mnt/` either way.
-        let mount =
-            if fact.workspace.name().is_main() && config.checkout_layout.mounts_at_checkout() {
-                config.checkout_path.clone()
-            } else {
-                layout
-                    .workspace_mount(fact.workspace.name())
-                    .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                        path: layout.project().mount_root.clone(),
-                        message: error.to_string(),
-                    })?
-            };
+        let mount = workspace_mountpoint(
+            layout,
+            config.checkout_layout,
+            &config.checkout_path,
+            fact.workspace.name(),
+        )?;
         paths.insert(fact.volume_key.clone(), mount);
     }
     Ok(paths)
+}
+
+/// Where one workspace of one project mounts.
+///
+/// Main's path follows the project's checkout layout — the adopted checkout itself under direct
+/// mount, the uniform `mnt/` path under the symlink layout. Every other workspace mounts under
+/// `mnt/` either way. One rule, because the read-only fact pass and the always-mounted check both
+/// need it and a project whose two answers disagreed would be reported as broken by whichever
+/// derivation ran second.
+fn workspace_mountpoint(
+    layout: &StorageLayout,
+    checkout_layout: CheckoutLayout,
+    checkout_path: &Path,
+    workspace: &WorkspaceName,
+) -> Result<PathBuf, GatewayInventoryError> {
+    if workspace.is_main() && checkout_layout.mounts_at_checkout() {
+        return Ok(checkout_path.to_owned());
+    }
+    layout
+        .workspace_mount(workspace)
+        .map_err(|error| GatewayInventoryError::InvalidMetadata {
+            path: layout.project().mount_root.clone(),
+            message: error.to_string(),
+        })
+}
+
+/// The canonical main image this project actually holds, in whichever format it was written.
+///
+/// The store holds at most one: `authoritative_checkout_path` rejects a project carrying both, so
+/// the first hit is the answer rather than a candidate.
+fn existing_main_image(
+    layout: &StorageLayout,
+) -> Result<Option<PathBuf>, GatewayInventoryError> {
+    for format in [ImageFormat::Asif, ImageFormat::Sparse] {
+        let paths =
+            layout
+                .main_image(format)
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: layout.project().project_root.clone(),
+                    message: error.to_string(),
+                })?;
+        if paths
+            .image()
+            .try_exists()
+            .map_err(|source| io_error("inspecting canonical main image", paths.image(), source))?
+        {
+            return Ok(Some(paths.image().to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Why this project's main is not mounted, or `None` when it is.
+///
+/// A project whose facts hold no main at all is reported rather than passed over: the always-
+/// mounted invariant is about the checkout the user sees, and a store that records no main for an
+/// adopted project cannot be serving one.
+fn main_mount_defect(
+    facts: ProjectInventoryFacts,
+) -> Result<Option<String>, GatewayInventoryError> {
+    let derived = derive_workspaces(facts.storage, facts.mounts, [])?;
+    let Some(main) = derived
+        .into_iter()
+        .find(|workspace| workspace.workspace.name().is_main())
+    else {
+        return Ok(Some(String::from(
+            "the project's store records no main workspace",
+        )));
+    };
+    Ok(match main.mount_state {
+        MountState::Mounted { .. } => None,
+        MountState::Detached => Some(String::from("main's volume is not mounted")),
+    })
 }
 
 fn reject_ambiguous_native_mounts(
@@ -1092,7 +1416,10 @@ mod tests {
         }
 
         fn bind(&self, repo: &RepoId) {
-            let paths = ProjectPaths::new(self.storage.store(), repo).expect("project paths");
+            let paths = StorageLayout::new(self.storage.store(), repo)
+                .expect("project paths")
+                .project()
+                .clone();
             fs::create_dir_all(&paths.project_root).expect("project root");
             let binding = RepositoryBinding::new(vec![BoundIdentity {
                 repo_id: repo.clone(),
@@ -1102,6 +1429,12 @@ mod tests {
             }])
             .expect("binding");
             write_json(&paths.repository_binding, &binding).expect("binding file");
+            // Adopt records the layout, so a fixture project that omitted it would be exercising a
+            // corrupted project rather than a healthy one.
+            StorageLayout::new(self.storage.store(), repo)
+                .expect("layout")
+                .record_checkout_layout(self.checkout_layout)
+                .expect("checkout layout record");
         }
 
         fn workspace(
@@ -1498,7 +1831,10 @@ mod tests {
             Err(GatewayInventoryError::AmbiguousMount(_))
         ));
 
-        let paths = ProjectPaths::new(fixture.storage.store(), &repo).expect("paths");
+        let paths = StorageLayout::new(fixture.storage.store(), &repo)
+            .expect("paths")
+            .project()
+            .clone();
         let foreign = RepositoryBinding::new(vec![BoundIdentity {
             repo_id: RepoId::parse("other/widget").expect("foreign repo"),
             remote_name: None,
@@ -1511,5 +1847,306 @@ mod tests {
             inventory.all_attached().await,
             Err(GatewayInventoryError::ForeignBinding { .. })
         ));
+    }
+
+    /// A heal source that mounts nothing and remembers the order it was asked in.
+    struct FakeHealSource {
+        projects: BTreeMap<RepoId, Vec<LifecycleWorkspace>>,
+        unopenable: BTreeSet<RepoId>,
+        refused: BTreeSet<String>,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeHealSource {
+        fn new(projects: BTreeMap<RepoId, Vec<LifecycleWorkspace>>) -> Self {
+            Self {
+                projects,
+                unopenable: BTreeSet::new(),
+                refused: BTreeSet::new(),
+                order: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn unopenable(mut self, repo: &RepoId) -> Self {
+            self.unopenable.insert(repo.clone());
+            self
+        }
+
+        fn refusing(mut self, workspace: &str) -> Self {
+            self.refused.insert(workspace.to_owned());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl HealSource for FakeHealSource {
+        async fn open(
+            &self,
+            _storage: &ValidatedHostStorage,
+            repo: &RepoId,
+        ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
+            if self.unopenable.contains(repo) {
+                return Err(GatewayInventoryError::InvalidMetadata {
+                    path: PathBuf::from(repo.as_str()),
+                    message: String::from("fixture cannot open this project"),
+                });
+            }
+            Ok(Arc::new(FakeProjectMounts {
+                workspaces: self.projects.get(repo).cloned().unwrap_or_default(),
+                refused: self.refused.clone(),
+                order: Arc::clone(&self.order),
+            }))
+        }
+    }
+
+    struct FakeProjectMounts {
+        workspaces: Vec<LifecycleWorkspace>,
+        refused: BTreeSet<String>,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ProjectMounts for FakeProjectMounts {
+        async fn workspaces(&self) -> Result<Vec<LifecycleWorkspace>, GatewayInventoryError> {
+            Ok(self.workspaces.clone())
+        }
+
+        async fn mount(
+            &self,
+            workspace: &LifecycleWorkspace,
+        ) -> Result<PathBuf, GatewayInventoryError> {
+            let key = format!("{}/{}", workspace.repo(), workspace.name());
+            self.order.lock().expect("mount order").push(key.clone());
+            if self.refused.contains(&key) {
+                return Err(GatewayInventoryError::InvalidMetadata {
+                    path: PathBuf::from(&key),
+                    message: String::from("fixture cannot mount this workspace"),
+                });
+            }
+            Ok(PathBuf::from("/mounted").join(key))
+        }
+    }
+
+    fn heal_workspace(repo: &RepoId, name: &str) -> LifecycleWorkspace {
+        let name = WorkspaceName::new(name).expect("workspace name");
+        let role = if name.is_main() {
+            WorkspaceRole::Main
+        } else {
+            WorkspaceRole::Workspace
+        };
+        LifecycleWorkspace::new(
+            repo.clone(),
+            name,
+            WorkspaceIncarnation::new("00000000000000000000000000000001").expect("incarnation"),
+            Revision::new(1),
+            Revision::new(1),
+            role,
+            ImageFormat::Sparse,
+        )
+        .expect("workspace")
+    }
+
+    /// Every project's main is mounted before any project's session.
+    ///
+    /// Mains are always-mounted, so the checkout a user sees must not wait behind another
+    /// project's session image — the fixture lists each project's session first precisely so
+    /// inventory order cannot pass this by accident.
+    #[tokio::test]
+    async fn eager_heal_mounts_every_main_before_the_first_session() {
+        let fixture = Fixture::new("heal-order");
+        let alpha = RepoId::parse("acme/alpha").expect("repo alpha");
+        let beta = RepoId::parse("acme/beta").expect("repo beta");
+        let mut projects = BTreeMap::new();
+        for repo in [&alpha, &beta] {
+            fixture.bind(repo);
+            projects.insert(
+                repo.clone(),
+                vec![heal_workspace(repo, "raven"), heal_workspace(repo, "main")],
+            );
+        }
+        let heal = Arc::new(FakeHealSource::new(projects));
+        let order = Arc::clone(&heal.order);
+        let inventory = NativeGatewayInventory::with_heal_source(
+            fixture.storage.clone(),
+            heal as Arc<dyn HealSource>,
+        );
+
+        let outcomes = inventory.heal_all().await.expect("eager heal");
+
+        assert_eq!(
+            *order.lock().expect("mount order"),
+            [
+                "acme/alpha/main",
+                "acme/beta/main",
+                "acme/alpha/raven",
+                "acme/beta/raven"
+            ]
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/alpha", "acme/beta"]
+        );
+        for outcome in &outcomes {
+            assert!(outcome.main.is_ok(), "{} main healed", outcome.repo_id);
+            assert_eq!(outcome.sessions.len(), 1);
+            assert!(outcome.sessions[0].mount.is_ok());
+        }
+    }
+
+    /// One unhealable project never costs another its mounts, and an unreachable main never costs
+    /// its own project's sessions.
+    ///
+    /// A single broken checkout taking the `RunAtLoad` daemon down with it would convert one
+    /// defect into a machine with no gateway at all (05_gateway.md).
+    #[tokio::test]
+    async fn one_unhealable_project_never_costs_another_its_mounts() {
+        let fixture = Fixture::new("heal-isolation");
+        let alpha = RepoId::parse("acme/alpha").expect("repo alpha");
+        let beta = RepoId::parse("acme/beta").expect("repo beta");
+        let gamma = RepoId::parse("acme/gamma").expect("repo gamma");
+        let mut projects = BTreeMap::new();
+        for repo in [&alpha, &beta, &gamma] {
+            fixture.bind(repo);
+            projects.insert(
+                repo.clone(),
+                vec![heal_workspace(repo, "main"), heal_workspace(repo, "raven")],
+            );
+        }
+        // Alpha sorts first, so its failure is upstream of every other project's mount.
+        let heal = Arc::new(
+            FakeHealSource::new(projects)
+                .unopenable(&alpha)
+                .refusing("acme/beta/main"),
+        );
+        let order = Arc::clone(&heal.order);
+        let inventory = NativeGatewayInventory::with_heal_source(
+            fixture.storage.clone(),
+            heal as Arc<dyn HealSource>,
+        );
+
+        let outcomes = inventory.heal_all().await.expect("eager heal");
+
+        assert_eq!(
+            *order.lock().expect("mount order"),
+            [
+                "acme/beta/main",
+                "acme/gamma/main",
+                "acme/beta/raven",
+                "acme/gamma/raven"
+            ]
+        );
+        let alpha_outcome = &outcomes[0];
+        assert_eq!(alpha_outcome.repo_id, alpha);
+        assert!(matches!(
+            alpha_outcome.main,
+            Err(GatewayInventoryError::InvalidMetadata { .. })
+        ));
+        assert!(
+            alpha_outcome.sessions.is_empty(),
+            "a project that never opened has nothing to attempt"
+        );
+        let beta_outcome = &outcomes[1];
+        assert_eq!(beta_outcome.repo_id, beta);
+        assert!(beta_outcome.main.is_err());
+        assert!(
+            beta_outcome.sessions[0].mount.is_ok(),
+            "an unreachable main still leaves its project's sessions to mount"
+        );
+        let gamma_outcome = &outcomes[2];
+        assert_eq!(gamma_outcome.repo_id, gamma);
+        assert!(gamma_outcome.main.is_ok());
+        assert!(gamma_outcome.sessions[0].mount.is_ok());
+    }
+
+    /// A project whose main records no main workspace at all is reported, not skipped.
+    #[tokio::test]
+    async fn a_project_with_no_main_workspace_reports_it_as_the_main_outcome() {
+        let fixture = Fixture::new("heal-no-main");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let heal = Arc::new(FakeHealSource::new(BTreeMap::from([(
+            repo.clone(),
+            vec![heal_workspace(&repo, "raven")],
+        )])));
+        let inventory = NativeGatewayInventory::with_heal_source(
+            fixture.storage.clone(),
+            heal as Arc<dyn HealSource>,
+        );
+
+        let outcomes = inventory.heal_all().await.expect("eager heal");
+
+        assert!(matches!(
+            &outcomes[0].main,
+            Err(GatewayInventoryError::MissingMainWorkspace(named)) if *named == repo
+        ));
+        assert!(outcomes[0].sessions[0].mount.is_ok());
+    }
+
+    /// The always-mounted check names main's image and its mountpoint, so a finding can point at
+    /// both the volume that should be mounted and the directory the user is looking at.
+    #[tokio::test]
+    async fn unmounted_mains_name_their_image_and_mountpoint() {
+        let fixture = Fixture::with_checkout_layout("unmounted-mains", CheckoutLayout::DirectMount);
+        let detached = RepoId::parse("acme/alpha").expect("repo alpha");
+        let served = RepoId::parse("acme/beta").expect("repo beta");
+        let source = Arc::new(FixtureSource::default());
+        for (repo, mounted) in [(&detached, false), (&served, true)] {
+            fixture.bind(repo);
+            let (storage, kernel) = fixture.workspace(
+                repo,
+                WorkspaceName::new("main").expect("main"),
+                "00000000000000000000000000000001",
+                3,
+                mounted,
+                true,
+            );
+            let (mounts, mount_paths) = match kernel {
+                Some((mount, path)) => (
+                    vec![mount.clone()],
+                    BTreeMap::from([(mount.volume_key, path)]),
+                ),
+                None => (
+                    Vec::new(),
+                    BTreeMap::from([(
+                        storage.volume_key.clone(),
+                        fixture.root.join(format!("checkout-{}", repo.repo())),
+                    )]),
+                ),
+            };
+            source.projects.lock().expect("source").insert(
+                repo.clone(),
+                ProjectInventoryFacts {
+                    storage: vec![storage],
+                    mounts,
+                    mount_paths,
+                },
+            );
+        }
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        let unreachable = inventory.unmounted_mains().await.expect("main reachability");
+
+        let layout = StorageLayout::new(fixture.storage.store(), &detached).expect("layout");
+        let image = layout
+            .main_image(ImageFormat::Sparse)
+            .expect("main image")
+            .image()
+            .to_owned();
+        assert_eq!(
+            unreachable,
+            vec![UnreachableMain {
+                repo_id: detached,
+                image,
+                mountpoint: fixture.root.join("checkout-alpha"),
+                reason: String::from("main's volume is not mounted"),
+            }],
+            "only the project whose main is detached is reported"
+        );
     }
 }

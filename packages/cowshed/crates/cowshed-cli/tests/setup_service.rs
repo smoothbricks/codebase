@@ -11,14 +11,15 @@ use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
 use cowshed_cli::output::Output;
 use cowshed_cli::setup_service::{
-    HostArtifactRemoval, HostSetup, WorkspaceCensus, dispatch as setup_dispatch,
+    HostArtifactRemoval, HostSetup, MainMounts, WorkspaceCensus, dispatch as setup_dispatch,
 };
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeRole,
     VolumeState,
 };
-use cowshed_core::{CowshedError, ErrorCode, Result};
+use cowshed_core::repository::RepoId;
+use cowshed_core::{CowshedError, ErrorCode, Result, UnreachableMain};
 use std::path::PathBuf;
 
 /// A host whose every answer is canned, recording the order it was asked.
@@ -30,6 +31,8 @@ struct FakeHost {
     uninstall_report: UninstallReport,
     census: WorkspaceCensus,
     removals: Vec<HostArtifactRemoval>,
+    /// Which projects have no mounted main, for the readiness sentence.
+    mains: MainMounts,
     /// What the escalating phase fails with, so the decline path is provable without a dialog.
     execute_error: Option<CowshedError>,
 }
@@ -64,6 +67,16 @@ fn occupied_census() -> WorkspaceCensus {
     }
 }
 
+/// One project whose main is not mounted, named exactly as core names it.
+fn detached_main() -> Vec<UnreachableMain> {
+    vec![UnreachableMain {
+        repo_id: RepoId::parse("acme/api").expect("repo"),
+        image: PathBuf::from("/private/cowshed/store/acme/api/main.asif"),
+        mountpoint: PathBuf::from("/Users/dev/src/api"),
+        reason: String::from("main's volume is not mounted"),
+    }]
+}
+
 
 impl Default for FakeHost {
     fn default() -> Self {
@@ -83,6 +96,7 @@ impl Default for FakeHost {
             uninstall_report: uninstall_report(UninstallFstabOutcome::AlreadyClean),
             census: empty_census(),
             removals: Vec::new(),
+            mains: MainMounts::Checked(Vec::new()),
             execute_error: None,
         }
     }
@@ -119,6 +133,11 @@ impl HostSetup for FakeHost {
     async fn census(&mut self) -> Result<WorkspaceCensus> {
         self.events.push(String::from("census"));
         Ok(self.census.clone())
+    }
+
+    async fn unmounted_mains(&mut self) -> Result<MainMounts> {
+        self.events.push(String::from("unmounted-mains"));
+        Ok(self.mains.clone())
     }
 
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>> {
@@ -449,7 +468,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
          next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
-    assert_eq!(host.events, ["plan", "execute", "census"]);
+    assert_eq!(host.events, ["plan", "execute", "unmounted-mains", "census"]);
 }
 
 /// 06_cli.md rule 3: the sentence naming the prompt is printed *before* the phase that raises it.
@@ -510,7 +529,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
         announcement < first_outcome,
         "the announcement must precede the work"
     );
-    assert_eq!(host.events, ["plan", "execute", "census"]);
+    assert_eq!(host.events, ["plan", "execute", "unmounted-mains", "census"]);
 }
 
 /// The user's actual host: volumes that already exist and valid, with no boot pins. Nothing is
@@ -1204,4 +1223,132 @@ fn gateway_stop_purge_is_parsed_and_documented() {
     let spec = help::command_named("gateway").expect("gateway has a help page");
     assert!(spec.page().contains("--purge"));
     assert!(help::command_map().contains("[--purge]"));
+}
+
+/// Mains are always-mounted (02_workspaces.md), so a host with one missing is not one setup may
+/// call ready — including the branch a healthy host actually reaches, where the volumes are fine
+/// and the plan did nothing. "Everything already set up" over a checkout the user cannot see is
+/// the flattest lie this verb could tell.
+#[tokio::test]
+async fn an_unmounted_main_downgrades_both_healthy_status_lines() {
+    let mut host = FakeHost {
+        report: HostSetupReport {
+            volumes: vec![volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::MountedValid,
+                "already-current",
+            )],
+            fstab: FstabOutcome::AlreadyCurrent,
+            authorized: false,
+            action_outcomes: Vec::new(),
+        },
+        census: occupied_census(),
+        mains: MainMounts::Checked(detached_main()),
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    // Exit stays 0: setup reports what it found, and `doctor` owns the verdict (06_cli.md).
+    assert_eq!(streams.exit, 0);
+    assert_eq!(
+        streams.stderr,
+        "cowshed: cowshed.store (store): mounted at its canonical path -> already-current\n\
+         cowshed: /etc/fstab already pins the boot mounts\n\
+         cowshed: everything already set up, but 1 main workspace is not mounted: acme/api\n\
+         next: cowshed doctor\n\
+         next: cowshed gateway start\n"
+    );
+
+    // The same observation qualifies the repaired-host sentence, and keeps its authorization clause.
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![HostAction::PinFstab {
+                uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            true,
+        ),
+        report: HostSetupReport {
+            volumes: Vec::new(),
+            fstab: FstabOutcome::Pinned,
+            authorized: true,
+            action_outcomes: Vec::new(),
+        },
+        census: occupied_census(),
+        mains: MainMounts::Checked(detached_main()),
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(streams.stderr.contains(
+        "cowshed: host storage is set up (one administrator authorization was used), but 1 main workspace is not mounted: acme/api\n"
+    ));
+    assert!(streams.stderr.contains("next: cowshed gateway start\n"));
+}
+
+/// "Nobody could check" is its own answer and never renders as "every main is mounted".
+#[tokio::test]
+async fn mains_that_could_not_be_checked_are_said_so_without_a_remedy() {
+    let mut host = FakeHost {
+        report: HostSetupReport {
+            volumes: Vec::new(),
+            fstab: FstabOutcome::AlreadyCurrent,
+            authorized: false,
+            action_outcomes: Vec::new(),
+        },
+        census: occupied_census(),
+        mains: MainMounts::Unknown {
+            reason: String::from("the store is not mounted"),
+        },
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(streams.stderr.contains(
+        "cowshed: everything already set up; main workspace mounts could not be checked: the store is not mounted\n"
+    ));
+    // No `gateway start`: an unchecked main is not an observed one, and guessing a remedy for a
+    // defect nobody confirmed would send the reader after the wrong problem.
+    assert!(!streams.stderr.contains("next: cowshed gateway start"));
+}
+
+/// A run that stopped partway keeps its own headline: the failure is the remedy, and a main-mount
+/// observation on top of it would aim the reader at the wrong problem. The host is never asked.
+#[tokio::test]
+async fn a_failed_run_never_observes_or_mentions_main_mounts() {
+    let mut host = FakeHost {
+        report: HostSetupReport {
+            volumes: Vec::new(),
+            fstab: FstabOutcome::Skipped(String::from("store volume is not mounted")),
+            authorized: false,
+            action_outcomes: vec![HostActionOutcome {
+                action: HostAction::PinFstab {
+                    uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
+                    mount_at: PathBuf::from("/private/cowshed/store"),
+                },
+                outcome: HostActionResult::Failed {
+                    error: CowshedError::internal("could not write /etc/fstab"),
+                },
+            }],
+        },
+        mains: MainMounts::Checked(detached_main()),
+        ..FakeHost::default()
+    };
+
+    let (streams, _) = failing_run(&mut host, REPAIR, false).await;
+
+    assert!(streams.stderr.contains("cowshed: host storage is NOT set up:"));
+    assert!(!streams.stderr.contains("main workspace"));
+    assert!(!streams.stderr.contains("next: cowshed gateway start"));
+    assert_eq!(
+        host.events,
+        ["plan", "execute"],
+        "a failed run asks nothing further of the host"
+    );
 }
