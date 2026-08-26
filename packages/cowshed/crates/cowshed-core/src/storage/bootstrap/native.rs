@@ -37,7 +37,8 @@ use super::{
     BootstrapExecutionError, BootstrapHost, BootstrapPlan, DISKUTIL, ExistingStorage, HostCommand,
     HostCommandFailure, HostCommandOutput, HostError, HostOperation, MountpointState, PlanError,
     SelectionError, StatFsEvidence, SubstrateKind, TokioBlockingLane, ValidatedHostStorage,
-    VolumeRole, execute_bootstrap, plan_bootstrap, require_mounted_marker, select_substrate,
+    VolumeRole, execute_bootstrap, execute_bootstrap_operation, plan_bootstrap,
+    require_mounted_marker, select_substrate,
 };
 use crate::storage::fstab::{FstabPin, build_fstab};
 #[cfg(target_os = "macos")]
@@ -126,9 +127,36 @@ impl HostAction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSetupReport {
+    pub action_outcomes: Vec<HostActionOutcome>,
     pub volumes: Vec<VolumeOutcome>,
     pub fstab: FstabOutcome,
     pub authorized: bool,
+}
+
+impl HostSetupReport {
+    pub fn failure(&self) -> Option<&CowshedError> {
+        self.action_outcomes.iter().find_map(|outcome| {
+            let HostActionResult::Failed { error } = &outcome.outcome else {
+                return None;
+            };
+            Some(error)
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostActionOutcome {
+    pub action: HostAction,
+    pub outcome: HostActionResult,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum HostActionResult {
+    Done,
+    Failed { error: CowshedError },
+    Skipped,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -457,6 +485,7 @@ struct SetupSnapshot {
     volumes: Vec<VolumeOutcome>,
     fstab: PlannedFstab,
     actions: Vec<HostAction>,
+    classified: Vec<ClassifiedVolume>,
 }
 
 fn prepare_setup_snapshot(
@@ -516,6 +545,7 @@ fn prepare_setup_snapshot(
         volumes,
         fstab,
         actions,
+        classified: gathered.volumes,
     })
 }
 
@@ -690,6 +720,189 @@ fn setup_requires_authorization(plan: &BootstrapPlan) -> bool {
     })
 }
 
+fn action_volume_name(action: &HostAction) -> Option<&str> {
+    match action {
+        HostAction::CreateVolume { name, .. }
+        | HostAction::MountExisting { name, .. }
+        | HostAction::RepairMounted { name, .. } => Some(name),
+        HostAction::PinFstab { .. } | HostAction::ReclaimStubs { .. } => None,
+    }
+}
+
+fn storage_device(storage: &ExistingStorage) -> Option<&str> {
+    match storage {
+        ExistingStorage::Absent => None,
+        ExistingStorage::MountedValid { exact_identifier }
+        | ExistingStorage::MountedIncomplete { exact_identifier }
+        | ExistingStorage::DetachedIncomplete { exact_identifier }
+        | ExistingStorage::MisMountedIncomplete {
+            exact_identifier, ..
+        }
+        | ExistingStorage::ExistingUnmounted {
+            exact_identifier, ..
+        } => Some(exact_identifier),
+        ExistingStorage::FoundElsewhere { device, .. } => Some(device),
+    }
+}
+
+fn operations_for_volume(
+    plan: &BootstrapPlan,
+    volume: &ClassifiedVolume,
+) -> Vec<HostOperation> {
+    for operation in plan.operations() {
+        if let HostOperation::ProvisionApfsVolumes {
+            container,
+            volumes,
+        } = operation
+            && let Some(provision) = volumes
+                .iter()
+                .find(|provision| provision.name() == volume.name)
+        {
+            return vec![HostOperation::ProvisionApfsVolumes {
+                container: container.clone(),
+                volumes: vec![provision.clone()],
+            }];
+        }
+    }
+    let device = storage_device(&volume.storage);
+    plan.operations()
+        .iter()
+        .filter(|operation| match operation {
+            HostOperation::GuardMountpoint { path, role, .. } => {
+                path == &volume.mountpoint && *role == volume.role
+            }
+            HostOperation::EnsureDirectory(path) | HostOperation::ReclaimMountpoint(path) => {
+                path == &volume.mountpoint
+            }
+            HostOperation::MountApfsVolume { mountpoint, .. } => {
+                mountpoint == &volume.mountpoint
+            }
+            HostOperation::RunCommand(command) => device.is_some_and(|device| {
+                command.args().iter().any(|argument| argument == device)
+            }),
+            HostOperation::ReportVolumeIssue { name, .. } => *name == volume.name,
+            HostOperation::VerifyZfsDelegation { .. }
+            | HostOperation::ProvisionApfsVolumes { .. }
+            | HostOperation::WriteMarkerAtomic { .. }
+            | HostOperation::PinVolumesInFstab { .. } => false,
+        })
+        .cloned()
+        .collect()
+}
+
+async fn execute_setup_operations(
+    operations: &[HostOperation],
+    host: Arc<dyn BootstrapHost>,
+) -> Result<(), CowshedError> {
+    for operation in operations {
+        execute_bootstrap_operation(operation, Arc::clone(&host), &TokioBlockingLane)
+            .await
+            .map_err(NativeBootstrapError::Execution)
+            .map_err(|error| setup_execution_error(error, "cowshed setup"))?;
+    }
+    Ok(())
+}
+
+async fn execute_snapshot_actions(
+    snapshot: &SetupSnapshot,
+    host: Arc<dyn BootstrapHost>,
+) -> (Vec<HostActionOutcome>, Option<CowshedError>) {
+    let mut outcomes = snapshot
+        .actions
+        .iter()
+        .cloned()
+        .map(|action| HostActionOutcome {
+            action,
+            outcome: HostActionResult::Skipped,
+        })
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    while index < outcomes.len() {
+        let action = outcomes[index].action.clone();
+        let result = match &action {
+            HostAction::ReclaimStubs { .. } => {
+                let operations = snapshot
+                    .classified
+                    .iter()
+                    .filter(|volume| !volume.reclaimable_stubs.is_empty())
+                    .map(|volume| HostOperation::ReclaimMountpoint(volume.mountpoint.clone()))
+                    .collect::<Vec<_>>();
+                execute_setup_operations(&operations, Arc::clone(&host)).await
+            }
+            HostAction::PinFstab { .. } => {
+                let pin_indices = (index..outcomes.len())
+                    .filter(|candidate| {
+                        matches!(
+                            outcomes[*candidate].action,
+                            HostAction::PinFstab { .. }
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let operation = snapshot.plan.operations().iter().find(|operation| {
+                    matches!(operation, HostOperation::PinVolumesInFstab { .. })
+                });
+                let result = match operation {
+                    Some(operation) => {
+                        execute_setup_operations(
+                            std::slice::from_ref(operation),
+                            Arc::clone(&host),
+                        )
+                        .await
+                    }
+                    None => Err(CowshedError::internal(
+                        "setup pin action has no fstab operation",
+                    )),
+                };
+                match result {
+                    Ok(()) => {
+                        for pin_index in pin_indices {
+                            outcomes[pin_index].outcome = HostActionResult::Done;
+                        }
+                        return (outcomes, None);
+                    }
+                    Err(error) => {
+                        for pin_index in pin_indices {
+                            outcomes[pin_index].outcome = HostActionResult::Failed {
+                                error: error.clone(),
+                            };
+                        }
+                        return (outcomes, Some(error));
+                    }
+                }
+            }
+            _ => {
+                let Some(name) = action_volume_name(&action) else {
+                    unreachable!("non-volume actions were handled above")
+                };
+                let operations = snapshot
+                    .classified
+                    .iter()
+                    .find(|volume| volume.name == name)
+                    .map(|volume| operations_for_volume(&snapshot.plan, volume))
+                    .unwrap_or_default();
+                if operations.is_empty() {
+                    Err(CowshedError::internal(format!(
+                        "setup action for {name} has no host operations"
+                    )))
+                } else {
+                    execute_setup_operations(&operations, Arc::clone(&host)).await
+                }
+            }
+        };
+        match result {
+            Ok(()) => outcomes[index].outcome = HostActionResult::Done,
+            Err(error) => {
+                outcomes[index].outcome = HostActionResult::Failed {
+                    error: error.clone(),
+                };
+                return (outcomes, Some(error));
+            }
+        }
+        index += 1;
+    }
+    (outcomes, None)
+}
+
 #[cfg(target_os = "macos")]
 async fn gather_setup_snapshot(
     home: &Path,
@@ -757,10 +970,16 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
         } else {
             Arc::new(SystemBootstrapHost)
         };
-        execute_bootstrap(&initial.plan, Arc::clone(&host), &TokioBlockingLane)
-            .await
-            .map_err(NativeBootstrapError::Execution)
-            .map_err(|error| setup_execution_error(error, "cowshed setup"))?;
+        let (mut action_outcomes, failure) =
+            execute_snapshot_actions(&initial, Arc::clone(&host)).await;
+        if let Some(error) = failure {
+            return Ok(HostSetupReport {
+                action_outcomes,
+                volumes: initial.volumes,
+                fstab: FstabOutcome::Skipped(error.message.clone()),
+                authorized,
+            });
+        }
 
         let pinned_initially = matches!(initial.fstab, PlannedFstab::NeedsPin(_));
         let needs_post_evidence = matches!(initial.fstab, PlannedFstab::Deferred(_))
@@ -776,34 +995,60 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
                 )
             });
         let fstab = if needs_post_evidence {
-            let post = gather_setup_snapshot(home, Arc::clone(&host))
-                .await
-                .map_err(|error| setup_execution_error(error, "cowshed setup"))?;
+            let post = match gather_setup_snapshot(home, Arc::clone(&host)).await {
+                Ok(post) => post,
+                Err(error) => {
+                    let error = setup_execution_error(error, "cowshed setup");
+                    if let Some(last) = action_outcomes.last_mut() {
+                        last.outcome = HostActionResult::Failed {
+                            error: error.clone(),
+                        };
+                    }
+                    return Ok(HostSetupReport {
+                        action_outcomes,
+                        volumes: initial.volumes,
+                        fstab: FstabOutcome::Skipped(error.message.clone()),
+                        authorized,
+                    });
+                }
+            };
             if post.plan.operations().iter().any(|operation| {
                 matches!(operation, HostOperation::ProvisionApfsVolumes { .. })
             }) {
-                return Err(existing_host_storage_error(NativeBootstrapError::Host(
-                    HostError::new(
-                        "post-setup evidence still proposes APFS volume creation; refusing a second create",
-                    ),
-                )));
+                let error = CowshedError::internal(
+                    "post-setup evidence still proposes APFS volume creation; refusing a second create",
+                );
+                if let Some(last) = action_outcomes.last_mut() {
+                    last.outcome = HostActionResult::Failed {
+                        error: error.clone(),
+                    };
+                }
+                return Ok(HostSetupReport {
+                    action_outcomes,
+                    volumes: initial.volumes,
+                    fstab: FstabOutcome::Skipped(error.message.clone()),
+                    authorized,
+                });
+            }
+            let mut pin_post = post.clone();
+            pin_post
+                .actions
+                .retain(|action| matches!(action, HostAction::PinFstab { .. }));
+            let (pin_outcomes, pin_failure) =
+                execute_snapshot_actions(&pin_post, Arc::clone(&host)).await;
+            action_outcomes.extend(pin_outcomes);
+            if let Some(error) = pin_failure {
+                return Ok(HostSetupReport {
+                    action_outcomes,
+                    volumes: initial.volumes,
+                    fstab: FstabOutcome::Skipped(error.message.clone()),
+                    authorized,
+                });
             }
             match post.fstab {
                 PlannedFstab::AlreadyCurrent if pinned_initially => FstabOutcome::Pinned,
                 PlannedFstab::AlreadyCurrent => FstabOutcome::AlreadyCurrent,
-                PlannedFstab::NeedsPin(pins) => {
-                    let pin_host = Arc::clone(&host);
-                    tokio::task::spawn_blocking(move || pin_host.pin_volumes_in_fstab(&pins))
-                        .await
-                        .map_err(|error| {
-                            existing_host_storage_error(NativeBootstrapError::Execution(
-                                BootstrapExecutionError::BlockingLane(error.to_string()),
-                            ))
-                        })?
-                        .map_err(NativeBootstrapError::Host)
-                        .map_err(|error| setup_execution_error(error, "cowshed setup"))?;
-                    FstabOutcome::Pinned
-                }
+                PlannedFstab::NeedsPin(_) => FstabOutcome::Pinned,
                 PlannedFstab::Deferred(reason) => FstabOutcome::Skipped(reason),
             }
         } else {
@@ -814,6 +1059,7 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
             }
         };
         Ok(HostSetupReport {
+            action_outcomes,
             volumes: initial.volumes,
             fstab,
             authorized,
@@ -3185,6 +3431,66 @@ mod tests {
         }
     }
 
+    struct PartialProgressHost {
+        completed: Mutex<Vec<String>>,
+        fail_volume: &'static str,
+    }
+
+    impl BootstrapHost for PartialProgressHost {
+        fn verify_zfs_delegation(
+            &self,
+            _pool: &str,
+            _required_root: &str,
+        ) -> Result<(), HostError> {
+            Err(HostError::new("unexpected ZFS operation"))
+        }
+
+        fn inspect_mountpoint(&self, _path: &Path) -> Result<MountpointState, HostError> {
+            Err(HostError::new("unexpected mountpoint inspection"))
+        }
+
+        fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+            Err(HostError::new("unexpected directory creation"))
+        }
+
+        fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
+            Err(HostError::new("unexpected reclaim"))
+        }
+
+        fn run_command(&self, _command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            Err(HostError::new("unexpected command"))
+        }
+
+        fn provision_apfs_volumes(
+            &self,
+            _container: &str,
+            volumes: &[ApfsVolumeProvision],
+        ) -> Result<(), HostError> {
+            let [volume] = volumes else {
+                return Err(HostError::new("setup action was not split by volume"));
+            };
+            if volume.name() == self.fail_volume {
+                return Err(HostError::new(format!(
+                    "{} action failed",
+                    volume.name()
+                )));
+            }
+            self.completed
+                .lock()
+                .expect("completed lock")
+                .push(volume.name().to_owned());
+            Ok(())
+        }
+
+        fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+            Err(HostError::new("unexpected marker write"))
+        }
+
+        fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+            Err(HostError::new("pin must be skipped after volume failure"))
+        }
+    }
+
     #[derive(Default)]
     struct ValidationLane {
         dispatches: AtomicUsize,
@@ -4864,6 +5170,49 @@ mod tests {
         .expect("provision lane applies fstab pin");
         assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 1);
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 1);
+        let action_host: Arc<dyn BootstrapHost> =
+            Arc::new(ReadOnlyValidationHost::default());
+        let (outcomes, failure) =
+            execute_snapshot_actions(&snapshot, action_host).await;
+        assert!(failure.is_none());
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome.outcome, HostActionResult::Done))
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_sequence_failure_reports_done_failed_and_skipped_actions() {
+        let mut source = healthy_existing_source();
+        for path in [
+            PathBuf::from("/Users/alice/.cowshed"),
+            PathBuf::from("/Users/alice/.cowshed/caches"),
+        ] {
+            source
+                .mountpoints
+                .insert(path, MountpointState::Mounted { marker: None });
+        }
+        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
+            .expect("two-volume repair snapshot");
+        assert_eq!(snapshot.actions.len(), 4);
+        let host: Arc<dyn BootstrapHost> = Arc::new(PartialProgressHost {
+            completed: Mutex::new(Vec::new()),
+            fail_volume: APFS_CACHES_VOLUME,
+        });
+
+        let (outcomes, failure) =
+            execute_snapshot_actions(&snapshot, Arc::clone(&host)).await;
+        let failure = failure.expect("second volume fails");
+        assert!(failure.message.contains("cowshed.caches action failed"));
+        assert!(matches!(outcomes[0].outcome, HostActionResult::Done));
+        assert!(matches!(
+            &outcomes[1].outcome,
+            HostActionResult::Failed { error }
+                if error.message.contains("cowshed.caches action failed")
+        ));
+        assert!(matches!(outcomes[2].outcome, HostActionResult::Skipped));
+        assert!(matches!(outcomes[3].outcome, HostActionResult::Skipped));
     }
     #[test]
     fn uninstall_plan_removes_only_tagged_pins_and_is_idempotent_when_clean() {
@@ -4900,6 +5249,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     #[test]
     fn setup_and_uninstall_report_json_is_frozen_camel_case() {
         let setup = crate::api::JsonEnvelope::success(HostSetupReport {
+            action_outcomes: Vec::new(),
             volumes: vec![
                 VolumeOutcome {
                     name: APFS_STORE_VOLUME.to_owned(),
@@ -4925,7 +5275,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         });
         assert_eq!(
             serde_json::to_string(&setup).expect("setup envelope"),
-            "{\"ok\":true,\"result\":{\"volumes\":[{\"name\":\"cowshed.store\",\"role\":\"store\",\"stateBefore\":{\"foundElsewhere\":{\"container\":\"disk4\",\"device\":\"disk4s7\",\"mountedAt\":null}},\"action\":\"reported\"},{\"name\":\"cowshed.caches\",\"role\":\"caches\",\"stateBefore\":{\"misMounted\":{\"mountedAt\":\"/Volumes/cowshed.caches\"}},\"action\":\"remounted\"}],\"fstab\":{\"skipped\":\"volume elsewhere\"},\"authorized\":false}}"
+            "{\"ok\":true,\"result\":{\"actionOutcomes\":[],\"volumes\":[{\"name\":\"cowshed.store\",\"role\":\"store\",\"stateBefore\":{\"foundElsewhere\":{\"container\":\"disk4\",\"device\":\"disk4s7\",\"mountedAt\":null}},\"action\":\"reported\"},{\"name\":\"cowshed.caches\",\"role\":\"caches\",\"stateBefore\":{\"misMounted\":{\"mountedAt\":\"/Volumes/cowshed.caches\"}},\"action\":\"remounted\"}],\"fstab\":{\"skipped\":\"volume elsewhere\"},\"authorized\":false}}"
         );
 
         let action = HostAction::RepairMounted {
@@ -4938,6 +5288,20 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert_eq!(
             serde_json::to_string(&action).expect("host action"),
             "{\"repairMounted\":{\"name\":\"cowshed.store\",\"uuid\":\"STORE-UUID\",\"sizeBytes\":1000000000000,\"mountedAt\":\"/Volumes/cowshed.store\",\"mountAt\":\"/Users/alice/.cowshed\"}}"
+        );
+
+        let failed = HostActionOutcome {
+            action: HostAction::PinFstab {
+                uuid: "STORE-UUID".to_owned(),
+                mount_at: PathBuf::from("/Users/alice/.cowshed"),
+            },
+            outcome: HostActionResult::Failed {
+                error: CowshedError::internal("install failed"),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&failed).expect("failed outcome"),
+            "{\"action\":{\"pinFstab\":{\"uuid\":\"STORE-UUID\",\"mountAt\":\"/Users/alice/.cowshed\"}},\"outcome\":{\"failed\":{\"error\":{\"code\":\"internal\",\"message\":\"install failed\",\"hint\":\"cowshed doctor --json\"}}}}"
         );
 
         let uninstall = crate::api::JsonEnvelope::success(UninstallReport {

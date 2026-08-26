@@ -15,9 +15,10 @@ use super::fstab::FstabPin;
 
 pub mod native;
 pub use native::{
-    FstabOutcome, HostAction, HostSetupPlan, HostSetupReport, HostUninstallPlan,
-    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState,
-    execute_host_setup, execute_host_uninstall, plan_host_setup, plan_host_uninstall,
+    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
+    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
+    VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall, plan_host_setup,
+    plan_host_uninstall,
 };
 
 
@@ -1510,24 +1511,36 @@ where
     L: BlockingLane,
 {
     for operation in plan.operations() {
-        let operation = resolve_operation(operation)?;
-        let host = Arc::clone(&host);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        lane.dispatch(Box::new(move || {
-            apply_operation(host.as_ref(), &operation)?;
-            sender.send(()).map_err(|_| {
-                BootstrapExecutionError::BlockingLane(
-                    "bootstrap operation result receiver closed".to_owned(),
-                )
-            })
-        }))
-        .await?;
-        receiver.try_recv().map_err(|error| {
-            BootstrapExecutionError::BlockingLane(format!(
-                "bootstrap operation produced no result: {error}"
-            ))
-        })?;
+        execute_bootstrap_operation(operation, Arc::clone(&host), lane).await?;
     }
+    Ok(())
+}
+
+pub(crate) async fn execute_bootstrap_operation<H, L>(
+    operation: &HostOperation,
+    host: Arc<H>,
+    lane: &L,
+) -> Result<(), BootstrapExecutionError>
+where
+    H: BootstrapHost + ?Sized + 'static,
+    L: BlockingLane,
+{
+    let operation = resolve_operation(operation)?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    lane.dispatch(Box::new(move || {
+        apply_operation(host.as_ref(), &operation)?;
+        sender.send(()).map_err(|_| {
+            BootstrapExecutionError::BlockingLane(
+                "bootstrap operation result receiver closed".to_owned(),
+            )
+        })
+    }))
+    .await?;
+    receiver.try_recv().map_err(|error| {
+        BootstrapExecutionError::BlockingLane(format!(
+            "bootstrap operation produced no result: {error}"
+        ))
+    })?;
     Ok(())
 }
 
