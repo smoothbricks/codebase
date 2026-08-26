@@ -17,6 +17,78 @@ pub const GATEWAY_LABEL: &str = "dev.cowshed.gateway";
 pub const SCCACHE_LABEL: &str = "dev.cowshed.sccache";
 pub const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 pub const PRIVATE_PLIST_MODE: u32 = 0o600;
+/// Runnable, and writable only by the user launchd runs the agent as.
+pub const STABLE_BINARY_MODE: u32 = 0o755;
+pub const COWSHED_BINARY_NAME: &str = "cowshed";
+pub const SCCACHE_BINARY_NAME: &str = "sccache";
+
+const APPLICATION_SUPPORT: &str = "Application Support";
+const STABLE_SUPPORT_DIRECTORY: &str = "dev.cowshed";
+const STABLE_BINARY_DIRECTORY: &str = "bin";
+
+/// A binary path launchd can still reach after a reboot.
+///
+/// `~/Library/Application Support/dev.cowshed/bin/<name>` is on the volume that also carries
+/// `~/Library/LaunchAgents`: if launchd can read the plist, the binary that plist names is there
+/// too. Every other candidate can be absent when the agent first runs — a checkout is rebuilt or
+/// deleted, a nix store path is garbage collected, and a workspace image is not mounted until
+/// cowshed mounts it, which is the gateway's own job. launchd answers a missing program with
+/// exit 78 and, under `KeepAlive`, retries it forever: the healer must not live inside what it
+/// heals.
+///
+/// This is the only way to name a service executable, so no caller can put a disappearing path
+/// into a plist. It carries the home it was derived from, which is also what keeps one home's
+/// plist from naming another home's binary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostStableExecutable {
+    home: PathBuf,
+    name: String,
+    path: PathBuf,
+}
+
+impl HostStableExecutable {
+    pub fn new(home: &Path, name: &str) -> Result<Self, LaunchdError> {
+        validate_canonical_absolute_path("home", home)?;
+        validate_binary_name(name)?;
+        let path = home
+            .join("Library")
+            .join(APPLICATION_SUPPORT)
+            .join(STABLE_SUPPORT_DIRECTORY)
+            .join(STABLE_BINARY_DIRECTORY)
+            .join(name);
+        Ok(Self {
+            home: home.to_path_buf(),
+            name: name.to_owned(),
+            path,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The directory holding every host-stable cowshed binary.
+    pub fn directory(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("derived paths always have a parent")
+    }
+
+    /// The `dev.cowshed` directory holding [`Self::directory`].
+    pub fn support_directory(&self) -> &Path {
+        self.directory()
+            .parent()
+            .expect("derived paths always have a parent")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceLifecycle {
@@ -39,17 +111,15 @@ pub struct LaunchAgentSpec {
 
 impl LaunchAgentSpec {
     pub fn new_user(
-        home: &Path,
+        executable: &HostStableExecutable,
         label: impl Into<String>,
-        executable: &Path,
         arguments: Vec<String>,
         lifecycle: ServiceLifecycle,
     ) -> Result<Self, LaunchdError> {
         validate_arguments(&arguments)?;
         Self::assemble(
-            home,
-            label.into(),
             executable,
+            label.into(),
             arguments,
             Vec::new(),
             lifecycle,
@@ -58,19 +128,17 @@ impl LaunchAgentSpec {
     }
 
     fn assemble(
-        home: &Path,
+        executable: &HostStableExecutable,
         label: String,
-        executable: &Path,
         arguments: Vec<String>,
         environment: Vec<(String, String)>,
         lifecycle: ServiceLifecycle,
         standard_error_file: &str,
     ) -> Result<Self, LaunchdError> {
-        validate_canonical_absolute_path("home", home)?;
-        validate_canonical_absolute_path("executable", executable)?;
         validate_label(&label)?;
         validate_environment(&environment)?;
 
+        let home = executable.home();
         let plist_path = home
             .join("Library")
             .join("LaunchAgents")
@@ -85,7 +153,7 @@ impl LaunchAgentSpec {
 
         Ok(Self {
             label,
-            executable: executable.to_path_buf(),
+            executable: executable.path().to_path_buf(),
             arguments,
             environment,
             lifecycle,
@@ -94,11 +162,10 @@ impl LaunchAgentSpec {
         })
     }
 
-    pub fn gateway(home: &Path, executable: &Path) -> Result<Self, LaunchdError> {
+    pub fn gateway(executable: &HostStableExecutable) -> Result<Self, LaunchdError> {
         Self::new_user(
-            home,
-            GATEWAY_LABEL,
             executable,
+            GATEWAY_LABEL,
             vec!["gateway".into(), "run".into()],
             ServiceLifecycle::KeepAlive,
         )
@@ -106,7 +173,8 @@ impl LaunchAgentSpec {
 
     /// The host-owned sccache server agent.
     ///
-    /// launchd runs the sccache binary itself: server mode is selected entirely
+    /// launchd runs the sccache binary itself — a host-stable copy of it, since the daemon has to
+    /// outlive the devenv profile or nix store path it came from. Server mode is selected entirely
     /// through the environment (`SCCACHE_START_SERVER=1` combined with any CLI
     /// argument is a parse error in sccache), so this is the one agent with an
     /// empty argv tail. `SCCACHE_NO_DAEMON=1` keeps the server in the
@@ -126,8 +194,7 @@ impl LaunchAgentSpec {
     ///
     /// All source-verified against sccache 0.16.
     pub fn sccache(
-        home: &Path,
-        sccache_executable: &Path,
+        executable: &HostStableExecutable,
         server_socket: &Path,
         cache_directory: &Path,
         cache_capacity: ImageCapacity,
@@ -148,9 +215,8 @@ impl LaunchAgentSpec {
             ("SCCACHE_BASEDIRS".to_owned(), path_string(base_directory)),
         ];
         Self::assemble(
-            home,
+            executable,
             SCCACHE_LABEL.to_owned(),
-            sccache_executable,
             Vec::new(),
             environment,
             ServiceLifecycle::KeepAlive,
@@ -276,8 +342,8 @@ impl InstallPlan {
 
 /// An ordered, filesystem-only mutation plan.
 ///
-/// `CreateExclusiveTemporaryFile` produces the temporary file consumed by the
-/// immediately following temporary-file operations. The executor must choose a
+/// `CreateExclusiveTemporaryFile` and `CopyToTemporaryFile` produce the temporary file consumed
+/// by the immediately following temporary-file operations. The executor must choose a
 /// unique suffix, open with exclusive creation and no symlink following, and
 /// clean up that file if a later operation fails.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,6 +360,14 @@ pub enum Mutation {
         directory: PathBuf,
         name_prefix: String,
         bytes: Vec<u8>,
+        mode: u32,
+    },
+    /// Stream `source` into a fresh temporary file. Service binaries are tens of megabytes: they
+    /// are copied through the filesystem, never carried in a plan.
+    CopyToTemporaryFile {
+        directory: PathBuf,
+        name_prefix: String,
+        source: PathBuf,
         mode: u32,
     },
     SyncTemporaryFile,
@@ -368,12 +442,181 @@ pub fn plan_remove(spec: &LaunchAgentSpec, installed: bool) -> InstallPlan {
     InstallPlan { operations }
 }
 
+/// What the host currently has at a [`HostStableExecutable`] path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutableInstallState {
+    /// Mode of `~/Library/Application Support/dev.cowshed`; `None` when it does not exist.
+    pub support_directory_mode: Option<u32>,
+    /// Mode of that directory's `bin`; `None` when it does not exist.
+    pub binary_directory_mode: Option<u32>,
+    /// The binary already at the path, when a regular file is there.
+    pub installed: Option<InstalledExecutable>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstalledExecutable {
+    pub mode: u32,
+    /// Whether its bytes are already the bytes being installed.
+    pub matches_source: bool,
+}
+
+/// Plan the copy that makes `source` runnable from the host-stable path.
+///
+/// The copy is published by renaming a temporary file within the destination directory: launchd
+/// restarts a `KeepAlive` service the moment it exits, so it must never observe a half-written
+/// binary at the path it runs. A binary that already matches plans nothing — the source is tens
+/// of megabytes and every `start` would otherwise rewrite the file launchd is running.
+pub fn plan_executable_install(
+    executable: &HostStableExecutable,
+    source: &Path,
+    state: ExecutableInstallState,
+) -> InstallPlan {
+    let mut operations = Vec::new();
+    for (directory, mode) in [
+        (executable.support_directory(), state.support_directory_mode),
+        (executable.directory(), state.binary_directory_mode),
+    ] {
+        match mode {
+            None => operations.push(Mutation::EnsureDirectory {
+                path: directory.to_path_buf(),
+                mode: PRIVATE_DIRECTORY_MODE,
+            }),
+            Some(mode) if mode != PRIVATE_DIRECTORY_MODE => {
+                operations.push(Mutation::SetPermissions {
+                    path: directory.to_path_buf(),
+                    mode: PRIVATE_DIRECTORY_MODE,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    let binary_is_current = state
+        .installed
+        .is_some_and(|installed| installed.mode == STABLE_BINARY_MODE && installed.matches_source);
+
+    if !binary_is_current {
+        operations.push(Mutation::CopyToTemporaryFile {
+            directory: executable.directory().to_path_buf(),
+            name_prefix: format!(".{}.", executable.name()),
+            source: source.to_path_buf(),
+            mode: STABLE_BINARY_MODE,
+        });
+        operations.push(Mutation::SyncTemporaryFile);
+        operations.push(Mutation::RenameTemporaryFile {
+            destination: executable.path().to_path_buf(),
+        });
+    }
+
+    if !operations.is_empty() {
+        operations.push(Mutation::SyncDirectory {
+            path: executable.directory().to_path_buf(),
+        });
+    }
+
+    InstallPlan { operations }
+}
+
+/// Where a candidate binary lives, as observed on the host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutableSource<'a> {
+    pub path: &'a Path,
+    /// Mount point of the volume holding `path`, from [`containing_mount_point`].
+    pub mount_point: &'a Path,
+    /// Whether that mount point carries the cowshed workspace marker.
+    pub mount_is_workspace: bool,
+}
+
+/// A binary cowshed refuses to install a LaunchAgent from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnstableExecutableSource {
+    Store { store: PathBuf },
+    Workspace { mount_point: PathBuf },
+    HomeVolume { mount_point: PathBuf },
+}
+
+impl fmt::Display for UnstableExecutableSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store { store } => write!(
+                formatter,
+                "the binary is inside the cowshed store at {}",
+                store.display()
+            ),
+            Self::Workspace { mount_point } => write!(
+                formatter,
+                "the binary is on a cowshed workspace image mounted at {}",
+                mount_point.display()
+            ),
+            Self::HomeVolume { mount_point } => write!(
+                formatter,
+                "the binary is on a volume mounted inside the home directory at {}",
+                mount_point.display()
+            ),
+        }
+    }
+}
+
+/// Decide whether a LaunchAgent may be installed from `source`.
+///
+/// The refusals are structural. Cowshed's storage is mounted *by cowshed*, and launchd starts
+/// agents before any of it exists, so a binary there is a binary the agent cannot reach at boot:
+/// the store prefix catches an unmounted store as well as a mounted one, the workspace marker
+/// names an image wherever it is mounted, and a volume mounted inside the home directory is
+/// cowshed's or nobody's.
+///
+/// Everything else is copied rather than refused. `/nix`, `/usr/local`, and a global npm prefix
+/// are all present before login, and the copy is what makes the agent independent of them anyway.
+pub fn classify_executable_source(
+    home: &Path,
+    source: ExecutableSource<'_>,
+) -> Result<(), UnstableExecutableSource> {
+    let store = home.join(".cowshed");
+    if source.path.starts_with(&store) {
+        return Err(UnstableExecutableSource::Store { store });
+    }
+    if source.mount_is_workspace {
+        return Err(UnstableExecutableSource::Workspace {
+            mount_point: source.mount_point.to_path_buf(),
+        });
+    }
+    if source.mount_point != home && source.mount_point.starts_with(home) {
+        return Err(UnstableExecutableSource::HomeVolume {
+            mount_point: source.mount_point.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// The mount point of the volume holding `path`.
+///
+/// Found by walking ancestors while the device number is unchanged, which is how a workspace
+/// image is recognised without parsing `mount(8)`: every cowshed image is its own APFS volume,
+/// so its root is exactly where the device changes.
+pub fn containing_mount_point(path: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let device = fs::metadata(path)?.dev();
+    let mut mount_point = path;
+    for ancestor in path.ancestors().skip(1) {
+        if fs::metadata(ancestor)?.dev() != device {
+            break;
+        }
+        mount_point = ancestor;
+    }
+    Ok(mount_point.to_path_buf())
+}
+
 pub const LAUNCHCTL_EXECUTABLE: &str = "/bin/launchctl";
 
 /// Filesystem operations required to execute an [`InstallPlan`].
 ///
-/// Implementations of `create_exclusive_no_follow` must either return a fully
-/// written file with exactly `mode`, or remove any file they created before
+/// `ensure_directory` creates missing parents with `mode` and guarantees exactly `mode` on the
+/// named directory: a home is not always furnished, and `~/Library/Application Support` does not
+/// exist on a freshly created account until something writes there.
+///
+/// Implementations of `create_exclusive_no_follow` and `copy_exclusive_no_follow` must either
+/// return a fully written file with exactly `mode`, or remove any file they created before
 /// returning an error.
 pub trait LaunchdFilesystem {
     fn ensure_directory(&mut self, path: &Path, mode: u32) -> io::Result<()>;
@@ -383,6 +626,13 @@ pub trait LaunchdFilesystem {
         directory: &Path,
         name_prefix: &str,
         bytes: &[u8],
+        mode: u32,
+    ) -> io::Result<PathBuf>;
+    fn copy_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        source: &Path,
         mode: u32,
     ) -> io::Result<PathBuf>;
     fn sync_file(&mut self, path: &Path) -> io::Result<()>;
@@ -401,14 +651,79 @@ impl NativeFilesystem {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Open a fresh exclusive temporary file in `directory` with exactly `mode`.
+    ///
+    /// The mode is set explicitly after creation as well: `O_CREAT` mode is masked by the
+    /// process umask, and a plist at 0644 or a binary without its exec bit are both wrong.
+    fn create_temporary_file(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        mode: u32,
+    ) -> io::Result<(PathBuf, File)> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        for _ in 0..128 {
+            let id = self.next_temporary_id;
+            self.next_temporary_id = self.next_temporary_id.wrapping_add(1);
+            let path = directory.join(format!("{name_prefix}{}.{}", std::process::id(), id));
+            let opened = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .custom_flags(no_follow_flag())
+                .open(&path);
+            let file = match opened {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+
+            let prepared = (|| {
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(wrong_file_kind("temporary path", FileKind::RegularFile));
+                }
+                file.set_permissions(fs::Permissions::from_mode(mode))
+            })();
+            return match prepared {
+                Ok(()) => Ok((path, file)),
+                Err(error) => {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    Err(error)
+                }
+            };
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate an exclusive launchd temporary file",
+        ))
+    }
+
+    /// Keep the temporary file only when it was written in full: a partial plist or binary must
+    /// never survive to be renamed over the path launchd reads.
+    fn published(path: PathBuf, file: File, written: io::Result<()>) -> io::Result<PathBuf> {
+        drop(file);
+        match written {
+            Ok(()) => Ok(path),
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                Err(error)
+            }
+        }
+    }
 }
 
 impl LaunchdFilesystem for NativeFilesystem {
     fn ensure_directory(&mut self, path: &Path, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
 
+        // Recursive so a home missing `Library/Application Support` still gets the agent: only
+        // directories this call creates take `mode`, and existing ancestors keep theirs.
         let mut builder = fs::DirBuilder::new();
-        builder.mode(mode);
+        builder.recursive(true).mode(mode);
         match builder.create(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -428,44 +743,25 @@ impl LaunchdFilesystem for NativeFilesystem {
         bytes: &[u8],
         mode: u32,
     ) -> io::Result<PathBuf> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let (path, mut file) = self.create_temporary_file(directory, name_prefix, mode)?;
+        let written = file.write_all(bytes);
+        Self::published(path, file, written)
+    }
 
-        for _ in 0..128 {
-            let id = self.next_temporary_id;
-            self.next_temporary_id = self.next_temporary_id.wrapping_add(1);
-            let path = directory.join(format!("{name_prefix}{}.{}", std::process::id(), id));
-            let opened = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(mode)
-                .custom_flags(no_follow_flag())
-                .open(&path);
-            let mut file = match opened {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            };
-
-            let write_result = (|| {
-                let metadata = file.metadata()?;
-                if !metadata.file_type().is_file() {
-                    return Err(wrong_file_kind("temporary path", FileKind::RegularFile));
-                }
-                file.set_permissions(fs::Permissions::from_mode(mode))?;
-                file.write_all(bytes)
-            })();
-            if let Err(error) = write_result {
-                drop(file);
-                let _ = fs::remove_file(&path);
-                return Err(error);
-            }
-            return Ok(path);
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate an exclusive launchd temporary file",
-        ))
+    fn copy_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        source: &Path,
+        mode: u32,
+    ) -> io::Result<PathBuf> {
+        let (path, mut file) = self.create_temporary_file(directory, name_prefix, mode)?;
+        // Streamed, not buffered: io::copy takes the platform's fast path and a service binary
+        // never has to be resident in this process.
+        let written = File::open(source)
+            .and_then(|mut source| io::copy(&mut source, &mut file))
+            .map(|_| ());
+        Self::published(path, file, written)
     }
 
     fn sync_file(&mut self, path: &Path) -> io::Result<()> {
@@ -554,6 +850,7 @@ pub enum FilesystemOperation {
     EnsureDirectory,
     SetPermissions,
     CreateTemporaryFile,
+    CopyTemporaryFile,
     SyncTemporaryFile,
     RenameTemporaryFile,
     RemoveFile,
@@ -925,6 +1222,35 @@ impl<F: LaunchdFilesystem, C> LaunchdExecutor<F, C> {
                         ),
                     }
                 }
+                Mutation::CopyToTemporaryFile {
+                    directory,
+                    name_prefix,
+                    source,
+                    mode,
+                } => {
+                    if temporary_file.is_some() {
+                        return Err(InstallExecutionError::InvalidPlan {
+                            operation: FilesystemOperation::CopyTemporaryFile,
+                            reason: "a temporary file is already active",
+                        });
+                    }
+                    match self.filesystem.copy_exclusive_no_follow(
+                        directory,
+                        name_prefix,
+                        source,
+                        *mode,
+                    ) {
+                        Ok(path) => {
+                            temporary_file = Some(path);
+                            continue;
+                        }
+                        Err(error) => (
+                            FilesystemOperation::CopyTemporaryFile,
+                            directory.as_path(),
+                            Err(error),
+                        ),
+                    }
+                }
                 Mutation::SyncTemporaryFile => {
                     let Some(path) = temporary_file.as_deref() else {
                         return Err(InstallExecutionError::InvalidPlan {
@@ -1153,6 +1479,24 @@ fn validate_label(label: &str) -> Result<(), LaunchdError> {
         Ok(())
     } else {
         Err(LaunchdError::InvalidLabel)
+    }
+}
+
+/// A binary name is one path component, so the derived path stays inside the host-stable
+/// directory: a name carrying a separator or a dot form would name something else entirely.
+fn validate_binary_name(name: &str) -> Result<(), LaunchdError> {
+    let valid = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.chars().any(is_unsafe_xml_control);
+    if valid {
+        Ok(())
+    } else {
+        Err(LaunchdError::InvalidPath {
+            field: "executable-name",
+            reason: "must be a single path component",
+        })
     }
 }
 
