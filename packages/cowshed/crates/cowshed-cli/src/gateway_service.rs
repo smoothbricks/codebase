@@ -316,10 +316,10 @@ impl StartProgress {
             "waited {}s for the gateway: {}",
             waited.as_secs(),
             match self.projects {
-                None => String::from("healing recorded projects…"),
-                Some(0) => String::from("no recorded projects to heal"),
-                Some(1) => String::from("healing 1 project…"),
-                Some(count) => format!("healing {count} projects…"),
+                None => String::from("mounting adopted projects…"),
+                Some(0) => String::from("no adopted projects to mount"),
+                Some(1) => String::from("mounting 1 adopted project…"),
+                Some(count) => format!("mounting {count} adopted projects…"),
             }
         ))
     }
@@ -473,7 +473,7 @@ async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
             for outcome in outcomes {
                 if let Err(error) = &outcome.main {
                     eprintln!(
-                        "cowshed: {} has no mounted main after startup heal: {error}",
+                        "cowshed: {}: main checkout is not mounted after gateway startup: {error}",
                         outcome.repo_id
                     );
                     eprintln!("next: cowshed doctor");
@@ -481,7 +481,7 @@ async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
                 for session in &outcome.sessions {
                     if let Err(error) = &session.mount {
                         eprintln!(
-                            "cowshed: could not heal {}/{} at startup: {error}",
+                            "cowshed: could not mount {}/{} at gateway startup: {error}",
                             outcome.repo_id, session.workspace
                         );
                     }
@@ -489,7 +489,7 @@ async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
             }
         }
         Err(error) => {
-            eprintln!("cowshed: could not enumerate projects to heal at startup: {error}");
+            eprintln!("cowshed: could not list adopted projects at gateway startup: {error}");
         }
     }
 }
@@ -909,12 +909,12 @@ mod tests {
         assert_eq!(progress.line(START_PROGRESS_INTERVAL - Duration::from_millis(1)), None);
         assert_eq!(
             progress.line(START_PROGRESS_INTERVAL),
-            Some(String::from("waited 5s for the gateway: healing 7 projects…"))
+            Some(String::from("waited 5s for the gateway: mounting 7 adopted projects…"))
         );
         assert_eq!(progress.line(START_PROGRESS_INTERVAL), None);
         assert_eq!(
             progress.line(START_PROGRESS_INTERVAL * 2),
-            Some(String::from("waited 10s for the gateway: healing 7 projects…"))
+            Some(String::from("waited 10s for the gateway: mounting 7 adopted projects…"))
         );
     }
 
@@ -926,12 +926,12 @@ mod tests {
 
         assert_eq!(
             progress.line(Duration::from_secs(90)),
-            Some(String::from("waited 90s for the gateway: healing 2 projects…"))
+            Some(String::from("waited 90s for the gateway: mounting 2 adopted projects…"))
         );
         assert_eq!(progress.line(Duration::from_secs(93)), None);
         assert_eq!(
             progress.line(Duration::from_secs(95)),
-            Some(String::from("waited 95s for the gateway: healing 2 projects…"))
+            Some(String::from("waited 95s for the gateway: mounting 2 adopted projects…"))
         );
     }
 
@@ -940,14 +940,29 @@ mod tests {
     #[test]
     fn the_start_wait_never_overstates_what_it_counted() {
         for (projects, expected) in [
-            (None, "waited 5s for the gateway: healing recorded projects…"),
-            (Some(0), "waited 5s for the gateway: no recorded projects to heal"),
-            (Some(1), "waited 5s for the gateway: healing 1 project…"),
+            (None, "waited 5s for the gateway: mounting adopted projects…"),
+            (Some(0), "waited 5s for the gateway: no adopted projects to mount"),
+            (Some(1), "waited 5s for the gateway: mounting 1 adopted project…"),
         ] {
             assert_eq!(
                 StartProgress::new(projects).line(START_PROGRESS_INTERVAL),
                 Some(String::from(expected))
             );
+        }
+    }
+
+    /// "heal" is cowshed's word for what it does to itself, not the user's word for what they are
+    /// waiting on. A person watching `gateway start` is waiting for their workspaces to be
+    /// mounted, and the line has to say that.
+    #[test]
+    fn the_start_wait_never_speaks_of_healing() {
+        for projects in [None, Some(0), Some(1), Some(4)] {
+            let line = StartProgress::new(projects)
+                .line(START_PROGRESS_INTERVAL)
+                .expect("a line once the interval has passed");
+            for jargon in ["heal", "unhealable", "reclaim", "provision", "incarnation"] {
+                assert!(!line.contains(jargon), "{line} leaks {jargon}");
+            }
         }
     }
 

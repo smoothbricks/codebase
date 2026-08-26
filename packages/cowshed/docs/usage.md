@@ -277,7 +277,7 @@ Important exit codes:
 |    2 | usage               | fix argv; do not retry unchanged                        |
 |    3 | not found           | refresh repository/workspace selection                  |
 |    4 | conflict            | preserve work or resolve the named state conflict       |
-|    5 | environment missing | follow the emitted setup/healing hint                   |
+|    5 | environment missing | follow the emitted setup or repair hint                 |
 |    6 | sandbox denied      | request the named authority; do not silently self-widen |
 |    7 | integrity failure   | stop; do not select whichever copy looks newest         |
 
