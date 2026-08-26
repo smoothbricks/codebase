@@ -2091,12 +2091,11 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         },
     };
     if diagnosis.storage_ready {
-        let roots = CanonicalRoots::for_home(&home).map_err(|error| {
-            CowshedError::internal(format!("could not derive host storage roots: {error}"))
-        })?;
         diagnosis
             .findings
-            .extend(retired_mount_layout_findings(roots.store()));
+            .extend(retired_mount_layout_findings(
+                CanonicalRoots::global().store(),
+            ));
     }
     match gateway_service::service_status().await {
         Ok(status) => diagnosis.findings.extend(gateway_findings(&status)),

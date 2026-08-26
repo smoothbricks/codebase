@@ -22,7 +22,7 @@ use crate::output::Output;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
 use cowshed_core::metadata::ImageCapacity;
 use cowshed_core::sandbox::{sccache_cache_directory, sccache_server_socket};
-use cowshed_core::storage::bootstrap::ValidatedHostStorage;
+use cowshed_core::storage::bootstrap::{STORE_ROOT, ValidatedHostStorage};
 use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
 use std::fs;
 use std::io::Write;
@@ -100,7 +100,7 @@ where
 pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheStatus> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
-    let cache_directory = sccache_cache_directory(&home);
+    let cache_directory = sccache_cache_directory();
     fs::create_dir_all(&cache_directory).map_err(|error| {
         CowshedError::internal(format!(
             "could not create {}: {error}",
@@ -111,7 +111,7 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
         Some(capacity) => capacity,
         None => derived_capacity(&storage).await?,
     };
-    let socket = sccache_server_socket(&home);
+    let socket = sccache_server_socket();
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let executable = install_host_stable_executable(
         &mut executor,
@@ -214,7 +214,7 @@ async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<ImageCapacit
 fn stop_service() -> Result<()> {
     let home = canonical_home()?;
     remove_launch_agent(&control_spec(&home)?)?;
-    remove_stale_socket(&sccache_server_socket(&home))?;
+    remove_stale_socket(&sccache_server_socket())?;
     Ok(())
 }
 
@@ -239,7 +239,7 @@ pub(crate) fn remove_stale_socket(socket: &Path) -> Result<()> {
 
 pub(crate) async fn service_status() -> Result<SccacheStatus> {
     let home = canonical_home()?;
-    let socket = sccache_server_socket(&home);
+    let socket = sccache_server_socket();
     let spec = control_spec(&home)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = match executor
@@ -318,15 +318,13 @@ async fn read_stats(socket: &Path) -> Option<SccacheStats> {
 /// `start` installed even after sccache has left `PATH` — a devenv update or removal must not
 /// strand it — and `start` writes the plist against this same host-stable path.
 pub(crate) fn control_spec(home: &Path) -> Result<LaunchAgentSpec> {
-    let socket = sccache_server_socket(home);
-    let cache_directory = sccache_cache_directory(home);
     let executable = HostStableExecutable::new(home, SCCACHE_BINARY_NAME).map_err(launchd_error)?;
     LaunchAgentSpec::sccache(
         &executable,
-        &socket,
-        &cache_directory,
+        &sccache_server_socket(),
+        &sccache_cache_directory(),
         MINIMUM_CAPACITY,
-        &home.join(".cowshed"),
+        Path::new(STORE_ROOT),
     )
     .map_err(launchd_error)
 }
@@ -339,7 +337,7 @@ pub(crate) fn sccache_launch_agent(
 ) -> Result<(HostStableExecutable, LaunchAgentSpec, PathBuf)> {
     let executable = HostStableExecutable::new(home, SCCACHE_BINARY_NAME).map_err(launchd_error)?;
     let spec = control_spec(home)?;
-    Ok((executable, spec, sccache_server_socket(home)))
+    Ok((executable, spec, sccache_server_socket()))
 }
 
 fn resolve_sccache_executable() -> Result<PathBuf> {
