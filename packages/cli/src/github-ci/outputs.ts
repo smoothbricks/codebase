@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, type Dirent, type Stats } from 'node:fs';
+import { chmodSync, createReadStream, type Dirent, type Stats } from 'node:fs';
 import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import typia from 'typia';
@@ -11,11 +11,12 @@ export interface CollectedOutputFile {
   output: string;
   path: string;
   size: number;
+  mode: number;
   sha256: string;
 }
 
 export interface CollectedOutputsManifest {
-  version: 1;
+  version: 2;
   sourceSha: string;
   files: CollectedOutputFile[];
 }
@@ -79,6 +80,7 @@ export async function collectNxOutputs(
             output: declaredOutput,
             path,
             size: stat.size,
+            mode: stat.mode & 0o7777,
             sha256: await sha256File(source),
             source,
           });
@@ -97,7 +99,7 @@ export async function collectNxOutputs(
   }
 
   const manifest: CollectedOutputsManifest = {
-    version: 1,
+    version: 2,
     sourceSha,
     files: pending.map(({ source: _source, ...file }) => file),
   };
@@ -118,7 +120,7 @@ export async function applyCollectedOutputs(
   const resolvedProjects = projects ?? (await readProjectTargets(root));
   const projectsByName = new Map(resolvedProjects.map((project) => [project.project, project]));
 
-  const overlays: Array<{ source: string; destination: string }> = [];
+  const overlays: Array<{ source: string; destination: string; mode: number }> = [];
   const claimedPaths = new Set<string>();
   for (const directory of directories) {
     const manifestPath = resolve(directory, 'manifest.json');
@@ -182,7 +184,7 @@ export async function applyCollectedOutputs(
       if (checksum !== file.sha256) {
         throw new Error(`SHA-256 mismatch for staged output ${path}.`);
       }
-      overlays.push({ source, destination: path });
+      overlays.push({ source, destination: path, mode: file.mode });
     }
 
     let workspaceStat: Stats;
@@ -210,6 +212,7 @@ export async function applyCollectedOutputs(
   for (const overlay of overlays) {
     const destination = await prepareSafeOutputPath(root, overlay.destination, 'workspace output file');
     await copyFile(overlay.source, destination);
+    chmodSync(destination, overlay.mode);
   }
 }
 
