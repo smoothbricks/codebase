@@ -72,12 +72,16 @@ identity cannot be derived unambiguously from its remotes.
 
 ## Lifecycle
 
-### `cowshed setup [--uninstall] [--force]`
+### `cowshed setup [--uninstall] [--force] [--mount-root <dir>]`
 
 Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates
 absent volumes, remounts detached or mis-mounted ones at their canonical paths, validates each volume marker, and pins
 the boot mounts in `/etc/fstab`. It never deletes a volume. On a healthy host it changes nothing and says so. Every
 storage error in the CLI points here — a host with no volumes has no checkout to adopt.
+
+`--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at
+`<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
+detached; otherwise setup names the attached workspaces and refuses. Stdout is the configured root.
 
 Anything that can escalate happens inside one authorization session, and **the exact intent for every volume is printed
 before the dialog appears** — name, UUID, size, and where it is going. When the plan creates and deletes nothing, that

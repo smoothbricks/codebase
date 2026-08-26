@@ -35,6 +35,7 @@ struct FakeHost {
     mains: MainMounts,
     /// What the escalating phase fails with, so the decline path is provable without a dialog.
     execute_error: Option<CowshedError>,
+    mount_root_error: Option<CowshedError>,
 }
 
 /// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
@@ -98,6 +99,7 @@ impl Default for FakeHost {
             removals: Vec::new(),
             mains: MainMounts::Checked(Vec::new()),
             execute_error: None,
+            mount_root_error: None,
         }
     }
 }
@@ -144,19 +146,31 @@ impl HostSetup for FakeHost {
         self.events.push(String::from("remove-host-services"));
         Ok(self.removals.clone())
     }
+
+    async fn configure_mount_root(&mut self, mount_root: &std::path::Path) -> Result<PathBuf> {
+        self.events
+            .push(format!("configure-mount-root:{}", mount_root.display()));
+        match self.mount_root_error.take() {
+            Some(error) => Err(error),
+            None => Ok(mount_root.to_path_buf()),
+        }
+    }
 }
 
 const REPAIR: SetupArgs = SetupArgs {
     uninstall: false,
     force: false,
+    mount_root: None,
 };
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: false,
+    mount_root: None,
 };
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: true,
+    mount_root: None,
 };
 
 struct Streams {
@@ -1193,10 +1207,13 @@ fn setup_is_in_the_command_map_between_adopt_and_new() {
     // The map prints the spec's own summary rather than a second copy of it, so this asserts the
     // coupling instead of duplicating the sentence and having to be edited alongside it.
     assert!(map.contains(spec.summary), "map omits the setup summary:\n{map}");
-    assert_eq!(spec.hint(), "cowshed setup [--uninstall] [--force]");
+    assert!(spec.hint().contains("--uninstall"));
+    assert!(spec.hint().contains("--force"));
+    assert!(spec.hint().contains("--mount-root"));
     let page = spec.page();
     assert!(page.contains("--uninstall"));
     assert!(page.contains("--force"));
+    assert!(page.contains("--mount-root"));
 
     // `provision` is cowshed's internal word for minting a volume. Parent's rule is that it never
     // reaches a person, and a help page is the most person-facing surface there is.
@@ -1223,6 +1240,63 @@ fn gateway_stop_purge_is_parsed_and_documented() {
     let spec = help::command_named("gateway").expect("gateway has a help page");
     assert!(spec.page().contains("--purge"));
     assert!(help::command_map().contains("[--purge]"));
+}
+
+#[tokio::test]
+async fn setup_mount_root_prints_the_configured_path() {
+    let mut host = FakeHost::default();
+    let args = SetupArgs {
+        uninstall: false,
+        force: false,
+        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
+    };
+    let streams = run(&mut host, args, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert_eq!(streams.stdout, "/Users/dev/.cowshed/mnt\n");
+    assert!(streams.stderr.contains("workspace mount root is /Users/dev/.cowshed/mnt"));
+    assert!(streams.stderr.contains("next: cowshed doctor"));
+    assert_eq!(
+        host.events,
+        ["configure-mount-root:/Users/dev/.cowshed/mnt"]
+    );
+}
+
+#[tokio::test]
+async fn setup_mount_root_json_is_empty_success() {
+    let mut host = FakeHost::default();
+    let args = SetupArgs {
+        uninstall: false,
+        force: false,
+        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
+    };
+    let streams = run(&mut host, args, true, false).await;
+    assert_eq!(streams.exit, 0);
+    assert_eq!(streams.stdout, "{\"ok\":true,\"result\":{}}\n");
+}
+
+#[tokio::test]
+async fn setup_mount_root_refuses_while_workspaces_are_attached() {
+    let mut host = FakeHost {
+        mount_root_error: Some(CowshedError::conflict(
+            "workspace mount root cannot change while attached: acme/widget/swift, zeta/widget/raven",
+            "detach every attached workspace, then cowshed setup --mount-root <dir>",
+        )),
+        ..FakeHost::default()
+    };
+    let args = SetupArgs {
+        uninstall: false,
+        force: false,
+        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
+    };
+    let error = refusal(&mut host, args).await;
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("acme/widget/swift"));
+    assert!(error.message.contains("zeta/widget/raven"));
+    assert!(error.hint.contains("detach"));
+    assert_eq!(
+        host.events,
+        ["configure-mount-root:/Users/dev/.cowshed/mnt"]
+    );
 }
 
 /// Mains are always-mounted (02_workspaces.md), so a host with one missing is not one setup may

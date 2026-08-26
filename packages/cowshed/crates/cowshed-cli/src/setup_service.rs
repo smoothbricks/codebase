@@ -25,6 +25,7 @@ use crate::launchd::RemovalOutcome;
 use crate::output::Output;
 use crate::sccache_service::{remove_stale_socket, sccache_launch_agent};
 use async_trait::async_trait;
+use cowshed_core::api::EmptyResult;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
@@ -32,6 +33,9 @@ use cowshed_core::storage::bootstrap::{
     plan_host_setup, plan_host_uninstall,
 };
 use cowshed_core::metadata::ImageFormat;
+use cowshed_core::storage::host_config::{
+    AttachedWorkspace, HostConfigError, execute_mount_root_change, plan_mount_root_change,
+};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
     CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
@@ -39,7 +43,8 @@ use cowshed_core::{
 };
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 /// The exact sentence a run that may escalate prints before it escalates.
 ///
@@ -146,6 +151,8 @@ pub trait HostSetup: Send {
     async fn unmounted_mains(&mut self) -> Result<MainMounts>;
     /// Deactivate and delete the host services and the binaries they ran.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>>;
+    /// Record the host workspace mount root. Refused while any workspace is attached.
+    async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf>;
 }
 
 /// The real host, rooted at the canonical home every other host verb resolves.
@@ -284,6 +291,26 @@ impl HostSetup for NativeHostSetup {
         remove_stale_socket(&sccache_socket)?;
         Ok(removals)
     }
+
+    async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf> {
+        let storage = validate_existing_host_storage(&self.home).await?;
+        let attached = NativeGatewayInventory::new(storage.clone())
+            .all_attached()
+            .await
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("could not list attached workspaces: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?
+            .into_iter()
+            .map(|fact| AttachedWorkspace::new(fact.repo_id, fact.workspace))
+            .collect::<Vec<_>>();
+        let plan = plan_mount_root_change(storage.store(), mount_root, attached)
+            .map_err(host_config_error)?;
+        let config = execute_mount_root_change(&plan).map_err(host_config_error)?;
+        Ok(config.mount_root().to_path_buf())
+    }
 }
 
 /// How many workspaces one project holds: its published session images plus its `main`.
@@ -345,10 +372,63 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    if let Some(mount_root) = args.mount_root.as_deref() {
+        return set_mount_root(setup, mount_root, json, output).await;
+    }
     if args.uninstall {
         return uninstall(setup, args.force, json, output).await;
     }
     repair(setup, json, output).await
+}
+
+async fn set_mount_root<S, W, E>(
+    setup: &mut S,
+    mount_root: &Path,
+    json: bool,
+    output: &mut Output<W, E>,
+) -> Result<i32>
+where
+    S: HostSetup,
+    W: Write + Send,
+    E: Write + Send,
+{
+    let path = setup.configure_mount_root(mount_root).await?;
+    if json {
+        output.success(EmptyResult {}).map_err(output_error)?;
+    } else {
+        output
+            .bare_line(path.as_os_str().as_bytes())
+            .map_err(output_error)?;
+    }
+    output
+        .guidance(&format!(
+            "workspace mount root is {}",
+            path.display()
+        ))
+        .map_err(output_error)?;
+    output.hint("cowshed doctor").map_err(output_error)?;
+    Ok(0)
+}
+
+fn host_config_error(error: HostConfigError) -> CowshedError {
+    match error {
+        HostConfigError::WorkspacesAttached { workspaces } => {
+            let names = workspaces
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            CowshedError::conflict(
+                format!("workspace mount root cannot change while attached: {names}"),
+                "detach every attached workspace, then cowshed setup --mount-root <dir>",
+            )
+        }
+        HostConfigError::InvalidPath { path, reason } => CowshedError::usage(
+            format!("invalid mount root {}: {reason}", path.display()),
+            "cowshed setup --mount-root <dir>",
+        ),
+        other => CowshedError::environment_missing(other.to_string(), "cowshed setup"),
+    }
 }
 
 async fn repair<S, W, E>(setup: &mut S, json: bool, output: &mut Output<W, E>) -> Result<i32>
