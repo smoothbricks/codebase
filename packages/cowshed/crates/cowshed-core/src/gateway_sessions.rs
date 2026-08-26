@@ -1,8 +1,9 @@
 //! The gateway's session table is a cache of host inventory, never an authority.
 //!
 //! Every workspace's gateway session — its endpoint (port block), token, CA, and egress policy
-//! from the grants file — is derived from what the host holds under `~/.cowshed/`; the running
-//! gateway only caches those sessions so it can answer data-plane connections. Reconcile repairs
+//! from the grants file — is derived from the machine-global store under
+//! `/private/cowshed/store`; the running gateway only caches those sessions so it can answer
+//! data-plane connections. Reconcile repairs
 //! the cache from the inventory: the project's stale sessions are removed by identity, a session a
 //! deleted project left holding a port block this project now owns is evicted once no live
 //! workspace claims it, a live collision is an integrity refusal naming both, and installs are

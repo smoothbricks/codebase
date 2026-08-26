@@ -943,27 +943,27 @@ mod tests {
     #[test]
     fn derives_contained_project_paths() {
         let paths = ProjectPaths::with_mount_root(
-            "/Users/test/.cowshed",
+            "/private/cowshed/store",
             "/Users/test/.cowshed/mnt",
             &repo_id("acme/widget"),
         )
         .unwrap();
         assert_eq!(
             paths.project_root,
-            Path::new("/Users/test/.cowshed/acme/widget")
+            Path::new("/private/cowshed/store/acme/widget")
         );
         assert_eq!(
             paths.repository_binding,
-            Path::new("/Users/test/.cowshed/acme/widget/repository.json")
+            Path::new("/private/cowshed/store/acme/widget/repository.json")
         );
         assert_eq!(
             paths.mount_root,
             Path::new("/Users/test/.cowshed/mnt/acme/widget")
         );
         assert!(paths.contains(&paths.sessions));
-        assert!(!paths.contains(Path::new("/Users/test/.cowshed")));
-        assert!(!paths.contains(Path::new("/Users/test/.cowshed/acme/../escape")));
-        assert!(!paths.contains(Path::new("/Users/test/.cowshed-other/acme/widget")));
+        assert!(!paths.contains(Path::new("/private/cowshed/store")));
+        assert!(!paths.contains(Path::new("/private/cowshed/store/acme/../escape")));
+        assert!(!paths.contains(Path::new("/private/cowshed/store-other/acme/widget")));
     }
 
     #[test]

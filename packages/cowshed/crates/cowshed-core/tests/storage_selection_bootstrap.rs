@@ -342,32 +342,37 @@ fn explicit_zfs_is_exact_and_conflicting_evidence_is_ambiguous() {
 fn apfs_plan_has_exact_roots_commands_markers_and_store_first_order() {
     let selected = select_substrate(apfs_evidence(), None).unwrap();
     let plan = plan_bootstrap(selected, Path::new("/Users/alice"), absent_apfs_storage()).unwrap();
-    assert_eq!(plan.roots().home(), Path::new("/Users/alice"));
-    assert_eq!(plan.roots().store(), Path::new("/Users/alice/.cowshed"));
+    assert_eq!(plan.home(), Path::new("/Users/alice"));
+    assert_eq!(plan.roots().store(), Path::new("/private/cowshed/store"));
     assert_eq!(
         plan.roots().caches(),
-        Path::new("/Users/alice/.cowshed/caches")
+        Path::new("/private/cowshed/caches")
     );
 
     assert!(matches!(
         &plan.operations()[0],
         HostOperation::GuardMountpoint { path, role: VolumeRole::Store, substrate: SubstrateKind::Apfs }
-            if path == Path::new("/Users/alice/.cowshed")
+            if path == Path::new("/private/cowshed/store")
     ));
-    let HostOperation::ProvisionApfsVolumes { container, volumes } = &plan.operations()[1] else {
+    assert!(matches!(
+        &plan.operations()[1],
+        HostOperation::GuardMountpoint { path, role: VolumeRole::Caches, substrate: SubstrateKind::Apfs }
+            if path == Path::new("/private/cowshed/caches")
+    ));
+    let HostOperation::ProvisionApfsVolumes { container, volumes } = &plan.operations()[2] else {
         panic!("absent APFS storage must use one provisioning batch");
     };
-    assert_eq!(plan.operations().len(), 2);
+    assert_eq!(plan.operations().len(), 3);
     assert_eq!(container, "disk3");
     assert_eq!(volumes.len(), 2);
     assert_eq!(volumes[0].name(), APFS_STORE_VOLUME);
-    assert_eq!(volumes[0].mountpoint(), Path::new("/Users/alice/.cowshed"));
+    assert_eq!(volumes[0].mountpoint(), Path::new("/private/cowshed/store"));
     assert_eq!(volumes[0].role(), VolumeRole::Store);
     assert!(matches!(volumes[0].kind(), ApfsProvisionKind::Create));
     assert_eq!(volumes[1].name(), APFS_CACHES_VOLUME);
     assert_eq!(
         volumes[1].mountpoint(),
-        Path::new("/Users/alice/.cowshed/caches")
+        Path::new("/private/cowshed/caches")
     );
     assert_eq!(volumes[1].role(), VolumeRole::Caches);
     assert!(matches!(volumes[1].kind(), ApfsProvisionKind::Create));
@@ -395,9 +400,9 @@ fn zfs_plan_has_exact_fixed_sibling_hierarchy_and_store_first_order() {
         commands,
         [
             "/usr/sbin/zfs create -o mountpoint=none tank/cowshed",
-            "/usr/sbin/zfs create -o mountpoint=/home/alice/.cowshed tank/cowshed/store",
+            "/usr/sbin/zfs create -o mountpoint=/private/cowshed/store tank/cowshed/store",
             "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=store tank/cowshed/store",
-            "/usr/sbin/zfs create -o mountpoint=/home/alice/.cowshed/caches tank/cowshed/caches",
+            "/usr/sbin/zfs create -o mountpoint=/private/cowshed/caches tank/cowshed/caches",
             "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=caches tank/cowshed/caches",
             "/usr/sbin/zfs create -o mountpoint=none tank/cowshed/projects",
             "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=projects tank/cowshed/projects",
@@ -485,8 +490,8 @@ fn create_or_heal_uses_only_exact_existing_storage_evidence() {
     assert_eq!(
         healed_commands,
         [
-            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed disk9s11",
-            "/usr/sbin/diskutil mount -nobrowse -mountPoint /Users/alice/.cowshed/caches disk9s12",
+            "/usr/sbin/diskutil mount -nobrowse -mountPoint /private/cowshed/store disk9s11",
+            "/usr/sbin/diskutil mount -nobrowse -mountPoint /private/cowshed/caches disk9s12",
         ]
     );
     assert!(
@@ -551,9 +556,9 @@ fn create_or_heal_uses_only_exact_existing_storage_evidence() {
     assert_eq!(
         healed_commands,
         [
-            "/usr/sbin/zfs set mountpoint=/home/alice/.cowshed tank/cowshed/store",
+            "/usr/sbin/zfs set mountpoint=/private/cowshed/store tank/cowshed/store",
             "/usr/sbin/zfs mount tank/cowshed/store",
-            "/usr/sbin/zfs set mountpoint=/home/alice/.cowshed/caches tank/cowshed/caches",
+            "/usr/sbin/zfs set mountpoint=/private/cowshed/caches tank/cowshed/caches",
             "/usr/sbin/zfs mount tank/cowshed/caches",
         ]
     );
@@ -677,7 +682,7 @@ fn unmounted_existing_storage_requires_a_current_exact_marker() {
 }
 
 #[test]
-fn impossible_existing_storage_topologies_are_rejected() {
+fn sibling_volume_roots_plan_independently_but_zfs_children_still_require_their_root() {
     let apfs = select_substrate(apfs_evidence(), None).unwrap();
     for (store, caches) in [
         (
@@ -692,14 +697,12 @@ fn impossible_existing_storage_topologies_are_rejected() {
             ExistingStorage::mounted_valid("disk9s12"),
         ),
     ] {
-        assert!(matches!(
-            plan_bootstrap(
-                apfs.clone(),
-                Path::new("/Users/alice"),
-                BootstrapEvidence::Apfs { store, caches },
-            ),
-            Err(PlanError::ImpossibleStorageTopology(_))
-        ));
+        plan_bootstrap(
+            apfs.clone(),
+            Path::new("/Users/alice"),
+            BootstrapEvidence::Apfs { store, caches },
+        )
+        .expect("sibling APFS volume roots do not impose a nested mount topology");
     }
 
     assert!(matches!(

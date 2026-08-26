@@ -63,8 +63,9 @@ layout root:
     <workspaceIncarnation>.sock      # bind-mounted into exactly one attached workspace; absent after detach/restore fence
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
-  caches/                            # ← cowshed.caches volume, NESTED mount (mirror, git mirrors, layer-3 caches)
+  (rebuildable caches live on the sibling `/private/cowshed/caches` volume, not beneath this tree)
   (workspaces mount under a host-configured mount root — default `~/.cowshed/mnt`; see 02_workspaces.md)
+```
 
 Workspace mountpoints live under one host-configured **mount root** (default `~/.cowshed/mnt`, settable via
 `cowshed setup --mount-root <dir>`), laid out `<mount-root>/<owner>/<repo>/<workspace>`. The root is a plain directory
@@ -93,18 +94,20 @@ After this layout, `{.asif|.sparseimage}` denotes exactly one format-selected ex
 metadata is optional and platform-specific: it is present only for macOS workspaces and is omitted on Linux; Linux does
 not synthesize a base port in persistent metadata.
 
-After this layout, cowshed's entire Data-volume home footprint is **one empty mountpoint directory** (plus the
-home-manager-managed items above): everything real lives on the two cowshed volumes, outside Data's snapshots, backups,
-and fsck domain.
+The Data-volume footprint is limited to the two empty `/private/cowshed/{store,caches}` mountpoint directories and the
+per-user workspace mount root (default `~/.cowshed/mnt`). Durable evidence and rebuildable cache churn live on the
+dedicated volumes, outside Data's snapshots, backups, and fsck domain.
 
 ### Two `.cowshed` namespaces
 
-The name appears in two namespaces that must not be confused. **Host-absolute `/private/cowshed/store`** exists once — it is the
-herd's: images, grants, caches, telemetry, mounts. **In-image relative `.cowshed/`** exists once _per workspace_, at
-each volume root — the marker, token, CA certificate, in-image cache roots, job spools — and travels with every clone.
-The wiring rule follows the split: shared/rebuildable state resolves to host-absolute `/private/cowshed/store/...` paths (the same
-string in every context), workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in every
-clone automatically). Main and sessions use identical wiring; only the sandbox's permission mask differs.
+The name appears in two namespaces that must not be confused. **Host-absolute
+`/private/cowshed/{store,caches}`** exists once — the herd's store volume holds images, grants, and telemetry, while the
+cache volume holds rebuildable shared caches. **In-image relative `.cowshed/`** exists once _per workspace_, at each
+workspace volume root — the marker, token, CA certificate, in-image cache roots, and job spools — and travels with
+every clone. The wiring rule follows the split: shared state resolves to the appropriate host-absolute
+`/private/cowshed/{store,caches}/...` path (the same string in every context), while workspace-keyed state resolves to
+in-image relative `.cowshed/...` paths (correct in every clone automatically). Main and sessions use identical wiring;
+only the sandbox's permission mask differs.
 
 ## Images
 
@@ -207,10 +210,10 @@ cowshed churn at all:
   durability is still git. Same-volume clonefile is preserved by construction — main → sessions → checkpoints and trash
   renames all stay within `cowshed.store`.
 
-Both volumes are created lazily by explicit foreground `cowshed adopt`
+Both volumes are created once by explicit foreground `cowshed setup`
 (`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`) and share the container's
 free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
-provisioning authorization session described in 14_nix.md. Volume _creation_ remains foreground `cowshed adopt` only.
+provisioning authorization session described in 14_nix.md.
 
 **Boot mounting is pinned in `/etc/fstab`, not delegated to cowshed.** At provision, the same authorization session
 appends one idempotent, comment-tagged line per volume:
@@ -233,9 +236,10 @@ machines whose local accounts trust each other; stronger isolation is a differen
 
 If either dedicated volume is absent, or the mountpoint holds anything other than a reclaimable stub, existing-only
 commands fail before mutation with `environment-missing` and an explanation of exactly which volumes are missing,
-detached, or mis-mounted and what will repair each state. A volume macOS auto-mounted at `/Volumes/<name>` is
-**mis-mounted**, not missing: repairing it is unprivileged `diskutil unmount` + mount-at-canonical-path work that
-`cowshed ensure`, `cowshed doctor`, and the gateway's RunAtLoad heal perform inline, without an authorization prompt.
+detached, or mis-mounted. A volume mounted at a retired home path or at `/Volumes/<name>` is **mis-mounted**, not
+missing. `cowshed doctor` reports the observed and canonical paths and prescribes `cowshed setup`; setup announces the
+complete repair, opens one authorization session, unmounts the existing volumes, remounts them at the canonical paths,
+and rewrites their fstab pins.
 
 
 **`cowshed setup` owns this transaction.** It is a host-level verb needing no repository context: gather evidence,
@@ -246,12 +250,12 @@ incidental mountpoint contents, and reclaimable stubs are enumerated (by name) a
 masking. A volume that exists but carries a wrong or missing marker is reported precisely (role, expected versus
 observed); it is never silently re-provisioned, because re-provisioning means deleteVolume.
 
-**Mount ordering and the unmounted-masking guard.** The layout nests: the caches volume and every workspace mount at
-directories that live _on_ the store volume, so validation and remount sequence store → caches → workspaces. When the
-store volume is not mounted, `/private/cowshed/store` is a bare directory on Data; the volume-root marker `.cowshed-volume.json` is
-how every cowshed command tells the difference. launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`,
-never under the mountpoint, so a reboot cannot recreate the masking stub. A leftover `telemetry/` stub from an older
-plist is deleted before remount.
+**Mount ordering and the unmounted-masking guard.** Store and caches are sibling mountpoints on Data; neither canonical
+root depends on the other, and each root's `.cowshed-volume.json` marker distinguishes a mounted cowshed volume from its
+bare mountpoint directory. The retired home layout nested `caches` beneath `store`, so its one-time migration unmounts
+the child caches volume before the parent store volume, then mounts both siblings at `/private/cowshed/{store,caches}`.
+launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`, never under either mountpoint, so a reboot cannot
+recreate a masking stub. A leftover `telemetry/` stub from an older plist is deleted before remount.
 
 Why volumes and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops
@@ -263,11 +267,11 @@ precious.
 ### One herd, multiple users
 
 There is one cowshed per machine, anchored to no account. `/private/cowshed/{store,caches}` are plain directories on
-Data created once at provision; they exist only as mountpoints and fstab targets. Per-user conveniences are
-a per-user `~/.cowshed/mnt` mount root (plain directories on Data) written by repair commands;
-no cowshed evidence, sandbox profile, or metadata derives a path from `$HOME`. Workspace images remain separate
-workspace images live under `<mount-root>/…`'s sibling layout on the store, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by
-sharing; concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and
+Data created once at provision; they exist only as mountpoints and fstab targets. The per-user convenience is a
+`~/.cowshed/mnt` workspace mount root (plain directories on Data), configurable at setup. No cowshed evidence,
+sandbox profile, or metadata path derives from `$HOME`. Workspace images remain on the store volume while their live
+mounts appear under `<mount-root>/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by sharing;
+concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and
 cross-user `gc` policy is deliberately blunt: any user may retire any shed, because `noowners` already made the
 trust model explicit.
 

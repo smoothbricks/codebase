@@ -1260,11 +1260,11 @@ impl SpawnSink for SystemSpawnSink {
             // wrong-boundary server inside the sandbox.
             .env(
                 "SCCACHE_SERVER_UDS",
-                crate::sandbox::sccache_server_socket(&request.sandbox.home),
+                crate::sandbox::sccache_server_socket(),
             )
             .env(
                 "SCCACHE_DIR",
-                crate::sandbox::sccache_cache_directory(&request.sandbox.home),
+                crate::sandbox::sccache_cache_directory(),
             )
             .env("COWSHED_PORT_BASE", &port_base)
             .env("COWSHED_WORKSPACE_TOKEN", workspace_token)

@@ -280,13 +280,13 @@ async fn absent_volumes_collapse_into_one_explicit_provisioning_batch() {
     assert_eq!(batches[0].1[0].name(), "cowshed.store");
     assert_eq!(
         batches[0].1[0].mountpoint(),
-        Path::new("/Users/alice/.cowshed")
+        Path::new("/private/cowshed/store")
     );
     assert!(matches!(batches[0].1[0].kind(), ApfsProvisionKind::Create));
     assert_eq!(batches[0].1[1].name(), "cowshed.caches");
     assert_eq!(
         batches[0].1[1].mountpoint(),
-        Path::new("/Users/alice/.cowshed/caches")
+        Path::new("/private/cowshed/caches")
     );
     assert!(matches!(batches[0].1[1].kind(), ApfsProvisionKind::Create));
 }
@@ -464,6 +464,7 @@ async fn automounted_exact_volume_remounts_without_provisioning() {
                 role: VolumeRole::Store,
                 ..
             },
+            HostOperation::ReportVolumeIssue { detail, .. },
             HostOperation::ReclaimMountpoint(path),
             HostOperation::RunCommand(command),
             HostOperation::MountApfsVolume { .. },
@@ -471,7 +472,9 @@ async fn automounted_exact_volume_remounts_without_provisioning() {
                 role: VolumeRole::Caches,
                 ..
             },
-        ] if path == Path::new("/Users/alice/.cowshed/caches")
+        ] if path == Path::new("/private/cowshed/caches")
+            && detail.contains("/Volumes/cowshed-wrong")
+            && detail.contains("/private/cowshed/caches")
             && command.args() == ["unmount", "force", "disk3s9"]
     ));
     assert!(
@@ -512,7 +515,7 @@ fn canonical_mount_flag_repair_does_not_require_a_prepublished_marker() {
             store: ExistingStorage::mounted_valid("disk3s8"),
             caches: ExistingStorage::mis_mounted_incomplete(
                 "disk3s9",
-                "/Users/alice/.cowshed/caches",
+                "/private/cowshed/caches",
             ),
         },
     )
@@ -534,7 +537,7 @@ fn canonical_mount_flag_repair_does_not_require_a_prepublished_marker() {
                         exact_identifier,
                         current_mountpoint,
                     } if exact_identifier == "disk3s9"
-                        && current_mountpoint == Path::new("/Users/alice/.cowshed/caches")
+                        && current_mountpoint == Path::new("/private/cowshed/caches")
                 )
         )
     ));

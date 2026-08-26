@@ -1606,8 +1606,10 @@ impl NativeProjectRuntimeHost {
             _ => (git_root, git),
         };
         if existing_only && binding_repo_id.is_none() {
-            let storage =
-                crate::storage::bootstrap::ValidatedHostStorage::new(bootstrap.roots().clone());
+            let storage = crate::storage::bootstrap::ValidatedHostStorage::new(
+                bootstrap.home().to_owned(),
+                bootstrap.roots().clone(),
+            );
             binding_repo_id = crate::gateway_inventory::NativeGatewayInventory::new(storage)
                 .repository_for_project_root(&git_root)
                 .await
@@ -2118,7 +2120,7 @@ impl NativeProjectRuntimeHost {
                     "{} overlaps cowshed storage or the current checkout",
                     destination.display()
                 ),
-                "choose a destination outside ~/.cowshed and outside the current checkout",
+                "choose a destination outside /private/cowshed/store and outside the current checkout",
             ));
         }
         let destination = destination.to_owned();
@@ -2828,11 +2830,11 @@ impl NativeProjectRuntimeHost {
     }
 
     async fn fresh_grants(&self) -> Result<PortGrantReservation> {
-        let roots = crate::storage::bootstrap::CanonicalRoots::for_home(&self.home)
-            .map_err(native_integrity_error)?;
+        let roots = crate::storage::bootstrap::CanonicalRoots::global();
         // NativeProjectRuntimeHost is created only after ExistingOnly/Provision bootstrap has
         // validated these exact roots; preserve that capability while enumerating every repo.
-        let storage = crate::storage::bootstrap::ValidatedHostStorage::new(roots);
+        let storage =
+            crate::storage::bootstrap::ValidatedHostStorage::new(self.home.clone(), roots);
         let reservation_root = storage.store().join(".staging");
         let used = crate::gateway_inventory::NativeGatewayInventory::new(storage)
             .all_reserved_port_bases()
@@ -2989,7 +2991,7 @@ impl NativeProjectRuntimeHost {
             // daemon instead of spawning a wrong-boundary server in-sandbox.
             allowed_unix_sockets: crate::sandbox::nix_daemon_socket()
                 .into_iter()
-                .chain([crate::sandbox::sccache_server_socket(&self.home)])
+                .chain([crate::sandbox::sccache_server_socket()])
                 .collect(),
             additional_denies: vec![
                 self.layout.project().project_root.clone(),
@@ -4652,7 +4654,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 error,
             ));
         }
-        let gateway_socket = cowshed_gateway::control_socket_path(&self.home);
+        let gateway_socket = crate::gateway_sessions::control_socket_path();
         let gateway_status = match cowshed_gateway::GatewayControlClient::new(gateway_socket.clone())
         {
             Ok(client) => client.status().await.map_err(|error| error.to_string()),
