@@ -238,7 +238,6 @@ class WorkspaceRefImpl implements WorkspaceRef {
     return parseWorkspaceInfo(await callNativeAsync(() => this.#native.infoJson()));
   }
 
-
   async attach(options?: AttachOptions): Promise<void> {
     await callNativeAsync(() => this.#native.attach(encodeAttachOptions(options)));
   }

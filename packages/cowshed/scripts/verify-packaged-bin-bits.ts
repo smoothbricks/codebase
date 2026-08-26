@@ -13,7 +13,7 @@
  * Run with: `nx run cowshed:verify-packaging`
  */
 
-import { readdirSync, statSync } from 'node:fs';
+import { readdirSync, type Stats, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const BIN_ROOT = new URL('../dist/bin', import.meta.url).pathname;
@@ -26,7 +26,7 @@ function listFilesRecursively(directory: string): string[] {
   });
 }
 
-let stat;
+let stat: Stats;
 try {
   stat = statSync(BIN_ROOT);
 } catch {

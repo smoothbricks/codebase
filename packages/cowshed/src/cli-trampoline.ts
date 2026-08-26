@@ -2,8 +2,8 @@
 
 import { spawn } from 'node:child_process';
 import { chmodSync, existsSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
@@ -19,7 +19,9 @@ export interface CliResolutionOptions {
   home?: string;
 }
 
-export type CliBackend = { kind: 'native'; path: string; source: 'stable' | 'package' | 'workspace' } | { kind: 'napi' };
+export type CliBackend =
+  | { kind: 'native'; path: string; source: 'stable' | 'package' | 'workspace' }
+  | { kind: 'napi' };
 
 export interface RunCliOptions extends CliResolutionOptions {
   spawnBinary?: (executable: string, argv: readonly string[]) => Promise<number>;

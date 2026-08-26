@@ -75,7 +75,6 @@ export interface GrantSet {
   readonly sim: readonly SimVerb[];
 }
 
-
 export interface AttachOptions {
   readonly browse?: boolean;
   readonly observedPath?: string;
