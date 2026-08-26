@@ -816,7 +816,6 @@ impl WorkspaceRef {
         .await
     }
 
-
     pub async fn attach(&self, options: AttachOptions) -> Result<()> {
         let _: EmptyResult = call_typed(
             &self.runtime,

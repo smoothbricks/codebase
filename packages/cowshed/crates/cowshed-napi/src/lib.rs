@@ -836,7 +836,6 @@ impl WorkspaceRef {
         })
     }
 
-
     #[napi]
     pub fn attach(&self, env: Env, options_json: Option<String>) -> napi::Result<JsObject> {
         let workspace = self.inner.clone();

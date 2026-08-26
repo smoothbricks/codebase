@@ -795,14 +795,8 @@ fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
         for argument in invocation.arguments {
             let argument = argument.to_string_lossy();
             assert!(
-                ![
-                    "sudo",
-                    "diskutil",
-                    "hdiutil",
-                    "osascript",
-                    "adopt",
-                ]
-                .contains(&argument.as_ref())
+                !["sudo", "diskutil", "hdiutil", "osascript", "adopt",]
+                    .contains(&argument.as_ref())
             );
         }
     }

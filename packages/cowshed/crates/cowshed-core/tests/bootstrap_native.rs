@@ -513,10 +513,7 @@ fn canonical_mount_flag_repair_does_not_require_a_prepublished_marker() {
         Path::new("/Users/alice"),
         BootstrapEvidence::Apfs {
             store: ExistingStorage::mounted_valid("disk3s8"),
-            caches: ExistingStorage::mis_mounted_incomplete(
-                "disk3s9",
-                "/private/cowshed/caches",
-            ),
+            caches: ExistingStorage::mis_mounted_incomplete("disk3s9", "/private/cowshed/caches"),
         },
     )
     .unwrap();

@@ -661,9 +661,7 @@ pub enum ConfigError {
     InvalidGitHelperExecutable,
     #[error("production gateway requires the canonical gateway.sock control endpoint")]
     MissingProductionControlSocket,
-    #[error(
-        "production mirror cache must be the owned mode-0700 <cache-volume>/mirror directory"
-    )]
+    #[error("production mirror cache must be the owned mode-0700 <cache-volume>/mirror directory")]
     InvalidProductionCacheRoot,
     #[error("gateway mirror cache low-water/TTL limits are invalid")]
     InvalidMirrorCacheLimits,

@@ -326,14 +326,20 @@ impl GitRepository {
                 .open(&envrc)
                 .map_err(|error| {
                     CowshedError::integrity(
-                        format!("cannot open workspace environment hook {}: {error}", envrc.display()),
+                        format!(
+                            "cannot open workspace environment hook {}: {error}",
+                            envrc.display()
+                        ),
                         "restore the repository .envrc as a regular file and retry",
                     )
                 })?;
             let mut existing = Vec::new();
             file.read_to_end(&mut existing).map_err(|error| {
                 CowshedError::integrity(
-                    format!("cannot read workspace environment hook {}: {error}", envrc.display()),
+                    format!(
+                        "cannot read workspace environment hook {}: {error}",
+                        envrc.display()
+                    ),
                     "repair the repository .envrc and retry",
                 )
             })?;
@@ -356,13 +362,19 @@ impl GitRepository {
             addition.push(b'\n');
             file.write_all(&addition).map_err(|error| {
                 CowshedError::integrity(
-                    format!("cannot update workspace environment hook {}: {error}", envrc.display()),
+                    format!(
+                        "cannot update workspace environment hook {}: {error}",
+                        envrc.display()
+                    ),
                     "repair the repository .envrc and retry",
                 )
             })?;
             file.sync_all().map_err(|error| {
                 CowshedError::integrity(
-                    format!("cannot sync workspace environment hook {}: {error}", envrc.display()),
+                    format!(
+                        "cannot sync workspace environment hook {}: {error}",
+                        envrc.display()
+                    ),
                     "repair the repository .envrc and retry",
                 )
             })?;

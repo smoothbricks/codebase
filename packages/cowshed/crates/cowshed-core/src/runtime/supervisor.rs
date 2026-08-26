@@ -1262,10 +1262,7 @@ impl SpawnSink for SystemSpawnSink {
                 "SCCACHE_SERVER_UDS",
                 crate::sandbox::sccache_server_socket(),
             )
-            .env(
-                "SCCACHE_DIR",
-                crate::sandbox::sccache_cache_directory(),
-            )
+            .env("SCCACHE_DIR", crate::sandbox::sccache_cache_directory())
             .env("COWSHED_PORT_BASE", &port_base)
             .env("COWSHED_WORKSPACE_TOKEN", workspace_token)
             .env("HTTP_PROXY", &gateway_http)

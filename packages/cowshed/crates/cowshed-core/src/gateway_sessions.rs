@@ -27,8 +27,8 @@ use crate::error::{CowshedError, Result};
 use crate::gateway_inventory::{GatewaySessionFact, NativeGatewayInventory};
 use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
 use crate::repository::RepoId;
-use crate::storage::bootstrap::{STORE_ROOT, ValidatedHostStorage};
 use crate::storage::bootstrap::native::validate_existing_host_storage;
+use crate::storage::bootstrap::{STORE_ROOT, ValidatedHostStorage};
 
 /// The gateway control socket, at the store root.
 ///

@@ -485,7 +485,6 @@ pub struct ProjectWorkspaces {
     pub workspaces: Vec<WorkspaceInfo>,
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MountResult {

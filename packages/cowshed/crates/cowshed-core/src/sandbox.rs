@@ -203,11 +203,7 @@ pub fn seatbelt_profile(
     if let Some(repository) = &config.git_worktree_repository {
         validate_path(repository)?;
     }
-    let hard_denies = hard_denies(
-        &config.home,
-        &config.mount_root,
-        &config.additional_denies,
-    )?;
+    let hard_denies = hard_denies(&config.home, &config.mount_root, &config.additional_denies)?;
     let read_grants = normalized_paths(&config.grants.read)?;
     let write_grants = normalized_paths(&config.grants.write)?;
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
@@ -385,9 +381,10 @@ pub fn seatbelt_profile(
     let job_artifacts = workspace_metadata.join("job");
 
     // SBPL is last-match-wins: immutable secrets and policy denies close the shared profile.
-    for deny in hard_denies.into_iter().filter(|path| {
-        path.as_ref() != cowshed && path.as_ref() != config.mount_root.as_path()
-    }) {
+    for deny in hard_denies
+        .into_iter()
+        .filter(|path| path.as_ref() != cowshed && path.as_ref() != config.mount_root.as_path())
+    {
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
 
@@ -705,9 +702,9 @@ mod tests {
         assert!(root_deny < root_traversal);
         assert!(root_deny < own_read);
         assert!(root_deny < own_write);
-        assert!(!profile.contains(
-            "(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))"
-        ));
+        assert!(
+            !profile.contains("(deny file-read* file-write* (subpath \"/Users/tester/.cowshed\"))")
+        );
         assert!(!profile.contains(
             "(allow file-read* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/swift\"))"
         ));
@@ -776,10 +773,7 @@ mod tests {
     fn sccache_store_is_daemon_write_only_and_its_socket_outlives_the_store_deny() {
         let mut with_socket = config(RunSandboxMode::ReadWrite);
         let socket = sccache_server_socket();
-        assert_eq!(
-            socket,
-            PathBuf::from("/private/cowshed/store/sccache.sock")
-        );
+        assert_eq!(socket, PathBuf::from("/private/cowshed/store/sccache.sock"));
         with_socket.allowed_unix_sockets.push(socket.clone());
         let profile = seatbelt_profile(&with_socket, SandboxProfileRole::ExecutedChild).unwrap();
 
