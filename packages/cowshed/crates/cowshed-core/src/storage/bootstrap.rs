@@ -15,9 +15,9 @@ use super::fstab::FstabPin;
 
 pub mod native;
 pub use native::{
-    FstabOutcome, HostSetupPlan, HostSetupReport, HostUninstallPlan, UninstallFstabOutcome,
-    UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
-    execute_host_uninstall, plan_host_setup, plan_host_uninstall,
+    FstabOutcome, HostAction, HostSetupPlan, HostSetupReport, HostUninstallPlan,
+    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState,
+    execute_host_setup, execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
 
 
@@ -703,6 +703,8 @@ pub enum ExistingStorage {
     FoundElsewhere {
         container: String,
         device: String,
+        volume_uuid: String,
+        size_bytes: u64,
         mounted_at: Option<PathBuf>,
     },
 }
@@ -1083,20 +1085,34 @@ fn plan_apfs_volume(
             operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
         }
         ExistingStorage::FoundElsewhere {
-            container,
             device,
             mounted_at,
-        } => {
-            let location = mounted_at
-                .as_ref()
-                .map_or_else(|| "detached".to_owned(), |path| path.display().to_string());
-            operations.push(HostOperation::ReportVolumeIssue {
-                name: volume_name,
-                detail: format!(
-                    "{volume_name} exists as {device} in APFS container {container} ({location}); inspect and move or recover that volume before retrying cowshed setup"
-                ),
-            });
-        }
+            ..
+        } => match mounted_at {
+            Some(current) if current == mountpoint => {
+                operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
+            }
+            Some(_) => {
+                operations.push(HostOperation::ReclaimMountpoint(mountpoint.to_owned()));
+                operations.push(HostOperation::RunCommand(HostCommand::new(
+                    DISKUTIL,
+                    ["unmount", "force", device.as_str()],
+                )));
+                operations.push(apfs_mount(
+                    mountpoint,
+                    VolumeRef::ExistingExact(device.clone()),
+                ));
+                operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
+            }
+            None => {
+                operations.push(HostOperation::EnsureDirectory(mountpoint.to_owned()));
+                operations.push(apfs_mount(
+                    mountpoint,
+                    VolumeRef::ExistingExact(device.clone()),
+                ));
+                operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
+            }
+        },
     }
 }
 
@@ -1379,9 +1395,9 @@ pub enum PlanError {
 pub enum MountpointState {
     Missing,
     EmptyDirectory,
-    /// Data-volume residue launchd creates for StandardErrorPath before the
-    /// store volume is remounted. Safe to delete; not user data.
-    ReclaimableStub,
+    /// Enumerated Data-volume residue that cowshed itself may create before the store volume is
+    /// remounted. Every path is proven safe to remove; arbitrary entries remain fatal evidence.
+    ReclaimableStub { paths: Vec<PathBuf> },
     NonEmptyDirectoryWithoutMount,
     Mounted {
         marker: Option<Vec<u8>>,
@@ -1431,17 +1447,36 @@ pub trait BootstrapHost: Send + Sync {
     fn pin_volumes_in_fstab(&self, pins: &[FstabPin]) -> Result<(), HostError>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostErrorKind {
+    Other,
+    AuthorizationDenied,
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("host operation failed: {message}")]
 pub struct HostError {
+    kind: HostErrorKind,
     message: String,
 }
 
 impl HostError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            kind: HostErrorKind::Other,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn authorization_denied(message: impl Into<String>) -> Self {
+        Self {
+            kind: HostErrorKind::AuthorizationDenied,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn is_authorization_denied(&self) -> bool {
+        self.kind == HostErrorKind::AuthorizationDenied
     }
 }
 
@@ -1542,7 +1577,7 @@ where
         {
             MountpointState::Missing
             | MountpointState::EmptyDirectory
-            | MountpointState::ReclaimableStub => Ok(()),
+            | MountpointState::ReclaimableStub { .. } => Ok(()),
             MountpointState::NonEmptyDirectoryWithoutMount => {
                 Err(BootstrapExecutionError::MaskedData(path.clone()))
             }
