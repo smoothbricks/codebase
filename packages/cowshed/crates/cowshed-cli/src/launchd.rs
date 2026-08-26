@@ -517,6 +517,29 @@ pub fn plan_executable_install(
     InstallPlan { operations }
 }
 
+/// Plan the removal of the host-stable copy, symmetric with [`plan_executable_install`].
+///
+/// Only the binary: the enclosing directories are removed by nothing, because
+/// `~/Library/Application Support/dev.cowshed` is shared by every service and an empty directory
+/// costs nothing. A binary that is not there plans nothing, which is what makes a second
+/// uninstall a no-op rather than a failure.
+pub fn plan_executable_remove(executable: &HostStableExecutable, installed: bool) -> InstallPlan {
+    let operations = if installed {
+        vec![
+            Mutation::RemoveFile {
+                path: executable.path().to_path_buf(),
+            },
+            Mutation::SyncDirectory {
+                path: executable.directory().to_path_buf(),
+            },
+        ]
+    } else {
+        Vec::new()
+    };
+
+    InstallPlan { operations }
+}
+
 /// Where a candidate binary lives, as observed on the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutableSource<'a> {
@@ -948,6 +971,18 @@ impl Error for InstallExecutionError {
 pub enum InstallOutcome {
     NoChange,
     Changed,
+}
+
+/// Whether a removal found anything to remove.
+///
+/// Kept distinct from [`InstallOutcome`] because it answers a different operational question: an
+/// install reports whether the host changed, a removal reports whether the artifact was there at
+/// all. Both are reportable outcomes rather than errors — a second uninstall is a no-op, and
+/// saying "nothing to remove" is how the caller learns the host was already clean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalOutcome {
+    Removed,
+    AlreadyAbsent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
