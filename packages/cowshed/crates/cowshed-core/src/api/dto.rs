@@ -2223,8 +2223,14 @@ pub struct CheckpointQuota {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GatewayStatus {
+    /// Whether launchd has the gateway agent loaded.
+    pub installed: bool,
+    /// Whether the control socket answered a status request.
     pub running: bool,
     pub socket: PathBuf,
+    pub cli_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
     pub cache_entries: u64,
     pub cache_bytes: u64,
     pub active_workspaces: u64,

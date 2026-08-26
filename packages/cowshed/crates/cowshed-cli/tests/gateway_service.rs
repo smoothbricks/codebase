@@ -193,8 +193,11 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
         &mut output,
         true,
         CliGatewayStatus {
+            installed: true,
             running: true,
             socket: PathBuf::from("/Users/test/.cowshed/gateway.sock"),
+            cli_version: "1.4.0".into(),
+            daemon_version: Some("1.3.0".into()),
             cache_entries: 0,
             cache_bytes: 0,
             active_workspaces: 2,
@@ -204,9 +207,67 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
     let (stdout, stderr) = output.into_inner();
     assert_eq!(
         stdout,
-        b"{\"ok\":true,\"result\":{\"running\":true,\"socket\":\"/Users/test/.cowshed/gateway.sock\",\"cacheEntries\":0,\"cacheBytes\":0,\"activeWorkspaces\":2}}\n"
+        b"{\"ok\":true,\"result\":{\"installed\":true,\"running\":true,\"socket\":\"/Users/test/.cowshed/gateway.sock\",\"cliVersion\":\"1.4.0\",\"daemonVersion\":\"1.3.0\",\"cacheEntries\":0,\"cacheBytes\":0,\"activeWorkspaces\":2}}\n"
     );
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn gateway_status_names_launchd_socket_and_both_versions() {
+    let cases = [
+        (
+            true,
+            true,
+            Some("1.3.0"),
+            "gateway is healthy: launchd loaded; control socket answers",
+        ),
+        (
+            true,
+            false,
+            None,
+            "gateway is installed but its control socket does not answer",
+        ),
+        (
+            false,
+            false,
+            None,
+            "gateway is not installed; no control socket answers",
+        ),
+    ];
+    for (installed, running, daemon_version, state) in cases {
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+        emit_gateway_status(
+            &mut output,
+            false,
+            CliGatewayStatus {
+                installed,
+                running,
+                socket: PathBuf::from("/Users/test/.cowshed/gateway.sock"),
+                cli_version: "1.4.0".into(),
+                daemon_version: daemon_version.map(str::to_owned),
+                cache_entries: 0,
+                cache_bytes: 0,
+                active_workspaces: 0,
+            },
+        )
+        .expect("status emits");
+        let (stdout, stderr) = output.into_inner();
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).expect("utf8 status");
+        assert!(stderr.contains(state), "{stderr}");
+        assert!(
+            stderr.contains("/Users/test/.cowshed/gateway.sock"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("cli 1.4.0"), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "daemon {}",
+                daemon_version.unwrap_or("unavailable")
+            )),
+            "{stderr}"
+        );
+    }
 }
 
 fn scratch_home(label: &str) -> PathBuf {
