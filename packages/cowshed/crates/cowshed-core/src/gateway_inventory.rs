@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
+use crate::checkout::load_checkout_layout;
 use crate::metadata::{
     CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
@@ -1005,6 +1006,12 @@ fn load_binding_candidate(
             actual,
         });
     }
+    load_checkout_layout(&expected_paths.checkout_layout).map_err(|error| {
+        GatewayInventoryError::InvalidMetadata {
+            path: expected_paths.checkout_layout,
+            message: error.to_string(),
+        }
+    })?;
     Ok(actual)
 }
 
@@ -1674,12 +1681,12 @@ mod tests {
         ));
     }
 
-    /// A direct-mount project's main volume is mounted at the adopted checkout, not at
-    /// `mnt/<owner>/<repo>/main`. Re-deriving the expected path from the layout alone rejected
-    /// every such project — the whole default layout — with "mounted workspace path does not equal
-    /// canonical path", so `cowshed adopt` finished with a gateway that never came up.
+    /// A legacy direct-mount project's main volume is mounted at the adopted checkout even though
+    /// adoption predated `checkout-layout.json`. Observation materializes that now-mandatory record
+    /// before deriving any mount paths, so the gateway both serves the project and leaves future
+    /// reads explicit.
     #[tokio::test]
-    async fn a_direct_mount_project_serves_main_from_its_adopted_checkout() {
+    async fn a_legacy_direct_mount_project_materializes_layout_and_serves_main() {
         let fixture = Fixture::with_checkout_layout("direct-mount", CheckoutLayout::DirectMount);
         let repo = RepoId::parse("hyperide/axe").expect("repo");
         fixture.bind(&repo);
@@ -1691,6 +1698,8 @@ mod tests {
             true,
             true,
         );
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        fs::remove_file(&layout.project().checkout_layout).expect("simulate legacy adoption");
         let (mount, path) = mounted.expect("mounted fixture");
         assert_eq!(path, fixture.root.join("checkout-axe"));
         let source = Arc::new(FixtureSource::default());
@@ -1716,6 +1725,10 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].mount, path);
         assert_eq!(facts[0].mount_id, mount.mount_id);
+        assert_eq!(
+            layout.checkout_layout().expect("materialized layout"),
+            CheckoutLayout::DirectMount
+        );
     }
 
     #[tokio::test]

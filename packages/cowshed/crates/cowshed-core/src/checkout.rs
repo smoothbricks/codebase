@@ -14,11 +14,12 @@
 //! are moved by the functions here rather than open-coded at each call site.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::metadata::{
-    CheckoutLayout, DetachedWorkspaceMetadata, MetadataError, WorkspaceMarker, sidecar_path,
-    write_json,
+    CheckoutLayout, CheckoutLayoutRecord, DetachedWorkspaceMetadata, MetadataError,
+    WorkspaceMarker, read_json, sidecar_path, write_json,
 };
 use crate::storage::WORKSPACE_MARKER_PATH;
 
@@ -125,6 +126,27 @@ pub fn observed_layout(checkout: &Path) -> CheckoutLayout {
         _ => CheckoutLayout::DirectMount,
     }
 }
+/// Read an adopted project's layout, upgrading the pre-record layout in place.
+///
+/// Direct mount is the only supported layout for newly adopted projects and was also the physical
+/// layout used by projects adopted before this record existed. Only absence is migratable:
+/// malformed or unsupported records are evidence we cannot safely reinterpret and remain errors.
+/// [`write_json`] publishes the version-one record atomically; a later observation only reads it.
+pub fn load_checkout_layout(path: &Path) -> Result<CheckoutLayout, MetadataError> {
+    match read_json::<CheckoutLayoutRecord>(path) {
+        Ok(record) => {
+            record.validate()?;
+            Ok(record.checkout_layout)
+        }
+        Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            let layout = CheckoutLayout::DirectMount;
+            write_json(path, &CheckoutLayoutRecord::new(layout))?;
+            Ok(layout)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -325,4 +347,56 @@ mod tests {
         assert_eq!(observed_layout(&checkout), CheckoutLayout::Symlink);
         assert_eq!(observed_layout(&mount), CheckoutLayout::DirectMount);
     }
+    #[test]
+    fn an_absent_layout_materializes_version_one_direct_mount() {
+        let temp = TempDirectory::new("legacy-layout");
+        let path = temp.path().join("checkout-layout.json");
+
+        assert_eq!(
+            load_checkout_layout(&path).expect("legacy layout"),
+            CheckoutLayout::DirectMount
+        );
+        let record =
+            crate::metadata::read_json::<crate::metadata::CheckoutLayoutRecord>(&path)
+                .expect("materialized record");
+        record.validate().expect("version one record");
+        assert_eq!(record.checkout_layout, CheckoutLayout::DirectMount);
+    }
+
+    #[test]
+    fn a_malformed_present_layout_fails_closed() {
+        let temp = TempDirectory::new("malformed-layout");
+        let path = temp.path().join("checkout-layout.json");
+        fs::write(&path, b"{not json").expect("malformed record");
+
+        assert!(matches!(
+            load_checkout_layout(&path),
+            Err(MetadataError::Json { .. })
+        ));
+        assert_eq!(
+            fs::read(&path).expect("malformed record remains"),
+            b"{not json"
+        );
+    }
+
+    #[test]
+    fn materializing_a_legacy_layout_is_idempotent() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = TempDirectory::new("idempotent-layout");
+        let path = temp.path().join("checkout-layout.json");
+        load_checkout_layout(&path).expect("first observation");
+        let inode = fs::metadata(&path).expect("first record").ino();
+
+        assert_eq!(
+            load_checkout_layout(&path).expect("second observation"),
+            CheckoutLayout::DirectMount
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("same record").ino(),
+            inode,
+            "a successful read must not replace the explicit record"
+        );
+    }
+
 }
