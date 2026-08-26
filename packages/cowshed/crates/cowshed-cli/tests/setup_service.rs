@@ -13,12 +13,12 @@ use cowshed_cli::output::Output;
 use cowshed_cli::setup_service::{
     HostArtifactRemoval, HostSetup, MainMounts, WorkspaceCensus, dispatch as setup_dispatch,
 };
+use cowshed_core::repository::RepoId;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeRole,
     VolumeState,
 };
-use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode, Result, UnreachableMain};
 use std::path::PathBuf;
 
@@ -77,7 +77,6 @@ fn detached_main() -> Vec<UnreachableMain> {
         reason: String::from("main's volume is not mounted"),
     }]
 }
-
 
 impl Default for FakeHost {
     fn default() -> Self {
@@ -194,11 +193,7 @@ async fn run(host: &mut FakeHost, args: SetupArgs, json: bool, quiet: bool) -> S
 
 /// A run that is expected to fail, keeping the streams: a partial run has to be judged on both
 /// what it printed and how it exited, and asserting either alone would miss the point.
-async fn failing_run(
-    host: &mut FakeHost,
-    args: SetupArgs,
-    json: bool,
-) -> (Streams, CowshedError) {
+async fn failing_run(host: &mut FakeHost, args: SetupArgs, json: bool) -> (Streams, CowshedError) {
     let mut output = Output::new(Vec::new(), Vec::new(), false);
     let error = setup_dispatch(host, &args, json, &mut output)
         .await
@@ -358,9 +353,9 @@ async fn a_partial_run_never_claims_success_in_json() {
     assert!(streams.stderr.contains(
         "cowshed: cowshed.caches exists (UUID UUID-B, 2.0 TB) and will be mounted at /private/cowshed/caches: FAILED — cowshed.caches could not be mounted: resource busy\n"
     ));
-    assert!(streams
-        .stderr
-        .contains("cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted\n"));
+    assert!(streams.stderr.contains(
+        "cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted\n"
+    ));
 }
 
 /// A denial noticed mid-sequence must not inherit the "nothing changed" sentence: earlier actions
@@ -398,9 +393,9 @@ async fn a_denial_partway_through_does_not_claim_nothing_changed() {
         "an action had already succeeded, so nothing-changed would be a lie"
     );
     assert!(!error.message.contains("-60006"));
-    assert!(streams
-        .stderr
-        .contains("cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted\n"));
+    assert!(streams.stderr.contains(
+        "cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted\n"
+    ));
 }
 
 /// A run that completed prints no per-action rows: they would only repeat the volume rows, and the
@@ -437,9 +432,11 @@ async fn a_completed_run_does_not_repeat_itself_action_by_action() {
     assert_eq!(streams.exit, 0);
     assert!(!streams.stderr.contains(": done\n"));
     assert!(!streams.stderr.contains("NOT set up"));
-    assert!(streams
-        .stderr
-        .contains("cowshed: host storage is set up (one administrator authorization was used)\n"));
+    assert!(
+        streams.stderr.contains(
+            "cowshed: host storage is set up (one administrator authorization was used)\n"
+        )
+    );
 }
 
 /// The point of the verb: a healthy host is told it is healthy, in one line, and nothing else
@@ -482,7 +479,10 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
          next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
-    assert_eq!(host.events, ["plan", "execute", "unmounted-mains", "census"]);
+    assert_eq!(
+        host.events,
+        ["plan", "execute", "unmounted-mains", "census"]
+    );
 }
 
 /// 06_cli.md rule 3: the sentence naming the prompt is printed *before* the phase that raises it.
@@ -543,7 +543,10 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
         announcement < first_outcome,
         "the announcement must precede the work"
     );
-    assert_eq!(host.events, ["plan", "execute", "unmounted-mains", "census"]);
+    assert_eq!(
+        host.events,
+        ["plan", "execute", "unmounted-mains", "census"]
+    );
 }
 
 /// The user's actual host: volumes that already exist and valid, with no boot pins. Nothing is
@@ -603,19 +606,25 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
 /// A plan that creates a volume cannot make the safety promise, and must not.
 #[tokio::test]
 async fn a_plan_that_creates_a_volume_makes_no_safety_promise() {
-    let mut host = FakeHost::default();
-    host.plan = setup_plan(
-        vec![HostAction::CreateVolume {
-            name: String::from("cowshed.store"),
-            container: String::from("disk3"),
-            mount_at: PathBuf::from("/private/cowshed/store"),
-        }],
-        true,
-    );
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![HostAction::CreateVolume {
+                name: String::from("cowshed.store"),
+                container: String::from("disk3"),
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            true,
+        ),
+        ..FakeHost::default()
+    };
 
     let streams = run(&mut host, REPAIR, false, false).await;
 
-    assert!(!streams.stderr.contains("no volumes will be created or deleted"));
+    assert!(
+        !streams
+            .stderr
+            .contains("no volumes will be created or deleted")
+    );
     assert!(streams.stderr.contains(
         "cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n"
     ));
@@ -629,24 +638,34 @@ async fn a_healthy_host_makes_no_safety_promise() {
 
     let streams = run(&mut host, REPAIR, false, false).await;
 
-    assert!(!streams.stderr.contains("no volumes will be created or deleted"));
-    assert!(streams.stderr.contains("cowshed: everything already set up\n"));
+    assert!(
+        !streams
+            .stderr
+            .contains("no volumes will be created or deleted")
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("cowshed: everything already set up\n")
+    );
 }
 
 /// Reclaimable stubs are named, never counted: "3 files will be deleted" is not something a
 /// person can agree to (01_storage.md).
 #[tokio::test]
 async fn reclaimable_stubs_are_enumerated_by_name() {
-    let mut host = FakeHost::default();
-    host.plan = setup_plan(
-        vec![HostAction::ReclaimStubs {
-            paths: vec![
-                PathBuf::from("/private/cowshed/store/.envrc"),
-                PathBuf::from("/private/cowshed/store/telemetry"),
-            ],
-        }],
-        false,
-    );
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![HostAction::ReclaimStubs {
+                paths: vec![
+                    PathBuf::from("/private/cowshed/store/.envrc"),
+                    PathBuf::from("/private/cowshed/store/telemetry"),
+                ],
+            }],
+            false,
+        ),
+        ..FakeHost::default()
+    };
 
     let streams = run(&mut host, REPAIR, false, false).await;
 
@@ -667,16 +686,18 @@ async fn volume_sizes_are_decimal_and_never_print_a_thousand_of_a_unit() {
         // Rounds to 1000.0 GB at one decimal place, so it promotes instead.
         (999_999_999_999, "1.0 TB"),
     ] {
-        let mut host = FakeHost::default();
-        host.plan = setup_plan(
-            vec![HostAction::MountExisting {
-                name: String::from("cowshed.store"),
-                uuid: String::from("U"),
-                size_bytes: bytes,
-                mount_at: PathBuf::from("/private/cowshed/store"),
-            }],
-            false,
-        );
+        let mut host = FakeHost {
+            plan: setup_plan(
+                vec![HostAction::MountExisting {
+                    name: String::from("cowshed.store"),
+                    uuid: String::from("U"),
+                    size_bytes: bytes,
+                    mount_at: PathBuf::from("/private/cowshed/store"),
+                }],
+                false,
+            ),
+            ..FakeHost::default()
+        };
 
         let streams = run(&mut host, REPAIR, false, false).await;
 
@@ -1072,7 +1093,6 @@ async fn uninstall_refuses_when_occupancy_cannot_be_established() {
     );
     assert_eq!(error.hint, "mount first: cowshed setup");
 
-
     let mut host = unknown();
     let streams = run(&mut host, FORCED_UNINSTALL, false, false).await;
     assert!(streams.stderr.contains(
@@ -1147,12 +1167,16 @@ async fn removal_prose_and_wire_token_stay_paired() {
         ..FakeHost::default()
     };
     let plain = run(&mut host, UNINSTALL, false, false).await;
-    assert!(plain
-        .stderr
-        .contains("cowshed: dev.cowshed.gateway agent: removed\n"));
-    assert!(plain
-        .stderr
-        .contains("cowshed: installed sccache binary: already absent\n"));
+    assert!(
+        plain
+            .stderr
+            .contains("cowshed: dev.cowshed.gateway agent: removed\n")
+    );
+    assert!(
+        plain
+            .stderr
+            .contains("cowshed: installed sccache binary: already absent\n")
+    );
 
     let mut host = FakeHost {
         uninstall_report: uninstall_report(UninstallFstabOutcome::AlreadyClean),
@@ -1201,12 +1225,18 @@ fn setup_is_in_the_command_map_between_adopt_and_new() {
     let adopt = map.find("\n  adopt").expect("adopt is listed");
     let setup = map.find("\n  setup").expect("setup is listed");
     let new = map.find("\n  new").expect("new is listed");
-    assert!(adopt < setup && setup < new, "setup sits after adopt:\n{map}");
+    assert!(
+        adopt < setup && setup < new,
+        "setup sits after adopt:\n{map}"
+    );
 
     let spec = help::command_named("setup").expect("setup has a help page");
     // The map prints the spec's own summary rather than a second copy of it, so this asserts the
     // coupling instead of duplicating the sentence and having to be edited alongside it.
-    assert!(map.contains(spec.summary), "map omits the setup summary:\n{map}");
+    assert!(
+        map.contains(spec.summary),
+        "map omits the setup summary:\n{map}"
+    );
     assert!(spec.hint().contains("--uninstall"));
     assert!(spec.hint().contains("--force"));
     assert!(spec.hint().contains("--mount-root"));
@@ -1253,7 +1283,11 @@ async fn setup_mount_root_prints_the_configured_path() {
     let streams = run(&mut host, args, false, false).await;
     assert_eq!(streams.exit, 0);
     assert_eq!(streams.stdout, "/Users/dev/.cowshed/mnt\n");
-    assert!(streams.stderr.contains("workspace mount root is /Users/dev/.cowshed/mnt"));
+    assert!(
+        streams
+            .stderr
+            .contains("workspace mount root is /Users/dev/.cowshed/mnt")
+    );
     assert!(streams.stderr.contains("next: cowshed doctor"));
     assert_eq!(
         host.events,
@@ -1417,7 +1451,11 @@ async fn a_failed_run_never_observes_or_mentions_main_mounts() {
 
     let (streams, _) = failing_run(&mut host, REPAIR, false).await;
 
-    assert!(streams.stderr.contains("cowshed: host storage is NOT set up:"));
+    assert!(
+        streams
+            .stderr
+            .contains("cowshed: host storage is NOT set up:")
+    );
     assert!(!streams.stderr.contains("main workspace"));
     assert!(!streams.stderr.contains("next: cowshed gateway start"));
     assert_eq!(
