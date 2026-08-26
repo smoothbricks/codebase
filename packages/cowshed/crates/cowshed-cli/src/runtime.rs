@@ -1741,7 +1741,7 @@ where
             }
             if project_checks_skipped {
                 output
-                    .guidance("project checks skipped: no adopted checkout at cwd")
+                    .note("project checks skipped: no adopted checkout at cwd")
                     .map_err(output_error)?;
             }
             Ok(success())

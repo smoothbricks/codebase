@@ -68,6 +68,14 @@ impl<W: Write, E: Write> Output<W, E> {
         writeln!(self.stderr, "cowshed: {message}")
     }
 
+    /// Emits a neutral stderr note without labelling it as a cowshed action.
+    pub fn note(&mut self, message: &str) -> io::Result<()> {
+        if self.quiet {
+            return Ok(());
+        }
+        writeln!(self.stderr, "{message}")
+    }
+
     /// Emits an actionable next command on stderr. Quiet mode never suppresses hints.
     pub fn hint(&mut self, command: &str) -> io::Result<()> {
         writeln!(self.stderr, "next: {command}")
@@ -122,6 +130,23 @@ mod tests {
         let (stdout, stderr) = output.into_inner();
         assert!(stdout.is_empty());
         assert_eq!(stderr, b"next: still visible\ncowshed: also visible\n");
+    }
+
+    #[test]
+    fn notes_are_unprefixed_and_quiet_suppresses_them() {
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+        output
+            .note("project checks skipped: no adopted checkout at cwd")
+            .unwrap();
+        let (_, stderr) = output.into_inner();
+        assert_eq!(
+            stderr,
+            b"project checks skipped: no adopted checkout at cwd\n"
+        );
+
+        let mut quiet = Output::new(Vec::new(), Vec::new(), true);
+        quiet.note("hidden").unwrap();
+        assert!(quiet.into_inner().1.is_empty());
     }
 
     #[test]
