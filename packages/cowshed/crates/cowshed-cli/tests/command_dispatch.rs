@@ -1399,18 +1399,33 @@ fn skill_requires_a_known_action_and_takes_no_positional_arguments() {
 
 /// Spec 06_cli.md rule 4: every hinted verb exists in the parser.
 ///
-/// Only `hint(` / `with_hint(` / typed-error constructors are scanned. CommandSpec
-/// `about` prose can open a line with `"cowshed ` and is not a next: command.
+/// Scans `hint(` / `with_hint(` and the CowshedError constructors that take a
+/// hint argument — those are the `--json` `error.hint` values, not CommandSpec
+/// `about` prose that can open a quoted line with `"cowshed `.
 #[test]
 fn every_next_hint_verb_in_source_is_a_registered_command() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut source = String::new();
     collect_rust_source(&root, &mut source);
     let mut verbs = HashSet::new();
-    for site in [".hint(", "with_hint(", "::usage(", "::not_found("] {
+    for site in [
+        ".hint(",
+        "with_hint(",
+        "CowshedError::new(",
+        "CowshedError::usage(",
+        "CowshedError::not_found(",
+        "CowshedError::conflict(",
+        "CowshedError::environment_missing(",
+        "::usage(",
+        "::not_found(",
+        "::conflict(",
+        "::environment_missing(",
+    ] {
+
         let mut rest = source.as_str();
         while let Some(start) = rest.find(site) {
-            let window = rest[start..].get(..400).unwrap_or(&rest[start..]);
+            let window = rest[start..].get(..512).unwrap_or(&rest[start..]);
+
             rest = &rest[start + site.len()..];
             let mut quoted = window;
             while let Some(quote) = quoted.find("\"cowshed ") {
