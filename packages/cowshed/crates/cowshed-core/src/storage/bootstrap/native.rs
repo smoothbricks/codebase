@@ -123,6 +123,14 @@ pub struct HostUninstallPlan {
 #[serde(rename_all = "camelCase")]
 pub struct UninstallReport {
     pub fstab: UninstallFstabOutcome,
+    pub services: Vec<UninstallServiceOutcome>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UninstallServiceOutcome {
+    pub what: String,
+    pub outcome: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -324,9 +332,9 @@ pub async fn bootstrap_system_storage(
 /// Validate the invoking user's pre-existing, machine-global host storage.
 ///
 /// The home directory is the sole filesystem-selection anchor. This boundary gathers the same
-/// exact APFS inventory, ownership, mount-flag, and marker evidence as bootstrap. Existing-only
-/// execution may reclaim a launchd stub and remount already-created volumes; volume creation and
-/// authorization remain provision-only.
+/// exact APFS inventory, ownership, mount-flag, and marker evidence as setup, but never executes
+/// the resulting plan. A detached or mis-mounted volume is reported as setup-required so callers
+/// such as gateways and cache services cannot mutate host storage during startup validation.
 pub async fn validate_existing_host_storage(home: &Path) -> crate::Result<ValidatedHostStorage> {
     if !cfg!(target_os = "macos") {
         return Err(existing_host_storage_error(
@@ -365,16 +373,22 @@ pub async fn validate_existing_host_storage(home: &Path) -> crate::Result<Valida
 
 async fn validate_existing_plan<H, L>(
     plan: &BootstrapPlan,
-    host: Arc<H>,
-    lane: &L,
+    _host: Arc<H>,
+    _lane: &L,
 ) -> crate::Result<ValidatedHostStorage>
 where
     H: BootstrapHost + 'static,
     L: BlockingLane,
 {
-    execute_native_bootstrap_plan(plan, NativeBootstrapMode::ExistingOnly, host, lane)
-        .await
-        .map_err(existing_host_storage_error)?;
+    let actions = read_only_validation_actions(plan);
+    if !actions.is_empty() {
+        return Err(existing_host_storage_error(
+            NativeBootstrapError::StorageSetupRequired {
+                actions,
+                hint: "cowshed setup",
+            },
+        ));
+    }
     Ok(ValidatedHostStorage::new(plan.roots().clone()))
 }
 
@@ -748,6 +762,7 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
         if !plan.requires_authorization {
             return Ok(UninstallReport {
                 fstab: UninstallFstabOutcome::AlreadyClean,
+                services: Vec::new(),
             });
         }
         tokio::task::spawn_blocking(move || {
@@ -764,6 +779,7 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
         .map_err(existing_host_storage_error)?;
         Ok(UninstallReport {
             fstab: UninstallFstabOutcome::Removed,
+            services: Vec::new(),
         })
     }
 }
@@ -798,6 +814,47 @@ where
     execute_bootstrap(plan, host, lane)
         .await
         .map_err(NativeBootstrapError::Execution)
+}
+
+fn read_only_validation_actions(plan: &BootstrapPlan) -> Vec<String> {
+    plan.operations()
+        .iter()
+        .filter_map(|operation| match operation {
+            HostOperation::GuardMountpoint { .. } => None,
+            HostOperation::VerifyZfsDelegation { required_root, .. } => {
+                Some(format!("verify delegated ZFS root {required_root}"))
+            }
+            HostOperation::EnsureDirectory(path) => {
+                Some(format!("create mountpoint {}", path.display()))
+            }
+            HostOperation::ReclaimMountpoint(path) => {
+                Some(format!("reclaim mountpoint {}", path.display()))
+            }
+            HostOperation::MountApfsVolume { mountpoint, .. } => {
+                Some(format!("mount APFS volume at {}", mountpoint.display()))
+            }
+            HostOperation::RunCommand(command) => Some(format!(
+                "run {} {}",
+                command.program(),
+                command.args().join(" ")
+            )),
+            HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(format!(
+                "provision APFS volumes {}",
+                volumes
+                    .iter()
+                    .map(ApfsVolumeProvision::name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            HostOperation::WriteMarkerAtomic { path, .. } => {
+                Some(format!("write volume marker {}", path.display()))
+            }
+            HostOperation::PinVolumesInFstab { .. } => {
+                Some("pin cowshed APFS volumes in /etc/fstab".to_owned())
+            }
+            HostOperation::ReportVolumeIssue { detail, .. } => Some(detail.clone()),
+        })
+        .collect()
 }
 
 fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
@@ -4306,8 +4363,8 @@ mod tests {
         assert_eq!(container_reference_of("disk3s1s1"), "disk3");
     }
 
-    #[test]
-    fn volume_mounted_outside_inventory_is_remountable_without_setup() {
+    #[tokio::test]
+    async fn validator_reports_mis_mounted_volume_without_executing_remount() {
         let mut evidence_source =
             source_with_caches_inventory_mountpoint_omitted(Some("/Volumes/cowshed.caches"));
         let gathered =
@@ -4330,6 +4387,14 @@ mod tests {
         let plan = plan_existing_host_storage(&mut plan_source, Path::new("/Users/alice"))
             .expect("mis-mounted caches repair plan");
         assert!(mutating_setup_actions(&plan).is_empty());
+        let host = Arc::new(ReadOnlyValidationHost::default());
+        let lane = ValidationLane::default();
+        let error = validate_existing_plan(&plan, Arc::clone(&host), &lane)
+            .await
+            .expect_err("validation must not heal a mis-mounted volume");
+        assert_eq!(error.hint, "cowshed setup");
+        assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -4498,6 +4563,47 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     }
 
     #[test]
+    fn setup_and_uninstall_report_json_is_frozen_camel_case() {
+        let setup = crate::api::JsonEnvelope::success(HostSetupReport {
+            volumes: vec![
+                VolumeOutcome {
+                    name: APFS_STORE_VOLUME.to_owned(),
+                    role: VolumeRole::Store,
+                    state_before: VolumeState::FoundElsewhere {
+                        container: "disk4".to_owned(),
+                        device: "disk4s7".to_owned(),
+                        mounted_at: None,
+                    },
+                    action: "reported".to_owned(),
+                },
+                VolumeOutcome {
+                    name: APFS_CACHES_VOLUME.to_owned(),
+                    role: VolumeRole::Caches,
+                    state_before: VolumeState::MisMounted {
+                        mounted_at: PathBuf::from("/Volumes/cowshed.caches"),
+                    },
+                    action: "remounted".to_owned(),
+                },
+            ],
+            fstab: FstabOutcome::Skipped("volume elsewhere".to_owned()),
+            authorized: false,
+        });
+        assert_eq!(
+            serde_json::to_string(&setup).expect("setup envelope"),
+            "{\"ok\":true,\"result\":{\"volumes\":[{\"name\":\"cowshed.store\",\"role\":\"store\",\"stateBefore\":{\"foundElsewhere\":{\"container\":\"disk4\",\"device\":\"disk4s7\",\"mountedAt\":null}},\"action\":\"reported\"},{\"name\":\"cowshed.caches\",\"role\":\"caches\",\"stateBefore\":{\"misMounted\":{\"mountedAt\":\"/Volumes/cowshed.caches\"}},\"action\":\"remounted\"}],\"fstab\":{\"skipped\":\"volume elsewhere\"},\"authorized\":false}}"
+        );
+
+        let uninstall = crate::api::JsonEnvelope::success(UninstallReport {
+            fstab: UninstallFstabOutcome::Removed,
+            services: Vec::new(),
+        });
+        assert_eq!(
+            serde_json::to_string(&uninstall).expect("uninstall envelope"),
+            "{\"ok\":true,\"result\":{\"fstab\":\"removed\",\"services\":[]}}"
+        );
+    }
+
+    #[test]
     fn healthy_host_with_current_fstab_has_zero_mutation_plan() {
         let mut first_source = healthy_existing_source();
         let first = prepare_setup_snapshot(&mut first_source, Path::new("/Users/alice"), "")
@@ -4550,10 +4656,10 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             validated.telemetry(),
             Path::new("/Users/alice/.cowshed/telemetry")
         );
-        assert_eq!(host.inspections.load(Ordering::SeqCst), 2);
+        assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(lane.dispatches.load(Ordering::SeqCst), 2);
+        assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
