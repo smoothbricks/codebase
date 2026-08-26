@@ -12,7 +12,7 @@ are coordinator-only.
 ## Placement and identity
 
 The host-only control plane is host-netns `127.0.0.1:7644` (override `COWSHED_GATEWAY_PORT`) plus
-`~/.cowshed/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable from a
+`/private/cowshed/store/gateway.sock` for status, audit tail, and coordinator verbs. Neither host endpoint is reachable from a
 workspace, and the sandbox baseline denies both. Linux separately reuses the numeric address `127.0.0.1:7644` inside
 each private netns for its data-plane connector; namespace separation makes it a different listener. Data-plane topology
 is platform-specific:
@@ -22,7 +22,7 @@ is platform-specific:
   files. The gateway binds `base`; `base+1 … base+15` are workspace service ports. Seatbelt permits a workspace to
   connect only to its own block. The destination `base` listener is the primary, kernel-enforced workspace identity.
 - **Linux — Unix socket, private netns, and trusted connector.** No `portBlock` is allocated. The controller creates
-  `~/.cowshed/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts that one
+  `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` under a 0700 directory with mode 0600 and bind-mounts that one
   socket as `/run/cowshed/gateway.sock` inside the workspace's private network namespace. The namespace has loopback up
   but no veth, routed interface, or default route. For ordinary package/proxy clients, the controller launches exactly
   one trusted minimal connector in that netns under a controller-owned process identity and dedicated cgroup that
@@ -241,7 +241,7 @@ Two distinct situations, not to be conflated:
 
 ## Audit events
 
-One audit event per decision, written as **Arrow segments** under `~/.cowshed/telemetry/` (schema, flush policy, and
+One audit event per decision, written as **Arrow segments** under `/private/cowshed/store/telemetry/` (schema, flush policy, and
 durability window in 13_telemetry.md) — on the store volume, denied to every sandbox (04_sandbox.md), because this is
 the authoritative egress record. There is no separate audit file and no separate gateway log file: audit events and
 gateway operational events are rows in the same telemetry store, distinguished by `kind`.

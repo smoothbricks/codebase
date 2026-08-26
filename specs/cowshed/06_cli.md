@@ -11,7 +11,7 @@ that possible and they are absolute:
 
 ```
 $ cowshed new raven
-~/.cowshed/mnt/acme/widget/raven        ← stdout (bare mount path)
+/private/cowshed/store/mnt/acme/widget/raven        ← stdout (bare mount path)
 cowshed: created workspace raven from main @ 8f31c2d (612ms)     ← stderr
 next: cd "$(cowshed path raven)"                                 ← stderr
 next: cowshed exec raven -- bun install                          ← stderr
@@ -211,7 +211,7 @@ gets no `main` remote (nothing to fetch from); and refuses `cowshed checkpoint` 
 history lives outside its image. Each refusal names the command that resolves it (02).
 
 `--slot <n>` (on `cowshed new`) mounts the workspace at a stable, recycled path
-(`~/.cowshed/mnt/<owner>/<repo>/slot-<n>`) instead of a name-derived one. `owner` and `repo` are the separately
+(`/private/cowshed/store/mnt/<owner>/<repo>/slot-<n>`) instead of a name-derived one. `owner` and `repo` are the separately
 validated and encoded components of the primary `repo_id`, never an unsplit path value. Successive workspaces in the
 same slot inherit each other's **path-keyed** cache warmth (cargo incremental, Xcode DerivedData) — opt-in, because it
 trades workspace-path uniqueness for warmth and only one workspace may hold a slot at a time (exit 4 if occupied).

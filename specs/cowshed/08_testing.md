@@ -15,7 +15,7 @@ No mounts, no root, no network — pure functions with table-driven cases:
   rule silently denies — measured).
 - **Profile ordering invariant (layered)**: SBPL is last-match-wins (measured — the same rules in the opposite order
   leave a secret readable), so every generated profile MUST emit its four layers in order: broad allows → the
-  `~/.cowshed` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes, own mount) → secret
+  `/private/cowshed/store` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes, own mount) → secret
   denies (04_sandbox.md). This test asserts the layer order structurally over generated grant sets AND by probe paths:
   grant file, CA key, sibling image, sibling mount must resolve to deny; own mount and designated cache subtrees to
   allow; secret paths to deny regardless of grants. The entire secret-protection model depends on it.

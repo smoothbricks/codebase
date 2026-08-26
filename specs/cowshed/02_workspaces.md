@@ -29,7 +29,7 @@ The invariant is checked, not assumed. One built-in scanner (`cowshed-core::secr
 
 - **`cowshed adopt` — blocking gate.** Full-tree scan before the image is created (skipping cache roots and `.git`
   objects). Findings refuse the adopt (exit 4) with per-file stderr guidance: migrate the value to the gateway Keychain,
-  delete the file, or `cowshed adopt --quarantine`, which moves findings to `~/.cowshed/<owner>/<repo>/quarantine/` (the
+  delete the file, or `cowshed adopt --quarantine`, which moves findings to `/private/cowshed/store/<owner>/<repo>/quarantine/` (the
   primary component-safe `repo_id` path; mode 0600, original paths preserved) so dependent tooling fails loudly instead
   of leaking silently. There is no "adopt anyway" flag — main's image is cloned to every future workspace; adopt is the
   one moment the invariant is cheap to establish.
@@ -62,11 +62,11 @@ not a best-effort script:
    break a tie only among remotes for that same identity. Record the selected remote name and its credential-, query-,
    and fragment-free URL, and validate that URL still normalizes to the recorded primary `repo_id`. Programmatic callers
    supply the same explicit identity as `AdoptOptions.repo_id`; the coordinator rejects any disagreement with the
-   provisional binding before image mutation. Load trusted policy only from `~/.cowshed/<owner>/<repo>/policy.json`.
+   provisional binding before image mutation. Load trusted policy only from `/private/cowshed/store/<owner>/<repo>/policy.json`.
    Also require that `<root>.pre-cowshed` does **not** already exist (exit 4 — a previous adopt left state behind;
    resolve it first). Ensure host setup is present — declaratively validated when home-manager/nix-darwin owns it
    (`programs.cowshed`/`services.cowshed`, 14_nix.md), imperatively applied otherwise — and both dedicated volumes
-   exist: lazily create and mount `cowshed.store` (at `~/.cowshed`) then `cowshed.caches` (nested; ordering and the
+   exist: lazily create and mount `cowshed.store` (at `/private/cowshed/store`) then `cowshed.caches` (nested; ordering and the
    volume marker in 01_storage.md) before any image is created.
 2. Select the supported format, then create the image under a staged, non-enumerated, format-specific name:
    `<owner>/<repo>/.staging/main.asif` for ASIF or `<owner>/<repo>/.staging/main.sparseimage` for SPARSE. Both
@@ -91,7 +91,7 @@ not a best-effort script:
 ## Checkout layouts
 
 Where `main` mounts is a per-project choice recorded in project metadata. Both layouts are supported, both use the same
-publication transaction, and every other workspace mounts at `~/.cowshed/mnt/<owner>/<repo>/<workspace>` under either.
+publication transaction, and every other workspace mounts at `/private/cowshed/store/mnt/<owner>/<repo>/<workspace>` under either.
 
 **Direct mount** (default). `main` mounts at the checkout's original path. Publication renames the original tree to
 `<root>.pre-cowshed`, recreates the emptied directory as the mountpoint with the stub `.envrc` inside it, and attaches
@@ -99,7 +99,7 @@ there. The user's path is the real thing: `pwd -P` reports it, the gitdir physic
 the volume label — which is why the label is the repository's name (01_storage.md) rather than an encoded identity. The
 cost is one mounted volume inside the user's source tree and a mountpoint that cannot be moved by `mv`.
 
-**Symlink**. `main` mounts at `~/.cowshed/mnt/<owner>/<repo>/main` like every other workspace — one uniform mount
+**Symlink**. `main` mounts at `/private/cowshed/store/mnt/<owner>/<repo>/main` like every other workspace — one uniform mount
 namespace, no special case in the layout, the substrate, or the runtime — and the checkout path holds a symlink to that
 mountpoint. Publication builds the symlink under a staging sibling, exchanges it with the original directory in one
 atomic `renameatx_np(RENAME_SWAP)`, and renames the displaced original to `<root>.pre-cowshed`.
@@ -113,8 +113,8 @@ all.
 The layouts differ in exactly one user-visible way beyond `pwd -P`, and it decides the default: **path-conditional Git
 configuration follows the physical path.** Git resolves a `gitdir:` condition against the resolved gitdir, so an
 `includeIf "gitdir:~/Dev/"` that scopes a work identity keeps matching under direct mount and stops matching under the
-symlink layout, where the real gitdir lives under `~/.cowshed/mnt`. Under the symlink layout that is the documented
-behavior for every workspace, `main` included: session workspaces have always lived under `~/.cowshed/mnt` and path
+symlink layout, where the real gitdir lives under `/private/cowshed/store/mnt`. Under the symlink layout that is the documented
+behavior for every workspace, `main` included: session workspaces have always lived under `/private/cowshed/store/mnt` and path
 conditions have never matched them.
 
 Cowshed does not compensate. Capturing the effective identity at adopt time and stamping it as repo-local config would
@@ -202,7 +202,7 @@ Budget: ≤ 1 s cold. No pool, no pre-warming.
    `sparseimage` according to main's validated detached `imageFormat` — ~2 ms regardless of content size. Create the
    complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach without mounting, run `fsck_apfs -q` against the clone's APFS volume device, then mount at
-   `~/.cowshed/mnt/<owner>/<repo>/<name>` — extension and detached `imageFormat` must agree, then attach dispatches to
+   `/private/cowshed/store/mnt/<owner>/<repo>/<name>` — extension and detached `imageFormat` must agree, then attach dispatches to
    `diskutil image attach --noMount` for ASIF or `hdiutil attach -nomount` for SPARSE (flags per 01_storage.md) —
    ~235–400 ms typical. Verification precedes the first mount; a clone never mounts unchecked.
 4. On fsck failure, delete the clone and retry once from a fresh sync. (Measured: 10/10 clonefiles taken under a
@@ -240,7 +240,7 @@ as what they do, and an agent that knows nothing about cowshed guesses it correc
 
 The URL is the canonical mount, never the recorded checkout path, and the two differ by checkout layout (see "Checkout
 layouts"): under direct mount they are the same directory, and under the symlink layout the checkout path is a symlink
-into `~/.cowshed/mnt/<owner>/<repo>/main`. Recording the symlink would put a path outside the workspace's read grants
+into `/private/cowshed/store/mnt/<owner>/<repo>/main`. Recording the symlink would put a path outside the workspace's read grants
 into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate owns,
 the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
 workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
@@ -298,7 +298,7 @@ gains three steps between attach and publication:
    makes cloning an already-linked worktree wrong (see the prototype report).
 2. Register the worktree against main's repository and plant the pointer file, using **main's canonical mount** as the
    repository path. Under direct mount that is the checkout path; under the symlink layout it is
-   `~/.cowshed/mnt/<owner>/<repo>/main`, and the registration must name it rather than the symlink for the same reason
+   `/private/cowshed/store/mnt/<owner>/<repo>/main`, and the registration must name it rather than the symlink for the same reason
    the `main` remote does — a registration recorded through the checkout symlink breaks the moment the checkout moves,
    and `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already
    present from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto
@@ -526,7 +526,7 @@ no credential helper, and no `insteadOf` rewriting inside any workspace.
 
 - **`cowshed repo mirror <url>`** — a control-plane RPC, not workspace git. The gateway checks the workspace's repo
   grants (`cowshed grant <ws> --repo github.com/org/*` — repo-scoped, finer than host egress), executes the fetch itself
-  with Keychain-held credentials into a bare mirror it owns at `~/.cowshed/caches/repo-mirrors/<host>/<org>/<repo>.git`,
+  with Keychain-held credentials into a bare mirror it owns at `/private/cowshed/caches/repo-mirrors/<host>/<org>/<repo>.git`,
   writes one audit line, and returns the mirror path on stdout. Mirrors are created by the gateway with its own config —
   no agent-writable git config is ever in the loop — and are fetch-only, sandbox-read-only (01_storage.md,
   05_gateway.md).
@@ -677,7 +677,7 @@ When something is wrong, `ensure` fixes what is safe to fix synchronously:
 - image exists but not mounted (reboot, eject) → re-attach and continue;
 - mounted with wrong flags or at the wrong path → re-mount;
 - `cowshed.store` or `cowshed.caches` volume missing or mounted with wrong flags → recreate (lazy, idempotent) and
-  re-mount with canonical flags, in order: store at `~/.cowshed` first — the other mountpoints live on it, and the
+  re-mount with canonical flags, in order: store at `/private/cowshed/store` first — the other mountpoints live on it, and the
   volume-root marker `.cowshed-volume.json` absent means "unmounted", never "empty" (01_storage.md);
 - broken in-image cache config → rewrite (03_caches.md).
 
