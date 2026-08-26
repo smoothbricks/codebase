@@ -1398,30 +1398,37 @@ fn skill_requires_a_known_action_and_takes_no_positional_arguments() {
 }
 
 /// Spec 06_cli.md rule 4: every hinted verb exists in the parser.
+///
+/// Only `hint(` / `with_hint(` / typed-error constructors are scanned. CommandSpec
+/// `about` prose can open a line with `"cowshed ` and is not a next: command.
 #[test]
 fn every_next_hint_verb_in_source_is_a_registered_command() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut source = String::new();
     collect_rust_source(&root, &mut source);
     let mut verbs = HashSet::new();
-    for prefix in ["\"cowshed "] {
+    for site in [".hint(", "with_hint(", "::usage(", "::not_found("] {
         let mut rest = source.as_str();
-        while let Some(start) = rest.find(prefix) {
-            rest = &rest[start + prefix.len()..];
-            let token: String = rest
-                .chars()
-                .take_while(|ch| ch.is_ascii_lowercase() || *ch == '-')
-                .collect();
-            if !token.is_empty() {
-                verbs.insert(token);
+        while let Some(start) = rest.find(site) {
+            let window = rest[start..].get(..400).unwrap_or(&rest[start..]);
+            rest = &rest[start + site.len()..];
+            let mut quoted = window;
+            while let Some(quote) = quoted.find("\"cowshed ") {
+                quoted = &quoted[quote + "\"cowshed ".len()..];
+                let token: String = quoted
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_lowercase() || *ch == '-')
+                    .collect();
+                if !token.is_empty() {
+                    verbs.insert(token);
+                }
             }
         }
     }
 
-
     assert!(
         !verbs.is_empty(),
-        "expected at least one `cowshed <verb>` hint in src/"
+        "expected at least one `cowshed <verb>` hint call in src/"
     );
     for verb in verbs {
         if matches!(verb.as_str(), "help" | "--help" | "--project") {
@@ -1451,4 +1458,5 @@ fn collect_rust_source(path: &std::path::Path, out: &mut String) {
         out.push('\n');
     }
 }
+
 
