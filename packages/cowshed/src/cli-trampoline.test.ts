@@ -99,7 +99,9 @@ describe('cowshed CLI trampoline', () => {
     await writeFile(packaged, '#!/nonexistent-cowshed-interpreter\n');
     await chmod(packaged, 0o644);
 
-    await expect(runCli(['ls', '--all'], { packageRoot: root, platform: 'darwin', arch: 'arm64' })).rejects.toMatchObject({
+    await expect(
+      runCli(['ls', '--all'], { packageRoot: root, platform: 'darwin', arch: 'arm64' }),
+    ).rejects.toMatchObject({
       code: 'EACCES',
     });
     expect((await stat(packaged)).mode & 0o111).toBe(0o111);
