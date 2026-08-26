@@ -71,7 +71,7 @@ Every command uses a named `cowshed-core` DTO as its `result`; adapters never as
 `baseCommit`, while query/attachment paths may omit it when no marker snapshot was requested. `detach`, `rm`, job
 detach/kill, and successful policy mutations with no additional observation return the literal empty object `{}` through
 `EmptyResult` (never `null`, `true`, or a message string). `doctor` returns `DoctorReport { healthy, findings }`; each
-`Finding` has `code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `ensure`
+`Finding` has `code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `attach`
 returns `EnsureReport`; `gc` returns `GcReport`. Exec and job commands return the frozen job DTOs in 07_api.md. Commands
 whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`, `RevisionResult { oid }`,
 `SlotResult { slot }`) so JSON never changes shape when another field is added.
@@ -164,8 +164,8 @@ never errors).
 | `cowshed repo clone <url> [dir]`              | clone path                                       | `repo mirror` then a local `git clone --dissociate` into the workspace (default dir: repo basename).                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `cowshed sim export <ws> [artifact]`          | drop path                                        | Copy a built iOS `.app` to the one-way drop dir for the personal-session simulator (02/14). Default: newest built app.                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `cowshed app export <ws> [artifact]`          | drop path                                        | Mac-target sibling of `sim export`: copy a built macOS `.app` to the drop dir (02/14).                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `cowshed app promote [artifact]`              | installed path                                   | **Personal-session, human-only** (no `<ws>`, not agent-invokable): verify signature (Developer-ID default), install a drop-dir build into `~/Applications`, clear quarantine (14_nix.md). `--force` for ad-hoc, `--system` for `/Applications`.                                                                                                                                                                                                                                                                                |
-| `cowshed ensure`                              | `--envrc`: export lines (≤2 load-bearing; 03)    | ≤25 ms fast path; heals mounts (02). `--attach` for stubs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `cowshed attach [ws] [--all]`                 | mount path(s)                                    | `<ws>` one; cwd in a project = that project's sessions; `--all` store-wide. Mains always mounted (05). |
+| `cowshed attach [ws] [--all]`                 | mount path(s)                                    | `<ws>` one; cwd in a project = that project's sessions; `--all` store-wide. Mains always mounted (05). |
 | `cowshed grant <ws> …`                        | new grant revision                               | `--read/--write <path>`, `--egress <host[:port]> [--opaque] [--impersonate <p>]`, `--repo <host/org[/repo]>`, `--sim <verb>`, `--preset simulator` (04/05).                                                                                                                                                                                                                                                                                                                                                                    |
 | `cowshed revoke <ws> …`                       | new grant revision                               | Same selectors + `--all`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `cowshed push <ws>`                           | preserved ref, source sha                        | `--branch <name>` plus optional incarnation/source/destination CAS expectations. Preserves under `refs/cowshed/<ws>/…`; never advances an integration branch or checkout (02).                                                                                                                                                                                                                                                                                                                                                 |
@@ -257,7 +257,7 @@ trades workspace-path uniqueness for warmth and only one workspace may hold a sl
 
 ### Inferring `<ws>` from the working directory
 
-A command run inside a mounted workspace may omit that workspace's name. Resolution is the one `ensure` already uses —
+A command run inside a mounted workspace may omit that workspace's name. Resolution reuses the workspace-from-cwd rule that `attach` uses —
 containment of the canonical cwd in exactly one currently mounted workspace (01_storage.md), which is exact because
 mount identity is keyed off the in-image marker, and which refuses an ambiguous match rather than picking one. An
 explicit argument always wins; inference never overrides what the caller named. Outside any workspace the refusal
@@ -267,7 +267,7 @@ The split is by what the verb does to the workspace, not by convenience:
 
 | Infers from cwd                                  | Requires the name                                         |
 | ------------------------------------------------ | ----------------------------------------------------------- |
-| `rebase`, `push`, `checkpoint`, `path`, `ensure` | `rm`, `land`, `restore`, `mv`, `attach`, `detach`, `exec` |
+| `rebase`, `push`, `checkpoint`, `path`           | `rm`, `land`, `restore`, `mv`, `attach`, `detach`, `exec` |
 
 Verbs that act on a workspace **in place** infer it. Verbs that **retire it** (`rm`, `land`), **replace it** (`restore`
 mints a fresh incarnation over the running one), **rename or move it** (`mv`), or **change its mount** (`attach`,
@@ -294,15 +294,13 @@ extra_workspace_dirs = ["build-out"]
 output_limit = "1GiB"         # combined stdout+stderr per job; explicit output-limit terminal state
 ```
 
-On macOS, `cowshed ensure --envrc` exports `COWSHED_PORT_BASE` (= the authoritative detached-metadata block base) as the
-dev-server convention, so `vite`/`astro`/`metro`/`devenv up` can select ports inside the workspace's own block instead
-of colliding with siblings (04_sandbox.md). Linux allocates no port block and emits no port sentinel: dev servers bind
-its private loopback, while ordinary package tools retain their configured `http://127.0.0.1:7644/…` proxy and registry
-URLs through exactly one trusted minimal connector launched inside that workspace's private loopback-only network
-namespace. On both platforms `ensure` exports `GOENV` pointing at the authoritative mounted workspace's in-image Go
-environment file and `COWSHED_WORKSPACE_TOKEN` containing the value read from its controller-minted token path. These,
-plus the macOS-only base, are the complete load-bearing export set; the CLI receives typed paths and `PortBlock` in
-`EnsureReport` and never guesses from cwd, a marker, a slot, or a mount-path convention.
+Workspace environment lives inside the image as `.cowshed/env`: it exports `GOENV` (the workspace's `.cowshed/cache/go/env`),
+`COWSHED_WORKSPACE_TOKEN` (controller-minted token), and on macOS `COWSHED_PORT_BASE` (= the authoritative detached-metadata
+block base) so `vite`/`astro`/`metro`/`devenv up` select ports inside the workspace's own block instead of colliding with
+siblings (04_sandbox.md). Linux allocates no port block and emits no port sentinel: dev servers bind its private loopback,
+while ordinary package tools retain their configured `http://127.0.0.1:7644/…` proxy and registry URLs through exactly one
+trusted minimal connector launched inside that namespace. Cowshed rewrites `.cowshed/env` whenever it rotates the token;
+`.envrc` sources it (see 02_workspaces.md). No CLI verb prints these values on demand.
 
 ## Tradeoffs
 

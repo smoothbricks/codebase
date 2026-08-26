@@ -18,7 +18,7 @@ Cloning main's live image for any consumer — including sandboxed agents — is
 worktree:
 
 - No `.env` files. Credentials exist only inside cowshed-gateway (Keychain-backed, 05_gateway.md).
-- Environment wiring (`cowshed ensure`) exports build-configuration variables only, never secrets.
+- Environment wiring (`.cowshed/env`, sourced by `.envrc`) exports build-configuration variables only, never secrets.
 
 Everything else in main — uncommitted source changes, installed dependencies, warm build state — is exactly what makes a
 clone useful.
@@ -136,7 +136,7 @@ mountpoint directory — and removes the displaced artifact. The checkout path i
 Renaming is a lifecycle operation, not a filesystem accident, for the same reason `rm` is: it has to own the unmount
 side. `cowshed mv <ws> <new-name>` retires the old identity and republishes under the new one — volume label, mount
 path, and recorded metadata move together — and `cowshed mv main <new-checkout-path>` moves the project's checkout.
-There is no separate verb per layout and no flag on `ensure`: one front door, symmetric with `rm`.
+There is no separate verb per layout: one front door, symmetric with `rm`.
 
 The second argument means what the first one decides. `main` is not a renameable workspace — its name is fixed by the
 project layout — so `mv main` can only be the checkout move and its destination is a path, while every other source
@@ -155,7 +155,7 @@ new path, and reattached — no unmount-and-remount gap at the user's path, no r
 the real transaction: detach → rename the (now stub-carrying) mountpoint directory → rebind the substrate onto the new
 path → re-attach. The rename is inverted on failure, so a refused move is indistinguishable from one never attempted.
 Past the rename there is no way back worth taking: the record and the tree both name the destination, so a failure to
-re-attach leaves a detached project at the right path, which `ensure` mounts.
+re-attach leaves a detached project at the right path, which the gateway's heal or `attach` mounts.
 
 The record moves **before** the tree, in both layouts. Under direct mount the source path stops existing the instant the
 rename lands, so a record still naming it would have nothing left to resolve, whereas a record naming the destination
@@ -174,15 +174,15 @@ one that overlaps cowshed storage or the current checkout. A dirty tree is _not_
 working tree is carried across untouched rather than republished, so there is nothing for a fence to protect.
 
 A user who moves an adopted checkout by hand has not broken anything: `cowshed doctor` accepts a checkout path that
-resolves to the workspace's volume root wherever it now sits, and `cowshed ensure` converges the recorded path onto the
-observed one. `mv <ws>` is the sanctioned front door; convergence is the safety net under it.
+resolves to the workspace's volume root wherever it now sits, and `cowshed attach` converges the recorded path onto the observed one. `mv <ws>` is the sanctioned front door;
+convergence is the safety net under it.
 
 Convergence needs an observation the controller cannot make for itself. `current_dir(2)` reports main's mount rather
-than the name the user reached it by, and it witnesses where the checkout actually lives. The CLI therefore carries its invocation directory into `ensure`, and convergence
+than the name the user reached it by, and it witnesses where the checkout actually lives. The CLI therefore carries its invocation directory into `attach`, and convergence
 fires only when that observation is unambiguous: the path sits inside main's mount, the checkout root above it resolves
 to that mount, that root lies outside cowshed's own storage — so the mount path is never mistaken for the user's
 checkout — and it differs from what is recorded. The layout is recorded from the same observation: a checkout that is a
-mount is direct mount by construction. An `ensure` with no
+mount is direct mount by construction. An `attach` with no
 observation converges nothing rather than guessing.
 
 ## `cowshed new <name>` — create a session workspace
@@ -237,7 +237,7 @@ layout"): they are the same directory. Recording a separate checkout path would 
 into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate owns,
 the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
 workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
-workspace that was detached while main moved has no volume to write into; `ensure` re-runs the same idempotent
+workspace that was detached while main moved has no volume to write into; `attach` re-runs the same idempotent
 configuration when the workspace is next used, so the repair rides the front door a workspace already passes through
 rather than needing a verb of its own. Both paths are the
 idempotent no-op the remote configuration is built to be.
@@ -657,41 +657,30 @@ persist. `attach` mounts at the canonical path with canonical flags and, on Linu
 socket/netns and starts exactly one connector before admitting execs. Personal macOS workspaces are typically attached
 at login by a launchd agent; Linux uses its platform service/controller lifecycle.
 
-## `cowshed ensure` — the .envrc fast path
+## Workspace environment: `.cowshed/env`, sourced by `.envrc`
 
-Contract: **silent exit 0 in ≤ 25 ms when healthy**. Resolution asks the bound controller to re-read canonical storage,
-detached metadata, and kernel mount facts. The canonical cwd must be contained in exactly one active mount for that
-project; nested paths resolve, while detached, ambiguous, cross-project, and marker-only paths fail closed. The marker
-is validated only after mount authority is established and never grants a capability by itself.
+Every workspace image carries its environment in the in-image private namespace as a plain `source`-able file:
+`.cowshed/env` exports `GOENV` (pointing at the workspace's `.cowshed/cache/go/env`), `COWSHED_WORKSPACE_TOKEN`
+(controller-minted, read from `.cowshed/token`), and on macOS `COWSHED_PORT_BASE` from detached metadata's exact
+`portBlock`. Linux has no port block and omits the line. Cowshed rewrites this file whenever it rewrites the token —
+at create/fork/restore — so values are always current; nothing is derived from cwd, guessed from a slot, or trusted
+from a marker alone.
 
-When something is wrong, `ensure` fixes what is safe to fix synchronously:
-
-- image exists but not mounted (reboot, eject) → re-attach and continue;
-- mounted with wrong flags or at the wrong path → re-mount;
-- `cowshed.store` or `cowshed.caches` volume missing or mounted with wrong flags → recreate (lazy, idempotent) and
-  re-mount with canonical flags, in order: store at `/private/cowshed/store` first — the other mountpoints live on it, and the
-  volume-root marker `.cowshed-volume.json` absent means "unmounted", never "empty" (01_storage.md);
-- broken in-image cache config → rewrite (03_caches.md).
-
-It warns (one stderr line each, never blocking) when the gateway is unreachable or the workspace has old unpushed work.
-It never does slow or surprising work — no fetch, no compaction, no refresh.
-
-`cowshed ensure --envrc` additionally prints exactly the load-bearing exports represented by the authoritative
-`EnsureReport`: `GOENV` points at the mounted workspace's `.cowshed/cache/go/env`, `COWSHED_WORKSPACE_TOKEN` contains
-the value read from the mounted workspace's controller-minted `.cowshed/token`, and macOS additionally exports
-`COWSHED_PORT_BASE` from the exact `portBlock` in detached metadata. Linux metadata has no port block and emits no
-sentinel value. The CLI never derives these paths from its cwd, guesses a port from a slot, or trusts a marker to choose
-a workspace. Usage in a repo's `.envrc`:
+The repo-visible wiring is one line. When a checkout has no `.envrc`, cowshed writes:
 
 ```bash
-eval "$(cowshed ensure --envrc)"
+source_env_if_present .cowshed/env
 ```
 
-**Self-healing stub**: the underlying (shadowed-when-mounted) mountpoint directory contains a one-line `.envrc` —
-`cowshed ensure --attach` — so `cd` into an unmounted workspace triggers direnv, cowshed re-attaches, and the real
-`.envrc` shadows the stub on the next prompt. Every `cd` is a repair opportunity. Main heals the same way in either
-checkout path: it _is_ the mountpoint,
-resolves to the mountpoint whether or not it is mounted, so a `cd` to the familiar path reaches the stub either way.
+When the project tracks its own `.envrc`, cowshed appends that single line under a marker comment instead — one
+committed line upstream, values never dirtying the tree across rotations. Interactive shells get real values through
+direnv; agent processes get the same environment injected at spawn by the supervisor (04_sandbox.md), so no verb exists
+to print these exports on demand.
+
+**Empty mountpoints are not user-visible state.** A mountpoint directory exists only while its workspace is attached;
+detach removes it. Main workspaces are always-mounted: the gateway mounts every main across every adopted project
+before reporting healthy (05_gateway.md), and doctor treats an unreachable main as a critical finding. There is no
+detached-main state for a user to stumble over.
 
 ## Tradeoffs
 
