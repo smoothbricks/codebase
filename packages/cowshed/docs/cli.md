@@ -45,7 +45,8 @@ $ cowshed path nonesuch --json
 
 Errors with `--json` still exit with their code; stderr stays human-readable either way. A bounded `JobInfo` may encode
 small `Inline.data` bytes in a tagged `utf8` or `base64` form. The size bound is load-bearing: larger and live artifacts
-remain handles, and unbounded bytes require `cowshed exec --session`, a `--background` job id, or an explicit artifact read.
+remain handles, and unbounded bytes require `cowshed exec --session`, a `--background` job id, or an explicit artifact
+read.
 
 ## Global flags
 
@@ -105,9 +106,8 @@ cowshed: host storage is set up (one administrator authorization was used)
 next: cowshed doctor
 ```
 
-Sizes are decimal, as `diskutil` and the hardware state them, so the number matches what Disk Utility shows.
-Reclaimable leftover files are listed by name rather than counted — "3 files will be deleted" is not something anyone
-can agree to.
+Sizes are decimal, as `diskutil` and the hardware state them, so the number matches what Disk Utility shows. Reclaimable
+leftover files are listed by name rather than counted — "3 files will be deleted" is not something anyone can agree to.
 
 Dismissing the authorization dialog is an answer, not a failure. Nothing is changed and the run exits **6**:
 
@@ -142,8 +142,8 @@ recognisably the same action. A run that completes prints no outcome lines — t
 With `--json` a partial run answers `ok:false` with the failing action's error; the per-action evidence stays on stderr,
 because the frozen envelope has no partial state and answering `ok:true` over a failure is the one thing it must not do.
 
-A dialog dismissed *partway* through says so, and pointedly does not claim nothing changed — earlier actions had
-already succeeded. It still exits 6.
+A dialog dismissed _partway_ through says so, and pointedly does not claim nothing changed — earlier actions had already
+succeeded. It still exits 6.
 
 The stranded-user recovery, after a reboot left the volumes unmounted:
 
@@ -181,10 +181,9 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
 the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, and the
 installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data;
-everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while their occupancy
-cannot be established at all (an unmounted store looks empty to every cheap check), until `--force` says the caller
-means it anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed command
-line:
+everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while their occupancy cannot
+be established at all (an unmounted store looks empty to every cheap check), until `--force` says the caller means it
+anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed command line:
 
 ```
 $ cowshed setup --uninstall
@@ -193,9 +192,9 @@ image, so they would be left unmanaged
 next: cowshed setup --uninstall --force
 ```
 
-With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab
-outcome and every service artifact it touched, in the order it touched them (both agents, then both binaries). A
-teardown that found nothing installed reports an empty `services` list rather than omitting the field:
+With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab outcome
+and every service artifact it touched, in the order it touched them (both agents, then both binaries). A teardown that
+found nothing installed reports an empty `services` list rather than omitting the field:
 
 ```
 $ cowshed setup --json
@@ -213,10 +212,10 @@ Run once inside each existing checkout you want cowshed to manage. Adoption conv
 image-backed **main workspace** at the same path. A host may have any number of adopted repositories and therefore any
 number of repository-scoped mains. Adoption is the only operation that copies the source tree into a new image.
 
-On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to create native storage. The first
-adopt on a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts
-the space-sharing `cowshed.store` and `cowshed.caches` APFS volumes. Once both volumes are present and correctly
-mounted, later adopts only validate them and do not prompt.
+On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to create native storage. The first adopt on
+a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts the
+space-sharing `cowshed.store` and `cowshed.caches` APFS volumes. Once both volumes are present and correctly mounted,
+later adopts only validate them and do not prompt.
 
 Every other command (`new`, `ls`, `path`, `exec`, `rm`, `attach`, `detach`, and `doctor`) opens storage in existing-only
 mode. If either volume is absent or needs mounting, the command exits with `environment-missing`, lists the required
@@ -238,9 +237,9 @@ next: cowshed new <name>
 <project-root>
 ```
 
-Workspace environment lives in the image at `.cowshed/env` and is rewritten on token rotation. The
-repository `.envrc` is a two-liner that sources that file. Cowshed does not authorize direnv or
-devenv trust databases. Reattach a detached session workspace with `cowshed attach`.
+Workspace environment lives in the image at `.cowshed/env` and is rewritten on token rotation. The repository `.envrc`
+is a two-liner that sources that file. Cowshed does not authorize direnv or devenv trust databases. Reattach a detached
+session workspace with `cowshed attach`.
 
 ### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse] [--slot <n>]`
 
@@ -278,7 +277,6 @@ origins. A config file included only in the checkout is reported by name with th
 in, plus the remedy: add a pattern covering the mount root, or `cowshed setup --mount-root`. Creation continues; the
 same finding appears in `cowshed doctor`.
 
-
 ### `cowshed ls [--all]`
 
 Bare `ls` remains scoped to the repository selected by cwd or `--project`. Its stdout is a space-aligned table:
@@ -292,8 +290,10 @@ fox    detached  cowshed/fox
 ```
 
 If that scoped list is empty, stderr reports how many other adopted projects exist and points to `cowshed ls --all`.
-`--all` discovers every validated `<store>/<owner>/<repo>/repository.json`, then uses each project's normal listing
-path. Plain output adds `repoId` as the first column and keeps projects contiguous:
+`--all` discovers every validated `<store>/<owner>/<repo>/repository.json` and derives every workspace from its image,
+detached sidecar, and current kernel mount facts. It never opens project checkouts or reads Git remotes, so a missing
+direct-mounted main is reported as detached instead of aborting the store-wide list. Plain output adds `repoId` as the
+first column and keeps projects contiguous:
 
 ```
 $ cowshed ls --all
@@ -313,8 +313,8 @@ path is always live; pass `--no-attach` to skip the remount and get the would-be
 ### `cowshed path --slot <n>` — build slots and compiler-cache reuse
 
 A **build slot** is one stable mount path, occupied by one workspace at a time. `cowshed new <name> --slot 3` binds slot
-3, and that workspace mounts at `<project-root>/.cowshed/slot-3` instead of `.../<name>`. When it is removed or
-renamed the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
+3, and that workspace mounts at `<project-root>/.cowshed/slot-3` instead of `.../<name>`. When it is removed or renamed
+the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
 
 That path identity is the entire feature, because compiler caches key on absolute paths:
 
@@ -439,8 +439,8 @@ credentials and is not a general TCP/Unix-socket forwarder; the socket inode, na
 authority boundary. Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration
 rather than assuming host-wide loopback.
 
-On macOS, `.cowshed/env` exports `PORT` (base+1) and `COWSHED_PORT_BASE` for tools that need several ports;
-devenv offsets can derive from the block. Linux configuration contains no block or sentinel values.
+On macOS, `.cowshed/env` exports `PORT` (base+1) and `COWSHED_PORT_BASE` for tools that need several ports; devenv
+offsets can derive from the block. Linux configuration contains no block or sentinel values.
 
 ```
 $ cowshed shell raven
@@ -468,14 +468,13 @@ $ cowshed exec raven --session build -- bun run build:everything
 ```
 
 Control/status JSON is bounded; it may carry tagged bytes only for a small inline artifact. Supervisor-captured streams
-and artifact reads resolve the canonical artifact independently of whether it is inline or spilled and preserve arbitrary
-binary output without UTF-8 assumptions or response-size growth.
-
+and artifact reads resolve the canonical artifact independently of whether it is inline or spilled and preserve
+arbitrary binary output without UTF-8 assumptions or response-size growth.
 
 ### `cowshed attach [ws] [--all]`
 
-Mount detached session workspaces and print their mount path(s). `<ws>` attaches one session workspace. With no name,
-a cwd inside a project checkout or session attaches that project's detached session workspaces. `--all` attaches every
+Mount detached session workspaces and print their mount path(s). `<ws>` attaches one session workspace. With no name, a
+cwd inside a project checkout or session attaches that project's detached session workspaces. `--all` attaches every
 detached session workspace store-wide. Mains are always mounted and are never attach targets.
 
 Workspace environment lives in the image as `.cowshed/env`, rewritten on token rotation and sourced by the repository
@@ -489,7 +488,6 @@ file. `attach` and `path` bring them back. `<ws>` detaches one session, resolved
 (`<owner>/<repo>/sessions/<ws>.image` plus the image sidecar / marker identity) so it does not require cwd or git
 discovery. `--project` still selects the project. `--all` detaches every attached session workspace store-wide. Mains
 are always mounted and are never detach targets.
-
 
 ### `cowshed resize <name|main> <size>`
 
@@ -559,11 +557,11 @@ egress	api.github.com
 
 ## Authority boundaries
 
-Project lookup is discovery-only. Workspace inspection may safely attach. A worker capability controls one
-workspace's exec, shell, jobs, quota-limited checkpoints, push, and grant reads. Only a trusted coordinator may
-grant/revoke, restore/destroy/rebase/land, run gc, or mirror repositories. The persistent per-workspace supervisor
-socket is permission- and peer-checked, supports concurrent clients and reconnect, and is never unlinked merely because
-one client disconnects.
+Project lookup is discovery-only. Workspace inspection may safely attach. A worker capability controls one workspace's
+exec, shell, jobs, quota-limited checkpoints, push, and grant reads. Only a trusted coordinator may grant/revoke,
+restore/destroy/rebase/land, run gc, or mirror repositories. The persistent per-workspace supervisor socket is
+permission- and peer-checked, supports concurrent clients and reconnect, and is never unlinked merely because one client
+disconnects.
 
 Protected in-volume Arrow records, inline bytes, and spill files are captured-content authority within their origin
 incarnation/checkpoint snapshot. The image's marker carries the incarnation and its lineage, which is what authorizes
@@ -580,9 +578,9 @@ denial.
 ## Git
 
 Workspace git is **local-paths-only**: every workspace has the `host` remote (main's repository, a mounted path) and can
-clone from read-only mirrors under `/private/cowshed/caches/repo-mirrors` — nothing else. No remote URLs, no credentials, no credential
-helpers exist inside a workspace; pushing to real remotes (origin, GitHub) is coordinator work, done host-side with your
-normal git setup.
+clone from read-only mirrors under `/private/cowshed/caches/repo-mirrors` — nothing else. No remote URLs, no
+credentials, no credential helpers exist inside a workspace; pushing to real remotes (origin, GitHub) is coordinator
+work, done host-side with your normal git setup.
 
 ### `cowshed push <name> [--branch <b>]`
 
@@ -644,8 +642,8 @@ files; a manifest commits every checkpoint-resident job byte. Recovery may disca
 Restore swaps the current image for the checkpoint (detach → clone → reattach, ~500 ms) and mints a new workspace
 incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker
 records the lineage, and the controller's audit record of the restore carries the hashes. Restore refuses over unsaved
-work (exit 4); the displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is
-itself undoable. List checkpoints with `cowshed ls --json` or `cowshed du`.
+work (exit 4); the displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is itself undoable.
+List checkpoints with `cowshed ls --json` or `cowshed du`.
 
 ```
 $ cowshed checkpoint raven pre-refactor
@@ -685,28 +683,28 @@ these are idempotent, and a `--purge` with nothing installed says so rather than
 }
 ```
 
-`gateway run` is the LaunchAgent's internal foreground entrypoint. It validates already-mounted host storage and
-creates none, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT. Ordinary `exec`,
+`gateway run` is the LaunchAgent's internal foreground entrypoint. It validates already-mounted host storage and creates
+none, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT. Ordinary `exec`,
 `attach`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
 reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
 `launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.
 
 ### `cowshed sccache start [--capacity <size>]` / `stop` / `status`
 
-The gateway daemon starts this agent itself, so a healthy host already has it: `run_daemon` repairs/reattaches every project's mounts
-and then the compile cache. A host without sccache on PATH logs one line and serves normally. The verbs are for repair,
-inspection, and resizing.
+The gateway daemon starts this agent itself, so a healthy host already has it: `run_daemon` repairs/reattaches every
+project's mounts and then the compile cache. A host without sccache on PATH logs one line and serves normally. The verbs
+are for repair, inspection, and resizing.
 
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.sccache`, then waits until the server answers on
-its unix socket at `/private/cowshed/store/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ — a copy at
-`~/Library/Application Support/dev.cowshed/bin/sccache`, installed by `start` from the sccache it resolves on the
-invoking shell's PATH, so run it from a shell with the devenv/nix sccache available — as a foreground unix-socket server:
-`SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
-`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at `/private/cowshed/caches/sccache`.
-Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the agent and removes the plist; both
-operations are idempotent. The copy is what keeps the daemon alive across a devenv update or nix garbage collection: an
-sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies on byte drift and rewrites the plist
-only on drift.
+its unix socket at `/private/cowshed/store/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ — a copy
+at `~/Library/Application Support/dev.cowshed/bin/sccache`, installed by `start` from the sccache it resolves on the
+invoking shell's PATH, so run it from a shell with the devenv/nix sccache available — as a foreground unix-socket
+server: `SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
+`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at
+`/private/cowshed/caches/sccache`. Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the
+agent and removes the plist; both operations are idempotent. The copy is what keeps the daemon alive across a devenv
+update or nix garbage collection: an sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies
+on byte drift and rewrites the plist only on drift.
 
 Two more variables are in that plist because sccache reads them once, at server start, and no client can supply them:
 

@@ -1583,6 +1583,19 @@ impl NativeProjectRuntimeHost {
         } else {
             None
         };
+        // A session marker identifies the project from store authority. Its recorded checkout may
+        // be a missing direct mount, so resolving that identity must happen before replacing the
+        // invocation repository handle with one rooted at the recorded checkout.
+        let session_project = if existing_only {
+            project_binding_from_workspace_origin(
+                bootstrap.roots().store(),
+                &git_root,
+                origin.as_ref(),
+            )
+            .await?
+        } else {
+            None
+        };
         let mut binding_repo_id = if existing_only {
             origin.as_ref().map(|origin| origin.repo_id.clone())
         } else {
@@ -1613,15 +1626,20 @@ impl NativeProjectRuntimeHost {
                 .await
                 .map_err(native_integrity_error)?;
         }
-        let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
-        let repo_id = candidate
-            .primary()
-            .map_err(native_integrity_error)?
-            .repo_id
-            .clone();
-        let layout = crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
-            .map_err(native_integrity_error)?;
-        let binding = load_or_validate_binding(&layout, candidate, &git).await?;
+        let (repo_id, layout, binding) = if let Some((repo_id, layout, binding)) = session_project {
+            (repo_id, layout, binding)
+        } else {
+            let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
+            let repo_id = candidate
+                .primary()
+                .map_err(native_integrity_error)?
+                .repo_id
+                .clone();
+            let layout = crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
+                .map_err(native_integrity_error)?;
+            let binding = load_or_validate_binding(&layout, candidate, &git).await?;
+            (repo_id, layout, binding)
+        };
         // Every resolver that answers "where does main mount" reads this one value, so it is
         // resolved once here, from durable project state, and never inferred per call site.
         let checkout_layout = layout.checkout_layout().map_err(native_integrity_error)?;
@@ -3155,15 +3173,23 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     }
 
     async fn recover(&mut self) -> Result<()> {
-        // One binding check and one inventory read for the whole recovery: the per-workspace
-        // entry point re-validates and re-lists because a verb may arrive long after open, but
-        // here every supervisor starts from the same just-validated, just-read state, and doing
-        // either per workspace made project open quadratic in workspace count (each inventory
-        // read touches every image) with four git processes per workspace on top.
-        self.validate_binding().await?;
-        let attached = self
-            .authoritative()
-            .await?
+        // One inventory read for the whole recovery. A detached direct-mounted main has no Git
+        // repository at its recorded checkout by definition; its session marker and persisted
+        // binding were validated during open, so querying remotes there would prevent the move
+        // operation that repairs it. Every other state retains the ordinary live-Git check.
+        let authoritative = self.authoritative().await?;
+        let detached_direct_main = self.substrate_config.checkout_layout.mounts_at_checkout()
+            && authoritative.iter().any(|workspace| {
+                workspace.derived.workspace.name().is_main()
+                    && matches!(
+                        workspace.derived.mount_state,
+                        crate::storage::lifecycle::MountState::Detached
+                    )
+            });
+        if !detached_direct_main {
+            self.validate_binding().await?;
+        }
+        let attached = authoritative
             .into_iter()
             .filter(|workspace| {
                 matches!(
@@ -3635,11 +3661,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     /// before the source link is removed, and the tree is reachable by at least one name at every
     /// instant.
     ///
-    /// **Direct mount.** The checkout path *is* the mountpoint, and a mountpoint cannot be renamed
-    /// while it is mounted. This is the real transaction: detach, rename the (now stub-carrying)
-    /// mountpoint directory, rebind the substrate onto the new path, re-attach. Every step after
-    /// the detach has an inverse, and a failure runs them in reverse so the checkout ends where it
-    /// started rather than in a half-moved state.
+    /// **Direct mount.** The checkout path *is* the mountpoint. A mounted main is detached, its
+    /// stub directory is renamed, the substrate is rebound, and the image is re-attached. A main
+    /// that was already detached is recovered from its image and detached sidecar instead: the old
+    /// path need not exist, and no Git command is sent there. In either case the destination fact
+    /// is durable before the final mount, so a crash can only leave a forward-recoverable detach.
     ///
     /// The durable record is rewritten **before** the tree moves, in both layouts. Under direct
     /// mount the source path stops existing the instant the rename lands, so a record still naming
@@ -3650,16 +3676,26 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
 
-        self.validate_binding().await?;
         let main = main_name();
         let source = self.substrate_config.checkout_path.clone();
         let layout = self.substrate_config.checkout_layout;
+        let current = self.current(&main).await?;
+        let detached_direct = layout.mounts_at_checkout()
+            && matches!(
+                current.derived.mount_state,
+                crate::storage::lifecycle::MountState::Detached
+            );
+        // A detached direct mount has no repository at the recorded checkout path. Its persisted
+        // binding was validated while opening from the session marker; querying Git here would
+        // turn the exact recovery state into "cannot change to <old path>".
+        if !detached_direct {
+            self.validate_binding().await?;
+        }
         self.validate_move_destination(&source, &destination)
             .await?;
 
-        let current = self.current(&main).await?;
         let mount_point = self.workspace_mount_path(&main)?;
-        if !crate::checkout::resolves_to(&source, &mount_point) {
+        if !detached_direct && !crate::checkout::resolves_to(&source, &mount_point) {
             return Err(CowshedError::conflict(
                 format!(
                     "the recorded checkout {} does not resolve to main's mount {}",
@@ -3670,6 +3706,103 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ));
         }
         let record = self.checkout_record(&current)?;
+
+        if detached_direct {
+            let prepare_record = record.clone();
+            let prepare_layout = self.layout.clone();
+            let prepare_source = source.clone();
+            let prepare_destination = destination.clone();
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                let source_existed = match std::fs::symlink_metadata(&prepare_source) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {
+                        std::fs::rename(&prepare_source, &prepare_destination).map_err(|error| {
+                            CowshedError::environment_missing(
+                                format!(
+                                    "cannot move the detached checkout mountpoint to {}: {error}",
+                                    prepare_destination.display()
+                                ),
+                                "choose a destination on the same writable filesystem",
+                            )
+                        })?;
+                        true
+                    }
+                    Ok(_) => {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "the detached checkout path {} is not a directory",
+                                prepare_source.display()
+                            ),
+                            "remove the occupant or run cowshed doctor --json",
+                        ));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&prepare_destination).map_err(|error| {
+                            CowshedError::environment_missing(
+                                format!(
+                                    "cannot create checkout mountpoint {}: {error}",
+                                    prepare_destination.display()
+                                ),
+                                "choose a destination in a writable directory",
+                            )
+                        })?;
+                        false
+                    }
+                    Err(error) => {
+                        return Err(CowshedError::environment_missing(
+                            format!(
+                                "cannot inspect detached checkout path {}: {error}",
+                                prepare_source.display()
+                            ),
+                            "check the old checkout parent permissions and retry",
+                        ));
+                    }
+                };
+                let recorded = prepare_layout
+                    .record_checkout_layout(layout)
+                    .map_err(native_integrity_error)
+                    .and_then(|()| {
+                        prepare_record
+                            .rewrite_detached_project_root(&prepare_destination)
+                            .map_err(native_integrity_error)
+                            .map(|_| ())
+                    });
+                if let Err(error) = recorded {
+                    if source_existed {
+                        let _ = std::fs::rename(&prepare_destination, &prepare_source);
+                    } else {
+                        let _ = std::fs::remove_dir(&prepare_destination);
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("detached checkout move task failed: {error}"))
+            })??;
+
+            self.rebind_checkout(&destination, layout)?;
+            let current = self.current(&main).await?;
+            self.substrate
+                .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+                .await
+                .map_err(native_storage_error)?;
+            self.advance_gateway_revision(&current).await?;
+            let current = self.current(&main).await?;
+            let mounted_record = self.checkout_record(&current)?;
+            let mounted_destination = destination.clone();
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                mounted_record.rewrite_project_root(&mounted_destination)
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("checkout record task failed: {error}"))
+            })?
+            .map_err(native_integrity_error)?;
+            self.rewrite_main_remotes().await?;
+            self.ensure_supervisor(&main).await?;
+            return self.snapshot_named(&main).await;
+        }
 
         // The record moves first; see the method comment for why this direction is the recoverable
         // one. It is also the only step that can fail for a reason the filesystem cannot undo, so
@@ -5322,18 +5455,11 @@ fn validate_binding_against_remotes(
 }
 
 #[cfg(target_os = "macos")]
-async fn load_or_validate_binding(
+async fn read_persisted_binding(
     layout: &crate::storage::StorageLayout,
-    candidate: RepositoryBinding,
-    git: &crate::git::GitRepository,
-) -> Result<RepositoryBinding> {
-    let candidate_repo_id = candidate
-        .primary()
-        .map_err(native_integrity_error)?
-        .repo_id
-        .clone();
+) -> Result<Option<RepositoryBinding>> {
     let path = layout.project().repository_binding.clone();
-    let loaded = crate::storage::lifecycle::dispatch_blocking(move || {
+    crate::storage::lifecycle::dispatch_blocking(move || {
         match crate::metadata::read_json::<RepositoryBinding>(&path) {
             Ok(binding) => Ok(Some(binding)),
             Err(crate::metadata::MetadataError::Io { source, .. })
@@ -5346,7 +5472,58 @@ async fn load_or_validate_binding(
     })
     .await
     .map_err(|error| CowshedError::internal(error.to_string()))?
-    .map_err(native_integrity_error)?;
+    .map_err(native_integrity_error)
+}
+
+/// Resolve a session invocation through the store binding, without opening the recorded checkout.
+///
+/// A session's marker names main's checkout, not the session repository the caller is standing
+/// in. When those roots differ, the marker identity and persisted binding are the complete project
+/// authority. In particular, the recorded checkout may be a missing direct mount; no Git command
+/// may be aimed at it merely to learn an identity the store already records.
+#[cfg(target_os = "macos")]
+async fn project_binding_from_workspace_origin(
+    store_root: &Path,
+    invocation_root: &Path,
+    origin: Option<&WorkspaceOrigin>,
+) -> Result<Option<(RepoId, crate::storage::StorageLayout, RepositoryBinding)>> {
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    if names_one_root(&origin.project_root, invocation_root) {
+        return Ok(None);
+    }
+    let repo_id = origin.repo_id.clone();
+    let layout =
+        crate::storage::StorageLayout::new(store_root, &repo_id).map_err(native_integrity_error)?;
+    let binding = read_persisted_binding(&layout).await?.ok_or_else(|| {
+        CowshedError::integrity(
+            format!("adopted project {repo_id} has no persisted repository binding"),
+            "cowshed doctor --json",
+        )
+    })?;
+    binding.validate().map_err(native_integrity_error)?;
+    if binding.primary().map_err(native_integrity_error)?.repo_id != repo_id {
+        return Err(CowshedError::conflict(
+            "workspace marker identity differs from the persisted repository binding",
+            "repair the repository binding before opening cowshed",
+        ));
+    }
+    Ok(Some((repo_id, layout, binding)))
+}
+
+#[cfg(target_os = "macos")]
+async fn load_or_validate_binding(
+    layout: &crate::storage::StorageLayout,
+    candidate: RepositoryBinding,
+    git: &crate::git::GitRepository,
+) -> Result<RepositoryBinding> {
+    let candidate_repo_id = candidate
+        .primary()
+        .map_err(native_integrity_error)?
+        .repo_id
+        .clone();
+    let loaded = read_persisted_binding(layout).await?;
     let binding = loaded.unwrap_or(candidate);
     if binding.primary().map_err(native_integrity_error)?.repo_id != candidate_repo_id {
         return Err(CowshedError::conflict(
@@ -6837,6 +7014,51 @@ mod workspace_origin_tests {
         assert_eq!(
             origin.project_root, checkout,
             "the project checkout comes from the marker, never from the invocation directory"
+        );
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[tokio::test]
+    async fn a_session_resolves_a_missing_main_from_the_store_without_opening_old_git() {
+        let temp = temp_directory("stale-main-binding");
+        let store = temp.join("store");
+        let missing_checkout = temp.join("missing-main");
+        let session = temp.join("mnt/slot@1");
+        std::fs::create_dir_all(&session).expect("session mount");
+        write_marker(
+            &session,
+            "task",
+            WorkspaceRole::Workspace,
+            &missing_checkout,
+        );
+        let origin = workspace_origin_from_marker(&session)
+            .await
+            .expect("session marker")
+            .expect("origin");
+        let repo_id = RepoId::parse("acme/widget").expect("repo");
+        let layout = crate::storage::StorageLayout::new(&store, &repo_id).expect("layout");
+        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id.clone(),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://example.test/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+            .expect("persist binding");
+
+        let (resolved_repo, _, resolved_binding) =
+            project_binding_from_workspace_origin(&store, &session, Some(&origin))
+                .await
+                .expect("store binding resolves a detached main")
+                .expect("session roots differ");
+        assert_eq!(resolved_repo, repo_id);
+        assert_eq!(resolved_binding, binding);
+        assert!(
+            !missing_checkout.exists(),
+            "the old checkout path remains absent; resolving identity never opens it"
         );
 
         std::fs::remove_dir_all(&temp).ok();
