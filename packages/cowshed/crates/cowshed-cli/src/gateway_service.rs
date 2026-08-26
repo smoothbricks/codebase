@@ -430,7 +430,7 @@ where
         // copying a file onto itself is the one publication the plan cannot express.
         return Ok(executable);
     }
-    require_durable_source(home, name, source)?;
+    require_durable_source(home, &executable, source)?;
     let state = observe_executable_install(&executable, source)?;
     executor
         .execute_install(&plan_executable_install(&executable, source, state))
@@ -439,7 +439,15 @@ where
 }
 
 /// Refuse a source launchd could not reach at boot, saying which volume and why.
-fn require_durable_source(home: &Path, name: &str, source: &Path) -> Result<()> {
+///
+/// The hint names the installed copy when there is one, because that is the case an operator
+/// actually hits: a cowshed reached through a workspace-resident trampoline cannot install the
+/// agent, while the copy already on the host volume can.
+fn require_durable_source(
+    home: &Path,
+    executable: &HostStableExecutable,
+    source: &Path,
+) -> Result<()> {
     let mount_point = containing_mount_point(source).map_err(|error| {
         CowshedError::internal(format!(
             "could not resolve the volume holding {}: {error}",
@@ -452,13 +460,21 @@ fn require_durable_source(home: &Path, name: &str, source: &Path) -> Result<()> 
         mount_is_workspace: fs::symlink_metadata(mount_point.join(WORKSPACE_MARKER_PATH)).is_ok(),
     };
     classify_executable_source(home, observed).map_err(|unstable| {
+        let hint = if fs::symlink_metadata(executable.path()).is_ok() {
+            format!("start the service from {}", executable.path().display())
+        } else {
+            format!(
+                "install {} outside every cowshed workspace and run this command from that binary",
+                executable.name()
+            )
+        };
         CowshedError::environment_missing(
             format!(
                 "{unstable}, so a LaunchAgent installed from it would dangle after a reboot: \
                  launchd starts the agent before cowshed has mounted anything, and the service \
                  exits 78 in a KeepAlive loop with nothing left to mount what would heal it"
             ),
-            format!("install {name} outside every cowshed workspace and run this command from that binary"),
+            hint,
         )
     })
 }
