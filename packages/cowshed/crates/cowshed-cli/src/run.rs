@@ -226,12 +226,38 @@ mod tests {
     }
 
     #[test]
-    fn detach_all_selects_store_wide_dispatch_before_project_open() {
-        let parsed = args::parse_args(["detach", "--all"]).expect("detach --all parses");
-
+    fn store_wide_dispatch_is_selected_before_any_project_open() {
+        let parsed = args::parse_args([
+            "--project",
+            "/adopted/checkout/whose-recorded-remote-is-stale",
+            "attach",
+            "--all",
+        ])
+        .expect("attach --all parses without opening the project");
         assert_eq!(runtime_dispatch(&parsed.command), RuntimeDispatch::Host);
+        assert_eq!(
+            parsed.command.project_discovery(),
+            args::ProjectDiscovery::NotUsed
+        );
 
-        let named = args::parse_args(["detach", "raven"]).expect("named detach parses");
+        let bare = args::parse_args(["attach"]).expect("bare attach parses");
+        assert_eq!(runtime_dispatch(&bare.command), RuntimeDispatch::Project);
+        assert_eq!(
+            bare.command.project_discovery(),
+            args::ProjectDiscovery::Required
+        );
+
+        let named = args::parse_args(["attach", "raven"]).expect("named attach parses");
         assert_eq!(runtime_dispatch(&named.command), RuntimeDispatch::Project);
+        assert_eq!(
+            named.command.project_discovery(),
+            args::ProjectDiscovery::Required
+        );
+
+        let detach_all = args::parse_args(["detach", "--all"]).expect("detach --all parses");
+        assert_eq!(
+            runtime_dispatch(&detach_all.command),
+            RuntimeDispatch::Host
+        );
     }
 }
