@@ -12,7 +12,9 @@ use std::io;
 use cowshed_core::CowshedError;
 use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper};
 
-use crate::{args, gateway_service, help, output, runtime, sccache_service, skill};
+use crate::{
+    args, gateway_service, help, output, runtime, sccache_service, setup_service, skill,
+};
 
 /// Run one CLI invocation. `arguments` excludes argv[0].
 ///
@@ -80,54 +82,44 @@ async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
         };
     }
     if let args::Command::Skill(skill_args) = &parsed.command {
-        return match skill::dispatch(skill_args, &parsed.global, &mut output) {
-            Ok(exit_code) => exit_code,
-            Err(error) => {
-                let exit_code = i32::from(error.exit_code());
-                if let Err(write_error) = write_error(&mut output, error, json, None) {
-                    eprintln!("cowshed: failed to write command result: {write_error}");
-                    1
-                } else {
-                    exit_code
-                }
-            }
-        };
+        let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
+        return finish(outcome, &mut output, json);
     }
     if let args::Command::Gateway(action) = &parsed.command {
-        return match gateway_service::dispatch(*action, parsed.global.json, &mut output).await {
-            Ok(exit_code) => exit_code,
-            Err(error) => {
-                let exit_code = i32::from(error.exit_code());
-                if let Err(write_error) = write_error(&mut output, error, json, None) {
-                    eprintln!("cowshed: failed to write command result: {write_error}");
-                    1
-                } else {
-                    exit_code
-                }
-            }
-        };
+        let outcome = gateway_service::dispatch(*action, parsed.global.json, &mut output).await;
+        return finish(outcome, &mut output, json);
     }
     if let args::Command::Sccache(action) = &parsed.command {
-        return match sccache_service::dispatch(action.clone(), parsed.global.json, &mut output)
-            .await
-        {
-            Ok(exit_code) => exit_code,
-            Err(error) => {
-                let exit_code = i32::from(error.exit_code());
-                if let Err(write_error) = write_error(&mut output, error, json, None) {
-                    eprintln!("cowshed: failed to write command result: {write_error}");
-                    1
-                } else {
-                    exit_code
-                }
-            }
-        };
+        let outcome =
+            sccache_service::dispatch(action.clone(), parsed.global.json, &mut output).await;
+        return finish(outcome, &mut output, json);
     }
-    match runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output).await {
-        Ok(exit) => exit.code,
+    // `setup` has no project and no workspace: its subject is the host, so it dispatches here
+    // beside the other host services rather than through the project runtime bridge.
+    if let args::Command::Setup(setup_args) = &parsed.command {
+        let outcome =
+            setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
+        return finish(outcome, &mut output, json);
+    }
+    let outcome = runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output)
+        .await
+        .map(|exit| exit.code);
+    finish(outcome, &mut output, json)
+}
+
+/// Turn one command's outcome into this process's exit code, reporting a failure in whichever
+/// format the caller asked for. Every dispatch path ends here so none of them can grow its own
+/// idea of how an error is written.
+fn finish<W: io::Write, E: io::Write>(
+    outcome: Result<i32, CowshedError>,
+    output: &mut output::Output<W, E>,
+    json: bool,
+) -> i32 {
+    match outcome {
+        Ok(exit_code) => exit_code,
         Err(error) => {
             let exit_code = i32::from(error.exit_code());
-            if let Err(write_error) = write_error(&mut output, error, json, None) {
+            if let Err(write_error) = write_error(output, error, json, None) {
                 eprintln!("cowshed: failed to write command result: {write_error}");
                 1
             } else {

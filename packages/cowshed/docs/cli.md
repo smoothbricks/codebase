@@ -71,22 +71,94 @@ identity cannot be derived unambiguously from its remotes.
 
 ## Lifecycle
 
+### `cowshed setup [--uninstall] [--force]`
+
+Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It
+provisions absent volumes, remounts detached or mis-mounted ones at their canonical paths, validates each volume
+marker, and pins the boot mounts in `/etc/fstab`. On a healthy host it changes nothing and says so. Every storage error
+in the CLI points here — a host with no volumes has no checkout to adopt.
+
+Anything that can escalate happens inside one authorization session, announced before the dialog appears; a run with
+nothing to escalate raises no prompt at all. `-q` suppresses the per-volume rows but never that announcement.
+
+The stranded-user recovery, after a reboot left the volumes unmounted:
+
+```
+$ cowshed new raven
+cowshed: cowshed.store is not mounted at /private/cowshed/store
+next: cowshed setup
+
+$ cowshed setup
+cowshed: planned: remount cowshed.store at /private/cowshed/store
+cowshed: planned: remount cowshed.caches at /private/cowshed/caches
+cowshed: cowshed.store (store): present but not mounted -> remounted
+cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted
+cowshed: /etc/fstab already pins the boot mounts
+cowshed: host storage is set up
+next: cowshed doctor
+
+$ cowshed setup
+cowshed: cowshed.store (store): mounted at its canonical path -> already-current
+cowshed: cowshed.caches (caches): mounted at its canonical path -> already-current
+cowshed: /etc/fstab already pins the boot mounts
+cowshed: everything already set up
+next: cowshed doctor
+```
+
+A volume that exists **outside this host's container** — a `cowshed.store` on another disk — is reported as its own
+state with its device named, and left exactly as it is. It is never reported as missing and never re-provisioned,
+because re-provisioning means `diskutil apfs deleteVolume`:
+
+```
+cowshed: cowshed.store (store): found outside this host's container (container disk4, device disk4s7) -> reported
+cowshed: data is safe on disk4s7; not provisioned
+cowshed: host storage is partially set up: 1 volume lives outside this host's container and left untouched
+```
+
+`--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
+the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, and the
+installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data;
+everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while their occupancy
+cannot be established at all (an unmounted store looks empty to every cheap check), until `--force` says the caller
+means it anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed command
+line:
+
+```
+$ cowshed setup --uninstall
+cowshed: 5 workspaces still exist on this host's volumes across 2 adopted projects; uninstall removes no volume and no
+image, so they would be left unmanaged
+next: cowshed setup --uninstall --force
+```
+
+With `--json`, `setup` emits the frozen envelope carrying the per-volume report, and `--uninstall` the fstab outcome:
+
+```
+$ cowshed setup --json
+{"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"provisioned"}],"fstab":"pinned","authorized":true}}
+
+$ cowshed setup --uninstall --force --json
+{"ok":true,"result":{"fstab":"removed"}}
+```
+
 ### `cowshed adopt`
 
 Run once inside each existing checkout you want cowshed to manage. Adoption converts that repository into an
 image-backed **main workspace** at the same path. A host may have any number of adopted repositories and therefore any
 number of repository-scoped mains. Adoption is the only operation that copies the source tree into a new image.
 
-On macOS, this foreground `cowshed adopt` is the **only** command allowed to provision native storage. The first adopt
-on a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts the
-space-sharing `cowshed.store` and `cowshed.caches` APFS volumes. Once both volumes are present and correctly mounted,
-later adopts only validate them and do not prompt.
+On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to provision native storage. The first
+adopt on a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts
+the space-sharing `cowshed.store` and `cowshed.caches` APFS volumes. Once both volumes are present and correctly
+mounted, later adopts only validate them and do not prompt.
 
 Every other command (`new`, `ls`, `path`, `exec`, `rm`, `attach`, `detach`, and `doctor`) opens storage in existing-only
 mode. If either volume is absent or needs mounting, the command exits with `environment-missing`, lists the required
-setup actions, and prints `next: cowshed adopt`; it never creates a volume, repairs a mount, or requests administrator
+setup actions, and prints `next: cowshed setup`; it never creates a volume, repairs a mount, or requests administrator
 authorization. Launchd agents and future background services use the same existing-only entrypoint, so a background
 process can report missing setup but can never cause a macOS authorization prompt.
+
+Storage guidance points at `cowshed setup`, never at adopting a directory: a host with no volumes has no checkout to
+adopt, and `adopt` would ask for one.
 
 ```
 $ cd <project-root> && cowshed adopt
@@ -537,7 +609,7 @@ next: cowshed exec raven -- git status
 
 ## Infrastructure
 
-### `cowshed gateway start` / `stop` / `status`
+### `cowshed gateway start` / `stop [--purge]` / `status`
 
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.gateway`, then waits until its authenticated Unix
 control socket is healthy. The generated mode-0600 plist names `~/Library/Application Support/dev.cowshed/bin/cowshed`,
@@ -545,7 +617,10 @@ control socket is healthy. The generated mode-0600 plist names `~/Library/Applic
 the volume carrying `~/Library/LaunchAgents` itself, so launchd can still reach the program after a reboot: `start`
 copies the running executable there when the bytes differ, and refuses a running executable inside cowshed's own storage
 rather than baking in a path that only exists once cowshed has mounted it. `stop` boots out the agent and removes the
-plist, leaving the installed binary; both operations are idempotent.
+plist, leaving the installed binary — that copy is host state rather than agent state, and keeping it makes the next
+`start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too, for a host that is done
+with the gateway rather than pausing it; `cowshed setup --uninstall` does the same for both services at once. All of
+these are idempotent, and a `--purge` with nothing installed says so rather than failing.
 
 `status` reports health without starting the service. Its JSON result is the standard frozen envelope:
 

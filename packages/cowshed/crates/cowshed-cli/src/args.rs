@@ -10,6 +10,7 @@ use crate::help::{self, CommandSpec, Opt};
 /// so a verb the parser dispatches is a verb the help knows about.
 pub static COMMANDS: &[&CommandSpec] = &[
     &ADOPT,
+    &SETUP,
     &NEW,
     &FORK,
     &MOVE,
@@ -49,6 +50,9 @@ pub struct Cli {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Adopt(AdoptArgs),
+    /// Host storage provisioning, repair, and teardown. Its subject is the host, so it takes no
+    /// project and no workspace — neither is something a stranded machine can name.
+    Setup(SetupArgs),
     New(NewArgs),
     Fork(ForkArgs),
     Move(MoveArgs),
@@ -104,6 +108,7 @@ impl Command {
             Self::List(args) if !args.all => ProjectDiscovery::Optional,
             Self::Doctor => ProjectDiscovery::Optional,
             Self::List(_)
+            | Self::Setup(_)
             | Self::Gateway(_)
             | Self::Sccache(_)
             | Self::Skill(_)
@@ -125,12 +130,27 @@ pub struct SkillArgs {
     pub harnesses: Vec<String>,
 }
 
+/// `stop` takes `--purge` because deactivating an agent and deleting the binary it ran are two
+/// different intentions: the ordinary stop leaves the installed copy so the next `start` is a
+/// plist write, and `--purge` is for a host that is done with cowshed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayCommand {
     Start,
-    Stop,
+    Stop { purge: bool },
     Status,
     Run,
+}
+
+/// `setup` runs in one of two directions and never both, so they are one flag apiece rather than a
+/// subcommand: the verb's whole promise is that a stranded host can type `cowshed setup`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SetupArgs {
+    /// Remove cowshed's host presence — fstab pins, service agents, installed binaries — while
+    /// leaving every volume, image, and workspace exactly where it is.
+    pub uninstall: bool,
+    /// Proceed with `--uninstall` although the volumes still hold workspaces, or although their
+    /// occupancy could not be established at all.
+    pub force: bool,
 }
 
 /// `start` takes the cache cap because the cap is the one thing a host operator has to be able to
@@ -384,6 +404,7 @@ impl std::error::Error for UsageError {}
 #[derive(Clone, Copy)]
 enum CommandName {
     Adopt,
+    Setup,
     New,
     Fork,
     Move,
@@ -412,6 +433,7 @@ impl CommandName {
     fn spec(self) -> &'static CommandSpec {
         match self {
             Self::Adopt => &ADOPT,
+            Self::Setup => &SETUP,
             Self::New => &NEW,
             Self::Fork => &FORK,
             Self::Move => &MOVE,
@@ -449,6 +471,7 @@ where
 
     let command = match args.get(index).and_then(|arg| arg.to_str()) {
         Some("adopt") => CommandName::Adopt,
+        Some("setup") => CommandName::Setup,
         Some("new") => CommandName::New,
         Some("fork") => CommandName::Fork,
         Some("mv") => CommandName::Move,
@@ -491,6 +514,7 @@ where
 
     let command = match command {
         CommandName::Adopt => parse_adopt(&args, index, &mut global)?,
+        CommandName::Setup => parse_setup(&args, index, &mut global)?,
         CommandName::New => parse_new(&args, index, &mut global)?,
         CommandName::Fork => parse_fork(&args, index, &mut global)?,
         CommandName::Move => parse_move(&args, index, &mut global)?,
@@ -573,8 +597,12 @@ const GATEWAY: CommandSpec = CommandSpec {
     about: &[
         "The gateway is the one trusted process outside every sandbox: workspaces reach the network, main's repository, and each other only through its authenticated Unix socket. `start` installs and loads the per-user LaunchAgent and waits until that socket answers; `stop` boots it out; `status` reports health without starting anything. Both mutations are idempotent.",
         "`run` is the LaunchAgent's own foreground entrypoint. It validates already-mounted storage and never provisions any, so a background start can report missing setup but can never raise an authorization prompt.",
+        "An ordinary `stop` leaves the host-stable binary copy the agent ran, because that copy is host state rather than agent state and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes it, for a host that is done with the gateway rather than pausing it.",
     ],
-    options: &[],
+    options: &[Opt {
+        spelling: "--purge",
+        meaning: "`stop` only: also delete the installed cowshed binary the agent ran, not just its plist",
+    }],
 };
 
 fn parse_gateway(
@@ -583,9 +611,9 @@ fn parse_gateway(
     global: &mut GlobalOptions,
 ) -> Result<Command, UsageError> {
     let usage: &'static CommandSpec = &GATEWAY;
-    let action = match args.get(index).and_then(|argument| argument.to_str()) {
+    let mut action = match args.get(index).and_then(|argument| argument.to_str()) {
         Some("start") => GatewayCommand::Start,
-        Some("stop") => GatewayCommand::Stop,
+        Some("stop") => GatewayCommand::Stop { purge: false },
         Some("status") => GatewayCommand::Status,
         Some("run") => GatewayCommand::Run,
         Some(other) => {
@@ -597,13 +625,21 @@ fn parse_gateway(
         None => return Err(UsageError::new("gateway action is required", usage)),
     };
     index += 1;
-    while index < args.len() && parse_global(args, &mut index, global)? {}
-    if index != args.len() {
-        let argument = args[index].to_string_lossy();
-        return Err(UsageError::new(
-            format!("unexpected gateway argument `{argument}`"),
-            usage,
-        ));
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match (args[index].to_str(), &mut action) {
+            (Some("--purge"), GatewayCommand::Stop { purge }) => *purge = true,
+            _ => {
+                let argument = args[index].to_string_lossy();
+                return Err(UsageError::new(
+                    format!("unexpected gateway argument `{argument}`"),
+                    usage,
+                ));
+            }
+        }
+        index += 1;
     }
     if global.project.is_some() {
         return Err(UsageError::new(
@@ -796,7 +832,8 @@ const ADOPT: CommandSpec = CommandSpec {
     trailing: "",
     summary: "adopt a checkout",
     about: &[
-        "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and on macOS the only command allowed to provision storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no later command ever can.",
+        "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and one of only two commands that may provision host storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no ordinary command ever can.",
+        "`cowshed setup` is the other, and the one every storage error points at: it repairs a host without needing a checkout to adopt. Reach for adopt when you have a repository to bring in, and for setup when the machine itself is wrong.",
     ],
     options: &[
         Opt {
@@ -840,6 +877,69 @@ fn parse_adopt(
         index += 1;
     }
     Ok(Command::Adopt(parsed))
+}
+
+const SETUP: CommandSpec = CommandSpec {
+    name: "setup",
+    args: "",
+    trailing: "",
+    summary: "provision or repair host storage and pin mounts",
+    about: &[
+        "Brings this host's two dedicated volumes to their canonical state and pins them in `/etc/fstab`: absent volumes are provisioned, detached or mis-mounted ones are remounted where they belong, markers are validated, and the fstab lines that survive a reboot are written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
+        "Everything that can require elevation happens inside one authorization session, announced on stderr before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never re-provisioned, because re-provisioning means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
+        "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--uninstall",
+            meaning: "remove cowshed's host presence — fstab pins, service agents, installed binaries — leaving every volume and workspace untouched",
+        },
+        Opt {
+            spelling: "--force",
+            meaning: "`--uninstall` only: proceed although workspaces remain, or although occupancy could not be established",
+        },
+    ],
+};
+
+/// `setup` takes two flags and never a project: a host whose volumes are missing has no adopted
+/// checkout to select, so silently accepting `--project` would promise a scope the verb does not
+/// have. `--force` without `--uninstall` is refused rather than ignored — it confirms a refusal
+/// that the forward direction never makes, so accepting it would answer a question nobody asked.
+fn parse_setup(
+    args: &[OsString],
+    mut index: usize,
+    global: &mut GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &SETUP;
+    let mut parsed = SetupArgs::default();
+    while index < args.len() {
+        if parse_global(args, &mut index, global)? {
+            continue;
+        }
+        match args[index].to_str() {
+            Some("--uninstall") => parsed.uninstall = true,
+            Some("--force") => parsed.force = true,
+            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
+            _ => {
+                let argument = args[index].to_string_lossy();
+                return Err(UsageError::new(
+                    format!("setup takes no arguments, only flags; got `{argument}`"),
+                    USAGE,
+                ));
+            }
+        }
+        index += 1;
+    }
+    if global.project.is_some() {
+        return Err(UsageError::new("--project is not valid for setup", USAGE));
+    }
+    if parsed.force && !parsed.uninstall {
+        return Err(UsageError::new(
+            "--force only confirms --uninstall; setup never refuses to repair a host",
+            USAGE,
+        ));
+    }
+    Ok(Command::Setup(parsed))
 }
 
 const NEW: CommandSpec = CommandSpec {
@@ -2337,6 +2437,91 @@ mod tests {
         assert!(parse_args(["sccache", "start", "--capacity"]).is_err());
     }
 
+    /// `setup` is host-level repair: no positionals, no project, and the two flags that pick its
+    /// direction. A stranded host has no adopted checkout to name, so accepting `--project` would
+    /// advertise a context the verb cannot use.
+    #[test]
+    fn setup_takes_only_its_own_flags_and_never_a_project() {
+        const REPAIR: SetupArgs = SetupArgs {
+            uninstall: false,
+            force: false,
+        };
+        assert_eq!(
+            parse_args(["setup"]).unwrap().command,
+            Command::Setup(REPAIR)
+        );
+
+        let cli = parse_args(["setup", "--json"]).unwrap();
+        assert_eq!(cli.command, Command::Setup(REPAIR));
+        assert!(cli.global.json);
+
+        let cli = parse_args(["--quiet", "setup"]).unwrap();
+        assert_eq!(cli.command, Command::Setup(REPAIR));
+        assert!(cli.global.quiet);
+
+        assert_eq!(
+            parse_args(["setup", "--uninstall"]).unwrap().command,
+            Command::Setup(SetupArgs {
+                uninstall: true,
+                force: false
+            })
+        );
+        assert_eq!(
+            parse_args(["setup", "--uninstall", "--force"])
+                .unwrap()
+                .command,
+            Command::Setup(SetupArgs {
+                uninstall: true,
+                force: true
+            })
+        );
+
+        let error = parse_args(["setup", "--project", "/repo"]).unwrap_err();
+        assert_eq!(error.message, "--project is not valid for setup");
+        assert_eq!(error.hint, "cowshed setup [--uninstall] [--force]");
+
+        // `--force` confirms a refusal only `--uninstall` can make, so on its own it is a
+        // misunderstanding worth naming rather than a no-op worth accepting.
+        let error = parse_args(["setup", "--force"]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "--force only confirms --uninstall; setup never refuses to repair a host"
+        );
+
+        assert!(parse_args(["setup", "extra"]).is_err());
+        assert!(parse_args(["setup", "--purge"]).is_err());
+    }
+
+    /// `--purge` belongs to `gateway stop` alone: it names bytes to delete, and deleting them
+    /// while starting or querying the service is not a thing anybody meant.
+    #[test]
+    fn gateway_stop_takes_purge_and_the_other_actions_do_not() {
+        assert_eq!(
+            parse_args(["gateway", "stop"]).unwrap().command,
+            Command::Gateway(GatewayCommand::Stop { purge: false })
+        );
+        assert_eq!(
+            parse_args(["gateway", "stop", "--purge"]).unwrap().command,
+            Command::Gateway(GatewayCommand::Stop { purge: true })
+        );
+
+        let cli = parse_args(["gateway", "stop", "--purge", "--json"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Command::Gateway(GatewayCommand::Stop { purge: true })
+        );
+        assert!(cli.global.json);
+
+        for argv in [
+            vec!["gateway", "start", "--purge"],
+            vec!["gateway", "status", "--purge"],
+            vec!["gateway", "run", "--purge"],
+            vec!["gateway", "--purge", "stop"],
+        ] {
+            assert!(parse_args(argv.clone()).is_err(), "accepted {argv:?}");
+        }
+    }
+
     #[test]
     fn lifecycle_options_parse_with_last_value_precedence() {
         let cli = parse_args([
@@ -2596,6 +2781,7 @@ mod tests {
 
         let cases: &[(&[&str], ProjectDiscovery)] = &[
             (&["adopt", "/repo"], Required),
+            (&["setup"], NotUsed),
             (&["new", "raven"], Required),
             (&["fork", "raven", "falcon"], Required),
             (&["mv", "raven", "falcon"], Required),

@@ -6,4 +6,5 @@ pub mod output;
 pub mod run;
 pub mod runtime;
 pub mod sccache_service;
+pub mod setup_service;
 pub mod skill;

@@ -10,13 +10,13 @@
 
 use crate::args::SccacheCommand;
 use crate::gateway_service::{
-    activate_launch_agent, canonical_home, deactivate_launch_agent, effective_uid,
-    inspect_install_state, install_host_stable_executable, launchd_error, output_error,
+    activate_launch_agent, canonical_home, effective_uid, inspect_install_state,
+    install_host_stable_executable, launchd_error, output_error, remove_launch_agent,
 };
 use crate::launchd::{
     ExistingPlist, HostStableExecutable, InstallState, LaunchAgentSpec, LaunchdExecutor,
     LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand, SCCACHE_BINARY_NAME,
-    plan_install, plan_remove,
+    plan_install,
 };
 use crate::output::Output;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
@@ -213,29 +213,26 @@ async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<ImageCapacit
 
 fn stop_service() -> Result<()> {
     let home = canonical_home()?;
-    let spec = control_spec(&home)?;
-    let uid = effective_uid();
-    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    deactivate_launch_agent(&mut executor, uid, &spec)?;
-    let installed = fs::symlink_metadata(spec.plist_path()).is_ok();
-    executor
-        .execute_install(&plan_remove(&spec, installed))
-        .map_err(launchd_error)?;
-    // The socket file is the daemon's artifact and cowshed owns its lifecycle:
-    // a booted-out server never unlinks it, and a stale socket only confuses
-    // inspection (a fresh server unlinks-then-rebinds anyway). Remove exactly
-    // a socket; anything else at the path is not ours to delete.
-    let socket = sccache_server_socket(&home);
-    if let Ok(metadata) = fs::symlink_metadata(&socket) {
-        use std::os::unix::fs::FileTypeExt as _;
-        if metadata.file_type().is_socket() {
-            fs::remove_file(&socket).map_err(|error| {
-                CowshedError::internal(format!(
-                    "could not remove stale sccache socket {}: {error}",
-                    socket.display()
-                ))
-            })?;
-        }
+    remove_launch_agent(&control_spec(&home)?)?;
+    remove_stale_socket(&sccache_server_socket(&home))?;
+    Ok(())
+}
+
+/// The socket file is the daemon's artifact and cowshed owns its lifecycle: a booted-out server
+/// never unlinks it, and a stale socket only confuses inspection (a fresh server unlinks-then-
+/// rebinds anyway). Removes exactly a socket; anything else at the path is not ours to delete.
+pub(crate) fn remove_stale_socket(socket: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(socket) else {
+        return Ok(());
+    };
+    use std::os::unix::fs::FileTypeExt as _;
+    if metadata.file_type().is_socket() {
+        fs::remove_file(socket).map_err(|error| {
+            CowshedError::internal(format!(
+                "could not remove stale sccache socket {}: {error}",
+                socket.display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -320,7 +317,7 @@ async fn read_stats(socket: &Path) -> Option<SccacheStats> {
 /// Deterministic, and deliberately not a `PATH` lookup: stop and status must reach the agent
 /// `start` installed even after sccache has left `PATH` — a devenv update or removal must not
 /// strand it — and `start` writes the plist against this same host-stable path.
-fn control_spec(home: &Path) -> Result<LaunchAgentSpec> {
+pub(crate) fn control_spec(home: &Path) -> Result<LaunchAgentSpec> {
     let socket = sccache_server_socket(home);
     let cache_directory = sccache_cache_directory(home);
     let executable = HostStableExecutable::new(home, SCCACHE_BINARY_NAME).map_err(launchd_error)?;
@@ -332,6 +329,17 @@ fn control_spec(home: &Path) -> Result<LaunchAgentSpec> {
         &home.join(".cowshed"),
     )
     .map_err(launchd_error)
+}
+
+/// The sccache agent, its installed binary, and its socket — everything `setup --uninstall`
+/// removes for this service. Returned together because the caller has to deactivate the agent
+/// before deleting the binary it runs.
+pub(crate) fn sccache_launch_agent(
+    home: &Path,
+) -> Result<(HostStableExecutable, LaunchAgentSpec, PathBuf)> {
+    let executable = HostStableExecutable::new(home, SCCACHE_BINARY_NAME).map_err(launchd_error)?;
+    let spec = control_spec(home)?;
+    Ok((executable, spec, sccache_server_socket(home)))
 }
 
 fn resolve_sccache_executable() -> Result<PathBuf> {
