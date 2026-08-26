@@ -322,6 +322,8 @@ impl ApfsExecutionHost for FakeHost {
         &self,
         _: &LifecycleWorkspace,
         _: &Path,
+        _: &Path,
+        _: &Path,
         private_key_path: &Path,
     ) -> Result<(), ApfsStorageError> {
         self.record_path(private_key_path);

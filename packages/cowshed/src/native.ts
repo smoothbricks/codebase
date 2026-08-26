@@ -16,7 +16,6 @@ export interface NativeWorkspaceRefHandle {
   readonly name: string;
   readonly mountPath: string;
   infoJson(): Promise<string>;
-  ensureJson(): Promise<string>;
   attach(optionsJson?: string): Promise<void>;
   grantsJson(): Promise<string>;
 }
