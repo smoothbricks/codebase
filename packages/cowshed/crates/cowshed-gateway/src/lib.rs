@@ -30,7 +30,7 @@ pub use config::{
     MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorCacheConfig, TOKEN_BYTES,
     WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken,
 };
-pub use control::{ControlError, ControlFailureCode, GatewayControlClient, control_socket_path};
+pub use control::{ControlError, ControlFailureCode, GatewayControlClient};
 pub use interfaces::{
     AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, AuthorizedTarget, BoxIo,
     ConnectError, CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery,

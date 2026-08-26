@@ -6,14 +6,14 @@ connection. This lets it add narrowly scoped credentials and trace context witho
 in-image CA certificate trusts the gateway as a server only; it is not a client identity and is never sent upstream.
 Protocol mirrors cache registry artifacts, and certificate-pinning clients can use an allowlisted opaque tunnel.
 
-The host control plane is host-netns `127.0.0.1:7644` plus `~/.cowshed/gateway.sock`; neither host endpoint is reachable
+The host control plane is host-netns `127.0.0.1:7644` plus `/private/cowshed/store/gateway.sock`; neither host endpoint is reachable
 from a workspace. Linux reuses the numeric loopback address inside each private netns for a distinct data-plane
 connector; it is not the host control listener. Data-plane identity depends on the OS:
 
 - **macOS:** each workspace has a 16-port block from `40960–49151`. The gateway listener is `base`; service ports are
   `base+1 … base+15`. Seatbelt lets the workspace connect only to its own block, so the destination listener identifies
   the workspace.
-- **Linux:** there is no port block. A controller-owned socket at `~/.cowshed/run/gateway/<workspaceIncarnation>.sock`
+- **Linux:** there is no port block. A controller-owned socket at `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock`
   is mounted as `/run/cowshed/gateway.sock` inside that workspace's private loopback-only network namespace. The
   controller launches exactly one trusted minimal connector in the netns, under a controller-owned identity and
   dedicated cgroup that workspace processes cannot signal, ptrace, inspect, or join. It binds only IPv4

@@ -6098,7 +6098,7 @@ fn supervisor_sandbox(
         // it. The sccache server socket rides along for the same reason.
         allowed_unix_sockets: crate::sandbox::nix_daemon_socket()
             .into_iter()
-            .chain([crate::sandbox::sccache_server_socket(home)])
+            .chain([crate::sandbox::sccache_server_socket()])
             .collect(),
         additional_denies: vec![
             layout.project().project_root.clone(),
