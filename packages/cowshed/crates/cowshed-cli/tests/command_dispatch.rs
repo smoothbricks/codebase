@@ -1397,17 +1397,18 @@ fn skill_requires_a_known_action_and_takes_no_positional_arguments() {
     assert!(parse_args(["skill", "install", "--nonesuch"]).is_err());
 }
 
-/// Spec 06_cli.md rule 4: every hinted verb exists in the parser.
+/// Spec 06_cli.md rule 4: every hinted command exists in the parser.
 ///
-/// Scans `hint(` / `with_hint(` and the CowshedError constructors that take a
-/// hint argument — those are the `--json` `error.hint` values, not CommandSpec
-/// `about` prose that can open a quoted line with `"cowshed `.
+/// Scans `hint(` / `with_hint(` and CowshedError constructors that take a hint.
+/// Each complete `"cowshed …"` literal is tokenized (placeholders dropped) and
+/// fed to `parse_args`, so `cowshed setup --nonesuch` fails just like an
+/// unknown verb. CommandSpec `about` prose is not a hint call site.
 #[test]
 fn every_next_hint_verb_in_source_is_a_registered_command() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut source = String::new();
     collect_rust_source(&root, &mut source);
-    let mut verbs = HashSet::new();
+    let mut hints = HashSet::new();
     for site in [
         ".hint(",
         "with_hint(",
@@ -1421,45 +1422,59 @@ fn every_next_hint_verb_in_source_is_a_registered_command() {
         "::conflict(",
         "::environment_missing(",
     ] {
-
         let mut rest = source.as_str();
         while let Some(start) = rest.find(site) {
             let window = rest[start..].get(..512).unwrap_or(&rest[start..]);
-
             rest = &rest[start + site.len()..];
             let mut quoted = window;
             while let Some(quote) = quoted.find("\"cowshed ") {
-                quoted = &quoted[quote + "\"cowshed ".len()..];
-                let token: String = quoted
-                    .chars()
-                    .take_while(|ch| ch.is_ascii_lowercase() || *ch == '-')
-                    .collect();
-                if !token.is_empty() {
-                    verbs.insert(token);
+                let body = &quoted[quote + 1..];
+                let Some(end) = body.find('"') else {
+                    break;
+                };
+                let hint = body[..end].trim_end_matches('\\');
+                if !hint.is_empty() {
+                    hints.insert(hint.to_owned());
                 }
+                quoted = &body[end + 1..];
             }
         }
     }
 
     assert!(
-        !verbs.is_empty(),
-        "expected at least one `cowshed <verb>` hint call in src/"
+        !hints.is_empty(),
+        "expected at least one `cowshed …` hint string in src/"
     );
-    for verb in verbs {
-        if matches!(verb.as_str(), "help" | "--help" | "--project") {
-            continue;
+    for hint in hints {
+        for part in hint.split(';') {
+            let argv: Vec<&str> = part
+                .split_whitespace()
+                .filter(|token| *token != "cowshed")
+                .filter(|token| !is_hint_placeholder(token))
+                .collect();
+            if argv.is_empty() || matches!(argv[0], "--help" | "--project" | "help") {
+                continue;
+            }
+            let parsed = parse_args(argv.iter().copied());
+            let unknown = parsed.as_ref().err().is_some_and(|error| {
+                error.message.starts_with("unknown command")
+                    || error.message.starts_with("unknown flag")
+            });
+            assert!(
+                !unknown,
+                "hint `{hint}` does not parse: {parsed:?}"
+            );
         }
-        let parsed = parse_args([verb.as_str()]);
-        let unknown = parsed
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.message.starts_with("unknown command"));
-        assert!(
-            !unknown,
-            "hinted verb `{verb}` is not a registered command"
-        );
     }
 }
+
+fn is_hint_placeholder(token: &str) -> bool {
+    token.starts_with('<')
+        || token.starts_with('[')
+        || token.contains("{}")
+        || token == "{}"
+}
+
 
 fn collect_rust_source(path: &std::path::Path, out: &mut String) {
     if path.is_dir() {
