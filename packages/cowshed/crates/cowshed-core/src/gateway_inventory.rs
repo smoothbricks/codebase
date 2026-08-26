@@ -1728,6 +1728,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_checkout_layout_never_gets_reinterpreted_as_direct_mount() {
+        let fixture =
+            Fixture::with_checkout_layout("malformed-layout", CheckoutLayout::DirectMount);
+        let repo = RepoId::parse("hyperide/axe").expect("repo");
+        fixture.bind(&repo);
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        fs::write(&layout.project().checkout_layout, b"{not json").expect("malformed layout");
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            Arc::new(FixtureSource::default()),
+        );
+
+        let error = inventory
+            .project_attached(&repo)
+            .await
+            .expect_err("malformed present metadata fails closed");
+        assert!(matches!(
+            error,
+            GatewayInventoryError::InvalidMetadata { path, .. }
+                if path == layout.project().checkout_layout
+        ));
+        assert_eq!(
+            fs::read(&layout.project().checkout_layout).expect("malformed record remains"),
+            b"{not json"
+        );
+    }
+
+    #[tokio::test]
     async fn retired_main_snapshot_recovers_its_exact_project_root_binding() {
         let fixture = Fixture::new("retired-root");
         let repo = RepoId::parse("acme/widget").expect("repo");
