@@ -329,3 +329,40 @@ fn installing_from_cowshed_storage_is_refused_with_the_reboot_reason() {
 
     fs::remove_dir_all(&home).expect("remove scratch home");
 }
+
+/// The host this fix comes from reaches cowshed through a trampoline inside a workspace mount, so
+/// the refusal has to name the binary that can install the agent: the copy already on the host
+/// volume, which is the one path `install_host_stable_executable` accepts unconditionally.
+#[test]
+fn refusal_points_at_the_installed_copy_when_the_host_already_has_one() {
+    let home = scratch_home("refusal-installed");
+    let installed = home.join("Library/Application Support/dev.cowshed/bin/cowshed");
+    fs::create_dir_all(installed.parent().expect("bin directory")).expect("bin directory");
+    fs::write(&installed, b"#!/bin/sh\nexit 0\n").expect("installed binary");
+
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    // A scratch home is on the host volume, so the store prefix is what refuses here; a real
+    // workspace mount is refused by its marker or by being mounted inside the home.
+    let store_source = home.join(".cowshed/mnt/acme/widget/main/target/debug/cowshed");
+    fs::create_dir_all(store_source.parent().expect("store directory")).expect("store directory");
+    fs::write(&store_source, b"#!/bin/sh\nexit 1\n").expect("store binary");
+    let error =
+        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &store_source)
+            .expect_err("a binary inside the store is refused");
+
+    assert_eq!(
+        error.hint,
+        format!("start the service from {}", installed.display())
+    );
+    // And that binary is accepted, so the hint is a command that works.
+    let executable =
+        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &installed)
+            .expect("the installed copy installs itself");
+    assert_eq!(executable.path(), installed);
+    assert_eq!(
+        fs::read(&installed).expect("installed bytes"),
+        b"#!/bin/sh\nexit 0\n"
+    );
+
+    fs::remove_dir_all(&home).expect("remove scratch home");
+}
