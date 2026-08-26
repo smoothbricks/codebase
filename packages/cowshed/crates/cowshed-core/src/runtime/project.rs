@@ -2960,6 +2960,7 @@ impl NativeProjectRuntimeHost {
         })?;
         let sandbox = crate::sandbox::SandboxConfig {
             home: self.home.clone(),
+            mount_root: self.layout.project().host_mount_root.clone(),
             workspace_mount: mount.clone(),
             exec_temp_dir: self
                 .layout
@@ -6066,6 +6067,7 @@ fn supervisor_sandbox(
 ) -> Result<crate::sandbox::SandboxConfig> {
     Ok(crate::sandbox::SandboxConfig {
         home: home.to_path_buf(),
+        mount_root: layout.project().host_mount_root.clone(),
         workspace_mount: mount,
         exec_temp_dir: layout
             .project()

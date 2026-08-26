@@ -27,7 +27,10 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
 use cowshed_core::storage::bootstrap::{
-    HostAction, HostSetupPlan, HostSetupReport, execute_host_setup, plan_host_setup,
+    CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, execute_host_setup, plan_host_setup,
+};
+use cowshed_core::storage::host_config::{
+    RETIRED_LAYOUT_HINT, retired_layout_paths,
 };
 use cowshed_core::{
     AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
@@ -2000,6 +2003,28 @@ fn main_mount_finding(main: &UnreachableMain) -> Finding {
     }
 }
 
+fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
+    match retired_layout_paths(store_root) {
+        Ok(records) => records
+            .into_iter()
+            .map(|record| Finding {
+                code: "retired-mount-layout".into(),
+                severity: FindingSeverity::Error,
+                message: record.doctor_message(),
+                hint: RETIRED_LAYOUT_HINT.into(),
+                path: Some(record.metadata_path),
+            })
+            .collect(),
+        Err(error) => vec![Finding {
+            code: "retired-mount-layout-scan".into(),
+            severity: FindingSeverity::Error,
+            message: format!("could not inspect detached metadata for retired mount paths: {error}"),
+            hint: "cowshed doctor --json".into(),
+            path: Some(store_root.to_path_buf()),
+        }],
+    }
+}
+
 fn sccache_finding(status: &SccacheStatus) -> Finding {
     let (severity, hint) = if status.running {
         (FindingSeverity::Info, String::new())
@@ -2065,6 +2090,14 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
             }],
         },
     };
+    if diagnosis.storage_ready {
+        let roots = CanonicalRoots::for_home(&home).map_err(|error| {
+            CowshedError::internal(format!("could not derive host storage roots: {error}"))
+        })?;
+        diagnosis
+            .findings
+            .extend(retired_mount_layout_findings(roots.store()));
+    }
     match gateway_service::service_status().await {
         Ok(status) => diagnosis.findings.extend(gateway_findings(&status)),
         Err(error) => diagnosis.findings.push(Finding {
@@ -2732,5 +2765,42 @@ mod tests {
             !report.healthy,
             "a project whose checkout is not mounted is not a healthy host"
         );
+    }
+
+    #[test]
+    fn retired_mount_metadata_is_a_critical_host_doctor_finding() {
+        use cowshed_core::storage::host_config::{
+            execute_mount_root_change, plan_mount_root_change,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-retired-layout-doctor-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let metadata = store.join("acme/widget/sessions/raven.asif.grants.json");
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        let plan =
+            plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
+        execute_mount_root_change(&plan).unwrap();
+        let recorded = store.join("mnt/acme/widget/raven");
+        std::fs::write(
+            &metadata,
+            serde_json::to_vec(&serde_json::json!({ "write": [recorded] })).unwrap(),
+        )
+        .unwrap();
+
+        let findings = retired_mount_layout_findings(&store);
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.code, "retired-mount-layout");
+        assert_eq!(finding.severity, FindingSeverity::Error);
+        assert!(finding.message.contains("recorded under retired layout, run cowshed setup --mount-root <dir>"));
+        assert_eq!(finding.hint, RETIRED_LAYOUT_HINT);
+        assert_eq!(finding.path.as_deref(), Some(metadata.as_path()));
+        assert!(!doctor_report(findings).healthy);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

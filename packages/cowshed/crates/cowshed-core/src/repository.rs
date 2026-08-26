@@ -537,6 +537,8 @@ impl<'de> Deserialize<'de> for BoundIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectPaths {
     pub store_root: PathBuf,
+    /// Host-configured root shared by every project's workspace mount tree.
+    pub host_mount_root: PathBuf,
     pub project_root: PathBuf,
     pub repository_binding: PathBuf,
     pub checkout_layout: PathBuf,
@@ -546,16 +548,25 @@ pub struct ProjectPaths {
     pub checkpoints: PathBuf,
     pub quarantine: PathBuf,
     pub waivers: PathBuf,
+    /// This project's encoded subtree beneath [`Self::host_mount_root`].
     pub mount_root: PathBuf,
 }
 
 impl ProjectPaths {
-    pub fn new(store_root: impl AsRef<Path>, repo_id: &RepoId) -> Result<Self, PathLayoutError> {
+
+    pub fn with_mount_root(
+        store_root: impl AsRef<Path>,
+        host_mount_root: impl AsRef<Path>,
+        repo_id: &RepoId,
+    ) -> Result<Self, PathLayoutError> {
         let store_root = validate_store_root(store_root.as_ref())?.to_path_buf();
+        let host_mount_root =
+            validate_mount_root(host_mount_root.as_ref())?.to_path_buf();
         let owner = encode_layout_owner(repo_id.owner())?;
         let repo = encode_component(repo_id.repo())?;
         let project_root = checked_join(&store_root, [owner.as_str(), repo.as_str()])?;
-        let mount_root = checked_join(&store_root, ["mnt", owner.as_str(), repo.as_str()])?;
+        let mount_root =
+            checked_join(&host_mount_root, [owner.as_str(), repo.as_str()])?;
 
         Ok(Self {
             repository_binding: checked_join(&project_root, ["repository.json"])?,
@@ -567,6 +578,7 @@ impl ProjectPaths {
             quarantine: checked_join(&project_root, ["quarantine"])?,
             waivers: checked_join(&project_root, ["waivers.json"])?,
             store_root,
+            host_mount_root,
             project_root,
             mount_root,
         })
@@ -588,6 +600,19 @@ fn validate_store_root(root: &Path) -> Result<&Path, PathLayoutError> {
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         return Err(PathLayoutError::StoreRootNotNormalized);
+    }
+    Ok(root)
+}
+
+fn validate_mount_root(root: &Path) -> Result<&Path, PathLayoutError> {
+    if !root.is_absolute() {
+        return Err(PathLayoutError::MountRootNotAbsolute);
+    }
+    if root
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(PathLayoutError::MountRootNotNormalized);
     }
     Ok(root)
 }
@@ -640,6 +665,10 @@ pub enum PathLayoutError {
     StoreRootNotAbsolute,
     #[error("store root must be lexically normalized")]
     StoreRootNotNormalized,
+    #[error("workspace mount root must be absolute")]
+    MountRootNotAbsolute,
+    #[error("workspace mount root must be lexically normalized")]
+    MountRootNotNormalized,
     #[error("path layout component could not be encoded: {0}")]
     ComponentEncoding(#[from] ComponentEncodingError),
     #[error("path layout component is unsafe")]
@@ -913,7 +942,12 @@ mod tests {
 
     #[test]
     fn derives_contained_project_paths() {
-        let paths = ProjectPaths::new("/Users/test/.cowshed", &repo_id("acme/widget")).unwrap();
+        let paths = ProjectPaths::with_mount_root(
+            "/Users/test/.cowshed",
+            "/Users/test/.cowshed/mnt",
+            &repo_id("acme/widget"),
+        )
+        .unwrap();
         assert_eq!(
             paths.project_root,
             Path::new("/Users/test/.cowshed/acme/widget")
@@ -930,6 +964,28 @@ mod tests {
         assert!(!paths.contains(Path::new("/Users/test/.cowshed")));
         assert!(!paths.contains(Path::new("/Users/test/.cowshed/acme/../escape")));
         assert!(!paths.contains(Path::new("/Users/test/.cowshed-other/acme/widget")));
+    }
+
+    #[test]
+    fn derives_project_mounts_below_an_independent_host_root() {
+        let paths = ProjectPaths::with_mount_root(
+            "/private/cowshed/store",
+            "/Users/tester/Dev/.cowshed-mounts",
+            &repo_id("acme/widget"),
+        )
+        .unwrap();
+        assert_eq!(
+            paths.project_root,
+            Path::new("/private/cowshed/store/acme/widget")
+        );
+        assert_eq!(
+            paths.host_mount_root,
+            Path::new("/Users/tester/Dev/.cowshed-mounts")
+        );
+        assert_eq!(
+            paths.mount_root,
+            Path::new("/Users/tester/Dev/.cowshed-mounts/acme/widget")
+        );
     }
 
     #[test]
@@ -961,7 +1017,9 @@ mod tests {
 
     #[test]
     fn reserved_owner_cannot_alias_layout_root() {
-        let paths = ProjectPaths::new("/store", &repo_id("gateway/widget")).unwrap();
+        let paths =
+            ProjectPaths::with_mount_root("/store", "/store/mnt", &repo_id("gateway/widget"))
+                .unwrap();
         assert_eq!(paths.project_root, Path::new("/store/%67ateway/widget"));
         assert_ne!(paths.project_root, Path::new("/store/gateway/widget"));
     }
@@ -969,12 +1027,36 @@ mod tests {
     #[test]
     fn rejects_unsafe_store_roots() {
         assert_eq!(
-            ProjectPaths::new("relative/store", &repo_id("acme/widget")),
+            ProjectPaths::with_mount_root(
+                "relative/store",
+                "/mounts",
+                &repo_id("acme/widget")
+            ),
             Err(PathLayoutError::StoreRootNotAbsolute)
         );
         assert_eq!(
-            ProjectPaths::new("/safe/../escape", &repo_id("acme/widget")),
+            ProjectPaths::with_mount_root(
+                "/safe/../escape",
+                "/mounts",
+                &repo_id("acme/widget")
+            ),
             Err(PathLayoutError::StoreRootNotNormalized)
+        );
+        assert_eq!(
+            ProjectPaths::with_mount_root(
+                "/store",
+                "relative/mounts",
+                &repo_id("acme/widget")
+            ),
+            Err(PathLayoutError::MountRootNotAbsolute)
+        );
+        assert_eq!(
+            ProjectPaths::with_mount_root(
+                "/store",
+                "/safe/../mounts",
+                &repo_id("acme/widget")
+            ),
+            Err(PathLayoutError::MountRootNotNormalized)
         );
     }
 }
