@@ -380,6 +380,15 @@ trait EvidenceSource {
         &mut self,
         path: &Path,
     ) -> Result<MountedVolumeEvidence, NativeBootstrapError>;
+    /// Where the named volume is currently mounted, per per-volume diskutil evidence.
+    ///
+    /// `None` means detached. This exists because `diskutil apfs list -plist` stopped
+    /// reporting `MountPoint` keys on recent macOS releases, so container-inventory
+    /// evidence alone can no longer distinguish "detached" from "mounted somewhere else".
+    fn volume_mountpoint(
+        &mut self,
+        identifier: &str,
+    ) -> Result<Option<PathBuf>, NativeBootstrapError>;
     fn invoking_identity(&mut self) -> (u32, u32);
 }
 
@@ -422,12 +431,34 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
         Ok(MountedVolumeEvidence {
             exact_identifier: exact_device_identifier(&snapshot.mount_source)?,
             mountpoint: snapshot.mountpoint,
+
             nobrowse: snapshot.nobrowse,
             uid: metadata.uid(),
             gid: metadata.gid(),
         })
     }
 
+    fn volume_mountpoint(
+        &mut self,
+        identifier: &str,
+    ) -> Result<Option<PathBuf>, NativeBootstrapError> {
+        let command = HostCommand::new(DISKUTIL, ["info", "-plist", identifier]);
+        let output = self.host.run_command(&command).map_err(NativeBootstrapError::Host)?;
+        if !output.succeeded() {
+            return Err(NativeBootstrapError::CommandFailed(
+                HostCommandFailure::new(command, output),
+            ));
+        }
+        let value = plist::Value::from_reader(std::io::Cursor::new(&output.stdout))
+            .map_err(|error| NativeBootstrapError::MalformedPlist(error.to_string()))?;
+        let root = dictionary(&value, "diskutil info root")?;
+        Ok(match root.get("MountPoint") {
+            Some(plist::Value::String(mountpoint)) if !mountpoint.is_empty() => {
+                Some(PathBuf::from(mountpoint))
+            }
+            _ => None,
+        })
+    }
     fn invoking_identity(&mut self) -> (u32, u32) {
         (unsafe { libc::getuid() }, unsafe { libc::getgid() })
     }
@@ -786,25 +817,38 @@ fn classify_volume(
         }
         MountpointState::Missing
         | MountpointState::EmptyDirectory
-        | MountpointState::ReclaimableStub => match &volume.mountpoint {
-            None => Ok(ExistingStorage::detached_incomplete(&volume.identifier)),
-            Some(mountpoint) => {
-                require_canonical(mountpoint)?;
-                let mounted = source.mounted_volume(mountpoint)?;
-                if mounted.exact_identifier != volume.identifier
-                    || mounted.mountpoint != *mountpoint
-                {
-                    return Err(NativeBootstrapError::MountEvidenceMismatch {
-                        path: mountpoint.clone(),
-                        identifier: mounted.exact_identifier,
-                    });
+        | MountpointState::ReclaimableStub => {
+            // Container-inventory mountpoint evidence is unreliable: `diskutil apfs list -plist`
+            // stopped emitting `MountPoint` keys on recent macOS releases, so a volume that is
+            // mounted somewhere else (macOS auto-mounts every container volume under /Volumes at
+            // boot) arrives here with `mountpoint: None`. Asking per-volume evidence before
+            // concluding "detached" is what keeps that state classifiable as a mis-mount and
+            // therefore repairable with the unprivileged remount plan below, instead of
+            // degrading into a privileged re-provision demand.
+            let current = match &volume.mountpoint {
+                Some(mountpoint) => Some(mountpoint.clone()),
+                None => source.volume_mountpoint(&volume.identifier)?,
+            };
+            match current {
+                None => Ok(ExistingStorage::detached_incomplete(&volume.identifier)),
+                Some(current) => {
+                    require_canonical(&current)?;
+                    let mounted = source.mounted_volume(&current)?;
+                    if mounted.exact_identifier != volume.identifier
+                        || mounted.mountpoint != current
+                    {
+                        return Err(NativeBootstrapError::MountEvidenceMismatch {
+                            path: current.clone(),
+                            identifier: mounted.exact_identifier,
+                        });
+                    }
+                    Ok(ExistingStorage::mis_mounted_incomplete(
+                        &volume.identifier,
+                        current,
+                    ))
                 }
-                Ok(ExistingStorage::mis_mounted_incomplete(
-                    &volume.identifier,
-                    mountpoint,
-                ))
             }
-        },
+        }
         MountpointState::NonEmptyDirectoryWithoutMount => {
             Err(NativeBootstrapError::MaskedMountpoint {
                 path: expected_mountpoint.to_owned(),
@@ -1838,8 +1882,11 @@ mod tests {
         command_output: HostCommandOutput,
         mountpoints: BTreeMap<PathBuf, MountpointState>,
         mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
-        invoking_identity: (u32, u32),
+        // Per-identifier answers for `volume_mountpoint`; an absent identifier means detached,
+        // mirroring what `diskutil info -plist` reports with an empty MountPoint.
+        volume_mountpoints: BTreeMap<String, Option<PathBuf>>,
         commands: Vec<HostCommand>,
+        invoking_identity: (u32, u32),
     }
 
     impl EvidenceSource for FakeEvidenceSource {
@@ -1882,6 +1929,13 @@ mod tests {
                     identifier: "missing mounted volume test evidence".to_owned(),
                 }
             })
+        }
+
+        fn volume_mountpoint(
+            &mut self,
+            identifier: &str,
+        ) -> Result<Option<PathBuf>, NativeBootstrapError> {
+            Ok(self.volume_mountpoints.get(identifier).cloned().flatten())
         }
 
         fn invoking_identity(&mut self) -> (u32, u32) {
@@ -1954,6 +2008,7 @@ mod tests {
                     },
                 ),
             ]),
+            volume_mountpoints: BTreeMap::new(),
             invoking_identity: (501, 20),
             commands: Vec::new(),
         }
