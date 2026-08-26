@@ -1,5 +1,6 @@
 use crate::args::{
-    AdoptArgs, Cli, Command, ExecArgs, MoveDestination, StdinSource as CliStdinSource,
+    AdoptArgs, Cli, Command, ExecArgs, MoveDestination, ProjectDiscovery,
+    StdinSource as CliStdinSource,
 };
 use crate::gateway_service;
 use crate::output::Output;
@@ -231,12 +232,7 @@ impl ActorBridge {
     }
 
     async fn adopted_projects(&self) -> Result<Vec<AdoptedProject>> {
-        let home = gateway_service::canonical_home()?;
-        let storage = validate_existing_host_storage(&home).await?;
-        NativeGatewayInventory::new(storage)
-            .adopted_projects()
-            .await
-            .map_err(project_inventory_error)
+        adopted_projects().await
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
@@ -253,6 +249,15 @@ impl ActorBridge {
     }
 }
 
+async fn adopted_projects() -> Result<Vec<AdoptedProject>> {
+    let home = gateway_service::canonical_home()?;
+    let storage = validate_existing_host_storage(&home).await?;
+    NativeGatewayInventory::new(storage)
+        .adopted_projects()
+        .await
+        .map_err(project_inventory_error)
+}
+
 async fn list_adopted_project(project: &AdoptedProject) -> Result<Vec<WorkspaceInfo>> {
     let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
     let primary = bridge.list().await;
@@ -264,6 +269,18 @@ async fn list_adopted_project(project: &AdoptedProject) -> Result<Vec<WorkspaceI
         },
         Err(primary) => Err(merge_primary(primary, teardown)),
     }
+}
+
+async fn list_all_adopted_projects() -> Result<Vec<ProjectWorkspaces>> {
+    let projects = adopted_projects().await?;
+    let mut grouped = Vec::with_capacity(projects.len());
+    for project in projects {
+        grouped.push(ProjectWorkspaces {
+            repo_id: project.repo_id.clone(),
+            workspaces: list_adopted_project(&project).await?,
+        });
+    }
+    Ok(grouped)
 }
 
 #[async_trait]
@@ -595,7 +612,26 @@ pub async fn resolve_project_root(cli: &Cli) -> Result<PathBuf> {
             )
         })?,
     };
-    Ok(GitRepository::discover(start).await?.root().to_path_buf())
+    let root = GitRepository::discover(start)
+        .await
+        .map(|repository| repository.root().to_path_buf());
+    match (&cli.command, root) {
+        (Command::Adopt(_), result) => result,
+        (_, Err(error)) => Err(project_context_error(error)),
+        (_, Ok(root)) => Ok(root),
+    }
+}
+
+fn project_context_error(error: CowshedError) -> CowshedError {
+    CowshedError::new(
+        error.code,
+        error.message,
+        "cowshed ls; cowshed --project <git-root> <command>",
+    )
+}
+
+fn optional_project_unavailable(error: &CowshedError) -> bool {
+    matches!(error.code, ErrorCode::EnvironmentMissing | ErrorCode::NotFound)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1635,14 +1671,85 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    let discovery = cli.command.project_discovery();
+    if discovery == ProjectDiscovery::NotUsed {
+        return dispatch_host_command(cli, output, false).await;
+    }
+    let root = match resolve_project_root(&cli).await {
+        Ok(root) => root,
+        Err(_) if discovery == ProjectDiscovery::Optional => {
+            return dispatch_host_command(cli, output, true).await;
+        }
+        Err(error) => return Err(error),
+    };
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;
-    let root = resolve_project_root(&cli).await?;
     let bridge = match mode {
-        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await?,
-        RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await?,
+        RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await,
+        RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await,
+    };
+    let bridge = match bridge {
+        Ok(bridge) => bridge,
+        Err(error)
+            if discovery == ProjectDiscovery::Optional
+                && optional_project_unavailable(&error) =>
+        {
+            return dispatch_host_command(cli, output, true).await;
+        }
+        Err(error) => return Err(error),
     };
     dispatch_and_shutdown(bridge, cli, stdin, output).await
+}
+
+async fn dispatch_host_command<W, E>(
+    cli: Cli,
+    output: &mut Output<W, E>,
+    project_checks_skipped: bool,
+) -> Result<DispatchExit>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    match cli.command {
+        Command::List(_) => {
+            let mut projects = list_all_adopted_projects().await?;
+            projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+            for project in &mut projects {
+                project
+                    .workspaces
+                    .sort_by(|left, right| left.workspace.cmp(&right.workspace));
+            }
+            if cli.global.json {
+                output.success(projects).map_err(output_error)?;
+            } else {
+                emit_project_workspaces_table(output, &projects)?;
+            }
+            Ok(success())
+        }
+        Command::Doctor => {
+            // Enumerating the validated host inventory exercises storage/bootstrap integrity even
+            // when there is no project whose coordinator can run the project-specific checks.
+            let _ = adopted_projects().await?;
+            let report = DoctorReport {
+                healthy: true,
+                findings: Vec::new(),
+            };
+            if cli.global.json {
+                output.success(report).map_err(output_error)?;
+            } else {
+                emit_doctor(output, &report)?;
+            }
+            if project_checks_skipped {
+                output
+                    .guidance("project checks skipped: no adopted checkout at cwd")
+                    .map_err(output_error)?;
+            }
+            Ok(success())
+        }
+        _ => Err(CowshedError::internal(
+            "command without project context was not dispatched by its host service",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1698,6 +1805,48 @@ mod tests {
             let parsed = crate::args::parse_args(arguments).unwrap();
             assert_eq!(runtime_open_mode(&parsed.command), expected);
         }
+    }
+
+    #[test]
+    fn optional_context_falls_back_only_when_an_adopted_checkout_is_absent() {
+        for code in [ErrorCode::EnvironmentMissing, ErrorCode::NotFound] {
+            assert!(optional_project_unavailable(&CowshedError::new(
+                code,
+                "missing",
+                "old hint"
+            )));
+        }
+        for code in [
+            ErrorCode::Internal,
+            ErrorCode::Usage,
+            ErrorCode::Conflict,
+            ErrorCode::SandboxDenied,
+            ErrorCode::Integrity,
+        ] {
+            assert!(!optional_project_unavailable(&CowshedError::new(
+                code,
+                "real failure",
+                "repair it"
+            )));
+        }
+    }
+
+    #[test]
+    fn project_discovery_failure_points_to_inventory_and_explicit_context() {
+        let original = CowshedError::environment_missing(
+            "/tmp is not inside a standalone git repository",
+            "cowshed adopt <git-root>",
+        );
+        let mapped = project_context_error(original);
+        assert_eq!(
+            mapped.hint,
+            "cowshed ls; cowshed --project <git-root> <command>"
+        );
+        assert_eq!(mapped.code, ErrorCode::EnvironmentMissing);
+        assert_eq!(
+            mapped.message,
+            "/tmp is not inside a standalone git repository"
+        );
     }
 
     #[test]
