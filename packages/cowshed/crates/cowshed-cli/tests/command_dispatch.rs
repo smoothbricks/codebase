@@ -7,7 +7,7 @@ use cowshed_cli::runtime::{
 };
 use cowshed_core::api::*;
 use cowshed_core::metadata::{
-    ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+    ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, ErrorCode, Result};
@@ -37,9 +37,7 @@ struct FakeService {
     push_options: Option<PushOptions>,
     rebase_options: Option<RebaseOptions>,
     land_options: Option<LandOptions>,
-    ensure_report: Option<EnsureReport>,
-    ensure_error: Option<CowshedError>,
-    ensure_path: Option<PathBuf>,
+    workspace_at_error: Option<CowshedError>,
     /// What `workspace_at` reports for the invocation cwd: `None` means the command was not run
     /// inside any mounted workspace, which is what makes the refusal path testable.
     cwd_workspace: Option<String>,
@@ -67,9 +65,7 @@ impl Default for FakeService {
             push_options: None,
             rebase_options: None,
             land_options: None,
-            ensure_report: None,
-            ensure_error: None,
-            ensure_path: None,
+            workspace_at_error: None,
             gc_candidates: Vec::new(),
             shutdowns: None,
             shutdown_error: None,
@@ -130,6 +126,9 @@ impl CliService for FakeService {
 
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo> {
         self.events.push(format!("workspace-at:{}", path.display()));
+        if let Some(error) = self.workspace_at_error.take() {
+            return Err(error);
+        }
         match self.cwd_workspace.clone() {
             Some(name) => Ok(workspace(&name, WorkspaceState::Attached)),
             None => Err(CowshedError::not_found(
@@ -137,24 +136,6 @@ impl CliService for FakeService {
                 "run cowshed from inside a mounted workspace",
             )),
         }
-    }
-
-    async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport> {
-        self.events.push(format!("ensure:{}", path.display()));
-        self.ensure_path = Some(path);
-        if let Some(error) = self.ensure_error.take() {
-            return Err(error);
-        }
-        Ok(self.ensure_report.take().unwrap_or_else(|| EnsureReport {
-            workspace: WorkspaceName::new("raven").unwrap(),
-            mount: PathBuf::from("/mnt/raven"),
-            action: EnsureAction::AlreadyMounted,
-            go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
-            sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
-            sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
-            workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
-            port_block: None,
-        }))
     }
 
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>> {
@@ -206,10 +187,10 @@ impl CliService for FakeService {
         })
     }
 
-    async fn attach(&mut self, name: &str, options: AttachOptions) -> Result<()> {
+    async fn attach(&mut self, name: &str, options: AttachOptions) -> Result<WorkspaceInfo> {
         self.events
             .push(format!("attach:{name}:{}", options.browse));
-        Ok(())
+        Ok(workspace(name, WorkspaceState::Attached))
     }
 
     async fn detach(&mut self, name: &str) -> Result<()> {
@@ -483,7 +464,7 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
     let (_, stdout, _) = run(&mut service, ["rm", "raven", "--force"]).await;
     assert!(stdout.is_empty());
     let (_, stdout, _) = run(&mut service, ["attach", "raven", "--browse"]).await;
-    assert!(stdout.is_empty());
+    assert_eq!(stdout, b"/mnt/raven\n");
     let (_, stdout, _) = run(&mut service, ["detach", "raven"]).await;
     assert!(stdout.is_empty());
     let (_, stdout, _) = run(&mut service, ["doctor"]).await;
@@ -716,29 +697,6 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
     );
     assert_eq!(stderr, b"next: cowshed exec raven -- git status\n");
 
-    let token_path =
-        std::env::temp_dir().join(format!("cowshed-cli-envrc-{}-token", std::process::id()));
-    std::fs::write(&token_path, b"tok'en").unwrap();
-    service.ensure_report = Some(EnsureReport {
-        workspace: WorkspaceName::new("raven").unwrap(),
-        mount: PathBuf::from("/mnt/raven"),
-        action: EnsureAction::AlreadyMounted,
-        go_env: PathBuf::from("/mnt/raven/nested dir/it's/go env"),
-        sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/scc'ache.sock"),
-        sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
-        workspace_token: token_path.clone(),
-        port_block: Some(PortBlock::new(40960, 16).unwrap()),
-    });
-    let (_, stdout, stderr) = run(&mut service, ["ensure", "--envrc"]).await;
-    // A name-mounted workspace gets the cache endpoints and nothing that routes rustc through
-    // them: `RUSTC_WRAPPER` here would buy a cache this path can never share.
-    assert_eq!(
-        stdout,
-        b"export GOENV='/mnt/raven/nested dir/it'\\''s/go env'\nexport SCCACHE_SERVER_UDS='/Users/tester/.cowshed/scc'\\''ache.sock'\nexport SCCACHE_DIR='/Users/tester/.cowshed/caches/sccache'\nexport COWSHED_WORKSPACE_TOKEN='tok'\\''en'\nexport COWSHED_PORT_BASE='40960'\n"
-    );
-    assert!(stderr.is_empty());
-    assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
-    std::fs::remove_file(token_path).unwrap();
 
     let (_, stdout, stderr) = run(&mut service, ["gc", "--dry-run"]).await;
     assert_eq!(stdout, b"0\n");
@@ -920,114 +878,131 @@ async fn abandoning_removal_prints_what_it_destroyed_and_where_the_bundle_went()
 }
 
 #[tokio::test]
-async fn ensure_uses_nested_invocation_cwd_and_reports_detached_healing() {
-    const CHILD: &str = "COWSHED_CLI_NESTED_CWD_TEST";
-    if std::env::var_os(CHILD).is_some() {
-        let mut service = FakeService {
-            ensure_report: Some(EnsureReport {
-                workspace: WorkspaceName::new("raven").unwrap(),
-                mount: PathBuf::from("/mnt/raven"),
-                action: EnsureAction::Attached,
-                go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
-                sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
-                sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
-                workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
-                port_block: None,
-            }),
-            ..FakeService::default()
-        };
-        let (_, stdout, stderr) = run(&mut service, ["ensure", "--json"]).await;
-        assert_eq!(
-            stdout,
-            b"{\"ok\":true,\"result\":{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"action\":\"attached\",\"goEnv\":\"/mnt/raven/.cowshed/cache/go/env\",\"sccacheServerUds\":\"/Users/tester/.cowshed/sccache.sock\",\"sccacheDir\":\"/Users/tester/.cowshed/caches/sccache\",\"workspaceToken\":\"/mnt/raven/.cowshed/token\"}}\n"
-        );
-        assert_eq!(stderr, b"cowshed: workspace raven is ready (attached)\n");
-        assert_eq!(service.ensure_path, Some(std::env::current_dir().unwrap()));
-        return;
-    }
-
-    let root = std::env::temp_dir().join(format!("cowshed-cli-nested-cwd-{}", std::process::id()));
-    let nested = root.join("workspace/deep/path");
-    std::fs::create_dir_all(&nested).unwrap();
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("ensure_uses_nested_invocation_cwd_and_reports_detached_healing")
-        .arg("--nocapture")
-        .env(CHILD, "1")
-        .current_dir(&nested)
-        .status()
-        .unwrap();
-    std::fs::remove_dir_all(root).unwrap();
-    assert!(status.success());
-}
-
-#[tokio::test]
-async fn ensure_resolution_and_token_errors_emit_no_partial_machine_output() {
-    let mut resolution_failure = FakeService {
-        ensure_error: Some(CowshedError::not_found(
-            "the current directory is not a cowshed workspace",
-            "cd into a workspace",
-        )),
-        ..FakeService::default()
-    };
-    let cli = parse_args(["ensure", "--json"]).unwrap();
-    let mut output = Output::new(Vec::new(), Vec::new(), false);
-    let error = dispatch(
-        &mut resolution_failure,
-        cli,
-        tokio::io::empty(),
-        &mut output,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code, ErrorCode::NotFound);
-    assert!(output.into_inner().0.is_empty());
-
-    let mut token_failure = FakeService {
-        ensure_report: Some(EnsureReport {
-            workspace: WorkspaceName::new("raven").unwrap(),
-            mount: PathBuf::from("/mnt/raven"),
-            action: EnsureAction::AlreadyMounted,
-            go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
-            sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
-            sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
-            workspace_token: PathBuf::from("/definitely/missing/cowshed/token"),
-            port_block: None,
-        }),
-        ..FakeService::default()
-    };
-    let cli = parse_args(["ensure", "--envrc"]).unwrap();
-    let mut output = Output::new(Vec::new(), Vec::new(), false);
-    let error = dispatch(&mut token_failure, cli, tokio::io::empty(), &mut output)
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Integrity);
-    let (stdout, stderr) = output.into_inner();
-    assert!(stdout.is_empty());
-    assert!(stderr.is_empty());
-}
-
-#[tokio::test]
-async fn ensure_envrc_outside_a_workspace_names_the_per_directory_requirement() {
-    let mut envrc_outside = FakeService {
-        ensure_error: Some(CowshedError::not_found(
-            "the current directory is not a cowshed workspace",
-            "cd into a workspace",
-        )),
-        ..FakeService::default()
-    };
-    let cli = parse_args(["ensure", "--envrc"]).unwrap();
-    let mut output = Output::new(Vec::new(), Vec::new(), false);
-    let error = dispatch(&mut envrc_outside, cli, tokio::io::empty(), &mut output)
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Usage);
+async fn attach_one_workspace_prints_its_mount() {
+    let mut service = FakeService::default();
+    let (_, stdout, stderr) = run(&mut service, ["attach", "raven", "--json"]).await;
     assert_eq!(
-        error.message,
-        "ensure --envrc must run inside a workspace directory"
+        stdout,
+        format!(
+            "{{\"ok\":true,\"result\":{{\"workspace\":\"raven\",\"mount\":\"/mnt/raven\",\"baseCommit\":\"{}\"}}}}\n",
+            "1".repeat(40)
+        )
+        .as_bytes()
     );
-    assert!(error.hint.contains("each workspace has its own exports"));
+    assert!(stderr.is_empty());
+    assert_eq!(service.events, ["attach:raven:false"]);
+}
+
+#[tokio::test]
+async fn attach_without_name_reattaches_the_project_detached_sessions() {
+    let mut service = FakeService {
+        cwd_workspace: Some("main".into()),
+        listed_workspaces: Some(vec![
+            workspace("main", WorkspaceState::Attached),
+            workspace("raven", WorkspaceState::Detached),
+            workspace("fox", WorkspaceState::Attached),
+        ]),
+        ..FakeService::default()
+    };
+    let (_, stdout, stderr) = run(&mut service, ["attach"]).await;
+    assert_eq!(stdout, b"/mnt/raven\n");
+    assert!(stderr.is_empty());
+    assert!(
+        service
+            .events
+            .iter()
+            .any(|event| event.starts_with("workspace-at:"))
+    );
+    assert!(service.events.iter().any(|event| event == "ls"));
+    assert!(
+        service
+            .events
+            .iter()
+            .any(|event| event == "attach:raven:false")
+    );
+    assert!(
+        !service
+            .events
+            .iter()
+            .any(|event| event.starts_with("attach:main:") || event.starts_with("attach:fox:"))
+    );
+}
+
+#[tokio::test]
+async fn attach_all_reattaches_every_detached_session_store_wide() {
+    let mut service = FakeService {
+        listed_projects: vec![
+            ProjectWorkspaces {
+                repo_id: RepoId::parse("zeta/tool").unwrap(),
+                workspaces: vec![
+                    workspace_for("zeta/tool", "main", WorkspaceState::Attached),
+                    workspace_for("zeta/tool", "warp", WorkspaceState::Detached),
+                ],
+            },
+            ProjectWorkspaces {
+                repo_id: RepoId::parse("alpha/widget").unwrap(),
+                workspaces: vec![
+                    workspace_for("alpha/widget", "main", WorkspaceState::Attached),
+                    workspace_for("alpha/widget", "raven", WorkspaceState::Detached),
+                    workspace_for("alpha/widget", "fox", WorkspaceState::Attached),
+                ],
+            },
+        ],
+        ..FakeService::default()
+    };
+    let (_, stdout, stderr) = run(&mut service, ["attach", "--all"]).await;
+    assert_eq!(stdout, b"/mnt/warp\n/mnt/raven\n");
+    assert!(stderr.is_empty());
+    assert_eq!(
+        service.events,
+        ["ls-all", "attach:warp:false", "attach:raven:false"]
+    );
+}
+
+#[tokio::test]
+async fn attach_reports_no_workspace_when_the_scope_has_no_detached_session() {
+    let mut service = FakeService {
+        cwd_workspace: Some("main".into()),
+        listed_workspaces: Some(vec![
+            workspace("main", WorkspaceState::Attached),
+            workspace("fox", WorkspaceState::Attached),
+        ]),
+        ..FakeService::default()
+    };
+    let cli = parse_args(["attach", "--json"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut service, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::NotFound);
+    assert_eq!(error.message, "no detached session workspace found");
     assert!(output.into_inner().0.is_empty());
+}
+
+#[tokio::test]
+async fn attach_refuses_an_ambiguous_project_without_partial_output() {
+    let mut service = FakeService {
+        workspace_at_error: Some(CowshedError::conflict(
+            "/tmp/overlap is contained in multiple active workspace mounts",
+            "repair overlapping workspace mounts and retry",
+        )),
+        listed_workspaces: Some(vec![workspace("raven", WorkspaceState::Detached)]),
+        ..FakeService::default()
+    };
+    let cli = parse_args(["attach", "--json"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut service, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("multiple active workspace mounts"));
+    assert!(output.into_inner().0.is_empty());
+    assert!(
+        !service
+            .events
+            .iter()
+            .any(|event| event.starts_with("attach:"))
+    );
 }
 
 
@@ -1283,9 +1258,6 @@ impl CliService for SerializedCreateService {
     async fn restore(&mut self, _: &str, _: &str) -> Result<WorkspaceInfo> {
         unreachable!()
     }
-    async fn ensure_current(&mut self, _: PathBuf) -> Result<EnsureReport> {
-        unreachable!()
-    }
     async fn workspace_at(&mut self, _: PathBuf) -> Result<WorkspaceInfo> {
         unreachable!()
     }
@@ -1298,7 +1270,7 @@ impl CliService for SerializedCreateService {
     async fn remove(&mut self, _: &str, _: RemoveOptions) -> Result<RemoveReport> {
         unreachable!()
     }
-    async fn attach(&mut self, _: &str, _: AttachOptions) -> Result<()> {
+    async fn attach(&mut self, _: &str, _: AttachOptions) -> Result<WorkspaceInfo> {
         unreachable!()
     }
     async fn detach(&mut self, _: &str) -> Result<()> {

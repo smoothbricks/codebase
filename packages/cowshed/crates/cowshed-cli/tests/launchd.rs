@@ -801,7 +801,6 @@ fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
                     "hdiutil",
                     "osascript",
                     "adopt",
-                    "ensure"
                 ]
                 .contains(&argument.as_ref())
             );

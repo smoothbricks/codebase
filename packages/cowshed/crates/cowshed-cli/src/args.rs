@@ -20,7 +20,6 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &MOVE,
     &CHECKPOINT,
     &RESTORE,
-    &ENSURE,
     &LIST,
     &PATH,
     &EXEC,
@@ -62,7 +61,6 @@ pub enum Command {
     Move(MoveArgs),
     Checkpoint(CheckpointArgs),
     Restore(RestoreArgs),
-    Ensure(EnsureArgs),
     List(ListArgs),
     Path(PathArgs),
     Exec(ExecArgs),
@@ -92,13 +90,13 @@ pub enum ProjectDiscovery {
 impl Command {
     pub const fn project_discovery(&self) -> ProjectDiscovery {
         match self {
+            Self::Attach(args) if args.all => ProjectDiscovery::NotUsed,
             Self::Adopt(_)
             | Self::New(_)
             | Self::Fork(_)
             | Self::Move(_)
             | Self::Checkpoint(_)
             | Self::Restore(_)
-            | Self::Ensure(_)
             | Self::Path(_)
             | Self::Exec(_)
             | Self::Remove(_)
@@ -233,11 +231,6 @@ pub struct RestoreArgs {
     pub label: OsString,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct EnsureArgs {
-    pub envrc: bool,
-    pub attach: bool,
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ListArgs {
@@ -290,10 +283,10 @@ pub struct RemoveArgs {
     pub restore: bool,
     pub abandon: bool,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachArgs {
-    pub workspace: String,
+    pub workspace: Option<String>,
+    pub all: bool,
     pub browse: bool,
 }
 
@@ -562,7 +555,6 @@ fn cli_command() -> ClapCommand {
                 .arg(positional("workspace", 0..=1))
                 .arg(positional("label", 0..=1)),
         )
-        .subcommand(leaf("ensure").args([flag("envrc"), flag("attach")]))
         .subcommand(leaf("ls").arg(flag("all")))
         .subcommand(
             leaf("path")
@@ -602,7 +594,7 @@ fn cli_command() -> ClapCommand {
         .subcommand(
             leaf("attach")
                 .arg(positional("workspace", 0..=1))
-                .arg(flag("browse")),
+                .args([flag("all"), flag("browse")]),
         )
         .subcommand(leaf("detach").arg(positional("workspace", 0..=1)))
         .subcommand(
@@ -736,7 +728,6 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "mv" => parse_move(leaf)?,
         "checkpoint" => parse_checkpoint(leaf)?,
         "restore" => parse_restore(leaf)?,
-        "ensure" => parse_ensure(leaf)?,
         "ls" => parse_list(leaf)?,
         "path" => parse_path(leaf)?,
         "exec" => parse_exec(leaf)?,
@@ -875,7 +866,6 @@ fn missing_required_message(spec: &CommandSpec) -> String {
         "restore" => String::from("restore requires a workspace"),
         "exec" => String::from("exec requires a workspace"),
         "rm" => String::from("rm requires a workspace"),
-        "attach" => String::from("attach requires a workspace"),
         "detach" => String::from("detach requires a workspace"),
         "resize" => String::from("resize requires a workspace"),
         "land" => String::from("land requires a workspace"),
@@ -1403,32 +1393,6 @@ fn parse_restore(matches: &ArgMatches) -> Result<Command, UsageError> {
 }
 
 
-const ENSURE: CommandSpec = CommandSpec {
-    name: "ensure",
-    args: "",
-    trailing: "",
-    summary: "repair the current workspace",
-    about: &[
-        "The fast auto-fix, and the one command safe to run on every prompt: a healthy workspace costs a marker read and a statfs, and says nothing. Otherwise it reattaches images after a reboot or a Finder eject, repairs mount flags, re-arms the autosave agent, and reconciles whatever drifted — synchronously, so when it returns you are standing in a valid workspace.",
-    ],
-    options: &[
-        Opt {
-            spelling: "--envrc",
-            meaning: "also print the POSIX shell exports for the current workspace, for `eval` or an .envrc",
-        },
-        Opt {
-            spelling: "--attach",
-            meaning: "the explicit remount spelling, for devenv-native repositories",
-        },
-    ],
-};
-
-fn parse_ensure(matches: &ArgMatches) -> Result<Command, UsageError> {
-    Ok(Command::Ensure(EnsureArgs {
-        envrc: flagged(matches, "envrc"),
-        attach: flagged(matches, "attach"),
-    }))
-}
 
 
 const LIST: CommandSpec = CommandSpec {
@@ -1668,28 +1632,43 @@ fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const ATTACH: CommandSpec = CommandSpec {
     name: "attach",
-    args: "<ws>",
+    args: "[ws]",
     trailing: "",
-    summary: "attach a workspace",
+    summary: "attach session workspace(s)",
     about: &[
-        "Mounts a detached workspace again. A detached workspace costs one closed file, so detaching is how a workspace waits without being deleted.",
+        "<ws> one; cwd in a project = that project's sessions; --all store-wide. Mains always mounted (05).",
     ],
-    options: &[Opt {
-        spelling: "--browse",
-        meaning: "show the volume in Finder; the default mount is nobrowse",
-    }],
+    options: &[
+        Opt {
+            spelling: "--all",
+            meaning: "every detached session workspace store-wide",
+        },
+        Opt {
+            spelling: "--browse",
+            meaning: "show the volume in Finder; the default mount is nobrowse",
+        },
+    ],
 };
 
 fn parse_attach(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &ATTACH;
-    Ok(Command::Attach(AttachArgs {
-        workspace: require_workspace(
-            matches,
-            "workspace",
-            false,
+    let workspace = optional_workspace(matches, "workspace", false, USAGE)?;
+    let all = flagged(matches, "all");
+    if all && workspace.is_some() {
+        return Err(UsageError::new(
+            "attach --all cannot name a workspace",
             USAGE,
-            "attach requires a workspace",
-        )?,
+        ));
+    }
+    if workspace.as_deref() == Some("main") {
+        return Err(UsageError::new(
+            "mains are always mounted; attach targets session workspaces",
+            USAGE,
+        ));
+    }
+    Ok(Command::Attach(AttachArgs {
+        workspace,
+        all,
         browse: flagged(matches, "browse"),
     }))
 }
@@ -1701,7 +1680,7 @@ const DETACH: CommandSpec = CommandSpec {
     trailing: "",
     summary: "detach a workspace",
     about: &[
-        "Unmounts the workspace and stops its supervisor without destroying anything. `attach`, `path`, and `ensure` bring it back.",
+        "Unmounts the workspace and stops its supervisor without destroying anything. `attach` and `path` bring it back.",
     ],
     options: &[],
 };
@@ -2018,6 +1997,40 @@ mod tests {
             let error = parse_args(invalid).unwrap_err();
             assert!(error.hint.contains("cowshed ls [--all]"));
         }
+    }
+
+    #[test]
+    fn attach_accepts_one_workspace_project_scope_or_store_wide() {
+        let Command::Attach(named) = parse_args(["attach", "raven"]).unwrap().command else {
+            panic!("expected attach")
+        };
+        assert_eq!(named.workspace.as_deref(), Some("raven"));
+        assert!(!named.all);
+        assert!(!named.browse);
+
+        let Command::Attach(project) = parse_args(["attach"]).unwrap().command else {
+            panic!("expected attach")
+        };
+        assert_eq!(project.workspace, None);
+        assert!(!project.all);
+
+        let Command::Attach(all) = parse_args(["attach", "--all", "--browse"]).unwrap().command
+        else {
+            panic!("expected attach")
+        };
+        assert_eq!(all.workspace, None);
+        assert!(all.all);
+        assert!(all.browse);
+
+        let named_all = parse_args(["attach", "raven", "--all"]).unwrap_err();
+        assert_eq!(named_all.message, "attach --all cannot name a workspace");
+        assert!(named_all.hint.contains("cowshed attach [ws]"));
+
+        let main = parse_args(["attach", "main"]).unwrap_err();
+        assert_eq!(
+            main.message,
+            "mains are always mounted; attach targets session workspaces"
+        );
     }
 
     #[test]
@@ -2412,7 +2425,9 @@ mod tests {
             );
         }
         // Retire, replace, rename, unmount: the workspace has to be named.
-        for verb in ["rm", "land", "restore", "mv", "detach", "attach", "exec"] {
+        // `attach` without a name is a different scope (the project's detached
+        // sessions), not cwd inference of one workspace.
+        for verb in ["rm", "land", "restore", "mv", "detach", "exec"] {
             assert!(
                 parse_args([verb]).is_err(),
                 "{verb} must not infer a workspace from the cwd"
@@ -2578,7 +2593,8 @@ mod tests {
             (&["mv", "raven", "falcon"], Required),
             (&["checkpoint", "raven"], Required),
             (&["restore", "raven", "saved"], Required),
-            (&["ensure"], Required),
+            (&["attach"], Required),
+            (&["attach", "--all"], NotUsed),
             (&["ls"], Optional),
             (&["ls", "--all"], NotUsed),
             (&["path", "raven"], Required),
@@ -2641,7 +2657,6 @@ mod tests {
             (&["restore"], "restore requires a workspace"),
             (&["exec", "--", "true"], "exec requires a workspace"),
             (&["rm"], "rm requires a workspace"),
-            (&["attach"], "attach requires a workspace"),
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
             (&["land"], "land requires a workspace"),
