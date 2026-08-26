@@ -91,7 +91,11 @@ not a best-effort script:
 ## Checkout layouts
 
 Where `main` mounts is a per-project choice recorded in project metadata. Both layouts are supported, both use the same
-publication transaction, and every other workspace mounts at `/private/cowshed/store/mnt/<owner>/<repo>/<workspace>` under either.
+publication transaction, and every workspace other than `main` mounts at `<project-root>/.cowshed/<workspace>` under
+either layout. The host-side `.cowshed/` directory is created with the first workspace, holds only mountpoint
+directories (empty when detached), and `gc` removes it when empty. It is excluded from Git via `.git/info/exclude`
+written at adopt; adopt also appends a `.cowshed/` pattern to `.gitignore` when no such pattern exists, so clones and
+collaborators stay clean once that one-line change is committed.
 
 **Direct mount** (default). `main` mounts at the checkout's original path. Publication renames the original tree to
 `<root>.pre-cowshed`, recreates the emptied directory as the mountpoint with the stub `.envrc` inside it, and attaches
@@ -99,8 +103,8 @@ there. The user's path is the real thing: `pwd -P` reports it, the gitdir physic
 the volume label — which is why the label is the repository's name (01_storage.md) rather than an encoded identity. The
 cost is one mounted volume inside the user's source tree and a mountpoint that cannot be moved by `mv`.
 
-**Symlink**. `main` mounts at `/private/cowshed/store/mnt/<owner>/<repo>/main` like every other workspace — one uniform mount
-namespace, no special case in the layout, the substrate, or the runtime — and the checkout path holds a symlink to that
+**Symlink**. `main` mounts inside the store's session namespace like every other image — one uniform mount namespace,
+no special case in the layout, the substrate, or the runtime — and the checkout path holds a symlink to that
 mountpoint. Publication builds the symlink under a staging sibling, exchanges it with the original directory in one
 atomic `renameatx_np(RENAME_SWAP)`, and renames the displaced original to `<root>.pre-cowshed`.
 
@@ -110,12 +114,16 @@ appears. Ordering the mount before the handoff is what "symlink last" protects; 
 than a move-aside followed by a link is what removes the window in which the user's familiar path would not exist at
 all.
 
+Nested mounting carries one ordering invariant: `main`'s volume cannot detach while workspaces are mounted inside it,
+so detach order is strictly children first — `rm`/`detach` of main refuses with guidance while any sibling is attached,
+and the gateway's heal sequence attaches main before sessions and detaches them before main.
+
 The layouts differ in exactly one user-visible way beyond `pwd -P`, and it decides the default: **path-conditional Git
 configuration follows the physical path.** Git resolves a `gitdir:` condition against the resolved gitdir, so an
-`includeIf "gitdir:~/Dev/"` that scopes a work identity keeps matching under direct mount and stops matching under the
-symlink layout, where the real gitdir lives under `/private/cowshed/store/mnt`. Under the symlink layout that is the documented
-behavior for every workspace, `main` included: session workspaces have always lived under `/private/cowshed/store/mnt` and path
-conditions have never matched them.
+`includeIf "gitdir:~/Dev/"` scoping a work identity keeps matching for main under direct mount and stops matching under
+the symlink layout, whose real gitdir lives inside the store. Workspaces inherit by construction under direct mount:
+their gitdirs sit beneath `<project-root>`, so every rule matching the project path covers them. Under the symlink
+layout they resolve into the store instead, and absolute-pattern rules are required for them.
 
 Cowshed does not compensate. Capturing the effective identity at adopt time and stamping it as repo-local config would
 snapshot one moment of a configuration the user keeps editing, and would then silently diverge from it; honoring the

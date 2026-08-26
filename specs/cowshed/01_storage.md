@@ -64,7 +64,14 @@ layout root:
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
   caches/                            # ← cowshed.caches volume, NESTED mount (mirror, git mirrors, layer-3 caches)
-  mnt/<owner>/<repo>/<workspace>/    # ← session workspace mounts, nested (empty dirs when detached)
+  (workspace mounts live in each project checkout — `<project-root>/.cowshed/<workspace>`; see 02_workspaces.md)
+
+Workspace mountpoints live inside the project's own checkout at `<project-root>/.cowshed/<workspace>`: path-conditional
+Git configuration (`includeIf "gitdir:…"`) inherits into every workspace exactly as it does for main, `$HOME` hosts only
+plain per-user directories, and the store volume holds bytes only. Main cannot detach while workspaces are mounted
+inside it; detach order is strictly children first, and `gc` removes the host-side `.cowshed/` directory when it is
+empty. This directory is distinct from the in-image `.cowshed/` namespace above and from the same-named directory
+inside every clone.
 
 ~/Library/LaunchAgents/dev.cowshed.*.plist   # launchd service definitions (gateway daemonizes to a system
                                              # LaunchDaemon; sccache stays per-user); home-manager-owned on nix hosts
@@ -133,13 +140,13 @@ in-image marker's `imageFormat` to match. The two formats have disjoint attach t
 ASIF outright with _"use 'diskutil image attach'"_):
 
 - **ASIF (`.asif`)**: `diskutil image attach --nobrowse --noMount --plist <image>`.
-- **SPARSE (`.sparseimage`, fallback)**: `hdiutil attach -nobrowse -owners on -nomount -plist <image>`.
-
-Both commands return machine-readable attachment data from which cowshed selects the APFS volume device. Before the
-first mount, cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and fails without exposing a
-workspace mount. It then mounts explicitly with `diskutil mount nobrowse -mountPoint <path> <device>` (`--browse` omits
-`nobrowse`). ASIF and SPARSE therefore share the same verify-before-mount safety boundary even though their image
-attachment tools remain disjoint. Ownership is also guaranteed by the ASIF chown-at-create step above.
+- Session workspaces mount at `<project-root>/.cowshed/<workspace>` — inside the project checkout, nested on main's
+  mounted volume. `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and the sidebar regardless of
+  Finder preferences.
+- The **main workspace mounts where its project's checkout layout says** (02_workspaces.md): at the repository's
+  original path (written `<project-root>` below) under direct mount, or at the store's session namespace with a symlink
+  at the original path under the symlink layout. Either way the user keeps working at the path they know, and in both
+  layouts sibling workspaces nest under `<project-root>/.cowshed/`.
 
 For every mounted attachment:
 
