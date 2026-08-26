@@ -49,7 +49,8 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 pub struct GatewayPaths {
     pub home: PathBuf,
     pub store: PathBuf,
-    pub cache: PathBuf,
+    pub cache_volume: PathBuf,
+    pub mirror_cache: PathBuf,
     pub telemetry: PathBuf,
     pub control_socket: PathBuf,
 }
@@ -59,7 +60,8 @@ impl GatewayPaths {
         Self {
             home: storage.home().to_path_buf(),
             store: storage.store().to_path_buf(),
-            cache: storage.caches().join("mirror"),
+            cache_volume: storage.caches().to_path_buf(),
+            mirror_cache: storage.caches().join("mirror"),
             telemetry: storage.telemetry().join("gateway"),
             control_socket: control_socket_path(),
         }
@@ -71,9 +73,10 @@ impl GatewayPaths {
             control_tcp: None,
             simulator_drop_root: None,
             data_socket_root: None,
+            production_cache_volume: Some(self.cache_volume.clone()),
             git_helper_executable: Some(git_helper_executable),
             authorized_control_uid: uid,
-            mirror_cache: MirrorCacheConfig::new(self.cache.clone()),
+            mirror_cache: MirrorCacheConfig::new(self.mirror_cache.clone()),
             ..GatewayConfig::default()
         }
     }
@@ -429,7 +432,7 @@ async fn run_daemon() -> Result<()> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
     let paths = GatewayPaths::from_storage(&storage);
-    ensure_private_directory(&paths.cache)?;
+    ensure_private_directory(&paths.mirror_cache)?;
     ensure_private_directory(&paths.telemetry)?;
     // Startup contract (05_gateway.md): validated store, then heal every project's mounts, then
     // serve. The gateway is RunAtLoad, so this pass is what closes the reboot window in which a
