@@ -1676,6 +1676,9 @@ impl NativeProjectRuntimeHost {
             CowshedError::internal(format!("retired workspace recovery task failed: {error}"))
         })??;
         let verified_facts = verified_recovery_facts(&facts, &pending);
+        if let Some(origin) = origin.as_ref() {
+            validate_workspace_origin_against_inventory(origin, &verified_facts)?;
+        }
         // Authority is the inventory itself: an incarnation that is both an active storage fact
         // and a retired (trashed) one is a host-side integrity fault, found here in one pass —
         // no log replay has anything to add to what the images say.
@@ -1749,6 +1752,23 @@ impl NativeProjectRuntimeHost {
     }
 
     async fn authoritative(&self) -> Result<Vec<NativeWorkspace>> {
+        self.authoritative_with_project_root_validation(ProjectRootValidation::Strict)
+            .await
+    }
+
+    async fn authoritative_allowing_detached_main_relocation(
+        &self,
+    ) -> Result<Vec<NativeWorkspace>> {
+        self.authoritative_with_project_root_validation(
+            ProjectRootValidation::AllowDetachedMainRelocation,
+        )
+        .await
+    }
+
+    async fn authoritative_with_project_root_validation(
+        &self,
+        root_validation: ProjectRootValidation,
+    ) -> Result<Vec<NativeWorkspace>> {
         use crate::storage::lifecycle::Substrate;
 
         let derived = self
@@ -1758,6 +1778,7 @@ impl NativeProjectRuntimeHost {
             .map_err(native_storage_error)?;
         let layout = self.layout.clone();
         let project_root = self.descriptor.git_root.clone();
+        let checkout_layout = self.substrate_config.checkout_layout;
         crate::storage::lifecycle::dispatch_blocking(move || {
             derived
                 .into_iter()
@@ -1786,17 +1807,13 @@ impl NativeProjectRuntimeHost {
                             format!("detached metadata disagrees with {}", image.display()),
                         ));
                     }
-                    if let Some(info) = metadata.info_snapshot.as_ref()
-                        && !names_one_root(&info.project_root, &project_root)
-                    {
-                        return Err(crate::storage::apfs::ApfsStorageError::MarkerMismatch(
-                            format!(
-                                "persisted project root {} disagrees with controller root {}",
-                                info.project_root.display(),
-                                project_root.display()
-                            ),
-                        ));
-                    }
+                    validate_workspace_controller_root(
+                        &derived,
+                        &metadata,
+                        &project_root,
+                        checkout_layout,
+                        root_validation,
+                    )?;
                     Ok(NativeWorkspace {
                         derived,
                         metadata,
@@ -3138,6 +3155,47 @@ struct NativeWorkspace {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectRootValidation {
+    Strict,
+    AllowDetachedMainRelocation,
+}
+
+#[cfg(target_os = "macos")]
+fn validate_workspace_controller_root(
+    derived: &crate::storage::lifecycle::DerivedWorkspace,
+    metadata: &crate::metadata::DetachedWorkspaceMetadata,
+    project_root: &Path,
+    checkout_layout: crate::metadata::CheckoutLayout,
+    validation: ProjectRootValidation,
+) -> std::result::Result<(), crate::storage::apfs::ApfsStorageError> {
+    if !derived.workspace.name().is_main() {
+        return Ok(());
+    }
+    let permits_retired_root = matches!(
+        validation,
+        ProjectRootValidation::AllowDetachedMainRelocation
+    ) && checkout_layout.mounts_at_checkout()
+        && matches!(
+            derived.mount_state,
+            crate::storage::lifecycle::MountState::Detached
+        );
+    if !permits_retired_root
+        && let Some(info) = metadata.info_snapshot.as_ref()
+        && !names_one_root(&info.project_root, project_root)
+    {
+        return Err(crate::storage::apfs::ApfsStorageError::MarkerMismatch(
+            format!(
+                "persisted project root {} disagrees with controller root {}",
+                info.project_root.display(),
+                project_root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeRemovalGitFence {
     incarnation: WorkspaceIncarnation,
@@ -3177,7 +3235,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // repository at its recorded checkout by definition; its session marker and persisted
         // binding were validated during open, so querying remotes there would prevent the move
         // operation that repairs it. Every other state retains the ordinary live-Git check.
-        let authoritative = self.authoritative().await?;
+        let authoritative = self
+            .authoritative_allowing_detached_main_relocation()
+            .await?;
         let detached_direct_main = self.substrate_config.checkout_layout.mounts_at_checkout()
             && authoritative.iter().any(|workspace| {
                 workspace.derived.workspace.name().is_main()
@@ -3679,7 +3739,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let main = main_name();
         let source = self.substrate_config.checkout_path.clone();
         let layout = self.substrate_config.checkout_layout;
-        let current = self.current(&main).await?;
+        let current = self
+            .authoritative_allowing_detached_main_relocation()
+            .await?
+            .into_iter()
+            .find(|workspace| workspace.derived.workspace.name() == &main)
+            .ok_or_else(|| {
+                CowshedError::not_found(
+                    "workspace main does not exist",
+                    "list published workspaces and retry",
+                )
+            })?;
         let detached_direct = layout.mounts_at_checkout()
             && matches!(
                 current.derived.mount_state,
@@ -3713,68 +3783,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let prepare_source = source.clone();
             let prepare_destination = destination.clone();
             crate::storage::lifecycle::dispatch_blocking(move || {
-                let source_existed = match std::fs::symlink_metadata(&prepare_source) {
-                    Ok(metadata) if metadata.file_type().is_dir() => {
-                        std::fs::rename(&prepare_source, &prepare_destination).map_err(|error| {
-                            CowshedError::environment_missing(
-                                format!(
-                                    "cannot move the detached checkout mountpoint to {}: {error}",
-                                    prepare_destination.display()
-                                ),
-                                "choose a destination on the same writable filesystem",
-                            )
-                        })?;
-                        true
-                    }
-                    Ok(_) => {
-                        return Err(CowshedError::conflict(
-                            format!(
-                                "the detached checkout path {} is not a directory",
-                                prepare_source.display()
-                            ),
-                            "remove the occupant or run cowshed doctor --json",
-                        ));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        std::fs::create_dir(&prepare_destination).map_err(|error| {
-                            CowshedError::environment_missing(
-                                format!(
-                                    "cannot create checkout mountpoint {}: {error}",
-                                    prepare_destination.display()
-                                ),
-                                "choose a destination in a writable directory",
-                            )
-                        })?;
-                        false
-                    }
-                    Err(error) => {
-                        return Err(CowshedError::environment_missing(
-                            format!(
-                                "cannot inspect detached checkout path {}: {error}",
-                                prepare_source.display()
-                            ),
-                            "check the old checkout parent permissions and retry",
-                        ));
-                    }
-                };
-                let recorded = prepare_layout
-                    .record_checkout_layout(layout)
-                    .map_err(native_integrity_error)
-                    .and_then(|()| {
-                        prepare_record
-                            .rewrite_detached_project_root(&prepare_destination)
-                            .map_err(native_integrity_error)
-                            .map(|_| ())
-                    });
-                if let Err(error) = recorded {
-                    if source_existed {
-                        let _ = std::fs::rename(&prepare_destination, &prepare_source);
-                    } else {
-                        let _ = std::fs::remove_dir(&prepare_destination);
-                    }
-                    return Err(error);
-                }
-                Ok(())
+                prepare_detached_checkout_relocation(
+                    &prepare_record,
+                    &prepare_layout,
+                    layout,
+                    &prepare_source,
+                    &prepare_destination,
+                )
             })
             .await
             .map_err(|error| {
@@ -5341,10 +5356,84 @@ async fn marker_project_root(path: &Path) -> Result<Option<PathBuf>> {
     Ok(marker.map(|marker| marker.project_root))
 }
 
+#[cfg(target_os = "macos")]
+fn prepare_detached_checkout_relocation(
+    record: &crate::checkout::CheckoutRecord,
+    storage_layout: &crate::storage::StorageLayout,
+    checkout_layout: crate::metadata::CheckoutLayout,
+    source: &Path,
+    destination: &Path,
+) -> Result<()> {
+    let source_existed = match std::fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            std::fs::rename(source, destination).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot move the detached checkout mountpoint to {}: {error}",
+                        destination.display()
+                    ),
+                    "choose a destination on the same writable filesystem",
+                )
+            })?;
+            true
+        }
+        Ok(_) => {
+            return Err(CowshedError::conflict(
+                format!(
+                    "the detached checkout path {} is not a directory",
+                    source.display()
+                ),
+                "remove the occupant or run cowshed doctor --json",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(destination).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot create checkout mountpoint {}: {error}",
+                        destination.display()
+                    ),
+                    "choose a destination in a writable directory",
+                )
+            })?;
+            false
+        }
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot inspect detached checkout path {}: {error}",
+                    source.display()
+                ),
+                "check the old checkout parent permissions and retry",
+            ));
+        }
+    };
+    let recorded = storage_layout
+        .record_checkout_layout(checkout_layout)
+        .map_err(native_integrity_error)
+        .and_then(|()| {
+            record
+                .rewrite_detached_project_root(destination)
+                .map_err(native_integrity_error)
+                .map(|_| ())
+        });
+    if let Err(error) = recorded {
+        if source_existed {
+            let _ = std::fs::rename(destination, source);
+        } else {
+            let _ = std::fs::remove_dir(destination);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// What a workspace marker tells an opening controller about the project it belongs to.
 #[cfg(target_os = "macos")]
 struct WorkspaceOrigin {
     repo_id: RepoId,
+    workspace: WorkspaceName,
+    workspace_incarnation: WorkspaceIncarnation,
     /// The project's checkout path, which every marker records — main's own for main, and main's
     /// for a session, since a session is a clone of the project rather than a project of its own.
     project_root: PathBuf,
@@ -5409,8 +5498,31 @@ async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<Work
     }
     Ok(Some(WorkspaceOrigin {
         repo_id: marker.repo_id,
+        workspace: marker.workspace,
+        workspace_incarnation: marker.workspace_incarnation,
         project_root: marker.project_root,
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_workspace_origin_against_inventory(
+    origin: &WorkspaceOrigin,
+    facts: &[&crate::storage::lifecycle::StorageFact],
+) -> Result<()> {
+    if facts.iter().any(|fact| {
+        fact.workspace.repo() == &origin.repo_id
+            && fact.workspace.name() == &origin.workspace
+            && fact.workspace.incarnation() == &origin.workspace_incarnation
+    }) {
+        return Ok(());
+    }
+    Err(CowshedError::conflict(
+        format!(
+            "workspace marker identity {}/{}/{} differs from active storage inventory",
+            origin.repo_id, origin.workspace, origin.workspace_incarnation
+        ),
+        "reopen from a workspace whose marker matches active storage",
+    ))
 }
 
 /// Do a recorded project root and an observed one name the same directory?
@@ -6952,7 +7064,12 @@ mod git_worktree_tests {
 mod workspace_origin_tests {
     use super::*;
     use crate::metadata::{
-        ImageFormat, METADATA_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole,
+        DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
+        PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker,
+        WorkspaceRole,
+    };
+    use crate::storage::lifecycle::{
+        DerivedWorkspace, LifecycleWorkspace, MountState, Revision, StorageFact,
     };
 
     fn temp_directory(test: &str) -> PathBuf {
@@ -6992,6 +7109,58 @@ mod workspace_origin_tests {
             },
         )
         .expect("write marker");
+    }
+
+    fn incarnation(value: &str) -> WorkspaceIncarnation {
+        WorkspaceIncarnation::new(value).expect("incarnation")
+    }
+
+    fn lifecycle_workspace(
+        workspace: &str,
+        incarnation: WorkspaceIncarnation,
+        role: WorkspaceRole,
+    ) -> LifecycleWorkspace {
+        LifecycleWorkspace::new(
+            RepoId::parse("acme/widget").expect("repo"),
+            WorkspaceName::new(workspace).expect("workspace"),
+            incarnation,
+            Revision::new(1),
+            Revision::new(1),
+            role,
+            ImageFormat::Asif,
+        )
+        .expect("lifecycle workspace")
+    }
+
+    fn main_metadata(
+        project_root: &Path,
+        incarnation: WorkspaceIncarnation,
+    ) -> DetachedWorkspaceMetadata {
+        DetachedWorkspaceMetadata {
+            version: METADATA_VERSION,
+            repo_id: RepoId::parse("acme/widget").expect("repo"),
+            workspace: WorkspaceName::new("main").expect("main"),
+            workspace_incarnation: incarnation,
+            image_format: ImageFormat::Asif,
+            platform: Platform::Macos,
+            publication_state: PublicationState::Active,
+            updated_at: "2026-07-13T00:00:00Z".to_owned(),
+            grants: GrantSet::closed_baseline(Some(
+                PortBlock::new(49_152, 16).expect("port block"),
+            ))
+            .expect("grants"),
+            info_snapshot: Some(WorkspaceInfoSnapshot {
+                project_root: project_root.to_owned(),
+                role: WorkspaceRole::Main,
+                base_commit: "0123456789abcdef".to_owned(),
+                branch: None,
+                created_at: "2026-07-13T00:00:00Z".to_owned(),
+                forked_from: None,
+                captured_at: "2026-07-13T00:00:00Z".to_owned(),
+                stale: false,
+                git_worktree: false,
+            }),
+        }
     }
 
     /// A coordinator verb invoked from inside a session workspace must open the project, not be
@@ -7062,6 +7231,185 @@ mod workspace_origin_tests {
         );
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[tokio::test]
+    async fn detached_main_relocation_accepts_retired_roots_after_session_identity_validation() {
+        let temp = temp_directory("retired-roots");
+        let persisted_old_root = temp.join("historical-a");
+        let retired_controller_root = temp.join("historical-b");
+        let session = temp.join("mnt/slot@1");
+        let destination = temp.join("destination-d");
+        let store = temp.join("store");
+        std::fs::create_dir_all(&session).expect("session mount");
+        write_marker(
+            &session,
+            "task",
+            WorkspaceRole::Workspace,
+            &retired_controller_root,
+        );
+
+        let origin = workspace_origin_from_marker(&session)
+            .await
+            .expect("session marker")
+            .expect("origin");
+        let repo_id = RepoId::parse("acme/widget").expect("repo");
+        let layout =
+            crate::storage::StorageLayout::with_mount_root(&store, temp.join("mnt"), &repo_id)
+                .expect("layout");
+        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id.clone(),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://example.test/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        let mismatched_binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: RepoId::parse("other/widget").expect("other repo"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://example.test/other/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("mismatched binding");
+        crate::metadata::write_json(&layout.project().repository_binding, &mismatched_binding)
+            .expect("persist mismatched binding");
+        project_binding_from_workspace_origin(&store, &session, Some(&origin))
+            .await
+            .expect_err("marker and binding repository identities must agree");
+        crate::metadata::write_json(&layout.project().repository_binding, &binding)
+            .expect("persist binding");
+        project_binding_from_workspace_origin(&store, &session, Some(&origin))
+            .await
+            .expect("store binding")
+            .expect("session invocation");
+
+        let session_fact = StorageFact {
+            workspace: lifecycle_workspace(
+                "task",
+                incarnation("00000000000000000000000000000001"),
+                WorkspaceRole::Workspace,
+            ),
+            volume_key: "disk-session".to_owned(),
+        };
+        let stale_session_fact = StorageFact {
+            workspace: lifecycle_workspace(
+                "task",
+                incarnation("00000000000000000000000000000009"),
+                WorkspaceRole::Workspace,
+            ),
+            volume_key: "disk-stale-session".to_owned(),
+        };
+        validate_workspace_origin_against_inventory(&origin, &[&stale_session_fact])
+            .expect_err("marker and active storage incarnations must agree");
+        validate_workspace_origin_against_inventory(&origin, &[&session_fact])
+            .expect("marker repo, workspace, and incarnation match storage");
+
+        let session_incarnation = incarnation("00000000000000000000000000000001");
+        let session_workspace = DerivedWorkspace {
+            workspace: lifecycle_workspace(
+                "task",
+                session_incarnation.clone(),
+                WorkspaceRole::Workspace,
+            ),
+            mount_state: MountState::Mounted { mount_id: 7 },
+            checkpoints: Vec::new(),
+        };
+        let mut session_metadata = main_metadata(&persisted_old_root, session_incarnation);
+        session_metadata.workspace = WorkspaceName::new("task").expect("task");
+        session_metadata
+            .info_snapshot
+            .as_mut()
+            .expect("snapshot")
+            .role = WorkspaceRole::Workspace;
+        validate_workspace_controller_root(
+            &session_workspace,
+            &session_metadata,
+            &retired_controller_root,
+            crate::metadata::CheckoutLayout::DirectMount,
+            ProjectRootValidation::Strict,
+        )
+        .expect("session sidecars do not claim the controller checkout");
+
+        let main_incarnation = incarnation("00000000000000000000000000000002");
+        let main = DerivedWorkspace {
+            workspace: lifecycle_workspace("main", main_incarnation.clone(), WorkspaceRole::Main),
+            mount_state: MountState::Detached,
+            checkpoints: Vec::new(),
+        };
+        let metadata = main_metadata(&persisted_old_root, main_incarnation);
+        validate_workspace_controller_root(
+            &main,
+            &metadata,
+            &retired_controller_root,
+            crate::metadata::CheckoutLayout::DirectMount,
+            ProjectRootValidation::AllowDetachedMainRelocation,
+        )
+        .expect("explicit detached-main relocation accepts retired roots");
+
+        let image = layout
+            .main_image(ImageFormat::Asif)
+            .expect("main paths")
+            .image()
+            .to_owned();
+        std::fs::write(&image, b"main image").expect("image");
+        metadata.write_for_image(&image).expect("sidecar");
+        let record = crate::checkout::CheckoutRecord {
+            mount_point: retired_controller_root.clone(),
+            image,
+        };
+        prepare_detached_checkout_relocation(
+            &record,
+            &layout,
+            crate::metadata::CheckoutLayout::DirectMount,
+            &retired_controller_root,
+            &destination,
+        )
+        .expect("relocate detached main");
+
+        assert!(
+            destination.is_dir(),
+            "the explicit destination becomes the mountpoint"
+        );
+        assert_eq!(
+            DetachedWorkspaceMetadata::read_for_image(&record.image)
+                .expect("updated sidecar")
+                .require_info_snapshot()
+                .expect("main snapshot")
+                .project_root,
+            destination
+        );
+        assert_eq!(
+            layout.checkout_layout().expect("updated layout"),
+            crate::metadata::CheckoutLayout::DirectMount
+        );
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn mounted_main_still_rejects_disagreeing_persisted_and_controller_roots() {
+        let main_incarnation = incarnation("00000000000000000000000000000003");
+        let main = DerivedWorkspace {
+            workspace: lifecycle_workspace("main", main_incarnation.clone(), WorkspaceRole::Main),
+            mount_state: MountState::Mounted { mount_id: 42 },
+            checkpoints: Vec::new(),
+        };
+        let metadata = main_metadata(Path::new("/historical/a"), main_incarnation);
+
+        let error = validate_workspace_controller_root(
+            &main,
+            &metadata,
+            Path::new("/retired/controller/b"),
+            crate::metadata::CheckoutLayout::DirectMount,
+            ProjectRootValidation::AllowDetachedMainRelocation,
+        )
+        .expect_err("mounted main retains strict root agreement");
+        assert!(
+            error
+                .to_string()
+                .contains("persisted project root /historical/a disagrees with controller root /retired/controller/b"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
