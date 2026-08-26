@@ -16,8 +16,8 @@ use super::fstab::FstabPin;
 pub mod native;
 pub use native::{
     FstabOutcome, HostSetupPlan, HostSetupReport, HostUninstallPlan, UninstallFstabOutcome,
-    UninstallReport, VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall,
-    plan_host_setup, plan_host_uninstall,
+    UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
+    execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
 
 
