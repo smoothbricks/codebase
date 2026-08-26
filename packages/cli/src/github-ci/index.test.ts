@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
@@ -177,7 +177,7 @@ describe('collected Nx outputs', () => {
 
       const sourceSha = await readGitHeadSha(root);
       expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
-        version: 1,
+        version: 2,
         sourceSha,
         files: [],
       });
@@ -204,7 +204,7 @@ describe('collected Nx outputs', () => {
     await withOutputFixture(async ({ root, artifact }) => {
       const manifest = await collectNxOutputs(root, artifact, [], SOURCE_SHA);
 
-      expect(manifest).toEqual({ version: 1, sourceSha: SOURCE_SHA, files: [] });
+      expect(manifest).toEqual({ version: 2, sourceSha: SOURCE_SHA, files: [] });
       await rm(join(artifact, 'workspace'), { recursive: true });
       await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [])).resolves.toBeUndefined();
     });
@@ -301,7 +301,7 @@ describe('collected Nx outputs', () => {
         SOURCE_SHA,
       );
       expect(manifest).toMatchObject({
-        version: 1,
+        version: 2,
         sourceSha: SOURCE_SHA,
         files: [
           {
@@ -318,6 +318,46 @@ describe('collected Nx outputs', () => {
       await rm(join(root, 'packages/app/dist'), { recursive: true, force: true });
       await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
       expect(await readFile(source, 'utf8')).toBe('native artifact');
+    });
+  });
+
+  it('records output modes and restores them after artifact transport', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      const source = join(root, 'packages/app/dist/result.bin');
+      await writeFile(source, 'native artifact');
+      await chmod(source, 0o751);
+
+      const manifest = await collectNxOutputs(
+        root,
+        artifact,
+        [{ target: 'build-macos', projects: [outputProject] }],
+        SOURCE_SHA,
+      );
+      expect(manifest.files).toEqual([expect.objectContaining({ path: 'packages/app/dist/result.bin', mode: 0o751 })]);
+
+      const staged = join(artifact, 'workspace/packages/app/dist/result.bin');
+      await chmod(staged, 0o644);
+      await rm(join(root, 'packages/app/dist'), { recursive: true, force: true });
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
+
+      expect((await stat(source)).mode & 0o7777).toBe(0o751);
+    });
+  });
+
+  it('rejects manifests from the previous schema version', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      await writeFile(join(root, 'packages/app/dist/result.bin'), 'native artifact');
+      const manifest = await collectNxOutputs(
+        root,
+        artifact,
+        [{ target: 'build-macos', projects: [outputProject] }],
+        SOURCE_SHA,
+      );
+      await writeFile(join(artifact, 'manifest.json'), `${JSON.stringify({ ...manifest, version: 1 })}\n`);
+
+      await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject])).rejects.toThrow(
+        'Invalid collected output manifest',
+      );
     });
   });
 
