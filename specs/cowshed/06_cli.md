@@ -165,7 +165,7 @@ never errors).
 | `cowshed sim export <ws> [artifact]`          | drop path                                        | Copy a built iOS `.app` to the one-way drop dir for the personal-session simulator (02/14). Default: newest built app.                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `cowshed app export <ws> [artifact]`          | drop path                                        | Mac-target sibling of `sim export`: copy a built macOS `.app` to the drop dir (02/14).                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `cowshed attach [ws] [--all]`                 | mount path(s)                                    | `<ws>` one; cwd in a project = that project's sessions; `--all` store-wide. Mains always mounted (05). |
-| `cowshed attach [ws] [--all]`                 | mount path(s)                                    | `<ws>` one; cwd in a project = that project's sessions; `--all` store-wide. Mains always mounted (05). |
+| `cowshed detach [ws] [--all]`                 | — (no stdout)                                    | `<ws>` one from store readdir (sidecar identity, no cwd/git); `--project` overrides; `--all` store-wide attached sessions. Mains never targets. |
 | `cowshed grant <ws> …`                        | new grant revision                               | `--read/--write <path>`, `--egress <host[:port]> [--opaque] [--impersonate <p>]`, `--repo <host/org[/repo]>`, `--sim <verb>`, `--preset simulator` (04/05).                                                                                                                                                                                                                                                                                                                                                                    |
 | `cowshed revoke <ws> …`                       | new grant revision                               | Same selectors + `--all`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `cowshed push <ws>`                           | preserved ref, source sha                        | `--branch <name>` plus optional incarnation/source/destination CAS expectations. Preserves under `refs/cowshed/<ws>/…`; never advances an integration branch or checkout (02).                                                                                                                                                                                                                                                                                                                                                 |
@@ -184,7 +184,6 @@ never errors).
 | `cowshed job wait <ws> <id>`                  | final status                                     | Wait for a terminal state; `--json` returns final `JobInfo`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `cowshed rm <ws>`                             | — (no stdout)                                    | Perceived-instant (02). Refuses unpushed branch without `--force`; `--force` also required for main / dirty.                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `cowshed mv <ws> <new-name>`                  | new mount path                                   | Rename a workspace, or move the project checkout with `cowshed mv main <new-path>` — the source decides whether the destination reads as a name or a path. Owns the unmount/republish/remount cycle, symmetric with `rm` (02). The rename refuses a dirty tree or a running job; the checkout move refuses a relative, occupied, parentless, or storage-overlapping destination — each naming the command that clears it (02).                                                                                                                                                                                                                                                                    |
-| `cowshed attach <ws>` / `cowshed detach <ws>` | mount path / —                                   | Explicit mount lifecycle. `--browse`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `cowshed du [ws]`                             | `--json`: written/referenced per ws + checkpoint | CoW-aware usage; lists checkpoints per workspace (01).                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `cowshed logs`                                | human table (`--json`/`--ndjson`: events)        | Controller telemetry (13). `--ws`, `--kind`, `--since`, `--follow`. Wraps `lmao-inspect` over the store segments.                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `cowshed audit`                               | human table (`--json`/`--ndjson`: events)        | Gateway audit events (05/13). `--denied`, `--host`, `--ws`, `--follow` (live tail via the control plane).                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -257,23 +256,31 @@ trades workspace-path uniqueness for warmth and only one workspace may hold a sl
 
 ### Inferring `<ws>` from the working directory
 
-A command run inside a mounted workspace may omit that workspace's name. Resolution reuses the workspace-from-cwd rule that `attach` uses —
+A command run inside a mounted workspace may omit that workspace's name when the verb infers from cwd. Resolution is
 containment of the canonical cwd in exactly one currently mounted workspace (01_storage.md), which is exact because
 mount identity is keyed off the in-image marker, and which refuses an ambiguous match rather than picking one. An
-explicit argument always wins; inference never overrides what the caller named. Outside any workspace the refusal
-stands and names both ways out: name one, or run the command from inside one.
+explicit argument always wins; inference never overrides what the caller named. Outside any workspace those verbs
+refuse and name both ways out: name one, or run the command from inside one.
 
 The split is by what the verb does to the workspace, not by convenience:
 
-| Infers from cwd                                  | Requires the name                                         |
-| ------------------------------------------------ | ----------------------------------------------------------- |
-| `rebase`, `push`, `checkpoint`, `path`           | `rm`, `land`, `restore`, `mv`, `attach`, `detach`, `exec` |
+| Infers from cwd                                  | Requires the name                            |
+| ------------------------------------------------ | -------------------------------------------- |
+| `rebase`, `push`, `checkpoint`, `path`           | `rm`, `land`, `restore`, `mv`, `exec`        |
 
 Verbs that act on a workspace **in place** infer it. Verbs that **retire it** (`rm`, `land`), **replace it** (`restore`
-mints a fresh incarnation over the running one), **rename or move it** (`mv`), or **change its mount** (`attach`,
-`detach`) require it to be named, so that losing the workspace you are standing in is always something you asked for by
-name rather than something the working directory decided for you. `exec` is excluded for a second reason as well: its
-workspace argument is positionally ambiguous with the command it runs.
+mints a fresh incarnation over the running one), or **rename or move it** (`mv`) require it to be named, so that losing
+the workspace you are standing in is always something you asked for by name rather than something the working directory
+decided for you. `exec` is excluded for a second reason as well: its workspace argument is positionally ambiguous with
+the command it runs.
+
+`attach` and `detach` change mount state but do not infer a single workspace from cwd. `attach [ws] [--all]`: `<ws>`
+one session; no name while cwd is in a project checkout or session = that project's detached sessions; `--all` every
+detached session store-wide. Mains are always mounted and are never attach targets. `detach [ws] [--all]`: `<ws>` one
+session resolved from the store readdir (`<owner>/<repo>/sessions/<ws>.image` plus sidecar/marker identity) without cwd
+or git discovery; `--project` still selects the project; `--all` every attached session store-wide. Mains are never
+detach targets. A bare `detach` with neither a name nor `--all` is usage.
+
 
 ## Configuration
 
