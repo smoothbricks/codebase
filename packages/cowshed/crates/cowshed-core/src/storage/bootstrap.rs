@@ -1246,7 +1246,7 @@ fn validate_zfs_evidence(state: &ExistingStorage, expected: &str) -> Result<(), 
             | ExistingStorage::FoundElsewhere { .. }
     ) {
         return Err(PlanError::ImpossibleStorageTopology(
-            "incomplete APFS provisioning evidence cannot describe a ZFS dataset",
+            "an APFS volume state cannot describe a ZFS dataset",
         ));
     }
     if let Some(actual) = state.exact_identifier()

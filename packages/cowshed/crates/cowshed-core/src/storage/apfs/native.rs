@@ -1442,7 +1442,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         let stub = mount_point.join(".envrc");
         fs::write(&stub, SELF_HEALING_STUB)
-            .map_err(|error| io_error("write self-healing mount stub", &stub, error))?;
+            .map_err(|error| io_error("write automatic mount stub", &stub, error))?;
         fs::File::open(mount_point)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| io_error("sync adopt mountpoint", mount_point, error))?;
@@ -2734,7 +2734,7 @@ where
             workspace.incarnation(),
         ) {
             return Err(ApfsStorageError::Host(format!(
-                "refusing to heal unrelated mount at {}: the volume mounted from {} carries no {}/{} marker for incarnation {}",
+                "cannot use unrelated mount at {}: the volume mounted from {} carries no {}/{} marker for incarnation {}",
                 mount_point.display(),
                 mount.source_device,
                 workspace.repo(),

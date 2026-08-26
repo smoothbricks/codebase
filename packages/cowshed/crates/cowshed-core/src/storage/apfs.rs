@@ -1420,7 +1420,7 @@ where
                     )
                 })
             {
-                return detach_after_failure(host.as_ref(), attachment, primary, "ensure mounted");
+                return detach_after_failure(host.as_ref(), attachment, primary, "mount workspace");
             }
             host.retain_mounted(&workspace, attachment)?;
             Ok(mount_point)

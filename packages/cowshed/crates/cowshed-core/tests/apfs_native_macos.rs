@@ -2099,7 +2099,7 @@ fn canonical_path_with_an_unrelated_volume_fails_closed_without_detaching() {
     assert!(
         error
             .to_string()
-            .contains("refusing to heal unrelated mount")
+            .contains("cannot use unrelated mount")
     );
     let error = host
         .detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
