@@ -310,15 +310,22 @@ export function expandNxTargetDependencyRuns(runs: NxTargetRun[]): NxTargetRun[]
 }
 
 export function nxRunManyArgs(run: NxTargetRun, configuration?: string): string[] {
-  if (run.projects.length === 0) {
-    throw new Error(`Nx target ${run.target} has no selected projects.`);
+  return nxRunManyBatchArgs([run], configuration);
+}
+
+/** One `nx run-many` for every selected target so independent rustc graphs overlap. */
+export function nxRunManyBatchArgs(runs: NxTargetRun[], configuration?: string): string[] {
+  if (runs.length === 0) {
+    throw new Error('Nx run-many has no selected targets.');
   }
-  const nxArgs = [
-    'run-many',
-    '-t',
-    run.target,
-    `--projects=${run.projects.map((project) => project.project).join(',')}`,
-  ];
+  const targets = [...new Set(runs.map((run) => run.target))];
+  const projects = [...new Set(runs.flatMap((run) => run.projects.map((project) => project.project)))].sort(
+    (left, right) => left.localeCompare(right),
+  );
+  if (projects.length === 0) {
+    throw new Error(`Nx targets ${targets.join(',')} have no selected projects.`);
+  }
+  const nxArgs = ['run-many', '-t', targets.join(','), `--projects=${projects.join(',')}`];
   if (configuration) {
     nxArgs.push(`--configuration=${configuration}`);
   }
@@ -336,8 +343,8 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
   if (expanded.unmatchedGlobs.length > 0) {
     console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
   }
-  for (const targetRun of expanded.runs) {
-    await run('nx', nxRunManyArgs(targetRun, options.configuration), root);
+  if (expanded.runs.length > 0) {
+    await run('nx', nxRunManyBatchArgs(expanded.runs, options.configuration), root);
   }
   if (options.collectOutputs) {
     const { collectNxOutputs } = await loadOutputBoundary();

@@ -217,18 +217,31 @@ jobs:
         run: nx build cli
 
       # Step 5
+      - name: 🤖 Configure release author
+        run:
+          git config user.name "github-actions[bot]" && git config user.email
+          "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Step 6
+      - name: 🏷️ Version release
+        id: version
+        run:
+          smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}" --github-output
+          "$GITHUB_OUTPUT"
+
+      # Step 7
       - name: 🍎 Build selected macOS and iOS release outputs
         id: platform-outputs
         run:
           smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" --targets
           "*-macos,*-ios" --output "${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"
 
-      # Step 6
+      # Step 8
       - name: 🧪 Unit test selected macOS and iOS packages
         if: steps.platform-outputs.outputs.projects != ''
         run: smoo github-ci nx-run-many --targets test --projects "${{ steps.platform-outputs.outputs.projects }}"
 
-      # Step 7
+      # Step 9
       - name: 📤 Upload macOS platform outputs
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -240,7 +253,7 @@ jobs:
 
       # --- Cleanup ------------------------------------------------------------
 
-      # Step 8
+      # Step 10
       - name: 🧹 Cleanup and cache Nix/devenv
         # success() is default; always() still saves GH Nix cache after a red job.
         if: always()
