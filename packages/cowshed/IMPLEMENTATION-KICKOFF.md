@@ -66,14 +66,15 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   `~/.cowshed/caches` (mirror, git mirrors, layer-3 caches — fully rebuildable, nukeable). Both lazily created,
   space-sharing the container; store mounts first (the other mountpoints live on it) and the volume-root marker
   `.cowshed-volume.json` distinguishes mounted from bare — absent means unmounted, heal before acting. Workspace mounts
-  at `~/.cowshed/mnt/<owner>/<repo>/<ws>` (primary `repo_id`, with each component separately validated and encoded;
-  nobrowse, owners on, NOT /Volumes). Data-volume home footprint: one empty mountpoint dir. Rationale: Data's local
+  at `<mount-root>/<owner>/<repo>/<ws>` (the host-configured root defaults to `~/.cowshed/mnt`; primary `repo_id`, with
+  each component separately validated and encoded; nobrowse, owners on, NOT /Volumes). Data-volume home footprint: one
+  empty mountpoint directory. Rationale: Data's local
   snapshots would pin churned image blocks (path-level tmutil exclusion doesn't stop snapshotting); dedicated volumes
   also collapse backup policy to per-volume decisions and separate fsck/corruption domains by rebuildability class.
   Sandbox consequence: ONE `~/.cowshed` subtree deny + carve-backs replaces the enumerated store/sibling-mount denies
   (04_sandbox.md). Spec: 01_storage.md.
 - **Declarative host setup + deployment postures (14_nix.md)**: on nix hosts, `programs.cowshed` (home-manager) owns the
-  cache-subtree symlinks, launchd agents, go env defaults, and TM exclusions declaratively — `adopt`/`ensure` VALIDATE
+  cache-subtree symlinks, launchd agents, go env defaults, and TM exclusions declaratively — `adopt`/`doctor` VALIDATE
   and never mutate when HM owns the host (detection: HM symlinks resolve into /nix/store); imperative mode stays the
   non-nix fallback. Volume creation and per-project artifacts stay imperative always. Postures: A = single-account
   (Seatbelt-only boundary, main unsandboxed); B2 (recommended) = dedicated `dev` uid used as a remote-backend "localhost
@@ -326,7 +327,7 @@ Interception + telemetry verification (05_gateway.md, 13_telemetry.md — fold i
   each supported host, sandboxed, with caches warm from main.
 - Exit code 6 and a grant hint appear only on authoritative sandbox-denial evidence. After a filesystem grant, the prior
   supervisor drains and relaunches at the new revision before retry; egress and simulator grants apply immediately.
-- `cowshed ensure` fast path ≤ 25 ms; `cowshed new` ≤ 1 s cold; `cowshed rm` returns instantly.
+- `cowshed attach` fast path ≤ 25 ms; `cowshed new` ≤ 1 s cold; `cowshed rm` returns instantly.
 - Zero host-visible inode growth per workspace beyond the image file + grants file.
 - Substrate parity: the acceptance flow above passes on Linux/ZFS with Landlock enforcement (integration leg; can run in
   CI on a ZFS-capable Linux host once the runner exists — bootstrap order is macOS first, then Linux substrate, then the
