@@ -68,6 +68,34 @@ impl CheckoutRecord {
         Ok(true)
     }
 
+    /// Rewrite the store-side checkout fact while main is detached.
+    ///
+    /// A missing direct-mount checkout has no readable in-image marker by definition. Its detached
+    /// sidecar is still the registry authority and is published atomically, so moving that fact
+    /// forward lets the image be mounted at the destination. Once mounted,
+    /// [`Self::rewrite_project_root`] updates the marker and confirms both copies agree.
+    pub fn rewrite_detached_project_root(
+        &self,
+        project_root: &Path,
+    ) -> Result<bool, MetadataError> {
+        if !project_root.is_absolute() {
+            return Err(MetadataError::InvalidPath(project_root.to_owned()));
+        }
+        let sidecar = sidecar_path(&self.image);
+        let mut metadata = DetachedWorkspaceMetadata::read_for_image(&self.image)?;
+        let snapshot = metadata
+            .info_snapshot
+            .as_mut()
+            .ok_or(MetadataError::MissingInfoSnapshot)?;
+        if snapshot.project_root == project_root {
+            return Ok(false);
+        }
+        snapshot.project_root = project_root.to_owned();
+        metadata.validate(&self.image)?;
+        write_json(&sidecar, &metadata)?;
+        Ok(true)
+    }
+
     /// The project root the record currently names, read from the marker.
     pub fn recorded_project_root(&self) -> Result<PathBuf, MetadataError> {
         WorkspaceMarker::read_from(&self.mount_point.join(WORKSPACE_MARKER_PATH))
@@ -146,7 +174,6 @@ pub fn load_checkout_layout(path: &Path) -> Result<CheckoutLayout, MetadataError
         Err(error) => Err(error),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -278,6 +305,28 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_direct_mount_rewrites_the_detached_sidecar_without_opening_the_old_path() {
+        let temp = TempDirectory::new("detached-rewrite");
+        let record = fixture(temp.path(), Path::new("/old/checkout"));
+        fs::remove_dir_all(&record.mount_point).expect("remove old direct mount");
+
+        assert!(
+            record
+                .rewrite_detached_project_root(Path::new("/new/checkout"))
+                .expect("rewrite detached record")
+        );
+        assert!(!record.mount_point.exists());
+        assert_eq!(
+            DetachedWorkspaceMetadata::read_for_image(&record.image)
+                .expect("sidecar")
+                .require_info_snapshot()
+                .expect("snapshot")
+                .project_root,
+            Path::new("/new/checkout")
+        );
+    }
+
+    #[test]
     fn a_relative_project_root_is_refused_before_either_record_is_touched() {
         let temp = TempDirectory::new("refuse-relative");
         let record = fixture(temp.path(), Path::new("/old/checkout"));
@@ -356,9 +405,8 @@ mod tests {
             load_checkout_layout(&path).expect("legacy layout"),
             CheckoutLayout::DirectMount
         );
-        let record =
-            crate::metadata::read_json::<crate::metadata::CheckoutLayoutRecord>(&path)
-                .expect("materialized record");
+        let record = crate::metadata::read_json::<crate::metadata::CheckoutLayoutRecord>(&path)
+            .expect("materialized record");
         record.validate().expect("version one record");
         assert_eq!(record.checkout_layout, CheckoutLayout::DirectMount);
     }
@@ -398,5 +446,4 @@ mod tests {
             "a successful read must not replace the explicit record"
         );
     }
-
 }

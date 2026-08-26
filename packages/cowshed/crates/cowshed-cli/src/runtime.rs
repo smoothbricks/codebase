@@ -303,29 +303,13 @@ async fn unmounted_mains() -> Result<Vec<UnreachableMain>> {
         .map_err(project_inventory_error)
 }
 
-async fn list_adopted_project(project: &AdoptedProject) -> Result<Vec<WorkspaceInfo>> {
-    let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
-    let primary = bridge.list().await;
-    let teardown = bridge.shutdown().await.err();
-    match primary {
-        Ok(workspaces) => match teardown {
-            Some(error) => Err(error),
-            None => Ok(workspaces),
-        },
-        Err(primary) => Err(merge_primary(primary, teardown)),
-    }
-}
-
 async fn list_all_adopted_projects() -> Result<Vec<ProjectWorkspaces>> {
-    let projects = adopted_projects().await?;
-    let mut grouped = Vec::with_capacity(projects.len());
-    for project in projects {
-        grouped.push(ProjectWorkspaces {
-            repo_id: project.repo_id.clone(),
-            workspaces: list_adopted_project(&project).await?,
-        });
-    }
-    Ok(grouped)
+    let home = gateway_service::canonical_home()?;
+    let storage = validate_existing_host_storage(&home).await?;
+    NativeGatewayInventory::new(storage)
+        .all_projects()
+        .await
+        .map_err(project_inventory_error)
 }
 
 #[async_trait]
@@ -401,21 +385,7 @@ impl CliService for ActorBridge {
     }
 
     async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
-        let current_repo = self.repo_id()?.clone();
-        let projects = self.adopted_projects().await?;
-        let mut grouped = Vec::with_capacity(projects.len());
-        for project in projects {
-            let workspaces = if project.repo_id == current_repo {
-                self.list().await?
-            } else {
-                list_adopted_project(&project).await?
-            };
-            grouped.push(ProjectWorkspaces {
-                repo_id: project.repo_id,
-                workspaces,
-            });
-        }
-        Ok(grouped)
+        list_all_adopted_projects().await
     }
 
     async fn other_adopted_project_count(&mut self) -> Result<usize> {
