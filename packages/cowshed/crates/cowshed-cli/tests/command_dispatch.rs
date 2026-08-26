@@ -1396,3 +1396,59 @@ fn skill_requires_a_known_action_and_takes_no_positional_arguments() {
     assert!(parse_args(["skill", "install", "extra"]).is_err());
     assert!(parse_args(["skill", "install", "--nonesuch"]).is_err());
 }
+
+/// Spec 06_cli.md rule 4: every hinted verb exists in the parser.
+#[test]
+fn every_next_hint_verb_in_source_is_a_registered_command() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut source = String::new();
+    collect_rust_source(&root, &mut source);
+    let mut verbs = HashSet::new();
+    for prefix in ["\"cowshed "] {
+        let mut rest = source.as_str();
+        while let Some(start) = rest.find(prefix) {
+            rest = &rest[start + prefix.len()..];
+            let token: String = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_lowercase() || *ch == '-')
+                .collect();
+            if !token.is_empty() {
+                verbs.insert(token);
+            }
+        }
+    }
+
+
+    assert!(
+        !verbs.is_empty(),
+        "expected at least one `cowshed <verb>` hint in src/"
+    );
+    for verb in verbs {
+        if matches!(verb.as_str(), "help" | "--help" | "--project") {
+            continue;
+        }
+        let parsed = parse_args([verb.as_str()]);
+        let unknown = parsed
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.message.starts_with("unknown command"));
+        assert!(
+            !unknown,
+            "hinted verb `{verb}` is not a registered command"
+        );
+    }
+}
+
+fn collect_rust_source(path: &std::path::Path, out: &mut String) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).expect("read src") {
+            collect_rust_source(&entry.expect("dirent").path(), out);
+        }
+        return;
+    }
+    if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+        out.push_str(&std::fs::read_to_string(path).expect("read rust source"));
+        out.push('\n');
+    }
+}
+
