@@ -21,7 +21,6 @@ pub use native::{
     plan_host_uninstall,
 };
 
-
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
 pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
@@ -667,7 +666,6 @@ pub enum VolumeRef {
     ExistingExact(String),
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExistingMarkerEvidence {
     Missing,
@@ -778,7 +776,8 @@ pub enum BootstrapEvidence {
         root: ExistingStorage,
         store: ExistingStorage,
         caches: ExistingStorage,
-        projects: ExistingStorage,
+        /// Boxed so four ZFS snapshots do not dwarf the two-snapshot APFS variant.
+        projects: Box<ExistingStorage>,
     },
 }
 
@@ -1097,9 +1096,7 @@ fn plan_apfs_volume(
             operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
         }
         ExistingStorage::FoundElsewhere {
-            device,
-            mounted_at,
-            ..
+            device, mounted_at, ..
         } => match mounted_at {
             Some(current) if current == mountpoint => {
                 operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
@@ -1191,7 +1188,6 @@ fn plan_zfs(
     }
     Ok(operations)
 }
-
 
 fn validate_zfs_topology(
     root: &ExistingStorage,
@@ -1391,7 +1387,9 @@ pub enum MountpointState {
     EmptyDirectory,
     /// Enumerated Data-volume residue that cowshed itself may create before the store volume is
     /// remounted. Every path is proven safe to remove; arbitrary entries remain fatal evidence.
-    ReclaimableStub { paths: Vec<PathBuf> },
+    ReclaimableStub {
+        paths: Vec<PathBuf>,
+    },
     NonEmptyDirectoryWithoutMount,
     Mounted {
         marker: Option<Vec<u8>>,
@@ -1559,10 +1557,7 @@ fn resolve_operation(operation: &HostOperation) -> Result<HostOperation, Bootstr
     )))
 }
 
-fn apply_operation<H>(
-    host: &H,
-    operation: &HostOperation,
-) -> Result<(), BootstrapExecutionError>
+fn apply_operation<H>(host: &H, operation: &HostOperation) -> Result<(), BootstrapExecutionError>
 where
     H: BootstrapHost + ?Sized,
 {
