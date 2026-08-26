@@ -2125,7 +2125,7 @@ impl NativeProjectRuntimeHost {
         &self,
         source: &Path,
         destination: &Path,
-        retired_main_mount: Option<&Path>,
+        retired_main_targets: &[PathBuf],
     ) -> Result<MoveDestination> {
         if !destination.is_absolute()
             || destination
@@ -2162,9 +2162,9 @@ impl NativeProjectRuntimeHost {
             ));
         }
         let destination = destination.to_owned();
-        let retired_main_mount = retired_main_mount.map(Path::to_owned);
+        let retired_main_targets = retired_main_targets.to_vec();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let state = classify_move_destination(&destination, retired_main_mount.as_deref())?;
+            let state = classify_move_destination(&destination, &retired_main_targets)?;
             let parent = destination.parent().ok_or_else(|| {
                 CowshedError::usage(
                     format!("{} has no parent directory", destination.display()),
@@ -3171,9 +3171,70 @@ fn occupied_move_destination(destination: &Path) -> CowshedError {
 }
 
 #[cfg(target_os = "macos")]
+fn canonical_lexical_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push(Path::new("/")),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+/// Exact mount roots emitted by direct-main layouts that cowshed has retired.
+///
+/// These are derived from the validated primary binding, never from the link. Comparing only
+/// lexically normalized raw link text keeps an arbitrary filesystem alias or user-supplied path
+/// from acquiring migration authority.
+#[cfg(target_os = "macos")]
+fn known_retired_main_targets(
+    current_main_mount: &Path,
+    invoking_home: &Path,
+    binding: &RepositoryBinding,
+) -> Result<Vec<PathBuf>> {
+    let repo_id = &binding.primary().map_err(native_integrity_error)?.repo_id;
+    let candidates = [
+        current_main_mount.to_owned(),
+        invoking_home
+            .join(".cowshed/mnt")
+            .join(repo_id.owner())
+            .join(repo_id.repo())
+            .join("main"),
+        Path::new("/private/cowshed/store/mnt")
+            .join(repo_id.owner())
+            .join(repo_id.repo())
+            .join("main"),
+    ];
+    let mut targets = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let normalized = canonical_lexical_absolute(&candidate).ok_or_else(|| {
+            native_integrity_error(format!(
+                "retired main target is not an absolute lexical path: {}",
+                candidate.display()
+            ))
+        })?;
+        if !targets.contains(&normalized) {
+            targets.push(normalized);
+        }
+    }
+    Ok(targets)
+}
+
+#[cfg(target_os = "macos")]
 fn classify_move_destination(
     destination: &Path,
-    retired_main_mount: Option<&Path>,
+    retired_main_targets: &[PathBuf],
 ) -> Result<MoveDestination> {
     let metadata = match std::fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
@@ -3193,19 +3254,16 @@ fn classify_move_destination(
     if !metadata.file_type().is_symlink() {
         return Err(occupied_move_destination(destination));
     }
-    let Some(retired_main_mount) = retired_main_mount else {
+    let target = std::fs::read_link(destination)
+        .ok()
+        .and_then(|target| canonical_lexical_absolute(&target))
+        .and_then(|target| retired_main_targets.contains(&target).then_some(target));
+    let is_dangling = std::fs::metadata(destination)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let Some(target) = target.filter(|_| is_dangling) else {
         return Err(occupied_move_destination(destination));
     };
-    let points_to_retired_main =
-        std::fs::read_link(destination).is_ok_and(|target| target == retired_main_mount);
-    let retired_main_is_dangling = std::fs::metadata(retired_main_mount)
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-    if !points_to_retired_main || !retired_main_is_dangling {
-        return Err(occupied_move_destination(destination));
-    }
-    Ok(MoveDestination::ReplaceDanglingLegacySymlink {
-        target: retired_main_mount.to_owned(),
-    })
+    Ok(MoveDestination::ReplaceDanglingLegacySymlink { target })
 }
 
 #[cfg(target_os = "macos")]
@@ -3238,9 +3296,9 @@ fn swap_checkout_paths(left: &Path, right: &Path) -> std::io::Result<()> {
 fn replace_legacy_destination(
     mountpoint: &Path,
     destination: &Path,
-    retired_main_mount: &Path,
+    retired_main_mount: &PathBuf,
 ) -> Result<()> {
-    match classify_move_destination(destination, Some(retired_main_mount))? {
+    match classify_move_destination(destination, std::slice::from_ref(retired_main_mount))? {
         MoveDestination::ReplaceDanglingLegacySymlink { .. } => {}
         MoveDestination::Vacant => return Err(occupied_move_destination(destination)),
     }
@@ -3254,7 +3312,7 @@ fn replace_legacy_destination(
         )
     })?;
     if matches!(
-        classify_move_destination(mountpoint, Some(retired_main_mount)),
+        classify_move_destination(mountpoint, std::slice::from_ref(retired_main_mount)),
         Ok(MoveDestination::ReplaceDanglingLegacySymlink { .. })
     ) {
         return Ok(());
@@ -3880,17 +3938,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if !detached_direct {
             self.validate_binding().await?;
         }
-        let retired_main_mount = if detached_direct {
-            Some(
-                self.layout
-                    .workspace_mount(&main)
-                    .map_err(native_integrity_error)?,
-            )
+        let retired_main_targets = if detached_direct {
+            let current_main_mount = self
+                .layout
+                .workspace_mount(&main)
+                .map_err(native_integrity_error)?;
+            known_retired_main_targets(&current_main_mount, &self.home, &self.descriptor.binding)?
         } else {
-            None
+            Vec::new()
         };
         let destination_state = self
-            .validate_move_destination(&source, &destination, retired_main_mount.as_deref())
+            .validate_move_destination(&source, &destination, &retired_main_targets)
             .await?;
 
         let mount_point = self.workspace_mount_path(&main)?;
@@ -5498,7 +5556,7 @@ fn prepare_detached_checkout_relocation(
 ) -> Result<()> {
     let replacement_target = match destination_state {
         MoveDestination::Vacant => None,
-        MoveDestination::ReplaceDanglingLegacySymlink { target } => Some(target.as_path()),
+        MoveDestination::ReplaceDanglingLegacySymlink { target } => Some(target),
     };
     let mut displaced_legacy_link = None;
     let source_existed = match std::fs::symlink_metadata(source) {
@@ -7551,9 +7609,11 @@ mod workspace_origin_tests {
             .expect("retired main mount");
         std::os::unix::fs::symlink(&retired_main_mount, &destination)
             .expect("retired checkout link");
-        classify_move_destination(&destination, None)
+        classify_move_destination(&destination, &[])
             .expect_err("only detached direct-main relocation may replace the retired link");
-        let destination_state = classify_move_destination(&destination, Some(&retired_main_mount))
+        let targets = known_retired_main_targets(&retired_main_mount, &temp, &binding)
+            .expect("known retired roots");
+        let destination_state = classify_move_destination(&destination, &targets)
             .expect("exact dangling retired main link");
         prepare_detached_checkout_relocation(
             &record,
@@ -7596,6 +7656,114 @@ mod workspace_origin_tests {
     }
 
     #[test]
+    fn detached_relocation_accepts_home_root_legacy_main_symlink() {
+        let temp = temp_directory("home-root-retired-link");
+        let source = temp.join("missing-retired-checkout");
+        let destination = temp.join("explicit-destination");
+        let store = temp.join("store");
+        let repo_id = RepoId::parse("axe-scale/minigraf").expect("live repository identity");
+        let layout = crate::storage::StorageLayout::with_mount_root(
+            &store,
+            temp.join("current-mnt"),
+            &repo_id,
+        )
+        .expect("layout");
+        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id,
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://example.test/axe-scale/minigraf.git".to_owned()),
+            primary: true,
+        }])
+        .expect("validated live binding");
+        let current_main_mount = layout
+            .workspace_mount(&WorkspaceName::new("main").expect("main"))
+            .expect("current main mount");
+        let invoking_home = Path::new("/Users/alice");
+        let historical_main_mount = Path::new("/Users/alice/.cowshed/mnt/axe-scale/minigraf/main");
+        let targets = known_retired_main_targets(&current_main_mount, invoking_home, &binding)
+            .expect("same-repository retired roots");
+        assert!(targets.contains(&historical_main_mount.to_owned()));
+        assert!(
+            targets.contains(
+                &Path::new("/private/cowshed/store/mnt/axe-scale/minigraf/main").to_owned()
+            )
+        );
+        assert_eq!(
+            targets.len(),
+            3,
+            "all distinct historical forms are retained"
+        );
+        assert_eq!(
+            known_retired_main_targets(historical_main_mount, invoking_home, &binding)
+                .expect("duplicate home and current root"),
+            vec![
+                historical_main_mount.to_owned(),
+                Path::new("/private/cowshed/store/mnt/axe-scale/minigraf/main").to_owned(),
+            ],
+            "an unchanged current home root is listed only once"
+        );
+
+        let image = layout
+            .main_image(ImageFormat::Asif)
+            .expect("main paths")
+            .image()
+            .to_owned();
+        std::fs::write(&image, b"main image").expect("image");
+        let mut metadata = main_metadata(&source, incarnation("00000000000000000000000000000004"));
+        metadata.repo_id = binding.primary().expect("primary binding").repo_id.clone();
+        metadata.write_for_image(&image).expect("sidecar");
+        let record = crate::checkout::CheckoutRecord {
+            mount_point: source.clone(),
+            image,
+        };
+        std::os::unix::fs::symlink(historical_main_mount, &destination)
+            .expect("exact live historical checkout link");
+        let destination_state = classify_move_destination(&destination, &targets)
+            .expect("same-repository home-root link");
+
+        prepare_detached_checkout_relocation(
+            &record,
+            &layout,
+            crate::metadata::CheckoutLayout::DirectMount,
+            &source,
+            &destination,
+            &destination_state,
+        )
+        .expect("explicit destination replaces the retired link");
+
+        assert!(destination.is_dir());
+        assert_eq!(
+            DetachedWorkspaceMetadata::read_for_image(&record.image)
+                .expect("updated sidecar")
+                .require_info_snapshot()
+                .expect("main snapshot")
+                .project_root,
+            destination
+        );
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn retired_link_targets_are_compared_by_canonical_lexical_spelling() {
+        let temp = temp_directory("retired-link-lexical");
+        let destination = temp.join("destination");
+        let retired_main_mount = temp.join("mnt/acme/widget/main");
+        let raw_target = temp.join("mnt/acme/../acme/widget/./main");
+
+        std::os::unix::fs::symlink(&raw_target, &destination).expect("lexical retired link");
+        assert_eq!(
+            classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
+                .expect("lexically equivalent dangling target"),
+            MoveDestination::ReplaceDanglingLegacySymlink {
+                target: retired_main_mount,
+            }
+        );
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
     fn detached_relocation_rejects_unrelated_or_live_symlinks() {
         let temp = temp_directory("retired-link-conflicts");
         let destination = temp.join("destination");
@@ -7603,14 +7771,14 @@ mod workspace_origin_tests {
         let unrelated = temp.join("unrelated-missing");
 
         std::os::unix::fs::symlink(&unrelated, &destination).expect("unrelated link");
-        classify_move_destination(&destination, Some(&retired_main_mount))
+        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
             .expect_err("an arbitrary dangling link remains an occupant");
         std::fs::remove_file(&destination).expect("remove unrelated link");
 
         std::fs::create_dir_all(&retired_main_mount).expect("live retired-layout mount");
         std::os::unix::fs::symlink(&retired_main_mount, &destination)
             .expect("link to live retired mount");
-        classify_move_destination(&destination, Some(&retired_main_mount))
+        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
             .expect_err("a link whose target exists remains an occupant");
 
         std::fs::remove_dir_all(&temp).ok();
@@ -7623,12 +7791,12 @@ mod workspace_origin_tests {
         let retired_main_mount = temp.join("mnt/acme/widget/main");
 
         std::fs::create_dir(&destination).expect("occupied directory");
-        classify_move_destination(&destination, Some(&retired_main_mount))
+        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
             .expect_err("an ordinary directory remains an occupant");
         std::fs::remove_dir(&destination).expect("remove directory");
 
         std::fs::write(&destination, b"occupant").expect("occupied file");
-        classify_move_destination(&destination, Some(&retired_main_mount))
+        classify_move_destination(&destination, std::slice::from_ref(&retired_main_mount))
             .expect_err("an ordinary file remains an occupant");
 
         std::fs::remove_dir_all(&temp).ok();
