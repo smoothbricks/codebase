@@ -48,6 +48,23 @@ fn setup_plan(actions: Vec<HostAction>, requires_authorization: bool) -> HostSet
     }
 }
 
+fn empty_census() -> WorkspaceCensus {
+    WorkspaceCensus::Counted {
+        store: PathBuf::from("/private/cowshed/store"),
+        repo_ids: Vec::new(),
+        workspaces: 0,
+    }
+}
+
+fn occupied_census() -> WorkspaceCensus {
+    WorkspaceCensus::Counted {
+        store: PathBuf::from("/private/cowshed/store"),
+        repo_ids: vec![String::from("acme/api"), String::from("acme/web")],
+        workspaces: 5,
+    }
+}
+
+
 impl Default for FakeHost {
     fn default() -> Self {
         Self {
@@ -57,16 +74,14 @@ impl Default for FakeHost {
                 volumes: Vec::new(),
                 fstab: FstabOutcome::AlreadyCurrent,
                 authorized: false,
+                action_outcomes: Vec::new(),
             },
             uninstall_plan: HostUninstallPlan {
                 pins_to_remove: Vec::new(),
                 requires_authorization: false,
             },
             uninstall_report: uninstall_report(UninstallFstabOutcome::AlreadyClean),
-            census: WorkspaceCensus::Counted {
-                projects: 0,
-                workspaces: 0,
-            },
+            census: empty_census(),
             removals: Vec::new(),
             execute_error: None,
         }
@@ -191,6 +206,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             ],
             fstab: FstabOutcome::AlreadyCurrent,
             authorized: false,
+            action_outcomes: Vec::new(),
         },
         ..FakeHost::default()
     };
@@ -205,9 +221,10 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
          cowshed: cowshed.caches (caches): mounted at its canonical path -> already-current\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
          cowshed: everything already set up\n\
-         next: cowshed doctor\n"
+         next: cowshed doctor\n\
+         next: cowshed adopt\n"
     );
-    assert_eq!(host.events, ["plan", "execute"]);
+    assert_eq!(host.events, ["plan", "execute", "census"]);
 }
 
 /// 06_cli.md rule 3: the sentence naming the prompt is printed *before* the phase that raises it.
@@ -238,6 +255,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             )],
             fstab: FstabOutcome::Pinned,
             authorized: true,
+            action_outcomes: Vec::new(),
         },
         ..FakeHost::default()
     };
@@ -252,7 +270,8 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
          cowshed: cowshed.store (store): absent -> created\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
-         next: cowshed doctor\n"
+         next: cowshed doctor\n\
+         next: cowshed adopt\n"
     );
     let announcement = streams
         .stderr
@@ -266,7 +285,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
         announcement < first_outcome,
         "the announcement must precede the work"
     );
-    assert_eq!(host.events, ["plan", "execute"]);
+    assert_eq!(host.events, ["plan", "execute", "census"]);
 }
 
 /// The user's actual host: volumes that already exist and valid, with no boot pins. Nothing is
@@ -301,6 +320,7 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
             )],
             fstab: FstabOutcome::Pinned,
             authorized: true,
+            action_outcomes: Vec::new(),
         },
         ..FakeHost::default()
     };
@@ -316,7 +336,8 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
          cowshed: cowshed.store (store): present but not mounted -> mounted\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
-         next: cowshed doctor\n"
+         next: cowshed doctor\n\
+         next: cowshed adopt\n"
     );
     assert!(!streams.stderr.contains("provision"));
 }
@@ -436,6 +457,7 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
             )],
             fstab: FstabOutcome::AlreadyCurrent,
             authorized: false,
+            action_outcomes: Vec::new(),
         },
         ..FakeHost::default()
     };
@@ -450,7 +472,8 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
          cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
          cowshed: host storage is set up\n\
-         next: cowshed doctor\n"
+         next: cowshed doctor\n\
+         next: cowshed adopt\n"
     );
 }
 
@@ -485,6 +508,7 @@ async fn a_volume_in_another_container_is_reported_and_left_alone() {
             ],
             fstab: FstabOutcome::Skipped(String::from("no cowshed volume in the home container")),
             authorized: false,
+            action_outcomes: Vec::new(),
         },
         ..FakeHost::default()
     };
@@ -499,7 +523,8 @@ async fn a_volume_in_another_container_is_reported_and_left_alone() {
          cowshed: data is safe on disk4s8; cowshed left it untouched\n\
          cowshed: /etc/fstab not pinned: no cowshed volume in the home container\n\
          cowshed: host storage is partially set up: 2 volumes live outside this host's container and left untouched\n\
-         next: cowshed doctor\n"
+         next: cowshed doctor\n\
+         next: cowshed adopt\n"
     );
     assert!(!streams.stderr.contains("absent"));
     assert!(!streams.stderr.contains("everything already set up"));
@@ -535,6 +560,7 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
             )],
             fstab: FstabOutcome::Pinned,
             authorized: true,
+            action_outcomes: Vec::new(),
         },
         ..FakeHost::default()
     };
@@ -543,7 +569,7 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
 
     assert_eq!(
         streams.stdout,
-        "{\"ok\":true,\"result\":{\"volumes\":[{\"name\":\"cowshed.store\",\"role\":\"store\",\
+        "{\"ok\":true,\"result\":{\"actionOutcomes\":[],\"volumes\":[{\"name\":\"cowshed.store\",\"role\":\"store\",\
          \"stateBefore\":{\"foundElsewhere\":{\"container\":\"disk4\",\"device\":\"disk4s7\",\
          \"mountedAt\":null}},\"action\":\"reported\"}],\"fstab\":\"pinned\",\"authorized\":true}}\n"
     );
@@ -553,7 +579,8 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
-         next: cowshed doctor\n"
+         next: cowshed doctor\n\
+         next: cowshed adopt\n"
     );
 }
 
@@ -579,6 +606,7 @@ async fn quiet_suppresses_rows_but_never_the_prompt_announcement_or_the_hint() {
             )],
             fstab: FstabOutcome::Pinned,
             authorized: true,
+            action_outcomes: Vec::new(),
         },
         ..FakeHost::default()
     };
@@ -589,7 +617,8 @@ async fn quiet_suppresses_rows_but_never_the_prompt_announcement_or_the_hint() {
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
-         next: cowshed doctor\n"
+         next: cowshed doctor\n\
+         next: cowshed adopt\n"
     );
     assert_eq!(streams.stdout, "");
 }
@@ -692,10 +721,7 @@ async fn uninstall_removes_host_presence_and_names_what_survives() {
             requires_authorization: true,
         },
         uninstall_report: uninstall_report(UninstallFstabOutcome::Removed),
-        census: WorkspaceCensus::Counted {
-            projects: 0,
-            workspaces: 0,
-        },
+        census: empty_census(),
         removals: vec![
             HostArtifactRemoval::new("dev.cowshed.gateway agent", RemovalOutcome::Removed),
             HostArtifactRemoval::new("dev.cowshed.sccache agent", RemovalOutcome::AlreadyAbsent),
@@ -736,10 +762,7 @@ async fn uninstall_removes_host_presence_and_names_what_survives() {
 #[tokio::test]
 async fn uninstall_refuses_occupied_volumes_until_forced() {
     let occupied = || FakeHost {
-        census: WorkspaceCensus::Counted {
-            projects: 2,
-            workspaces: 5,
-        },
+        census: occupied_census(),
         uninstall_report: uninstall_report(UninstallFstabOutcome::Removed),
         ..FakeHost::default()
     };
@@ -749,7 +772,7 @@ async fn uninstall_refuses_occupied_volumes_until_forced() {
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(
         error.message,
-        "5 workspaces still exist on this host's volumes across 2 adopted projects; \
+        "5 workspaces still exist on /private/cowshed/store across acme/api, acme/web; \
          uninstall removes no volume and no image, so they would be left unmanaged"
     );
     assert_eq!(error.hint, "cowshed setup --uninstall --force");
@@ -758,7 +781,7 @@ async fn uninstall_refuses_occupied_volumes_until_forced() {
     let mut host = occupied();
     let streams = run(&mut host, FORCED_UNINSTALL, false, false).await;
     assert!(streams.stderr.contains(
-        "cowshed: cowshed's host presence is removed; 5 workspaces and their images are still on the volumes, which were not touched\n"
+        "cowshed: cowshed's host presence is removed; 5 workspaces (acme/api, acme/web) and their images are still on /private/cowshed/store, which was not touched\n"
     ));
     assert_eq!(
         host.events,
@@ -789,7 +812,8 @@ async fn uninstall_refuses_when_occupancy_cannot_be_established() {
         error.message,
         "could not establish what the volumes hold: cowshed.store is not mounted at /private/cowshed/store"
     );
-    assert_eq!(error.hint, "cowshed setup --uninstall --force");
+    assert_eq!(error.hint, "mount first: cowshed setup");
+
 
     let mut host = unknown();
     let streams = run(&mut host, FORCED_UNINSTALL, false, false).await;

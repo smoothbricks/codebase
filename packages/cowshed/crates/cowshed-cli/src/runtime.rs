@@ -19,7 +19,7 @@ use cowshed_core::api::{
     WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_core::metadata::{ImageCapacity, SlotId, WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::metadata::{ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
@@ -675,7 +675,17 @@ where
             let gateway = service.reconcile_gateway().await;
             emit_mount(output, json, &info)?;
             output
-                .guidance(&format!("image capacity {capacity}"))
+                .guidance(&format!(
+                    "created {}.{} for {} (capacity {}, {})",
+                    info.workspace,
+                    info.image_format.extension(),
+                    info.repo_id,
+                    capacity,
+                    match info.image_format {
+                        ImageFormat::Asif => "asif",
+                        ImageFormat::Sparse => "sparse",
+                    }
+                ))
                 .map_err(output_error)?;
             match gateway {
                 Ok(()) => output.hint("cowshed new <name>").map_err(output_error)?,
@@ -765,7 +775,19 @@ where
             Ok(success())
         }
         Command::Ensure(args) => {
-            let report = service.ensure_current(invocation_cwd()?).await?;
+            let report = match service.ensure_current(invocation_cwd()?).await {
+                Ok(report) => report,
+                Err(error)
+                    if args.envrc
+                        && matches!(error.code, ErrorCode::NotFound | ErrorCode::Usage) =>
+                {
+                    return Err(usage(
+                        "ensure --envrc must run inside a workspace directory",
+                        "each workspace has its own exports — cd into that workspace, then eval \"$(cowshed ensure --envrc)\"",
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
             service.reconcile_gateway().await?;
             if json {
                 output.success(report.clone()).map_err(output_error)?;
@@ -972,7 +994,7 @@ where
                 };
                 output
                     .guidance(&format!(
-                        "dry run examined {} objects; {} {}, {} bytes reclaimable",
+                        "dry run examined {} objects; {} {}, {} bytes deletable",
                         report.examined,
                         report.candidates.len(),
                         candidate_noun,
@@ -1173,7 +1195,7 @@ fn os_incarnation(value: std::ffi::OsString) -> Result<WorkspaceIncarnation> {
     WorkspaceIncarnation::new(os_utf8(value)?).map_err(|error| {
         usage(
             error.to_string(),
-            "use the current 32-character lowercase workspace incarnation",
+            "find it in `cowshed ls --json` (workspaceIncarnation)",
         )
     })
 }
@@ -1468,7 +1490,7 @@ const fn ensure_action(action: EnsureAction) -> &'static str {
     match action {
         EnsureAction::AlreadyMounted => "already mounted",
         EnsureAction::Attached => "attached",
-        EnsureAction::Healed => "healed",
+        EnsureAction::Healed => "repaired",
     }
 }
 
@@ -1479,7 +1501,7 @@ fn emit_gc_candidates<W: Write, E: Write>(
     for candidate in &report.candidates {
         output
             .guidance(&format!(
-                "would reclaim {} ({} bytes; reason: {})",
+                "would delete {} ({} bytes; reason: {})",
                 candidate.path.display(),
                 candidate.bytes,
                 gc_reason(candidate.reason)
@@ -1491,11 +1513,11 @@ fn emit_gc_candidates<W: Write, E: Write>(
 
 const fn gc_reason(reason: GcReason) -> &'static str {
     match reason {
-        GcReason::RetiredWorkspace => "retiredWorkspace",
-        GcReason::OrphanStagingImage => "orphanStagingImage",
-        GcReason::OrphanStagingMetadata => "orphanStagingMetadata",
-        GcReason::ExpiredCheckpoint => "expiredCheckpoint",
-        GcReason::DetachedImageCompaction => "detachedImageCompaction",
+        GcReason::RetiredWorkspace => "workspace was retired",
+        GcReason::OrphanStagingImage => "orphaned staging image",
+        GcReason::OrphanStagingMetadata => "orphaned staging metadata",
+        GcReason::ExpiredCheckpoint => "expired checkpoint",
+        GcReason::DetachedImageCompaction => "detached image compaction",
     }
 }
 
