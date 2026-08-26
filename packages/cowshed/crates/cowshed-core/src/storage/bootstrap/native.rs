@@ -11,8 +11,67 @@ use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+/// How long a read-only diskutil probe may run before the disk arbitration daemon counts as
+/// unresponsive, and how long a mutating mount may take once it answers. These are behavioral
+/// deadlines, not output parsing: a wedged `diskarbitrationd` never answers at all.
+#[cfg(unix)]
+const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const KILLALL: &str = "/usr/bin/killall";
+
+fn is_diskutil_mount(command: &HostCommand) -> bool {
+    command.program() == DISKUTIL
+        && command.args().first().is_some_and(|argument| argument == "mount")
+}
+
+#[cfg(unix)]
+fn spawn_with_deadline(
+    program: &Path,
+    args: &[String],
+    deadline: Duration,
+) -> Result<Output, HostError> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| host_io_error("execute", program, source))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|source| host_io_error("collect output from", program, source));
+            }
+            Ok(None) => {
+                if started.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(HostError::new(format!(
+                        "{program:?} produced no result within {deadline:?}; the disk arbitration daemon is unresponsive"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(source) => return Err(host_io_error("wait for", program, source)),
+        }
+    }
+}
+
+/// Cheap responsiveness probe: `diskutil info <device>` must answer before anything mutates.
+#[cfg(target_os = "macos")]
+fn arbitration_probe(device: &str) -> Result<(), HostError> {
+    let probe = HostCommand::new(DISKUTIL, ["info", device]);
+    spawn_with_deadline(Path::new(DISKUTIL), probe.args(), DISKUTIL_PROBE_DEADLINE).map(|_| ())
+}
 
 use crate::error::CowshedError;
 use plist::{Dictionary, Value};
@@ -233,6 +292,27 @@ impl BootstrapHost for SystemBootstrapHost {
         inspect_system_mountpoint(path)
     }
 
+    fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+        ensure_supported_host()?;
+        if is_diskutil_mount(command) {
+            let device = command.args().last().expect("mount argv carries a device");
+            arbitration_probe(device).map_err(|_| {
+                HostError::new(
+                    "disk arbitration daemon did not answer within 5s; it is wedged and needs a restart (cowshed setup performs this)",
+                )
+            })?;
+            return spawn_with_deadline(
+                Path::new(command.program()),
+                command.args(),
+                DISKUTIL_MOUNT_DEADLINE,
+            )
+            .map(HostCommandOutput::from);
+        }
+        run_command_with(command, |program, args| {
+            Command::new(program).args(args).output()
+        })
+    }
+
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError> {
         ensure_supported_host()?;
         require_host_canonical(path)?;
@@ -241,13 +321,6 @@ impl BootstrapHost for SystemBootstrapHost {
 
     fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError> {
         reclaim_system_mountpoint(path)
-    }
-
-    fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
-        ensure_supported_host()?;
-        run_command_with(command, |program, args| {
-            Command::new(program).args(args).output()
-        })
     }
 
     fn provision_apfs_volumes(
@@ -333,6 +406,22 @@ impl BootstrapHost for AuthorizedBootstrapHost {
     }
 
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+        if is_diskutil_mount(command) {
+            let device = command.args().last().expect("mount argv carries a device");
+            if arbitration_probe(device).is_err() {
+                // The daemon is wedged. Restart it through the already-open authorization
+                // session (killall needs root; launchd respawns it on demand), wait out the
+                // respawn, and prove responsiveness before re-attempting the mount.
+                let restart = HostCommand::new(KILLALL, ["diskarbitrationd"]);
+                self.session()?.execute(&restart)?;
+                std::thread::sleep(Duration::from_secs(3));
+                arbitration_probe(device).map_err(|_| {
+                    HostError::new(
+                        "disk arbitration daemon remained unresponsive after a restart",
+                    )
+                })?;
+            }
+        }
         if command.program() == DISKUTIL {
             return self.session()?.execute(command);
         }
@@ -3145,6 +3234,29 @@ mod tests {
     use super::*;
     use crate::storage::bootstrap::ApfsProvisionKind;
     use crate::storage::bootstrap::VolumeMarker;
+
+    #[cfg(unix)]
+    fn deadline_spawn(args: &[&str], deadline: Duration) -> Result<Output, HostError> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        spawn_with_deadline(Path::new("/bin/sleep"), &args, deadline)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_spawn_completes_when_the_child_answers() {
+        let output = deadline_spawn(&["0.05"], Duration::from_secs(10)).expect("fast child");
+        assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_spawn_reports_unresponsiveness_and_kills_the_child() {
+        let started = std::time::Instant::now();
+        let error = deadline_spawn(&["30"], Duration::from_millis(250))
+            .expect_err("stalled child must be reported");
+        assert!(error.to_string().contains("unresponsive"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     struct FakeEvidenceSource {
         statfs: StatFsSnapshot,
