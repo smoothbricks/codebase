@@ -115,6 +115,32 @@ cowshed: administrator authorization was declined, so nothing on this host was c
 next: cowshed setup
 ```
 
+A sequence that stops partway is reported action by action, and **never** as a success. Core hands the CLI the progress
+it made alongside the failure that stopped it, so the run says which actions completed, which one failed and why, and
+which were never reached — then exits with the failing action's own code:
+
+```
+$ cowshed setup
+cowshed: setup will request administrator authorization once, for the actions below
+cowshed: no volumes will be created or deleted; existing data is untouched
+cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store
+cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be mounted at /private/cowshed/caches
+cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store: done
+cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be mounted at /private/cowshed/caches: FAILED — resource busy
+cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot: not attempted
+cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted
+cowshed: cowshed.caches could not be mounted: resource busy
+next: cowshed doctor
+```
+
+Each outcome line repeats its intent sentence verbatim, so the line you authorized and the line reporting it are
+recognisably the same action. A run that completes prints no outcome lines — they would only repeat the volume rows.
+With `--json` a partial run answers `ok:false` with the failing action's error; the per-action evidence stays on stderr,
+because the frozen envelope has no partial state and answering `ok:true` over a failure is the one thing it must not do.
+
+A dialog dismissed *partway* through says so, and pointedly does not claim nothing changed — earlier actions had
+already succeeded. It still exits 6.
+
 The stranded-user recovery, after a reboot left the volumes unmounted:
 
 ```

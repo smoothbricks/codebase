@@ -14,9 +14,9 @@ use cowshed_cli::setup_service::{
     HostArtifactRemoval, HostSetup, WorkspaceCensus, dispatch as setup_dispatch,
 };
 use cowshed_core::storage::bootstrap::{
-    FstabOutcome, HostAction, HostSetupPlan, HostSetupReport, HostUninstallPlan,
-    UninstallFstabOutcome,
-    UninstallReport, VolumeOutcome, VolumeRole, VolumeState,
+    FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
+    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeRole,
+    VolumeState,
 };
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use std::path::PathBuf;
@@ -159,6 +159,28 @@ async fn run(host: &mut FakeHost, args: SetupArgs, json: bool, quiet: bool) -> S
     }
 }
 
+/// A run that is expected to fail, keeping the streams: a partial run has to be judged on both
+/// what it printed and how it exited, and asserting either alone would miss the point.
+async fn failing_run(
+    host: &mut FakeHost,
+    args: SetupArgs,
+    json: bool,
+) -> (Streams, CowshedError) {
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = setup_dispatch(host, &args, json, &mut output)
+        .await
+        .expect_err("dispatch fails");
+    let (stdout, stderr) = output.into_inner();
+    (
+        Streams {
+            stdout: String::from_utf8(stdout).expect("utf8 stdout"),
+            stderr: String::from_utf8(stderr).expect("utf8 stderr"),
+            exit: i32::from(error.exit_code()),
+        },
+        error,
+    )
+}
+
 async fn refusal(host: &mut FakeHost, args: SetupArgs) -> CowshedError {
     let mut output = Output::new(Vec::new(), Vec::new(), false);
     setup_dispatch(host, &args, false, &mut output)
@@ -182,6 +204,209 @@ fn volume(name: &str, role: VolumeRole, state: VolumeState, action: &str) -> Vol
         state_before: state,
         action: String::from(action),
     }
+}
+
+/// The three actions a partial run walks: one succeeded, one failed, one was never reached.
+fn interrupted_actions() -> (Vec<HostAction>, Vec<HostActionOutcome>) {
+    let mount = HostAction::MountExisting {
+        name: String::from("cowshed.store"),
+        uuid: String::from("UUID-A"),
+        size_bytes: 1_000_000_000_000,
+        mount_at: PathBuf::from("/private/cowshed/store"),
+    };
+    let caches = HostAction::MountExisting {
+        name: String::from("cowshed.caches"),
+        uuid: String::from("UUID-B"),
+        size_bytes: 2_000_000_000_000,
+        mount_at: PathBuf::from("/private/cowshed/caches"),
+    };
+    let pin = HostAction::PinFstab {
+        uuid: String::from("UUID-A"),
+        mount_at: PathBuf::from("/private/cowshed/store"),
+    };
+    let outcomes = vec![
+        HostActionOutcome {
+            action: mount.clone(),
+            outcome: HostActionResult::Done,
+        },
+        HostActionOutcome {
+            action: caches.clone(),
+            outcome: HostActionResult::Failed {
+                error: CowshedError::environment_missing(
+                    "cowshed.caches could not be mounted: resource busy",
+                    "cowshed doctor",
+                ),
+            },
+        },
+        HostActionOutcome {
+            action: pin.clone(),
+            outcome: HostActionResult::Skipped,
+        },
+    ];
+    (vec![mount, caches, pin], outcomes)
+}
+
+/// A run that stopped partway says so, action by action, and does not claim the host is set up.
+///
+/// Core reports partial progress as a successful report carrying a failure, so this is the case
+/// where exiting 0 would tell every script the host was ready when it is not.
+#[tokio::test]
+async fn a_partial_run_reports_each_action_and_refuses_to_claim_success() {
+    let (actions, action_outcomes) = interrupted_actions();
+    let mut host = FakeHost {
+        plan: setup_plan(actions, true),
+        report: HostSetupReport {
+            action_outcomes,
+            volumes: vec![volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::Detached,
+                "mounted",
+            )],
+            fstab: FstabOutcome::Skipped(String::from("cowshed.caches is not mounted")),
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+
+    let (streams, error) = failing_run(&mut host, REPAIR, false).await;
+
+    assert_eq!(
+        streams.stderr,
+        "cowshed: setup will request administrator authorization once, for the actions below\n\
+         cowshed: no volumes will be created or deleted; existing data is untouched\n\
+         cowshed: cowshed.store exists (UUID UUID-A, 1.0 TB) and will be mounted at /private/cowshed/store\n\
+         cowshed: cowshed.caches exists (UUID UUID-B, 2.0 TB) and will be mounted at /private/cowshed/caches\n\
+         cowshed: /etc/fstab will pin UUID UUID-A at /private/cowshed/store so it mounts at every boot\n\
+         cowshed: cowshed.store exists (UUID UUID-A, 1.0 TB) and will be mounted at /private/cowshed/store: done\n\
+         cowshed: cowshed.caches exists (UUID UUID-B, 2.0 TB) and will be mounted at /private/cowshed/caches: FAILED — cowshed.caches could not be mounted: resource busy\n\
+         cowshed: /etc/fstab will pin UUID UUID-A at /private/cowshed/store so it mounts at every boot: not attempted\n\
+         cowshed: cowshed.store (store): present but not mounted -> mounted\n\
+         cowshed: /etc/fstab not pinned: cowshed.caches is not mounted\n\
+         cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted\n"
+    );
+    // Never the completeness claims, and never the hint that follows a good run.
+    assert!(!streams.stderr.contains("host storage is set up"));
+    assert!(!streams.stderr.contains("everything already set up"));
+    assert!(!streams.stderr.contains("next: cowshed doctor"));
+
+    // Core's taxonomy and remedy survive: it knows why the action failed and what fixes it.
+    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+    assert_eq!(streams.exit, 5);
+    assert_eq!(
+        error.message,
+        "cowshed.caches could not be mounted: resource busy"
+    );
+    assert_eq!(error.hint, "cowshed doctor");
+    // The census is never taken: there is no healthy host to inventory.
+    assert_eq!(host.events, ["plan", "execute"]);
+}
+
+/// `--json` cannot answer `ok:true` over a failure. The frozen envelope has no partial state, so
+/// the failure is the envelope and the per-action evidence goes to stderr.
+#[tokio::test]
+async fn a_partial_run_never_claims_success_in_json() {
+    let (actions, action_outcomes) = interrupted_actions();
+    let mut host = FakeHost {
+        plan: setup_plan(actions, true),
+        report: HostSetupReport {
+            action_outcomes,
+            volumes: Vec::new(),
+            fstab: FstabOutcome::Skipped(String::from("cowshed.caches is not mounted")),
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+
+    let (streams, error) = failing_run(&mut host, REPAIR, true).await;
+
+    assert_eq!(streams.stdout, "", "a failed run publishes no success body");
+    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+    assert!(streams.stderr.contains(
+        "cowshed: cowshed.caches exists (UUID UUID-B, 2.0 TB) and will be mounted at /private/cowshed/caches: FAILED — cowshed.caches could not be mounted: resource busy\n"
+    ));
+    assert!(streams
+        .stderr
+        .contains("cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted\n"));
+}
+
+/// A denial noticed mid-sequence must not inherit the "nothing changed" sentence: earlier actions
+/// had already succeeded, so that reassurance would be false. Still exit 6 — the evidence is the
+/// same — and the state of the host is stated once, by the status line.
+#[tokio::test]
+async fn a_denial_partway_through_does_not_claim_nothing_changed() {
+    let (actions, mut action_outcomes) = interrupted_actions();
+    action_outcomes[1].outcome = HostActionResult::Failed {
+        error: CowshedError::sandbox_denied(
+            "execute privileged command failed with Authorization Services status -60006",
+            "retry",
+        ),
+    };
+    let mut host = FakeHost {
+        plan: setup_plan(actions, true),
+        report: HostSetupReport {
+            action_outcomes,
+            volumes: Vec::new(),
+            fstab: FstabOutcome::Skipped(String::from("cowshed.caches is not mounted")),
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+
+    let (streams, error) = failing_run(&mut host, REPAIR, false).await;
+
+    assert_eq!(streams.exit, 6);
+    assert_eq!(
+        error.message,
+        "administrator authorization was declined partway through the sequence above"
+    );
+    assert!(
+        !error.message.contains("nothing on this host was changed"),
+        "an action had already succeeded, so nothing-changed would be a lie"
+    );
+    assert!(!error.message.contains("-60006"));
+    assert!(streams
+        .stderr
+        .contains("cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted\n"));
+}
+
+/// A run that completed prints no per-action rows: they would only repeat the volume rows, and the
+/// evidence they exist for is what happened when things did *not* all happen.
+#[tokio::test]
+async fn a_completed_run_does_not_repeat_itself_action_by_action() {
+    let (actions, _) = interrupted_actions();
+    let done = actions
+        .iter()
+        .cloned()
+        .map(|action| HostActionOutcome {
+            action,
+            outcome: HostActionResult::Done,
+        })
+        .collect();
+    let mut host = FakeHost {
+        plan: setup_plan(actions, true),
+        report: HostSetupReport {
+            action_outcomes: done,
+            volumes: vec![volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::Detached,
+                "mounted",
+            )],
+            fstab: FstabOutcome::Pinned,
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(!streams.stderr.contains(": done\n"));
+    assert!(!streams.stderr.contains("NOT set up"));
+    assert!(streams
+        .stderr
+        .contains("cowshed: host storage is set up (one administrator authorization was used)\n"));
 }
 
 /// The point of the verb: a healthy host is told it is healthy, in one line, and nothing else
