@@ -73,13 +73,46 @@ identity cannot be derived unambiguously from its remotes.
 
 ### `cowshed setup [--uninstall] [--force]`
 
-Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It
-provisions absent volumes, remounts detached or mis-mounted ones at their canonical paths, validates each volume
-marker, and pins the boot mounts in `/etc/fstab`. On a healthy host it changes nothing and says so. Every storage error
-in the CLI points here — a host with no volumes has no checkout to adopt.
+Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates
+absent volumes, remounts detached or mis-mounted ones at their canonical paths, validates each volume marker, and pins
+the boot mounts in `/etc/fstab`. It never deletes a volume. On a healthy host it changes nothing and says so. Every
+storage error in the CLI points here — a host with no volumes has no checkout to adopt.
 
-Anything that can escalate happens inside one authorization session, announced before the dialog appears; a run with
-nothing to escalate raises no prompt at all. `-q` suppresses the per-volume rows but never that announcement.
+Anything that can escalate happens inside one authorization session, and **the exact intent for every volume is printed
+before the dialog appears** — name, UUID, size, and where it is going. When the plan creates and deletes nothing, that
+is stated outright, because the macOS dialog gives you no way to tell a mount from a reformat. A run with nothing to
+escalate raises no prompt at all. `-q` drops the per-volume outcome rows, but never the pre-dialog disclosure: hiding
+what you are about to authorize is not a thing `--quiet` may do.
+
+The common repair — volumes that already exist but have lost their boot pins:
+
+```
+$ cowshed setup
+cowshed: setup will request administrator authorization once, for the actions below
+cowshed: no volumes will be created or deleted; existing data is untouched
+cowshed: cowshed.store exists (UUID 1D6F0E1A-…-AAAA, 1.0 TB) and will be mounted at /private/cowshed/store
+cowshed: cowshed.caches exists (UUID 1D6F0E1A-…-BBBB, 2.0 TB) and will be mounted at /private/cowshed/caches
+cowshed: /etc/fstab will pin UUID 1D6F0E1A-…-AAAA at /private/cowshed/store so it mounts at every boot
+cowshed: cowshed.store (store): present but not mounted -> mounted
+cowshed: cowshed.caches (caches): present but not mounted -> mounted
+cowshed: pinned the boot mounts in /etc/fstab
+cowshed: host storage is set up (one administrator authorization was used)
+next: cowshed doctor
+```
+
+Sizes are decimal, as `diskutil` and the hardware state them, so the number matches what Disk Utility shows.
+Reclaimable leftover files are listed by name rather than counted — "3 files will be deleted" is not something anyone
+can agree to.
+
+Dismissing the authorization dialog is an answer, not a failure. Nothing is changed and the run exits **6**:
+
+```
+$ cowshed setup
+cowshed: setup will request administrator authorization once, for the actions below
+…
+cowshed: administrator authorization was declined, so nothing on this host was changed
+next: cowshed setup
+```
 
 The stranded-user recovery, after a reboot left the volumes unmounted:
 
@@ -89,9 +122,8 @@ cowshed: cowshed.store is not mounted at /private/cowshed/store
 next: cowshed setup
 
 $ cowshed setup
-cowshed: planned: remount cowshed.store at /private/cowshed/store
-cowshed: planned: remount cowshed.caches at /private/cowshed/caches
-cowshed: cowshed.store (store): present but not mounted -> remounted
+…
+cowshed: cowshed.store (store): present but not mounted -> mounted
 cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted
 cowshed: /etc/fstab already pins the boot mounts
 cowshed: host storage is set up
@@ -106,12 +138,12 @@ next: cowshed doctor
 ```
 
 A volume that exists **outside this host's container** — a `cowshed.store` on another disk — is reported as its own
-state with its device named, and left exactly as it is. It is never reported as missing and never re-provisioned,
-because re-provisioning means `diskutil apfs deleteVolume`:
+state with its container, device, and current mount point named, and left exactly as it is. It is never reported as
+missing and never re-created, because re-creating means `diskutil apfs deleteVolume`:
 
 ```
-cowshed: cowshed.store (store): found outside this host's container (container disk4, device disk4s7) -> reported
-cowshed: data is safe on disk4s7; not provisioned
+cowshed: cowshed.store (store): found outside this host's container (container disk4, device disk4s7, mounted at /Volumes/cowshed.store) -> reported
+cowshed: data is safe on disk4s7; cowshed left it untouched
 cowshed: host storage is partially set up: 1 volume lives outside this host's container and left untouched
 ```
 
@@ -136,7 +168,7 @@ teardown that found nothing installed reports an empty `services` list rather th
 
 ```
 $ cowshed setup --json
-{"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"provisioned"}],"fstab":"pinned","authorized":true}}
+{"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"created"}],"fstab":"pinned","authorized":true}}
 
 $ cowshed setup --uninstall --force --json
 {"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"installed sccache binary","outcome":"already-absent"}]}}
@@ -150,7 +182,7 @@ Run once inside each existing checkout you want cowshed to manage. Adoption conv
 image-backed **main workspace** at the same path. A host may have any number of adopted repositories and therefore any
 number of repository-scoped mains. Adoption is the only operation that copies the source tree into a new image.
 
-On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to provision native storage. The first
+On macOS, `cowshed adopt` and `cowshed setup` are the only commands allowed to create native storage. The first
 adopt on a machine may display one administrator authorization prompt from `diskutil` while cowshed creates and mounts
 the space-sharing `cowshed.store` and `cowshed.caches` APFS volumes. Once both volumes are present and correctly
 mounted, later adopts only validate them and do not prompt.
@@ -641,8 +673,8 @@ these are idempotent, and a `--purge` with nothing installed says so rather than
 }
 ```
 
-`gateway run` is the LaunchAgent's internal foreground entrypoint. It validates already-mounted host storage without
-provisioning, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT. Ordinary `exec`,
+`gateway run` is the LaunchAgent's internal foreground entrypoint. It validates already-mounted host storage and
+creates none, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT. Ordinary `exec`,
 `ensure`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
 reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
 `launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.

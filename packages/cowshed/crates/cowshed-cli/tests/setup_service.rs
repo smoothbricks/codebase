@@ -14,7 +14,8 @@ use cowshed_cli::setup_service::{
     HostArtifactRemoval, HostSetup, WorkspaceCensus, dispatch as setup_dispatch,
 };
 use cowshed_core::storage::bootstrap::{
-    FstabOutcome, HostSetupPlan, HostSetupReport, HostUninstallPlan, UninstallFstabOutcome,
+    FstabOutcome, HostAction, HostSetupPlan, HostSetupReport, HostUninstallPlan,
+    UninstallFstabOutcome,
     UninstallReport, VolumeOutcome, VolumeRole, VolumeState,
 };
 use cowshed_core::{CowshedError, ErrorCode, Result};
@@ -29,16 +30,29 @@ struct FakeHost {
     uninstall_report: UninstallReport,
     census: WorkspaceCensus,
     removals: Vec<HostArtifactRemoval>,
+    /// What the escalating phase fails with, so the decline path is provable without a dialog.
+    execute_error: Option<CowshedError>,
+}
+
+/// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
+/// `CreateVolume`, and there are no delete actions — so the fake cannot express a plan core could
+/// never produce.
+fn setup_plan(actions: Vec<HostAction>, requires_authorization: bool) -> HostSetupPlan {
+    let non_destructive = !actions
+        .iter()
+        .any(|action| matches!(action, HostAction::CreateVolume { .. }));
+    HostSetupPlan {
+        actions,
+        non_destructive,
+        requires_authorization,
+    }
 }
 
 impl Default for FakeHost {
     fn default() -> Self {
         Self {
             events: Vec::new(),
-            plan: HostSetupPlan {
-                actions: Vec::new(),
-                requires_authorization: false,
-            },
+            plan: setup_plan(Vec::new(), false),
             report: HostSetupReport {
                 volumes: Vec::new(),
                 fstab: FstabOutcome::AlreadyCurrent,
@@ -54,6 +68,7 @@ impl Default for FakeHost {
                 workspaces: 0,
             },
             removals: Vec::new(),
+            execute_error: None,
         }
     }
 }
@@ -67,7 +82,10 @@ impl HostSetup for FakeHost {
 
     async fn execute(&mut self) -> Result<HostSetupReport> {
         self.events.push(String::from("execute"));
-        Ok(self.report.clone())
+        match self.execute_error.take() {
+            Some(error) => Err(error),
+            None => Ok(self.report.clone()),
+        }
     }
 
     async fn plan_uninstall(&mut self) -> Result<HostUninstallPlan> {
@@ -77,7 +95,10 @@ impl HostSetup for FakeHost {
 
     async fn execute_uninstall(&mut self) -> Result<UninstallReport> {
         self.events.push(String::from("execute-uninstall"));
-        Ok(self.uninstall_report.clone())
+        match self.execute_error.take() {
+            Some(error) => Err(error),
+            None => Ok(self.uninstall_report.clone()),
+        }
     }
 
     async fn census(&mut self) -> Result<WorkspaceCensus> {
@@ -194,19 +215,26 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
 #[tokio::test]
 async fn an_escalating_run_announces_the_prompt_before_executing() {
     let mut host = FakeHost {
-        plan: HostSetupPlan {
-            actions: vec![
-                String::from("create volume cowshed.store"),
-                String::from("pin /private/cowshed/store in /etc/fstab"),
+        plan: setup_plan(
+            vec![
+                HostAction::CreateVolume {
+                    name: String::from("cowshed.store"),
+                    container: String::from("disk3"),
+                    mount_at: PathBuf::from("/private/cowshed/store"),
+                },
+                HostAction::PinFstab {
+                    uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
+                    mount_at: PathBuf::from("/private/cowshed/store"),
+                },
             ],
-            requires_authorization: true,
-        },
+            true,
+        ),
         report: HostSetupReport {
             volumes: vec![volume(
                 "cowshed.store",
                 VolumeRole::Store,
                 VolumeState::Absent,
-                "provisioned",
+                "created",
             )],
             fstab: FstabOutcome::Pinned,
             authorized: true,
@@ -218,10 +246,10 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
 
     assert_eq!(
         streams.stderr,
-        "cowshed: setup will request administrator authorization to provision/remount cowshed volumes\n\
-         cowshed: planned: create volume cowshed.store\n\
-         cowshed: planned: pin /private/cowshed/store in /etc/fstab\n\
-         cowshed: cowshed.store (store): absent -> provisioned\n\
+        "cowshed: setup will request administrator authorization once, for the actions below\n\
+         cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
+         cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /private/cowshed/store so it mounts at every boot\n\
+         cowshed: cowshed.store (store): absent -> created\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
          next: cowshed doctor\n"
@@ -241,14 +269,162 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
     assert_eq!(host.events, ["plan", "execute"]);
 }
 
+/// The user's actual host: volumes that already exist and valid, with no boot pins. Nothing is
+/// created, so the run can promise it — and the promise is the whole point, because the macOS
+/// dialog itself gives a person no way to tell a mount from a reformat.
+///
+/// This pins the sentence form parent mandated verbatim: name, UUID, size, and destination.
+#[tokio::test]
+async fn an_existing_volume_announces_its_identity_size_and_destination() {
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![
+                HostAction::MountExisting {
+                    name: String::from("cowshed.store"),
+                    uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
+                    size_bytes: 1_000_000_000_000,
+                    mount_at: PathBuf::from("/Users/danny/.cowshed"),
+                },
+                HostAction::PinFstab {
+                    uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
+                    mount_at: PathBuf::from("/Users/danny/.cowshed"),
+                },
+            ],
+            true,
+        ),
+        report: HostSetupReport {
+            volumes: vec![volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::Detached,
+                "mounted",
+            )],
+            fstab: FstabOutcome::Pinned,
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(
+        streams.stderr,
+        "cowshed: setup will request administrator authorization once, for the actions below\n\
+         cowshed: no volumes will be created or deleted; existing data is untouched\n\
+         cowshed: cowshed.store exists (UUID 1D6F0E1A-0000-4000-8000-00000000AAAA, 1.0 TB) and will be mounted at /Users/danny/.cowshed\n\
+         cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /Users/danny/.cowshed so it mounts at every boot\n\
+         cowshed: cowshed.store (store): present but not mounted -> mounted\n\
+         cowshed: pinned the boot mounts in /etc/fstab\n\
+         cowshed: host storage is set up (one administrator authorization was used)\n\
+         next: cowshed doctor\n"
+    );
+    assert!(!streams.stderr.contains("provision"));
+}
+
+/// A plan that creates a volume cannot make the safety promise, and must not.
+#[tokio::test]
+async fn a_plan_that_creates_a_volume_makes_no_safety_promise() {
+    let mut host = FakeHost::default();
+    host.plan = setup_plan(
+        vec![HostAction::CreateVolume {
+            name: String::from("cowshed.store"),
+            container: String::from("disk3"),
+            mount_at: PathBuf::from("/private/cowshed/store"),
+        }],
+        true,
+    );
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert!(!streams.stderr.contains("no volumes will be created or deleted"));
+    assert!(streams.stderr.contains(
+        "cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n"
+    ));
+}
+
+/// A healthy host has no list, so it gets no promise about one either — the status line already
+/// says everything is set up, and a reassurance about work nobody is doing is noise.
+#[tokio::test]
+async fn a_healthy_host_makes_no_safety_promise() {
+    let mut host = FakeHost::default();
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert!(!streams.stderr.contains("no volumes will be created or deleted"));
+    assert!(streams.stderr.contains("cowshed: everything already set up\n"));
+}
+
+/// Reclaimable stubs are named, never counted: "3 files will be deleted" is not something a
+/// person can agree to (01_storage.md).
+#[tokio::test]
+async fn reclaimable_stubs_are_enumerated_by_name() {
+    let mut host = FakeHost::default();
+    host.plan = setup_plan(
+        vec![HostAction::ReclaimStubs {
+            paths: vec![
+                PathBuf::from("/private/cowshed/store/.envrc"),
+                PathBuf::from("/private/cowshed/store/telemetry"),
+            ],
+        }],
+        false,
+    );
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert!(streams.stderr.contains(
+        "cowshed: these leftover placeholder files will be removed: /private/cowshed/store/.envrc, /private/cowshed/store/telemetry\n"
+    ));
+}
+
+/// Sizes are decimal, one fraction digit, and promote rather than printing a four-digit mantissa —
+/// a person comparing the sentence against Disk Utility has to read the same number.
+#[tokio::test]
+async fn volume_sizes_are_decimal_and_never_print_a_thousand_of_a_unit() {
+    for (bytes, expected) in [
+        (512_u64, "512 B"),
+        (1_000, "1.0 KB"),
+        (2_000_000_000_000, "2.0 TB"),
+        (500_107_862_016, "500.1 GB"),
+        // Rounds to 1000.0 GB at one decimal place, so it promotes instead.
+        (999_999_999_999, "1.0 TB"),
+    ] {
+        let mut host = FakeHost::default();
+        host.plan = setup_plan(
+            vec![HostAction::MountExisting {
+                name: String::from("cowshed.store"),
+                uuid: String::from("U"),
+                size_bytes: bytes,
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            false,
+        );
+
+        let streams = run(&mut host, REPAIR, false, false).await;
+
+        assert!(
+            streams
+                .stderr
+                .contains(&format!("(UUID U, {expected}) and will be mounted at")),
+            "{bytes} should render as {expected}, got:\n{}",
+            streams.stderr
+        );
+    }
+}
+
 /// A run with nothing to escalate raises no prompt, so it says nothing about one.
 #[tokio::test]
 async fn a_run_that_cannot_escalate_never_mentions_authorization() {
     let mut host = FakeHost {
-        plan: HostSetupPlan {
-            actions: vec![String::from("remount cowshed.caches at /private/cowshed/caches")],
-            requires_authorization: false,
-        },
+        plan: setup_plan(
+            vec![HostAction::RepairMounted {
+                name: String::from("cowshed.caches"),
+                uuid: String::from("1D6F0E1A-0000-4000-8000-00000000BBBB"),
+                size_bytes: 2_000_000_000_000,
+                mounted_at: PathBuf::from("/Volumes/cowshed.caches"),
+                mount_at: PathBuf::from("/private/cowshed/caches"),
+            }],
+            false,
+        ),
         report: HostSetupReport {
             volumes: vec![volume(
                 "cowshed.caches",
@@ -269,7 +445,8 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
     assert!(!streams.stderr.contains("authorization"));
     assert_eq!(
         streams.stderr,
-        "cowshed: planned: remount cowshed.caches at /private/cowshed/caches\n\
+        "cowshed: no volumes will be created or deleted; existing data is untouched\n\
+         cowshed: cowshed.caches exists (UUID 1D6F0E1A-0000-4000-8000-00000000BBBB, 2.0 TB) and is mounted at /Volumes/cowshed.caches; it will be remounted at /private/cowshed/caches\n\
          cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted\n\
          cowshed: /etc/fstab already pins the boot mounts\n\
          cowshed: host storage is set up\n\
@@ -278,8 +455,8 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
 }
 
 /// A volume in another container is its own state with its own guidance, never "missing", and the
-/// status line refuses to call the host set up while it stands. Re-provisioning it would mean
-/// `deleteVolume`, so the one thing this row must never imply is that setup could fix it.
+/// status line refuses to call the host set up while it stands. Adopting it would mean deleting a
+/// volume, so the one thing this row must never imply is that setup could fix it.
 #[tokio::test]
 async fn a_volume_in_another_container_is_reported_and_left_alone() {
     let mut host = FakeHost {
@@ -316,16 +493,20 @@ async fn a_volume_in_another_container_is_reported_and_left_alone() {
 
     assert_eq!(
         streams.stderr,
-        "cowshed: cowshed.store (store): found outside this host's container (container disk4, device disk4s7) -> reported\n\
-         cowshed: data is safe on disk4s7; not provisioned (readable at /Volumes/cowshed.store)\n\
+        "cowshed: cowshed.store (store): found outside this host's container (container disk4, device disk4s7, mounted at /Volumes/cowshed.store) -> reported\n\
+         cowshed: data is safe on disk4s7; cowshed left it untouched\n\
          cowshed: cowshed.caches (caches): found outside this host's container (container disk4, device disk4s8) -> reported\n\
-         cowshed: data is safe on disk4s8; not provisioned\n\
+         cowshed: data is safe on disk4s8; cowshed left it untouched\n\
          cowshed: /etc/fstab not pinned: no cowshed volume in the home container\n\
          cowshed: host storage is partially set up: 2 volumes live outside this host's container and left untouched\n\
          next: cowshed doctor\n"
     );
     assert!(!streams.stderr.contains("absent"));
     assert!(!streams.stderr.contains("everything already set up"));
+    assert!(
+        !streams.stderr.contains("provision"),
+        "`provision` is cowshed's internal word and must never reach a person"
+    );
 }
 
 /// `--json` puts exactly one frozen envelope on stdout and keeps prose off it. The rendered rows
@@ -333,10 +514,14 @@ async fn a_volume_in_another_container_is_reported_and_left_alone() {
 #[tokio::test]
 async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
     let mut host = FakeHost {
-        plan: HostSetupPlan {
-            actions: vec![String::from("create volume cowshed.store")],
-            requires_authorization: true,
-        },
+        plan: setup_plan(
+            vec![HostAction::CreateVolume {
+                name: String::from("cowshed.store"),
+                container: String::from("disk3"),
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            true,
+        ),
         report: HostSetupReport {
             volumes: vec![volume(
                 "cowshed.store",
@@ -366,8 +551,8 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
     // dialog is about to appear either way.
     assert_eq!(
         streams.stderr,
-        "cowshed: setup will request administrator authorization to provision/remount cowshed volumes\n\
-         cowshed: planned: create volume cowshed.store\n\
+        "cowshed: setup will request administrator authorization once, for the actions below\n\
+         cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
          next: cowshed doctor\n"
     );
 }
@@ -377,16 +562,20 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
 #[tokio::test]
 async fn quiet_suppresses_rows_but_never_the_prompt_announcement_or_the_hint() {
     let mut host = FakeHost {
-        plan: HostSetupPlan {
-            actions: vec![String::from("create volume cowshed.store")],
-            requires_authorization: true,
-        },
+        plan: setup_plan(
+            vec![HostAction::CreateVolume {
+                name: String::from("cowshed.store"),
+                container: String::from("disk3"),
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            true,
+        ),
         report: HostSetupReport {
             volumes: vec![volume(
                 "cowshed.store",
                 VolumeRole::Store,
                 VolumeState::Absent,
-                "provisioned",
+                "created",
             )],
             fstab: FstabOutcome::Pinned,
             authorized: true,
@@ -398,10 +587,100 @@ async fn quiet_suppresses_rows_but_never_the_prompt_announcement_or_the_hint() {
 
     assert_eq!(
         streams.stderr,
-        "cowshed: setup will request administrator authorization to provision/remount cowshed volumes\n\
+        "cowshed: setup will request administrator authorization once, for the actions below\n\
+         cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
          next: cowshed doctor\n"
     );
     assert_eq!(streams.stdout, "");
+}
+
+/// Dismissing the dialog denies cowshed a right: exit 6, cowshed's own sentence, and an explicit
+/// promise that the host is unchanged.
+///
+/// The platform's `Authorization Services status -60006` is deliberately not surfaced — it is not
+/// a sentence anyone can act on, and the part that matters (nothing changed) is not in it.
+#[tokio::test]
+async fn a_declined_authorization_is_policy_denied_and_exits_six() {
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![HostAction::CreateVolume {
+                name: String::from("cowshed.store"),
+                container: String::from("disk3"),
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            true,
+        ),
+        execute_error: Some(CowshedError::sandbox_denied(
+            "execute privileged command failed with Authorization Services status -60006",
+            "retry",
+        )),
+        ..FakeHost::default()
+    };
+
+    let error = refusal(&mut host, REPAIR).await;
+
+    assert_eq!(error.code, ErrorCode::SandboxDenied);
+    assert_eq!(error.exit_code(), 6);
+    assert_eq!(
+        error.message,
+        "administrator authorization was declined, so nothing on this host was changed"
+    );
+    assert_eq!(error.hint, "cowshed setup");
+    assert!(!error.message.contains("-60006"));
+    // The announcement still happened: the caller was told a dialog was coming before it came,
+    // which is the whole point of gathering the plan first.
+    assert_eq!(host.events, ["plan", "execute"]);
+}
+
+/// Teardown escalates too — it edits a root-owned file — so a decline there is the same answer.
+#[tokio::test]
+async fn a_declined_uninstall_authorization_is_policy_denied_and_exits_six() {
+    let mut host = FakeHost {
+        uninstall_plan: HostUninstallPlan {
+            pins_to_remove: vec![String::from("UUID=1111 /private/cowshed/store")],
+            requires_authorization: true,
+        },
+        execute_error: Some(CowshedError::sandbox_denied(
+            "execute privileged command failed with Authorization Services status -60005",
+            "retry",
+        )),
+        ..FakeHost::default()
+    };
+
+    let error = refusal(&mut host, UNINSTALL).await;
+
+    assert_eq!(error.exit_code(), 6);
+    assert_eq!(
+        error.message,
+        "administrator authorization was declined, so nothing on this host was changed"
+    );
+}
+
+/// Only an authoritatively typed denial becomes exit 6. 06_cli.md forbids inferring a denial from
+/// text, so a genuine failure that merely mentions authorization keeps its own taxonomy, message,
+/// and hint — otherwise a broken `diskutil` would be reported to the user as "you said no".
+#[tokio::test]
+async fn a_failure_that_is_not_a_denial_keeps_its_own_taxonomy() {
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![HostAction::CreateVolume {
+                name: String::from("cowshed.store"),
+                container: String::from("disk3"),
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            true,
+        ),
+        execute_error: Some(CowshedError::internal(
+            "authorization session lock is poisoned",
+        )),
+        ..FakeHost::default()
+    };
+
+    let error = refusal(&mut host, REPAIR).await;
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.message, "authorization session lock is poisoned");
 }
 
 /// Teardown removes the machine presence and says, every time, that the data is still there.
@@ -432,7 +711,7 @@ async fn uninstall_removes_host_presence_and_names_what_survives() {
     assert_eq!(
         streams.stderr,
         "cowshed: setup --uninstall will request administrator authorization to remove cowshed's /etc/fstab pins\n\
-         cowshed: planned: UUID=1111 /private/cowshed/store\n\
+         cowshed: /etc/fstab pin will be removed: UUID=1111 /private/cowshed/store\n\
          cowshed: dev.cowshed.gateway agent: removed\n\
          cowshed: dev.cowshed.sccache agent: already absent\n\
          cowshed: installed cowshed binary: removed\n\
@@ -641,13 +920,22 @@ fn setup_is_in_the_command_map_between_adopt_and_new() {
     let setup = map.find("\n  setup").expect("setup is listed");
     let new = map.find("\n  new").expect("new is listed");
     assert!(adopt < setup && setup < new, "setup sits after adopt:\n{map}");
-    assert!(map.contains("provision or repair host storage and pin mounts"));
 
     let spec = help::command_named("setup").expect("setup has a help page");
+    // The map prints the spec's own summary rather than a second copy of it, so this asserts the
+    // coupling instead of duplicating the sentence and having to be edited alongside it.
+    assert!(map.contains(spec.summary), "map omits the setup summary:\n{map}");
     assert_eq!(spec.hint(), "cowshed setup [--uninstall] [--force]");
     let page = spec.page();
     assert!(page.contains("--uninstall"));
     assert!(page.contains("--force"));
+
+    // `provision` is cowshed's internal word for minting a volume. Parent's rule is that it never
+    // reaches a person, and a help page is the most person-facing surface there is.
+    assert!(
+        !page.contains("provision"),
+        "setup's help page must not say `provision`:\n{page}"
+    );
 }
 
 /// `--purge` is `gateway stop`'s alone, and it is in the gateway's help page because the parser
