@@ -1,15 +1,28 @@
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use cowshed_core::apfs::{
         ApfsBackend, ApfsCaseSensitivity, AttachedImage, CreateImageRequest, DetachIntent,
         ImageFormatSelection, MacOsApfsBackend, SystemCommandRunner,
     };
+    use cowshed_core::copy::copy_until_quiescent_blocking;
     use cowshed_core::metadata::{ImageCapacity, ImageFormat};
 
     pub fn run() {
+        let mut arguments = std::env::args_os();
+        let _program = arguments.next();
+        if arguments.next().as_deref() == Some(std::ffi::OsStr::new("tree-copy")) {
+            let source = arguments
+                .next()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| panic!("tree-copy requires a source directory"));
+            benchmark_tree_copy(&source)
+                .unwrap_or_else(|error| panic!("tree-copy benchmark failed: {error}"));
+            return;
+        }
+
         let formats = [ImageFormat::Sparse, ImageFormat::Asif];
         let mut completed = 0;
         for format in formats {
@@ -22,6 +35,34 @@ mod macos {
             formats.len(),
             "both APFS formats must complete the benchmark"
         );
+    }
+
+    fn benchmark_tree_copy(source: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let root = BenchmarkRoot(PathBuf::from(format!(
+            "/private/tmp/cowshed-tree-copy-bench-{}",
+            std::process::id()
+        )));
+        if root.0.exists() {
+            std::fs::remove_dir_all(&root.0)?;
+        }
+        std::fs::create_dir_all(&root.0)?;
+        let destination = root.0.join("destination");
+        std::fs::create_dir(&destination)?;
+        let started = Instant::now();
+        let report = copy_until_quiescent_blocking(source, &destination)?;
+        let elapsed = started.elapsed();
+        let entries = walkdir::WalkDir::new(&destination)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .count();
+        println!(
+            "tree-copy elapsed_ms={} entries={} passes={} changed_entries={}",
+            elapsed.as_millis(),
+            entries,
+            report.passes,
+            report.changed_entries
+        );
+        Ok(())
     }
 
     struct BenchmarkRoot(PathBuf);
