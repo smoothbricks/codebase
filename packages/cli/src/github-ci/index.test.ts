@@ -11,6 +11,7 @@ import {
   githubCiNxDeploy,
   githubCiNxRunMany,
   nxRunManyArgs,
+  nxRunManyBatchArgs,
   nxSmartArgs,
   publishGithubDeployment,
   readGitHeadSha,
@@ -54,6 +55,13 @@ describe('GitHub CI Nx target expansion', () => {
       ['build-macos', ['desktop']],
       ['package-macos', ['desktop']],
       ['build-ios', ['mobile']],
+    ]);
+    expect(nxRunManyBatchArgs(expanded.runs)).toEqual([
+      'run-many',
+      '-t',
+      'build-macos,package-macos,build-ios',
+      '--projects=desktop,mobile',
+      '--parallel=100%',
     ]);
   });
 
@@ -108,7 +116,7 @@ describe('GitHub CI Nx target expansion', () => {
       runs: [],
       unmatchedGlobs: ['*-macos'],
     });
-    expect(() => nxRunManyArgs({ target: 'test', projects: [] })).toThrow('has no selected projects');
+    expect(() => nxRunManyArgs({ target: 'test', projects: [] })).toThrow('have no selected projects');
   });
 
   it('expands same-project target dependencies in dependency-first order exactly once', () => {

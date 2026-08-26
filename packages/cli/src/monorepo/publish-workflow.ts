@@ -777,6 +777,21 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
+    '      - name: 🤖 Configure release author',
+    '        run:',
+    '          git config user.name "github-actions[bot]" && git config user.email',
+    '          "41898282+github-actions[bot]@users.noreply.github.com"',
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🏷️ Version release',
+    '        id: version',
+    '        run:',
+    `          smoo release version --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
+    '          "$GITHUB_OUTPUT"',
+  );
+  lines.push(
+    '',
+    `      # Step ${stepNumber++}`,
     '      - name: 🍎 Build selected macOS and iOS release outputs',
     '        id: platform-outputs',
     '        run:',
