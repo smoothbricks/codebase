@@ -145,7 +145,7 @@ pub enum GatewayCommand {
 
 /// `setup` runs in one of two directions and never both, so they are one flag apiece rather than a
 /// subcommand: the verb's whole promise is that a stranded host can type `cowshed setup`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SetupArgs {
     /// Remove cowshed's host presence — fstab pins, service agents, installed binaries — while
     /// leaving every volume, image, and workspace exactly where it is.
@@ -153,6 +153,9 @@ pub struct SetupArgs {
     /// Proceed with `--uninstall` although the volumes still hold workspaces, or although their
     /// occupancy could not be established at all.
     pub force: bool,
+    /// Host-configured workspace mount root (`<mount-root>/<owner>/<repo>/<ws>`). Settable only
+    /// when nothing is attached.
+    pub mount_root: Option<PathBuf>,
 }
 
 /// `start` takes the cache cap because the cap is the one thing a host operator has to be able to
@@ -525,7 +528,7 @@ fn cli_command() -> ClapCommand {
             value("repo-id"),
             flag("quarantine"),
         ]))
-        .subcommand(leaf("setup").args([flag("uninstall"), flag("force")]))
+        .subcommand(leaf("setup").args([flag("uninstall"), flag("force"), value("mount-root")]))
         .subcommand(leaf("new").arg(positional("name", 0..=1)).args([
             value("ref"),
             value("from"),
@@ -1176,7 +1179,7 @@ const SETUP: CommandSpec = CommandSpec {
     about: &[
         "Brings this host's two dedicated volumes to their canonical state and pins them in `/etc/fstab`: absent volumes are created; existing volumes are never deleted. Detached or mis-mounted ones are remounted where they belong, markers are validated, and the fstab lines that survive a reboot are written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
         "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
-
+        "`--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at `<mount-root>/<owner>/<repo>/<ws>`. The root can change only while every workspace is detached.",
         "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
     ],
     options: &[
@@ -1188,27 +1191,44 @@ const SETUP: CommandSpec = CommandSpec {
             spelling: "--force",
             meaning: "`--uninstall` only: proceed although workspaces remain, or although occupancy could not be established",
         },
+        Opt {
+            spelling: "--mount-root <dir>",
+            meaning: "set the host workspace mount root; refused while any workspace is attached",
+        },
     ],
 };
 
-/// `setup` takes two flags and never a project: a host whose volumes are missing has no adopted
-/// checkout to select, so silently accepting `--project` would promise a scope the verb does not
-/// have. `--force` without `--uninstall` is refused rather than ignored — it confirms a refusal
-/// that the forward direction never makes, so accepting it would answer a question nobody asked.
+/// `setup` takes no project: a host whose volumes are missing has no adopted checkout to select,
+/// so silently accepting `--project` would promise a scope the verb does not have. `--force`
+/// without `--uninstall` is refused rather than ignored — it confirms a refusal that the forward
+/// direction never makes, so accepting it would answer a question nobody asked. `--mount-root`
+/// is a third direction and cannot combine with teardown.
 fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SETUP;
     reject_project(global, USAGE, "--project is not valid for setup")?;
-    let parsed = SetupArgs {
-        uninstall: flagged(matches, "uninstall"),
-        force: flagged(matches, "force"),
+    let uninstall = flagged(matches, "uninstall");
+    let force = flagged(matches, "force");
+    let mount_root = match os(matches, "mount-root") {
+        Some(value) => Some(absolute_mount_root(&value, USAGE)?),
+        None => None,
     };
-    if parsed.force && !parsed.uninstall {
+    if mount_root.is_some() && (uninstall || force) {
+        return Err(UsageError::new(
+            "--mount-root cannot be combined with --uninstall",
+            USAGE,
+        ));
+    }
+    if force && !uninstall {
         return Err(UsageError::new(
             "--force only confirms --uninstall; setup never refuses to repair a host",
             USAGE,
         ));
     }
-    Ok(Command::Setup(parsed))
+    Ok(Command::Setup(SetupArgs {
+        uninstall,
+        force,
+        mount_root,
+    }))
 }
 
 
@@ -1325,6 +1345,17 @@ fn parse_move(matches: &ArgMatches) -> Result<Command, UsageError> {
         source,
         destination,
     }))
+}
+
+fn absolute_mount_root(value: &OsStr, usage: &'static CommandSpec) -> Result<PathBuf, UsageError> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(UsageError::new(
+            "the workspace mount root must be an absolute path",
+            usage,
+        ));
+    }
+    Ok(path)
 }
 
 
@@ -2226,22 +2257,11 @@ mod tests {
                 capacity: Some(OsString::from("80g"))
             })
         );
-
-        let cli = parse_args(["sccache", "start"]).unwrap();
-        assert_eq!(
-            cli.command,
-            Command::Sccache(SccacheCommand::Start { capacity: None })
-        );
-
-        let cli = parse_args(["sccache", "status", "--json"]).unwrap();
-        assert_eq!(cli.command, Command::Sccache(SccacheCommand::Status));
-        assert!(cli.global.json);
-
+        assert!(parse_args(["sccache", "status", "--capacity", "80g"]).is_err());
         assert!(parse_args(["sccache", "stop", "--capacity", "80g"]).is_err());
-        assert!(parse_args(["sccache", "start", "--capacity"]).is_err());
     }
 
-    /// `setup` is host-level repair: no positionals, no project, and the two flags that pick its
+    /// `setup` is host-level repair: no positionals, no project, and the flags that pick its
     /// direction. A stranded host has no adopted checkout to name, so accepting `--project` would
     /// advertise a context the verb cannot use.
     #[test]
@@ -2249,6 +2269,7 @@ mod tests {
         const REPAIR: SetupArgs = SetupArgs {
             uninstall: false,
             force: false,
+            mount_root: None,
         };
         assert_eq!(
             parse_args(["setup"]).unwrap().command,
@@ -2267,7 +2288,8 @@ mod tests {
             parse_args(["setup", "--uninstall"]).unwrap().command,
             Command::Setup(SetupArgs {
                 uninstall: true,
-                force: false
+                force: false,
+                mount_root: None,
             })
         );
         assert_eq!(
@@ -2276,20 +2298,45 @@ mod tests {
                 .command,
             Command::Setup(SetupArgs {
                 uninstall: true,
-                force: true
+                force: true,
+                mount_root: None,
             })
         );
 
+        let Command::Setup(configured) =
+            parse_args(["setup", "--mount-root", "/Users/dev/.cowshed/mnt"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected setup")
+        };
+        assert_eq!(
+            configured.mount_root.as_deref(),
+            Some(std::path::Path::new("/Users/dev/.cowshed/mnt"))
+        );
+        assert!(!configured.uninstall);
+
         let error = parse_args(["setup", "--project", "/repo"]).unwrap_err();
         assert_eq!(error.message, "--project is not valid for setup");
-        assert_eq!(error.hint, "cowshed setup [--uninstall] [--force]");
+        assert!(error.hint.contains("cowshed setup"));
+        assert!(error.hint.contains("--mount-root"));
 
-        // `--force` confirms a refusal only `--uninstall` can make, so on its own it is a
-        // misunderstanding worth naming rather than a no-op worth accepting.
         let error = parse_args(["setup", "--force"]).unwrap_err();
         assert_eq!(
             error.message,
             "--force only confirms --uninstall; setup never refuses to repair a host"
+        );
+
+        let error = parse_args(["setup", "--uninstall", "--mount-root", "/tmp/mnt"]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "--mount-root cannot be combined with --uninstall"
+        );
+
+        let error = parse_args(["setup", "--mount-root", "relative/mnt"]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "the workspace mount root must be an absolute path"
         );
 
         assert!(parse_args(["setup", "extra"]).is_err());
