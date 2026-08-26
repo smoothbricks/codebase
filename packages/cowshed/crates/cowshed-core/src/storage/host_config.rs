@@ -136,15 +136,20 @@ impl MountRootChangePlan {
 
 /// Plan a host mount-root change without touching the filesystem.
 ///
-/// The attached list is an authoritative kernel-derived snapshot supplied by the host adapter. It
-/// is sorted and retained in the error so the CLI can name every workspace that blocks the change.
+/// The attached list is an authoritative kernel-derived snapshot supplied by the host adapter.
+/// Main is deliberately ignored: direct-mounted mains live at their checkout paths, outside the
+/// configurable session mount root. Session workspaces are sorted and retained in the error so
+/// the CLI can name every mount that actually blocks the change.
 pub fn plan_mount_root_change(
     store_root: &Path,
     mount_root: &Path,
     attached: impl IntoIterator<Item = AttachedWorkspace>,
 ) -> Result<MountRootChangePlan, HostConfigError> {
     validate_absolute_path(store_root)?;
-    let mut attached: Vec<_> = attached.into_iter().collect();
+    let mut attached: Vec<_> = attached
+        .into_iter()
+        .filter(|workspace| !workspace.workspace.is_main())
+        .collect();
     attached.sort();
     attached.dedup();
     if !attached.is_empty() {
@@ -457,6 +462,33 @@ mod tests {
     }
 
     #[test]
+    fn direct_mounted_main_does_not_block_mount_root_change() {
+        let root = temp_directory("attached-main");
+        let store = root.join("store");
+        let mount_root = root.join("workspaces");
+        fs::create_dir_all(&store).unwrap();
+
+        let plan = plan_mount_root_change(
+            &store,
+            &mount_root,
+            [AttachedWorkspace::new(
+                RepoId::parse("hyperide/axe").unwrap(),
+                WorkspaceName::new("main").unwrap(),
+            )],
+        )
+        .expect("main is mounted at its checkout, not below the session mount root");
+        execute_mount_root_change(&plan).unwrap();
+
+        assert_eq!(
+            HostConfig::load(&store, &root.join("home"))
+                .unwrap()
+                .mount_root(),
+            mount_root
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn mount_root_change_names_every_attached_workspace_and_writes_nothing() {
         let root = temp_directory("attached");
         let store = root.join("store");
@@ -464,26 +496,26 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
         let attached = [
             AttachedWorkspace::new(
-                RepoId::parse("zeta/widget").unwrap(),
-                WorkspaceName::new("raven").unwrap(),
+                RepoId::parse("hyperide/axe").unwrap(),
+                WorkspaceName::new("main").unwrap(),
             ),
             AttachedWorkspace::new(
-                RepoId::parse("acme/widget").unwrap(),
-                WorkspaceName::new("swift").unwrap(),
+                RepoId::parse("zeta/widget").unwrap(),
+                WorkspaceName::new("raven").unwrap(),
             ),
         ];
 
         let error = plan_mount_root_change(&store, &mount_root, attached).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "workspace mount root cannot change while attached: [acme/widget/swift, zeta/widget/raven]"
+            "workspace mount root cannot change while attached: [zeta/widget/raven]"
         );
         let HostConfigError::WorkspacesAttached { workspaces } = error else {
             panic!("unexpected error: {error}");
         };
         assert_eq!(
             workspaces.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            ["acme/widget/swift", "zeta/widget/raven"]
+            ["zeta/widget/raven"]
         );
         assert!(!mount_root.exists());
         assert!(!store.join(HOST_CONFIG_FILE).exists());

@@ -151,7 +151,7 @@ pub trait HostSetup: Send {
     async fn unmounted_mains(&mut self) -> Result<MainMounts>;
     /// Deactivate and delete the host services and the binaries they ran.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>>;
-    /// Record the host workspace mount root. Refused while any workspace is attached.
+    /// Record the host session mount root. Refused while any session workspace is attached.
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf>;
 }
 
@@ -420,7 +420,7 @@ fn host_config_error(error: HostConfigError) -> CowshedError {
                 .join(", ");
             CowshedError::conflict(
                 format!("workspace mount root cannot change while attached: {names}"),
-                "detach every attached workspace, then cowshed setup --mount-root <dir>",
+                "detach every attached session, then cowshed setup --mount-root <dir>",
             )
         }
         HostConfigError::InvalidPath { path, reason } => CowshedError::usage(

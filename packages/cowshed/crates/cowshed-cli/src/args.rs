@@ -153,8 +153,8 @@ pub struct SetupArgs {
     /// Proceed with `--uninstall` although the volumes still hold workspaces, or although their
     /// occupancy could not be established at all.
     pub force: bool,
-    /// Host-configured workspace mount root (`<mount-root>/<owner>/<repo>/<ws>`). Settable only
-    /// when nothing is attached.
+    /// Host-configured session mount root (`<mount-root>/<owner>/<repo>/<ws>`). Settable only
+    /// when every session workspace is detached; direct-mounted mains are unaffected.
     pub mount_root: Option<PathBuf>,
 }
 
@@ -1184,7 +1184,7 @@ const SETUP: CommandSpec = CommandSpec {
     about: &[
         "Brings this host's two dedicated volumes to their canonical state and pins them in `/etc/fstab`: absent volumes are created; existing volumes are never deleted. Detached or mis-mounted ones are remounted where they belong, markers are validated, and the fstab lines that survive a reboot are written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
         "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
-        "`--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at `<mount-root>/<owner>/<repo>/<ws>`. The root can change only while every workspace is detached.",
+        "`--mount-root <dir>` sets the host session workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at `<mount-root>/<owner>/<repo>/<ws>`. The root can change only while every session workspace is detached; mains stay mounted directly at their checkout paths.",
         "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
     ],
     options: &[
@@ -1198,7 +1198,7 @@ const SETUP: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--mount-root <dir>",
-            meaning: "set the host workspace mount root; refused while any workspace is attached",
+            meaning: "set the host session mount root; refused while any session workspace is attached",
         },
     ],
 };

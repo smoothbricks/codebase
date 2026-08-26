@@ -101,10 +101,34 @@ async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
         return finish(outcome, &mut output, json);
     }
-    let outcome = runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output)
-        .await
-        .map(|exit| exit.code);
+    let outcome = match runtime_dispatch(&parsed.command) {
+        RuntimeDispatch::Host => runtime::run_host_command(parsed, &mut output).await,
+        RuntimeDispatch::Project => {
+            runtime::run_bridge_command(parsed, tokio::io::stdin(), &mut output).await
+        }
+    }
+    .map(|exit| exit.code);
     finish(outcome, &mut output, json)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeDispatch {
+    Host,
+    Project,
+}
+
+/// Select host commands before anything is allowed to discover or open a project.
+///
+/// The store-wide forms are entirely described by their parsed flags. Routing them here keeps a
+/// broken cwd checkout (including one whose recorded Git remote no longer exists) out of the
+/// execution path instead of asking project discovery to fail before the host operation starts.
+fn runtime_dispatch(command: &args::Command) -> RuntimeDispatch {
+    match command {
+        args::Command::Attach(args) if args.all => RuntimeDispatch::Host,
+        args::Command::Detach(args) if args.all => RuntimeDispatch::Host,
+        args::Command::List(args) if args.all => RuntimeDispatch::Host,
+        _ => RuntimeDispatch::Project,
+    }
 }
 
 /// Turn one command's outcome into this process's exit code, reporting a failure in whichever
@@ -199,5 +223,15 @@ mod tests {
             assert!(result.is_err());
             assert!(!service_invoked.get());
         }
+    }
+
+    #[test]
+    fn detach_all_selects_store_wide_dispatch_before_project_open() {
+        let parsed = args::parse_args(["detach", "--all"]).expect("detach --all parses");
+
+        assert_eq!(runtime_dispatch(&parsed.command), RuntimeDispatch::Host);
+
+        let named = args::parse_args(["detach", "raven"]).expect("named detach parses");
+        assert_eq!(runtime_dispatch(&named.command), RuntimeDispatch::Project);
     }
 }
