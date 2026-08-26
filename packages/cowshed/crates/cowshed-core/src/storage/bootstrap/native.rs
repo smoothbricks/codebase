@@ -2046,6 +2046,40 @@ mod tests {
         source
     }
 
+    fn source_with_caches_inventory_mountpoint_omitted(
+        volume_mountpoint: Option<&str>,
+    ) -> FakeEvidenceSource {
+        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
+            + &volume(APFS_STORE_VOLUME, "disk3s8", Some("/Users/alice/.cowshed"))
+            + &volume(APFS_CACHES_VOLUME, "disk3s9", None);
+        let mut source = healthy_existing_source();
+        source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
+        source.mountpoints.insert(
+            PathBuf::from("/Users/alice/.cowshed/caches"),
+            MountpointState::Missing,
+        );
+        source
+            .mounted_volumes
+            .remove(Path::new("/Users/alice/.cowshed/caches"));
+        source.mounted_volumes.insert(
+            PathBuf::from("/Volumes/cowshed.caches"),
+            MountedVolumeEvidence {
+                exact_identifier: "disk3s9".to_owned(),
+                mountpoint: PathBuf::from("/Volumes/cowshed.caches"),
+                nobrowse: false,
+                uid: 501,
+                gid: 20,
+            },
+        );
+        if let Some(mountpoint) = volume_mountpoint {
+            source.volume_mountpoints.insert(
+                "disk3s9".to_owned(),
+                Some(PathBuf::from(mountpoint)),
+            );
+        }
+        source
+    }
+
     #[derive(Default)]
     struct ReadOnlyValidationHost {
         inspections: AtomicUsize,
@@ -3441,6 +3475,66 @@ mod tests {
         assert_eq!(container_reference_of("disk13s1"), "disk13");
         // A sealed system snapshot mounts as `<volume>s<snapshot>`; the container is unchanged.
         assert_eq!(container_reference_of("disk3s1s1"), "disk3");
+    }
+
+    #[test]
+    fn volume_mounted_outside_inventory_is_remountable_without_setup() {
+        let mut evidence_source =
+            source_with_caches_inventory_mountpoint_omitted(Some("/Volumes/cowshed.caches"));
+        let gathered =
+            gather_existing_apfs_evidence(&mut evidence_source, Path::new("/Users/alice"))
+                .expect("mis-mounted caches evidence");
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                caches: ExistingStorage::MisMountedIncomplete {
+                    ref exact_identifier,
+                    ref current_mountpoint,
+                },
+                ..
+            } if exact_identifier == "disk3s9"
+                && current_mountpoint == Path::new("/Volumes/cowshed.caches")
+        ));
+
+        let mut plan_source =
+            source_with_caches_inventory_mountpoint_omitted(Some("/Volumes/cowshed.caches"));
+        let plan = plan_existing_host_storage(&mut plan_source, Path::new("/Users/alice"))
+            .expect("mis-mounted caches repair plan");
+        assert!(mutating_setup_actions(&plan).is_empty());
+    }
+
+    #[test]
+    fn volume_absent_from_inventory_and_mountpoint_info_requires_provisioning() {
+        let mut evidence_source = source_with_caches_inventory_mountpoint_omitted(None);
+        let gathered =
+            gather_existing_apfs_evidence(&mut evidence_source, Path::new("/Users/alice"))
+                .expect("detached caches evidence");
+        assert!(matches!(
+            gathered.bootstrap,
+            BootstrapEvidence::Apfs {
+                caches: ExistingStorage::DetachedIncomplete {
+                    ref exact_identifier,
+                },
+                ..
+            } if exact_identifier == "disk3s9"
+        ));
+
+        let mut plan_source = source_with_caches_inventory_mountpoint_omitted(None);
+        let plan = plan_existing_host_storage(&mut plan_source, Path::new("/Users/alice"))
+            .expect("detached caches repair plan");
+        assert!(plan.operations().iter().any(|operation| matches!(
+            operation,
+            HostOperation::ProvisionApfsVolumes { volumes, .. }
+                if volumes.iter().any(|volume| {
+                    volume.name() == APFS_CACHES_VOLUME
+                        && matches!(
+                            volume.kind(),
+                            ApfsProvisionKind::RecoverDetached { exact_identifier }
+                                if exact_identifier == "disk3s9"
+                        )
+                })
+        )));
+        assert!(!mutating_setup_actions(&plan).is_empty());
     }
 
     #[tokio::test]
