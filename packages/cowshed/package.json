@@ -153,11 +153,13 @@
         }
       },
       "verify-packaging": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
         "options": {
-          "cwd": "packages/cowshed",
-          "command": "bun scripts/verify-packaged-bin-bits.ts"
+          "command": "bun scripts/verify-packaged-bin-bits.ts",
+          "cwd": "{projectRoot}",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
         }
       },
       "test": {
