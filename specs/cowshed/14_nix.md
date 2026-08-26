@@ -12,7 +12,7 @@ _validating_, and the deployment postures (which uid runs all of this). The NixO
 programs.cowshed = {
   enable = true;               # puts the cowshed binary in home.packages
   relocations = true;          # cache-subtree symlinks: ~/.cargo/{registry,git}, ~/.cache/zig,
-                               #   ~/.gradle/caches (+ other gradle cache dirs), sccache default → ~/.cowshed/caches/…
+                               #   ~/.gradle/caches (+ other gradle cache dirs), sccache default → /private/cowshed/caches/…
   gateway.launchd = true;      # dev.cowshed.gateway LaunchAgent (HM manages ~/Library/LaunchAgents on darwin)
   sccache.launchd = true;      # dev.cowshed.sccache LaunchAgent: host-owned foreground sccache UDS server
                                #   (03_caches.md "The sccache daemon"); imperative counterpart: cowshed sccache start
@@ -26,7 +26,7 @@ programs.cowshed = {
 ```
 
 With the module enabled, cowshed's last `~/Library` residue (the launchd plists) becomes a home-manager generation —
-declared, rollbackable, never drifting. Combined with the store volume mounted at `~/.cowshed` (01_storage.md), the
+declared, rollbackable, never drifting. Combined with the store volume mounted at `/private/cowshed/store` (01_storage.md), the
 Data-volume home footprint is: one empty mountpoint directory, plus HM-managed artifacts.
 
 On Linux, `programs.cowshed.linuxConnector` (and `services.cowshed-runner` in CI) installs the controller-side launcher
@@ -57,7 +57,7 @@ not configured: HM-created symlinks resolve into `/nix/store` (verification item
 `repo_id`, normalized from a chosen remote URL to lowercase `owner/repo`. The binding records that chosen remote and
 validation requires its URL to produce the recorded `repo_id`; discovery may propose a binding but never silently mint
 one. Multiple bindings may exist with exactly one primary, while a local-only repository requires an explicit `repo_id`.
-Trusted policy lives at `~/.cowshed/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as separate, path-safe
+Trusted policy lives at `/private/cowshed/store/<owner>/<repo>/policy.json`, with `owner` and `repo` encoded as separate, path-safe
 components. Home-manager or the trusted host bootstrap owns that file; `adopt`, `ensure`, workspaces, agents, and
 repository content may validate it but never create or rewrite it. Missing policy or an inconsistent binding is a
 bootstrap error with a declarative remediation hint, never an imperative fallback derived from a checkout path.
@@ -76,8 +76,8 @@ workspace authority.
 
 ## Deployment postures
 
-Paths are uid-relative under every posture: cowshed state is rooted at `~/.cowshed`, and trusted policy is
-`~/.cowshed/<owner>/<repo>/policy.json`. A posture decides _which uid owns that root and its policy_, never derives a
+Paths are uid-relative under every posture: cowshed state is rooted at `/private/cowshed/store`, and trusted policy is
+`/private/cowshed/store/<owner>/<repo>/policy.json`. A posture decides _which uid owns that root and its policy_, never derives a
 second identity from a machine-local checkout path. Host activation and repository bootstrap MUST run as that owning uid
 (or a trusted system service writing on its behalf); a workspace, remote editor, or personal-session broker cannot
 bootstrap policy. Changing postures is an explicit reprovision into the new owner's root, not a recursive `chown`,
