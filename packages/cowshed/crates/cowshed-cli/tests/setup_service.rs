@@ -48,9 +48,7 @@ impl Default for FakeHost {
                 pins_to_remove: Vec::new(),
                 requires_authorization: false,
             },
-            uninstall_report: UninstallReport {
-                fstab: UninstallFstabOutcome::AlreadyClean,
-            },
+            uninstall_report: uninstall_report(UninstallFstabOutcome::AlreadyClean),
             census: WorkspaceCensus::Counted {
                 projects: 0,
                 workspaces: 0,
@@ -130,6 +128,15 @@ async fn refusal(host: &mut FakeHost, args: SetupArgs) -> CowshedError {
     setup_dispatch(host, &args, false, &mut output)
         .await
         .expect_err("dispatch refuses")
+}
+
+/// Core's own half of the teardown report. `services` is always empty here, because core returns
+/// it empty and the adapter under test is what fills it — asserting that is the point.
+fn uninstall_report(fstab: UninstallFstabOutcome) -> UninstallReport {
+    UninstallReport {
+        fstab,
+        services: Vec::new(),
+    }
 }
 
 fn volume(name: &str, role: VolumeRole, state: VolumeState, action: &str) -> VolumeOutcome {
@@ -405,9 +412,7 @@ async fn uninstall_removes_host_presence_and_names_what_survives() {
             pins_to_remove: vec![String::from("UUID=1111 /private/cowshed/store")],
             requires_authorization: true,
         },
-        uninstall_report: UninstallReport {
-            fstab: UninstallFstabOutcome::Removed,
-        },
+        uninstall_report: uninstall_report(UninstallFstabOutcome::Removed),
         census: WorkspaceCensus::Counted {
             projects: 0,
             workspaces: 0,
@@ -456,9 +461,7 @@ async fn uninstall_refuses_occupied_volumes_until_forced() {
             projects: 2,
             workspaces: 5,
         },
-        uninstall_report: UninstallReport {
-            fstab: UninstallFstabOutcome::Removed,
-        },
+        uninstall_report: uninstall_report(UninstallFstabOutcome::Removed),
         ..FakeHost::default()
     };
 
@@ -516,18 +519,23 @@ async fn uninstall_refuses_when_occupancy_cannot_be_established() {
     ));
 }
 
-/// Teardown's `--json` carries the core report and nothing else; the service teardown stays on
-/// stderr, because the frozen envelope has exactly one named result body.
+/// Teardown's `--json` carries the whole outcome, not just core's half.
+///
+/// Core returns `services` empty — the fstab pins are all it owns — so this asserts that the
+/// adapter fills it. Order matters and is frozen: both agents, then both binaries, because the
+/// gateway agent is `KeepAlive` and deleting its binary under a loaded agent would leave launchd
+/// respawning a vanished path. The `what` and `outcome` vocabularies are frozen here because this
+/// is the only place they are produced.
 #[tokio::test]
-async fn uninstall_json_carries_the_frozen_uninstall_report() {
+async fn uninstall_json_reports_the_services_the_adapter_removed() {
     let mut host = FakeHost {
-        uninstall_report: UninstallReport {
-            fstab: UninstallFstabOutcome::AlreadyClean,
-        },
-        removals: vec![HostArtifactRemoval::new(
-            "installed cowshed binary",
-            RemovalOutcome::AlreadyAbsent,
-        )],
+        uninstall_report: uninstall_report(UninstallFstabOutcome::Removed),
+        removals: vec![
+            HostArtifactRemoval::new("dev.cowshed.gateway agent", RemovalOutcome::Removed),
+            HostArtifactRemoval::new("dev.cowshed.sccache agent", RemovalOutcome::AlreadyAbsent),
+            HostArtifactRemoval::new("installed cowshed binary", RemovalOutcome::Removed),
+            HostArtifactRemoval::new("installed sccache binary", RemovalOutcome::AlreadyAbsent),
+        ],
         ..FakeHost::default()
     };
 
@@ -535,9 +543,64 @@ async fn uninstall_json_carries_the_frozen_uninstall_report() {
 
     assert_eq!(
         streams.stdout,
-        "{\"ok\":true,\"result\":{\"fstab\":\"alreadyClean\"}}\n"
+        "{\"ok\":true,\"result\":{\"fstab\":\"removed\",\"services\":[\
+         {\"what\":\"dev.cowshed.gateway agent\",\"outcome\":\"removed\"},\
+         {\"what\":\"dev.cowshed.sccache agent\",\"outcome\":\"already-absent\"},\
+         {\"what\":\"installed cowshed binary\",\"outcome\":\"removed\"},\
+         {\"what\":\"installed sccache binary\",\"outcome\":\"already-absent\"}\
+         ]}}\n"
     );
     assert_eq!(streams.stderr, "next: cowshed doctor\n");
+}
+
+/// A teardown that found nothing installed still reports the empty list rather than omitting it,
+/// so a consumer never has to distinguish "no services" from "field missing".
+#[tokio::test]
+async fn uninstall_json_reports_an_empty_service_list_when_nothing_was_installed() {
+    let mut host = FakeHost {
+        uninstall_report: uninstall_report(UninstallFstabOutcome::AlreadyClean),
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, UNINSTALL, true, false).await;
+
+    assert_eq!(
+        streams.stdout,
+        "{\"ok\":true,\"result\":{\"fstab\":\"alreadyClean\",\"services\":[]}}\n"
+    );
+}
+
+/// The stderr rendering and the JSON `outcome` token are deliberately different spellings of the
+/// same typed value: prose reads "already absent", the wire token is hyphenated like core's action
+/// vocabulary. Both come from one match, so neither can drift alone.
+#[tokio::test]
+async fn removal_prose_and_wire_token_stay_paired() {
+    let removals = vec![
+        HostArtifactRemoval::new("dev.cowshed.gateway agent", RemovalOutcome::Removed),
+        HostArtifactRemoval::new("installed sccache binary", RemovalOutcome::AlreadyAbsent),
+    ];
+
+    let mut host = FakeHost {
+        uninstall_report: uninstall_report(UninstallFstabOutcome::AlreadyClean),
+        removals: removals.clone(),
+        ..FakeHost::default()
+    };
+    let plain = run(&mut host, UNINSTALL, false, false).await;
+    assert!(plain
+        .stderr
+        .contains("cowshed: dev.cowshed.gateway agent: removed\n"));
+    assert!(plain
+        .stderr
+        .contains("cowshed: installed sccache binary: already absent\n"));
+
+    let mut host = FakeHost {
+        uninstall_report: uninstall_report(UninstallFstabOutcome::AlreadyClean),
+        removals,
+        ..FakeHost::default()
+    };
+    let json = run(&mut host, UNINSTALL, true, false).await;
+    assert!(json.stdout.contains("\"outcome\":\"removed\""));
+    assert!(json.stdout.contains("\"outcome\":\"already-absent\""));
 }
 
 /// The verb's whole promise is that a stranded host can type it from anywhere: no project is

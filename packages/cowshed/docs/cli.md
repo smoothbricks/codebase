@@ -130,15 +130,19 @@ image, so they would be left unmanaged
 next: cowshed setup --uninstall --force
 ```
 
-With `--json`, `setup` emits the frozen envelope carrying the per-volume report, and `--uninstall` the fstab outcome:
+With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab
+outcome and every service artifact it touched, in the order it touched them (both agents, then both binaries). A
+teardown that found nothing installed reports an empty `services` list rather than omitting the field:
 
 ```
 $ cowshed setup --json
 {"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"provisioned"}],"fstab":"pinned","authorized":true}}
 
 $ cowshed setup --uninstall --force --json
-{"ok":true,"result":{"fstab":"removed"}}
+{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"installed sccache binary","outcome":"already-absent"}]}}
 ```
+
+`outcome` is `removed` or `already-absent`; the stderr rendering of the same value reads `already absent`.
 
 ### `cowshed adopt`
 
