@@ -11,14 +11,13 @@ use bytes::Bytes;
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
-    AdoptOptions, AttachOptions, BranchName, CheckpointOptions, CheckpointResult, CommandArg,
-    Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest,
-    ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason,
-    GcReport, GitOid, JobInfo, JobStream, LandOptions, LandReport, MountResult, OutputPublication,
-    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    AdoptOptions, AttachOptions, BranchName, CheckpointInfo, CheckpointOptions, CheckpointResult,
+    CommandArg, Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
+    ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason, GcReport, GitOid,
+    JobInfo, JobStream, LandOptions, LandReport, MountResult, OutputPublication, PublicationPolicy,
+    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult,
+    RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
+    UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use cowshed_core::git::GitRepository;
@@ -36,7 +35,9 @@ use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, STORE_ROOT,
     ValidatedHostStorage, execute_host_setup, plan_host_setup,
 };
-use cowshed_core::storage::lifecycle::{MountState, Substrate};
+use cowshed_core::storage::lifecycle::{
+    DerivedWorkspace, MountIntent, MountState, Pin, Substrate,
+};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, retired_layout_paths,
@@ -1510,24 +1511,15 @@ async fn attach_scoped_sessions(
 }
 
 async fn attach_store_wide(browse: bool) -> Result<Vec<WorkspaceInfo>> {
-    let options = AttachOptions {
-        browse,
-        observed_path: None,
-    };
+    let home = gateway_service::canonical_home()?;
+    let storage = validate_existing_host_storage(&home).await?;
+    let projects = NativeGatewayInventory::new(storage.clone())
+        .adopted_projects()
+        .await
+        .map_err(project_inventory_error)?;
     let mut attached = Vec::new();
-    for project in adopted_projects().await? {
-        let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
-        let primary = attach_project_sessions(&mut bridge, options.clone()).await;
-        let teardown = bridge.shutdown().await.err();
-        match primary {
-            Ok(mut infos) => {
-                if let Some(error) = teardown {
-                    return Err(error);
-                }
-                attached.append(&mut infos);
-            }
-            Err(primary) => return Err(merge_primary(primary, teardown)),
-        }
+    for project in &projects {
+        attached.extend(attach_project_sessions_from_store(&storage, project, browse).await?);
     }
     if attached.is_empty() {
         return Err(no_detached_sessions());
@@ -1535,25 +1527,104 @@ async fn attach_store_wide(browse: bool) -> Result<Vec<WorkspaceInfo>> {
     Ok(attached)
 }
 
-async fn attach_project_sessions(
-    service: &mut dyn CliService,
-    options: AttachOptions,
+/// Attach a project's detached sessions from store metadata and APFS facts alone.
+///
+/// Store-wide attach must not open `project.project_root`: a stale or missing checkout remote
+/// does not invalidate the image sidecar, repository binding, or canonical mount layout needed to
+/// mount a session. Main is intentionally excluded because it is an always-mounted host invariant,
+/// not a user-detachable session.
+async fn attach_project_sessions_from_store(
+    storage: &ValidatedHostStorage,
+    project: &AdoptedProject,
+    browse: bool,
 ) -> Result<Vec<WorkspaceInfo>> {
-    let targets: Vec<WorkspaceInfo> = service
-        .list()
-        .await?
+    let layout = StorageLayout::new(storage.store(), &project.repo_id)
+        .map_err(attach_store_storage_error)?;
+    let checkout_layout = layout
+        .checkout_layout()
+        .map_err(attach_store_storage_error)?;
+    let config = ApfsSubstrateConfig::new(
+        storage.store(),
+        storage.caches(),
+        &project.project_root,
+        checkout_layout,
+        ApfsCaseSensitivity::Sensitive,
+    );
+    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
+        .map_err(attach_store_storage_error)?;
+    let substrate = ApfsSubstrate::new(config, host);
+    let targets = substrate
+        .list(&project.repo_id)
+        .await
+        .map_err(attach_store_storage_error)?
         .into_iter()
-        .filter(is_detached_session)
-        .collect();
+        .filter(|derived| {
+            derived.workspace.role() != WorkspaceRole::Main
+                && derived.mount_state == MountState::Detached
+        })
+        .collect::<Vec<_>>();
     let mut attached = Vec::with_capacity(targets.len());
     for target in targets {
-        attached.push(
-            service
-                .attach(target.workspace.as_str(), options.clone())
-                .await?,
-        );
+        let mut info = store_workspace_info(&layout, &target)?;
+        info.mount = substrate
+            .ensure_mounted(&target.workspace, MountIntent { browse })
+            .await
+            .map_err(attach_store_storage_error)?;
+        info.state = WorkspaceState::Attached;
+        attached.push(info);
     }
     Ok(attached)
+}
+
+fn store_workspace_info(
+    layout: &StorageLayout,
+    derived: &DerivedWorkspace,
+) -> Result<WorkspaceInfo> {
+    let image = layout
+        .session_image(derived.workspace.name(), derived.workspace.format())
+        .map_err(attach_store_storage_error)?;
+    let metadata = DetachedWorkspaceMetadata::read_for_image(image.image())
+        .map_err(attach_store_storage_error)?;
+    let snapshot = metadata.info_snapshot.as_ref();
+    let base_commit = snapshot
+        .map(|snapshot| GitOid::new(snapshot.base_commit.clone()))
+        .transpose()
+        .map_err(attach_store_storage_error)?;
+    let created_at = snapshot
+        .map(|snapshot| UtcTimestamp::new(snapshot.created_at.clone()))
+        .transpose()
+        .map_err(attach_store_storage_error)?;
+    Ok(WorkspaceInfo {
+        repo_id: derived.workspace.repo().clone(),
+        workspace: derived.workspace.name().clone(),
+        workspace_incarnation: derived.workspace.incarnation().clone(),
+        role: derived.workspace.role(),
+        image_format: derived.workspace.format(),
+        mount: layout
+            .workspace_mount(derived.workspace.name())
+            .map_err(attach_store_storage_error)?,
+        state: WorkspaceState::Detached,
+        branch: snapshot.and_then(|snapshot| snapshot.branch.clone()),
+        base_commit,
+        created_at,
+        checkpoints: derived
+            .checkpoints
+            .iter()
+            .map(|checkpoint| CheckpointInfo {
+                label: checkpoint.label.to_string(),
+                revision: checkpoint.revision.get(),
+                pinned: checkpoint.pin == Pin::Pinned,
+            })
+            .collect(),
+        snapshot_stale: snapshot.is_some_and(|snapshot| snapshot.stale),
+    })
+}
+
+fn attach_store_storage_error(error: impl std::fmt::Display) -> CowshedError {
+    CowshedError::integrity(
+        format!("store-wide attach could not read or mount a session: {error}"),
+        "cowshed doctor --json",
+    )
 }
 
 fn is_attached_session(info: &WorkspaceInfo) -> bool {
@@ -1650,19 +1721,6 @@ fn detach_store_storage_error(error: impl std::fmt::Display) -> CowshedError {
         format!("store-wide detach could not read or unmount a session: {error}"),
         "cowshed doctor --json",
     )
-}
-
-async fn detach_project_sessions(service: &mut dyn CliService) -> Result<usize> {
-    let targets: Vec<WorkspaceInfo> = service
-        .list()
-        .await?
-        .into_iter()
-        .filter(is_attached_session)
-        .collect();
-    for target in &targets {
-        service.detach(target.workspace.as_str()).await?;
-    }
-    Ok(targets.len())
 }
 
 /// Resolve a session workspace's owning checkout from the store readdir.
