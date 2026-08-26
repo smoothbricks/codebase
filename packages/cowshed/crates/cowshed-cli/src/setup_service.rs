@@ -26,13 +26,15 @@ use crate::output::Output;
 use crate::sccache_service::{remove_stale_socket, sccache_launch_agent};
 use async_trait::async_trait;
 use cowshed_core::storage::bootstrap::{
-    FstabOutcome, HostSetupPlan, HostSetupReport, HostUninstallPlan, UninstallFstabOutcome,
-    UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeRole, VolumeState,
-    execute_host_setup, execute_host_uninstall, plan_host_setup, plan_host_uninstall,
+    FstabOutcome, HostAction, HostSetupPlan, HostSetupReport, HostUninstallPlan,
+    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeRole,
+    VolumeState, execute_host_setup, execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
 use cowshed_core::metadata::ImageFormat;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
-use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
+use cowshed_core::{
+    CowshedError, ErrorCode, NativeGatewayInventory, Result, validate_existing_host_storage,
+};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -40,14 +42,27 @@ use std::path::PathBuf;
 /// The exact sentence a run that may escalate prints before it escalates.
 ///
 /// Fixed rather than derived: the caller has to be able to recognise "a dialog is about to appear"
-/// without parsing the per-volume action list that follows it.
+/// without reading the action list. The list that follows carries the intent, so this sentence
+/// deliberately names only the prompt and points at them.
+///
+/// "provision" is cowshed's internal word for minting a volume and never appears in output a
+/// person reads; the user-facing verb is "create".
 const AUTHORIZATION_ANNOUNCEMENT: &str =
-    "setup will request administrator authorization to provision/remount cowshed volumes";
+    "setup will request administrator authorization once, for the actions below";
 
 /// The teardown counterpart. Removing fstab pins edits a root-owned file, so it escalates for its
 /// own reason and says so in its own words.
 const UNINSTALL_AUTHORIZATION_ANNOUNCEMENT: &str =
     "setup --uninstall will request administrator authorization to remove cowshed's /etc/fstab pins";
+
+/// The promise a run can make when its plan mints nothing and removes nothing.
+///
+/// This is the sentence the common case needs most: a host whose volumes already exist and merely
+/// lack boot pins is one authorization dialog away from being fixed, and the dialog itself gives a
+/// person no way to tell a mount from a reformat. Printed only when the plan's own actions support
+/// it, never as a default reassurance.
+const NON_DESTRUCTIVE_PROMISE: &str =
+    "no volumes will be created or deleted; existing data is untouched";
 
 /// What the volumes still hold, or why nobody could tell.
 ///
@@ -295,13 +310,8 @@ where
     E: Write + Send,
 {
     let plan = setup.plan().await?;
-    announce(
-        plan.requires_authorization,
-        AUTHORIZATION_ANNOUNCEMENT,
-        &plan.actions,
-        output,
-    )?;
-    let report = setup.execute().await?;
+    announce_setup(&plan, output)?;
+    let report = setup.execute().await.map_err(declined_authorization)?;
     if json {
         output.success(report).map_err(output_error)?;
     } else {
@@ -332,14 +342,12 @@ where
         return Err(refusal);
     }
     let plan = setup.plan_uninstall().await?;
-    announce(
-        plan.requires_authorization,
-        UNINSTALL_AUTHORIZATION_ANNOUNCEMENT,
-        &plan.pins_to_remove,
-        output,
-    )?;
+    announce_uninstall(&plan, output)?;
     let removals = setup.remove_host_services().await?;
-    let mut report = setup.execute_uninstall().await?;
+    let mut report = setup
+        .execute_uninstall()
+        .await
+        .map_err(declined_authorization)?;
     // Core owns the fstab half and reports it; the service half is this adapter's work, so the
     // adapter is what puts it in the report. Without this the JSON surface would be narrower than
     // the stderr surface, and a caller reading only the envelope would never learn that two
@@ -352,6 +360,24 @@ where
     }
     output.hint("cowshed doctor").map_err(output_error)?;
     Ok(0)
+}
+
+/// A person who dismissed the dialog denied cowshed a right; that is not a bug and not a
+/// half-finished run.
+///
+/// Said in cowshed's words rather than the platform's, because `Authorization Services status
+/// -60006` is not a sentence anyone can act on, and the actionable part — that the host is
+/// unchanged — is not in it at all. Only an authoritatively typed denial is rewritten: 06_cli.md
+/// permits exit 6 on denial evidence alone and never on scanning text, so every other failure
+/// keeps its own taxonomy, message, and hint untouched.
+fn declined_authorization(error: CowshedError) -> CowshedError {
+    if error.code != ErrorCode::SandboxDenied {
+        return error;
+    }
+    CowshedError::sandbox_denied(
+        "administrator authorization was declined, so nothing on this host was changed",
+        "cowshed setup",
+    )
 }
 
 /// The refusal that stands in for a confirmation prompt.
@@ -384,22 +410,146 @@ fn refuse_occupied(census: &WorkspaceCensus, force: bool) -> Option<CowshedError
     }
 }
 
-/// Everything the run will do, said before it does any of it.
-fn announce<W: Write, E: Write>(
-    requires_authorization: bool,
-    announcement: &str,
-    actions: &[String],
+/// Everything the run will do to this host, said before it does any of it.
+///
+/// The disclosure is one block: the prompt, the safety promise when one can be made, then the
+/// exact intent for each volume. When the run escalates, the whole block is unsuppressible — `-q`
+/// hiding the list would leave "authorization once, for the actions below" pointing at nothing,
+/// and a person cannot answer a dialog they were not told the reason for (06_cli.md rule 3). When
+/// nothing escalates there is no dialog to answer, so the list is ordinary guidance.
+fn announce_setup<W: Write, E: Write>(
+    plan: &HostSetupPlan,
     output: &mut Output<W, E>,
 ) -> Result<()> {
-    if requires_authorization {
-        output.announce(announcement).map_err(output_error)?;
-    }
-    for action in actions {
+    if plan.requires_authorization {
         output
-            .guidance(&format!("planned: {action}"))
+            .announce(AUTHORIZATION_ANNOUNCEMENT)
             .map_err(output_error)?;
     }
+    // Only worth saying when something is about to happen: on a healthy host there is no list for
+    // it to reassure anyone about.
+    if plan.non_destructive && !plan.actions.is_empty() {
+        emit(plan.requires_authorization, NON_DESTRUCTIVE_PROMISE, output)?;
+    }
+    for action in &plan.actions {
+        emit(plan.requires_authorization, &action_intent(action), output)?;
+    }
     Ok(())
+}
+
+/// Teardown's disclosure: the prompt, then the exact fstab lines that will go.
+fn announce_uninstall<W: Write, E: Write>(
+    plan: &HostUninstallPlan,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    if plan.requires_authorization {
+        output
+            .announce(UNINSTALL_AUTHORIZATION_ANNOUNCEMENT)
+            .map_err(output_error)?;
+    }
+    for pin in &plan.pins_to_remove {
+        emit(
+            plan.requires_authorization,
+            &format!("/etc/fstab pin will be removed: {pin}"),
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+/// One disclosure line, unsuppressible exactly when it is explaining a dialog.
+fn emit<W: Write, E: Write>(
+    escalating: bool,
+    line: &str,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    if escalating {
+        output.announce(line)
+    } else {
+        output.guidance(line)
+    }
+    .map_err(output_error)
+}
+
+/// The exact intent for one action, in the second person's terms rather than cowshed's.
+///
+/// Every arm names the volume and where it will end up, because "will be mounted" without a path
+/// is not intent a person can consent to. No default branch: an action core adds stops compiling
+/// here rather than being silently announced as something it is not — and an unannounced action
+/// behind an authorization dialog is precisely the contract violation rule 3 exists to prevent.
+fn action_intent(action: &HostAction) -> String {
+    match action {
+        HostAction::CreateVolume {
+            name,
+            container,
+            mount_at,
+        } => format!(
+            "{name} does not exist yet and will be created in container {container}, then mounted at {}",
+            mount_at.display()
+        ),
+        HostAction::MountExisting {
+            name,
+            uuid,
+            size_bytes,
+            mount_at,
+        } => format!(
+            "{name} exists (UUID {uuid}, {}) and will be mounted at {}",
+            decimal_size(*size_bytes),
+            mount_at.display()
+        ),
+        HostAction::RepairMounted {
+            name,
+            uuid,
+            size_bytes,
+            mounted_at,
+            mount_at,
+        } => format!(
+            "{name} exists (UUID {uuid}, {}) and is mounted at {}; it will be remounted at {}",
+            decimal_size(*size_bytes),
+            mounted_at.display(),
+            mount_at.display()
+        ),
+        HostAction::PinFstab { uuid, mount_at } => format!(
+            "/etc/fstab will pin UUID {uuid} at {} so it mounts at every boot",
+            mount_at.display()
+        ),
+        // Named, not counted: 01_storage.md requires reclaimable stubs to be enumerated, because
+        // "3 files will be deleted" is not something a person can agree to.
+        HostAction::ReclaimStubs { paths } => format!(
+            "these leftover placeholder files will be removed: {}",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Volume sizes the way macOS states them: decimal units, one fraction digit.
+///
+/// Decimal rather than binary because that is what `diskutil` prints and what is printed on the
+/// hardware; a person checking cowshed's sentence against Disk Utility has to see the same number.
+/// Byte counts under a kilobyte keep no fraction — a fractional byte is not a quantity.
+fn decimal_size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const STEP: f64 = 1000.0;
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= STEP && unit + 1 < UNITS.len() {
+        value /= STEP;
+        unit += 1;
+    }
+    // Re-promote when one-decimal rounding lands on the next unit, so 999_999_999_999 reads
+    // "1.0 TB" and never "1000.0 GB".
+    if (value * 10.0).round() / 10.0 >= STEP && unit + 1 < UNITS.len() {
+        value /= STEP;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn render_repair<W: Write, E: Write>(
@@ -453,7 +603,7 @@ const fn removal_word(outcome: RemovalOutcome) -> &'static str {
     }
 }
 
-/// `cowshed.store (store): absent -> provisioned`.
+/// `cowshed.store (store): absent -> created`.
 ///
 /// Role as well as name because the name is a mutable label and the role is the identity
 /// (01_storage.md, "Ownership, identity, and the volume label"): a hand-renamed volume still has
@@ -489,17 +639,30 @@ fn state_phrase(state: &VolumeState) -> String {
         VolumeState::MisMounted { mounted_at } => {
             format!("mis-mounted at {}", mounted_at.display())
         }
+        // Where the bytes are readable belongs in the row, beside the container and device that
+        // identify them; the sentence that follows is reassurance and stays one clause long.
         VolumeState::FoundElsewhere {
-            container, device, ..
-        } => format!("found outside this host's container (container {container}, device {device})"),
+            container,
+            device,
+            mounted_at,
+        } => match mounted_at {
+            Some(path) => format!(
+                "found outside this host's container (container {container}, device {device}, mounted at {})",
+                path.display()
+            ),
+            None => format!(
+                "found outside this host's container (container {container}, device {device})"
+            ),
+        },
     }
 }
 
 /// The one state that needs a sentence of its own.
 ///
 /// A `cowshed.store` in another container is not a missing volume and must never be reported as
-/// one: repairing it would mean `deleteVolume`, so setup deliberately does nothing and says why.
-/// The mount point is named when macOS has one, because that is where the bytes are readable now.
+/// one: adopting it would mean deleting a volume, so setup deliberately does nothing and says so.
+/// One clause, because its whole job is reassurance — the container, device, and mount point are
+/// already in the row above it.
 fn state_guidance(state: &VolumeState) -> Option<String> {
     match state {
         VolumeState::Absent
@@ -507,15 +670,9 @@ fn state_guidance(state: &VolumeState) -> Option<String> {
         | VolumeState::MountedIncomplete
         | VolumeState::Detached
         | VolumeState::MisMounted { .. } => None,
-        VolumeState::FoundElsewhere {
-            device, mounted_at, ..
-        } => Some(match mounted_at {
-            Some(path) => format!(
-                "data is safe on {device}; not provisioned (readable at {})",
-                path.display()
-            ),
-            None => format!("data is safe on {device}; not provisioned"),
-        }),
+        VolumeState::FoundElsewhere { device, .. } => {
+            Some(format!("data is safe on {device}; cowshed left it untouched"))
+        }
     }
 }
 
