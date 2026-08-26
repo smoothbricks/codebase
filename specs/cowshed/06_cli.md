@@ -1,13 +1,19 @@
 # CLI Contract
 
-The `cowshed` binary is self-driving: an agent that has never seen it can operate it from its own output. Two rules make
-that possible and they are absolute:
+The `cowshed` binary is self-driving: an agent that has never seen it can operate it from its own output. Three rules
+make that possible and they are absolute:
 
 1. **stdout is machine-readable only.** A bare value (usually a path) or, with `--json`, one JSON envelope. Nothing else
    — ever. `cowshed path raven | xargs ls` and `cowshed ls | grep …` must never see prose.
 2. **Everything for humans and agents goes to stderr**: progress, warnings, and — after every command — actionable
    hints. Guidance can never contaminate pipes or grep. Guidance lines are prefixed `cowshed:`; trailing hint lines are
    prefixed `next:`.
+3. **A command that may trigger an authorization prompt says so first.** Any operation that can escalate — volume
+   provisioning, a remount macOS classifies as privileged, plist installation — emits a `cowshed:` line naming the
+   action and the prompt before the dialog appears (`cowshed: one administrator authorization will remount
+   cowshed.caches at /private/cowshed/caches`). A silent SecurityAgent dialog behind an unrelated read-only verb is a
+   contract violation, not a platform quirk to tolerate. Where the platform permits (fstab-pinned mounts), cowshed
+   prefers designs in which no prompt can occur at all (01_storage.md).
 
 ```
 $ cowshed new raven
