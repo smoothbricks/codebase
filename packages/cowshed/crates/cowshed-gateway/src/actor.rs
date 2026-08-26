@@ -392,6 +392,8 @@ impl Drop for Gateway {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatewayStatus {
+    /// Version of the daemon process that answered the control request.
+    pub version: String,
     pub draining: bool,
     pub sessions: Vec<SessionStatus>,
     pub active: usize,
@@ -1619,6 +1621,7 @@ impl Actor {
             .collect();
         sessions.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
         GatewayStatus {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             draining: self.draining,
             sessions,
             active: self.global_active,

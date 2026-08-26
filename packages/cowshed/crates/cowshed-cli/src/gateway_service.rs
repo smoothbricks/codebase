@@ -233,7 +233,12 @@ async fn start_service() -> Result<CliGatewayStatus> {
     let deadline = tokio::time::Instant::now() + START_DEADLINE;
     loop {
         if let Ok(status) = client.status().await {
-            return Ok(cli_status(true, paths.control_socket, Some(&status)));
+            return Ok(cli_status(
+                true,
+                true,
+                paths.control_socket,
+                Some(&status),
+            ));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(CowshedError::environment_missing(
@@ -318,27 +323,31 @@ fn stop_service(purge: bool) -> Result<RemovalOutcome> {
     Ok(RemovalOutcome::AlreadyAbsent)
 }
 
-async fn service_status() -> Result<CliGatewayStatus> {
+pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     let home = canonical_home()?;
     let socket = control_socket_path(&home);
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    match executor
-        .execute_status(&crate::launchd::ControlPlan::print(effective_uid(), &spec))
-        .map_err(launchd_error)?
-    {
-        LaunchdServiceStatus::NotLoaded { .. } => Ok(cli_status(false, socket, None)),
-        LaunchdServiceStatus::Loaded { .. } => {
-            let client = GatewayControlClient::new(socket.clone()).map_err(control_error)?;
-            let status = client
-                .status()
-                .await
-                .map_err(|_| gateway_absent(effective_uid()))?;
-            Ok(cli_status(true, socket, Some(&status)))
-        }
-    }
+    let installed = matches!(
+        executor
+            .execute_status(&crate::launchd::ControlPlan::print(effective_uid(), &spec))
+            .map_err(launchd_error)?,
+        LaunchdServiceStatus::Loaded { .. }
+    );
+    let status = if installed {
+        let client = GatewayControlClient::new(socket.clone()).map_err(control_error)?;
+        client.status().await.ok()
+    } else {
+        None
+    };
+    Ok(cli_status(
+        installed,
+        status.is_some(),
+        socket,
+        status.as_ref(),
+    ))
 }
 
 async fn run_daemon() -> Result<()> {
@@ -427,10 +436,18 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     }
 }
 
-fn cli_status(running: bool, socket: PathBuf, status: Option<&GatewayStatus>) -> CliGatewayStatus {
+fn cli_status(
+    installed: bool,
+    running: bool,
+    socket: PathBuf,
+    status: Option<&GatewayStatus>,
+) -> CliGatewayStatus {
     CliGatewayStatus {
+        installed,
         running,
         socket,
+        cli_version: env!("CARGO_PKG_VERSION").to_owned(),
+        daemon_version: status.map(|status| status.version.clone()),
         cache_entries: 0,
         cache_bytes: 0,
         active_workspaces: status.map_or(0, |status| status.sessions.len() as u64),
@@ -444,15 +461,32 @@ pub fn emit_gateway_status<W: Write, E: Write>(
 ) -> Result<()> {
     if json {
         output.success(status).map_err(output_error)?;
-    } else if status.running {
-        output
-            .guidance("gateway is healthy")
-            .map_err(output_error)?;
-    } else {
-        output
-            .guidance("gateway is stopped")
-            .map_err(output_error)?;
+        return Ok(());
     }
+    let state = if status.running {
+        format!(
+            "gateway is healthy: launchd loaded; control socket answers at {}",
+            status.socket.display()
+        )
+    } else if status.installed {
+        format!(
+            "gateway is installed but its control socket does not answer at {}",
+            status.socket.display()
+        )
+    } else {
+        format!(
+            "gateway is not installed; no control socket answers at {}",
+            status.socket.display()
+        )
+    };
+    output.guidance(&state).map_err(output_error)?;
+    output
+        .guidance(&format!(
+            "gateway versions: cli {}; daemon {}",
+            status.cli_version,
+            status.daemon_version.as_deref().unwrap_or("unavailable")
+        ))
+        .map_err(output_error)?;
     Ok(())
 }
 

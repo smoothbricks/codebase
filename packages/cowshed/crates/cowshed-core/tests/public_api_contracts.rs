@@ -733,15 +733,18 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
     );
 
     let status = GatewayStatus {
+        installed: true,
         running: true,
         socket: PathBuf::from("/store/gateway.sock"),
+        cli_version: "1.4.0".into(),
+        daemon_version: Some("1.3.0".into()),
         cache_entries: 7,
         cache_bytes: 8192,
         active_workspaces: 2,
     };
     assert_eq!(
         serde_json::to_value(status).unwrap(),
-        json!({"running":true,"socket":"/store/gateway.sock","cacheEntries":7,"cacheBytes":8192,"activeWorkspaces":2})
+        json!({"installed":true,"running":true,"socket":"/store/gateway.sock","cliVersion":"1.4.0","daemonVersion":"1.3.0","cacheEntries":7,"cacheBytes":8192,"activeWorkspaces":2})
     );
 
     let audit = AuditEvent {
