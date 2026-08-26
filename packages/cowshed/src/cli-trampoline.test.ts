@@ -131,6 +131,90 @@ describe('cowshed CLI trampoline', () => {
       }),
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
+
+  it('routes daemon verbs through the host-stable install ahead of packaged binaries', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
+    const spawns: Array<{ executable: string; argv: readonly string[] }> = [];
+
+    const exitCode = await runCli(['gateway', 'status'], {
+      packageRoot: root,
+      platform: 'darwin',
+      arch: 'arm64',
+      home: join(root, 'home'),
+      async spawnBinary(executable, argv) {
+        spawns.push({ executable, argv });
+        return 0;
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(spawns).toEqual([{ executable: stable, argv: ['gateway', 'status'] }]);
+  });
+
+  it('detects daemon verbs after leading flags', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
+    const spawns: string[] = [];
+
+    await runCli(['--json', 'sccache', 'start'], {
+      packageRoot: root,
+      platform: 'darwin',
+      arch: 'arm64',
+      home: join(root, 'home'),
+      async spawnBinary(executable) {
+        spawns.push(executable);
+        return 0;
+      },
+    });
+
+    expect(spawns).toEqual([stable]);
+  });
+
+  it('keeps non-daemon verbs on the packaged binary even when the stable install exists', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
+    const spawns: string[] = [];
+
+    await runCli(['ls', '--all'], {
+      packageRoot: root,
+      platform: 'darwin',
+      arch: 'arm64',
+      home: join(root, 'home'),
+      async spawnBinary(executable) {
+        spawns.push(executable);
+        return 0;
+      },
+    });
+
+    expect(spawns).toEqual([packaged]);
+  });
+
+  it('falls through to the packaged binary for daemon verbs when no stable install exists', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    await fixtureFile(packaged);
+    const spawns: string[] = [];
+
+    await runCli(['gateway', 'start'], {
+      packageRoot: root,
+      platform: 'darwin',
+      arch: 'arm64',
+      home: join(root, 'home'),
+      async spawnBinary(executable) {
+        spawns.push(executable);
+        return 0;
+      },
+    });
+
+    expect(spawns).toEqual([packaged]);
+  });
 });
 
 async function fixtureRoot(): Promise<string> {
