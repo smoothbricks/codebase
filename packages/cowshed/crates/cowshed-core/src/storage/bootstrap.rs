@@ -617,7 +617,7 @@ pub struct ValidatedHostStorage {
 }
 
 impl ValidatedHostStorage {
-    pub(crate) fn new(home: PathBuf, roots: CanonicalRoots) -> Self {
+    pub fn new(home: PathBuf, roots: CanonicalRoots) -> Self {
         Self { home, roots }
     }
 

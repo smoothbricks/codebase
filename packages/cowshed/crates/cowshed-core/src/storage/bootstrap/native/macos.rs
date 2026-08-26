@@ -27,9 +27,8 @@ use super::shared::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode, SystemBootstrapHost,
     UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeState,
-    execute_native_bootstrap_plan, existing_host_storage_error, host_io_error, platform_host_error,
-    read_only_validation_actions, require_host_canonical, setup_execution_error,
-    spawn_with_deadline, write_marker_atomic,
+    execute_native_bootstrap_plan, existing_host_storage_error, platform_host_error,
+    setup_execution_error,
 };
 use crate::error::CowshedError;
 use crate::storage::fstab::{FstabPin, build_fstab};
@@ -2590,6 +2589,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::super::shared::mutating_setup_actions;
     use super::*;
@@ -5023,4 +5023,261 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert_eq!(fs::read(&target).unwrap(), b"unchanged");
         fs::remove_dir_all(&directory).unwrap();
     }
+
+    fn deadline_spawn(
+        args: &[&str],
+        deadline: Duration,
+    ) -> Result<std::process::Output, HostError> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        spawn_with_deadline(Path::new("/bin/sleep"), &args, deadline)
+    }
+
+    #[test]
+    fn deadline_spawn_completes_when_the_child_answers() {
+        let output = deadline_spawn(&["0.05"], Duration::from_secs(10)).expect("fast child");
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn deadline_spawn_reports_unresponsiveness_and_kills_the_child() {
+        let started = std::time::Instant::now();
+        let error = deadline_spawn(&["30"], Duration::from_millis(250)).expect_err("deadline");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.to_string().contains("unresponsive"));
+    }
 }
+
+fn read_only_validation_actions(plan: &BootstrapPlan) -> Vec<String> {
+    plan.operations()
+        .iter()
+        .filter_map(|operation| match operation {
+            HostOperation::GuardMountpoint { .. } => None,
+            HostOperation::VerifyZfsDelegation { required_root, .. } => {
+                Some(format!("verify delegated ZFS root {required_root}"))
+            }
+            HostOperation::EnsureDirectory(path) => {
+                Some(format!("create mountpoint {}", path.display()))
+            }
+            HostOperation::ReclaimMountpoint(path) => {
+                Some(format!("reclaim mountpoint {}", path.display()))
+            }
+            HostOperation::MountApfsVolume { mountpoint, .. } => {
+                Some(format!("mount APFS volume at {}", mountpoint.display()))
+            }
+            HostOperation::RunCommand(command) => Some(format!(
+                "run {} {}",
+                command.program(),
+                command.args().join(" ")
+            )),
+            HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(format!(
+                "create APFS volumes {}",
+                volumes
+                    .iter()
+                    .map(ApfsVolumeProvision::name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            HostOperation::WriteMarkerAtomic { path, .. } => {
+                Some(format!("write volume marker {}", path.display()))
+            }
+            HostOperation::PinVolumesInFstab { .. } => {
+                Some("pin cowshed APFS volumes in /etc/fstab".to_owned())
+            }
+            HostOperation::ReportVolumeIssue { detail, .. } => Some(detail.clone()),
+        })
+        .collect()
+}
+
+fn require_host_canonical(path: &Path) -> Result<(), HostError> {
+    if path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        Ok(())
+    } else {
+        Err(HostError::new(format!(
+            "path must be absolute and normalized: {path:?}"
+        )))
+    }
+}
+
+fn host_io_error(operation: &str, path: &Path, source: io::Error) -> HostError {
+    HostError::new(format!("cannot {operation} {path:?}: {source}"))
+}
+
+mod unix {
+    use super::*;
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::process::{Command, Output, Stdio};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    const MARKER_MODE: libc::mode_t = 0o600;
+
+    pub(super) fn spawn_with_deadline(
+        program: &Path,
+        args: &[String],
+        deadline: Duration,
+    ) -> Result<Output, HostError> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| host_io_error("execute", program, source))?;
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child
+                        .wait_with_output()
+                        .map_err(|source| host_io_error("collect output from", program, source));
+                }
+                Ok(None) => {
+                    if started.elapsed() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(HostError::new(format!(
+                            "{program:?} produced no result within {deadline:?}; the disk arbitration daemon is unresponsive"
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(source) => return Err(host_io_error("wait for", program, source)),
+            }
+        }
+    }
+
+    pub(super) fn write_marker_atomic(path: &Path, contents: &[u8]) -> Result<(), HostError> {
+        require_host_canonical(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| HostError::new(format!("marker has no parent: {path:?}")))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| HostError::new(format!("marker has no filename: {path:?}")))?;
+        let parent_c = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| HostError::new(format!("marker parent contains NUL: {parent:?}")))?;
+        let name_c = CString::new(name.as_bytes())
+            .map_err(|_| HostError::new(format!("marker filename contains NUL: {path:?}")))?;
+        let parent_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `parent_c` is NUL-terminated and open returns a new owned descriptor.
+        let parent_fd = unsafe { libc::open(parent_c.as_ptr(), parent_flags) };
+        if parent_fd == -1 {
+            return Err(host_io_error(
+                "open marker parent without following",
+                parent,
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `parent_fd` is newly owned after successful open.
+        let parent_file = unsafe { File::from_raw_fd(parent_fd) };
+        reject_non_regular_destination(parent_file.as_raw_fd(), &name_c, path)?;
+
+        let temporary_name = format!(".{}.tmp.{}", name.to_string_lossy(), Uuid::new_v4());
+        let temporary_c = CString::new(temporary_name.as_bytes())
+            .expect("UUID temporary marker filename contains no NUL");
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: parent fd is an open directory and temporary_c is one NUL-terminated component.
+        let temporary_fd = unsafe {
+            libc::openat(
+                parent_file.as_raw_fd(),
+                temporary_c.as_ptr(),
+                flags,
+                MARKER_MODE as libc::c_uint,
+            )
+        };
+        if temporary_fd == -1 {
+            return Err(host_io_error(
+                "create temporary marker",
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `temporary_fd` is newly owned after successful openat.
+        let mut temporary = unsafe { File::from_raw_fd(temporary_fd) };
+        let result = (|| {
+            // SAFETY: temporary is an open file descriptor owned by this function.
+            if unsafe { libc::fchmod(temporary.as_raw_fd(), MARKER_MODE) } != 0 {
+                return Err(host_io_error(
+                    "set temporary marker mode",
+                    path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            temporary
+                .write_all(contents)
+                .map_err(|source| host_io_error("write temporary marker", path, source))?;
+            temporary
+                .sync_all()
+                .map_err(|source| host_io_error("sync temporary marker", path, source))?;
+            drop(temporary);
+            // SAFETY: both names are NUL-terminated entries relative to the same open directory.
+            if unsafe {
+                libc::renameat(
+                    parent_file.as_raw_fd(),
+                    temporary_c.as_ptr(),
+                    parent_file.as_raw_fd(),
+                    name_c.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(host_io_error(
+                    "publish marker atomically",
+                    path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            parent_file
+                .sync_all()
+                .map_err(|source| host_io_error("sync marker parent", parent, source))
+        })();
+        if result.is_err() {
+            // SAFETY: unlinkat removes only the no-follow temporary directory entry.
+            unsafe {
+                libc::unlinkat(parent_file.as_raw_fd(), temporary_c.as_ptr(), 0);
+            }
+        }
+        result
+    }
+
+    fn reject_non_regular_destination(
+        parent_fd: libc::c_int,
+        name: &CStr,
+        path: &Path,
+    ) -> Result<(), HostError> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: parent fd and name identify an entry; metadata points to writable storage.
+        let result = unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == -1 {
+            let source = io::Error::last_os_error();
+            if source.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(host_io_error("inspect marker destination", path, source));
+        }
+        // SAFETY: successful fstatat initialized metadata.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(HostError::new(format!(
+                "refusing non-regular marker destination: {path:?}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+use unix::{spawn_with_deadline, write_marker_atomic};
