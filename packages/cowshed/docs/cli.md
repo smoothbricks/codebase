@@ -540,9 +540,12 @@ next: cowshed exec raven -- git status
 ### `cowshed gateway start` / `stop` / `status`
 
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.gateway`, then waits until its authenticated Unix
-control socket is healthy. The generated mode-0600 plist uses the absolute current `cowshed` executable, `RunAtLoad`,
-`KeepAlive`, and stable pre-tracer stderr at `~/Library/Logs/cowshed/daemon-stderr.log`. `stop` boots out the agent and
-removes the plist; both operations are idempotent.
+control socket is healthy. The generated mode-0600 plist names `~/Library/Application Support/dev.cowshed/bin/cowshed`,
+`RunAtLoad`, `KeepAlive`, and stable pre-tracer stderr at `~/Library/Logs/cowshed/daemon-stderr.log`. That path is on
+the volume carrying `~/Library/LaunchAgents` itself, so launchd can still reach the program after a reboot: `start`
+copies the running executable there when the bytes differ, and refuses a running executable inside cowshed's own storage
+rather than baking in a path that only exists once cowshed has mounted it. `stop` boots out the agent and removes the
+plist, leaving the installed binary; both operations are idempotent.
 
 `status` reports health without starting the service. Its JSON result is the standard frozen envelope:
 
@@ -572,13 +575,15 @@ and then the compile cache. A host without sccache on PATH logs one line and ser
 inspection, and resizing.
 
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.sccache`, then waits until the server answers on
-its unix socket at `~/.cowshed/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ (resolved from the
-invoking shell's PATH — run it from a shell with the devenv/nix sccache available) as a foreground unix-socket server:
+its unix socket at `~/.cowshed/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ — a copy at
+`~/Library/Application Support/dev.cowshed/bin/sccache`, installed by `start` from the sccache it resolves on the
+invoking shell's PATH, so run it from a shell with the devenv/nix sccache available — as a foreground unix-socket server:
 `SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
 `SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at `~/.cowshed/caches/sccache`.
 Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the agent and removes the plist; both
-operations are idempotent. An sccache upgrade that moves the binary is picked up by rerunning `cowshed sccache start` —
-the plist is byte-compared and rewritten only on drift.
+operations are idempotent. The copy is what keeps the daemon alive across a devenv update or nix garbage collection: an
+sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies on byte drift and rewrites the plist
+only on drift.
 
 Two more variables are in that plist because sccache reads them once, at server start, and no client can supply them:
 

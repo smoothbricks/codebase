@@ -69,12 +69,22 @@ cowshed gateway start
 cowshed gateway status --json
 ```
 
-`start` atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with the absolute current
-executable followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures
+`start` installs the agent's binary before its plist. The plist may only name
+`~/Library/Application Support/dev.cowshed/bin/cowshed`, on the volume that carries `~/Library/LaunchAgents` itself, so
+launchd can still reach the program after a reboot; `start` copies the running executable there when the bytes differ,
+streamed into an exclusive temporary file and renamed, and leaves a current binary untouched. A running executable
+inside cowshed's own storage — the store tree, a volume carrying `.cowshed/workspace.json`, or any volume mounted inside
+the home directory — is refused rather than copied, because nothing would be mounted to run it at boot and the agent
+would exit 78 in a `KeepAlive` loop. `stop` and `status` derive the same path rather than the running executable.
+
+`start` then atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with that binary
+followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures
 go only to `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `~/.cowshed` mountpoint. The CLI uses fixed
 `/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
-already-loaded/not-loaded states idempotently. It waits for the authenticated Unix control socket before returning
-success. `cowshed gateway stop` boots out the agent and removes its plist.
+already-loaded/not-loaded states idempotently. A plist this run rewrote is booted out and bootstrapped again rather than
+kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits for the
+authenticated Unix control socket before returning success. `cowshed gateway stop` boots out the agent and removes its
+plist; the installed binary stays, as host state rather than agent state.
 
 The internal `cowshed gateway run` entrypoint first remounts already-created host volumes if macOS auto-mounted them at
 `/Volumes` or if a leftover launchd stub occupies `~/.cowshed`. It never creates volumes or opens an authorization
