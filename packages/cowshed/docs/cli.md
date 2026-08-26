@@ -693,7 +693,7 @@ reconcile again before reporting success. If the service is absent they fail wit
 
 ### `cowshed sccache start [--capacity <size>]` / `stop` / `status`
 
-The gateway daemon starts this agent itself, so a healthy host already has it: `run_daemon` heals every project's mounts
+The gateway daemon starts this agent itself, so a healthy host already has it: `run_daemon` repairs/reattaches every project's mounts
 and then the compile cache. A host without sccache on PATH logs one line and serves normally. The verbs are for repair,
 inspection, and resizing.
 
