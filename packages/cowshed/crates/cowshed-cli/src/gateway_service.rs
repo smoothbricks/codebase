@@ -32,8 +32,16 @@ pub use cowshed_core::gateway_sessions::{
     sessions_from_facts, stable_workspace_id,
 };
 
-const START_DEADLINE: Duration = Duration::from_secs(10);
+/// How long `gateway start` waits for the daemon's control socket.
+///
+/// Sized for the startup heal rather than for a process start: the daemon attaches, checks, and
+/// mounts every recorded project's images before it serves (05_gateway.md), and a host carrying
+/// several multi-gigabyte mains needs minutes for that pass. Ten seconds timed out mid-heal and
+/// told the user to kickstart a gateway that was working exactly as intended.
+const START_DEADLINE: Duration = Duration::from_secs(180);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the wait says that it is still waiting, and on what.
+const START_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,7 +175,7 @@ where
 {
     match action {
         GatewayCommand::Start => {
-            let status = start_service().await?;
+            let status = start_service(output).await?;
             emit_gateway_status(output, json, status)?;
         }
         GatewayCommand::Stop { purge } => {
@@ -201,7 +209,11 @@ where
     Ok(0)
 }
 
-async fn start_service() -> Result<CliGatewayStatus> {
+async fn start_service<W, E>(output: &mut Output<W, E>) -> Result<CliGatewayStatus>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
     let paths = GatewayPaths::from_storage(&storage);
@@ -230,7 +242,8 @@ async fn start_service() -> Result<CliGatewayStatus> {
     activate_launch_agent(&mut executor, uid, &spec, written)?;
 
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
-    let deadline = tokio::time::Instant::now() + START_DEADLINE;
+    let mut progress = StartProgress::new(recorded_project_count(&storage).await);
+    let started = tokio::time::Instant::now();
     loop {
         if let Ok(status) = client.status().await {
             return Ok(cli_status(
@@ -240,13 +253,74 @@ async fn start_service() -> Result<CliGatewayStatus> {
                 Some(&status),
             ));
         }
-        if tokio::time::Instant::now() >= deadline {
+        let waited = started.elapsed();
+        if waited >= START_DEADLINE {
             return Err(CowshedError::environment_missing(
-                "gateway did not become healthy before the startup deadline",
+                format!(
+                    "gateway did not become healthy within {}s of starting",
+                    START_DEADLINE.as_secs()
+                ),
                 kickstart_hint(uid),
             ));
         }
+        if let Some(line) = progress.line(waited) {
+            output.guidance(&line).map_err(output_error)?;
+        }
         tokio::time::sleep(START_POLL_INTERVAL).await;
+    }
+}
+
+/// How many projects the startup heal has to work through, or `None` when the store cannot say.
+///
+/// Counted from the store rather than asked of the gateway, because the gateway is precisely what
+/// is not answering yet. A count that cannot be taken is not an error: it costs the wait its
+/// number, and a wait that reports nothing at all is the defect being fixed.
+async fn recorded_project_count(storage: &ValidatedHostStorage) -> Option<usize> {
+    NativeGatewayInventory::new(storage.clone())
+        .adopted_projects()
+        .await
+        .ok()
+        .map(|projects| projects.len())
+}
+
+/// The wait's own reporting, at most one line per [`START_PROGRESS_INTERVAL`].
+///
+/// A first start after a reboot mounts every recorded project before the control socket answers,
+/// which is minutes of silence on a host with several multi-gigabyte mains — long enough that the
+/// only available conclusion is that cowshed has hung. So the wait says what it is waiting for and
+/// how long it has waited.
+struct StartProgress {
+    projects: Option<usize>,
+    next: Duration,
+}
+
+impl StartProgress {
+    const fn new(projects: Option<usize>) -> Self {
+        Self {
+            projects,
+            next: START_PROGRESS_INTERVAL,
+        }
+    }
+
+    /// The line to emit after waiting `waited`, or `None` while the last one is still current.
+    fn line(&mut self, waited: Duration) -> Option<String> {
+        if waited < self.next {
+            return None;
+        }
+        // Anchored to `waited` rather than advanced by one interval: a poll that returns late —
+        // a heal saturating the disk — then reports once instead of flushing a backlog of lines
+        // for intervals that have already passed.
+        self.next = waited + START_PROGRESS_INTERVAL;
+        Some(format!(
+            "waited {}s for the gateway: {}",
+            waited.as_secs(),
+            match self.projects {
+                None => String::from("healing recorded projects…"),
+                Some(0) => String::from("no recorded projects to heal"),
+                Some(1) => String::from("healing 1 project…"),
+                Some(count) => format!("healing {count} projects…"),
+            }
+        ))
     }
 }
 
@@ -822,5 +896,65 @@ mod tests {
             kickstart_hint(501),
             "launchctl kickstart -k gui/501/dev.cowshed.gateway"
         );
+    }
+
+    /// The wait stays quiet until an interval has passed, then speaks once per interval and names
+    /// what the gateway is doing — a heal of several multi-gigabyte images, not a hung process.
+    #[test]
+    fn the_start_wait_reports_once_per_interval_with_the_project_count() {
+        let mut progress = StartProgress::new(Some(7));
+
+        assert_eq!(progress.line(Duration::from_secs(0)), None);
+        assert_eq!(progress.line(START_PROGRESS_INTERVAL - Duration::from_millis(1)), None);
+        assert_eq!(
+            progress.line(START_PROGRESS_INTERVAL),
+            Some(String::from("waited 5s for the gateway: healing 7 projects…"))
+        );
+        assert_eq!(progress.line(START_PROGRESS_INTERVAL), None);
+        assert_eq!(
+            progress.line(START_PROGRESS_INTERVAL * 2),
+            Some(String::from("waited 10s for the gateway: healing 7 projects…"))
+        );
+    }
+
+    /// A poll that returns long after its interval reports the wait it actually observed, once,
+    /// rather than one line for every interval that elapsed while it was blocked.
+    #[test]
+    fn a_late_poll_reports_the_observed_wait_once() {
+        let mut progress = StartProgress::new(Some(2));
+
+        assert_eq!(
+            progress.line(Duration::from_secs(90)),
+            Some(String::from("waited 90s for the gateway: healing 2 projects…"))
+        );
+        assert_eq!(progress.line(Duration::from_secs(93)), None);
+        assert_eq!(
+            progress.line(Duration::from_secs(95)),
+            Some(String::from("waited 95s for the gateway: healing 2 projects…"))
+        );
+    }
+
+    /// The count is evidence, so the line never claims projects it did not count: an uncountable
+    /// store says so, an empty one says so, and one project is not "1 projects".
+    #[test]
+    fn the_start_wait_never_overstates_what_it_counted() {
+        for (projects, expected) in [
+            (None, "waited 5s for the gateway: healing recorded projects…"),
+            (Some(0), "waited 5s for the gateway: no recorded projects to heal"),
+            (Some(1), "waited 5s for the gateway: healing 1 project…"),
+        ] {
+            assert_eq!(
+                StartProgress::new(projects).line(START_PROGRESS_INTERVAL),
+                Some(String::from(expected))
+            );
+        }
+    }
+
+    /// The deadline has to outlast a real heal: mounting several multi-gigabyte mains takes
+    /// minutes, and a deadline shorter than that fails a start that was working.
+    #[test]
+    fn the_start_deadline_outlasts_a_multi_project_heal() {
+        assert!(START_DEADLINE >= Duration::from_secs(120));
+        assert!(START_DEADLINE > START_PROGRESS_INTERVAL * 4);
     }
 }
