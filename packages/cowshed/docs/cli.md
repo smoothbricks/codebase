@@ -230,15 +230,13 @@ cowshed: creating image /private/cowshed/store/acme/widget/main.asif (capacity 1
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
 cowshed: swapping <project-root> -> mountpoint (stub .envrc written beneath)
-next: eval "$(cowshed ensure --envrc)"   # direnv repositories: add to .envrc
 next: cowshed new <name>
 <project-root>
 ```
 
-The `.envrc` line is direnv wiring; cowshed does not authorize it. Devenv-native repositories instead reattach an
-unmounted workspace with `cowshed ensure --attach`, evaluate the same exports in the human shell with
-`eval "$(cowshed ensure --envrc)"`, and run the repository's `devenv:allow` command once for that workspace. Cowshed
-never modifies either tool's trust database.
+Workspace environment lives in the image at `.cowshed/env` and is rewritten on token rotation. The
+repository `.envrc` is a two-liner that sources that file. Cowshed does not authorize direnv or
+devenv trust databases. Reattach a detached session workspace with `cowshed attach`.
 
 ### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse] [--slot <n>]`
 
@@ -334,7 +332,7 @@ both land there, but a build reached through some other route to the same files 
 into one) is a different compilation.
 
 The trade: a workspace mounted at a slot path gets `RUSTC_WRAPPER=sccache` **and `CARGO_INCREMENTAL=0`**, from
-`ensure --envrc` and from `cowshed exec` alike. Incremental compilation is per-unit local state sccache cannot cache and
+`.cowshed/env` and from `cowshed exec` alike. Incremental compilation is per-unit local state sccache cannot cache and
 cargo prefers when both are available, so a slot tenant is choosing the shared cross-generation cache over local
 incrementality. Name-mounted workspaces are never opted in: they get the cache endpoints (`SCCACHE_SERVER_UDS`,
 `SCCACHE_DIR`) but nothing that routes rustc through a cache their path cannot share.
@@ -430,7 +428,7 @@ credentials and is not a general TCP/Unix-socket forwarder; the socket inode, na
 authority boundary. Detach or restore drains and kills it. Tools must use cowshed's platform-specific configuration
 rather than assuming host-wide loopback.
 
-On macOS, `cowshed ensure --envrc` exports `PORT` (base+1) and `COWSHED_PORT_BASE` for tools that need several ports;
+On macOS, `.cowshed/env` exports `PORT` (base+1) and `COWSHED_PORT_BASE` for tools that need several ports;
 devenv offsets can derive from the block. Linux configuration contains no block or sentinel values.
 
 ```
@@ -463,47 +461,20 @@ and artifact reads resolve the canonical artifact independently of whether it is
 binary output without UTF-8 assumptions or response-size growth.
 
 
-### `cowshed ensure [--envrc]`
+### `cowshed attach [ws] [--all]`
 
-The fast auto-fix. Healthy fast-path is a marker read plus a statfs (~15–25 ms, silent, exit 0). Otherwise it reattaches
-images after reboot or Finder ejects, repairs mount flags, re-arms the autosave agent, and reconciles anything drifted —
-synchronously, so when it returns you are standing in a valid workspace. Devenv-native repositories use
-`cowshed ensure --attach` as the explicit remount spelling. `--envrc` additionally prints POSIX shell exports for the
-current workspace and must be run from inside that workspace — each directory has its own exports:
+Mount detached session workspaces and print their mount path(s). `<ws>` attaches one session workspace. With no name,
+a cwd inside a project checkout or session attaches that project's detached session workspaces. `--all` attaches every
+detached session workspace store-wide. Mains are always mounted and are never attach targets.
 
-```sh
-$ cowshed ensure --envrc
-export GOENV='<project-root>/.cowshed/raven/.cowshed/cache/go/env'
-export SCCACHE_SERVER_UDS='/private/cowshed/store/sccache.sock'
-export COWSHED_WORKSPACE_TOKEN='cw1_r4v3n…'
-export COWSHED_PORT_BASE='40960'
-```
+Workspace environment lives in the image as `.cowshed/env`, rewritten on token rotation and sourced by the repository
+`.envrc` two-liner. Sandboxed `cowshed exec` processes receive the cowshed-owned exports directly. Wiring is carried by
+**files, not a CLI env printer**.
 
-Direnv repositories evaluate that output from `.envrc`. Devenv-native repositories may evaluate it after an explicit
-attach; sandboxed `cowshed exec` processes receive the cowshed-owned exports directly. If `[devenv] dir` is configured
-in `.cowshed.toml`, devenv's exported variables form the base environment for each new sandbox process, while
-controller-filtered values and cowshed's own `GOENV`/`SCCACHE_SERVER_UDS`/`COWSHED_*` values win on conflicts. The
-devenv-provided `PATH` is discarded in favor of cowshed's admitted, profile-first PATH.
+### `cowshed detach <name>`
 
-Deliberately short: wiring is carried by **files, not environment**. The registry URL (the macOS workspace gateway base
-port, or Linux's fixed private-loopback connector at `127.0.0.1:7644`) and the bun cache dir live in the committed
-`bunfig.toml` — bun honors a _relative_ `[install.cache] dir`, verified, so there is no cache export at all; cargo's
-source replacement and `SCCACHE_SERVER_UDS` live in the in-image `.cargo/config.toml` (cargo's `[env]` verifiably
-reaches rustc-wrapper invocations); the read-at-build caches (cargo registry, Go module/build caches, sccache, zig,
-gradle) are reached through their tools' _default_ host paths, relocated once onto the caches volume at first adopt —
-except Go, which has no directory-scoped config: its in-image env file (carrying the per-workspace `GOPROXY`, the shared
-caches, in-image `GOPATH`/`GOBIN`, and `GOTOOLCHAIN=local`) is reached via the `GOENV` export, so `~/go` is never
-created. The load-bearing exports above are few by design (token-via-config would kill the first; a file-based `GOENV`
-alternative — none known — would kill the second; `SCCACHE_SERVER_UDS` stays, as the host sccache daemon's endpoint has
-no per-tool config file); on macOS, `PORT`/`COWSHED_PORT_BASE` wire dev servers into the workspace's port block (see
-"Dev servers" above); Linux has no block. The `COWSHED_*` identity lines are prompt conveniences, never load-bearing.
-
-`ensure` never does slow or surprising work — no fetches, no compaction, no installs. Main gets the same wiring (that's
-the "main shares caches like sandboxes do" rule; the only difference is main isn't sandboxed).
-
-### `cowshed attach <name>` / `cowshed detach <name>`
-
-Suspend and resume a workspace without destroying it. Detached workspaces cost one closed file.
+Unmount the workspace and stop its supervisor without destroying anything. Detached workspaces cost one closed file.
+`attach` and `path` bring them back.
 
 ### `cowshed resize <name|main> <size>`
 
@@ -573,7 +544,7 @@ egress	api.github.com
 
 ## Authority boundaries
 
-Project lookup is discovery-only. Workspace inspection may safely ensure or attach. A worker capability controls one
+Project lookup is discovery-only. Workspace inspection may safely attach. A worker capability controls one
 workspace's exec, shell, jobs, quota-limited checkpoints, push, and grant reads. Only a trusted coordinator may
 grant/revoke, restore/destroy/rebase/land, run gc, or mirror repositories. The persistent per-workspace supervisor
 socket is permission- and peer-checked, supports concurrent clients and reconnect, and is never unlinked merely because
@@ -701,7 +672,7 @@ these are idempotent, and a `--purge` with nothing installed says so rather than
 
 `gateway run` is the LaunchAgent's internal foreground entrypoint. It validates already-mounted host storage and
 creates none, restores every authoritative attached workspace session, and drains on SIGTERM or SIGINT. Ordinary `exec`,
-`ensure`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
+`attach`, and `doctor` commands reconcile the current project's attached sessions before admission; lifecycle commands
 reconcile again before reporting success. If the service is absent they fail with exit 5 and the exact
 `launchctl kickstart -k gui/<uid>/dev.cowshed.gateway` next hint.
 
@@ -758,7 +729,7 @@ whenever it answers:
 Hits and misses are per language on purpose: cross-workspace C and C++ reuse works without any slot, so a healthy
 aggregate hit rate routinely hides a Rust hit rate of zero — which is the number a slot host is managing.
 
-Workspaces reach the daemon through `SCCACHE_SERVER_UDS` (supervisor-injected, `ensure --envrc`-exported, and carried by
+Workspaces reach the daemon through `SCCACHE_SERVER_UDS` (supervisor-injected, `.cowshed/env`-exported, and carried by
 the cargo `[env]` guidance); the Seatbelt profile admits exactly that socket and keeps the sccache store
 daemon-write-only. `sccache --show-stats` works from any shell with the export set — it speaks to the same server.
 

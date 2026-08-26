@@ -11,7 +11,7 @@ pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointOptions, CheckpointResult, CommandArg,
-    Coordinator, CreateOptions, DoctorReport, EmptyResult, EnsureAction, EnsureReport, ExecRequest,
+    Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest,
     ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason,
     GcReport, GitOid, JobInfo, JobStream, LandOptions, LandReport, MountResult, OutputPublication,
     PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
@@ -20,7 +20,9 @@ use cowshed_core::api::{
     validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
-use cowshed_core::metadata::{ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::metadata::{
+    ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
@@ -28,7 +30,7 @@ use cowshed_core::storage::bootstrap::{
     HostAction, HostSetupPlan, HostSetupReport, execute_host_setup, plan_host_setup,
 };
 use cowshed_core::{
-    AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result,
+    AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
     validate_existing_host_storage,
 };
 use std::collections::HashMap;
@@ -70,7 +72,6 @@ pub trait CliService: Send {
     async fn move_checkout(&mut self, destination: &Path) -> Result<WorkspaceInfo>;
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
     async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
-    async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo>;
     async fn list(&mut self) -> Result<Vec<WorkspaceInfo>>;
     async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
@@ -83,7 +84,7 @@ pub trait CliService: Send {
     }
     async fn path(&mut self, workspace: &str, no_attach: bool) -> Result<WorkspaceInfo>;
     async fn remove(&mut self, workspace: &str, options: RemoveOptions) -> Result<RemoveReport>;
-    async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<()>;
+    async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<WorkspaceInfo>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
     async fn doctor(&mut self) -> Result<DoctorReport>;
@@ -120,7 +121,6 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Move(_)
         | Command::Checkpoint(_)
         | Command::Restore(_)
-        | Command::Ensure(_)
         | Command::List(_)
         | Command::Path(_)
         | Command::Exec(_)
@@ -263,6 +263,19 @@ async fn adopted_projects() -> Result<Vec<AdoptedProject>> {
         .map_err(project_inventory_error)
 }
 
+/// Which adopted projects have no mounted main, read straight from the host store.
+///
+/// Host-scoped rather than project-scoped on purpose: mains are always-mounted across every
+/// adopted project, so the answer must not depend on where `doctor` was run from.
+async fn unmounted_mains() -> Result<Vec<UnreachableMain>> {
+    let home = gateway_service::canonical_home()?;
+    let storage = validate_existing_host_storage(&home).await?;
+    NativeGatewayInventory::new(storage)
+        .unmounted_mains()
+        .await
+        .map_err(project_inventory_error)
+}
+
 async fn list_adopted_project(project: &AdoptedProject) -> Result<Vec<WorkspaceInfo>> {
     let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
     let primary = bridge.list().await;
@@ -340,14 +353,6 @@ impl CliService for ActorBridge {
             .await
     }
 
-    async fn ensure_current(&mut self, path: PathBuf) -> Result<EnsureReport> {
-        self.coordinator()?
-            .project()
-            .workspace_at(path.clone())
-            .await?
-            .ensure_observed_at(Some(&path))
-            .await
-    }
 
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo> {
         self.coordinator()?
@@ -410,13 +415,10 @@ impl CliService for ActorBridge {
         self.coordinator()?.destroy(workspace, options).await
     }
 
-    async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<()> {
-        self.coordinator()?
-            .project()
-            .workspace(workspace)
-            .await?
-            .attach(options)
-            .await
+    async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<WorkspaceInfo> {
+        let snapshot = self.coordinator()?.project().workspace(workspace).await?;
+        snapshot.attach(options).await?;
+        snapshot.refresh_info().await
     }
 
     async fn detach(&mut self, workspace: &str) -> Result<()> {
@@ -778,40 +780,6 @@ where
                 .map_err(output_error)?;
             Ok(success())
         }
-        Command::Ensure(args) => {
-            let report = match service.ensure_current(invocation_cwd()?).await {
-                Ok(report) => report,
-                Err(error)
-                    if args.envrc
-                        && matches!(
-                            error.code,
-                            ErrorCode::NotFound | ErrorCode::Usage
-                        ) =>
-                {
-                    return Err(usage(
-                        "ensure --envrc must run inside a workspace directory",
-                        "each workspace has its own exports — cd into that workspace, then eval \"$(cowshed ensure --envrc)\"",
-                    ));
-                }
-                Err(error) => return Err(error),
-            };
-            service.reconcile_gateway().await?;
-            if json {
-                output.success(report.clone()).map_err(output_error)?;
-            } else if args.envrc {
-                emit_envrc(output, &report).await?;
-            }
-            if report.action != EnsureAction::AlreadyMounted {
-                output
-                    .guidance(&format!(
-                        "workspace {} is ready ({})",
-                        report.workspace,
-                        ensure_action(report.action)
-                    ))
-                    .map_err(output_error)?;
-            }
-            Ok(success())
-        }
         Command::List(args) => {
             if args.all {
                 let mut projects = service.list_all().await?;
@@ -936,18 +904,21 @@ where
             Ok(success())
         }
         Command::Attach(args) => {
-            service
-                .attach(
-                    &args.workspace,
-                    AttachOptions {
-                        browse: args.browse,
-                    },
-                )
-                .await?;
+            let options = AttachOptions {
+                browse: args.browse,
+                observed_path: if args.all {
+                    None
+                } else {
+                    Some(invocation_cwd()?)
+                },
+            };
+            let infos = if let Some(workspace) = args.workspace {
+                vec![service.attach(&workspace, options).await?]
+            } else {
+                attach_scoped_sessions(service, args.all, options).await?
+            };
             service.reconcile_gateway().await?;
-            if json {
-                output.success(EmptyResult {}).map_err(output_error)?;
-            }
+            emit_attached(output, json, &infos)?;
             Ok(success())
         }
         Command::Detach(args) => {
@@ -1120,7 +1091,7 @@ where
 }
 
 fn requires_gateway_before_dispatch(command: &Command) -> bool {
-    matches!(command, Command::Exec(_) | Command::Ensure(_))
+    matches!(command, Command::Exec(_))
 }
 
 fn success() -> DispatchExit {
@@ -1215,9 +1186,9 @@ fn os_expected_ref(value: std::ffi::OsString) -> Result<ExpectedRefHead> {
 /// Resolve a `<ws>` argument, falling back to the workspace the command was run inside.
 ///
 /// An explicit argument always wins — inference never overrides what the caller named. Otherwise
-/// the cwd is resolved the way `ensure` already resolves it: containment in exactly one currently
-/// mounted workspace, which is authoritative because mount identity is keyed off the in-image
-/// marker, and which already refuses an ambiguous match rather than picking one.
+/// the cwd is resolved by containment in exactly one currently mounted workspace, which is
+/// authoritative because mount identity is keyed off the in-image marker, and which already
+/// refuses an ambiguous match rather than picking one.
 ///
 /// Only verbs that act on a workspace *in place* get this. Verbs that retire, replace, rename, or
 /// unmount one require it to be named, so that losing the workspace you are standing in is always
@@ -1418,84 +1389,130 @@ fn emit_mount<W: Write, E: Write>(
     }
 }
 
-async fn emit_envrc<W: Write, E: Write>(
+fn emit_attached<W: Write, E: Write>(
     output: &mut Output<W, E>,
-    report: &EnsureReport,
+    json: bool,
+    infos: &[WorkspaceInfo],
 ) -> Result<()> {
-    let token = tokio::fs::read(&report.workspace_token)
-        .await
-        .map_err(|error| {
-            CowshedError::integrity(
-                format!(
-                    "could not read workspace token {}: {error}",
-                    report.workspace_token.display()
-                ),
-                "run cowshed ensure again; if this persists, run cowshed doctor",
-            )
-        })?;
-    emit_shell_export(output, b"GOENV", report.go_env.as_os_str().as_bytes())?;
-    // Host-level endpoint, identical for every workspace: rustc-wrapper clients
-    // in IDE terminals and other cowshed-unspawned processes must reach the
-    // host-owned sccache daemon instead of spawning a private server with
-    // default cache paths.
-    emit_shell_export(
-        output,
-        b"SCCACHE_SERVER_UDS",
-        report.sccache_server_uds.as_os_str().as_bytes(),
-    )?;
-    emit_shell_export(
-        output,
-        b"SCCACHE_DIR",
-        report.sccache_dir.as_os_str().as_bytes(),
-    )?;
-    // Routing Rust through sccache is a slot-path privilege, not a default. Cargo's `-C metadata`
-    // and sccache's own key both carry the absolute build path, so only a workspace mounted at a
-    // slot's stable path can hit another generation's entries; a name-mounted workspace would pay
-    // the wrapper's cost for a cache it can never share. The same trade forces incremental off:
-    // incremental compilation is per-unit local state sccache cannot cache, and cargo silently
-    // wins the race, so a slot tenant chooses the shared cache over local incrementality.
-    if SlotId::from_mount_path(&report.mount).is_some() {
-        emit_shell_export(output, b"RUSTC_WRAPPER", b"sccache")?;
-        emit_shell_export(output, b"CARGO_INCREMENTAL", b"0")?;
-    }
-    emit_shell_export(output, b"COWSHED_WORKSPACE_TOKEN", &token)?;
-    if let Some(port_block) = report.port_block {
-        emit_shell_export(
-            output,
-            b"COWSHED_PORT_BASE",
-            port_block.base().to_string().as_bytes(),
-        )?;
-    }
-    Ok(())
-}
-
-fn emit_shell_export<W: Write, E: Write>(
-    output: &mut Output<W, E>,
-    name: &[u8],
-    value: &[u8],
-) -> Result<()> {
-    output
-        .bare(b"export ")
-        .and_then(|()| output.bare(name))
-        .and_then(|()| output.bare(b"='"))
-        .map_err(output_error)?;
-    let mut first = true;
-    for part in value.split(|byte| *byte == b'\'') {
-        if !first {
-            output.bare(b"'\\''").map_err(output_error)?;
+    match infos {
+        [] => Err(no_detached_sessions()),
+        [info] => emit_mount(output, json, info),
+        many => {
+            if json {
+                output.success(many.to_vec()).map_err(output_error)
+            } else {
+                for info in many {
+                    output
+                        .bare_line(info.mount.as_os_str().as_bytes())
+                        .map_err(output_error)?;
+                }
+                Ok(())
+            }
         }
-        first = false;
-        output.bare(part).map_err(output_error)?;
     }
-    output.bare(b"'\n").map_err(output_error)
 }
 
-const fn ensure_action(action: EnsureAction) -> &'static str {
-    match action {
-        EnsureAction::AlreadyMounted => "already mounted",
-        EnsureAction::Attached => "attached",
-        EnsureAction::Healed => "repaired",
+fn is_detached_session(info: &WorkspaceInfo) -> bool {
+    info.role != WorkspaceRole::Main && info.state == WorkspaceState::Detached
+}
+
+fn no_detached_sessions() -> CowshedError {
+    CowshedError::not_found(
+        "no detached session workspace found",
+        "cowshed ls; cowshed attach <ws>; cowshed attach --all",
+    )
+}
+async fn attach_scoped_sessions(
+    service: &mut dyn CliService,
+    all: bool,
+    options: AttachOptions,
+) -> Result<Vec<WorkspaceInfo>> {
+    if !all {
+        match service.workspace_at(invocation_cwd()?).await {
+            Ok(_) => {}
+            Err(error) if error.code == ErrorCode::Conflict => {
+                return Err(CowshedError::conflict(
+                    error.message,
+                    "name one workspace or repair overlapping mounts",
+                ));
+            }
+            Err(error) if error.code == ErrorCode::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
+    let candidates = if all {
+        service
+            .list_all()
+            .await?
+            .into_iter()
+            .flat_map(|project| project.workspaces)
+            .collect()
+    } else {
+        service.list().await?
+    };
+    let targets: Vec<WorkspaceInfo> = candidates
+        .into_iter()
+        .filter(is_detached_session)
+        .collect();
+    if targets.is_empty() {
+        return Err(no_detached_sessions());
+    }
+    let mut attached = Vec::with_capacity(targets.len());
+    for target in targets {
+        attached.push(
+            service
+                .attach(target.workspace.as_str(), options.clone())
+                .await?,
+        );
+    }
+    Ok(attached)
+}
+
+async fn attach_store_wide(browse: bool) -> Result<Vec<WorkspaceInfo>> {
+    let options = AttachOptions {
+        browse,
+        observed_path: None,
+    };
+    let mut attached = Vec::new();
+    for project in adopted_projects().await? {
+        let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
+        let primary = attach_project_sessions(&mut bridge, options.clone()).await;
+        let teardown = bridge.shutdown().await.err();
+        match primary {
+            Ok(mut infos) => {
+                if let Some(error) = teardown {
+                    return Err(error);
+                }
+                attached.append(&mut infos);
+            }
+            Err(primary) => return Err(merge_primary(primary, teardown)),
+        }
+    }
+    if attached.is_empty() {
+        return Err(no_detached_sessions());
+    }
+    Ok(attached)
+}
+
+async fn attach_project_sessions(
+    service: &mut dyn CliService,
+    options: AttachOptions,
+) -> Result<Vec<WorkspaceInfo>> {
+    let targets: Vec<WorkspaceInfo> = service
+        .list()
+        .await?
+        .into_iter()
+        .filter(is_detached_session)
+        .collect();
+    let mut attached = Vec::with_capacity(targets.len());
+    for target in targets {
+        attached.push(
+            service
+                .attach(target.workspace.as_str(), options.clone())
+                .await?,
+        );
+    }
+    Ok(attached)
 }
 
 fn emit_gc_candidates<W: Write, E: Write>(
@@ -1960,6 +1977,7 @@ fn gateway_findings(status: &GatewayStatus) -> Vec<Finding> {
     findings
 }
 
+
 fn sccache_finding(status: &SccacheStatus) -> Finding {
     let (severity, hint) = if status.running {
         (FindingSeverity::Info, String::new())
@@ -2222,6 +2240,11 @@ where
     E: Write + Send,
 {
     match cli.command {
+        Command::Attach(args) if args.all && args.workspace.is_none() => {
+            let infos = attach_store_wide(args.browse).await?;
+            emit_attached(output, cli.global.json, &infos)?;
+            Ok(success())
+        }
         Command::List(_) => {
             let mut projects = list_all_adopted_projects().await?;
             projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
@@ -2515,7 +2538,7 @@ mod tests {
                 vec!["restore", "raven", "stable"],
                 RuntimeOpenMode::ExistingOnly,
             ),
-            (vec!["ensure"], RuntimeOpenMode::ExistingOnly),
+            (vec!["attach", "--all"], RuntimeOpenMode::ExistingOnly),
             (vec!["ls"], RuntimeOpenMode::ExistingOnly),
             (vec!["path", "raven"], RuntimeOpenMode::ExistingOnly),
             (
