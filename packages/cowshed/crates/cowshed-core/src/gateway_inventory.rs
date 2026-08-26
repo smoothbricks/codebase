@@ -406,7 +406,9 @@ impl NativeGatewayInventory {
             let layout = match StorageLayout::new(self.storage.store(), &repo_id) {
                 Ok(layout) => layout,
                 Err(error) => {
-                    eprintln!("cowshed: skipping unhealable project {repo_id}: {error}");
+                    eprintln!(
+                        "cowshed: skipping {repo_id}: its store layout could not be read: {error}"
+                    );
                     continue;
                 }
             };
@@ -417,7 +419,7 @@ impl NativeGatewayInventory {
                 }),
                 Ok(None) | Err(_) => {
                     eprintln!(
-                        "cowshed: skipping unhealable project {repo_id}: project records no adopted checkout path"
+                        "cowshed: skipping {repo_id}: it records no adopted checkout path"
                     );
                 }
             }
@@ -758,7 +760,9 @@ impl NativeGatewayInventory {
                     ) {
                         return Err(error);
                     }
-                    eprintln!("cowshed: skipping unhealable project {repo}: {error}");
+                    eprintln!(
+                        "cowshed: skipping {repo}: its workspace records could not be read: {error}"
+                    );
                 }
             }
         }
