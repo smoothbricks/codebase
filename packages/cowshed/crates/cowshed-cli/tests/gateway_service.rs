@@ -2,9 +2,12 @@ use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, parse_args};
 use cowshed_cli::gateway_service::{
     GatewayDrain, GatewayPaths, activate_launch_agent, drain_after_shutdown, emit_gateway_status,
+    install_host_stable_executable,
 };
 use cowshed_cli::launchd::{
-    CommandOutput, CommandStatus, LaunchAgentSpec, LaunchctlCommand, LaunchdExecutor,
+    COWSHED_BINARY_NAME, CommandOutput, CommandStatus, HostStableExecutable, LaunchAgentSpec,
+    LaunchctlCommand, LaunchdExecutor, NativeFilesystem, NativeLaunchctlCommand,
+    STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
 use cowshed_core::Result;
@@ -12,7 +15,9 @@ use cowshed_core::api::GatewayStatus as CliGatewayStatus;
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::fs;
 use std::io;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,8 +68,8 @@ impl LaunchctlCommand for RecordingLaunchctl {
 
 fn launch_spec() -> LaunchAgentSpec {
     LaunchAgentSpec::gateway(
-        Path::new("/Users/test"),
-        Path::new("/Applications/Cowshed.app/Contents/MacOS/cowshed"),
+        &HostStableExecutable::new(Path::new("/Users/test"), COWSHED_BINARY_NAME)
+            .expect("valid host-stable binary"),
     )
     .expect("valid spec")
 }
@@ -167,4 +172,125 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
         b"{\"ok\":true,\"result\":{\"running\":true,\"socket\":\"/Users/test/.cowshed/gateway.sock\",\"cacheEntries\":0,\"cacheBytes\":0,\"activeWorkspaces\":2}}\n"
     );
     assert!(stderr.is_empty());
+}
+
+fn scratch_home(label: &str) -> PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "cowshed-cli-gateway-{label}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).expect("scratch home");
+    home.canonicalize().expect("canonical scratch home")
+}
+
+/// `gateway start` runs from wherever the user's cowshed happens to live — a nix store path, a
+/// global npm prefix, a build directory — and launchd has to keep working after that path is
+/// gone. The binary is copied onto the volume that carries the plist, and a second start reuses
+/// that copy rather than rewriting the file launchd is running.
+#[test]
+fn installing_the_agent_binary_publishes_a_host_stable_copy_and_reuses_it() {
+    let home = scratch_home("install");
+    let source = home.join("build/cowshed");
+    fs::create_dir_all(source.parent().expect("build directory")).expect("build directory");
+    fs::write(&source, b"#!/bin/sh\nexit 0\n").expect("source binary");
+
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    let executable =
+        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
+            .expect("install succeeds");
+
+    assert_eq!(
+        executable.path(),
+        home.join("Library/Application Support/dev.cowshed/bin/cowshed")
+    );
+    let installed = fs::symlink_metadata(executable.path()).expect("installed binary");
+    assert!(installed.is_file());
+    assert_eq!(installed.permissions().mode() & 0o777, STABLE_BINARY_MODE);
+    assert_eq!(
+        fs::read(executable.path()).expect("installed bytes"),
+        b"#!/bin/sh\nexit 0\n"
+    );
+    // The plist launchd reads names exactly this path.
+    let spec = LaunchAgentSpec::gateway(&executable).expect("valid spec");
+    assert_eq!(spec.program_arguments().next(), executable.path().to_str());
+
+    // A current copy is left in place: same inode, no rewrite of a running binary.
+    let reinstalled =
+        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
+            .expect("second install succeeds");
+    assert_eq!(reinstalled.path(), executable.path());
+    assert_eq!(
+        fs::symlink_metadata(executable.path())
+            .expect("installed binary")
+            .ino(),
+        installed.ino()
+    );
+
+    // A newer build replaces it, and the replacement is a different file: launchd never sees a
+    // partially written binary at the path it runs.
+    fs::write(&source, b"#!/bin/sh\nexit 1\n").expect("newer source binary");
+    install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
+        .expect("upgrade succeeds");
+    assert_eq!(
+        fs::read(executable.path()).expect("installed bytes"),
+        b"#!/bin/sh\nexit 1\n"
+    );
+    assert_ne!(
+        fs::symlink_metadata(executable.path())
+            .expect("installed binary")
+            .ino(),
+        installed.ino()
+    );
+
+    // Installing the copy from itself is the steady state and touches nothing.
+    let same = install_host_stable_executable(
+        &mut executor,
+        &home,
+        COWSHED_BINARY_NAME,
+        executable.path(),
+    )
+    .expect("self install succeeds");
+    assert_eq!(same.path(), executable.path());
+
+    fs::remove_dir_all(&home).expect("remove scratch home");
+}
+
+/// The incident: a cowshed running from inside its own store installed an agent that launchd
+/// could not reach after a reboot, and nothing was left to mount it. Refusal names the reason.
+#[test]
+fn installing_from_cowshed_storage_is_refused_with_the_reboot_reason() {
+    let home = scratch_home("refusal");
+    let source = home.join(".cowshed/mnt/acme/widget/main/target/release/cowshed");
+    fs::create_dir_all(source.parent().expect("workspace directory")).expect("workspace directory");
+    fs::write(&source, b"#!/bin/sh\nexit 0\n").expect("workspace binary");
+
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    let error = install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
+        .expect_err("a binary inside the store is refused");
+
+    // The message is the whole deliverable of a refusal: it has to name the volume, the
+    // consequence, and the exit code an operator will find in the log.
+    assert_eq!(error.code.as_str(), "environment-missing");
+    assert_eq!(
+        error.message,
+        format!(
+            "the binary is inside the cowshed store at {}/.cowshed, so a LaunchAgent installed \
+             from it would dangle after a reboot: launchd starts the agent before cowshed has \
+             mounted anything, and the service exits 78 in a KeepAlive loop with nothing left to \
+             mount what would heal it",
+            home.display()
+        )
+    );
+    assert_eq!(
+        error.hint,
+        "install cowshed outside every cowshed workspace and run this command from that binary"
+    );
+    // Nothing was installed, so no plist can name a path inside the store.
+    assert!(
+        fs::symlink_metadata(home.join("Library/Application Support/dev.cowshed/bin/cowshed"))
+            .is_err()
+    );
+
+    fs::remove_dir_all(&home).expect("remove scratch home");
 }
