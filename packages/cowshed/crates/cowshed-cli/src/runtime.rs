@@ -12,17 +12,21 @@ use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection
 use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointOptions, CheckpointResult, CommandArg,
     Coordinator, CreateOptions, DoctorReport, EmptyResult, EnsureAction, EnsureReport, ExecRequest,
-    ExitStatus, ExpectedRefHead, GcOptions, GcReason, GcReport, GitOid, JobInfo, JobStream,
-    LandOptions, LandReport, MountResult, OutputPublication, PublicationPolicy, PushOptions,
-    PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RevisionResult,
-    RevisionTarget, RunSandboxMode, StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath,
-    WorkspaceState, validate_command_argv,
+    ExitStatus, ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason,
+    GcReport, GitOid, JobInfo, JobStream, LandOptions, LandReport, MountResult, OutputPublication,
+    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
+    ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
+use cowshed_core::storage::bootstrap::{
+    HostAction, HostSetupPlan, HostSetupReport, execute_host_setup, plan_host_setup,
+};
 use cowshed_core::{
     AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result,
     validate_existing_host_storage,
@@ -779,7 +783,10 @@ where
                 Ok(report) => report,
                 Err(error)
                     if args.envrc
-                        && matches!(error.code, ErrorCode::NotFound | ErrorCode::Usage) =>
+                        && matches!(
+                            error.code,
+                            ErrorCode::NotFound | ErrorCode::Usage
+                        ) =>
                 {
                     return Err(usage(
                         "ensure --envrc must run inside a workspace directory",
@@ -1113,10 +1120,7 @@ where
 }
 
 fn requires_gateway_before_dispatch(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::Exec(_) | Command::Ensure(_) | Command::Doctor
-    )
+    matches!(command, Command::Exec(_) | Command::Ensure(_))
 }
 
 fn success() -> DispatchExit {
@@ -1639,8 +1643,16 @@ fn emit_doctor<W: Write, E: Write>(output: &mut Output<W, E>, report: &DoctorRep
         })
         .map_err(output_error)?;
     for finding in &report.findings {
+        let severity = match finding.severity {
+            FindingSeverity::Info => "info",
+            FindingSeverity::Warning => "warning",
+            FindingSeverity::Error => "error",
+        };
         output
-            .guidance(&format!("[{}] {}", finding.code, finding.message))
+            .guidance(&format!(
+                "[{severity} {}] {}",
+                finding.code, finding.message
+            ))
             .map_err(output_error)?;
         if !finding.hint.is_empty() {
             output.hint(&finding.hint).map_err(output_error)?;
@@ -1662,6 +1674,472 @@ fn child_exit_code(info: &JobInfo) -> Result<i32> {
 
 fn usage(message: impl Into<String>, hint: impl Into<String>) -> CowshedError {
     CowshedError::usage(message, hint)
+}
+
+#[async_trait]
+trait AdoptHostSetup: Send {
+    async fn plan(&mut self) -> Result<HostSetupPlan>;
+    async fn execute(&mut self) -> Result<HostSetupReport>;
+}
+
+struct NativeAdoptHostSetup {
+    home: PathBuf,
+}
+
+impl NativeAdoptHostSetup {
+    fn for_canonical_home() -> Result<Self> {
+        Ok(Self {
+            home: gateway_service::canonical_home()?,
+        })
+    }
+}
+
+#[async_trait]
+impl AdoptHostSetup for NativeAdoptHostSetup {
+    async fn plan(&mut self) -> Result<HostSetupPlan> {
+        plan_host_setup(&self.home).await
+    }
+
+    async fn execute(&mut self) -> Result<HostSetupReport> {
+        execute_host_setup(&self.home).await
+    }
+}
+
+async fn prepare_adopt_host_storage<S, W, E>(
+    setup: &mut S,
+    output: &mut Output<W, E>,
+) -> Result<HostSetupReport>
+where
+    S: AdoptHostSetup,
+    W: Write,
+    E: Write,
+{
+    let plan = setup.plan().await?;
+    if plan.requires_authorization {
+        output
+            .announce(
+                "adopt will request administrator authorization once to set up cowshed host storage",
+            )
+            .map_err(output_error)?;
+        for action in &plan.actions {
+            output
+                .announce(&host_action_evidence(action))
+                .map_err(output_error)?;
+        }
+    }
+    let report = setup.execute().await?;
+    if let Some(error) = report.failure() {
+        return Err(error.clone());
+    }
+    Ok(report)
+}
+
+fn host_action_evidence(action: &HostAction) -> String {
+    match action {
+        HostAction::CreateVolume {
+            name,
+            container,
+            mount_at,
+        } => format!(
+            "create {name} in APFS container {container} and mount it at {}",
+            mount_at.display()
+        ),
+        HostAction::MountExisting {
+            name,
+            uuid,
+            size_bytes,
+            mount_at,
+        } => format!(
+            "mount existing {name} ({uuid}, {size_bytes} bytes) at {}",
+            mount_at.display()
+        ),
+        HostAction::RepairMounted {
+            name,
+            uuid,
+            size_bytes,
+            mounted_at,
+            mount_at,
+        } => format!(
+            "repair {name} ({uuid}, {size_bytes} bytes) mounted at {}; canonical mount is {}",
+            mounted_at.display(),
+            mount_at.display()
+        ),
+        HostAction::PinFstab { uuid, mount_at } => format!(
+            "pin volume {uuid} at {} in /etc/fstab",
+            mount_at.display()
+        ),
+        HostAction::ReclaimStubs { paths } => format!(
+            "reclaim mountpoint stubs: {}",
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for (name, expected) in [
+        ("cowshed.store", Path::new("/private/cowshed/store")),
+        ("cowshed.caches", Path::new("/private/cowshed/caches")),
+    ] {
+        let action = plan.actions.iter().find(|action| {
+            matches!(
+                action,
+                HostAction::CreateVolume { name: action_name, .. }
+                    | HostAction::MountExisting { name: action_name, .. }
+                    | HostAction::RepairMounted { name: action_name, .. }
+                    if action_name == name
+            )
+        });
+        let finding = match action {
+            None => Finding {
+                code: "host-volume".into(),
+                severity: FindingSeverity::Info,
+                message: format!(
+                    "{name}: present, mounted at {}, marker valid",
+                    expected.display()
+                ),
+                hint: String::new(),
+                path: Some(expected.to_owned()),
+            },
+            Some(HostAction::CreateVolume {
+                container,
+                mount_at,
+                ..
+            }) => Finding {
+                code: "host-volume-absent".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "{name}: absent from APFS container {container}; expected mount {}; marker absent",
+                    mount_at.display()
+                ),
+                hint: "cowshed setup".into(),
+                path: Some(mount_at.clone()),
+            },
+            Some(HostAction::MountExisting {
+                uuid,
+                size_bytes,
+                mount_at,
+                ..
+            }) => Finding {
+                code: "mount".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "{name}: present ({uuid}, {size_bytes} bytes), not mounted; expected {}; marker unavailable while detached",
+                    mount_at.display()
+                ),
+                hint: "cowshed setup".into(),
+                path: Some(mount_at.clone()),
+            },
+            Some(HostAction::RepairMounted {
+                uuid,
+                size_bytes,
+                mounted_at,
+                mount_at,
+                ..
+            }) if mounted_at == mount_at => Finding {
+                code: "marker".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "{name}: present ({uuid}, {size_bytes} bytes), mounted at {}; marker missing or invalid",
+                    mounted_at.display()
+                ),
+                hint: "cowshed setup".into(),
+                path: Some(mount_at.clone()),
+            },
+            Some(HostAction::RepairMounted {
+                uuid,
+                size_bytes,
+                mounted_at,
+                mount_at,
+                ..
+            }) => Finding {
+                code: "mount".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "{name}: present ({uuid}, {size_bytes} bytes), mounted at {}; expected {}; marker will be validated after remount",
+                    mounted_at.display(),
+                    mount_at.display()
+                ),
+                hint: "cowshed setup".into(),
+                path: Some(mount_at.clone()),
+            },
+            Some(HostAction::PinFstab { .. } | HostAction::ReclaimStubs { .. }) => {
+                unreachable!("volume lookup only selects volume actions")
+            }
+        };
+        findings.push(finding);
+    }
+    for action in &plan.actions {
+        match action {
+            HostAction::PinFstab { uuid, mount_at } => findings.push(Finding {
+                code: "host-fstab".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "volume {uuid} should mount at {} but /etc/fstab has no canonical pin",
+                    mount_at.display()
+                ),
+                hint: "cowshed setup".into(),
+                path: Some(mount_at.clone()),
+            }),
+            HostAction::ReclaimStubs { paths } => findings.push(Finding {
+                code: "mount-stubs".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "reclaimable mountpoint stubs: {}",
+                    paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                hint: "cowshed setup".into(),
+                path: paths.first().cloned(),
+            }),
+            HostAction::CreateVolume { .. }
+            | HostAction::MountExisting { .. }
+            | HostAction::RepairMounted { .. } => {}
+        }
+    }
+    findings
+}
+
+fn gateway_findings(status: &GatewayStatus) -> Vec<Finding> {
+    let mut findings = vec![if status.running {
+        Finding {
+            code: "gateway".into(),
+            severity: FindingSeverity::Info,
+            message: format!(
+                "gateway: launchd loaded; control socket answers at {}; cli version {}; daemon version {}",
+                status.socket.display(),
+                status.cli_version,
+                status.daemon_version.as_deref().unwrap_or("unavailable")
+            ),
+            hint: String::new(),
+            path: Some(status.socket.clone()),
+        }
+    } else {
+        Finding {
+            code: "gateway-down".into(),
+            severity: FindingSeverity::Error,
+            message: format!(
+                "gateway: launchd {}; control socket does not answer at {}; cli version {}; daemon version unavailable",
+                if status.installed {
+                    "loaded"
+                } else {
+                    "not loaded"
+                },
+                status.socket.display(),
+                status.cli_version
+            ),
+            hint: if status.installed {
+                "cowshed gateway stop && cowshed gateway start".into()
+            } else {
+                "cowshed gateway start".into()
+            },
+            path: Some(status.socket.clone()),
+        }
+    }];
+    if let Some(daemon_version) = status.daemon_version.as_deref()
+        && daemon_version != status.cli_version
+    {
+        findings.push(Finding {
+            code: "gateway-version-skew".into(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "gateway version skew: cli {}; daemon {}",
+                status.cli_version, daemon_version
+            ),
+            hint: "cowshed gateway stop && cowshed gateway start".into(),
+            path: Some(status.socket.clone()),
+        });
+    }
+    findings
+}
+
+fn sccache_finding(status: &SccacheStatus) -> Finding {
+    let (severity, hint) = if status.running {
+        (FindingSeverity::Info, String::new())
+    } else if status.installed {
+        (FindingSeverity::Warning, "cowshed sccache stop && cowshed sccache start".into())
+    } else {
+        (FindingSeverity::Info, "cowshed sccache start".into())
+    };
+    Finding {
+        code: if status.running {
+            "sccache"
+        } else {
+            "sccache-down"
+        }
+        .into(),
+        severity,
+        message: format!(
+            "sccache: launchd {}; socket {} at {}{}",
+            if status.installed {
+                "loaded"
+            } else {
+                "not loaded"
+            },
+            if status.running {
+                "answers"
+            } else {
+                "does not answer"
+            },
+            status.socket.display(),
+            status.stats.as_ref().map_or_else(String::new, |stats| format!(
+                "; {} compile requests, {} executed, {} configured base directories",
+                stats.compile_requests,
+                stats.requests_executed,
+                stats.base_directories.len()
+            ))
+        ),
+        hint,
+        path: Some(status.socket.clone()),
+    }
+}
+
+struct HostDiagnosis {
+    storage_ready: bool,
+    findings: Vec<Finding>,
+}
+
+async fn diagnose_host() -> Result<HostDiagnosis> {
+    let home = gateway_service::canonical_home()?;
+    let plan = plan_host_setup(&home).await;
+    let mut diagnosis = match plan {
+        Ok(plan) => HostDiagnosis {
+            storage_ready: plan.actions.is_empty(),
+            findings: host_storage_findings(&plan),
+        },
+        Err(error) => HostDiagnosis {
+            storage_ready: false,
+            findings: vec![Finding {
+                code: "host-storage".into(),
+                severity: FindingSeverity::Error,
+                message: error.message,
+                hint: "cowshed setup".into(),
+                path: None,
+            }],
+        },
+    };
+    match gateway_service::service_status().await {
+        Ok(status) => diagnosis.findings.extend(gateway_findings(&status)),
+        Err(error) => diagnosis.findings.push(Finding {
+            code: "gateway-status".into(),
+            severity: FindingSeverity::Error,
+            message: error.message,
+            hint: "cowshed gateway start".into(),
+            path: None,
+        }),
+    }
+    match crate::sccache_service::service_status().await {
+        Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
+        Err(error) => diagnosis.findings.push(Finding {
+            code: "sccache-status".into(),
+            severity: FindingSeverity::Warning,
+            message: error.message,
+            hint: "cowshed sccache status".into(),
+            path: None,
+        }),
+    }
+    if diagnosis.storage_ready {
+        match adopted_projects().await {
+            Ok(projects) => diagnosis.findings.push(Finding {
+                code: "workspace-inventory".into(),
+                severity: FindingSeverity::Info,
+                message: format!("{} adopted project(s) recorded", projects.len()),
+                hint: if projects.is_empty() {
+                    "cowshed adopt <git-root>".into()
+                } else {
+                    String::new()
+                },
+                path: None,
+            }),
+            Err(error) => diagnosis.findings.push(Finding {
+                code: "workspace-inventory".into(),
+                severity: FindingSeverity::Error,
+                message: error.message,
+                hint: error.hint,
+                path: None,
+            }),
+        }
+    }
+    Ok(diagnosis)
+}
+
+fn doctor_report(findings: Vec<Finding>) -> DoctorReport {
+    DoctorReport {
+        healthy: !findings
+            .iter()
+            .any(|finding| finding.severity == FindingSeverity::Error),
+        findings,
+    }
+}
+
+fn emit_doctor_report<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    json: bool,
+    report: DoctorReport,
+) -> Result<DispatchExit> {
+    let healthy = report.healthy;
+    if json {
+        output.success(report).map_err(output_error)?;
+    } else {
+        emit_doctor(output, &report)?;
+    }
+    Ok(DispatchExit {
+        code: if healthy { 0 } else { 5 },
+    })
+}
+
+async fn run_doctor_command<W, E>(cli: Cli, output: &mut Output<W, E>) -> Result<DispatchExit>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let project_root = resolve_project_root(&cli).await.ok();
+    let mut diagnosis = diagnose_host().await?;
+    if diagnosis.storage_ready {
+        if let Some(root) = project_root {
+            match ActorBridge::open_existing(&root).await {
+                Ok(mut bridge) => {
+                    let project = bridge.doctor().await;
+                    let teardown = bridge.shutdown().await.err();
+                    match project {
+                        Ok(report) => diagnosis.findings.extend(report.findings),
+                        Err(error) => diagnosis.findings.push(Finding {
+                            code: "project-doctor".into(),
+                            severity: FindingSeverity::Error,
+                            message: error.message,
+                            hint: error.hint,
+                            path: Some(root),
+                        }),
+                    }
+                    if let Some(error) = teardown {
+                        diagnosis.findings.push(Finding {
+                            code: "project-shutdown".into(),
+                            severity: FindingSeverity::Error,
+                            message: error.message,
+                            hint: error.hint,
+                            path: None,
+                        });
+                    }
+                }
+                Err(error) if optional_project_unavailable(&error) => {}
+                Err(error) => diagnosis.findings.push(Finding {
+                    code: "project-open".into(),
+                    severity: FindingSeverity::Error,
+                    message: error.message,
+                    hint: error.hint,
+                    path: Some(root),
+                }),
+            }
+        }
+    }
+    emit_doctor_report(output, cli.global.json, doctor_report(diagnosis.findings))
 }
 
 pub async fn dispatch_and_shutdown<S, R, W, E>(
@@ -1697,6 +2175,9 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    if matches!(&cli.command, Command::Doctor) {
+        return run_doctor_command(cli, output).await;
+    }
     let discovery = cli.command.project_discovery();
     if discovery == ProjectDiscovery::NotUsed {
         return dispatch_host_command(cli, output, false).await;
@@ -1710,6 +2191,10 @@ where
     };
     let mode = runtime_open_mode(&cli.command);
     let requested_repo_id = runtime_open_repo_id(&cli.command)?;
+    if mode == RuntimeOpenMode::Provision {
+        let mut setup = NativeAdoptHostSetup::for_canonical_home()?;
+        let _ = prepare_adopt_host_storage(&mut setup, output).await?;
+    }
     let bridge = match mode {
         RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await,
         RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await,
@@ -1753,24 +2238,17 @@ where
             Ok(success())
         }
         Command::Doctor => {
-            // Enumerating the validated host inventory exercises storage/bootstrap integrity even
-            // when there is no project whose coordinator can run the project-specific checks.
-            let _ = adopted_projects().await?;
-            let report = DoctorReport {
-                healthy: true,
-                findings: Vec::new(),
-            };
-            if cli.global.json {
-                output.success(report).map_err(output_error)?;
-            } else {
-                emit_doctor(output, &report)?;
-            }
+            let diagnosis = diagnose_host().await?;
             if project_checks_skipped {
                 output
                     .note("project checks skipped: no adopted checkout at cwd")
                     .map_err(output_error)?;
             }
-            Ok(success())
+            emit_doctor_report(
+                output,
+                cli.global.json,
+                doctor_report(diagnosis.findings),
+            )
         }
         _ => Err(CowshedError::internal(
             "command without project context was not dispatched by its host service",
@@ -1781,6 +2259,233 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("writer lock").extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RefusingAdoptSetup {
+        plan: HostSetupPlan,
+        stderr: SharedWriter,
+        saw_announcement_before_execute: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AdoptHostSetup for RefusingAdoptSetup {
+        async fn plan(&mut self) -> Result<HostSetupPlan> {
+            Ok(self.plan.clone())
+        }
+
+        async fn execute(&mut self) -> Result<HostSetupReport> {
+            let announced = String::from_utf8(
+                self.stderr
+                    .0
+                    .lock()
+                    .expect("writer lock")
+                    .clone(),
+            )
+            .expect("utf8 announcement")
+            .contains("will request administrator authorization");
+            self.saw_announcement_before_execute
+                .store(announced, Ordering::SeqCst);
+            Err(CowshedError::sandbox_denied(
+                "authorization declined",
+                "cowshed setup",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_announces_an_escalating_plan_before_authorization() {
+        let stderr = SharedWriter::default();
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut setup = RefusingAdoptSetup {
+            plan: HostSetupPlan {
+                actions: vec![HostAction::PinFstab {
+                    uuid: "1111-2222".into(),
+                    mount_at: PathBuf::from("/private/cowshed/store"),
+                }],
+                requires_authorization: true,
+                non_destructive: true,
+            },
+            stderr: stderr.clone(),
+            saw_announcement_before_execute: Arc::clone(&observed),
+        };
+        let mut output = Output::new(Vec::new(), stderr, false);
+
+        let error = prepare_adopt_host_storage(&mut setup, &mut output)
+            .await
+            .expect_err("authorization refusal");
+
+        assert_eq!(error.code, ErrorCode::SandboxDenied);
+        assert!(observed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn setup_required_becomes_per_volume_findings_with_evidence() {
+        let plan = HostSetupPlan {
+            actions: vec![
+                HostAction::ReclaimStubs {
+                    paths: vec![
+                        PathBuf::from("/private/cowshed/store/gateway.stderr.log"),
+                        PathBuf::from("/private/cowshed/store/stale.sock"),
+                    ],
+                },
+                HostAction::RepairMounted {
+                    name: "cowshed.store".into(),
+                    uuid: "STORE-UUID".into(),
+                    size_bytes: 4096,
+                    mounted_at: PathBuf::from("/Volumes/cowshed.store"),
+                    mount_at: PathBuf::from("/private/cowshed/store"),
+                },
+                HostAction::MountExisting {
+                    name: "cowshed.caches".into(),
+                    uuid: "CACHE-UUID".into(),
+                    size_bytes: 8192,
+                    mount_at: PathBuf::from("/private/cowshed/caches"),
+                },
+            ],
+            requires_authorization: true,
+            non_destructive: true,
+        };
+
+        let findings = host_storage_findings(&plan);
+
+        assert!(findings.iter().any(|finding| {
+            finding.code == "mount"
+                && finding.message.contains("STORE-UUID")
+                && finding.message.contains("/Volumes/cowshed.store")
+                && finding.message.contains("/private/cowshed/store")
+                && finding.hint == "cowshed setup"
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.code == "mount"
+                && finding.message.contains("CACHE-UUID")
+                && finding.message.contains("marker unavailable while detached")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.code == "mount-stubs"
+                && finding.message.contains("gateway.stderr.log")
+                && finding.message.contains("stale.sock")
+        }));
+        assert!(findings.iter().all(|finding| !finding.message.is_empty()));
+    }
+
+    #[test]
+    fn setup_required_report_emits_json_findings_and_environment_exit() {
+        let plan = HostSetupPlan {
+            actions: vec![HostAction::CreateVolume {
+                name: "cowshed.store".into(),
+                container: "disk3".into(),
+                mount_at: PathBuf::from("/private/cowshed/store"),
+            }],
+            requires_authorization: true,
+            non_destructive: false,
+        };
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+
+        let exit = emit_doctor_report(
+            &mut output,
+            true,
+            doctor_report(host_storage_findings(&plan)),
+        )
+        .expect("doctor emits");
+
+        assert_eq!(exit.code, 5);
+        let (stdout, stderr) = output.into_inner();
+        assert!(stderr.is_empty());
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&stdout).expect("doctor JSON envelope");
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["result"]["healthy"], false);
+        assert!(
+            envelope["result"]["findings"]
+                .as_array()
+                .expect("findings")
+                .iter()
+                .any(|finding| finding["code"] == "host-volume-absent"
+                    && finding["hint"] == "cowshed setup"
+                    && finding["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("disk3")))
+        );
+    }
+
+    #[test]
+    fn gateway_version_skew_is_a_warning_with_a_restart_hint() {
+        let status = GatewayStatus {
+            installed: true,
+            running: true,
+            socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
+            cli_version: "2.0.0".into(),
+            daemon_version: Some("1.9.0".into()),
+            cache_entries: 0,
+            cache_bytes: 0,
+            active_workspaces: 0,
+        };
+
+        let findings = gateway_findings(&status);
+        let skew = findings
+            .iter()
+            .find(|finding| finding.code == "gateway-version-skew")
+            .expect("version skew finding");
+        assert_eq!(skew.severity, FindingSeverity::Warning);
+        assert_eq!(
+            skew.hint,
+            "cowshed gateway stop && cowshed gateway start"
+        );
+        assert!(skew.message.contains("cli 2.0.0"));
+        assert!(skew.message.contains("daemon 1.9.0"));
+    }
+
+    #[test]
+    fn service_findings_name_launchd_socket_and_recovery() {
+        let gateway = gateway_findings(&GatewayStatus {
+            installed: true,
+            running: false,
+            socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
+            cli_version: "2.0.0".into(),
+            daemon_version: None,
+            cache_entries: 0,
+            cache_bytes: 0,
+            active_workspaces: 0,
+        });
+        assert_eq!(gateway[0].code, "gateway-down");
+        assert_eq!(gateway[0].severity, FindingSeverity::Error);
+        assert!(gateway[0].message.contains("launchd loaded"));
+        assert!(gateway[0].message.contains("gateway.sock"));
+        assert_eq!(
+            gateway[0].hint,
+            "cowshed gateway stop && cowshed gateway start"
+        );
+
+        let sccache = sccache_finding(&SccacheStatus {
+            installed: true,
+            running: false,
+            socket: PathBuf::from("/private/cowshed/store/sccache.sock"),
+            stats: None,
+        });
+        assert_eq!(sccache.code, "sccache-down");
+        assert_eq!(sccache.severity, FindingSeverity::Warning);
+        assert!(sccache.message.contains("launchd loaded"));
+        assert!(sccache.message.contains("sccache.sock"));
+        assert_eq!(
+            sccache.hint,
+            "cowshed sccache stop && cowshed sccache start"
+        );
+    }
 
     #[test]
     fn durations_are_exact_and_checked() {

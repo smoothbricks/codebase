@@ -4716,6 +4716,24 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 error,
             ));
         }
+        let gateway_socket = cowshed_gateway::control_socket_path(&self.home);
+        let gateway_status = match cowshed_gateway::GatewayControlClient::new(gateway_socket.clone())
+        {
+            Ok(client) => client.status().await.map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = gateway_status {
+            findings.push(crate::api::dto::Finding {
+                code: "gateway-down".into(),
+                severity: crate::api::dto::FindingSeverity::Error,
+                message: format!(
+                    "gateway control socket does not answer at {}: {error}",
+                    gateway_socket.display()
+                ),
+                hint: "cowshed gateway start".into(),
+                path: Some(gateway_socket),
+            });
+        }
         match self.commitments.health().await {
             Ok(health) if health.failed > 0 => findings.push(crate::api::dto::Finding {
                 code: "audit-sink".into(),
@@ -4762,25 +4780,102 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         match self.authoritative().await {
             Ok(workspaces) => {
                 for workspace in workspaces {
-                    if matches!(
-                        workspace.derived.mount_state,
-                        crate::storage::lifecycle::MountState::Detached
-                    ) && self
-                        .supervisors
-                        .contains_key(workspace.derived.workspace.name())
-                    {
-                        findings.push(crate::api::dto::Finding {
-                            code: "mount-supervisor".into(),
-                            severity: crate::api::dto::FindingSeverity::Error,
-                            message: "detached workspace still has a supervisor".into(),
-                            hint: "cowshed detach and reattach the workspace".into(),
-                            path: Some(workspace.image),
-                        });
+                    let workspace_name = workspace.derived.workspace.name().clone();
+                    let expected_mount = match self.workspace_mount_path(&workspace_name) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            findings.push(native_finding(
+                                "mount",
+                                crate::api::dto::FindingSeverity::Error,
+                                error,
+                            ));
+                            continue;
+                        }
+                    };
+                    match &workspace.derived.mount_state {
+                        crate::storage::lifecycle::MountState::Detached => {
+                            findings.push(crate::api::dto::Finding {
+                                code: "mount".into(),
+                                severity: crate::api::dto::FindingSeverity::Info,
+                                message: format!(
+                                    "workspace {workspace_name} is detached; expected mount {}",
+                                    expected_mount.display()
+                                ),
+                                hint: format!("cowshed attach {workspace_name}"),
+                                path: Some(expected_mount),
+                            });
+                            if self.supervisors.contains_key(&workspace_name) {
+                                findings.push(crate::api::dto::Finding {
+                                    code: "mount-supervisor".into(),
+                                    severity: crate::api::dto::FindingSeverity::Error,
+                                    message: format!(
+                                        "detached workspace {workspace_name} still has a supervisor"
+                                    ),
+                                    hint: format!(
+                                        "cowshed detach {workspace_name} && cowshed attach {workspace_name}"
+                                    ),
+                                    path: Some(workspace.image),
+                                });
+                            }
+                        }
+                        crate::storage::lifecycle::MountState::Mounted { .. } => {
+                            let marker_path =
+                                expected_mount.join(crate::storage::WORKSPACE_MARKER_PATH);
+                            let expected_repo = self.descriptor.repo_id.clone();
+                            let expected_workspace = workspace_name.clone();
+                            let expected_incarnation =
+                                workspace.derived.workspace.incarnation().clone();
+                            let expected_project_root = self.descriptor.git_root.clone();
+                            let checked_marker_path = marker_path.clone();
+                            let marker = crate::storage::lifecycle::dispatch_blocking(move || {
+                                let marker = crate::metadata::WorkspaceMarker::read_from(
+                                    &checked_marker_path,
+                                )
+                                .map_err(|error| error.to_string())?;
+                                if marker.repo_id != expected_repo
+                                    || marker.workspace != expected_workspace
+                                    || marker.workspace_incarnation != expected_incarnation
+                                    || !names_one_root(
+                                        &marker.project_root,
+                                        &expected_project_root,
+                                    )
+                                {
+                                    return Err(format!(
+                                        "workspace marker identity does not match {expected_workspace}"
+                                    ));
+                                }
+                                Ok(())
+                            })
+                            .await;
+                            match marker {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => findings.push(crate::api::dto::Finding {
+                                    code: "marker".into(),
+                                    severity: crate::api::dto::FindingSeverity::Error,
+                                    message: format!(
+                                        "workspace {workspace_name} marker is invalid: {error}"
+                                    ),
+                                    hint: format!(
+                                        "cowshed detach {workspace_name} && cowshed attach {workspace_name}"
+                                    ),
+                                    path: Some(marker_path),
+                                }),
+                                Err(error) => findings.push(crate::api::dto::Finding {
+                                    code: "marker".into(),
+                                    severity: crate::api::dto::FindingSeverity::Error,
+                                    message: format!(
+                                        "could not validate workspace {workspace_name} marker: {error}"
+                                    ),
+                                    hint: "cowshed doctor --json".into(),
+                                    path: Some(marker_path),
+                                }),
+                            }
+                        }
                     }
                 }
             }
             Err(error) => findings.push(native_finding(
-                "metadata-integrity",
+                "marker",
                 crate::api::dto::FindingSeverity::Error,
                 error,
             )),
