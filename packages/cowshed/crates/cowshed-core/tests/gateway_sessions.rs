@@ -46,6 +46,7 @@ fn session_at(identity: &str, revision: u64, token_byte: u8, port: u16) -> Works
 
 fn status(sessions: Vec<SessionStatus>) -> GatewayStatus {
     GatewayStatus {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
         draining: false,
         sessions,
         active: 0,

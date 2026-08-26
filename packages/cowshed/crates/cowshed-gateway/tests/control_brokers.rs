@@ -126,13 +126,9 @@ async fn tcp_credential_is_distinct_unix_is_local_and_shutdown_closes_both() {
     .expect("start gateway");
 
     let unix = GatewayControlClient::new(socket.clone()).expect("Unix client");
-    assert!(
-        unix.status()
-            .await
-            .expect("Unix status")
-            .sessions
-            .is_empty()
-    );
+    let unix_status = unix.status().await.expect("Unix status");
+    assert!(unix_status.sessions.is_empty());
+    assert_eq!(unix_status.version, env!("CARGO_PKG_VERSION"));
     let tcp = GatewayControlClient::new_tcp(
         "127.0.0.1:7644".parse::<SocketAddr>().expect("address"),
         credential,
