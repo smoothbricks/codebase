@@ -3,8 +3,8 @@ use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableInstallState, ExecutableSource, ExistingPlist,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, classify_executable_source, containing_mount_point,
-    plan_executable_install, plan_install, plan_remove,
+    NativeLaunchctlCommand, RemovalOutcome, classify_executable_source, containing_mount_point,
+    plan_executable_install, plan_executable_remove, plan_install, plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
@@ -170,14 +170,26 @@ where
             let status = start_service().await?;
             emit_gateway_status(output, json, status)?;
         }
-        GatewayCommand::Stop => {
-            stop_service()?;
+        GatewayCommand::Stop { purge } => {
+            let purged = stop_service(purge)?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             } else {
                 output
                     .guidance("gateway is stopped")
                     .map_err(output_error)?;
+                if purge {
+                    output
+                        .guidance(&match purged {
+                            RemovalOutcome::Removed => {
+                                String::from("removed the installed cowshed binary")
+                            }
+                            RemovalOutcome::AlreadyAbsent => {
+                                String::from("no installed cowshed binary to remove")
+                            }
+                        })
+                        .map_err(output_error)?;
+                }
             }
         }
         GatewayCommand::Status => {
@@ -249,22 +261,61 @@ fn running_executable() -> Result<PathBuf> {
     })
 }
 
-fn stop_service() -> Result<()> {
-    let home = canonical_home()?;
-    // Deterministic, not derived from the running binary: stop has to reach the agent that
-    // `start` installed however this process was invoked. The installed copy stays — it is host
-    // state, not agent state, and leaving it makes the next start a plist write.
-    let executable =
-        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
-    let uid = effective_uid();
+/// Boot the agent out and delete its plist, reporting whether a plist was there.
+///
+/// Shared by `gateway stop`, `sccache stop`, and `setup --uninstall`: an agent is deactivated
+/// before its definition is removed, or launchd keeps running a service whose plist has gone.
+pub fn remove_launch_agent(spec: &LaunchAgentSpec) -> Result<RemovalOutcome> {
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    deactivate_launch_agent(&mut executor, uid, &spec)?;
+    deactivate_launch_agent(&mut executor, effective_uid(), spec)?;
     let installed = fs::symlink_metadata(spec.plist_path()).is_ok();
     executor
-        .execute_install(&plan_remove(&spec, installed))
+        .execute_install(&plan_remove(spec, installed))
         .map_err(launchd_error)?;
-    Ok(())
+    Ok(if installed {
+        RemovalOutcome::Removed
+    } else {
+        RemovalOutcome::AlreadyAbsent
+    })
+}
+
+/// Delete the host-stable copy a LaunchAgent ran. Only ever called once its agent is gone: the
+/// gateway agent is `KeepAlive`, so removing the binary under a loaded agent would leave launchd
+/// respawning a path that no longer resolves.
+pub fn remove_host_stable_executable(executable: &HostStableExecutable) -> Result<RemovalOutcome> {
+    let installed = fs::symlink_metadata(executable.path()).is_ok();
+    LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand)
+        .execute_install(&plan_executable_remove(executable, installed))
+        .map_err(launchd_error)?;
+    Ok(if installed {
+        RemovalOutcome::Removed
+    } else {
+        RemovalOutcome::AlreadyAbsent
+    })
+}
+
+/// The gateway agent's own spec, resolved from the canonical home rather than the running binary.
+///
+/// Deterministic on purpose: stop and uninstall have to reach the agent `start` installed however
+/// this process was invoked.
+pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, LaunchAgentSpec)> {
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
+    Ok((executable, spec))
+}
+
+/// Stop the gateway; with `purge`, also delete the installed binary it ran.
+///
+/// Without `purge` the copy stays: it is host state rather than agent state, and leaving it makes
+/// the next `start` a plist write instead of a fresh multi-megabyte copy.
+fn stop_service(purge: bool) -> Result<RemovalOutcome> {
+    let home = canonical_home()?;
+    let (executable, spec) = gateway_launch_agent(&home)?;
+    remove_launch_agent(&spec)?;
+    if purge {
+        return remove_host_stable_executable(&executable);
+    }
+    Ok(RemovalOutcome::AlreadyAbsent)
 }
 
 async fn service_status() -> Result<CliGatewayStatus> {

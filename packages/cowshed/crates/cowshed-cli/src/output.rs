@@ -68,6 +68,16 @@ impl<W: Write, E: Write> Output<W, E> {
         writeln!(self.stderr, "cowshed: {message}")
     }
 
+    /// Emits a `cowshed:` line quiet mode never suppresses.
+    ///
+    /// Reserved for 06_cli.md rule 3: a command about to raise an authorization prompt names the
+    /// action and the prompt *first*. That announcement is not guidance a caller can opt out of —
+    /// a SecurityAgent dialog nobody was warned about is a contract violation whether or not `-q`
+    /// was passed — so it does not travel on [`Self::guidance`].
+    pub fn announce(&mut self, message: &str) -> io::Result<()> {
+        writeln!(self.stderr, "cowshed: {message}")
+    }
+
     /// Emits a neutral stderr note without labelling it as a cowshed action.
     pub fn note(&mut self, message: &str) -> io::Result<()> {
         if self.quiet {

@@ -128,6 +128,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Push(_)
         | Command::Rebase(_)
         | Command::Land(_)
+        | Command::Setup(_)
         | Command::Gateway(_)
         | Command::Sccache(_)
         | Command::Skill(_)
@@ -1073,6 +1074,9 @@ where
         }
         Command::Gateway(_) => Err(CowshedError::internal(
             "gateway commands must be dispatched by the host service entrypoint",
+        )),
+        Command::Setup(_) => Err(CowshedError::internal(
+            "setup must be dispatched by the host service entrypoint",
         )),
         Command::Sccache(_) => Err(CowshedError::internal(
             "sccache commands must be dispatched by the host service entrypoint",
