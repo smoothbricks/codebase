@@ -439,6 +439,8 @@ pub struct GatewayConfig {
     pub git_helper_executable: Option<PathBuf>,
     /// Authoritative private directory for Linux workspace data sockets.
     pub data_socket_root: Option<PathBuf>,
+    /// Canonical root of the dedicated host cache volume in production.
+    pub production_cache_volume: Option<PathBuf>,
     pub authorized_control_uid: u32,
     pub limits: GatewayLimits,
     pub timeouts: GatewayTimeouts,
@@ -454,6 +456,7 @@ impl Default for GatewayConfig {
             simulator_drop_root: None,
             git_helper_executable: None,
             data_socket_root: None,
+            production_cache_volume: None,
             authorized_control_uid: unsafe { libc::geteuid() },
             limits: GatewayLimits::default(),
             timeouts: GatewayTimeouts::default(),
@@ -502,10 +505,11 @@ impl GatewayConfig {
         if control.file_name().and_then(|name| name.to_str()) != Some("gateway.sock") {
             return Err(ConfigError::InvalidProductionCacheRoot);
         }
-        let gateway_root = control
-            .parent()
+        let cache_volume = self
+            .production_cache_volume
+            .as_deref()
             .ok_or(ConfigError::InvalidProductionCacheRoot)?;
-        let expected = gateway_root.join("caches").join("mirror");
+        let expected = cache_volume.join("mirror");
         let canonical_expected = std::fs::canonicalize(&expected)
             .map_err(|_| ConfigError::InvalidProductionCacheRoot)?;
         let canonical_configured = std::fs::canonicalize(&self.mirror_cache.cache_root)
@@ -658,7 +662,7 @@ pub enum ConfigError {
     #[error("production gateway requires the canonical gateway.sock control endpoint")]
     MissingProductionControlSocket,
     #[error(
-        "production mirror cache must be the owned mode-0700 <gateway-root>/caches/mirror directory"
+        "production mirror cache must be the owned mode-0700 <cache-volume>/mirror directory"
     )]
     InvalidProductionCacheRoot,
     #[error("gateway mirror cache low-water/TTL limits are invalid")]

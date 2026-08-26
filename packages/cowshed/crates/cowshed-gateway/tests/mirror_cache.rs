@@ -1313,10 +1313,13 @@ fn gateway_mirror_cache_config_requires_a_preexisting_real_root() {
 }
 
 #[test]
-fn production_cache_root_is_fixed_beneath_control_socket_parent() {
+fn production_cache_root_is_fixed_beneath_the_cache_volume() {
     let fixture = TestRoot::new();
-    let gateway_root = std::fs::canonicalize(fixture.path()).expect("canonical fixture root");
-    let fixed = gateway_root.join("caches").join("mirror");
+    let root = std::fs::canonicalize(fixture.path()).expect("canonical fixture root");
+    let store = root.join("store");
+    let cache_volume = root.join("caches");
+    let fixed = cache_volume.join("mirror");
+    std::fs::create_dir(&store).expect("store root");
     std::fs::create_dir_all(&fixed).expect("create fixed cache root");
     #[cfg(unix)]
     {
@@ -1325,7 +1328,8 @@ fn production_cache_root_is_fixed_beneath_control_socket_parent() {
             .expect("secure fixed cache root");
     }
     let mut config = GatewayConfig {
-        control_socket: Some(gateway_root.join("gateway.sock")),
+        control_socket: Some(store.join("gateway.sock")),
+        production_cache_volume: Some(cache_volume),
         git_helper_executable: Some(std::env::current_exe().expect("current test executable")),
         mirror_cache: MirrorCacheConfig::new(fixed),
         ..GatewayConfig::default()
@@ -1334,7 +1338,7 @@ fn production_cache_root_is_fixed_beneath_control_socket_parent() {
         .validate_host_cache_layout()
         .expect("fixed production cache layout");
 
-    config.mirror_cache = MirrorCacheConfig::new(gateway_root);
+    config.mirror_cache = MirrorCacheConfig::new(root);
     assert!(matches!(
         config.validate_host_cache_layout(),
         Err(ConfigError::InvalidProductionCacheRoot)

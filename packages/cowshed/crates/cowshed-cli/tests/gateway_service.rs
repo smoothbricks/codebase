@@ -154,7 +154,8 @@ fn production_config_disables_tcp_and_uses_validated_roots_and_fixed_helper() {
     let paths = GatewayPaths {
         home: PathBuf::from("/Users/test"),
         store: PathBuf::from("/private/cowshed/store"),
-        cache: PathBuf::from("/private/cowshed/caches/mirror"),
+        cache_volume: PathBuf::from("/private/cowshed/caches"),
+        mirror_cache: PathBuf::from("/private/cowshed/caches/mirror"),
         telemetry: PathBuf::from("/private/cowshed/store/telemetry/gateway"),
         control_socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
     };
@@ -163,7 +164,8 @@ fn production_config_disables_tcp_and_uses_validated_roots_and_fixed_helper() {
     assert_eq!(config.control_socket, Some(paths.control_socket));
     assert_eq!(config.control_tcp, None);
     assert_eq!(config.authorized_control_uid, 501);
-    assert_eq!(config.mirror_cache.cache_root, paths.cache);
+    assert_eq!(config.production_cache_volume, Some(paths.cache_volume));
+    assert_eq!(config.mirror_cache.cache_root, paths.mirror_cache);
     assert_eq!(config.git_helper_executable, Some(helper));
 }
 
