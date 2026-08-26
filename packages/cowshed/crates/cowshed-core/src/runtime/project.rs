@@ -2121,7 +2121,12 @@ impl NativeProjectRuntimeHost {
     }
 
     /// Refuse a checkout destination that cannot be moved onto, before anything is mutated.
-    async fn validate_move_destination(&self, source: &Path, destination: &Path) -> Result<()> {
+    async fn validate_move_destination(
+        &self,
+        source: &Path,
+        destination: &Path,
+        retired_main_mount: Option<&Path>,
+    ) -> Result<MoveDestination> {
         if !destination.is_absolute()
             || destination
                 .components()
@@ -2157,13 +2162,9 @@ impl NativeProjectRuntimeHost {
             ));
         }
         let destination = destination.to_owned();
+        let retired_main_mount = retired_main_mount.map(Path::to_owned);
         crate::storage::lifecycle::dispatch_blocking(move || {
-            if std::fs::symlink_metadata(&destination).is_ok() {
-                return Err(CowshedError::conflict(
-                    format!("{} already exists", destination.display()),
-                    "remove the occupant or choose another destination",
-                ));
-            }
+            let state = classify_move_destination(&destination, retired_main_mount.as_deref())?;
             let parent = destination.parent().ok_or_else(|| {
                 CowshedError::usage(
                     format!("{} has no parent directory", destination.display()),
@@ -2176,7 +2177,7 @@ impl NativeProjectRuntimeHost {
                     "create the parent directory first",
                 ));
             }
-            Ok(())
+            Ok(state)
         })
         .await
         .map_err(|error| {
@@ -3155,6 +3156,124 @@ struct NativeWorkspace {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MoveDestination {
+    Vacant,
+    ReplaceDanglingLegacySymlink { target: PathBuf },
+}
+
+#[cfg(target_os = "macos")]
+fn occupied_move_destination(destination: &Path) -> CowshedError {
+    CowshedError::conflict(
+        format!("{} already exists", destination.display()),
+        "remove the occupant or choose another destination",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn classify_move_destination(
+    destination: &Path,
+    retired_main_mount: Option<&Path>,
+) -> Result<MoveDestination> {
+    let metadata = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MoveDestination::Vacant);
+        }
+        Err(error) => {
+            return Err(CowshedError::environment_missing(
+                format!(
+                    "cannot inspect checkout destination {}: {error}",
+                    destination.display()
+                ),
+                "check the destination parent permissions and retry",
+            ));
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Err(occupied_move_destination(destination));
+    }
+    let Some(retired_main_mount) = retired_main_mount else {
+        return Err(occupied_move_destination(destination));
+    };
+    let points_to_retired_main =
+        std::fs::read_link(destination).is_ok_and(|target| target == retired_main_mount);
+    let retired_main_is_dangling = std::fs::metadata(retired_main_mount)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if !points_to_retired_main || !retired_main_is_dangling {
+        return Err(occupied_move_destination(destination));
+    }
+    Ok(MoveDestination::ReplaceDanglingLegacySymlink {
+        target: retired_main_mount.to_owned(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn swap_checkout_paths(left: &Path, right: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    const RENAME_SWAP: u32 = 0x0000_0002;
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            RENAME_SWAP,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn replace_legacy_destination(
+    mountpoint: &Path,
+    destination: &Path,
+    retired_main_mount: &Path,
+) -> Result<()> {
+    match classify_move_destination(destination, Some(retired_main_mount))? {
+        MoveDestination::ReplaceDanglingLegacySymlink { .. } => {}
+        MoveDestination::Vacant => return Err(occupied_move_destination(destination)),
+    }
+    swap_checkout_paths(mountpoint, destination).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot replace the retired checkout link at {}: {error}",
+                destination.display()
+            ),
+            "choose a destination on the same writable filesystem",
+        )
+    })?;
+    if matches!(
+        classify_move_destination(mountpoint, Some(retired_main_mount)),
+        Ok(MoveDestination::ReplaceDanglingLegacySymlink { .. })
+    ) {
+        return Ok(());
+    }
+    let rollback = swap_checkout_paths(mountpoint, destination);
+    Err(CowshedError::conflict(
+        format!(
+            "{} changed while the retired checkout link was being replaced{}",
+            destination.display(),
+            rollback
+                .err()
+                .map(|error| format!("; rollback failed: {error}"))
+                .unwrap_or_default()
+        ),
+        "inspect both checkout paths and retry",
+    ))
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectRootValidation {
     Strict,
@@ -3761,7 +3880,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if !detached_direct {
             self.validate_binding().await?;
         }
-        self.validate_move_destination(&source, &destination)
+        let retired_main_mount = if detached_direct {
+            Some(
+                self.layout
+                    .workspace_mount(&main)
+                    .map_err(native_integrity_error)?,
+            )
+        } else {
+            None
+        };
+        let destination_state = self
+            .validate_move_destination(&source, &destination, retired_main_mount.as_deref())
             .await?;
 
         let mount_point = self.workspace_mount_path(&main)?;
@@ -3782,6 +3911,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let prepare_layout = self.layout.clone();
             let prepare_source = source.clone();
             let prepare_destination = destination.clone();
+            let prepare_destination_state = destination_state.clone();
             crate::storage::lifecycle::dispatch_blocking(move || {
                 prepare_detached_checkout_relocation(
                     &prepare_record,
@@ -3789,6 +3919,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     layout,
                     &prepare_source,
                     &prepare_destination,
+                    &prepare_destination_state,
                 )
             })
             .await
@@ -5363,18 +5494,29 @@ fn prepare_detached_checkout_relocation(
     checkout_layout: crate::metadata::CheckoutLayout,
     source: &Path,
     destination: &Path,
+    destination_state: &MoveDestination,
 ) -> Result<()> {
+    let replacement_target = match destination_state {
+        MoveDestination::Vacant => None,
+        MoveDestination::ReplaceDanglingLegacySymlink { target } => Some(target.as_path()),
+    };
+    let mut displaced_legacy_link = None;
     let source_existed = match std::fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            std::fs::rename(source, destination).map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot move the detached checkout mountpoint to {}: {error}",
-                        destination.display()
-                    ),
-                    "choose a destination on the same writable filesystem",
-                )
-            })?;
+            if let Some(retired_main_mount) = replacement_target {
+                replace_legacy_destination(source, destination, retired_main_mount)?;
+                displaced_legacy_link = Some(source.to_owned());
+            } else {
+                std::fs::rename(source, destination).map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot move the detached checkout mountpoint to {}: {error}",
+                            destination.display()
+                        ),
+                        "choose a destination on the same writable filesystem",
+                    )
+                })?;
+            }
             true
         }
         Ok(_) => {
@@ -5387,15 +5529,45 @@ fn prepare_detached_checkout_relocation(
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(destination).map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot create checkout mountpoint {}: {error}",
-                        destination.display()
-                    ),
-                    "choose a destination in a writable directory",
-                )
-            })?;
+            if let Some(retired_main_mount) = replacement_target {
+                let parent = destination
+                    .parent()
+                    .expect("validated checkout destination has a parent");
+                let leaf = destination
+                    .file_name()
+                    .expect("validated checkout destination has a file name")
+                    .to_string_lossy();
+                let staging = parent.join(format!(
+                    ".{leaf}.cowshed-relocate-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                std::fs::create_dir(&staging).map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot stage checkout mountpoint beside {}: {error}",
+                            destination.display()
+                        ),
+                        "choose a destination in a writable directory",
+                    )
+                })?;
+                if let Err(error) =
+                    replace_legacy_destination(&staging, destination, retired_main_mount)
+                {
+                    let _ = std::fs::remove_dir(&staging);
+                    return Err(error);
+                }
+                displaced_legacy_link = Some(staging);
+            } else {
+                std::fs::create_dir(destination).map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot create checkout mountpoint {}: {error}",
+                            destination.display()
+                        ),
+                        "choose a destination in a writable directory",
+                    )
+                })?;
+            }
             false
         }
         Err(error) => {
@@ -5418,12 +5590,28 @@ fn prepare_detached_checkout_relocation(
                 .map(|_| ())
         });
     if let Err(error) = recorded {
-        if source_existed {
+        if let Some(displaced) = displaced_legacy_link.as_ref() {
+            let _ = swap_checkout_paths(destination, displaced);
+            if !source_existed {
+                let _ = std::fs::remove_dir(displaced);
+            }
+        } else if source_existed {
             let _ = std::fs::rename(destination, source);
         } else {
             let _ = std::fs::remove_dir(destination);
         }
         return Err(error);
+    }
+    if let Some(displaced) = displaced_legacy_link {
+        std::fs::remove_file(&displaced).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot remove retired checkout link {}: {error}",
+                    displaced.display()
+                ),
+                "check the checkout parent permissions and retry",
+            )
+        })?;
     }
     Ok(())
 }
@@ -7358,12 +7546,22 @@ mod workspace_origin_tests {
             mount_point: retired_controller_root.clone(),
             image,
         };
+        let retired_main_mount = layout
+            .workspace_mount(&WorkspaceName::new("main").expect("main"))
+            .expect("retired main mount");
+        std::os::unix::fs::symlink(&retired_main_mount, &destination)
+            .expect("retired checkout link");
+        classify_move_destination(&destination, None)
+            .expect_err("only detached direct-main relocation may replace the retired link");
+        let destination_state = classify_move_destination(&destination, Some(&retired_main_mount))
+            .expect("exact dangling retired main link");
         prepare_detached_checkout_relocation(
             &record,
             &layout,
             crate::metadata::CheckoutLayout::DirectMount,
             &retired_controller_root,
             &destination,
+            &destination_state,
         )
         .expect("relocate detached main");
 
@@ -7383,6 +7581,56 @@ mod workspace_origin_tests {
             layout.checkout_layout().expect("updated layout"),
             crate::metadata::CheckoutLayout::DirectMount
         );
+        assert!(
+            !std::fs::symlink_metadata(&destination)
+                .expect("destination metadata")
+                .file_type()
+                .is_symlink(),
+            "the retired symlink is replaced rather than followed"
+        );
+        assert!(
+            !retired_controller_root.exists(),
+            "the absent retired checkout is not recreated"
+        );
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn detached_relocation_rejects_unrelated_or_live_symlinks() {
+        let temp = temp_directory("retired-link-conflicts");
+        let destination = temp.join("destination");
+        let retired_main_mount = temp.join("mnt/acme/widget/main");
+        let unrelated = temp.join("unrelated-missing");
+
+        std::os::unix::fs::symlink(&unrelated, &destination).expect("unrelated link");
+        classify_move_destination(&destination, Some(&retired_main_mount))
+            .expect_err("an arbitrary dangling link remains an occupant");
+        std::fs::remove_file(&destination).expect("remove unrelated link");
+
+        std::fs::create_dir_all(&retired_main_mount).expect("live retired-layout mount");
+        std::os::unix::fs::symlink(&retired_main_mount, &destination)
+            .expect("link to live retired mount");
+        classify_move_destination(&destination, Some(&retired_main_mount))
+            .expect_err("a link whose target exists remains an occupant");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn detached_relocation_rejects_ordinary_occupied_destinations() {
+        let temp = temp_directory("retired-link-ordinary-occupants");
+        let destination = temp.join("destination");
+        let retired_main_mount = temp.join("mnt/acme/widget/main");
+
+        std::fs::create_dir(&destination).expect("occupied directory");
+        classify_move_destination(&destination, Some(&retired_main_mount))
+            .expect_err("an ordinary directory remains an occupant");
+        std::fs::remove_dir(&destination).expect("remove directory");
+
+        std::fs::write(&destination, b"occupant").expect("occupied file");
+        classify_move_destination(&destination, Some(&retired_main_mount))
+            .expect_err("an ordinary file remains an occupant");
+
         std::fs::remove_dir_all(&temp).ok();
     }
 
