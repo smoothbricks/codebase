@@ -8,6 +8,7 @@ use cowshed_core::storage::bootstrap::native::{
     NativeBootstrapError, NativeBootstrapMode, execute_native_bootstrap_plan,
 };
 use cowshed_core::storage::bootstrap::*;
+use cowshed_core::storage::fstab::FstabPin;
 
 struct InlineLane;
 
@@ -83,6 +84,11 @@ impl BootstrapHost for ValidationHost {
     }
 
     fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -162,6 +168,10 @@ impl BootstrapHost for RecordingHost {
     }
 
     fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
         Ok(())
     }
 }
@@ -282,7 +292,7 @@ async fn absent_volumes_collapse_into_one_explicit_provisioning_batch() {
 }
 
 #[tokio::test]
-async fn existing_only_missing_volumes_rejects_before_dispatch_with_adopt_hint() {
+async fn existing_only_missing_volumes_rejects_before_dispatch_with_setup_hint() {
     let host = Arc::new(ValidationHost::default());
     let lane = CountingLane::default();
     let error = execute_native_bootstrap_plan(
@@ -296,10 +306,10 @@ async fn existing_only_missing_volumes_rejects_before_dispatch_with_adopt_hint()
 
     match error {
         NativeBootstrapError::StorageSetupRequired { actions, hint } => {
-            assert_eq!(hint, "cowshed adopt");
+            assert_eq!(hint, "cowshed setup");
             assert_eq!(
                 actions,
-                ["provision APFS volumes cowshed.store, cowshed.caches"]
+                ["create APFS volumes cowshed.store, cowshed.caches"]
             );
         }
         error => panic!("unexpected error: {error}"),
@@ -419,7 +429,7 @@ async fn detached_exact_volume_requires_explicit_provisioning_without_prompt() {
     assert!(matches!(
         error,
         NativeBootstrapError::StorageSetupRequired {
-            hint: "cowshed adopt",
+            hint: "cowshed setup",
             ..
         }
     ));

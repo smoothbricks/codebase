@@ -5,6 +5,7 @@ use std::thread::ThreadId;
 
 use async_trait::async_trait;
 use cowshed_core::storage::bootstrap::*;
+use cowshed_core::storage::fstab::FstabPin;
 use proptest::prelude::*;
 
 fn apfs_evidence() -> StatFsEvidence {
@@ -976,6 +977,11 @@ impl BootstrapHost for SpyHost {
         self.record(true);
         Ok(())
     }
+
+    fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+        self.record(true);
+        Ok(())
+    }
 }
 struct TransitionHost {
     post_store: MountpointState,
@@ -1069,6 +1075,11 @@ impl BootstrapHost for TransitionHost {
     fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
         self.next_sequence();
         self.relabels.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+        self.next_sequence();
         Ok(())
     }
 }
