@@ -8,18 +8,19 @@ use crate::probe;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
+use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointInfo, CheckpointOptions, CheckpointResult,
     CommandArg, Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
-    ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason, GcReport, GitOid,
-    JobInfo, JobStream, LandOptions, LandReport, MountResult, OutputPublication, PublicationPolicy,
-    PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult,
-    RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
-    UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState, validate_command_argv,
+    ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason, GcReport,
+    GitOid, JobInfo, JobStream, LandOptions, LandReport, MountResult, OutputPublication,
+    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
+    ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
-use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation,
@@ -28,20 +29,14 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
-use cowshed_core::storage::apfs::{
-    ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY,
-};
+use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, STORE_ROOT,
     ValidatedHostStorage, execute_host_setup, plan_host_setup,
 };
-use cowshed_core::storage::lifecycle::{
-    DerivedWorkspace, MountIntent, MountState, Pin, Substrate,
-};
+use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
+use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
-use cowshed_core::storage::host_config::{
-    RETIRED_LAYOUT_HINT, retired_layout_paths,
-};
 use cowshed_core::{
     AdoptedProject, CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
     validate_existing_host_storage,
@@ -385,7 +380,6 @@ impl CliService for ActorBridge {
             .await
     }
 
-
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo> {
         self.coordinator()?
             .project()
@@ -670,7 +664,10 @@ fn project_context_error(error: CowshedError) -> CowshedError {
 }
 
 fn optional_project_unavailable(error: &CowshedError) -> bool {
-    matches!(error.code, ErrorCode::EnvironmentMissing | ErrorCode::NotFound)
+    matches!(
+        error.code,
+        ErrorCode::EnvironmentMissing | ErrorCode::NotFound
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1492,10 +1489,7 @@ async fn attach_scoped_sessions(
     } else {
         service.list().await?
     };
-    let targets: Vec<WorkspaceInfo> = candidates
-        .into_iter()
-        .filter(is_detached_session)
-        .collect();
+    let targets: Vec<WorkspaceInfo> = candidates.into_iter().filter(is_detached_session).collect();
     if targets.is_empty() {
         return Err(no_detached_sessions());
     }
@@ -1728,9 +1722,8 @@ fn detach_store_storage_error(error: impl std::fmt::Display) -> CowshedError {
 /// Identity is the image sidecar's `infoSnapshot.projectRoot` (the same project root the
 /// in-image marker records). Remotes and cwd git discovery are not consulted.
 pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Result<PathBuf> {
-    let wanted = WorkspaceName::session(workspace).map_err(|error| {
-        usage(error.to_string(), "cowshed detach <ws>; cowshed ls --all")
-    })?;
+    let wanted = WorkspaceName::session(workspace)
+        .map_err(|error| usage(error.to_string(), "cowshed detach <ws>; cowshed ls --all"))?;
     let mut found: Vec<(RepoId, PathBuf)> = Vec::new();
     let owners = fs::read_dir(store).map_err(|error| {
         CowshedError::environment_missing(
@@ -1768,9 +1761,9 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
             let Ok(entries) = fs::read_dir(&sessions) else {
                 continue;
             };
-            let images = discover_session_images(entries.filter_map(|entry| {
-                entry.ok().map(|entry| entry.path())
-            }))
+            let images = discover_session_images(
+                entries.filter_map(|entry| entry.ok().map(|entry| entry.path())),
+            )
             .map_err(|error| {
                 CowshedError::conflict(
                     error.to_string(),
@@ -1781,8 +1774,8 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
                 if image.workspace() != &wanted {
                     continue;
                 }
-                let metadata = DetachedWorkspaceMetadata::read_for_image(image.path()).map_err(
-                    |error| {
+                let metadata =
+                    DetachedWorkspaceMetadata::read_for_image(image.path()).map_err(|error| {
                         CowshedError::integrity(
                             format!(
                                 "workspace {wanted} sidecar at {} is unreadable: {error}",
@@ -1790,8 +1783,7 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
                             ),
                             "cowshed doctor",
                         )
-                    },
-                )?;
+                    })?;
                 let snapshot = metadata.require_info_snapshot().map_err(|error| {
                     CowshedError::integrity(
                         format!(
@@ -1818,9 +1810,7 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(CowshedError::conflict(
-                format!(
-                    "workspace {workspace} exists in more than one project ({projects})"
-                ),
+                format!("workspace {workspace} exists in more than one project ({projects})"),
                 "cowshed --project <git-root> detach <ws>",
             ))
         }
@@ -1861,10 +1851,7 @@ fn report_new_git_identity<W: Write, E: Write>(
 fn git_identity_findings(bridge: &ActorBridge) -> Result<Vec<Finding>> {
     let (candidate, mount_root) = identity_probe_target(bridge, None)?;
     let gaps = probe::probe_git_identity(bridge.git_root()?, &candidate)?;
-    Ok(gaps
-        .iter()
-        .map(|gap| gap.finding(&mount_root))
-        .collect())
+    Ok(gaps.iter().map(|gap| gap.finding(&mount_root)).collect())
 }
 
 fn identity_probe_target(
@@ -1877,9 +1864,8 @@ fn identity_probe_target(
     let mount_root = layout.project().host_mount_root.clone();
     let candidate = match workspace {
         Some(name) => {
-            let workspace = WorkspaceName::session(name).map_err(|error| {
-                usage(error.to_string(), "use a valid workspace name")
-            })?;
+            let workspace = WorkspaceName::session(name)
+                .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?;
             layout.workspace_mount(&workspace).map_err(|error| {
                 CowshedError::environment_missing(
                     error.to_string(),
@@ -1899,14 +1885,10 @@ fn unused_identity_candidate(layout: &StorageLayout) -> Result<PathBuf> {
         } else {
             format!("identity-probe-{index}")
         };
-        let workspace = WorkspaceName::session(name).map_err(|error| {
-            CowshedError::internal(error.to_string())
-        })?;
+        let workspace = WorkspaceName::session(name)
+            .map_err(|error| CowshedError::internal(error.to_string()))?;
         let path = layout.workspace_mount(&workspace).map_err(|error| {
-            CowshedError::environment_missing(
-                error.to_string(),
-                "cowshed setup --mount-root <dir>",
-            )
+            CowshedError::environment_missing(error.to_string(), "cowshed setup --mount-root <dir>")
         })?;
         if !path.exists() {
             return Ok(path);
@@ -2204,10 +2186,9 @@ fn host_action_evidence(action: &HostAction) -> String {
             mounted_at.display(),
             mount_at.display()
         ),
-        HostAction::PinFstab { uuid, mount_at } => format!(
-            "pin volume {uuid} at {} in /etc/fstab",
-            mount_at.display()
-        ),
+        HostAction::PinFstab { uuid, mount_at } => {
+            format!("pin volume {uuid} at {} in /etc/fstab", mount_at.display())
+        }
         HostAction::ReclaimStubs { paths } => format!(
             "reclaim mountpoint stubs: {}",
             paths
@@ -2453,7 +2434,9 @@ fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
         Err(error) => vec![Finding {
             code: "retired-mount-layout-scan".into(),
             severity: FindingSeverity::Error,
-            message: format!("could not inspect detached metadata for retired mount paths: {error}"),
+            message: format!(
+                "could not inspect detached metadata for retired mount paths: {error}"
+            ),
             hint: "cowshed doctor --json".into(),
             path: Some(store_root.to_path_buf()),
         }],
@@ -2464,7 +2447,10 @@ fn sccache_finding(status: &SccacheStatus) -> Finding {
     let (severity, hint) = if status.running {
         (FindingSeverity::Info, String::new())
     } else if status.installed {
-        (FindingSeverity::Warning, "cowshed sccache stop && cowshed sccache start".into())
+        (
+            FindingSeverity::Warning,
+            "cowshed sccache stop && cowshed sccache start".into(),
+        )
     } else {
         (FindingSeverity::Info, "cowshed sccache start".into())
     };
@@ -2489,12 +2475,15 @@ fn sccache_finding(status: &SccacheStatus) -> Finding {
                 "does not answer"
             },
             status.socket.display(),
-            status.stats.as_ref().map_or_else(String::new, |stats| format!(
-                "; {} compile requests, {} executed, {} configured base directories",
-                stats.compile_requests,
-                stats.requests_executed,
-                stats.base_directories.len()
-            ))
+            status
+                .stats
+                .as_ref()
+                .map_or_else(String::new, |stats| format!(
+                    "; {} compile requests, {} executed, {} configured base directories",
+                    stats.compile_requests,
+                    stats.requests_executed,
+                    stats.base_directories.len()
+                ))
         ),
         hint,
         path: Some(status.socket.clone()),
@@ -2526,11 +2515,9 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         },
     };
     if diagnosis.storage_ready {
-        diagnosis
-            .findings
-            .extend(retired_mount_layout_findings(
-                CanonicalRoots::global().store(),
-            ));
+        diagnosis.findings.extend(retired_mount_layout_findings(
+            CanonicalRoots::global().store(),
+        ));
     }
     match gateway_service::service_status().await {
         Ok(status) => diagnosis.findings.extend(gateway_findings(&status)),
@@ -2600,6 +2587,17 @@ fn doctor_report(findings: Vec<Finding>) -> DoctorReport {
     }
 }
 
+fn emit_project_checks_skipped<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    error: Option<&CowshedError>,
+) -> Result<()> {
+    let message = error.map_or_else(
+        || "project checks skipped: no adopted checkout at cwd".to_owned(),
+        |error| format!("project checks skipped: {}", error.message),
+    );
+    output.note(&message).map_err(output_error)
+}
+
 fn emit_doctor_report<W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
@@ -2621,11 +2619,11 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let project_root = resolve_project_root(&cli).await.ok();
+    let project_root = resolve_project_root(&cli).await;
     let mut diagnosis = diagnose_host().await?;
     if diagnosis.storage_ready {
-        if let Some(root) = project_root {
-            match ActorBridge::open_existing(&root).await {
+        match project_root {
+            Ok(root) => match ActorBridge::open_existing(&root).await {
                 Ok(mut bridge) => {
                     let identity = git_identity_findings(&bridge);
                     let project = bridge.doctor().await;
@@ -2660,15 +2658,13 @@ where
                         });
                     }
                 }
-                Err(error) if optional_project_unavailable(&error) => {}
-                Err(error) => diagnosis.findings.push(Finding {
-                    code: "project-open".into(),
-                    severity: FindingSeverity::Error,
-                    message: error.message,
-                    hint: error.hint,
-                    path: Some(root),
-                }),
-            }
+                // Opening cwd is enrichment only: stale identity or remote-name bindings belong to
+                // that checkout, while the host storage, services, and store-wide inventory above
+                // remain authoritative. Reporting an open failure as a host error made the same
+                // machine healthy or unhealthy solely according to which clone invoked doctor.
+                Err(error) => emit_project_checks_skipped(output, Some(&error))?,
+            },
+            Err(_) => emit_project_checks_skipped(output, None)?,
         }
     }
     emit_doctor_report(output, cli.global.json, doctor_report(diagnosis.findings))
@@ -2741,8 +2737,7 @@ where
     let bridge = match bridge {
         Ok(bridge) => bridge,
         Err(error)
-            if discovery == ProjectDiscovery::Optional
-                && optional_project_unavailable(&error) =>
+            if discovery == ProjectDiscovery::Optional && optional_project_unavailable(&error) =>
         {
             return dispatch_host_command(cli, output, true).await;
         }
@@ -2758,10 +2753,7 @@ where
     dispatch_and_shutdown(bridge, cli, stdin, output).await
 }
 
-pub async fn run_host_command<W, E>(
-    cli: Cli,
-    output: &mut Output<W, E>,
-) -> Result<DispatchExit>
+pub async fn run_host_command<W, E>(cli: Cli, output: &mut Output<W, E>) -> Result<DispatchExit>
 where
     W: Write + Send,
     E: Write + Send,
@@ -2809,15 +2801,9 @@ where
         Command::Doctor => {
             let diagnosis = diagnose_host().await?;
             if project_checks_skipped {
-                output
-                    .note("project checks skipped: no adopted checkout at cwd")
-                    .map_err(output_error)?;
+                emit_project_checks_skipped(output, None)?;
             }
-            emit_doctor_report(
-                output,
-                cli.global.json,
-                doctor_report(diagnosis.findings),
-            )
+            emit_doctor_report(output, cli.global.json, doctor_report(diagnosis.findings))
         }
         _ => Err(CowshedError::internal(
             "command without project context was not dispatched by its host service",
@@ -2836,7 +2822,10 @@ mod tests {
 
     impl Write for SharedWriter {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("writer lock").extend_from_slice(buffer);
+            self.0
+                .lock()
+                .expect("writer lock")
+                .extend_from_slice(buffer);
             Ok(buffer.len())
         }
 
@@ -2858,15 +2847,9 @@ mod tests {
         }
 
         async fn execute(&mut self) -> Result<HostSetupReport> {
-            let announced = String::from_utf8(
-                self.stderr
-                    .0
-                    .lock()
-                    .expect("writer lock")
-                    .clone(),
-            )
-            .expect("utf8 announcement")
-            .contains("will request administrator authorization");
+            let announced = String::from_utf8(self.stderr.0.lock().expect("writer lock").clone())
+                .expect("utf8 announcement")
+                .contains("will request administrator authorization");
             self.saw_announcement_before_execute
                 .store(announced, Ordering::SeqCst);
             Err(CowshedError::sandbox_denied(
@@ -2942,7 +2925,9 @@ mod tests {
         assert!(findings.iter().any(|finding| {
             finding.code == "mount"
                 && finding.message.contains("CACHE-UUID")
-                && finding.message.contains("marker unavailable while detached")
+                && finding
+                    .message
+                    .contains("marker unavailable while detached")
         }));
         assert!(findings.iter().any(|finding| {
             finding.code == "mount-stubs"
@@ -2980,7 +2965,9 @@ mod tests {
         assert_eq!(store.code, "mount");
         assert_eq!(store.path.as_deref(), Some(Path::new(STORE_ROOT)));
         assert!(
-            store.message.contains(&format!("mounted at {}", observed.display())),
+            store
+                .message
+                .contains(&format!("mounted at {}", observed.display())),
             "{}",
             store.message
         );
@@ -3085,10 +3072,7 @@ mod tests {
             .find(|finding| finding.code == "gateway-version-skew")
             .expect("version skew finding");
         assert_eq!(skew.severity, FindingSeverity::Warning);
-        assert_eq!(
-            skew.hint,
-            "cowshed gateway stop && cowshed gateway start"
-        );
+        assert_eq!(skew.hint, "cowshed gateway stop && cowshed gateway start");
         assert!(skew.message.contains("cli 2.0.0"));
         assert!(skew.message.contains("daemon 1.9.0"));
     }
@@ -3185,9 +3169,7 @@ mod tests {
     fn optional_context_falls_back_only_when_an_adopted_checkout_is_absent() {
         for code in [ErrorCode::EnvironmentMissing, ErrorCode::NotFound] {
             assert!(optional_project_unavailable(&CowshedError::new(
-                code,
-                "missing",
-                "old hint"
+                code, "missing", "old hint"
             )));
         }
         for code in [
@@ -3203,6 +3185,32 @@ mod tests {
                 "repair it"
             )));
         }
+    }
+
+    #[test]
+    fn repository_binding_mismatch_skips_project_checks_without_changing_host_verdict() {
+        let mismatch = CowshedError::conflict(
+            "repository binding remote codebase does not match Git configuration",
+            "restore the recorded remote before opening cowshed",
+        );
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+
+        emit_project_checks_skipped(&mut output, Some(&mismatch)).expect("skip note");
+        let report = doctor_report(Vec::new());
+
+        assert!(report.healthy);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.code != "project-open"),
+            "optional project-open failures do not become host findings"
+        );
+        let (_, stderr) = output.into_inner();
+        assert_eq!(
+            stderr,
+            b"project checks skipped: repository binding remote codebase does not match Git configuration\n"
+        );
     }
 
     #[test]
@@ -3330,10 +3338,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let store = root.join("store");
-        let metadata = store.join("acme/widget/sessions/raven.asif.grants.json");
+        let project = bind_test_repository(&store, "acme/widget");
+        let metadata = project.join("sessions/raven.asif.grants.json");
         std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
-        let plan =
-            plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
+        let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
         execute_mount_root_change(&plan).unwrap();
         let recorded = store.join("mnt/acme/widget/raven");
         std::fs::write(
@@ -3347,7 +3355,11 @@ mod tests {
         let finding = &findings[0];
         assert_eq!(finding.code, "retired-mount-layout");
         assert_eq!(finding.severity, FindingSeverity::Error);
-        assert!(finding.message.contains("recorded under retired layout, run cowshed setup --mount-root <dir>"));
+        assert!(
+            finding
+                .message
+                .contains("recorded under retired layout, run cowshed setup --mount-root <dir>")
+        );
         assert_eq!(finding.hint, RETIRED_LAYOUT_HINT);
         assert_eq!(finding.path.as_deref(), Some(metadata.as_path()));
         assert!(!doctor_report(findings).healthy);
@@ -3367,13 +3379,7 @@ mod tests {
         ));
         let store = root.join("store");
         let other_checkout = PathBuf::from("/other/project");
-        write_session_image(
-            &store,
-            "acme",
-            "widget",
-            "fox",
-            Path::new("/cwd/project"),
-        );
+        write_session_image(&store, "acme", "widget", "fox", Path::new("/cwd/project"));
         write_session_image(&store, "zeta", "tool", "raven", &other_checkout);
 
         let resolved = resolve_session_project_root(&store, "raven").expect("found raven");
@@ -3382,19 +3388,35 @@ mod tests {
         let missing = resolve_session_project_root(&store, "absent").unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
 
-        write_session_image(
-            &store,
-            "acme",
-            "widget",
-            "raven",
-            Path::new("/cwd/project"),
-        );
+        write_session_image(&store, "acme", "widget", "raven", Path::new("/cwd/project"));
         let conflict = resolve_session_project_root(&store, "raven").unwrap_err();
         assert_eq!(conflict.code, ErrorCode::Conflict);
         assert!(conflict.message.contains("zeta/tool"));
         assert!(conflict.message.contains("acme/widget"));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn bind_test_repository(store: &Path, repo_id: &str) -> PathBuf {
+        let repo_id =
+            cowshed_core::repository::RepoId::parse(repo_id).expect("repository identity");
+        let paths = cowshed_core::storage::StorageLayout::new(store, &repo_id)
+            .expect("project paths")
+            .project()
+            .clone();
+        std::fs::create_dir_all(&paths.project_root).expect("project root");
+        let binding = cowshed_core::repository::RepositoryBinding::new(vec![
+            cowshed_core::repository::BoundIdentity {
+                repo_id,
+                remote_name: None,
+                remote_url: None,
+                primary: true,
+            },
+        ])
+        .expect("repository binding");
+        cowshed_core::metadata::write_json(&paths.repository_binding, &binding)
+            .expect("binding file");
+        paths.project_root
     }
 
     fn write_session_image(
