@@ -9,6 +9,9 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
+use crate::api::dto::{
+    CheckpointInfo, GitOid, ProjectWorkspaces, UtcTimestamp, WorkspaceInfo, WorkspaceState,
+};
 use crate::checkout::load_checkout_layout;
 use crate::metadata::{
     CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
@@ -401,6 +404,30 @@ impl NativeGatewayInventory {
             .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
+    /// Enumerate every current workspace directly from the host storage registry.
+    ///
+    /// Unlike a project runtime open, this never discovers a Git repository or reads remotes from
+    /// the recorded checkout path. The image and detached sidecar identify each workspace; the
+    /// captured kernel mount inventory supplies only its attached/detached state. That distinction
+    /// is what lets a detached direct-mounted main remain listable after its old checkout path has
+    /// disappeared.
+    pub async fn all_projects(&self) -> Result<Vec<ProjectWorkspaces>, GatewayInventoryError> {
+        let inventory = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || inventory.all_projects_blocking())
+            .await
+            .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
+    fn all_projects_blocking(&self) -> Result<Vec<ProjectWorkspaces>, GatewayInventoryError> {
+        let repositories = discover_repositories(self.storage.store())?;
+        let mut projects = Vec::with_capacity(repositories.len());
+        for repo_id in repositories {
+            projects.push(self.load_project_workspaces(&repo_id)?);
+        }
+        projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+        Ok(projects)
+    }
+
     fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
         let mut projects = Vec::new();
         for repo_id in discover_repositories(self.storage.store())? {
@@ -781,6 +808,81 @@ impl NativeGatewayInventory {
         Ok(facts)
     }
 
+    fn load_project_workspaces(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<ProjectWorkspaces, GatewayInventoryError> {
+        let authoritative = self.source.project_facts(&self.storage, repo_id)?;
+        reject_duplicate_mount_facts(&authoritative.mounts)?;
+        let derived = derive_workspaces(authoritative.storage, authoritative.mounts, [])?;
+        let layout = StorageLayout::new(self.storage.store(), repo_id).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: self.storage.store().to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let mut workspaces = Vec::with_capacity(derived.len());
+        for workspace in derived {
+            let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
+            let mount = authoritative.mount_paths.get(&volume).ok_or_else(|| {
+                GatewayInventoryError::InvalidMetadata {
+                    path: layout.project().project_root.clone(),
+                    message: format!("missing canonical mount path for {volume}"),
+                }
+            })?;
+            let image_paths = canonical_image_paths(&layout, &workspace.workspace)?;
+            let metadata = read_current_metadata(
+                self.storage.store(),
+                image_paths.image(),
+                &workspace.workspace,
+            )?;
+            let info = metadata.info_snapshot.as_ref();
+            let base_commit = info
+                .map(|snapshot| GitOid::new(snapshot.base_commit.clone()))
+                .transpose()
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: sidecar_path(image_paths.image()),
+                    message: error.to_string(),
+                })?;
+            let created_at = info
+                .map(|snapshot| UtcTimestamp::new(snapshot.created_at.clone()))
+                .transpose()
+                .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                    path: sidecar_path(image_paths.image()),
+                    message: error.to_string(),
+                })?;
+            workspaces.push(WorkspaceInfo {
+                repo_id: repo_id.clone(),
+                workspace: workspace.workspace.name().clone(),
+                workspace_incarnation: workspace.workspace.incarnation().clone(),
+                role: workspace.workspace.role(),
+                image_format: workspace.workspace.format(),
+                mount: mount.clone(),
+                state: match workspace.mount_state {
+                    MountState::Detached => WorkspaceState::Detached,
+                    MountState::Mounted { .. } => WorkspaceState::Attached,
+                },
+                branch: info.and_then(|snapshot| snapshot.branch.clone()),
+                base_commit,
+                created_at,
+                checkpoints: workspace
+                    .checkpoints
+                    .iter()
+                    .map(|checkpoint| CheckpointInfo {
+                        label: checkpoint.label.to_string(),
+                        revision: checkpoint.revision.get(),
+                        pinned: matches!(checkpoint.pin, crate::storage::lifecycle::Pin::Pinned),
+                    })
+                    .collect(),
+                snapshot_stale: info.is_some_and(|snapshot| snapshot.stale),
+            });
+        }
+        workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+        Ok(ProjectWorkspaces {
+            repo_id: repo_id.clone(),
+            workspaces,
+        })
+    }
     fn load_project(
         &self,
         repo_id: &RepoId,
@@ -1496,7 +1598,7 @@ mod tests {
                         mount.clone()
                     },
                     role,
-                    base_commit: "0123456789abcdef".to_owned(),
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                     branch: Some("main".to_owned()),
                     created_at: "2026-07-14T00:00:00Z".to_owned(),
                     forked_from: None,
@@ -1675,6 +1777,89 @@ mod tests {
             error,
             GatewayInventoryError::DuplicatePortBlock(40_960)
         ));
+    }
+
+    #[tokio::test]
+    async fn store_wide_listing_includes_a_project_whose_direct_mounted_main_path_is_gone() {
+        let fixture = Fixture::with_checkout_layout("list-stale-main", CheckoutLayout::DirectMount);
+        let valid_repo = RepoId::parse("acme/valid").expect("valid repo");
+        let stale_repo = RepoId::parse("acme/stale").expect("stale repo");
+        fixture.bind(&valid_repo);
+        fixture.bind(&stale_repo);
+
+        let (valid_storage, valid_mounted) = fixture.workspace(
+            &valid_repo,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000001",
+            3,
+            true,
+            true,
+        );
+        let (valid_mount, valid_path) = valid_mounted.expect("valid main mounted");
+        let (stale_storage, stale_mounted) = fixture.workspace(
+            &stale_repo,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000002",
+            4,
+            false,
+            true,
+        );
+        assert!(stale_mounted.is_none());
+        let stale_path = fixture.root.join("checkout-stale");
+        fs::remove_dir_all(&stale_path).expect("remove stale direct mount path");
+
+        let source = Arc::new(FixtureSource {
+            projects: Mutex::new(BTreeMap::from([
+                (
+                    valid_repo.clone(),
+                    ProjectInventoryFacts {
+                        storage: vec![valid_storage],
+                        mounts: vec![valid_mount.clone()],
+                        mount_paths: BTreeMap::from([(valid_mount.volume_key, valid_path)]),
+                    },
+                ),
+                (
+                    stale_repo.clone(),
+                    ProjectInventoryFacts {
+                        mount_paths: BTreeMap::from([(
+                            stale_storage.volume_key.clone(),
+                            stale_path.clone(),
+                        )]),
+                        storage: vec![stale_storage],
+                        mounts: Vec::new(),
+                    },
+                ),
+            ])),
+        });
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        let projects = inventory
+            .all_projects()
+            .await
+            .expect("store-wide list does not open checkout Git repositories");
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.repo_id.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/stale", "acme/valid"]
+        );
+        let stale = projects
+            .iter()
+            .find(|project| project.repo_id == stale_repo)
+            .expect("stale project listed");
+        assert_eq!(stale.workspaces.len(), 1);
+        assert_eq!(stale.workspaces[0].state, WorkspaceState::Detached);
+        assert_eq!(stale.workspaces[0].mount, stale_path);
+        assert!(!stale.workspaces[0].mount.exists());
+        let valid = projects
+            .iter()
+            .find(|project| project.repo_id == valid_repo)
+            .expect("valid project listed");
+        assert_eq!(valid.workspaces[0].state, WorkspaceState::Attached);
     }
 
     /// A legacy direct-mount project's main volume is mounted at the adopted checkout even though
