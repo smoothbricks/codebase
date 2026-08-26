@@ -1185,8 +1185,15 @@ mod tests {
             };
             let mounted = mounted.then(|| {
                 fs::create_dir_all(&mount).expect("mount");
-                mint_workspace_credentials(&workspace, &mount, image.ca_private_key())
-                    .expect("credentials");
+                mint_workspace_credentials(
+                    &workspace,
+                    &mount,
+                    &mount,
+                    Platform::Macos,
+                    Some(PortBlock::new(40_960, 16).expect("port block")),
+                    image.ca_private_key(),
+                )
+                .expect("credentials");
                 (
                     KernelMountFact {
                         mount_id: revision + 100,

@@ -16,7 +16,6 @@ import {
   type CoordinatorEndpoint,
   CowshedError,
   type CreateOptions,
-  type EnsureReport,
   type ErrorCode,
   type ExecRequest,
   type GcOptions,
@@ -48,8 +47,6 @@ export {
   CowshedError,
   type EgressMode,
   type EgressRule,
-  type EnsureAction,
-  type EnsureReport,
   type ErrorCode,
   type ExecRequest,
   type ExpectedRefHead,
@@ -93,7 +90,6 @@ const native = loadNativeModule();
 const isNativeError = typia.createIs<NativeError>();
 const parseWorkspaceInfo = typia.json.createAssertParse<WorkspaceInfo>();
 const parseWorkspaceInfos = typia.json.createAssertParse<WorkspaceInfo[]>();
-const parseEnsureReport = typia.json.createAssertParse<EnsureReport>();
 const parseGrantSet = typia.json.createAssertParse<GrantSet>();
 const parseLandReport = typia.json.createAssertParse<LandReport>();
 const parseGcReport = typia.json.createAssertParse<GcReport>();
@@ -242,9 +238,6 @@ class WorkspaceRefImpl implements WorkspaceRef {
     return parseWorkspaceInfo(await callNativeAsync(() => this.#native.infoJson()));
   }
 
-  async ensure(): Promise<EnsureReport> {
-    return parseEnsureReport(await callNativeAsync(() => this.#native.ensureJson()));
-  }
 
   async attach(options?: AttachOptions): Promise<void> {
     await callNativeAsync(() => this.#native.attach(encodeAttachOptions(options)));

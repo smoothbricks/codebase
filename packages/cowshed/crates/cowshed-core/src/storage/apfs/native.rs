@@ -50,7 +50,7 @@ use super::{
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
 const CHECKPOINT_FACT_SUFFIX: &str = ".checkpoint.json";
-const SELF_HEALING_STUB: &[u8] = b"cowshed ensure --attach\n";
+const SELF_HEALING_STUB: &[u8] = b"cowshed attach\n";
 
 const ROOT_OPEN_FLAGS: libc::c_int =
     libc::O_RDONLY + libc::O_DIRECTORY + libc::O_NOFOLLOW + libc::O_CLOEXEC;
@@ -2610,13 +2610,34 @@ where
     fn mint_workspace_credentials(
         &self,
         workspace: &LifecycleWorkspace,
+        image_path: &Path,
         mount_point: &Path,
+        workspace_mount: &Path,
         private_key_path: &Path,
     ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image_path)?;
         self.verify_controller_path(mount_point)?;
         self.verify_controller_path(private_key_path)?;
-        mint_workspace_credentials(workspace, mount_point, private_key_path)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))
+        let metadata = DetachedWorkspaceMetadata::read_for_image(image_path)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.repo_id != *workspace.repo()
+            || metadata.workspace != *workspace.name()
+            || metadata.workspace_incarnation != *workspace.incarnation()
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "credential environment metadata disagrees with workspace: {}",
+                image_path.display()
+            )));
+        }
+        mint_workspace_credentials(
+            workspace,
+            mount_point,
+            workspace_mount,
+            metadata.platform,
+            metadata.grants.port_block,
+            private_key_path,
+        )
+        .map_err(|error| ApfsStorageError::Host(error.to_string()))
     }
 
     fn write_marker(

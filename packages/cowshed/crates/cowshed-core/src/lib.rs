@@ -17,10 +17,12 @@ pub mod sandbox;
 pub mod secrets;
 pub mod storage;
 pub mod workspace_credentials;
+pub mod workspace_environment;
 
 pub use error::{CowshedError, ErrorCode, Result};
 pub use gateway_inventory::{
     AdoptedProject, GatewayInventoryError, GatewaySessionFact, NativeGatewayInventory,
+    ProjectHealOutcome, SessionHealOutcome, UnreachableMain,
 };
 pub use storage::bootstrap::ValidatedHostStorage;
 pub use storage::bootstrap::native::validate_existing_host_storage;

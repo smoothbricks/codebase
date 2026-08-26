@@ -100,13 +100,6 @@ pub trait ProjectRuntimeHost: Send + 'static {
     ) -> Result<WorkspaceSnapshot>;
     /// Move the project's checkout to a new path, keeping every record of where it lives in step.
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot>;
-    /// Attach `workspace`, converging the recorded checkout path onto `observed` when the caller
-    /// witnesses the checkout somewhere other than where the record says it is.
-    async fn ensure(
-        &mut self,
-        workspace: WorkspaceName,
-        observed: Option<PathBuf>,
-    ) -> Result<crate::api::dto::EnsureReport>;
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
     async fn resize(
@@ -364,7 +357,6 @@ impl ProjectActor {
             "project.workspaceAt" => self.project_workspace_at(request).await,
             "project.list" => self.project_list(request).await,
             "workspace.info" => self.workspace_info(request).await,
-            "workspace.ensure" => self.workspace_ensure(request).await,
             "workspace.attach" => self.workspace_attach(request).await,
             "workspace.grants" => self.workspace_grants(request).await,
             "coordinator.adopt" => self.coordinator_adopt(request).await,
@@ -493,23 +485,6 @@ impl ProjectActor {
         json_response(&snapshot.info)
     }
 
-    async fn workspace_ensure(&mut self, request: RouterRequest) -> Result<RouterResponse> {
-        require_coordinator(request.authority())?;
-        let params: EnsureParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(
-            request.authority(),
-            &WorkspaceParams {
-                repo_id: params.repo_id.clone(),
-                workspace: params.workspace.clone(),
-            },
-        )
-        .await?;
-        let result = self
-            .host
-            .ensure(params.workspace, params.observed_path)
-            .await?;
-        json_response(result)
-    }
 
     async fn workspace_attach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
@@ -1081,18 +1056,6 @@ struct ForkParams {
     destination: WorkspaceName,
 }
 
-/// `workspace.ensure`, which additionally carries where the caller observed the checkout.
-///
-/// Optional because only a caller with a real invocation directory has an observation to offer; an
-/// automated ensure with no cwd converges nothing rather than guessing.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EnsureParams {
-    repo_id: RepoId,
-    workspace: WorkspaceName,
-    #[serde(default)]
-    observed_path: Option<PathBuf>,
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2024,7 +1987,7 @@ impl NativeProjectRuntimeHost {
     /// exactly the thing `workspace_mount_path` already answers.
     ///
     /// Detached workspaces are skipped rather than mounted: there is nothing to write into an
-    /// unmounted volume, and `ensure` repairs the link when the workspace is next used.
+    /// unmounted volume, and `attach` repairs the link when the workspace is next used.
     async fn rewrite_main_remotes(&mut self) -> Result<()> {
         let main_mount = self.workspace_mount_path(&main_name())?;
         for workspace in self.authoritative().await? {
@@ -2340,23 +2303,6 @@ impl NativeProjectRuntimeHost {
         })
     }
 
-    fn ensure_report(
-        &self,
-        workspace: &NativeWorkspace,
-        mount: PathBuf,
-        action: crate::api::dto::EnsureAction,
-    ) -> crate::api::dto::EnsureReport {
-        crate::api::dto::EnsureReport {
-            workspace: workspace.derived.workspace.name().clone(),
-            go_env: mount.join(".cowshed/cache/go/env"),
-            sccache_server_uds: crate::sandbox::sccache_server_socket(&self.home),
-            sccache_dir: crate::sandbox::sccache_cache_directory(&self.home),
-            workspace_token: mount.join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH),
-            port_block: workspace.metadata.grants.port_block,
-            mount,
-            action,
-        }
-    }
 
     async fn checkpoint_quota(&self, workspace: &WorkspaceName) -> Result<Option<CheckpointQuota>> {
         let path = self.layout.project().policy.clone();
@@ -3308,7 +3254,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let checkout_layout = self.substrate_config.checkout_layout;
         let receipt = self
             .substrate
-            .execute_adopt_staged(plan, move |_stage| async move {
+            .execute_adopt_staged(plan, move |stage| async move {
+                crate::git::GitRepository::from_root(&stage.mount_point)
+                    .ensure_workspace_environment_wiring()
+                    .await?;
                 crate::storage::lifecycle::dispatch_blocking(move || {
                     layout_record.record_checkout_layout(checkout_layout)?;
                     crate::metadata::write_json(&binding_path, &binding)
@@ -3418,6 +3367,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .substrate
                 .execute_create_staged(plan, move |stage| async move {
                     let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                    repository.ensure_workspace_environment_wiring().await?;
                     if git_worktree {
                         repository
                             .adopt_as_linked_worktree(
@@ -3582,10 +3532,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let receipt = self
             .substrate
             .execute_fork_staged(plan, move |stage| async move {
+                let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                repository.ensure_workspace_environment_wiring().await?;
                 if !source_is_git_worktree {
                     return Ok(());
                 }
-                crate::git::GitRepository::from_root(&stage.mount_point)
+                repository
                     .adopt_as_linked_worktree(&forked.to_string(), &main_mount, None)
                     .await
             })
@@ -3692,7 +3644,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     /// The durable record is rewritten **before** the tree moves, in both layouts. Under direct
     /// mount the source path stops existing the instant the rename lands, so a record still naming
     /// it would be unrecoverable — nothing left to resolve — whereas a record naming the
-    /// destination becomes true the moment the rename completes, and `ensure` converges the rest.
+    /// destination becomes true the moment the rename completes, and `attach` converges the rest.
     /// Recording ahead of the move is what makes the crash window recoverable in the forward
     /// direction instead of the dead one.
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot> {
@@ -3772,7 +3724,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let current = self.current(&main).await?;
             // Past the rename there is no way back worth taking: the record and the tree both name
             // the destination, so a failure to re-attach here is a detached project at the right
-            // path, which `cowshed ensure` mounts. Rolling back would move the tree a second time
+            // path, which `cowshed attach` mounts. Rolling back would move the tree a second time
             // to reach a state that is strictly further from where the user asked to be.
             self.substrate
                 .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
@@ -3784,48 +3736,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.snapshot_named(&main).await
     }
 
-    async fn ensure(
-        &mut self,
-        workspace: WorkspaceName,
-        observed: Option<PathBuf>,
-    ) -> Result<crate::api::dto::EnsureReport> {
-        let before = self.current(&workspace).await?;
-        let already = matches!(
-            before.derived.mount_state,
-            crate::storage::lifecycle::MountState::Mounted { .. }
-        );
-        self.ensure_supervisor(&workspace).await?;
-        if let Some(observed) = observed {
-            self.converge_checkout_record(&observed).await?;
-        }
-        if !workspace.is_main() {
-            // The reconciliation half of `mv`: a workspace that was detached while main moved
-            // still names main's old mount — as a remote URL, or as the gitdir a git-worktree
-            // workspace points at. Both repairs are idempotent and neither touches state cowshed
-            // did not create, so running one on every ensure keeps every workspace's link to main
-            // true without a repair verb.
-            let main_mount = self.workspace_mount_path(&main_name())?;
-            let mount = self.workspace_mount_path(&workspace)?;
-            if is_git_worktree(&before.metadata) {
-                repair_git_worktree_link(&main_mount, &mount).await?;
-            } else {
-                crate::git::GitRepository::from_root(&mount)
-                    .configure_main_remote(&main_mount)
-                    .await?;
-            }
-        }
-        let current = self.current(&workspace).await?;
-        let mount = self.workspace_mount_path(&workspace)?;
-        Ok(self.ensure_report(
-            &current,
-            mount,
-            if already {
-                crate::api::dto::EnsureAction::AlreadyMounted
-            } else {
-                crate::api::dto::EnsureAction::Attached
-            },
-        ))
-    }
 
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
@@ -3851,7 +3761,25 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if was_detached {
             self.advance_gateway_revision(&current).await?;
         }
-        self.ensure_supervisor(&workspace).await.map(|_| ())
+        self.ensure_supervisor(&workspace).await?;
+        if let Some(observed) = options.observed_path {
+            self.converge_checkout_record(&observed).await?;
+        }
+        if !workspace.is_main() {
+            // A workspace detached while main moved still names main's old mount. Attachment is
+            // the reconciliation front door, so repair both standalone remotes and linked
+            // worktree registrations before admitting work.
+            let main_mount = self.workspace_mount_path(&main_name())?;
+            let mount = self.workspace_mount_path(&workspace)?;
+            if is_git_worktree(&current.metadata) {
+                repair_git_worktree_link(&main_mount, &mount).await?;
+            } else {
+                crate::git::GitRepository::from_root(&mount)
+                    .configure_main_remote(&main_mount)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()> {
@@ -4011,7 +3939,14 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .substrate
             .execute_restore_staged(
                 plan,
-                |_stage| async { Ok::<_, CowshedError>(()) },
+                |stage| async move {
+                    if let crate::storage::apfs::RestoreStage::Replace(stage) = stage {
+                        crate::git::GitRepository::from_root(&stage.mount_point)
+                            .ensure_workspace_environment_wiring()
+                            .await?;
+                    }
+                    Ok::<_, CowshedError>(())
+                },
                 move |fence| async move {
                     commitments
                         .record(CommitmentDraft::Restore {
@@ -5337,7 +5272,7 @@ async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<Work
                 marker.project_root.display(),
                 project_root.display()
             ),
-            "cowshed ensure",
+            "cowshed attach",
         ));
     }
     Ok(Some(WorkspaceOrigin {

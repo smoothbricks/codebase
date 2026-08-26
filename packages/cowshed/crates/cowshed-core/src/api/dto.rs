@@ -485,33 +485,6 @@ pub struct ProjectWorkspaces {
     pub workspaces: Vec<WorkspaceInfo>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum EnsureAction {
-    AlreadyMounted,
-    Attached,
-    Healed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnsureReport {
-    pub workspace: WorkspaceName,
-    pub mount: PathBuf,
-    pub action: EnsureAction,
-    pub go_env: PathBuf,
-    /// Host-level sccache server socket (`SCCACHE_SERVER_UDS`), identical for
-    /// every workspace on the host; carried per report so envrc emission needs
-    /// no ambient environment.
-    pub sccache_server_uds: PathBuf,
-    /// Host-level sccache cache directory (`SCCACHE_DIR`), carried for the same reason as the
-    /// socket: a client that finds no daemon spawns its own server, and that server must land in
-    /// the shared cache rather than sccache's user default.
-    pub sccache_dir: PathBuf,
-    pub workspace_token: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port_block: Option<PortBlock>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2039,10 +2012,12 @@ pub struct CreateOptions {
     pub git_worktree: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct AttachOptions {
     pub browse: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_path: Option<PathBuf>,
 }
 
 /// What `cowshed resize` changed, with both capacities as the image itself reports them.
@@ -2342,7 +2317,6 @@ macro_rules! result_bodies {
 result_bodies!(
     EmptyResult,
     MountResult,
-    EnsureReport,
     DoctorReport,
     GcReport,
     CheckpointResult,

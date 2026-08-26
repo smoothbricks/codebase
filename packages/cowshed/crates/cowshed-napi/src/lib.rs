@@ -836,14 +836,6 @@ impl WorkspaceRef {
         })
     }
 
-    #[napi(js_name = "ensureJson")]
-    pub fn ensure_json(&self, env: Env) -> napi::Result<JsObject> {
-        let workspace = self.inner.clone();
-        spawn_promise(env, async move {
-            let report = workspace.ensure().await.map_err(AddonFailure::from)?;
-            canonical_json("workspace ensure report", &report)
-        })
-    }
 
     #[napi]
     pub fn attach(&self, env: Env, options_json: Option<String>) -> napi::Result<JsObject> {

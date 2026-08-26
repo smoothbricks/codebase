@@ -13,9 +13,10 @@ use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use zeroize::Zeroizing;
 
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName, write_atomic_bytes};
+use crate::metadata::{Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes};
 use crate::repository::RepoId;
 use crate::storage::lifecycle::LifecycleWorkspace;
+use crate::workspace_environment::{WorkspaceEnvironmentError, write_workspace_environment};
 
 pub const CA_CERTIFICATE_PATH: &str = ".cowshed/ca.pem";
 pub const WORKSPACE_TOKEN_PATH: &str = ".cowshed/token";
@@ -75,11 +76,16 @@ pub enum WorkspaceCredentialError {
     Generation(&'static str),
     #[error("invalid workspace credential asset {kind} at {path}")]
     InvalidAsset { kind: &'static str, path: PathBuf },
+    #[error(transparent)]
+    Environment(#[from] WorkspaceEnvironmentError),
 }
 
 pub fn mint_workspace_credentials(
     workspace: &LifecycleWorkspace,
     mount_point: &Path,
+    workspace_mount: &Path,
+    platform: Platform,
+    port_block: Option<PortBlock>,
     private_key_path: &Path,
 ) -> Result<(), WorkspaceCredentialError> {
     let credential_directory = ensure_credential_directory(mount_point)?;
@@ -117,6 +123,7 @@ pub fn mint_workspace_credentials(
     publish_asset(private_key_path, private_key.as_bytes())?;
     publish_asset(&certificate_path, certificate_pem.as_bytes())?;
     publish_asset(&token_path, token.as_bytes())?;
+    write_workspace_environment(mount_point, workspace_mount, &token, platform, port_block)?;
     sync_directory(&credential_directory, "syncing credential directory")?;
 
     validate_workspace_credentials(workspace, mount_point, private_key_path)
@@ -430,6 +437,21 @@ mod tests {
         .expect("lifecycle workspace")
     }
 
+    fn mint_credentials(
+        workspace: &LifecycleWorkspace,
+        mount: &Path,
+        private_key: &Path,
+    ) -> Result<(), WorkspaceCredentialError> {
+        mint_workspace_credentials(
+            workspace,
+            mount,
+            mount,
+            Platform::Macos,
+            Some(PortBlock::new(40_960, 16).expect("port block")),
+            private_key,
+        )
+    }
+
     fn test_root(case: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "cowshed-workspace-credentials-{case}-{}",
@@ -440,6 +462,82 @@ mod tests {
     }
 
     #[test]
+    fn token_rotation_rewrites_the_in_image_environment() {
+        let root = test_root("environment-rotation");
+        let image_mount = root.join("image");
+        fs::create_dir(&image_mount).expect("image mount");
+        let canonical_mount = Path::new("/Users/test/.cowshed/mnt/acme/widget/raven");
+        let key_path = root.join("raven.ca.key");
+        let workspace = workspace("00112233445566778899aabbccddeeff");
+        let port_block = crate::metadata::PortBlock::new(40_960, 16).expect("port block");
+
+        mint_workspace_credentials(
+            &workspace,
+            &image_mount,
+            canonical_mount,
+            crate::metadata::Platform::Macos,
+            Some(port_block),
+            &key_path,
+        )
+        .expect("first mint");
+        let first_token = fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
+        let first_environment =
+            fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment");
+        assert_eq!(
+            first_environment,
+            format!(
+                "export GOENV=/Users/test/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env\nexport COWSHED_WORKSPACE_TOKEN={first_token}\nexport COWSHED_PORT_BASE=40960\n"
+            )
+        );
+
+        mint_workspace_credentials(
+            &workspace,
+            &image_mount,
+            canonical_mount,
+            crate::metadata::Platform::Macos,
+            Some(port_block),
+            &key_path,
+        )
+        .expect("rotated mint");
+        let second_token =
+            fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("rotated token");
+        let second_environment =
+            fs::read_to_string(image_mount.join(".cowshed/env")).expect("rotated environment");
+        assert_ne!(second_token, first_token);
+        assert_ne!(second_environment, first_environment);
+        assert!(second_environment.contains(&format!(
+            "export COWSHED_WORKSPACE_TOKEN={second_token}\n"
+        )));
+        assert!(!second_environment.contains(&first_token));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn linux_environment_omits_the_port_export() {
+        let root = test_root("linux-environment");
+        let image_mount = root.join("image");
+        fs::create_dir(&image_mount).expect("image mount");
+        let key_path = root.join("raven.ca.key");
+
+        mint_workspace_credentials(
+            &workspace("00112233445566778899aabbccddeeff"),
+            &image_mount,
+            Path::new("/home/test/.cowshed/mnt/acme/widget/raven"),
+            crate::metadata::Platform::Linux,
+            None,
+            &key_path,
+        )
+        .expect("mint Linux credentials");
+        let environment =
+            fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment");
+        assert_eq!(environment.lines().count(), 2);
+        assert!(!environment.contains("COWSHED_PORT_BASE"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn minted_assets_are_private_p256_ca_and_exact_base64url_token() {
         let root = test_root("contract");
         let mount = root.join("mount");
@@ -447,7 +545,7 @@ mod tests {
         let key_path = root.join("staged.sparseimage.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
 
-        mint_workspace_credentials(&workspace, &mount, &key_path).expect("mint credentials");
+        mint_credentials(&workspace, &mount, &key_path).expect("mint credentials");
         validate_workspace_credentials(&workspace, &mount, &key_path)
             .expect("validate credentials");
 
@@ -480,9 +578,9 @@ mod tests {
         let first_workspace = workspace("00112233445566778899aabbccddeeff");
         let second_workspace = workspace("ffeeddccbbaa99887766554433221100");
 
-        mint_workspace_credentials(&first_workspace, &first_mount, &first_key)
+        mint_credentials(&first_workspace, &first_mount, &first_key)
             .expect("first credentials");
-        mint_workspace_credentials(&second_workspace, &second_mount, &second_key)
+        mint_credentials(&second_workspace, &second_mount, &second_key)
             .expect("second credentials");
         assert_ne!(
             fs::read(&first_key).expect("first key"),
@@ -510,11 +608,7 @@ mod tests {
         symlink(&outside, mount.join(CREDENTIAL_DIRECTORY)).expect("symlink");
         let key_path = root.join("staged.ca.key");
 
-        let error = mint_workspace_credentials(
-            &workspace("00112233445566778899aabbccddeeff"),
-            &mount,
-            &key_path,
-        )
+        let error = mint_credentials(&workspace("00112233445566778899aabbccddeeff"), &mount, &key_path)
         .expect_err("symlink must fail");
         assert!(matches!(
             error,
@@ -535,7 +629,7 @@ mod tests {
         fs::create_dir(&mount).expect("mount");
         let key_path = root.join("workspace.ca.key");
         let workspace = workspace("00112233445566778899aabbccddeeff");
-        mint_workspace_credentials(&workspace, &mount, &key_path).expect("mint credentials");
+        mint_credentials(&workspace, &mount, &key_path).expect("mint credentials");
 
         let expected_token =
             String::from_utf8(fs::read(mount.join(WORKSPACE_TOKEN_PATH)).unwrap()).unwrap();
@@ -563,14 +657,14 @@ mod tests {
         let mode_mount = root.join("mode");
         fs::create_dir(&mode_mount).unwrap();
         let mode_key = root.join("mode.ca.key");
-        mint_workspace_credentials(&subject, &mode_mount, &mode_key).unwrap();
+        mint_credentials(&subject, &mode_mount, &mode_key).unwrap();
         fs::set_permissions(&mode_key, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_gateway_workspace_credentials(&subject, &mode_mount, &mode_key).is_err());
 
         let symlink_mount = root.join("symlink");
         fs::create_dir(&symlink_mount).unwrap();
         let symlink_key = root.join("symlink.ca.key");
-        mint_workspace_credentials(&subject, &symlink_mount, &symlink_key).unwrap();
+        mint_credentials(&subject, &symlink_mount, &symlink_key).unwrap();
         let token_path = symlink_mount.join(WORKSPACE_TOKEN_PATH);
         let outside_token = root.join("outside-token");
         fs::rename(&token_path, &outside_token).unwrap();
@@ -585,19 +679,15 @@ mod tests {
         fs::create_dir(&other_mount).unwrap();
         let pair_key = root.join("pair.ca.key");
         let other_key = root.join("other.ca.key");
-        mint_workspace_credentials(&subject, &pair_mount, &pair_key).unwrap();
-        mint_workspace_credentials(
-            &workspace("ffeeddccbbaa99887766554433221100"),
-            &other_mount,
-            &other_key,
-        )
+        mint_credentials(&subject, &pair_mount, &pair_key).unwrap();
+        mint_credentials(&workspace("ffeeddccbbaa99887766554433221100"), &other_mount, &other_key)
         .unwrap();
         assert!(read_gateway_workspace_credentials(&subject, &pair_mount, &other_key).is_err());
 
         let token_mount = root.join("token");
         fs::create_dir(&token_mount).unwrap();
         let token_key = root.join("token.ca.key");
-        mint_workspace_credentials(&subject, &token_mount, &token_key).unwrap();
+        mint_credentials(&subject, &token_mount, &token_key).unwrap();
         fs::write(token_mount.join(WORKSPACE_TOKEN_PATH), b"not-a-valid-token").unwrap();
         assert!(read_gateway_workspace_credentials(&subject, &token_mount, &token_key).is_err());
 

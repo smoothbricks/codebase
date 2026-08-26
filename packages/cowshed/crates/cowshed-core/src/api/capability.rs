@@ -630,13 +630,15 @@ impl Cowshed {
         })?;
         let wire: ProjectWire =
             call_typed(&self.runtime, "project.open", json!({ "path": path })).await?;
-        let paths = ProjectPaths::new(&wire.store_root, &wire.repo_id).map_err(|error| {
-            CowshedError::new(
-                ErrorCode::Internal,
-                format!("controller returned invalid project paths: {error}"),
-                "cowshed doctor --json",
-            )
-        })?;
+        let paths = crate::storage::StorageLayout::new(&wire.store_root, &wire.repo_id)
+            .map(|layout| layout.project().clone())
+            .map_err(|error| {
+                CowshedError::new(
+                    ErrorCode::Internal,
+                    format!("controller returned invalid project paths: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?;
         Ok(Project {
             repo_id: wire.repo_id,
             binding: wire.binding,
@@ -814,30 +816,6 @@ impl WorkspaceRef {
         .await
     }
 
-    pub async fn ensure(&self) -> Result<super::dto::EnsureReport> {
-        self.ensure_observed_at(None).await
-    }
-
-    /// Ensure, telling the controller where the caller observed this workspace's checkout.
-    ///
-    /// The observation is what lets `ensure` converge a recorded checkout path that has fallen
-    /// behind a hand-moved symlink; `std::env::current_dir` cannot supply it, because it resolves
-    /// symlinks and so reports the mount rather than the name the user reached it by.
-    pub async fn ensure_observed_at(
-        &self,
-        observed: Option<&std::path::Path>,
-    ) -> Result<super::dto::EnsureReport> {
-        call_typed(
-            &self.runtime,
-            "workspace.ensure",
-            json!({
-                "repoId": self.info.repo_id,
-                "workspace": self.info.workspace,
-                "observedPath": observed,
-            }),
-        )
-        .await
-    }
 
     pub async fn attach(&self, options: AttachOptions) -> Result<()> {
         let _: EmptyResult = call_typed(
@@ -2153,7 +2131,12 @@ mod tests {
             repo_id: repo_id.clone(),
             binding,
             git_root: PathBuf::from("/repo"),
-            paths: ProjectPaths::new("/tmp/cowshed-capability-tests", &repo_id).unwrap(),
+            paths: ProjectPaths::with_mount_root(
+                "/tmp/cowshed-capability-tests",
+                "/tmp/cowshed-capability-tests/mnt",
+                &repo_id,
+            )
+            .unwrap(),
             runtime: Arc::clone(&runtime),
         };
         Coordinator {

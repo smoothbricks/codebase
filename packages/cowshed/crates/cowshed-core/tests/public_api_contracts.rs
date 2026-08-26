@@ -258,30 +258,7 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
 }
 
 #[test]
-fn ensure_doctor_gc_and_empty_results_have_exact_shapes() {
-    let ensure = EnsureReport {
-        workspace: workspace(),
-        mount: PathBuf::from("/mnt/raven"),
-        action: EnsureAction::Healed,
-        go_env: PathBuf::from("/mnt/raven/.cowshed/cache/go/env"),
-        sccache_server_uds: PathBuf::from("/Users/tester/.cowshed/sccache.sock"),
-        sccache_dir: PathBuf::from("/Users/tester/.cowshed/caches/sccache"),
-        workspace_token: PathBuf::from("/mnt/raven/.cowshed/token"),
-        port_block: Some(PortBlock::new(49_152, 16).expect("valid port block")),
-    };
-    assert_eq!(
-        serde_json::to_value(ensure).expect("ensure JSON"),
-        json!({
-            "workspace":"raven",
-            "mount":"/mnt/raven",
-            "action":"healed",
-            "goEnv":"/mnt/raven/.cowshed/cache/go/env",
-            "sccacheServerUds":"/Users/tester/.cowshed/sccache.sock",
-            "sccacheDir":"/Users/tester/.cowshed/caches/sccache",
-            "workspaceToken":"/mnt/raven/.cowshed/token",
-            "portBlock":{"base":49152,"size":16}
-        })
-    );
+fn doctor_gc_and_empty_results_have_exact_shapes() {
 
     let doctor = DoctorReport {
         healthy: false,
@@ -612,8 +589,12 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         })
     );
     assert_eq!(
-        serde_json::to_value(AttachOptions { browse: true }).unwrap(),
-        json!({"browse":true})
+        serde_json::to_value(AttachOptions {
+            browse: true,
+            observed_path: Some(PathBuf::from("/Users/tester/Dev/widget")),
+        })
+        .unwrap(),
+        json!({"browse":true,"observedPath":"/Users/tester/Dev/widget"})
     );
     assert_eq!(
         serde_json::to_value(RemoveOptions {

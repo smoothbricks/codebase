@@ -22,7 +22,6 @@ export class CowshedError extends Error {
 export type WorkspaceRole = 'main' | 'workspace';
 export type ImageFormat = 'asif' | 'sparse';
 export type WorkspaceState = 'attached' | 'detached';
-export type EnsureAction = 'alreadyMounted' | 'attached' | 'healed';
 export type EgressMode = 'intercept' | 'opaque';
 export type SimVerb = 'openurl' | 'install';
 export type RunSandboxMode = 'readWrite' | 'readOnly';
@@ -76,19 +75,10 @@ export interface GrantSet {
   readonly sim: readonly SimVerb[];
 }
 
-export interface EnsureReport {
-  readonly workspace: string;
-  readonly mount: string;
-  readonly action: EnsureAction;
-  readonly goEnv: string;
-  /** Host-level sccache server socket (`SCCACHE_SERVER_UDS`), identical for every workspace. */
-  readonly sccacheServerUds: string;
-  readonly workspaceToken: string;
-  readonly portBlock?: PortBlock;
-}
 
 export interface AttachOptions {
   readonly browse?: boolean;
+  readonly observedPath?: string;
 }
 
 export interface AdoptOptions {
@@ -289,7 +279,6 @@ export interface WorkspaceRef {
   readonly name: string;
   readonly mountPath: string;
   info(): Promise<WorkspaceInfo>;
-  ensure(): Promise<EnsureReport>;
   attach(options?: AttachOptions): Promise<void>;
   grants(): Promise<GrantSet>;
 }

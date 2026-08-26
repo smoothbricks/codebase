@@ -506,6 +506,21 @@ fn workspace(format: ImageFormat) -> LifecycleWorkspace {
     .expect("workspace")
 }
 
+fn mint_credentials(
+    workspace: &LifecycleWorkspace,
+    image_mount: &Path,
+    private_key_path: &Path,
+) -> Result<(), cowshed_core::workspace_credentials::WorkspaceCredentialError> {
+    mint_workspace_credentials(
+        workspace,
+        image_mount,
+        image_mount,
+        Platform::Macos,
+        Some(PortBlock::new(40_960, 16).expect("port block")),
+        private_key_path,
+    )
+}
+
 #[test]
 fn duplicate_asif_sparse_stems_fail_before_any_command() {
     let fixture = Fixture::new("duplicate");
@@ -809,8 +824,7 @@ fn marker_validation_checks_every_detached_identity_dimension() {
     host.write_marker(&mount, &workspace, None, &identity(&fixture))
         .expect("write marker");
     let private_key = fixture.root.join("marker.ca.key");
-    host.mint_workspace_credentials(&workspace, &mount, &private_key)
-        .expect("workspace credentials");
+    mint_credentials(&workspace, &mount, &private_key).expect("workspace credentials");
     let expected = MarkerExpectation {
         repo: workspace.repo().clone(),
         workspace: workspace.name().clone(),
@@ -2125,7 +2139,7 @@ fn direct_mount_handoff_swaps_the_checkout_for_a_stubbed_mountpoint() {
     assert!(checkout.is_dir());
     assert_eq!(
         std::fs::read(checkout.join(".envrc")).expect("stub"),
-        b"cowshed ensure --attach\n"
+        b"cowshed attach\n"
     );
     assert_eq!(
         std::fs::read_dir(&checkout).expect("mountpoint").count(),
@@ -2582,7 +2596,7 @@ fn adopt_publication_builds_the_canonical_mount_without_touching_the_checkout() 
     // The durable half of the transaction landed...
     assert_eq!(
         std::fs::read(canonical_mount.join(".envrc")).expect("stub"),
-        b"cowshed ensure --attach\n"
+        b"cowshed attach\n"
     );
     assert!(canonical.image().exists());
     assert!(sidecar_path(canonical.image()).exists());
@@ -2688,7 +2702,7 @@ fn adopt_recovery_completes_publication_after_restart_without_the_checkout() {
     assert!(!staged.exists());
     assert_eq!(
         std::fs::read(canonical_mount.join(".envrc")).expect("stub"),
-        b"cowshed ensure --attach\n"
+        b"cowshed attach\n"
     );
     assert_eq!(
         std::fs::read(config.checkout_path.join("tracked")).expect("untouched source"),
@@ -3187,13 +3201,9 @@ fn stateless_restore_recovery_converges_each_publication_boundary() {
         let new_credential_mount = fixture.root.join("new-credential-mount");
         std::fs::create_dir_all(&old_credential_mount).expect("old credential mount");
         std::fs::create_dir_all(&new_credential_mount).expect("new credential mount");
-        mint_workspace_credentials(
-            &workspace(ImageFormat::Sparse),
-            &old_credential_mount,
-            &ca_key_path(canonical.image()),
-        )
+        mint_credentials(&workspace(ImageFormat::Sparse), &old_credential_mount, &ca_key_path(canonical.image()))
         .expect("old credentials");
-        mint_workspace_credentials(&replacement, &new_credential_mount, &ca_key_path(&staged))
+        mint_credentials(&replacement, &new_credential_mount, &ca_key_path(&staged))
             .expect("replacement credentials");
         let old_ca_key = std::fs::read(ca_key_path(canonical.image())).expect("old CA key");
         let new_ca_key = std::fs::read(ca_key_path(&staged)).expect("new CA key");
@@ -3878,11 +3888,7 @@ fn gc_first_recovers_post_handoff_adopt_before_pruning_staging() {
     create_image(&staged, ImageFormat::Sparse);
     let credential_mount = fixture.root.join("credential-mount");
     std::fs::create_dir_all(&credential_mount).expect("credential mount");
-    mint_workspace_credentials(
-        &workspace(ImageFormat::Sparse),
-        &credential_mount,
-        &ca_key_path(&staged),
-    )
+    mint_credentials(&workspace(ImageFormat::Sparse), &credential_mount, &ca_key_path(&staged))
     .expect("valid staged credentials");
     std::fs::write(&staged, b"complete adopted image").expect("staged bytes");
     std::fs::create_dir_all(&config.checkout_path).expect("source checkout");
@@ -4514,13 +4520,12 @@ fn resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
     create_image(image.image(), ImageFormat::Sparse);
     let mount = main_mount(&fixture);
     plant_mount_marker(&fixture, &mount);
-    native_host(&fixture, RecordingRunner::default())
-        .mint_workspace_credentials(
-            &workspace(ImageFormat::Sparse),
-            &mount,
-            &fixture.root.join("resize.ca.key"),
-        )
-        .expect("workspace credentials");
+    mint_credentials(
+        &workspace(ImageFormat::Sparse),
+        &mount,
+        &fixture.root.join("resize.ca.key"),
+    )
+    .expect("workspace credentials");
     let runner = ResizeRunner::new(
         image.image(),
         ImageCapacity::from_gibibytes(100),
