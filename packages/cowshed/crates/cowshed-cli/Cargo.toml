@@ -14,6 +14,8 @@ base64 = "0.22"
 bytes = "1"
 cowshed-core.workspace = true
 cowshed-gateway = { path = "../cowshed-gateway" }
+clap.workspace = true
+
 libc = "0.2"
 sha2 = "0.10"
 serde.workspace = true
