@@ -10,8 +10,8 @@ use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, CreateOptions, DoctorReport, Finding, FindingSeverity, GcOptions,
     GcReport, GitOid, GrantDelta, GrantSet, ImageFormat, JobId, JobInfo, LandOptions, LandReport,
-    MirrorInfo, PortBlock, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, WorkspaceInfo, WorkspaceState,
+    MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
+    ResizeResult, WorkspaceInfo, WorkspaceState,
 };
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
@@ -468,7 +468,6 @@ impl ProjectRuntimeHost for FakeHost {
         let current = self.workspace(&main)?;
         Ok(self.snapshot(current))
     }
-
 
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {
         // Convergence, in miniature: an observed main checkout that differs from the recorded one
@@ -1386,7 +1385,6 @@ async fn workspace_at_uses_active_mount_facts_and_attach_preserves_exec_mount() 
     .await
     .expect("nested path resolution");
     assert_eq!(resolved["info"]["workspace"], "main");
-
 
     let created = route(
         &router,

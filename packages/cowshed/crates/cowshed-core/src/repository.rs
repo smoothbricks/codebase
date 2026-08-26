@@ -553,20 +553,17 @@ pub struct ProjectPaths {
 }
 
 impl ProjectPaths {
-
     pub fn with_mount_root(
         store_root: impl AsRef<Path>,
         host_mount_root: impl AsRef<Path>,
         repo_id: &RepoId,
     ) -> Result<Self, PathLayoutError> {
         let store_root = validate_store_root(store_root.as_ref())?.to_path_buf();
-        let host_mount_root =
-            validate_mount_root(host_mount_root.as_ref())?.to_path_buf();
+        let host_mount_root = validate_mount_root(host_mount_root.as_ref())?.to_path_buf();
         let owner = encode_layout_owner(repo_id.owner())?;
         let repo = encode_component(repo_id.repo())?;
         let project_root = checked_join(&store_root, [owner.as_str(), repo.as_str()])?;
-        let mount_root =
-            checked_join(&host_mount_root, [owner.as_str(), repo.as_str()])?;
+        let mount_root = checked_join(&host_mount_root, [owner.as_str(), repo.as_str()])?;
 
         Ok(Self {
             repository_binding: checked_join(&project_root, ["repository.json"])?,
@@ -1027,35 +1024,19 @@ mod tests {
     #[test]
     fn rejects_unsafe_store_roots() {
         assert_eq!(
-            ProjectPaths::with_mount_root(
-                "relative/store",
-                "/mounts",
-                &repo_id("acme/widget")
-            ),
+            ProjectPaths::with_mount_root("relative/store", "/mounts", &repo_id("acme/widget")),
             Err(PathLayoutError::StoreRootNotAbsolute)
         );
         assert_eq!(
-            ProjectPaths::with_mount_root(
-                "/safe/../escape",
-                "/mounts",
-                &repo_id("acme/widget")
-            ),
+            ProjectPaths::with_mount_root("/safe/../escape", "/mounts", &repo_id("acme/widget")),
             Err(PathLayoutError::StoreRootNotNormalized)
         );
         assert_eq!(
-            ProjectPaths::with_mount_root(
-                "/store",
-                "relative/mounts",
-                &repo_id("acme/widget")
-            ),
+            ProjectPaths::with_mount_root("/store", "relative/mounts", &repo_id("acme/widget")),
             Err(PathLayoutError::MountRootNotAbsolute)
         );
         assert_eq!(
-            ProjectPaths::with_mount_root(
-                "/store",
-                "/safe/../mounts",
-                &repo_id("acme/widget")
-            ),
+            ProjectPaths::with_mount_root("/store", "/safe/../mounts", &repo_id("acme/widget")),
             Err(PathLayoutError::MountRootNotNormalized)
         );
     }

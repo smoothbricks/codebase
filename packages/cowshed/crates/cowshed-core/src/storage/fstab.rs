@@ -9,7 +9,6 @@ pub enum FstabBuildError {
     NonUtf8Mountpoint(PathBuf),
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FstabPin {
     pub volume_uuid: String,

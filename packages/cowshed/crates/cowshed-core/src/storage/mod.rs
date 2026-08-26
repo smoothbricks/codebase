@@ -579,7 +579,9 @@ mod tests {
                 .checkpoint_image(&raven, &label, ImageFormat::Asif)
                 .unwrap()
                 .image,
-            Path::new("/private/cowshed/store/acme/widget/checkpoints/raven/ci-fail.2026-07-11.asif")
+            Path::new(
+                "/private/cowshed/store/acme/widget/checkpoints/raven/ci-fail.2026-07-11.asif"
+            )
         );
         assert_eq!(
             layout.workspace_mount(&raven).unwrap(),
@@ -591,10 +593,10 @@ mod tests {
     #[test]
     fn configured_host_root_changes_only_workspace_mount_derivation() {
         let root = temp_store("configured-mount-root");
-        let mount_root = root.parent().unwrap().join(format!(
-            "cowshed-custom-mounts-{}",
-            std::process::id()
-        ));
+        let mount_root = root
+            .parent()
+            .unwrap()
+            .join(format!("cowshed-custom-mounts-{}", std::process::id()));
         let plan = host_config::plan_mount_root_change(&root, &mount_root, []).unwrap();
         host_config::execute_mount_root_change(&plan).unwrap();
 

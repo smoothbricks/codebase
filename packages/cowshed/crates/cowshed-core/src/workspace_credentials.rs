@@ -13,7 +13,9 @@ use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use zeroize::Zeroizing;
 
-use crate::metadata::{Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes};
+use crate::metadata::{
+    Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes,
+};
 use crate::repository::RepoId;
 use crate::storage::lifecycle::LifecycleWorkspace;
 use crate::workspace_environment::{WorkspaceEnvironmentError, write_workspace_environment};
@@ -480,7 +482,8 @@ mod tests {
             &key_path,
         )
         .expect("first mint");
-        let first_token = fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
+        let first_token =
+            fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
         let first_environment =
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment");
         assert_eq!(
@@ -505,9 +508,10 @@ mod tests {
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("rotated environment");
         assert_ne!(second_token, first_token);
         assert_ne!(second_environment, first_environment);
-        assert!(second_environment.contains(&format!(
-            "export COWSHED_WORKSPACE_TOKEN={second_token}\n"
-        )));
+        assert!(
+            second_environment
+                .contains(&format!("export COWSHED_WORKSPACE_TOKEN={second_token}\n"))
+        );
         assert!(!second_environment.contains(&first_token));
 
         fs::remove_dir_all(root).expect("cleanup");
@@ -578,8 +582,7 @@ mod tests {
         let first_workspace = workspace("00112233445566778899aabbccddeeff");
         let second_workspace = workspace("ffeeddccbbaa99887766554433221100");
 
-        mint_credentials(&first_workspace, &first_mount, &first_key)
-            .expect("first credentials");
+        mint_credentials(&first_workspace, &first_mount, &first_key).expect("first credentials");
         mint_credentials(&second_workspace, &second_mount, &second_key)
             .expect("second credentials");
         assert_ne!(
@@ -608,7 +611,11 @@ mod tests {
         symlink(&outside, mount.join(CREDENTIAL_DIRECTORY)).expect("symlink");
         let key_path = root.join("staged.ca.key");
 
-        let error = mint_credentials(&workspace("00112233445566778899aabbccddeeff"), &mount, &key_path)
+        let error = mint_credentials(
+            &workspace("00112233445566778899aabbccddeeff"),
+            &mount,
+            &key_path,
+        )
         .expect_err("symlink must fail");
         assert!(matches!(
             error,
@@ -680,7 +687,11 @@ mod tests {
         let pair_key = root.join("pair.ca.key");
         let other_key = root.join("other.ca.key");
         mint_credentials(&subject, &pair_mount, &pair_key).unwrap();
-        mint_credentials(&workspace("ffeeddccbbaa99887766554433221100"), &other_mount, &other_key)
+        mint_credentials(
+            &workspace("ffeeddccbbaa99887766554433221100"),
+            &other_mount,
+            &other_key,
+        )
         .unwrap();
         assert!(read_gateway_workspace_credentials(&subject, &pair_mount, &other_key).is_err());
 

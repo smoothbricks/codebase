@@ -34,12 +34,14 @@ pub fn write_workspace_environment(
         ));
     }
     match (platform, port_block) {
-        (Platform::Macos, Some(block)) => block.validate().map_err(|_| {
-            WorkspaceEnvironmentError::InvalidPortWiring {
-                platform,
-                port_block,
-            }
-        })?,
+        (Platform::Macos, Some(block)) => {
+            block
+                .validate()
+                .map_err(|_| WorkspaceEnvironmentError::InvalidPortWiring {
+                    platform,
+                    port_block,
+                })?
+        }
         (Platform::Linux, None) => {}
         _ => {
             return Err(WorkspaceEnvironmentError::InvalidPortWiring {
@@ -62,7 +64,10 @@ pub fn write_workspace_environment(
         contents.push_str(&format!("export COWSHED_PORT_BASE={}\n", block.base()));
     }
 
-    write_atomic_bytes(&image_root.join(WORKSPACE_ENVIRONMENT_PATH), contents.as_bytes())?;
+    write_atomic_bytes(
+        &image_root.join(WORKSPACE_ENVIRONMENT_PATH),
+        contents.as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -70,7 +75,10 @@ fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-')
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
         })
     {
         return value.to_owned();

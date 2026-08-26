@@ -26,13 +26,13 @@ use crate::output::Output;
 use crate::sccache_service::{remove_stale_socket, sccache_launch_agent};
 use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
+use cowshed_core::metadata::ImageFormat;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
     VolumeOutcome, VolumeRole, VolumeState, execute_host_setup, execute_host_uninstall,
     plan_host_setup, plan_host_uninstall,
 };
-use cowshed_core::metadata::ImageFormat;
 use cowshed_core::storage::host_config::{
     AttachedWorkspace, HostConfigError, execute_mount_root_change, plan_mount_root_change,
 };
@@ -59,8 +59,7 @@ const AUTHORIZATION_ANNOUNCEMENT: &str =
 
 /// The teardown counterpart. Removing fstab pins edits a root-owned file, so it escalates for its
 /// own reason and says so in its own words.
-const UNINSTALL_AUTHORIZATION_ANNOUNCEMENT: &str =
-    "setup --uninstall will request administrator authorization to remove cowshed's /etc/fstab pins";
+const UNINSTALL_AUTHORIZATION_ANNOUNCEMENT: &str = "setup --uninstall will request administrator authorization to remove cowshed's /etc/fstab pins";
 
 /// The promise a run can make when its plan mints nothing and removes nothing.
 ///
@@ -83,7 +82,9 @@ pub enum WorkspaceCensus {
         repo_ids: Vec<String>,
         workspaces: usize,
     },
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+    },
 }
 
 /// What setup could observe about the always-mounted mains.
@@ -97,7 +98,9 @@ pub enum WorkspaceCensus {
 pub enum MainMounts {
     /// Every adopted project was checked; these are the ones whose main is not mounted.
     Checked(Vec<UnreachableMain>),
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+    },
 }
 
 /// One host artifact teardown touched, in the order it was touched.
@@ -401,10 +404,7 @@ where
             .map_err(output_error)?;
     }
     output
-        .guidance(&format!(
-            "workspace mount root is {}",
-            path.display()
-        ))
+        .guidance(&format!("workspace mount root is {}", path.display()))
         .map_err(output_error)?;
     output.hint("cowshed doctor").map_err(output_error)?;
     Ok(0)
@@ -635,11 +635,7 @@ fn announce_uninstall<W: Write, E: Write>(
 }
 
 /// One disclosure line, unsuppressible exactly when it is explaining a dialog.
-fn emit<W: Write, E: Write>(
-    escalating: bool,
-    line: &str,
-    output: &mut Output<W, E>,
-) -> Result<()> {
+fn emit<W: Write, E: Write>(escalating: bool, line: &str, output: &mut Output<W, E>) -> Result<()> {
     if escalating {
         output.announce(line)
     } else {
@@ -836,9 +832,9 @@ fn state_phrase(state: &VolumeState) -> String {
     match state {
         VolumeState::Absent => String::from("absent"),
         VolumeState::MountedValid => String::from("mounted at its canonical path"),
-        VolumeState::MountedIncomplete => {
-            String::from("mounted, but its contents could not be identified as this host's cowshed volume")
-        }
+        VolumeState::MountedIncomplete => String::from(
+            "mounted, but its contents could not be identified as this host's cowshed volume",
+        ),
         VolumeState::Detached => String::from("present but not mounted"),
         VolumeState::MisMounted { mounted_at } => {
             format!("mis-mounted at {}", mounted_at.display())
@@ -874,9 +870,9 @@ fn state_guidance(state: &VolumeState) -> Option<String> {
         | VolumeState::MountedIncomplete
         | VolumeState::Detached
         | VolumeState::MisMounted { .. } => None,
-        VolumeState::FoundElsewhere { device, .. } => {
-            Some(format!("data is safe on {device}; cowshed left it untouched"))
-        }
+        VolumeState::FoundElsewhere { device, .. } => Some(format!(
+            "data is safe on {device}; cowshed left it untouched"
+        )),
     }
 }
 
@@ -891,9 +887,7 @@ fn fstab_phrase(fstab: &FstabOutcome) -> String {
 fn uninstall_fstab_phrase(fstab: &UninstallFstabOutcome) -> String {
     match fstab {
         UninstallFstabOutcome::Removed => String::from("removed cowshed's /etc/fstab pins"),
-        UninstallFstabOutcome::AlreadyClean => {
-            String::from("/etc/fstab carried no cowshed pins")
-        }
+        UninstallFstabOutcome::AlreadyClean => String::from("/etc/fstab carried no cowshed pins"),
     }
 }
 
@@ -922,15 +916,12 @@ fn repair_status(
     mains: Option<&MainMounts>,
 ) -> String {
     if report.failure().is_some() {
-        let done = count_outcomes(report, |result| {
-            matches!(result, HostActionResult::Done)
-        });
+        let done = count_outcomes(report, |result| matches!(result, HostActionResult::Done));
         let failed = count_outcomes(report, |result| {
             matches!(result, HostActionResult::Failed { .. })
         });
-        let not_attempted = count_outcomes(report, |result| {
-            matches!(result, HostActionResult::Skipped)
-        });
+        let not_attempted =
+            count_outcomes(report, |result| matches!(result, HostActionResult::Skipped));
         return format!(
             "host storage is NOT set up: {done} {} done, {failed} failed, {not_attempted} not attempted",
             plural(done, "action", "actions"),
