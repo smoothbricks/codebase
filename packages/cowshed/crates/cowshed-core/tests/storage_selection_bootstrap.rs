@@ -35,7 +35,7 @@ fn absent_zfs_storage() -> BootstrapEvidence {
         root: ExistingStorage::Absent,
         store: ExistingStorage::Absent,
         caches: ExistingStorage::Absent,
-        projects: ExistingStorage::Absent,
+        projects: Box::new(ExistingStorage::Absent),
     }
 }
 
@@ -51,10 +51,10 @@ fn mounted_zfs_storage(pool: &str) -> BootstrapEvidence {
         root: ExistingStorage::mounted_valid(format!("{pool}/cowshed")),
         store: ExistingStorage::mounted_valid(format!("{pool}/cowshed/store")),
         caches: ExistingStorage::mounted_valid(format!("{pool}/cowshed/caches")),
-        projects: ExistingStorage::existing_unmounted(
+        projects: Box::new(ExistingStorage::existing_unmounted(
             format!("{pool}/cowshed/projects"),
             VolumeMarker::new(VolumeRole::Projects, SubstrateKind::Zfs),
-        ),
+        )),
     }
 }
 
@@ -344,10 +344,7 @@ fn apfs_plan_has_exact_roots_commands_markers_and_store_first_order() {
     let plan = plan_bootstrap(selected, Path::new("/Users/alice"), absent_apfs_storage()).unwrap();
     assert_eq!(plan.home(), Path::new("/Users/alice"));
     assert_eq!(plan.roots().store(), Path::new("/private/cowshed/store"));
-    assert_eq!(
-        plan.roots().caches(),
-        Path::new("/private/cowshed/caches")
-    );
+    assert_eq!(plan.roots().caches(), Path::new("/private/cowshed/caches"));
 
     assert!(matches!(
         &plan.operations()[0],
@@ -541,10 +538,10 @@ fn create_or_heal_uses_only_exact_existing_storage_evidence() {
                 "tank/cowshed/caches",
                 VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Zfs),
             ),
-            projects: ExistingStorage::existing_unmounted(
+            projects: Box::new(ExistingStorage::existing_unmounted(
                 "tank/cowshed/projects",
                 VolumeMarker::new(VolumeRole::Projects, SubstrateKind::Zfs),
-            ),
+            )),
         },
     )
     .unwrap();
@@ -615,7 +612,7 @@ fn bootstrap_evidence_must_match_the_selected_exact_storage() {
                 root: ExistingStorage::mounted_valid("other/cowshed"),
                 store: ExistingStorage::Absent,
                 caches: ExistingStorage::Absent,
-                projects: ExistingStorage::Absent,
+                projects: Box::new(ExistingStorage::Absent),
             }
         ),
         Err(PlanError::UnexpectedStorageIdentifier { expected, actual })
@@ -669,7 +666,7 @@ fn unmounted_existing_storage_requires_a_current_exact_marker() {
                         marker: invalid,
                     },
                     caches: ExistingStorage::Absent,
-                    projects: ExistingStorage::Absent,
+                    projects: Box::new(ExistingStorage::Absent),
                 },
             ),
             Err(PlanError::InvalidExistingStorageMarker {
@@ -713,7 +710,7 @@ fn sibling_volume_roots_plan_independently_but_zfs_children_still_require_their_
                 root: ExistingStorage::Absent,
                 store: ExistingStorage::mounted_valid("tank/cowshed/store"),
                 caches: ExistingStorage::Absent,
-                projects: ExistingStorage::Absent,
+                projects: Box::new(ExistingStorage::Absent),
             },
         ),
         Err(PlanError::ImpossibleStorageTopology(_))
@@ -1108,7 +1105,7 @@ fn existing_unmounted_plan(zfs: bool, caches: ExistingStorage) -> BootstrapPlan 
                     VolumeMarker::new(VolumeRole::Store, SubstrateKind::Zfs),
                 ),
                 caches,
-                projects: ExistingStorage::Absent,
+                projects: Box::new(ExistingStorage::Absent),
             },
         )
         .unwrap()
