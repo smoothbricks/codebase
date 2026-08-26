@@ -29,18 +29,19 @@ Each `owner` and `repo` component is encoded independently as one filesystem com
 layout root, an owner component equal to a host namespace (`gateway`, `telemetry`, `caches`, `mnt`, or
 `.cowshed-volume.json`) is also percent-escaped, so a valid remote identity can never alias controller infrastructure.
 The `/` in `repo_id` is the one layout separator, never untrusted path text. Thus `acme/widget` maps to
-`~/.cowshed/acme/widget/`; containment is checked after joining and symlinks are refused. The repository binding is
-`~/.cowshed/acme/widget/repository.json`; trusted project policy is `~/.cowshed/acme/widget/policy.json`. Both are
+`/private/cowshed/store/acme/widget/`; containment is checked after joining and symlinks are refused. The repository binding is
+`/private/cowshed/store/acme/widget/repository.json`; trusted project policy is `/private/cowshed/store/acme/widget/policy.json`. Both are
 controller-owned, mode 0600, and never visible to a sandbox. Every path below uses the primary `repo_id` through this
 component-safe mapping.
 
 ## Directory layout
 
-`~/.cowshed` **is** the `cowshed.store` volume — the dotdir is a mountpoint, not a directory tree on Data. There is no
-intermediate `store/` level; the volume root is the layout root:
+`/private/cowshed/store` **is** the `cowshed.store` volume — the path is a mountpoint pinned in `/etc/fstab`, not a
+directory tree on Data and not inside any user's home. There is no intermediate `store/` level; the volume root is the
+layout root:
 
 ```
-~/.cowshed/                          # ← the cowshed.store volume, mounted here (see "Dedicated volumes")
+/private/cowshed/store/                          # ← the cowshed.store volume, fstab-pinned here (see "Dedicated volumes")
   .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (see mount ordering below)
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
@@ -65,10 +66,12 @@ intermediate `store/` level; the volume root is the layout root:
   caches/                            # ← cowshed.caches volume, NESTED mount (mirror, git mirrors, layer-3 caches)
   mnt/<owner>/<repo>/<workspace>/    # ← session workspace mounts, nested (empty dirs when detached)
 
-~/Library/LaunchAgents/dev.cowshed.*.plist   # the ONLY ~/Library residue — launchd requires this location;
-                                             # home-manager-owned on nix hosts (14_nix.md)
-~/Library/Logs/cowshed/daemon-stderr.log     # launchd stderr for pre-tracer-init crashes only; kept off the
-                                             # ~/.cowshed mountpoint so reboot remount cannot be masked
+~/Library/LaunchAgents/dev.cowshed.*.plist   # launchd service definitions (gateway daemonizes to a system
+                                             # LaunchDaemon; sccache stays per-user); home-manager-owned on nix hosts
+                                             # (14_nix.md). The gateway/sccache binaries they run live at a host-stable
+                                             # install path, never inside a workspace mount.
+~/Library/Logs/cowshed/*.log                 # launchd stderr for pre-tracer-init crashes only; kept off the
+                                             # /private/cowshed/store mountpoint so a reboot cannot recreate a masking stub
 ```
 
 Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Repository paths are safe because both `repo_id`
@@ -86,10 +89,10 @@ and fsck domain.
 
 ### Two `.cowshed` namespaces
 
-The name appears in two namespaces that must not be confused. **Host-absolute `~/.cowshed`** exists once — it is the
+The name appears in two namespaces that must not be confused. **Host-absolute `/private/cowshed/store`** exists once — it is the
 herd's: images, grants, caches, telemetry, mounts. **In-image relative `.cowshed/`** exists once _per workspace_, at
 each volume root — the marker, token, CA certificate, in-image cache roots, job spools — and travels with every clone.
-The wiring rule follows the split: shared/rebuildable state resolves to host-absolute `~/.cowshed/...` paths (the same
+The wiring rule follows the split: shared/rebuildable state resolves to host-absolute `/private/cowshed/store/...` paths (the same
 string in every context), workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in every
 clone automatically). Main and sessions use identical wiring; only the sandbox's permission mask differs.
 
@@ -140,10 +143,10 @@ attachment tools remain disjoint. Ownership is also guaranteed by the ASIF chown
 
 For every mounted attachment:
 
-- Session workspaces mount at `~/.cowshed/mnt/<owner>/<repo>/<workspace>`. `-nobrowse` keeps every cowshed volume out of
+- Session workspaces mount at `/private/cowshed/store/mnt/<owner>/<repo>/<workspace>`. `-nobrowse` keeps every cowshed volume out of
   Finder, the Desktop, and the sidebar regardless of Finder preferences.
 - The **main workspace mounts where its project's checkout layout says** (02_workspaces.md): at the repository's
-  original path (written `<project-root>` below) under direct mount, or at `~/.cowshed/mnt/<owner>/<repo>/main` with a
+  original path (written `<project-root>` below) under direct mount, or at `/private/cowshed/store/mnt/<owner>/<repo>/main` with a
   symlink at the original path under the symlink layout. Either way the user keeps working at the path they know.
 - Mountpoint directories are created before attach and removed by `cowshed gc`; an empty mountpoint dir is the defined
   "detached" state, and the underlying dir holds a stub `.envrc` used for self-healing (see 02_workspaces.md).
@@ -157,7 +160,7 @@ For every mounted attachment:
 
 Three questions, three authorities, none of them the volume label:
 
-- **Which volumes are cowshed's?** Ownership is by location. Every backing image lives under `~/.cowshed`, and
+- **Which volumes are cowshed's?** Ownership is by location. Every backing image lives under `/private/cowshed/store`, and
   enumeration is a `readdir` of that tree (`sessions/` plus the one canonical `main` image per project) — never a scan
   of `diskutil list`. A volume cowshed did not create has no image there and is therefore invisible to enumeration, gc,
   and crash-window classification regardless of what it is called.
@@ -182,32 +185,51 @@ within one project, but that key is computed from metadata on both sides and nev
 All cowshed bytes live on two dedicated APFS volumes, split by **rebuildability class**, so the Data volume carries no
 cowshed churn at all:
 
-- **`cowshed.caches`**, mounted at `~/.cowshed/caches` — everything rebuildable. Layout:
-  `~/.cowshed/caches/{mirror,repo-mirrors,cargo,sccache,zig,gradle,go/{mod,build},nix/{cache,state}}` (see
+- **`cowshed.caches`**, mounted at `/private/cowshed/caches` — everything rebuildable. Layout:
+  `/private/cowshed/caches/{mirror,repo-mirrors,cargo,sccache,zig,gradle,go/{mod,build},nix/{cache,state}}` (see
   03_caches.md). `repo-mirrors/` holds bare git mirrors (`<host>/<org>/<repo>.git`) — written only by the gateway via
   `cowshed repo mirror`, sandbox-read-only, and distinct from Cargo's shared writable `cargo/git` cache. Because nothing
   unique lives here, the nuclear recovery path is always safe: `diskutil apfs deleteVolume` + lazy recreate — the mirror
   refetches, sccache and registries rebuild. `cowshed doctor` offers it as the fix for cache-volume corruption;
   `cowshed gc` never needs more than it.
-- **`cowshed.store`**, mounted at `~/.cowshed` — images, grant sidecars, waivers, quarantine, gateway config and audit,
+- **`cowshed.store`**, mounted at `/private/cowshed/store` — images, grant sidecars, waivers, quarantine, gateway config and audit,
   telemetry. Mostly rebuildable, with a small unique window: uncommitted work between autosaves (02_workspaces.md);
   durability is still git. Same-volume clonefile is preserved by construction — main → sessions → checkpoints and trash
   renames all stay within `cowshed.store`.
 
 Both volumes are created lazily by explicit foreground `cowshed adopt`
-(`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`, then mounted `-nobrowse`) and share
-the container's free-space pool — no sizing, no space cost for the split. The complete create/mount/ownership
-transaction uses the one provisioning authorization session described in 14_nix.md. macOS auto-mounts container volumes
-at boot, but `-nobrowse` is not sticky. `cowshed ensure`, `cowshed doctor`, and the RunAtLoad gateway therefore reclaim
-a Data-volume launchd stub (only `telemetry/daemon-stderr.log` and `telemetry/sccache-stderr.log`) and remount an
-already-created cowshed volume at its canonical path with `-nobrowse`. That remount is unprivileged `diskutil` work and
-does not open an authorization prompt. Volume _creation_ remains foreground `cowshed adopt` only. If either dedicated
-volume is absent, or the mountpoint holds anything other than a reclaimable stub, existing-only commands fail before
-mutation with `environment-missing` and `next: cowshed adopt`.
+(`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`) and share the container's
+free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
+provisioning authorization session described in 14_nix.md. Volume _creation_ remains foreground `cowshed adopt` only.
+
+**Boot mounting is pinned in `/etc/fstab`, not delegated to cowshed.** At provision, the same authorization session
+appends one idempotent, comment-tagged line per volume:
+
+```
+UUID=<store-uuid>  /private/cowshed/store   apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.store
+UUID=<caches-uuid> /private/cowshed/caches  apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.caches
+```
+
+UUID form because labels are mutable (the same lesson nix-installer learned in DeterminateSystems/nix-installer#212).
+`diskarbitrationd` reads fstab in userspace — no SIP interaction — and mounts both volumes at these paths before login,
+so a reboot never depends on any cowshed binary existing: the remounter cannot live inside what it remounts. `nobrowse`
+keeps both volumes out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes` at all.
+
+**`noowners` is deliberate.** The herd is machine-global and shared by every local account: with ownership honoring off,
+every user sees the same bytes as their own, which is exactly right for git checkouts (git tracks mode bits, never
+owners) and rebuildable caches. It also removes the entire class of "mounted by another uid" classification failures.
+The trust consequence is stated plainly: any local user can read or write anything on either volume. Cowshed is for
+machines whose local accounts trust each other; stronger isolation is a different product.
+
+If either dedicated volume is absent, or the mountpoint holds anything other than a reclaimable stub, existing-only
+commands fail before mutation with `environment-missing` and an explanation of exactly which volumes are missing,
+detached, or mis-mounted and what will repair each state. A volume macOS auto-mounted at `/Volumes/<name>` is
+**mis-mounted**, not missing: repairing it is unprivileged `diskutil unmount` + mount-at-canonical-path work that
+`cowshed ensure`, `cowshed doctor`, and the gateway's RunAtLoad heal perform inline, without an authorization prompt.
 
 **Mount ordering and the unmounted-masking guard.** The layout nests: the caches volume and every workspace mount at
 directories that live _on_ the store volume, so validation and remount sequence store → caches → workspaces. When the
-store volume is not mounted, `~/.cowshed` is a bare directory on Data; the volume-root marker `.cowshed-volume.json` is
+store volume is not mounted, `/private/cowshed/store` is a bare directory on Data; the volume-root marker `.cowshed-volume.json` is
 how every cowshed command tells the difference. launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`,
 never under the mountpoint, so a reboot cannot recreate the masking stub. A leftover `telemetry/` stub from an older
 plist is deleted before remount.
@@ -218,6 +240,17 @@ backup, not snapshotting). Dedicated volumes get no local snapshots, collapse ba
 isolate fsck domains and corruption blast radius (cache loss = re-download; store loss = WIP since last autosave; Data
 untouched either way), and leave the only volume with sandbox-writable subtrees — the caches volume — holding nothing
 precious.
+
+### One herd, multiple users
+
+There is one cowshed per machine, anchored to no account. `/private/cowshed/{store,caches}` are plain directories on
+Data created once at provision; they exist only as mountpoints and fstab targets. Per-user conveniences are
+unprivileged symlinks (`~/.cowshed → /private/cowshed/store`) written by `cowshed ensure` purely for muscle memory;
+no cowshed evidence, sandbox profile, or metadata derives a path from `$HOME`. Workspace images remain separate
+volumes mounted under `store/mnt/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by
+sharing; concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and
+cross-user `gc` policy is deliberately blunt: any user may retire any shed, because `noowners` already made the
+trust model explicit.
 
 ## Runtime state: derived, never stored
 
@@ -359,7 +392,7 @@ ASIF measures decisively better on I/O and metadata (2–5.6×) at the cost of ~
 path (`diskutil image attach`).
 
 **`/Volumes` mount root rejected.** DiskArbitration-managed mountpoints save a mkdir/rmdir pair but put cowshed paths in
-a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). `~/.cowshed/mnt` gives
+a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). `/private/cowshed/store/mnt` gives
 short, stable, hidden paths cowshed fully owns.
 
 **`~/Library/Application Support` rejected.** The Apple-idiomatic location puts multi-GB churning images on the Data
@@ -367,9 +400,9 @@ volume, where local snapshots pin their rewritten blocks and backup policy needs
 dedicated volumes cost nothing (container space-sharing) and reduce cowshed's `~/Library` footprint to the launchd
 plists that must live there.
 
-**A `store/` sub-mountpoint rejected.** Mounting the store volume at `~/.cowshed/store` left `~/.cowshed` as a real
+**A `store/` sub-mountpoint rejected.** Mounting the store volume at `/private/cowshed/store/store` left `/private/cowshed/store` as a real
 Data-volume directory holding one wrapper level that meant nothing to users ("store with nested telemetry"). Mounting
-the volume at `~/.cowshed` itself makes the dotdir a door, not a room: one empty mountpoint inode on Data, every other
+the volume at `/private/cowshed/store` itself makes the dotdir a door, not a room: one empty mountpoint inode on Data, every other
 path one level shorter, and "cowshed stuff lives in the cowshed" is literally true. The costs — mount ordering and the
 bare-directory guard above — are machinery `ensure` already had for the workspaces.
 

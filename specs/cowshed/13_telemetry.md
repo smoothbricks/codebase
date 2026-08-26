@@ -107,14 +107,14 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   that lineage is what authorizes records an ancestor wrote into a cloned image.
 - **Authority is the host inventory.** What workspaces exist, which incarnation each is, which are retired, which
   lineage an image carries, and which port block and grants belong to a workspace are read from the images and mounts
-  under `~/.cowshed/`, the per-workspace grants files, and the controller lock. No log is replayed for any of these
+  under `/private/cowshed/store/`, the per-workspace grants files, and the controller lock. No log is replayed for any of these
   decisions; a controller that opens a project reads the inventory once and starts.
 - **Controller audit records** — every controller act (workspace introduced/retired, job admission and terminal state,
   checkpoint, fork, restore) is emitted as one typed `ControllerCommitment` record to an audit sink. The records carry
   existence, lifecycle/status, a writer-local order, lineage, byte counts, and expected hashes; they never contain
   inline output, a protected artifact path, a redirect source, or any other raw stdout/stderr payload duplication.
   **Nothing reads them for a decision.** The sink is selected when the project opens (`COWSHED_CONTINUITY_AUDIT`):
-  `arrow` (default for the standalone CLI) writes sealed per-writer segments under `~/.cowshed/telemetry/`, `off`
+  `arrow` (default for the standalone CLI) writes sealed per-writer segments under `/private/cowshed/store/telemetry/`, `off`
   discards, and a supervising runtime injects its own sink through `ProjectRuntime::open_existing_with_audit`
   (Containium routes the same records into PTMCART). A sink that refuses a record is a `doctor` finding (`audit-sink`),
   never a reason to fail the act it describes.
@@ -132,7 +132,7 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   acts, each acknowledged by the sink before the next; the short-timer one-batch crash window applies to diagnostic
   events; gateway decision boundaries retain the flush policy below.
 - **The one text-file survivor** — `~/Library/Logs/cowshed/daemon-stderr.log`, the launchd `StandardErrorPath` target,
-  exists only for crashes before tracer initialization. It lives off the `~/.cowshed` mountpoint so reboot remount
+  exists only for crashes before tracer initialization. It lives off the `/private/cowshed/store` mountpoint so reboot remount
   cannot be masked. `doctor` flags it when non-empty.
 
 `StreamInfo` is the shared content descriptor:

@@ -65,20 +65,20 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
                                          │          │
                     ┌────────────────────┘          └──────────────────┐
                     ▼                                                  ▼
-        ~/.cowshed/  (= the cowshed.store volume)                  cowshed-gateway (localhost)
+        /private/cowshed/store/  (= the cowshed.store volume)                  cowshed-gateway (localhost)
         <owner>/<repo>/main{.asif|.sparseimage} ─ clonefile ─►    npm/cargo mirror · per-workspace CA interception
         <owner>/<repo>/sessions/<ws>{.asif|.sparseimage}          repo-mirror verb · Arrow audit (13)
         <owner>/<repo>/sessions/<ws>{.asif|.sparseimage}.grants.json    │
                     │                                                ▼
                     ▼ format-selected attach                 cowshed.caches APFS volume
-        ~/.cowshed/mnt/<owner>/<repo>/<ws>/          ◄─ sccache/zig/gradle ─  ~/.cowshed/caches/
+        /private/cowshed/store/mnt/<owner>/<repo>/<ws>/          ◄─ sccache/zig/gradle ─  /private/cowshed/caches/
         (workspace: src + .git + node_modules + target)
 ```
 
 The diagram shows the macOS/APFS substrate: ASIF images use `.asif` and `diskutil image attach`, while SPARSE fallback
 images use `.sparseimage` and `hdiutil attach`; detached metadata selects the tool and must agree with the extension
 (01_storage.md). On Linux the same logical shape holds with ZFS datasets in place of image files and the store mounted
-directly at `~/.cowshed` with the caches dataset nested at `~/.cowshed/caches` (09_substrates.md). Both volumes are
+directly at `/private/cowshed/store` with the caches dataset nested at `/private/cowshed/caches` (09_substrates.md). Both volumes are
 dedicated: the Data volume carries no cowshed bytes (01_storage.md).
 
 Gateway reachability is deliberately platform-specific. macOS package clients use the workspace's `portBlock.base`.
@@ -101,7 +101,7 @@ validates it on every open, permits multiple bound identities with exactly one p
 `repo_id` for a local-only repository. Discovery never mints an identity: it may select a remote only when every
 normalized candidate has the same `repo_id`; distinct candidates require an explicit matching `repo_id`, with `origin`
 preferred only among remotes for that same identity. Each component is validated and encoded independently before path
-joining. Trusted project policy lives only at `~/.cowshed/<owner>/<repo>/policy.json`, outside every workspace and
+joining. Trusted project policy lives only at `/private/cowshed/store/<owner>/<repo>/policy.json`, outside every workspace and
 denied to sandboxes (01_storage.md).
 
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
@@ -110,7 +110,7 @@ in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnati
 database**. The persistent daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md),
 with the optional MCP socket server (12_mcp.md). Linux additionally has one ephemeral minimal connector per attached
 workspace; it is attachment plumbing and stores no authority. Runtime processes hold no sole authority: kill them and
-the next command rederives lifecycle from the host inventory — the images and mounts under `~/.cowshed/`, the marker
+the next command rederives lifecycle from the host inventory — the images and mounts under `/private/cowshed/store/`, the marker
 each image carries (incarnation and lineage), the per-workspace grants files, and the controller lock — together with
 the protected in-volume job evidence. The trusted supervisor is nevertheless the sole live writer of that in-volume
 evidence; the controller emits each of its acts as a compact audit record to an optional sink.

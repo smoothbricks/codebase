@@ -45,7 +45,7 @@ Shape:
 ;; (measured: the kernel canonicalizes the connect target before matching — a
 ;; /tmp-spelled rule silently denies what a /private/tmp rule allows).
 (allow network-outbound (remote unix-socket (path-literal "<nix daemon socket>")))
-(allow network-outbound (remote unix-socket (path-literal "~/.cowshed/sccache.sock")))  ;; host sccache daemon
+(allow network-outbound (remote unix-socket (path-literal "/private/cowshed/store/sccache.sock")))  ;; host sccache daemon
 (allow network-outbound (remote unix-socket (path-literal "<own supervisor socket>")))
 
 ;; Loopback TCP — isolation rides ENTIRELY on outbound. Measured SBPL constraints
@@ -78,21 +78,21 @@ Shape:
   … granted write paths …)
 
 ;; The cowshed tree: deny the volume, carve back the workspace's share.
-;; `~/.cowshed` IS the store volume (01_storage.md) and everything cowshed mounts
+;; `/private/cowshed/store` IS the store volume (01_storage.md) and everything cowshed mounts
 ;; nests beneath it, so ONE subtree deny covers images, grant files, CA keys,
 ;; telemetry, gateway state, AND every sibling workspace's mount — including
 ;; projects adopted after this profile was generated. SBPL is last-match-wins,
 ;; so the carve-backs are emitted AFTER the deny:
-(deny file-read* file-write* (subpath "~/.cowshed"))
-(allow file-read* (subpath "~/.cowshed/caches"))       ;; layer-1/3 caches: readable
+(deny file-read* file-write* (subpath "/private/cowshed/store"))
+(allow file-read* (subpath "/private/cowshed/caches"))       ;; layer-1/3 caches: readable
 ;; sccache is absent from the write list: its store is daemon-write-only
 ;; (03_caches.md) — clients speak to the host daemon over the socket above
 ;; and never touch the store directly.
 (allow file-write*
-  (subpath "~/.cowshed/caches/zig")
-  (subpath "~/.cowshed/caches/gradle")
-  (subpath "~/.cowshed/caches/go/mod")
-  (subpath "~/.cowshed/caches/go/build"))
+  (subpath "/private/cowshed/caches/zig")
+  (subpath "/private/cowshed/caches/gradle")
+  (subpath "/private/cowshed/caches/go/mod")
+  (subpath "/private/cowshed/caches/go/build"))
 (allow file-read* file-write* (subpath "<workspace mount>"))  ;; own mount ONLY
 
 ;; Secrets: denied. SBPL is LAST-MATCH-WINS (measured, both directions, network
@@ -144,10 +144,10 @@ Notes:
 - The broad `file-read-data` allow is required for dyld; confidentiality is achieved by explicit denies — which work
   **only because of emission order**. SBPL has no deny-beats-allow precedence: evaluation is last-match-wins (measured:
   the same rules in the opposite order leave the token readable). Profiles are generated in four ordered **layers** —
-  broad allows → the `~/.cowshed` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes,
+  broad allows → the `/private/cowshed/store` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes,
   own mount) → secret denies — and a unit test (08_testing.md) asserts the layer order plus probe paths (grant file, CA
   key, sibling image, sibling mount unreadable; own mount and designated caches writable). The single subtree deny on
-  `~/.cowshed` is _structurally_ stronger than the old enumerated list: sibling workspace mounts and projects adopted
+  `/private/cowshed/store` is _structurally_ stronger than the old enumerated list: sibling workspace mounts and projects adopted
   after profile generation are covered without being named.
 - The caches volume's **mirror** and **git** (bare-mirror) subtrees are readable but never writable from a sandbox (only
   the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
@@ -191,10 +191,10 @@ Notes:
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may
   propose an identity but never silently mint one. For that identity cowshed computes the canonical-path union of (1)
-  built-in secret and control-plane denies, (2) operator denies from trusted `~/.cowshed/<owner>/<repo>/policy.json`,
+  built-in secret and control-plane denies, (2) operator denies from trusted `/private/cowshed/store/<owner>/<repo>/policy.json`,
   and (3) additional denies declared by the repository. Repository-controlled config may add denies but cannot remove,
   replace, mask, or carve back either earlier layer. The trusted path is constructed as
-  `~/.cowshed/<owner>/<repo>/policy.json`: `owner` and `repo` are separately lowercased and validated as non-empty
+  `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately lowercased and validated as non-empty
   `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and decoded aliases are rejected before
   any join. The policy is read by the controller, never through a repository-relative path, and the resulting deny
   snapshot is recorded with the grant revision. Missing policy means no operator-added entries; malformed or unreadable
@@ -313,7 +313,7 @@ uid's own device sets — cannot run under the closed baseline: CoreSimulator is
 XPC/unix sockets the baseline's scoped IPC rules deny. The **"simulator" preset** is a named grant class
 (`cowshed grant <ws> --preset simulator`) that relaxes exactly that surface — the CoreSimulator service lookups and
 sockets, nothing else. It is a documented preset, not an escape hatch: the secret denies still terminate the profile,
-the `~/.cowshed` deny still stands, and egress is untouched. The precise mach-lookup/socket inventory is an
+the `/private/cowshed/store` deny still stands, and egress is untouched. The precise mach-lookup/socket inventory is an
 implementation-time verification item (kickoff); the escape suite pins that the preset does not widen filesystem or
 network authority. Note the preset concerns the **dev uid's own** simulators only — the personal-session simulator is
 never reached through Seatbelt at all, only through the gateway `/sim/` broker and its grant axis above.
@@ -422,7 +422,7 @@ guarantees cowshed owns:
   caches), documented, never proxied. GC-root registration for `.devenv` profiles is likewise daemon-side; no grant
   needed.
 - **Nix client state**: the closed baseline's writable roots additionally include the shared cache subtrees `nix/cache`
-  and `nix/state` under `~/.cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite files; they
+  and `nix/state` under `/private/cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite files; they
   stay on the host and are shared across workspaces like any concurrency-safe cache. They live under the cowshed caches
   root rather than under the user's `~/.cache` and `~/.local/state`, because the sandbox never grants a path inside the
   real `$HOME` — the workspace's `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all private, in-image directories,
@@ -498,10 +498,10 @@ workspace must also ride block ports. On Linux the netns makes both moot: each w
 ## The sccache daemon as trusted mediator
 
 The host-owned sccache server (03_caches.md) follows the nix-daemon doctrine: a scoped canonical-path `unix-socket`
-allow in the baseline (`~/.cowshed/sccache.sock`), a daemon running _outside_ every sandbox, and no protocol translation
+allow in the baseline (`/private/cowshed/store/sccache.sock`), a daemon running _outside_ every sandbox, and no protocol translation
 by cowshed — sccache speaks its own client-server protocol, and cowshed adds lifecycle (the `dev.cowshed.sccache`
 LaunchAgent, managed by `cowshed sccache start|stop|status`) plus scoped access, nothing else. Unlike the nix socket,
-the path is admitted without resolving to a live socket: it is a cowshed-owned constant under `~/.cowshed`, where the
+the path is admitted without resolving to a live socket: it is a cowshed-owned constant under `/private/cowshed/store`, where the
 store-wide deny leaves sandboxes unable to create, unlink, or bind anything, so naming the path grants nothing a sandbox
 could conjure and profiles stay correct across daemon restarts and late installs. The same deny doubles as the client
 fail-fast: sccache 0.16 has no client flag that suppresses spawning a fallback server on connect failure
@@ -514,14 +514,14 @@ binary with client-supplied arguments and environment, unsandboxed, at the clien
 arbitrary user-uid execution outside the sandbox. Accepted: the confinement threat model (semi-trusted agents running
 the user's own code) already concedes that class to a deliberate adversary through layer-3 cache poisoning — a poisoned
 sccache entry feeds main's next build (03_caches.md) — so the daemon adds immediacy, not new reach. In exchange the
-store itself narrows: the `~/.cowshed/caches/sccache` write carve-back is gone and every cache write flows through the
+store itself narrows: the `/private/cowshed/caches/sccache` write carve-back is gone and every cache write flows through the
 daemon.
 
 ## Linux enforcement (ZFS substrate)
 
 On Linux the model is identical — start closed, widen by grant, narrow by revoke, one grant file feeding both planes —
 only the enforcers change. Nothing above the enforcement layer differs: same `<image>.grants.json` schema
-(09_substrates.md: the same `~/.cowshed/…` paths on Linux too), same revision semantics, the same revision-bound
+(09_substrates.md: the same `/private/cowshed/store/…` paths on Linux too), same revision semantics, the same revision-bound
 supervisor drain/relaunch for effective filesystem mutations with inner profiles narrowing only and existing jobs
 retaining their old revision, immediate egress via the gateway, and the same exit code 6 on a grant that intersects the
 deny set.
@@ -541,7 +541,7 @@ deny set.
   unless `COWSHED_NO_SANDBOX=1` is set explicitly (same escape hatch, same audit note as macOS).
 - **Egress: trusted loopback connector, per-workspace Unix socket, and private netns.** Each attached workspace has a
   fresh network namespace with loopback up and no physical, veth, routed, or default-route interface. The controller
-  creates a Unix stream socket at host path `~/.cowshed/run/gateway/<workspaceIncarnation>.sock` (parent 0700,
+  creates a Unix stream socket at host path `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` (parent 0700,
   socket 0600) and bind-mounts it at `/run/cowshed/gateway.sock` in that workspace only. It then launches exactly one
   minimal connector **inside that netns** under a controller-owned uid/process identity and dedicated cgroup that
   workspace jobs cannot join, inspect, ptrace, or signal. The connector binds only `127.0.0.1:7644` (never `0.0.0.0`,
@@ -567,7 +567,7 @@ A regression harness runs adversarial commands through the real exec pipeline an
 under Seatbelt; the same cases run on Linux under Landlock, plus Linux-specific escapes:
 
 - write outside granted roots (absolute, relative, `..`-traversal, symlink pivot, hardlink);
-- read `~/.ssh`, `~/.aws`, Keychains, any `~/.cowshed` path outside the carve-backs (grant files, CA keys, sibling
+- read `~/.ssh`, `~/.aws`, Keychains, any `/private/cowshed/store` path outside the carve-backs (grant files, CA keys, sibling
   images, sibling mounts);
 - tamper with own grant file or marker via crafted paths;
 - connect to a sibling workspace's supervisor socket (must be refused by the scoped unix-socket allow — including via a
@@ -579,7 +579,7 @@ under Seatbelt; the same cases run on Linux under Landlock, plus Linux-specific 
 - write to `~/.cargo/bin`, cargo config/credentials, or `~/.gradle/gradle.properties` — directly and via the
   sandbox-writable cache volume;
 - write to `~/go` (the misconfig tripwire — must EPERM); write to another workspace's in-image `GOBIN` (unreachable
-  across the mount boundary); chmod a 0444 `~/.cowshed/caches/go/mod` entry writable and modify it (allowed by scope —
+  across the mount boundary); chmod a 0444 `/private/cowshed/caches/go/mod` entry writable and modify it (allowed by scope —
   the accepted layer-3 poisoning risk — but asserted to appear in telemetry as a mutation of a shared cache);
 - read the workspace's own CA **private key** or any sibling workspace's CA key (both on the store volume — denied): a
   workspace can read only its own in-image CA **cert** (a public anchor), never a signing key, and cannot obtain a leaf
