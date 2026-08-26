@@ -54,7 +54,7 @@ pub struct Cli {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Adopt(AdoptArgs),
-    /// Host storage provisioning, repair, and teardown. Its subject is the host, so it takes no
+    /// Host storage setup, repair, and teardown. Its subject is the host, so it takes no
     /// project and no workspace — neither is something a stranded machine can name.
     Setup(SetupArgs),
     New(NewArgs),
@@ -986,7 +986,8 @@ const GATEWAY: CommandSpec = CommandSpec {
     summary: "manage the host gateway",
     about: &[
         "The gateway is the one trusted process outside every sandbox: workspaces reach the network, main's repository, and each other only through its authenticated Unix socket. `start` installs and loads the per-user LaunchAgent and waits until that socket answers; `stop` boots it out; `status` reports health without starting anything. Both mutations are idempotent.",
-        "`run` is the LaunchAgent's own foreground entrypoint. It validates already-mounted storage and never provisions any, so a background start can report missing setup but can never raise an authorization prompt.",
+        "`run` is the LaunchAgent's own foreground entrypoint. It validates already-mounted storage and never creates any, so a background start can report missing setup but can never raise an authorization prompt.",
+
         "An ordinary `stop` leaves the host-stable binary copy the agent ran, because that copy is host state rather than agent state and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes it, for a host that is done with the gateway rather than pausing it.",
     ],
     options: &[Opt {
@@ -1138,7 +1139,8 @@ const ADOPT: CommandSpec = CommandSpec {
     trailing: "",
     summary: "adopt a checkout",
     about: &[
-        "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and one of only two commands that may provision host storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no ordinary command ever can.",
+        "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and one of only two commands that may create host storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no ordinary command ever can.",
+
         "`cowshed setup` is the other, and the one every storage error points at: it repairs a host without needing a checkout to adopt. Reach for adopt when you have a repository to bring in, and for setup when the machine itself is wrong.",
     ],
     options: &[
@@ -1162,10 +1164,11 @@ const SETUP: CommandSpec = CommandSpec {
     name: "setup",
     args: "",
     trailing: "",
-    summary: "provision or repair host storage and pin mounts",
+    summary: "set up or repair host storage and pin mounts",
     about: &[
-        "Brings this host's two dedicated volumes to their canonical state and pins them in `/etc/fstab`: absent volumes are provisioned, detached or mis-mounted ones are remounted where they belong, markers are validated, and the fstab lines that survive a reboot are written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
-        "Everything that can require elevation happens inside one authorization session, announced on stderr before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never re-provisioned, because re-provisioning means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
+        "Brings this host's two dedicated volumes to their canonical state and pins them in `/etc/fstab`: absent volumes are created; existing volumes are never deleted. Detached or mis-mounted ones are remounted where they belong, markers are validated, and the fstab lines that survive a reboot are written. It is idempotent — on a healthy host it changes nothing and says so — and it needs no repository, because its subject is the machine rather than a checkout.",
+        "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
+
         "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
     ],
     options: &[
