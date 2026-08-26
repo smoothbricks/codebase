@@ -18,7 +18,7 @@ namespaces is a later platform goal; [zfs.md](zfs.md) records that contract but 
 ```sh
 $ cd ~/src/api
 $ cowshed new raven --json
-{"ok":true,"result":{"workspace":"raven","mount":"/Users/me/.cowshed/mnt/acme/api/raven","baseCommit":"6f3a2c1000000000000000000000000000000000"}}
+{"ok":true,"result":{"workspace":"raven","mount":"<mount-root>/acme/api/raven","baseCommit":"6f3a2c1000000000000000000000000000000000"}}
 next: cowshed exec raven -- <cmd>
 ```
 
@@ -110,13 +110,13 @@ rules, start with [usage.md](usage.md).
 
 | What                                                                | Where                                                                        |
 | ------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Images (main + workspaces + checkpoints)                            | `~/.cowshed/<owner>/<repo>/` (the primary, component-safe `repo_id`)         |
-| Workspace mounts                                                    | `~/.cowshed/mnt/<owner>/<repo>/<workspace>`                                  |
-| Adopted main mount                                                  | its original `<project-root>`                                                |
-| Trusted project policy                                              | `~/.cowshed/<owner>/<repo>/policy.json` (controller-owned, sandbox-denied)   |
-| Repository binding                                                  | `~/.cowshed/<owner>/<repo>/repository.json`                                  |
-| Shared writable build caches (Cargo, sccache, zig, Gradle, Go, Nix) | exact tool subdirectories under `~/.cowshed/caches`                          |
-| Gateway registry and repository mirrors                             | `~/.cowshed/caches/{mirror,repo-mirrors}` (gateway-owned, sandbox-read-only) |
+| Images (main + workspaces + checkpoints)                            | `/private/cowshed/store/<owner>/<repo>/` (the primary, component-safe `repo_id`) |
+| Workspace mounts                                                    | `<mount-root>/<owner>/<repo>/<workspace>`                                     |
+| Adopted main mount                                                  | its original `<project-root>`                                                 |
+| Trusted project policy                                              | `/private/cowshed/store/<owner>/<repo>/policy.json` (controller-owned, sandbox-denied) |
+| Repository binding                                                  | `/private/cowshed/store/<owner>/<repo>/repository.json`                       |
+| Shared writable build caches (Cargo, sccache, zig, Gradle, Go, Nix) | exact tool subdirectories under `/private/cowshed/caches`                     |
+| Gateway registry and repository mirrors                             | `/private/cowshed/caches/{mirror,repo-mirrors}` (gateway-owned, sandbox-read-only) |
 | Host cargo registry (index + `.crate` archives)                     | `~/.cargo/registry/{index,cache}` (host-owned, sandbox-read-only)            |
 
 Before adoption, cowshed derives a stable lowercase `owner/repo` identity from configured remotes when the choice is
@@ -132,13 +132,13 @@ _are_ the state; every command derives the world by looking at them.
 ## The cache model in one paragraph
 
 Downloads happen once, ever: the gateway mirrors npm, cargo, and Go module registries (and, via `cowshed repo`, git
-repositories) and caches artifacts on `~/.cowshed/caches`. On macOS each workspace's clients use its own localhost
+repositories) and caches artifacts in `/private/cowshed/caches`. On macOS each workspace's clients use its own localhost
 `portBlock.base`; on Linux, where no port block exists, ordinary Bun/Cargo/Go and proxy-aware clients use
 `http://127.0.0.1:7644` inside their private netns. A trusted per-workspace connector forwards those bytes only to the
 mounted per-workspace Unix gateway socket, which remains the primary endpoint identity. Bun's install cache lives
 _inside_ each workspace image — inherited from main via copy-on-write — because bun clones out of it, and clonefile
 can't cross volumes; that keeps `bun install` on its fast path. Read-at-build caches are shared under
-`~/.cowshed/caches`: Cargo uses distinct writable `cargo/{registry,git}` directories; Go uses `go/{mod,build}`; Nix uses
+`/private/cowshed/caches`: Cargo uses distinct writable `cargo/{registry,git}` directories; Go uses `go/{mod,build}`; Nix uses
 `nix/{cache,state}`; sccache, zig, and Gradle have named roots. A sandbox's `$CARGO_HOME` follows its private `HOME`, so
 it reaches the host's own `~/.cargo/registry/{index,cache}` read-only through links planted at exec, and unpacks into a
 writable `registry/src` inside the mount: a crate the host already downloaded builds offline in every workspace. Gateway

@@ -19,23 +19,23 @@ chooses one.
 | Main workspace                                           | dataset `<pool>/cowshed/projects/<owner>/<repo>/main`, mounted at the original path             |
 | Session workspaces                                       | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`, mounted at `<mount-root>/<owner>/<repo>/<name>` |
 | Checkpoints                                              | `zfs snapshot`s on the workspace dataset                                                        |
-| Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | `<pool>/cowshed/caches`, mounted at `~/.cowshed/caches`                                         |
-| Gateway registry/repository mirrors                      | `mirror/` and `repo-mirrors/` on caches; gateway-owned, sandbox-read-only                       |
-| Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `~/.cowshed`; policy is `<owner>/<repo>/policy.json`                  |
-| Telemetry + gateway audit (Arrow segments)               | `~/.cowshed/telemetry/` (`cowshed logs`/`audit`/`trace`) — same as macOS                        |
+| Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | `<pool>/cowshed/caches`, mounted at `/private/cowshed/caches`                                |
+| Gateway registry/repository mirrors                      | `mirror/` and `repo-mirrors/` on caches; gateway-owned, sandbox-read-only                    |
+| Bindings, trusted policy, grants, waivers, gateway state | `<pool>/cowshed/store` at `/private/cowshed/store`; policy is `<owner>/<repo>/policy.json`   |
+| Telemetry + gateway audit (Arrow segments)               | `/private/cowshed/store/telemetry/` (`cowshed logs`/`audit`/`trace`) — same as macOS         |
 | Linux gateway data plane                                 | per-incarnation Unix socket plus private-netns connector at `127.0.0.1:7644`; no `portBlock`    |
 | Secrets                                                  | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                           |
 
 Mountpoints are ZFS properties and normally return at pool import. cowshed still writes the same underlying stub
 `.envrc` as APFS because an unimported pool also makes a mount disappear; `cowshed attach` verifies the mount, identity,
-wiring, and grants and heals it when possible.
+wiring, and grants and repairs it when possible.
 
 The dataset hierarchy is fixed, with three siblings:
 
 ```text
 <pool>/cowshed
-├── store       mountpoint=~/.cowshed
-├── caches      mountpoint=~/.cowshed/caches
+├── store       mountpoint=/private/cowshed/store
+├── caches      mountpoint=/private/cowshed/caches
 └── projects    mountpoint=none
     └── <owner>/<repo>/{main,ws/...}
 ```
