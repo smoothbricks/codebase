@@ -272,6 +272,13 @@ new Git branch at another revision and is mutually exclusive with `--from`. The 
 — see [`cowshed path --slot`](#cowshed-path---slot-n--build-slots-and-compiler-cache-reuse). A slot already held by
 another workspace is a conflict (exit 4).
 
+Before the clone, cowshed probes git identity: it runs `git config --list --show-origin` in the checkout and in a
+throwaway repository at the candidate workspace path (`<mount-root>/<owner>/<repo>/<name>`), then diffs the observed
+origins. A config file included only in the checkout is reported by name with the `includeIf` condition that pulled it
+in, plus the remedy: add a pattern covering the mount root, or `cowshed setup --mount-root`. Creation continues; the
+same finding appears in `cowshed doctor`.
+
+
 ### `cowshed ls [--all]`
 
 Bare `ls` remains scoped to the repository selected by cwd or `--project`. Its stdout is a space-aligned table:
@@ -475,10 +482,14 @@ Workspace environment lives in the image as `.cowshed/env`, rewritten on token r
 `.envrc` two-liner. Sandboxed `cowshed exec` processes receive the cowshed-owned exports directly. Wiring is carried by
 **files, not a CLI env printer**.
 
-### `cowshed detach <name>`
+### `cowshed detach [ws] [--all]`
 
-Unmount the workspace and stop its supervisor without destroying anything. Detached workspaces cost one closed file.
-`attach` and `path` bring them back.
+Unmount session workspace(s) and stop their supervisors without destroying anything. Detached workspaces cost one closed
+file. `attach` and `path` bring them back. `<ws>` detaches one session, resolved from the store
+(`<owner>/<repo>/sessions/<ws>.image` plus the image sidecar / marker identity) so it does not require cwd or git
+discovery. `--project` still selects the project. `--all` detaches every attached session workspace store-wide. Mains
+are always mounted and are never detach targets.
+
 
 ### `cowshed resize <name|main> <size>`
 
@@ -772,8 +783,9 @@ what it freed. Safe to run anytime; `rm`, `land`, and `restore` also run it oppo
 ### `cowshed doctor`
 
 Invariant checks: every image has a marker, every mount matches an image, grants files parse, caches volume and gateway
-reachable, autosave fresh. Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5) with one
-`cowshed:` line per issue and a `next:` fix for each.
+reachable, autosave fresh, and git identity at the workspace mount root matches the checkout (`includeIf gitdir:` files
+that would not apply under the mount root). Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5)
+with one `cowshed:` line per issue and a `next:` fix for each.
 
 ```
 $ cowshed doctor
