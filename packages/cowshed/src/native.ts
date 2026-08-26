@@ -9,6 +9,8 @@ export interface NativeProjectHandle {
   readonly gitRoot: string;
   main(): Promise<NativeWorkspaceRefHandle>;
   workspace(name: string): Promise<NativeWorkspaceRefHandle>;
+  workspaceAt(path: string): Promise<NativeWorkspaceRefHandle>;
+  path(name: string, noAttach: boolean): Promise<string>;
   listWorkspaces(): Promise<string>;
 }
 
@@ -24,14 +26,18 @@ export interface NativeCoordinatorHandle {
   adopt(optionsJson: string): Promise<NativeWorkspaceRefHandle>;
   create(name: string, optionsJson: string): Promise<NativeWorkspaceRefHandle>;
   fork(source: string, destination: string): Promise<NativeWorkspaceRefHandle>;
+  rename(source: string, destination: string): Promise<NativeWorkspaceRefHandle>;
+  moveCheckout(destination: string): Promise<NativeWorkspaceRefHandle>;
   grant(workspace: string, deltaJson: string): Promise<string>;
   revoke(workspace: string, deltaJson: string): Promise<string>;
   rebase(workspace: string, optionsJson: string): Promise<string>;
   land(workspace: string, optionsJson: string): Promise<string>;
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
-  destroy(workspace: string, optionsJson: string): Promise<void>;
+  resize(workspace: string, capacity: string): Promise<string>;
+  remove(workspace: string, optionsJson: string): Promise<string>;
   gc(optionsJson: string): Promise<string>;
+  doctor(): Promise<string>;
   worker(workspace: string): Promise<NativeWorkspaceHandle>;
 }
 
@@ -42,6 +48,7 @@ export interface NativeWorkspaceHandle {
   shell(session?: string): Promise<NativeSessionHandle>;
   listJobs(): Promise<string>;
   job(id: number): Promise<NativeJobHandle>;
+  checkpoint(optionsJson: string): Promise<string>;
   push(optionsJson: string): Promise<string>;
   grantsJson(): Promise<string>;
 }

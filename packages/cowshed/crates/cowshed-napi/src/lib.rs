@@ -16,9 +16,9 @@ use cowshed_core::{
     JobHandle as CoreJobHandle, JobStream, Project as CoreProject, Session as CoreSession,
     WorkspaceHandle as CoreWorkspaceHandle, WorkspaceRef as CoreWorkspaceRef,
     api::{
-        AdoptOptions, AttachOptions, CreateOptions, ExecRequest, GcOptions, GrantDelta, JobId,
-        LandOptions, OutputPublication, PushOptions, RebaseOptions, RemoveOptions, RunSandboxMode,
-        StdinSource, TraceContext, WorkspacePath,
+        AdoptOptions, AttachOptions, CheckpointOptions, CreateOptions, ExecRequest, GcOptions,
+        GrantDelta, JobId, LandOptions, OutputPublication, PushOptions, RebaseOptions,
+        RemoveOptions, RunSandboxMode, StdinSource, TraceContext, WorkspacePath,
     },
 };
 use napi::{
@@ -353,6 +353,29 @@ impl Coordinator {
             Ok(WorkspaceRef { inner: workspace })
         })
     }
+    #[napi]
+    pub fn rename(&self, env: Env, source: String, destination: String) -> napi::Result<JsObject> {
+        let coordinator = Arc::clone(&self.inner);
+        spawn_promise(env, async move {
+            let workspace = coordinator
+                .rename(&source, &destination)
+                .await
+                .map_err(AddonFailure::from)?;
+            Ok(WorkspaceRef { inner: workspace })
+        })
+    }
+
+    #[napi(js_name = "moveCheckout")]
+    pub fn move_checkout(&self, env: Env, destination: String) -> napi::Result<JsObject> {
+        let coordinator = Arc::clone(&self.inner);
+        spawn_promise(env, async move {
+            let workspace = coordinator
+                .move_checkout(std::path::Path::new(&destination))
+                .await
+                .map_err(AddonFailure::from)?;
+            Ok(WorkspaceRef { inner: workspace })
+        })
+    }
 
     #[napi]
     pub fn grant(&self, env: Env, workspace: String, delta_json: String) -> napi::Result<JsObject> {
@@ -444,9 +467,20 @@ impl Coordinator {
                 .map(|_| ())
         })
     }
+    #[napi]
+    pub fn resize(&self, env: Env, workspace: String, capacity: String) -> napi::Result<JsObject> {
+        let coordinator = Arc::clone(&self.inner);
+        spawn_promise(env, async move {
+            let result = coordinator
+                .resize(&workspace, &capacity)
+                .await
+                .map_err(AddonFailure::from)?;
+            canonical_json("resize result", &result)
+        })
+    }
 
     #[napi]
-    pub fn destroy(
+    pub fn remove(
         &self,
         env: Env,
         workspace: String,
@@ -470,6 +504,14 @@ impl Coordinator {
             let options = parse_json::<GcOptions>("GC options", &options_json)?;
             let report = coordinator.gc(options).await.map_err(AddonFailure::from)?;
             canonical_json("GC report", &report)
+        })
+    }
+    #[napi]
+    pub fn doctor(&self, env: Env) -> napi::Result<JsObject> {
+        let coordinator = Arc::clone(&self.inner);
+        spawn_promise(env, async move {
+            let report = coordinator.doctor().await.map_err(AddonFailure::from)?;
+            canonical_json("doctor report", &report)
         })
     }
 
@@ -572,6 +614,14 @@ impl WorkspaceHandle {
             Ok(JobHandle {
                 inner: Arc::new(job),
             })
+        })
+    }
+    #[napi]
+    pub fn checkpoint(&self, env: Env, options_json: String) -> napi::Result<JsObject> {
+        let worker = Arc::clone(&self.inner);
+        spawn_promise(env, async move {
+            let options = parse_json::<CheckpointOptions>("checkpoint options", &options_json)?;
+            worker.checkpoint(options).await.map_err(AddonFailure::from)
         })
     }
 
@@ -781,6 +831,35 @@ impl Project {
             Ok(WorkspaceRef { inner: workspace })
         })
     }
+    #[napi(js_name = "workspaceAt")]
+    pub fn workspace_at(&self, env: Env, path: String) -> napi::Result<JsObject> {
+        let project = self.inner.clone();
+        spawn_promise(env, async move {
+            let workspace = project
+                .workspace_at(std::path::Path::new(&path))
+                .await
+                .map_err(AddonFailure::from)?;
+            Ok(WorkspaceRef { inner: workspace })
+        })
+    }
+
+    #[napi]
+    pub fn path(&self, env: Env, name: String, no_attach: bool) -> napi::Result<JsObject> {
+        let project = self.inner.clone();
+        spawn_promise(env, async move {
+            let workspace = project.workspace(&name).await.map_err(AddonFailure::from)?;
+            if !no_attach {
+                workspace
+                    .attach(AttachOptions::default())
+                    .await
+                    .map_err(AddonFailure::from)?;
+            }
+            canonical_json(
+                "workspace info",
+                &workspace.refresh_info().await.map_err(AddonFailure::from)?,
+            )
+        })
+    }
 
     #[napi(js_name = "listWorkspaces")]
     pub fn list_workspaces(&self, env: Env) -> napi::Result<JsObject> {
@@ -885,4 +964,77 @@ pub async fn run_cli(argv: Vec<String>) -> napi::Result<i32> {
     .await
     .map_err(|error| napi::Error::from_reason(format!("cowshed CLI task failed: {error}")))?
     .map_err(|error| napi::Error::from_reason(format!("cowshed CLI runtime failed: {error}")))
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use cowshed_cli::args::{Command, parse_args};
+
+    fn napi_export(command: &Command) -> &'static str {
+        match command {
+            Command::Adopt(_) => "Coordinator.adopt",
+            Command::New(_) => "Coordinator.create",
+            Command::Fork(_) => "Coordinator.fork",
+            Command::Move(_) => "Coordinator.rename|Coordinator.moveCheckout",
+            Command::Checkpoint(_) => "WorkspaceHandle.checkpoint",
+            Command::Restore(_) => "Coordinator.restore",
+            Command::List(_) => "Project.listWorkspaces|runCli",
+            Command::Path(_) => "Project.path",
+            Command::Exec(_) => "WorkspaceHandle.exec",
+            Command::Remove(_) => "Coordinator.remove",
+            Command::Attach(_) => "WorkspaceRef.attach",
+            Command::Detach(_) => "Coordinator.detach",
+            Command::Resize(_) => "Coordinator.resize",
+            Command::Gc(_) => "Coordinator.gc",
+            Command::Push(_) => "WorkspaceHandle.push",
+            Command::Rebase(_) => "Coordinator.rebase",
+            Command::Land(_) => "Coordinator.land",
+            Command::Doctor => "Coordinator.doctor",
+            Command::Gateway(_)
+            | Command::Sccache(_)
+            | Command::Skill(_)
+            | Command::Setup(_)
+            | Command::Version
+            | Command::Help(_) => "runCli",
+        }
+    }
+
+    #[test]
+    fn every_cli_command_has_a_napi_export() {
+        let samples: &[&[&str]] = &[
+            &["adopt"],
+            &["new", "parity"],
+            &["fork", "main", "parity"],
+            &["mv", "parity", "renamed"],
+            &["checkpoint", "parity"],
+            &["restore", "parity", "saved"],
+            &["ls"],
+            &["path", "parity"],
+            &["exec", "parity", "--", "true"],
+            &["rm", "parity"],
+            &["attach", "parity"],
+            &["detach", "parity"],
+            &["resize", "parity", "200g"],
+            &["gc"],
+            &["push", "parity"],
+            &["rebase", "parity"],
+            &["land", "parity"],
+            &["doctor"],
+            &["gateway", "status"],
+            &["sccache", "status"],
+            &["skill", "install"],
+            &["help"],
+            &["setup"],
+            &["--version"],
+        ];
+
+        for argv in samples {
+            let parsed =
+                parse_args(argv.iter().copied()).expect("representative CLI command parses");
+            assert!(
+                !napi_export(&parsed.command).is_empty(),
+                "CLI command {argv:?} has no N-API export"
+            );
+        }
+    }
 }
