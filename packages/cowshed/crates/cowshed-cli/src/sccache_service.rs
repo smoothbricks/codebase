@@ -11,11 +11,12 @@
 use crate::args::SccacheCommand;
 use crate::gateway_service::{
     activate_launch_agent, canonical_home, deactivate_launch_agent, effective_uid,
-    inspect_install_state, launchd_error, output_error,
+    inspect_install_state, install_host_stable_executable, launchd_error, output_error,
 };
 use crate::launchd::{
-    ExistingPlist, InstallState, LaunchAgentSpec, LaunchdExecutor, LaunchdServiceStatus,
-    NativeFilesystem, NativeLaunchctlCommand, plan_install, plan_remove,
+    ExistingPlist, HostStableExecutable, InstallState, LaunchAgentSpec, LaunchdExecutor,
+    LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand, SCCACHE_BINARY_NAME,
+    plan_install, plan_remove,
 };
 use crate::output::Output;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
@@ -111,9 +112,14 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
         None => derived_capacity(&storage).await?,
     };
     let socket = sccache_server_socket(&home);
-    let executable = resolve_sccache_executable()?;
-    let spec = LaunchAgentSpec::sccache(
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    let executable = install_host_stable_executable(
+        &mut executor,
         &home,
+        SCCACHE_BINARY_NAME,
+        &resolve_sccache_executable()?,
+    )?;
+    let spec = LaunchAgentSpec::sccache(
         &executable,
         &socket,
         &cache_directory,
@@ -138,7 +144,6 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
         },
     );
     let uid = effective_uid();
-    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     executor.execute_install(&plan).map_err(launchd_error)?;
     activate_launch_agent(&mut executor, uid, &spec)?;
 
@@ -312,25 +317,14 @@ async fn read_stats(socket: &Path) -> Option<SccacheStats> {
 
 /// A spec good for launchctl control targets (label and plist path).
 ///
-/// Stop and status must work after the sccache binary has left `PATH` — a
-/// devenv update or removal must not strand the agent — so the executable
-/// recorded here falls back to the cowshed binary. Only `start` writes a
-/// plist, and `start` always resolves the real sccache executable.
+/// Deterministic, and deliberately not a `PATH` lookup: stop and status must reach the agent
+/// `start` installed even after sccache has left `PATH` — a devenv update or removal must not
+/// strand it — and `start` writes the plist against this same host-stable path.
 fn control_spec(home: &Path) -> Result<LaunchAgentSpec> {
     let socket = sccache_server_socket(home);
     let cache_directory = sccache_cache_directory(home);
-    let executable = resolve_sccache_executable().or_else(|_| {
-        fs::canonicalize(std::env::current_exe().map_err(|error| {
-            CowshedError::internal(format!(
-                "could not identify the cowshed executable: {error}"
-            ))
-        })?)
-        .map_err(|error| {
-            CowshedError::internal(format!("could not resolve the cowshed executable: {error}"))
-        })
-    })?;
+    let executable = HostStableExecutable::new(home, SCCACHE_BINARY_NAME).map_err(launchd_error)?;
     LaunchAgentSpec::sccache(
-        home,
         &executable,
         &socket,
         &cache_directory,

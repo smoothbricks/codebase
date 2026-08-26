@@ -1,11 +1,15 @@
 use crate::args::GatewayCommand;
 use crate::launchd::{
-    ExistingPlist, InstallState, LaunchAgentSpec, LaunchctlCommand, LaunchdExecutor,
-    LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand, plan_install, plan_remove,
+    COWSHED_BINARY_NAME, ExecutableInstallState, ExecutableSource, ExistingPlist,
+    HostStableExecutable, InstallState, InstalledExecutable, LaunchAgentSpec, LaunchctlCommand,
+    LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
+    NativeLaunchctlCommand, classify_executable_source, containing_mount_point,
+    plan_executable_install, plan_install, plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus};
+use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 use cowshed_core::{
     CowshedError, NativeGatewayInventory, Result, ValidatedHostStorage,
     validate_existing_host_storage,
@@ -15,7 +19,7 @@ use cowshed_gateway::{
     MirrorCacheConfig, control_socket_path,
 };
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -180,19 +184,14 @@ async fn start_service() -> Result<CliGatewayStatus> {
     let storage = validate_existing_host_storage(&home).await?;
     let paths = GatewayPaths::from_storage(&storage);
     ensure_private_directory(&paths.telemetry)?;
-    let executable = fs::canonicalize(std::env::current_exe().map_err(|error| {
-        CowshedError::environment_missing(
-            format!("could not identify the cowshed executable: {error}"),
-            "reinstall cowshed",
-        )
-    })?)
-    .map_err(|error| {
-        CowshedError::environment_missing(
-            format!("could not resolve the cowshed executable: {error}"),
-            "reinstall cowshed",
-        )
-    })?;
-    let spec = LaunchAgentSpec::gateway(&home, &executable).map_err(launchd_error)?;
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    let executable = install_host_stable_executable(
+        &mut executor,
+        &home,
+        COWSHED_BINARY_NAME,
+        &running_executable()?,
+    )?;
+    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let observed = inspect_install_state(&spec)?;
     let plan = plan_install(
         &spec,
@@ -205,7 +204,6 @@ async fn start_service() -> Result<CliGatewayStatus> {
         },
     );
     let uid = effective_uid();
-    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     executor.execute_install(&plan).map_err(launchd_error)?;
     activate_launch_agent(&mut executor, uid, &spec)?;
 
@@ -225,17 +223,30 @@ async fn start_service() -> Result<CliGatewayStatus> {
     }
 }
 
+/// The binary this process is running from.
+fn running_executable() -> Result<PathBuf> {
+    let path = std::env::current_exe().map_err(|error| {
+        CowshedError::environment_missing(
+            format!("could not identify the cowshed executable: {error}"),
+            "reinstall cowshed",
+        )
+    })?;
+    fs::canonicalize(&path).map_err(|error| {
+        CowshedError::environment_missing(
+            format!("could not resolve the cowshed executable: {error}"),
+            "reinstall cowshed",
+        )
+    })
+}
+
 fn stop_service() -> Result<()> {
     let home = canonical_home()?;
-    let executable = fs::canonicalize(std::env::current_exe().map_err(|error| {
-        CowshedError::internal(format!(
-            "could not identify the cowshed executable: {error}"
-        ))
-    })?)
-    .map_err(|error| {
-        CowshedError::internal(format!("could not resolve the cowshed executable: {error}"))
-    })?;
-    let spec = LaunchAgentSpec::gateway(&home, &executable).map_err(launchd_error)?;
+    // Deterministic, not derived from the running binary: stop has to reach the agent that
+    // `start` installed however this process was invoked. The installed copy stays — it is host
+    // state, not agent state, and leaving it makes the next start a plist write.
+    let executable =
+        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let uid = effective_uid();
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     deactivate_launch_agent(&mut executor, uid, &spec)?;
@@ -249,15 +260,9 @@ fn stop_service() -> Result<()> {
 async fn service_status() -> Result<CliGatewayStatus> {
     let home = canonical_home()?;
     let socket = control_socket_path(&home);
-    let executable = fs::canonicalize(std::env::current_exe().map_err(|error| {
-        CowshedError::internal(format!(
-            "could not identify the cowshed executable: {error}"
-        ))
-    })?)
-    .map_err(|error| {
-        CowshedError::internal(format!("could not resolve the cowshed executable: {error}"))
-    })?;
-    let spec = LaunchAgentSpec::gateway(&home, &executable).map_err(launchd_error)?;
+    let executable =
+        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     match executor
         .execute_status(&crate::launchd::ControlPlan::print(effective_uid(), &spec))
@@ -287,15 +292,9 @@ async fn run_daemon() -> Result<()> {
     heal_recorded_projects(&storage).await;
     heal_sccache_daemon().await;
     let inventory = NativeSessionInventory::new(storage);
-    let executable = fs::canonicalize(std::env::current_exe().map_err(|error| {
-        CowshedError::internal(format!(
-            "could not identify the cowshed executable: {error}"
-        ))
-    })?)
-    .map_err(|error| {
-        CowshedError::internal(format!("could not resolve the cowshed executable: {error}"))
-    })?;
-    let config = paths.config(effective_uid(), executable);
+    // The git credential helper is this same binary, which launchd started from the host-stable
+    // path: a helper spawned by the daemon has to keep resolving for as long as the daemon runs.
+    let config = paths.config(effective_uid(), running_executable()?);
     let telemetry = ArrowAuditConfig::new(paths.telemetry.clone())
         .map_err(|error| CowshedError::internal(format!("invalid gateway telemetry: {error}")))?;
     let gateway = Gateway::start_host(config, telemetry)
@@ -396,6 +395,180 @@ pub fn emit_gateway_status<W: Write, E: Write>(
     Ok(())
 }
 
+/// Install `source` at the host-stable path launchd will run, and answer with that path.
+///
+/// This is what keeps a LaunchAgent independent of wherever the user's cowshed happens to live:
+/// the plist names a copy on the volume that carries the plist itself, so the agent starts on a
+/// host that has since rebuilt, updated, or deleted the binary that installed it.
+///
+/// A binary on cowshed's own storage is refused rather than copied. That is the incident this
+/// exists for — a gateway installed from inside a workspace mount exited 78 in a loop after a
+/// reboot, with nothing left to mount what would have healed it — and a workspace's own build is
+/// not the host's cowshed.
+pub fn install_host_stable_executable<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    home: &Path,
+    name: &str,
+    source: &Path,
+) -> Result<HostStableExecutable>
+where
+    F: LaunchdFilesystem,
+{
+    let executable = HostStableExecutable::new(home, name).map_err(launchd_error)?;
+    if source == executable.path() {
+        // Already the installed copy: this is the steady state on a host launchd started, and
+        // copying a file onto itself is the one publication the plan cannot express.
+        return Ok(executable);
+    }
+    require_durable_source(home, name, source)?;
+    let state = observe_executable_install(&executable, source)?;
+    executor
+        .execute_install(&plan_executable_install(&executable, source, state))
+        .map_err(launchd_error)?;
+    Ok(executable)
+}
+
+/// Refuse a source launchd could not reach at boot, saying which volume and why.
+fn require_durable_source(home: &Path, name: &str, source: &Path) -> Result<()> {
+    let mount_point = containing_mount_point(source).map_err(|error| {
+        CowshedError::internal(format!(
+            "could not resolve the volume holding {}: {error}",
+            source.display()
+        ))
+    })?;
+    let observed = ExecutableSource {
+        path: source,
+        mount_point: &mount_point,
+        mount_is_workspace: fs::symlink_metadata(mount_point.join(WORKSPACE_MARKER_PATH)).is_ok(),
+    };
+    classify_executable_source(home, observed).map_err(|unstable| {
+        CowshedError::environment_missing(
+            format!(
+                "{unstable}, so a LaunchAgent installed from it would dangle after a reboot: \
+                 launchd starts the agent before cowshed has mounted anything, and the service \
+                 exits 78 in a KeepAlive loop with nothing left to mount what would heal it"
+            ),
+            format!("install {name} outside every cowshed workspace and run this command from that binary"),
+        )
+    })
+}
+
+/// What the host has at the stable path, and whether it is already this source.
+fn observe_executable_install(
+    executable: &HostStableExecutable,
+    source: &Path,
+) -> Result<ExecutableInstallState> {
+    let installed = match fs::symlink_metadata(executable.path()) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != effective_uid()
+            {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "the installed {} binary is not a user-owned regular file: {}",
+                        executable.name(),
+                        executable.path().display()
+                    ),
+                    "remove it and rerun the service start command",
+                ));
+            }
+            Some(InstalledExecutable {
+                mode: metadata.permissions().mode() & 0o777,
+                matches_source: same_contents(source, executable.path(), metadata.len())?,
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(CowshedError::internal(format!(
+                "could not inspect {}: {error}",
+                executable.path().display()
+            )));
+        }
+    };
+    Ok(ExecutableInstallState {
+        support_directory_mode: private_directory_mode(executable.support_directory())?,
+        binary_directory_mode: private_directory_mode(executable.directory())?,
+        installed,
+    })
+}
+
+/// Whether the installed binary already holds the source's bytes.
+///
+/// Length first, then a streaming comparison: the alternative is rewriting tens of megabytes on
+/// every `start`, and any digest would have to read both files anyway.
+fn same_contents(source: &Path, installed: &Path, installed_length: u64) -> Result<bool> {
+    let mut source_file = open_for_compare(source)?;
+    let source_length = source_file
+        .metadata()
+        .map_err(|error| compare_error(source, error))?
+        .len();
+    if source_length != installed_length {
+        return Ok(false);
+    }
+    let mut installed_file = open_for_compare(installed)?;
+    let mut source_chunk = vec![0u8; COMPARE_CHUNK_BYTES];
+    let mut installed_chunk = vec![0u8; COMPARE_CHUNK_BYTES];
+    loop {
+        let read = fill(&mut source_file, &mut source_chunk)
+            .map_err(|error| compare_error(source, error))?;
+        let other = fill(&mut installed_file, &mut installed_chunk)
+            .map_err(|error| compare_error(installed, error))?;
+        if read != other || source_chunk[..read] != installed_chunk[..read] {
+            return Ok(false);
+        }
+        if read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+const COMPARE_CHUNK_BYTES: usize = 64 * 1024;
+
+fn open_for_compare(path: &Path) -> Result<fs::File> {
+    fs::File::open(path).map_err(|error| compare_error(path, error))
+}
+
+fn compare_error(path: &Path, error: io::Error) -> CowshedError {
+    CowshedError::internal(format!("could not read {}: {error}", path.display()))
+}
+
+/// Read until the buffer is full or the file ends, so a short read is never mistaken for a
+/// difference.
+fn fill(file: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
+}
+
+/// The mode of a cowshed-owned directory, `None` when it does not exist yet.
+fn private_directory_mode(path: &Path) -> Result<Option<u32>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != effective_uid()
+            {
+                return Err(CowshedError::integrity(
+                    format!("path is not a user-owned directory: {}", path.display()),
+                    format!("repair the ownership of {} and retry", path.display()),
+                ));
+            }
+            Ok(Some(metadata.permissions().mode() & 0o777))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CowshedError::internal(format!(
+            "could not inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 pub(crate) struct ObservedInstallState {
     pub(crate) directory_mode: Option<u32>,
     pub(crate) plist: Option<ObservedPlist>,
@@ -407,30 +580,7 @@ pub(crate) struct ObservedPlist {
 }
 
 pub(crate) fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedInstallState> {
-    let directory_mode = match fs::symlink_metadata(spec.launch_agents_directory()) {
-        Ok(metadata) => {
-            if !metadata.is_dir()
-                || metadata.file_type().is_symlink()
-                || metadata.uid() != effective_uid()
-            {
-                return Err(CowshedError::integrity(
-                    format!(
-                        "LaunchAgents path is not a user-owned directory: {}",
-                        spec.launch_agents_directory().display()
-                    ),
-                    "repair ~/Library/LaunchAgents ownership and retry",
-                ));
-            }
-            Some(metadata.permissions().mode() & 0o777)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(CowshedError::internal(format!(
-                "could not inspect {}: {error}",
-                spec.launch_agents_directory().display()
-            )));
-        }
-    };
+    let directory_mode = private_directory_mode(spec.launch_agents_directory())?;
     match fs::symlink_metadata(spec.plist_path()) {
         Ok(metadata) => {
             if !metadata.is_file()

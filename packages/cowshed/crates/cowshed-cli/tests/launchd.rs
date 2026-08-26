@@ -1,22 +1,34 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use cowshed_cli::launchd::{
-    CommandOutput, CommandStatus, ControlAction, ControlExecutionError, ControlPlan, ExistingPlist,
-    FilesystemOperation, GATEWAY_LABEL, InstallOutcome, InstallState, LAUNCHCTL_EXECUTABLE,
-    LaunchAgentSpec, LaunchctlCommand, LaunchdError, LaunchdExecutor, LaunchdFilesystem,
-    LaunchdServiceStatus, Mutation, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_LABEL,
-    ServiceLifecycle, plan_install, plan_remove,
+    COWSHED_BINARY_NAME, CommandOutput, CommandStatus, ControlAction, ControlExecutionError,
+    ControlPlan, ExecutableInstallState, ExecutableSource, ExistingPlist, FilesystemOperation,
+    GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
+    LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand, LaunchdError, LaunchdExecutor,
+    LaunchdFilesystem, LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE,
+    PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle,
+    UnstableExecutableSource, classify_executable_source, containing_mount_point,
+    plan_executable_install, plan_install, plan_remove,
 };
 use cowshed_core::metadata::ImageCapacity;
 
 const HOME: &str = "/Users/cowshed-test";
-const EXECUTABLE: &str = "/nix/store/abc-cowshed/bin/cowshed";
+/// The only path shape a cowshed LaunchAgent can name: on the volume that carries the plist.
+const EXECUTABLE: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed";
+const BINARY_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin";
+const SUPPORT_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed";
+
+fn cowshed_binary() -> HostStableExecutable {
+    HostStableExecutable::new(Path::new(HOME), COWSHED_BINARY_NAME).unwrap()
+}
 
 fn gateway() -> LaunchAgentSpec {
-    LaunchAgentSpec::gateway(Path::new(HOME), Path::new(EXECUTABLE)).unwrap()
+    LaunchAgentSpec::gateway(&cowshed_binary()).unwrap()
 }
 
 #[test]
@@ -54,7 +66,7 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "  <string>dev.cowshed.gateway</string>\n",
         "  <key>ProgramArguments</key>\n",
         "  <array>\n",
-        "    <string>/nix/store/abc-cowshed/bin/cowshed</string>\n",
+        "    <string>/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed</string>\n",
         "    <string>gateway</string>\n",
         "    <string>run</string>\n",
         "  </array>\n",
@@ -75,16 +87,17 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
 #[test]
 fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
     let spec = LaunchAgentSpec::new_user(
-        Path::new("/Users/a&b"),
+        &HostStableExecutable::new(Path::new("/Users/a&b"), COWSHED_BINARY_NAME).unwrap(),
         "dev.cowshed.future",
-        Path::new("/Applications/Cowshed & Tools/cowshed"),
         vec!["future".into(), "a<b".into()],
         ServiceLifecycle::RunAtLoad,
     )
     .unwrap();
 
     let plist = String::from_utf8(spec.plist_bytes()).unwrap();
-    assert!(plist.contains("<string>/Applications/Cowshed &amp; Tools/cowshed</string>"));
+    assert!(plist.contains(
+        "<string>/Users/a&amp;b/Library/Application Support/dev.cowshed/bin/cowshed</string>"
+    ));
     assert!(plist.contains("<string>a&lt;b</string>"));
     assert!(plist.contains("<key>KeepAlive</key>\n  <false/>"));
 }
@@ -99,8 +112,7 @@ fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
 #[test]
 fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     let spec = LaunchAgentSpec::sccache(
-        Path::new(HOME),
-        Path::new("/nix/store/abc-sccache/bin/sccache"),
+        &HostStableExecutable::new(Path::new(HOME), SCCACHE_BINARY_NAME).unwrap(),
         Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
         Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
         ImageCapacity::from_gibibytes(40),
@@ -151,7 +163,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         "  <string>dev.cowshed.sccache</string>\n",
         "  <key>ProgramArguments</key>\n",
         "  <array>\n",
-        "    <string>/nix/store/abc-sccache/bin/sccache</string>\n",
+        "    <string>/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/sccache</string>\n",
         "  </array>\n",
         "  <key>RunAtLoad</key>\n",
         "  <true/>\n",
@@ -200,8 +212,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     // Socket and cache paths are validated like every other launchd path.
     assert!(matches!(
         LaunchAgentSpec::sccache(
-            Path::new(HOME),
-            Path::new("/nix/store/abc-sccache/bin/sccache"),
+            &HostStableExecutable::new(Path::new(HOME), SCCACHE_BINARY_NAME).unwrap(),
             Path::new("relative.sock"),
             Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
             ImageCapacity::from_gibibytes(40),
@@ -335,14 +346,18 @@ fn update_and_remove_plans_are_deterministic_and_filesystem_only() {
 
 #[test]
 fn rejects_noncanonical_paths_empty_or_unsafe_inputs_and_provisioning() {
+    // The executable is derived from the home directory and a binary name, so a bad home or a
+    // name that is not a single path component is the only way to name a bad executable.
     let cases = [
-        LaunchAgentSpec::gateway(Path::new("Users/me"), Path::new(EXECUTABLE)),
-        LaunchAgentSpec::gateway(Path::new("/Users/me/../other"), Path::new(EXECUTABLE)),
-        LaunchAgentSpec::gateway(Path::new("/Users/me/"), Path::new(EXECUTABLE)),
-        LaunchAgentSpec::gateway(Path::new(HOME), Path::new("bin/cowshed")),
-        LaunchAgentSpec::gateway(Path::new(HOME), Path::new("/opt/./cowshed")),
-        LaunchAgentSpec::gateway(Path::new("/"), Path::new(EXECUTABLE)),
-        LaunchAgentSpec::gateway(Path::new(HOME), Path::new("/")),
+        HostStableExecutable::new(Path::new("Users/me"), COWSHED_BINARY_NAME),
+        HostStableExecutable::new(Path::new("/Users/me/../other"), COWSHED_BINARY_NAME),
+        HostStableExecutable::new(Path::new("/Users/me/"), COWSHED_BINARY_NAME),
+        HostStableExecutable::new(Path::new("/"), COWSHED_BINARY_NAME),
+        HostStableExecutable::new(Path::new(HOME), ""),
+        HostStableExecutable::new(Path::new(HOME), "."),
+        HostStableExecutable::new(Path::new(HOME), ".."),
+        HostStableExecutable::new(Path::new(HOME), "bin/cowshed"),
+        HostStableExecutable::new(Path::new(HOME), "cow\u{1}shed"),
     ];
     for result in cases {
         assert!(matches!(result, Err(LaunchdError::InvalidPath { .. })));
@@ -351,9 +366,8 @@ fn rejects_noncanonical_paths_empty_or_unsafe_inputs_and_provisioning() {
     for label in ["", ".dev.cowshed", "dev..cowshed", "dev/cowshed"] {
         assert_eq!(
             LaunchAgentSpec::new_user(
-                Path::new(HOME),
+                &cowshed_binary(),
                 label,
-                Path::new(EXECUTABLE),
                 vec!["run".into()],
                 ServiceLifecycle::RunAtLoad,
             ),
@@ -363,9 +377,8 @@ fn rejects_noncanonical_paths_empty_or_unsafe_inputs_and_provisioning() {
 
     assert!(matches!(
         LaunchAgentSpec::new_user(
-            Path::new(HOME),
+            &cowshed_binary(),
             "dev.cowshed.empty",
-            Path::new(EXECUTABLE),
             Vec::new(),
             ServiceLifecycle::RunAtLoad,
         ),
@@ -373,9 +386,8 @@ fn rejects_noncanonical_paths_empty_or_unsafe_inputs_and_provisioning() {
     ));
     assert!(matches!(
         LaunchAgentSpec::new_user(
-            Path::new(HOME),
+            &cowshed_binary(),
             "dev.cowshed.empty",
-            Path::new(EXECUTABLE),
             vec!["run".into(), String::new()],
             ServiceLifecycle::RunAtLoad,
         ),
@@ -383,9 +395,8 @@ fn rejects_noncanonical_paths_empty_or_unsafe_inputs_and_provisioning() {
     ));
     assert_eq!(
         LaunchAgentSpec::new_user(
-            Path::new(HOME),
+            &cowshed_binary(),
             "dev.cowshed.provision",
-            Path::new(EXECUTABLE),
             vec!["adopt".into()],
             ServiceLifecycle::KeepAlive,
         ),
@@ -401,6 +412,12 @@ enum FilesystemEvent {
         directory: PathBuf,
         name_prefix: String,
         bytes: Vec<u8>,
+        mode: u32,
+    },
+    CopyTemporary {
+        directory: PathBuf,
+        name_prefix: String,
+        source: PathBuf,
         mode: u32,
     },
     SyncFile(PathBuf),
@@ -460,6 +477,23 @@ impl LaunchdFilesystem for FakeFilesystem {
             mode,
         });
         self.result(FilesystemOperation::CreateTemporaryFile)?;
+        Ok(directory.join(".exclusive-no-follow-temp"))
+    }
+
+    fn copy_exclusive_no_follow(
+        &mut self,
+        directory: &Path,
+        name_prefix: &str,
+        source: &Path,
+        mode: u32,
+    ) -> io::Result<PathBuf> {
+        self.events.push(FilesystemEvent::CopyTemporary {
+            directory: directory.to_path_buf(),
+            name_prefix: name_prefix.to_owned(),
+            source: source.to_path_buf(),
+            mode,
+        });
+        self.result(FilesystemOperation::CopyTemporaryFile)?;
         Ok(directory.join(".exclusive-no-follow-temp"))
     }
 
@@ -921,4 +955,357 @@ fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
             source,
         }) if source.kind() == io::ErrorKind::NotFound
     ));
+}
+
+/// The type is the guarantee: a spec can only be built from a path under
+/// `~/Library/Application Support/dev.cowshed/bin`, so no caller can bake a checkout, a nix
+/// store path, or a workspace image into a plist. Both agents are checked because both are
+/// installed by a binary that may itself be running from anywhere.
+#[test]
+fn every_agent_plist_names_only_the_host_stable_binary() {
+    let cowshed = cowshed_binary();
+    assert_eq!(cowshed.path(), Path::new(EXECUTABLE));
+    assert_eq!(cowshed.directory(), Path::new(BINARY_DIRECTORY));
+    assert_eq!(cowshed.support_directory(), Path::new(SUPPORT_DIRECTORY));
+    assert_eq!(cowshed.home(), Path::new(HOME));
+    assert_eq!(cowshed.name(), "cowshed");
+
+    let sccache = HostStableExecutable::new(Path::new(HOME), SCCACHE_BINARY_NAME).unwrap();
+    let specs = [
+        LaunchAgentSpec::gateway(&cowshed).unwrap(),
+        LaunchAgentSpec::sccache(
+            &sccache,
+            Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
+            Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
+            ImageCapacity::from_gibibytes(40),
+            Path::new("/Users/cowshed-test/.cowshed"),
+        )
+        .unwrap(),
+    ];
+    for (spec, expected) in specs.iter().zip([
+        EXECUTABLE,
+        "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/sccache",
+    ]) {
+        assert_eq!(spec.executable(), Path::new(expected));
+        assert_eq!(spec.program_arguments().next(), Some(expected));
+        let plist = String::from_utf8(spec.plist_bytes()).unwrap();
+        assert!(plist.contains(&format!("  <array>\n    <string>{expected}</string>\n")));
+    }
+}
+
+/// A host without the copy gets one, and a host that already has it is left alone: the source is
+/// tens of megabytes, and every `start` would otherwise rewrite the binary launchd is running.
+#[test]
+fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
+    let executable = cowshed_binary();
+    let source = Path::new("/nix/store/abc-cowshed/bin/cowshed");
+    let binary_directory = PathBuf::from(BINARY_DIRECTORY);
+
+    assert_eq!(
+        plan_executable_install(&executable, source, ExecutableInstallState::default())
+            .operations(),
+        [
+            Mutation::EnsureDirectory {
+                path: PathBuf::from(SUPPORT_DIRECTORY),
+                mode: PRIVATE_DIRECTORY_MODE,
+            },
+            Mutation::EnsureDirectory {
+                path: binary_directory.clone(),
+                mode: PRIVATE_DIRECTORY_MODE,
+            },
+            Mutation::CopyToTemporaryFile {
+                directory: binary_directory.clone(),
+                name_prefix: ".cowshed.".into(),
+                source: source.to_path_buf(),
+                mode: STABLE_BINARY_MODE,
+            },
+            Mutation::SyncTemporaryFile,
+            Mutation::RenameTemporaryFile {
+                destination: PathBuf::from(EXECUTABLE),
+            },
+            Mutation::SyncDirectory {
+                path: binary_directory.clone(),
+            },
+        ]
+    );
+
+    let current = ExecutableInstallState {
+        support_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
+        binary_directory_mode: Some(PRIVATE_DIRECTORY_MODE),
+        installed: Some(InstalledExecutable {
+            mode: STABLE_BINARY_MODE,
+            matches_source: true,
+        }),
+    };
+    assert!(plan_executable_install(&executable, source, current).is_noop());
+
+    // A newer build at the source, and an installed copy that lost its exec bit, both reinstall.
+    for installed in [
+        InstalledExecutable {
+            mode: STABLE_BINARY_MODE,
+            matches_source: false,
+        },
+        InstalledExecutable {
+            mode: 0o644,
+            matches_source: true,
+        },
+    ] {
+        let plan = plan_executable_install(
+            &executable,
+            source,
+            ExecutableInstallState {
+                installed: Some(installed),
+                ..current
+            },
+        );
+        assert!(matches!(
+            plan.operations(),
+            [
+                Mutation::CopyToTemporaryFile {
+                    mode: STABLE_BINARY_MODE,
+                    ..
+                },
+                Mutation::SyncTemporaryFile,
+                Mutation::RenameTemporaryFile { .. },
+                Mutation::SyncDirectory { .. },
+            ]
+        ));
+    }
+
+    // A world-readable directory is tightened without recopying a current binary.
+    assert_eq!(
+        plan_executable_install(
+            &executable,
+            source,
+            ExecutableInstallState {
+                binary_directory_mode: Some(0o755),
+                ..current
+            },
+        )
+        .operations(),
+        [
+            Mutation::SetPermissions {
+                path: binary_directory.clone(),
+                mode: PRIVATE_DIRECTORY_MODE,
+            },
+            Mutation::SyncDirectory {
+                path: binary_directory,
+            },
+        ]
+    );
+}
+
+/// The refusal the incident calls for: a binary on storage cowshed mounts itself cannot be the
+/// thing that mounts it. Everything a host mounts before login is copied instead, because the
+/// copy is what makes the agent independent of it.
+#[test]
+fn binary_sources_inside_cowshed_storage_are_refused_and_host_volumes_are_not() {
+    let home = Path::new(HOME);
+
+    assert_eq!(
+        classify_executable_source(
+            home,
+            ExecutableSource {
+                path: Path::new(
+                    "/Users/cowshed-test/.cowshed/mnt/acme/widget/main/target/release/cowshed"
+                ),
+                mount_point: Path::new("/Users/cowshed-test/.cowshed/mnt/acme/widget/main"),
+                mount_is_workspace: true,
+            }
+        ),
+        Err(UnstableExecutableSource::Store {
+            store: PathBuf::from("/Users/cowshed-test/.cowshed"),
+        })
+    );
+
+    // A project mount outside the store, recognised by the marker every workspace root carries.
+    assert_eq!(
+        classify_executable_source(
+            home,
+            ExecutableSource {
+                path: Path::new("/private/tmp/checkout/packages/cowshed/dist/native/cowshed"),
+                mount_point: Path::new("/private/tmp/checkout"),
+                mount_is_workspace: true,
+            }
+        ),
+        Err(UnstableExecutableSource::Workspace {
+            mount_point: PathBuf::from("/private/tmp/checkout"),
+        })
+    );
+
+    // A volume mounted inside the home directory, marker or not: cowshed is the only thing that
+    // mounts there, and launchd sees none of it at boot.
+    assert_eq!(
+        classify_executable_source(
+            home,
+            ExecutableSource {
+                path: Path::new("/Users/cowshed-test/Dev/project/packages/cowshed/dist/cowshed"),
+                mount_point: Path::new("/Users/cowshed-test/Dev/project"),
+                mount_is_workspace: false,
+            }
+        ),
+        Err(UnstableExecutableSource::HomeVolume {
+            mount_point: PathBuf::from("/Users/cowshed-test/Dev/project"),
+        })
+    );
+
+    for source in [
+        // The nix store: its own volume, mounted before any user agent runs.
+        ExecutableSource {
+            path: Path::new("/nix/store/abc-cowshed/bin/cowshed"),
+            mount_point: Path::new("/nix"),
+            mount_is_workspace: false,
+        },
+        ExecutableSource {
+            path: Path::new("/usr/local/bin/cowshed"),
+            mount_point: Path::new("/"),
+            mount_is_workspace: false,
+        },
+        // A global npm prefix in the home directory, on the home volume itself.
+        ExecutableSource {
+            path: Path::new("/Users/cowshed-test/.bun/install/global/node_modules/cowshed/cowshed"),
+            mount_point: Path::new("/"),
+            mount_is_workspace: false,
+        },
+        // The installed copy itself.
+        ExecutableSource {
+            path: Path::new(EXECUTABLE),
+            mount_point: Path::new("/"),
+            mount_is_workspace: false,
+        },
+    ] {
+        assert_eq!(classify_executable_source(home, source), Ok(()));
+    }
+}
+
+/// Binary installs ride the same temporary-file discipline as plists: launchd polls a KeepAlive
+/// service hard enough that it must never observe a half-written binary at the path it runs.
+#[test]
+fn executor_publishes_a_binary_copy_through_a_temporary_file() {
+    let executable = cowshed_binary();
+    let source = PathBuf::from("/nix/store/abc-cowshed/bin/cowshed");
+    let plan = plan_executable_install(&executable, &source, ExecutableInstallState::default());
+    let binary_directory = PathBuf::from(BINARY_DIRECTORY);
+    let temporary = binary_directory.join(".exclusive-no-follow-temp");
+
+    let mut executor = LaunchdExecutor::new(FakeFilesystem::default(), FakeCommand::default());
+    assert_eq!(
+        executor.execute_install(&plan).unwrap(),
+        InstallOutcome::Changed
+    );
+    let (filesystem, command) = executor.into_parts();
+    assert!(command.invocations.is_empty());
+    assert_eq!(
+        filesystem.events,
+        [
+            FilesystemEvent::EnsureDirectory(
+                PathBuf::from(SUPPORT_DIRECTORY),
+                PRIVATE_DIRECTORY_MODE
+            ),
+            FilesystemEvent::EnsureDirectory(binary_directory.clone(), PRIVATE_DIRECTORY_MODE),
+            FilesystemEvent::CopyTemporary {
+                directory: binary_directory.clone(),
+                name_prefix: ".cowshed.".into(),
+                source,
+                mode: STABLE_BINARY_MODE,
+            },
+            FilesystemEvent::SyncFile(temporary.clone()),
+            FilesystemEvent::Rename(temporary.clone(), PathBuf::from(EXECUTABLE)),
+            FilesystemEvent::SyncDirectory(binary_directory),
+        ]
+    );
+
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::failing(FilesystemOperation::CopyTemporaryFile),
+        FakeCommand::default(),
+    );
+    let error = executor.execute_install(&plan).unwrap_err();
+    assert_eq!(error.operation(), FilesystemOperation::CopyTemporaryFile);
+
+    let mut executor = LaunchdExecutor::new(
+        FakeFilesystem::failing(FilesystemOperation::RenameTemporaryFile),
+        FakeCommand::default(),
+    );
+    let error = executor.execute_install(&plan).unwrap_err();
+    assert_eq!(error.operation(), FilesystemOperation::RenameTemporaryFile);
+    let (filesystem, _) = executor.into_parts();
+    assert_eq!(
+        filesystem.events.last(),
+        Some(&FilesystemEvent::Remove(temporary))
+    );
+}
+
+fn scratch(label: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "cowshed-cli-launchd-{label}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).unwrap();
+    path.canonicalize().unwrap()
+}
+
+/// The device walk is how a workspace image is recognised without parsing `mount(8)`: every
+/// cowshed image is its own volume, so the walk stops exactly at its root.
+#[test]
+fn containing_mount_point_reports_the_volume_root_of_a_real_file() {
+    let root = scratch("mount-point");
+    let file = root.join("cowshed");
+    fs::write(&file, b"binary").unwrap();
+
+    let mount_point = containing_mount_point(&file).unwrap();
+    assert!(mount_point.is_absolute());
+    assert!(
+        file.starts_with(&mount_point),
+        "{} is not under {}",
+        file.display(),
+        mount_point.display()
+    );
+    // A file and the directory holding it are always on one volume.
+    assert_eq!(mount_point, containing_mount_point(&root).unwrap());
+    assert!(containing_mount_point(&root.join("absent")).is_err());
+
+    fs::remove_dir_all(&root).unwrap();
+}
+
+/// The native adapter streams the copy into an exclusive temporary file carrying the exec bit,
+/// and a copy that cannot be read leaves nothing behind for a later rename to publish.
+#[test]
+fn native_filesystem_copies_a_binary_with_the_exec_bit_and_exact_bytes() {
+    let root = scratch("copy");
+    let source = root.join("source");
+    let bytes = vec![7u8; 300_000];
+    fs::write(&source, &bytes).unwrap();
+    let destination = root.join("cowshed");
+    fs::write(&destination, b"stale").unwrap();
+
+    let mut filesystem = NativeFilesystem::new();
+    let temporary = filesystem
+        .copy_exclusive_no_follow(&root, ".cowshed.", &source, STABLE_BINARY_MODE)
+        .unwrap();
+    filesystem.sync_file(&temporary).unwrap();
+    filesystem.rename(&temporary, &destination).unwrap();
+
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+        STABLE_BINARY_MODE
+    );
+
+    assert!(
+        filesystem
+            .copy_exclusive_no_follow(&root, ".cowshed.", &root.join("absent"), STABLE_BINARY_MODE)
+            .is_err()
+    );
+    let leftovers: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".cowshed."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files leaked: {leftovers:?}"
+    );
+
+    fs::remove_dir_all(&root).unwrap();
 }
