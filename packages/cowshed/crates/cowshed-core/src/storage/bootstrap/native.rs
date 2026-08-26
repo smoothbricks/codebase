@@ -3143,7 +3143,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    #[cfg(target_os = "macos")]
     use crate::storage::bootstrap::ApfsProvisionKind;
     use crate::storage::bootstrap::VolumeMarker;
 
