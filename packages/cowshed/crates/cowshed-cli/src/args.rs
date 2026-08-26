@@ -2,7 +2,11 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
+
 use crate::help::{self, CommandSpec, Opt};
+
 
 /// Every command, in the order the command map lists them.
 ///
@@ -401,144 +405,69 @@ impl fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
-#[derive(Clone, Copy)]
-enum CommandName {
-    Adopt,
-    Setup,
-    New,
-    Fork,
-    Move,
-    Checkpoint,
-    Restore,
-    Ensure,
-    List,
-    Path,
-    Exec,
-    Remove,
-    Attach,
-    Detach,
-    Resize,
-    Gc,
-    Push,
-    Rebase,
-    Land,
-    Doctor,
-    Gateway,
-    Sccache,
-    Skill,
-}
-
-impl CommandName {
-    /// The dispatched verb's entry in the table, which is where its help and its grammar live.
-    fn spec(self) -> &'static CommandSpec {
-        match self {
-            Self::Adopt => &ADOPT,
-            Self::Setup => &SETUP,
-            Self::New => &NEW,
-            Self::Fork => &FORK,
-            Self::Move => &MOVE,
-            Self::Checkpoint => &CHECKPOINT,
-            Self::Restore => &RESTORE,
-            Self::Ensure => &ENSURE,
-            Self::List => &LIST,
-            Self::Path => &PATH,
-            Self::Exec => &EXEC,
-            Self::Remove => &REMOVE,
-            Self::Attach => &ATTACH,
-            Self::Detach => &DETACH,
-            Self::Resize => &RESIZE,
-            Self::Gc => &GC,
-            Self::Push => &PUSH,
-            Self::Rebase => &REBASE,
-            Self::Land => &LAND,
-            Self::Doctor => &DOCTOR,
-            Self::Gateway => &GATEWAY,
-            Self::Sccache => &SCCACHE,
-            Self::Skill => &SKILL,
-        }
-    }
-}
-
 pub fn parse_args<I, T>(args: I) -> Result<Cli, UsageError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
-    let mut args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if let Some(cli) = parse_help_request(&args)? {
+        return Ok(cli);
+    }
+    match cli_command().try_get_matches_from(&args) {
+        Ok(matches) => cli_from_matches(matches),
+        Err(error) => Err(translate_clap(error, &args)),
+    }
+}
+
+/// `--help` is an answer, not a grammar check: it wins even on a half-typed line,
+/// and clap never sees it because its help flag is disabled (stdout purity).
+fn parse_help_request(args: &[OsString]) -> Result<Option<Cli>, UsageError> {
     let mut global = GlobalOptions::default();
     let mut index = 0;
-    while index < args.len() && parse_global(&args, &mut index, &mut global)? {}
-
-    let command = match args.get(index).and_then(|arg| arg.to_str()) {
-        Some("adopt") => CommandName::Adopt,
-        Some("setup") => CommandName::Setup,
-        Some("new") => CommandName::New,
-        Some("fork") => CommandName::Fork,
-        Some("mv") => CommandName::Move,
-        Some("checkpoint") => CommandName::Checkpoint,
-        Some("restore") => CommandName::Restore,
-        Some("ensure") => CommandName::Ensure,
-        Some("ls") => CommandName::List,
-        Some("path") => CommandName::Path,
-        Some("exec") => CommandName::Exec,
-        Some("rm") => CommandName::Remove,
-        Some("attach") => CommandName::Attach,
-        Some("detach") => CommandName::Detach,
-        Some("resize") => CommandName::Resize,
-        Some("gc") => CommandName::Gc,
-        Some("push") => CommandName::Push,
-        Some("rebase") => CommandName::Rebase,
-        Some("land") => CommandName::Land,
-        Some("doctor") => CommandName::Doctor,
-        Some("gateway") => CommandName::Gateway,
-        Some("sccache") => CommandName::Sccache,
-        Some("skill") => CommandName::Skill,
-        Some("--help" | "-h" | "help") => {
-            let command = parse_help(&args, index + 1)?;
-            return Ok(Cli { global, command });
+    while index < args.len() {
+        match args[index].to_str() {
+            Some("--json") => {
+                global.json = true;
+                index += 1;
+            }
+            Some("-q" | "--quiet") => {
+                global.quiet = true;
+                index += 1;
+            }
+            Some("--project") => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    UsageError::with_hint(
+                        "--project requires a git root",
+                        "cowshed --project <git-root> <command>",
+                    )
+                })?;
+                global.project = Some(PathBuf::from(value));
+                index += 1;
+            }
+            Some("--help" | "-h" | "help") => {
+                return Ok(Some(Cli {
+                    global,
+                    command: parse_help(args, index + 1)?,
+                }));
+            }
+            Some(name) if !name.starts_with('-') => {
+                if wants_help(&args[index + 1..]) {
+                    let spec = help::command_named(name).ok_or_else(|| unknown_command(name))?;
+                    return Ok(Some(Cli {
+                        global,
+                        command: Command::Help(Some(spec)),
+                    }));
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
         }
-        Some(other) => return Err(unknown_command(other)),
-        None => return Err(UsageError::missing_command()),
-    };
-    index += 1;
-
-    // `--help` among a verb's own arguments answers the question the command line was about to get
-    // wrong, rather than refusing the half-typed grammar it appears in. The scan stops at `--`,
-    // where cowshed's arguments end and the child's begin.
-    if wants_help(&args[index..]) {
-        return Ok(Cli {
-            global,
-            command: Command::Help(Some(command.spec())),
-        });
     }
-
-    let command = match command {
-        CommandName::Adopt => parse_adopt(&args, index, &mut global)?,
-        CommandName::Setup => parse_setup(&args, index, &mut global)?,
-        CommandName::New => parse_new(&args, index, &mut global)?,
-        CommandName::Fork => parse_fork(&args, index, &mut global)?,
-        CommandName::Move => parse_move(&args, index, &mut global)?,
-        CommandName::Checkpoint => parse_checkpoint(&args, index, &mut global)?,
-        CommandName::Restore => parse_restore(&args, index, &mut global)?,
-        CommandName::Ensure => parse_ensure(&args, index, &mut global)?,
-        CommandName::List => parse_list(&args, index, &mut global)?,
-        CommandName::Path => parse_path(&args, index, &mut global)?,
-        CommandName::Exec => parse_exec(&mut args, index, &mut global)?,
-        CommandName::Remove => parse_remove(&args, index, &mut global)?,
-        CommandName::Attach => parse_attach(&args, index, &mut global)?,
-        CommandName::Detach => parse_detach(&args, index, &mut global)?,
-        CommandName::Resize => parse_resize(&args, index, &mut global)?,
-        CommandName::Gc => parse_gc(&args, index, &mut global)?,
-        CommandName::Push => parse_push(&args, index, &mut global)?,
-        CommandName::Rebase => parse_rebase(&args, index, &mut global)?,
-        CommandName::Land => parse_land(&args, index, &mut global)?,
-        CommandName::Doctor => parse_empty(&args, index, &mut global, &DOCTOR, Command::Doctor)?,
-        CommandName::Gateway => parse_gateway(&args, index, &mut global)?,
-        CommandName::Sccache => parse_sccache(&args, index, &mut global)?,
-        CommandName::Skill => parse_skill(&args, index, &mut global)?,
-    };
-    Ok(Cli { global, command })
+    Ok(None)
 }
+
 
 /// `help [<command>]`, and the `--help`/`-h` spellings of the same request.
 fn parse_help(args: &[OsString], mut index: usize) -> Result<Command, UsageError> {
@@ -589,6 +518,467 @@ fn unknown_command(name: &str) -> UsageError {
     UsageError::with_hint(message, "cowshed --help")
 }
 
+fn cli_command() -> ClapCommand {
+    ClapCommand::new("cowshed")
+        .no_binary_name(true)
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .disable_version_flag(true)
+
+        .subcommand_required(true)
+        .args(global_args())
+        .subcommand(leaf("adopt").arg(positional("path", 0..=1)).args([
+            value("capacity"),
+            value("repo-id"),
+            flag("quarantine"),
+        ]))
+        .subcommand(leaf("setup").args([flag("uninstall"), flag("force")]))
+        .subcommand(leaf("new").arg(positional("name", 0..=1)).args([
+            value("ref"),
+            value("from"),
+            flag("browse"),
+            value("slot"),
+            flag("register"),
+            flag("git-worktree"),
+        ]))
+        .subcommand(
+            leaf("fork")
+                .arg(positional("src", 0..=1))
+                .arg(positional("dst", 0..=1)),
+        )
+        .subcommand(
+            leaf("mv")
+                .arg(positional("src", 0..=1))
+                .arg(positional("dst", 0..=1)),
+        )
+        .subcommand(
+            leaf("checkpoint")
+                .arg(positional("workspace", 0..=1))
+                .arg(positional("label", 0..=1))
+                .arg(flag("keep")),
+        )
+        .subcommand(
+            leaf("restore")
+                .arg(positional("workspace", 0..=1))
+                .arg(positional("label", 0..=1)),
+        )
+        .subcommand(leaf("ensure").args([flag("envrc"), flag("attach")]))
+        .subcommand(leaf("ls").arg(flag("all")))
+        .subcommand(
+            leaf("path")
+                .arg(positional("workspace", 0..=1))
+                .args([value("slot"), flag("no-attach")]),
+        )
+        .subcommand(
+            leaf("exec")
+                .arg(positional("workspace", 0..=1))
+                .args([
+                    flag("stdin"),
+                    value("stdin-file"),
+                    value("stdin-base64"),
+                    flag("ro"),
+                    value("cwd"),
+                    value("session"),
+                    value("timeout"),
+                    flag("background"),
+                    value_once("stdout-copy"),
+                    value_once("stderr-copy"),
+
+                    flag("replace-output"),
+                ])
+                .arg(
+                    Arg::new("argv")
+                        .value_parser(value_parser!(OsString))
+                        .num_args(0..)
+                        .last(true)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
+            flag("force"),
+            flag("restore"),
+            flag("abandon"),
+        ]))
+        .subcommand(
+            leaf("attach")
+                .arg(positional("workspace", 0..=1))
+                .arg(flag("browse")),
+        )
+        .subcommand(leaf("detach").arg(positional("workspace", 0..=1)))
+        .subcommand(
+            leaf("resize")
+                .arg(positional("workspace", 0..=1))
+                .arg(positional("size", 0..=1)),
+        )
+        .subcommand(leaf("gc").arg(flag("dry-run")))
+        .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
+            value("branch"),
+            value("expected-workspace-incarnation"),
+            value("expected-source-head"),
+            value("expected-destination-head"),
+        ]))
+        .subcommand(leaf("rebase").arg(positional("workspace", 0..=1)).args([
+            value("onto"),
+            flag("fresh"),
+            value("expected-workspace-incarnation"),
+            value("expected-source-head"),
+            value("expected-onto-head"),
+        ]))
+        .subcommand(leaf("land").arg(positional("workspace", 0..=1)).args([
+            value("target"),
+            append_value("check"),
+            flag("no-retire"),
+            flag("push-only"),
+            value("expected-workspace-incarnation"),
+            value("expected-source-head"),
+            value("expected-target-head"),
+        ]))
+
+        .subcommand(leaf("doctor"))
+        .subcommand(
+            leaf("gateway")
+                .subcommand_required(true)
+                .subcommand(leaf("start"))
+                .subcommand(leaf("stop").arg(flag("purge")))
+                .subcommand(leaf("status"))
+                .subcommand(leaf("run")),
+        )
+        .subcommand(
+            leaf("sccache")
+                .subcommand_required(true)
+                .subcommand(leaf("start").arg(value("capacity")))
+                .subcommand(leaf("stop"))
+                .subcommand(leaf("status")),
+        )
+        .subcommand(
+            leaf("skill")
+                .subcommand_required(true)
+                .subcommand(leaf("install").arg(append_value("harness"))),
+        )
+
+}
+
+fn global_args() -> [Arg; 3] {
+    [
+        Arg::new("json")
+            .long("json")
+            .action(ArgAction::SetTrue)
+            .global(true),
+        Arg::new("quiet")
+            .short('q')
+            .long("quiet")
+            .action(ArgAction::SetTrue)
+            .global(true),
+        Arg::new("project")
+            .long("project")
+            .value_name("git-root")
+            .value_parser(value_parser!(PathBuf))
+            .allow_hyphen_values(true)
+            .global(true),
+    ]
+}
+
+fn leaf(name: &'static str) -> ClapCommand {
+    ClapCommand::new(name)
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+}
+
+fn flag(name: &'static str) -> Arg {
+    Arg::new(name).long(name).action(ArgAction::SetTrue)
+}
+
+fn value(name: &'static str) -> Arg {
+    Arg::new(name)
+        .long(name)
+        .num_args(1)
+        .value_parser(value_parser!(OsString))
+        .allow_hyphen_values(true)
+        .overrides_with(name)
+}
+
+fn value_once(name: &'static str) -> Arg {
+    Arg::new(name)
+        .long(name)
+        .num_args(1)
+        .value_parser(value_parser!(OsString))
+        .allow_hyphen_values(true)
+}
+
+fn append_value(name: &'static str) -> Arg {
+    Arg::new(name)
+        .long(name)
+        .num_args(1)
+        .value_parser(value_parser!(OsString))
+        .allow_hyphen_values(true)
+        .action(ArgAction::Append)
+}
+
+
+fn positional(name: &'static str, _range: std::ops::RangeInclusive<usize>) -> Arg {
+    Arg::new(name)
+        .value_parser(value_parser!(OsString))
+        .required(false)
+        .num_args(1)
+}
+
+
+fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
+    let Some((name, leaf)) = matches.subcommand() else {
+        return Err(UsageError::missing_command());
+    };
+    let global = merge_globals(&matches, leaf);
+    let command = match name {
+        "adopt" => parse_adopt(leaf)?,
+        "setup" => parse_setup(leaf, &global)?,
+        "new" => parse_new(leaf)?,
+        "fork" => parse_fork(leaf)?,
+        "mv" => parse_move(leaf)?,
+        "checkpoint" => parse_checkpoint(leaf)?,
+        "restore" => parse_restore(leaf)?,
+        "ensure" => parse_ensure(leaf)?,
+        "ls" => parse_list(leaf)?,
+        "path" => parse_path(leaf)?,
+        "exec" => parse_exec(leaf)?,
+        "rm" => parse_remove(leaf)?,
+        "attach" => parse_attach(leaf)?,
+        "detach" => parse_detach(leaf)?,
+        "resize" => parse_resize(leaf)?,
+        "gc" => parse_gc(leaf)?,
+        "push" => parse_push(leaf)?,
+        "rebase" => parse_rebase(leaf)?,
+        "land" => parse_land(leaf)?,
+        "doctor" => parse_empty(leaf, &DOCTOR, Command::Doctor)?,
+        "gateway" => parse_gateway(leaf, &global)?,
+        "sccache" => parse_sccache(leaf, &global)?,
+        "skill" => parse_skill(leaf, &global)?,
+        other => return Err(unknown_command(other)),
+    };
+    Ok(Cli { global, command })
+}
+
+fn merge_globals(root: &ArgMatches, leaf: &ArgMatches) -> GlobalOptions {
+    let mut global = globals_from(root);
+    overlay_globals(&mut global, leaf);
+    if let Some((_, child)) = leaf.subcommand() {
+        overlay_globals(&mut global, child);
+        if let Some((_, inner)) = child.subcommand() {
+            overlay_globals(&mut global, inner);
+        }
+    }
+    global
+}
+
+fn overlay_globals(global: &mut GlobalOptions, matches: &ArgMatches) {
+    let nested = globals_from(matches);
+    if nested.json {
+        global.json = true;
+    }
+    if nested.quiet {
+        global.quiet = true;
+    }
+    if nested.project.is_some() {
+        global.project = nested.project;
+    }
+}
+
+fn globals_from(matches: &ArgMatches) -> GlobalOptions {
+    GlobalOptions {
+        json: matches.get_flag("json"),
+        quiet: matches.get_flag("quiet"),
+        project: matches.get_one::<PathBuf>("project").cloned(),
+    }
+}
+
+fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
+    let spec = spec_from_argv(args);
+    match error.kind() {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::MissingSubcommand => match spec {
+            None => UsageError::missing_command(),
+            Some(spec) if matches!(spec.name, "gateway" | "sccache" | "skill") => {
+                UsageError::new(format!("{} action is required", spec.name), spec)
+            }
+            Some(spec) => UsageError::new(format!("{} requires an argument", spec.name), spec),
+        },
+        ErrorKind::InvalidSubcommand => {
+            let name = context_string(&error, ContextKind::InvalidSubcommand)
+                .or_else(|| first_unrecognized(args).map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned());
+            match spec {
+                Some(spec) if matches!(spec.name, "gateway" | "sccache" | "skill") => {
+                    UsageError::new(format!("unknown {} action `{name}`", spec.name), spec)
+                }
+                _ => unknown_command(&name),
+            }
+        }
+        ErrorKind::UnknownArgument => {
+            let token = context_string(&error, ContextKind::InvalidArg)
+                .or_else(|| first_unrecognized(args).map(str::to_owned))
+                .unwrap_or_else(|| "flag".to_owned());
+            match spec {
+                None => unknown_command(&token),
+                Some(spec) if spec.name == "setup" && !token.starts_with('-') => UsageError::new(
+                    format!("setup takes no arguments, only flags; got `{token}`"),
+                    spec,
+                ),
+                Some(spec) if spec.name == "exec" && !token.starts_with('-') => UsageError::new(
+                    "exec requires `--` before the child argv",
+                    spec,
+                ),
+                Some(spec) if token.starts_with('-') => unknown_flag(&token, spec),
+                Some(spec) => UsageError::new(
+                    format!("{} accepts no positional arguments", spec.name),
+                    spec,
+                ),
+            }
+        }
+        ErrorKind::TooManyValues | ErrorKind::ArgumentConflict => {
+            let option = context_string(&error, ContextKind::InvalidArg)
+                .unwrap_or_else(|| "option".to_owned());
+            if let Some(spec) = spec {
+                UsageError::new(format!("{option} may only be specified once"), spec)
+            } else {
+                UsageError::with_hint(
+                    format!("{option} may only be specified once"),
+                    "cowshed --help",
+                )
+            }
+        }
+
+        _ => {
+            let head = error_head(&error);
+            let message = if head.contains("multiple times") {
+                let option = context_string(&error, ContextKind::InvalidArg)
+                    .unwrap_or_else(|| "option".to_owned());
+                format!("{option} may only be specified once")
+            } else {
+                head
+            };
+            if let Some(spec) = spec {
+                UsageError::new(message, spec)
+            } else {
+                UsageError::with_hint(message, "cowshed --help")
+            }
+        }
+
+    }
+}
+
+fn error_head(error: &clap::Error) -> String {
+    error
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or("invalid arguments")
+        .trim()
+        .trim_start_matches("error: ")
+        .to_owned()
+}
+
+fn context_string(error: &clap::Error, wanted: ContextKind) -> Option<String> {
+    error.context().find_map(|(kind, value)| {
+        if kind != wanted {
+            return None;
+        }
+        match value {
+            ContextValue::String(text) => Some(text.clone()),
+            ContextValue::Strings(texts) => texts.first().cloned(),
+            _ => None,
+        }
+    })
+}
+
+fn spec_from_argv(args: &[OsString]) -> Option<&'static CommandSpec> {
+    verb_from_argv(args).and_then(help::command_named)
+}
+
+fn verb_from_argv(args: &[OsString]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].to_str() {
+            Some("--") => return None,
+            Some("--project") => index += 2,
+            Some(flag) if flag.starts_with('-') => index += 1,
+            Some(name) => return Some(name),
+            None => return None,
+        }
+    }
+    None
+}
+
+fn first_unrecognized(args: &[OsString]) -> Option<&str> {
+    args.iter()
+        .filter_map(|argument| argument.to_str())
+        .find(|argument| {
+            *argument != "--"
+                && help::command_named(argument).is_none()
+                && !matches!(
+                    *argument,
+                    "--json"
+                        | "-q"
+                        | "--quiet"
+                        | "--project"
+                        | "start"
+                        | "stop"
+                        | "status"
+                        | "run"
+                        | "install"
+                )
+        })
+}
+
+fn os(matches: &ArgMatches, name: &str) -> Option<OsString> {
+    matches.get_one::<OsString>(name).cloned()
+}
+
+fn flagged(matches: &ArgMatches, name: &str) -> bool {
+    matches.get_flag(name)
+}
+
+fn require_workspace(
+    matches: &ArgMatches,
+    field: &str,
+    reserve_main: bool,
+    usage: &'static CommandSpec,
+    missing: &str,
+) -> Result<String, UsageError> {
+    let value = os(matches, field).ok_or_else(|| UsageError::new(missing, usage))?;
+    workspace_name(&value, reserve_main, usage)
+}
+
+fn optional_workspace(
+    matches: &ArgMatches,
+    field: &str,
+    reserve_main: bool,
+    usage: &'static CommandSpec,
+) -> Result<Option<String>, UsageError> {
+    os(matches, field)
+        .map(|value| workspace_name(&value, reserve_main, usage))
+        .transpose()
+}
+
+fn parse_slot_value(matches: &ArgMatches, usage: &'static CommandSpec) -> Result<Option<u32>, UsageError> {
+    let Some(value) = os(matches, "slot") else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .and_then(|text| text.parse().ok())
+        .map(Some)
+        .ok_or_else(|| UsageError::new("--slot must be an unsigned integer", usage))
+}
+
+fn reject_project(global: &GlobalOptions, usage: &'static CommandSpec, message: &str) -> Result<(), UsageError> {
+    if global.project.is_some() {
+        return Err(UsageError::new(message, usage));
+    }
+    Ok(())
+}
+
+
+
 const GATEWAY: CommandSpec = CommandSpec {
     name: "gateway",
     args: "<start|stop|status|run>",
@@ -605,50 +995,29 @@ const GATEWAY: CommandSpec = CommandSpec {
     }],
 };
 
-fn parse_gateway(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
-    let usage: &'static CommandSpec = &GATEWAY;
-    let mut action = match args.get(index).and_then(|argument| argument.to_str()) {
-        Some("start") => GatewayCommand::Start,
-        Some("stop") => GatewayCommand::Stop { purge: false },
-        Some("status") => GatewayCommand::Status,
-        Some("run") => GatewayCommand::Run,
-        Some(other) => {
+fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &GATEWAY;
+    reject_project(global, USAGE, "--project is not valid for gateway commands")?;
+    let (action, child) = matches.subcommand().ok_or_else(|| {
+        UsageError::new("gateway action is required", USAGE)
+    })?;
+    let command = match action {
+        "start" => GatewayCommand::Start,
+        "stop" => GatewayCommand::Stop {
+            purge: flagged(child, "purge"),
+        },
+        "status" => GatewayCommand::Status,
+        "run" => GatewayCommand::Run,
+        other => {
             return Err(UsageError::new(
                 format!("unknown gateway action `{other}`"),
-                usage,
+                USAGE,
             ));
         }
-        None => return Err(UsageError::new("gateway action is required", usage)),
     };
-    index += 1;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match (args[index].to_str(), &mut action) {
-            (Some("--purge"), GatewayCommand::Stop { purge }) => *purge = true,
-            _ => {
-                let argument = args[index].to_string_lossy();
-                return Err(UsageError::new(
-                    format!("unexpected gateway argument `{argument}`"),
-                    usage,
-                ));
-            }
-        }
-        index += 1;
-    }
-    if global.project.is_some() {
-        return Err(UsageError::new(
-            "--project is not valid for gateway commands",
-            usage,
-        ));
-    }
-    Ok(Command::Gateway(action))
+    Ok(Command::Gateway(command))
 }
+
 
 const SCCACHE: CommandSpec = CommandSpec {
     name: "sccache",
@@ -665,51 +1034,28 @@ const SCCACHE: CommandSpec = CommandSpec {
     }],
 };
 
-fn parse_sccache(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
-    let usage: &'static CommandSpec = &SCCACHE;
-    let mut action = match args.get(index).and_then(|argument| argument.to_str()) {
-        Some("start") => SccacheCommand::Start { capacity: None },
-        Some("stop") => SccacheCommand::Stop,
-        Some("status") => SccacheCommand::Status,
-        Some(other) => {
+fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &SCCACHE;
+    reject_project(global, USAGE, "--project is not valid for sccache commands")?;
+    let (action, child) = matches.subcommand().ok_or_else(|| {
+        UsageError::new("sccache action is required", USAGE)
+    })?;
+    let command = match action {
+        "start" => SccacheCommand::Start {
+            capacity: os(child, "capacity"),
+        },
+        "stop" => SccacheCommand::Stop,
+        "status" => SccacheCommand::Status,
+        other => {
             return Err(UsageError::new(
                 format!("unknown sccache action `{other}`"),
-                usage,
+                USAGE,
             ));
         }
-        None => return Err(UsageError::new("sccache action is required", usage)),
     };
-    index += 1;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match (args[index].to_str(), &mut action) {
-            (Some("--capacity"), SccacheCommand::Start { capacity }) => {
-                *capacity = Some(take_value(args, &mut index, "--capacity", usage)?);
-            }
-            _ => {
-                let argument = args[index].to_string_lossy();
-                return Err(UsageError::new(
-                    format!("unexpected sccache argument `{argument}`"),
-                    usage,
-                ));
-            }
-        }
-        index += 1;
-    }
-    if global.project.is_some() {
-        return Err(UsageError::new(
-            "--project is not valid for sccache commands",
-            usage,
-        ));
-    }
-    Ok(Command::Sccache(action))
+    Ok(Command::Sccache(command))
 }
+
 
 const SKILL: CommandSpec = CommandSpec {
     name: "skill",
@@ -726,56 +1072,28 @@ const SKILL: CommandSpec = CommandSpec {
     }],
 };
 
-fn parse_skill(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_skill(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SKILL;
-    let action = match args.get(index).and_then(|argument| argument.to_str()) {
-        Some("install") => SkillCommand::Install,
-        Some(other) => {
-            return Err(UsageError::new(
-                format!("unknown skill action `{other}`"),
-                USAGE,
-            ));
-        }
-        None => return Err(UsageError::new("skill action is required", USAGE)),
-    };
-    index += 1;
-
-    let mut harnesses = Vec::new();
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--harness") => {
-                let value = take_value(args, &mut index, "--harness", USAGE)?;
-                let name = value
-                    .to_str()
-                    .ok_or_else(|| {
-                        UsageError::new("--harness requires a UTF-8 harness name", USAGE)
-                    })?
-                    .to_owned();
-                if !harnesses.contains(&name) {
-                    harnesses.push(name);
-                }
-            }
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ => {
-                let argument = args[index].to_string_lossy();
-                return Err(UsageError::new(
-                    format!("unexpected skill argument `{argument}`"),
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
+    let (action, child) = matches.subcommand().ok_or_else(|| {
+        UsageError::new("skill action is required", USAGE)
+    })?;
+    if action != "install" {
+        return Err(UsageError::new(
+            format!("unknown skill action `{action}`"),
+            USAGE,
+        ));
     }
-
-    // The scope decides which harness names exist, so validation waits until
-    // --project has been seen wherever it appears in the argument list.
+    let mut harnesses = Vec::new();
+    if let Some(values) = child.get_many::<OsString>("harness") {
+        for value in values {
+            let name = value.to_str().ok_or_else(|| {
+                UsageError::new("--harness requires a UTF-8 harness name", USAGE)
+            })?;
+            if !harnesses.iter().any(|existing| existing == name) {
+                harnesses.push(name.to_owned());
+            }
+        }
+    }
     let scope = if global.project.is_some() {
         crate::skill::Scope::Project
     } else {
@@ -798,33 +1116,21 @@ fn parse_skill(
             ));
         }
     }
-
-    Ok(Command::Skill(SkillArgs { action, harnesses }))
+    Ok(Command::Skill(SkillArgs {
+        action: SkillCommand::Install,
+        harnesses,
+    }))
 }
 
-fn parse_global(
-    args: &[OsString],
-    index: &mut usize,
-    global: &mut GlobalOptions,
-) -> Result<bool, UsageError> {
-    match args[*index].to_str() {
-        Some("--json") => global.json = true,
-        Some("-q" | "--quiet") => global.quiet = true,
-        Some("--project") => {
-            *index += 1;
-            let value = args.get(*index).ok_or_else(|| {
-                UsageError::with_hint(
-                    "--project requires a git root",
-                    "cowshed --project <git-root> <command>",
-                )
-            })?;
-            global.project = Some(PathBuf::from(value));
-        }
-        _ => return Ok(false),
-    }
-    *index += 1;
-    Ok(true)
+fn parse_adopt(matches: &ArgMatches) -> Result<Command, UsageError> {
+    Ok(Command::Adopt(AdoptArgs {
+        path: os(matches, "path").map(PathBuf::from),
+        capacity: os(matches, "capacity"),
+        repo_id: os(matches, "repo-id"),
+        quarantine: flagged(matches, "quarantine"),
+    }))
 }
+
 
 const ADOPT: CommandSpec = CommandSpec {
     name: "adopt",
@@ -851,33 +1157,6 @@ const ADOPT: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_adopt(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &ADOPT;
-    let mut parsed = AdoptArgs::default();
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--capacity") => {
-                parsed.capacity = Some(take_value(args, &mut index, "--capacity", USAGE)?);
-            }
-            Some("--repo-id") => {
-                parsed.repo_id = Some(take_value(args, &mut index, "--repo-id", USAGE)?);
-            }
-            Some("--quarantine") => parsed.quarantine = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if parsed.path.is_none() => parsed.path = Some(PathBuf::from(&args[index])),
-            _ => return Err(UsageError::new("adopt accepts at most one path", USAGE)),
-        }
-        index += 1;
-    }
-    Ok(Command::Adopt(parsed))
-}
 
 const SETUP: CommandSpec = CommandSpec {
     name: "setup",
@@ -905,34 +1184,13 @@ const SETUP: CommandSpec = CommandSpec {
 /// checkout to select, so silently accepting `--project` would promise a scope the verb does not
 /// have. `--force` without `--uninstall` is refused rather than ignored — it confirms a refusal
 /// that the forward direction never makes, so accepting it would answer a question nobody asked.
-fn parse_setup(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SETUP;
-    let mut parsed = SetupArgs::default();
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--uninstall") => parsed.uninstall = true,
-            Some("--force") => parsed.force = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ => {
-                let argument = args[index].to_string_lossy();
-                return Err(UsageError::new(
-                    format!("setup takes no arguments, only flags; got `{argument}`"),
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
-    if global.project.is_some() {
-        return Err(UsageError::new("--project is not valid for setup", USAGE));
-    }
+    reject_project(global, USAGE, "--project is not valid for setup")?;
+    let parsed = SetupArgs {
+        uninstall: flagged(matches, "uninstall"),
+        force: flagged(matches, "force"),
+    };
     if parsed.force && !parsed.uninstall {
         return Err(UsageError::new(
             "--force only confirms --uninstall; setup never refuses to repair a host",
@@ -941,6 +1199,7 @@ fn parse_setup(
     }
     Ok(Command::Setup(parsed))
 }
+
 
 const NEW: CommandSpec = CommandSpec {
     name: "new",
@@ -979,57 +1238,24 @@ const NEW: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_new(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_new(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &NEW;
-    let mut name = None;
-    let mut reference = None;
-    let mut from = None;
-    let mut browse = false;
-    let mut slot = None;
-    let mut register = false;
-    let mut git_worktree = false;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--ref") => reference = Some(take_value(args, &mut index, "--ref", USAGE)?),
-            Some("--from") => {
-                let value = take_value(args, &mut index, "--from", USAGE)?;
-                from = Some(workspace_name(&value, false, USAGE)?);
-            }
-            Some("--browse") => browse = true,
-            Some("--register") => register = true,
-            Some("--git-worktree") => git_worktree = true,
-            Some("--slot") => slot = Some(parse_slot(args, &mut index, USAGE)?),
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if name.is_none() => name = Some(workspace_name(&args[index], true, USAGE)?),
-            _ => {
-                return Err(UsageError::new(
-                    "new accepts exactly one workspace name",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
+    let reference = os(matches, "ref");
+    let from = optional_workspace(matches, "from", false, USAGE)?;
     if reference.is_some() && from.is_some() {
         return Err(UsageError::new("--ref conflicts with --from", USAGE));
     }
     Ok(Command::New(NewArgs {
-        name: name.ok_or_else(|| UsageError::new("new requires a workspace name", USAGE))?,
+        name: require_workspace(matches, "name", true, USAGE, "new requires a workspace name")?,
         reference,
         from,
-        browse,
-        slot,
-        register,
-        git_worktree,
+        browse: flagged(matches, "browse"),
+        slot: parse_slot_value(matches, USAGE)?,
+        register: flagged(matches, "register"),
+        git_worktree: flagged(matches, "git-worktree"),
     }))
 }
+
 
 const FORK: CommandSpec = CommandSpec {
     name: "fork",
@@ -1042,41 +1268,26 @@ const FORK: CommandSpec = CommandSpec {
     options: &[],
 };
 
-fn parse_fork(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &FORK;
-    let mut source = None;
-    let mut destination = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if source.is_none() => {
-                source = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ if destination.is_none() => {
-                destination = Some(workspace_name(&args[index], true, USAGE)?);
-            }
-            _ => {
-                return Err(UsageError::new(
-                    "fork accepts exactly two workspaces",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
     Ok(Command::Fork(ForkArgs {
-        source: source.ok_or_else(|| UsageError::new("fork requires a source workspace", USAGE))?,
-        destination: destination
-            .ok_or_else(|| UsageError::new("fork requires a destination workspace", USAGE))?,
+        source: require_workspace(
+            matches,
+            "src",
+            false,
+            USAGE,
+            "fork requires a source workspace",
+        )?,
+        destination: require_workspace(
+            matches,
+            "dst",
+            true,
+            USAGE,
+            "fork requires a destination workspace",
+        )?,
     }))
 }
+
 
 const MOVE: CommandSpec = CommandSpec {
     name: "mv",
@@ -1089,37 +1300,11 @@ const MOVE: CommandSpec = CommandSpec {
     options: &[],
 };
 
-fn parse_move(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_move(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &MOVE;
-    let mut source: Option<String> = None;
-    let mut destination: Option<OsString> = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            // `main` is accepted here and means the checkout move; every other source is a
-            // workspace the coordinator renames.
-            _ if source.is_none() => {
-                source = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ if destination.is_none() => {
-                destination = Some(args[index].clone());
-            }
-            _ => {
-                return Err(UsageError::new("mv accepts exactly two arguments", USAGE));
-            }
-        }
-        index += 1;
-    }
-    let source = source.ok_or_else(|| UsageError::new("mv requires a workspace", USAGE))?;
+    let source = require_workspace(matches, "src", false, USAGE, "mv requires a workspace")?;
     let destination =
-        destination.ok_or_else(|| UsageError::new("mv requires a destination", USAGE))?;
+        os(matches, "dst").ok_or_else(|| UsageError::new("mv requires a destination", USAGE))?;
     let destination = if source == "main" {
         MoveDestination::Checkout(checkout_destination(&destination, USAGE)?)
     } else {
@@ -1130,6 +1315,7 @@ fn parse_move(
         destination,
     }))
 }
+
 
 /// A checkout destination is a path, and the only thing the parser can decide about it is that it
 /// is spelt absolutely. Whether it exists, is occupied, or overlaps cowshed storage is the
@@ -1159,41 +1345,15 @@ const CHECKPOINT: CommandSpec = CommandSpec {
     }],
 };
 
-fn parse_checkpoint(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_checkpoint(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &CHECKPOINT;
-    let mut workspace = None;
-    let mut label = None;
-    let mut keep = false;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--keep") => keep = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ if label.is_none() => label = Some(args[index].clone()),
-            _ => {
-                return Err(UsageError::new(
-                    "checkpoint accepts one workspace and at most one label",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
     Ok(Command::Checkpoint(CheckpointArgs {
-        workspace,
-        label,
-        keep,
+        workspace: optional_workspace(matches, "workspace", false, USAGE)?,
+        label: os(matches, "label"),
+        keep: flagged(matches, "keep"),
     }))
 }
+
 
 const RESTORE: CommandSpec = CommandSpec {
     name: "restore",
@@ -1206,39 +1366,21 @@ const RESTORE: CommandSpec = CommandSpec {
     options: &[],
 };
 
-fn parse_restore(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_restore(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &RESTORE;
-    let mut workspace = None;
-    let mut label = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ if label.is_none() => label = Some(args[index].clone()),
-            _ => {
-                return Err(UsageError::new(
-                    "restore accepts exactly one workspace and one label",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
     Ok(Command::Restore(RestoreArgs {
-        workspace: workspace
-            .ok_or_else(|| UsageError::new("restore requires a workspace", USAGE))?,
-        label: label.ok_or_else(|| UsageError::new("restore requires a label", USAGE))?,
+        workspace: require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            "restore requires a workspace",
+        )?,
+        label: os(matches, "label")
+            .ok_or_else(|| UsageError::new("restore requires a label", USAGE))?,
     }))
 }
+
 
 const ENSURE: CommandSpec = CommandSpec {
     name: "ensure",
@@ -1260,32 +1402,13 @@ const ENSURE: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_ensure(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &ENSURE;
-    let mut parsed = EnsureArgs::default();
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--envrc") => parsed.envrc = true,
-            Some("--attach") => parsed.attach = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ => {
-                return Err(UsageError::new(
-                    "ensure accepts no positional arguments",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
-    Ok(Command::Ensure(parsed))
+fn parse_ensure(matches: &ArgMatches) -> Result<Command, UsageError> {
+    Ok(Command::Ensure(EnsureArgs {
+        envrc: flagged(matches, "envrc"),
+        attach: flagged(matches, "attach"),
+    }))
 }
+
 
 const LIST: CommandSpec = CommandSpec {
     name: "ls",
@@ -1301,41 +1424,13 @@ const LIST: CommandSpec = CommandSpec {
     }],
 };
 
-fn parse_list(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &LIST;
-    let mut parsed = ListArgs::default();
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--all") => parsed.all = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ => {
-                return Err(UsageError::new("ls accepts no positional arguments", USAGE));
-            }
-        }
-        index += 1;
-    }
-    Ok(Command::List(parsed))
+fn parse_list(matches: &ArgMatches) -> Result<Command, UsageError> {
+    Ok(Command::List(ListArgs {
+        all: flagged(matches, "all"),
+    }))
 }
 
-/// `--slot <n>` in every verb that takes one.
-fn parse_slot(
-    args: &[OsString],
-    index: &mut usize,
-    usage: &'static CommandSpec,
-) -> Result<u32, UsageError> {
-    let value = take_value(args, index, "--slot", usage)?;
-    value
-        .to_str()
-        .and_then(|text| text.parse().ok())
-        .ok_or_else(|| UsageError::new("--slot must be an unsigned integer", usage))
-}
+
 
 const PATH: CommandSpec = CommandSpec {
     name: "path",
@@ -1357,30 +1452,10 @@ const PATH: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_path(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_path(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &PATH;
-    let mut workspace = None;
-    let mut slot = None;
-    let mut no_attach = false;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--no-attach") => no_attach = true,
-            Some("--slot") => slot = Some(parse_slot(args, &mut index, USAGE)?),
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?)
-            }
-            _ => return Err(UsageError::new("path accepts exactly one workspace", USAGE)),
-        }
-        index += 1;
-    }
+    let workspace = optional_workspace(matches, "workspace", false, USAGE)?;
+    let slot = parse_slot_value(matches, USAGE)?;
     if workspace.is_some() && slot.is_some() {
         return Err(UsageError::new(
             "path takes a workspace or --slot, not both",
@@ -1390,9 +1465,10 @@ fn parse_path(
     Ok(Command::Path(PathArgs {
         workspace,
         slot,
-        no_attach,
+        no_attach: flagged(matches, "no-attach"),
     }))
 }
+
 
 const EXEC: CommandSpec = CommandSpec {
     name: "exec",
@@ -1451,112 +1527,69 @@ const EXEC: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_exec(
-    args: &mut Vec<OsString>,
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &EXEC;
-    let mut workspace = None;
     let mut stdin = None;
-    let mut read_only = false;
-    let mut cwd = None;
-    let mut session = None;
-    let mut timeout = None;
-    let mut background = false;
-    let mut stdout_copy = None;
-    let mut stderr_copy = None;
-    let mut replace_output = false;
-
-    while index < args.len() {
-        if args[index] == OsStr::new("--") {
-            index += 1;
-            break;
-        }
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--stdin") => set_stdin(&mut stdin, StdinSource::Stream, USAGE)?,
-            Some("--stdin-file") => {
-                let value = take_value(args, &mut index, "--stdin-file", USAGE)?;
-                set_stdin(
-                    &mut stdin,
-                    StdinSource::WorkspaceFile(PathBuf::from(value)),
-                    USAGE,
-                )?;
-            }
-            Some("--stdin-base64") => {
-                let value = take_value(args, &mut index, "--stdin-base64", USAGE)?;
-                set_stdin(&mut stdin, StdinSource::InlineBase64(value), USAGE)?;
-            }
-            Some("--ro") => read_only = true,
-            Some("--cwd") => {
-                cwd = Some(PathBuf::from(take_value(args, &mut index, "--cwd", USAGE)?))
-            }
-            Some("--session") => {
-                let value = take_value(args, &mut index, "--session", USAGE)?;
-                session = Some(workspace_name(&value, false, USAGE)?);
-            }
-            Some("--timeout") => timeout = Some(take_value(args, &mut index, "--timeout", USAGE)?),
-            Some("--background") => background = true,
-            Some("--stdout-copy") => {
-                let value = PathBuf::from(take_value(args, &mut index, "--stdout-copy", USAGE)?);
-                set_output_copy(&mut stdout_copy, value, "--stdout-copy", USAGE)?;
-            }
-            Some("--stderr-copy") => {
-                let value = PathBuf::from(take_value(args, &mut index, "--stderr-copy", USAGE)?);
-                set_output_copy(&mut stderr_copy, value, "--stderr-copy", USAGE)?;
-            }
-            Some("--replace-output") => replace_output = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?)
-            }
-            _ => {
-                return Err(UsageError::new(
-                    "exec requires `--` before the child argv",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
+    if flagged(matches, "stdin") {
+        set_stdin(&mut stdin, StdinSource::Stream, USAGE)?;
     }
-    let workspace = workspace.ok_or_else(|| UsageError::new("exec requires a workspace", USAGE))?;
-    if index == 0 || args.get(index.wrapping_sub(1)) != Some(&OsString::from("--")) {
-        return Err(UsageError::new(
-            "exec requires `--` before the child argv",
+    if let Some(value) = os(matches, "stdin-file") {
+        set_stdin(
+            &mut stdin,
+            StdinSource::WorkspaceFile(PathBuf::from(value)),
             USAGE,
-        ));
+        )?;
     }
+    if let Some(value) = os(matches, "stdin-base64") {
+        set_stdin(&mut stdin, StdinSource::InlineBase64(value), USAGE)?;
+    }
+    let stdout_copy = os(matches, "stdout-copy").map(PathBuf::from);
+    let stderr_copy = os(matches, "stderr-copy").map(PathBuf::from);
+    let replace_output = flagged(matches, "replace-output");
     if replace_output && stdout_copy.is_none() && stderr_copy.is_none() {
         return Err(UsageError::new(
             "--replace-output requires --stdout-copy or --stderr-copy",
             USAGE,
         ));
     }
-    args.drain(..index);
-    let argv = std::mem::take(args);
+    let argv: Vec<OsString> = matches
+        .get_many::<OsString>("argv")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
     if argv.is_empty() {
         return Err(UsageError::new(
-            "exec requires a child command after `--`",
+            if matches.contains_id("argv") {
+                "exec requires a child command after `--`"
+            } else {
+                "exec requires `--` before the child argv"
+            },
             USAGE,
         ));
     }
+    let session = os(matches, "session")
+        .map(|value| workspace_name(&value, false, USAGE))
+        .transpose()?;
     Ok(Command::Exec(ExecArgs {
-        workspace,
+        workspace: require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            "exec requires a workspace",
+        )?,
         argv,
         stdin,
-        read_only,
-        cwd,
+        read_only: flagged(matches, "ro"),
+        cwd: os(matches, "cwd").map(PathBuf::from),
         session,
-        timeout,
-        background,
+        timeout: os(matches, "timeout"),
+        background: flagged(matches, "background"),
         stdout_copy,
         stderr_copy,
         replace_output,
     }))
 }
+
 
 /// Usage text is where the destructive flags are documented: a human reads options here
 /// deliberately, whereas a refusal message is what an agent pattern-matches into a retry — which
@@ -1586,33 +1619,11 @@ const REMOVE: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_remove(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &REMOVE;
-    let mut workspace = None;
-    let mut force = false;
-    let mut restore = false;
-    let mut abandon = false;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--force") => force = true,
-            Some("--restore") => restore = true,
-            Some("--abandon") => abandon = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?)
-            }
-            _ => return Err(UsageError::new("rm accepts exactly one workspace", USAGE)),
-        }
-        index += 1;
-    }
-    let workspace = workspace.ok_or_else(|| UsageError::new("rm requires a workspace", USAGE))?;
+    let workspace = require_workspace(matches, "workspace", false, USAGE, "rm requires a workspace")?;
+    let restore = flagged(matches, "restore");
+    let abandon = flagged(matches, "abandon");
     if restore && workspace != "main" {
         return Err(UsageError::new(
             "--restore is only valid for the main workspace",
@@ -1627,11 +1638,12 @@ fn parse_remove(
     }
     Ok(Command::Remove(RemoveArgs {
         workspace,
-        force,
+        force: flagged(matches, "force"),
         restore,
         abandon,
     }))
 }
+
 
 const ATTACH: CommandSpec = CommandSpec {
     name: "attach",
@@ -1647,39 +1659,20 @@ const ATTACH: CommandSpec = CommandSpec {
     }],
 };
 
-fn parse_attach(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_attach(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &ATTACH;
-    let mut workspace = None;
-    let mut browse = false;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--browse") => browse = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?)
-            }
-            _ => {
-                return Err(UsageError::new(
-                    "attach accepts exactly one workspace",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
     Ok(Command::Attach(AttachArgs {
-        workspace: workspace
-            .ok_or_else(|| UsageError::new("attach requires a workspace", USAGE))?,
-        browse,
+        workspace: require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            "attach requires a workspace",
+        )?,
+        browse: flagged(matches, "browse"),
     }))
 }
+
 
 const DETACH: CommandSpec = CommandSpec {
     name: "detach",
@@ -1692,36 +1685,19 @@ const DETACH: CommandSpec = CommandSpec {
     options: &[],
 };
 
-fn parse_detach(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_detach(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &DETACH;
-    let mut workspace = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?)
-            }
-            _ => {
-                return Err(UsageError::new(
-                    "detach accepts exactly one workspace",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
     Ok(Command::Detach(DetachArgs {
-        workspace: workspace
-            .ok_or_else(|| UsageError::new("detach requires a workspace", USAGE))?,
+        workspace: require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            "detach requires a workspace",
+        )?,
     }))
 }
+
 
 const RESIZE: CommandSpec = CommandSpec {
     name: "resize",
@@ -1734,41 +1710,21 @@ const RESIZE: CommandSpec = CommandSpec {
     options: &[],
 };
 
-fn parse_resize(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &RESIZE;
-    let mut workspace = None;
-    let mut capacity: Option<OsString> = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            // `main` resizes too, so the name is not reserved here the way it is for verbs that
-            // would create or replace a workspace.
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ if capacity.is_none() => capacity = Some(args[index].clone()),
-            _ => {
-                return Err(UsageError::new(
-                    "resize accepts exactly one workspace and one size",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
     Ok(Command::Resize(ResizeArgs {
-        workspace: workspace
-            .ok_or_else(|| UsageError::new("resize requires a workspace", USAGE))?,
-        capacity: capacity.ok_or_else(|| UsageError::new("resize requires a size", USAGE))?,
+        workspace: require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            "resize requires a workspace",
+        )?,
+        capacity: os(matches, "size")
+            .ok_or_else(|| UsageError::new("resize requires a size", USAGE))?,
     }))
 }
+
 
 const GC: CommandSpec = CommandSpec {
     name: "gc",
@@ -1784,26 +1740,12 @@ const GC: CommandSpec = CommandSpec {
     }],
 };
 
-fn parse_gc(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
-    const USAGE: &CommandSpec = &GC;
-    let mut parsed = GcArgs::default();
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--dry-run") => parsed.dry_run = true,
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ => return Err(UsageError::new("gc accepts no positional arguments", USAGE)),
-        }
-        index += 1;
-    }
-    Ok(Command::Gc(parsed))
+fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
+    Ok(Command::Gc(GcArgs {
+        dry_run: flagged(matches, "dry-run"),
+    }))
 }
+
 
 const PUSH: CommandSpec = CommandSpec {
     name: "push",
@@ -1834,63 +1776,17 @@ const PUSH: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_push(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_push(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &PUSH;
-    let mut workspace = None;
-    let mut branch = None;
-    let mut expected_workspace_incarnation = None;
-    let mut expected_source_head = None;
-    let mut expected_destination_head = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--branch") => branch = Some(take_value(args, &mut index, "--branch", USAGE)?),
-            Some("--expected-workspace-incarnation") => {
-                expected_workspace_incarnation = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-workspace-incarnation",
-                    USAGE,
-                )?);
-            }
-            Some("--expected-source-head") => {
-                expected_source_head = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-source-head",
-                    USAGE,
-                )?);
-            }
-            Some("--expected-destination-head") => {
-                expected_destination_head = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-destination-head",
-                    USAGE,
-                )?);
-            }
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ => return Err(UsageError::new("push accepts exactly one workspace", USAGE)),
-        }
-        index += 1;
-    }
     Ok(Command::Push(PushArgs {
-        workspace,
-        branch,
-        expected_workspace_incarnation,
-        expected_source_head,
-        expected_destination_head,
+        workspace: optional_workspace(matches, "workspace", false, USAGE)?,
+        branch: os(matches, "branch"),
+        expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
+        expected_source_head: os(matches, "expected-source-head"),
+        expected_destination_head: os(matches, "expected-destination-head"),
     }))
 }
+
 
 const REBASE: CommandSpec = CommandSpec {
     name: "rebase",
@@ -1924,67 +1820,18 @@ const REBASE: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_rebase(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &REBASE;
-    let mut workspace = None;
-    let mut onto = None;
-    let mut fresh = false;
-    let mut expected_workspace_incarnation = None;
-    let mut expected_source_head = None;
-    let mut expected_onto_head = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--onto") => onto = Some(take_value(args, &mut index, "--onto", USAGE)?),
-            Some("--fresh") => fresh = true,
-            Some("--expected-workspace-incarnation") => {
-                expected_workspace_incarnation = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-workspace-incarnation",
-                    USAGE,
-                )?);
-            }
-            Some("--expected-source-head") => {
-                expected_source_head = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-source-head",
-                    USAGE,
-                )?);
-            }
-            Some("--expected-onto-head") => {
-                expected_onto_head =
-                    Some(take_value(args, &mut index, "--expected-onto-head", USAGE)?);
-            }
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ => {
-                return Err(UsageError::new(
-                    "rebase accepts exactly one workspace",
-                    USAGE,
-                ));
-            }
-        }
-        index += 1;
-    }
     Ok(Command::Rebase(RebaseArgs {
-        workspace,
-        onto,
-        fresh,
-        expected_workspace_incarnation,
-        expected_source_head,
-        expected_onto_head,
+        workspace: optional_workspace(matches, "workspace", false, USAGE)?,
+        onto: os(matches, "onto"),
+        fresh: flagged(matches, "fresh"),
+        expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
+        expected_source_head: os(matches, "expected-source-head"),
+        expected_onto_head: os(matches, "expected-onto-head"),
     }))
 }
+
 
 const LAND: CommandSpec = CommandSpec {
     name: "land",
@@ -2027,72 +1874,30 @@ const LAND: CommandSpec = CommandSpec {
     ],
 };
 
-fn parse_land(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-) -> Result<Command, UsageError> {
+fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &LAND;
-    let mut workspace = None;
-    let mut target = None;
-    let mut checks = Vec::new();
-    let mut retire = true;
-    let mut push_only = false;
-    let mut expected_workspace_incarnation = None;
-    let mut expected_source_head = None;
-    let mut expected_target_head = None;
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        match args[index].to_str() {
-            Some("--target") => target = Some(take_value(args, &mut index, "--target", USAGE)?),
-            Some("--check") => checks.push(take_value(args, &mut index, "--check", USAGE)?),
-            Some("--no-retire") => retire = false,
-            Some("--push-only") => push_only = true,
-            Some("--expected-workspace-incarnation") => {
-                expected_workspace_incarnation = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-workspace-incarnation",
-                    USAGE,
-                )?);
-            }
-            Some("--expected-source-head") => {
-                expected_source_head = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-source-head",
-                    USAGE,
-                )?);
-            }
-            Some("--expected-target-head") => {
-                expected_target_head = Some(take_value(
-                    args,
-                    &mut index,
-                    "--expected-target-head",
-                    USAGE,
-                )?);
-            }
-            Some(flag) if flag.starts_with('-') => return Err(unknown_flag(flag, USAGE)),
-            _ if workspace.is_none() => {
-                workspace = Some(workspace_name(&args[index], false, USAGE)?);
-            }
-            _ => return Err(UsageError::new("land accepts exactly one workspace", USAGE)),
-        }
-        index += 1;
-    }
+    let checks = matches
+        .get_many::<OsString>("check")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
     Ok(Command::Land(LandArgs {
-        workspace: workspace.ok_or_else(|| UsageError::new("land requires a workspace", USAGE))?,
-        target,
+        workspace: require_workspace(
+            matches,
+            "workspace",
+            false,
+            USAGE,
+            "land requires a workspace",
+        )?,
+        target: os(matches, "target"),
         checks,
-        retire,
-        push_only,
-        expected_workspace_incarnation,
-        expected_source_head,
-        expected_target_head,
+        retire: !flagged(matches, "no-retire"),
+        push_only: flagged(matches, "push-only"),
+        expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
+        expected_source_head: os(matches, "expected-source-head"),
+        expected_target_head: os(matches, "expected-target-head"),
     }))
 }
+
 
 const DOCTOR: CommandSpec = CommandSpec {
     name: "doctor",
@@ -2106,35 +1911,14 @@ const DOCTOR: CommandSpec = CommandSpec {
 };
 
 fn parse_empty(
-    args: &[OsString],
-    mut index: usize,
-    global: &mut GlobalOptions,
-    spec: &'static CommandSpec,
+    _matches: &ArgMatches,
+    _spec: &'static CommandSpec,
     parsed: Command,
 ) -> Result<Command, UsageError> {
-    while index < args.len() {
-        if parse_global(args, &mut index, global)? {
-            continue;
-        }
-        return Err(UsageError::new(
-            format!("{} accepts no arguments", spec.name),
-            spec,
-        ));
-    }
     Ok(parsed)
 }
 
-fn take_value(
-    args: &[OsString],
-    index: &mut usize,
-    option: &str,
-    usage: &'static CommandSpec,
-) -> Result<OsString, UsageError> {
-    *index += 1;
-    args.get(*index)
-        .cloned()
-        .ok_or_else(|| UsageError::new(format!("{option} requires a value"), usage))
-}
+
 
 fn set_stdin(
     target: &mut Option<StdinSource>,
@@ -2148,20 +1932,6 @@ fn set_stdin(
         ));
     }
     *target = Some(value);
-    Ok(())
-}
-fn set_output_copy(
-    target: &mut Option<PathBuf>,
-    value: PathBuf,
-    option: &str,
-    usage: &'static CommandSpec,
-) -> Result<(), UsageError> {
-    if target.replace(value).is_some() {
-        return Err(UsageError::new(
-            format!("{option} may only be specified once"),
-            usage,
-        ));
-    }
     Ok(())
 }
 
