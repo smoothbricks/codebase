@@ -384,15 +384,32 @@ async fn run_daemon() -> Result<()> {
     drain_after_shutdown(gateway, wait_for_shutdown_signal()).await
 }
 
-/// Heal every recorded project, reporting rather than raising. A project that cannot be healed is
-/// a finding for `cowshed doctor`; it must never stop the gateway from serving the healthy ones.
+/// Heal every recorded project, mains before sessions, reporting rather than raising.
+///
+/// A project that cannot be healed is a finding for `cowshed doctor`; it must never stop the
+/// gateway from serving the healthy ones (05_gateway.md). Mains are logged apart from sessions
+/// because they are not equally load-bearing: an unmounted main is the user's own checkout missing
+/// from their shell and editor, which is why `doctor` reports it as critical and this line carries
+/// the remedy with it.
 async fn heal_recorded_projects(storage: &ValidatedHostStorage) {
     let inventory = NativeGatewayInventory::new(storage.clone());
     match inventory.heal_all().await {
         Ok(outcomes) => {
-            for (repo, outcome) in outcomes {
-                if let Err(error) = outcome {
-                    eprintln!("cowshed: could not heal {repo} at startup: {error}");
+            for outcome in outcomes {
+                if let Err(error) = &outcome.main {
+                    eprintln!(
+                        "cowshed: {} has no mounted main after startup heal: {error}",
+                        outcome.repo_id
+                    );
+                    eprintln!("next: cowshed doctor");
+                }
+                for session in &outcome.sessions {
+                    if let Err(error) = &session.mount {
+                        eprintln!(
+                            "cowshed: could not heal {}/{} at startup: {error}",
+                            outcome.repo_id, session.workspace
+                        );
+                    }
                 }
             }
         }
