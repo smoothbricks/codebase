@@ -90,10 +90,9 @@ not a best-effort script:
 
 ## Checkout layouts
 
-Where `main` mounts is a per-project choice recorded in project metadata. Both layouts are supported, both use the same
-publication transaction, and every workspace other than `main` mounts at `<mount-root>/<owner>/<repo>/<workspace>`,
-where the mount root is host configuration (default `~/.cowshed/mnt`, set via `cowshed setup --mount-root`; see
-01_storage.md). The root holds only mountpoint directories (empty when detached) and is plain per-user directories on
+Main mounts at the checkout's original path — one layout, no per-project choice to record — and every other
+workspace mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is host configuration (default
+`~/.cowshed/mnt`, set via `cowshed setup --mount-root`; see 01_storage.md). The root holds only mountpoint directories (empty when detached) and is plain per-user directories on
 Data; nothing is written inside any checkout, so no Git exclusion is required for them. Changing the root requires
 every workspace detached and is refused otherwise.
 
@@ -103,16 +102,11 @@ there. The user's path is the real thing: `pwd -P` reports it, the gitdir physic
 the volume label — which is why the label is the repository's name (01_storage.md) rather than an encoded identity. The
 cost is one mounted volume inside the user's source tree and a mountpoint that cannot be moved by `mv`.
 
-**Symlink**. `main` mounts inside the store's session namespace like every other image — one uniform mount namespace,
-no special case in the layout, the substrate, or the runtime — and the checkout path holds a symlink to that
-mountpoint. Publication builds the symlink under a staging sibling, exchanges it with the original directory in one
-atomic `renameatx_np(RENAME_SWAP)`, and renames the displaced original to `<root>.pre-cowshed`.
-
-The swap carries the guarantee: the checkout path transitions directly from real directory to valid symlink, so there is
-no instant at which it is absent and none at which it dangles — the mount is already live when the symlink first
-appears. Ordering the mount before the handoff is what "symlink last" protects; performing the handoff as a swap rather
-than a move-aside followed by a link is what removes the window in which the user's familiar path would not exist at
-all.
+**A symlink checkout layout was rejected.** Mounting main inside the store and leaving a symlink at the original path
+keeps the tree movable, but Git resolves `gitdir:` conditions against the real path — the moment adopt completes, every
+path-conditional rule anchored at the original checkout stops applying, and the loss stays undetectable because the
+checkout's own resolved gitdir already lives inside the store. Identity must sit where the user's rules look for it;
+direct mount is the only faithful option.
 
 Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Rules anchored at an ancestor shared by both
 the checkout and the mount root (for example `gitdir:~/Dev/` when checkouts live in `~/Dev` and the root is
@@ -134,7 +128,7 @@ directory, swap pending_ — recovery needs nothing from the user's tree to fini
 exist yet. `<root>.pre-cowshed` is retained until the user deletes it; cowshed never auto-deletes it.
 
 Adopting is reversible, and reverses the same way: `cowshed rm main --restore` detaches, swaps the retained
-`<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the symlink, or the emptied
+`<root>.pre-cowshed` tree back against whatever publication left at the checkout path — the emptied
 mountpoint directory — and removes the displaced artifact. The checkout path is never absent during the restore either.
 
 ## `cowshed mv` — rename a workspace or move the checkout
@@ -154,11 +148,8 @@ The checkout path is written down in three places, and no two of them can be der
 at main's mount root, the `infoSnapshot.projectRoot` in the sidecar beside main's canonical image, and the layout record
 that says whether the checkout _is_ the mountpoint. Every move carries all three.
 
-**Symlink layout.** Main stays mounted in the store's session namespace throughout. The checkout path is only a symlink into
-it and nothing about the mount depends on where that symlink sits, so there is no unmount and no remount — the move is
-the relink alone. Gaplessness therefore costs nothing: the destination link is created before the source link is
-removed, and the tree answers to at least one name at every instant. A crash between the two steps leaves both names,
-which is an extra alias rather than a lost checkout.
+Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
+new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
 
 **Direct mount.** The checkout path _is_ the mountpoint, and a mountpoint cannot be renamed while it is mounted. This is
 the real transaction: detach → rename the (now stub-carrying) mountpoint directory → rebind the substrate onto the new
@@ -182,17 +173,16 @@ in-flight job; for the checkout move, a relative destination, one that is occupi
 one that overlaps cowshed storage or the current checkout. A dirty tree is _not_ a refusal for the checkout move — the
 working tree is carried across untouched rather than republished, so there is nothing for a fence to protect.
 
-A user who moves a symlinked checkout by hand has not broken anything: `cowshed doctor` accepts a checkout path that
+A user who moves an adopted checkout by hand has not broken anything: `cowshed doctor` accepts a checkout path that
 resolves to the workspace's volume root wherever it now sits, and `cowshed ensure` converges the recorded path onto the
-observed one. `mv` is the sanctioned front door; convergence is the safety net under it.
+observed one. `mv <ws>` is the sanctioned front door; convergence is the safety net under it.
 
-Convergence needs an observation the controller cannot make for itself. `current_dir(2)` resolves symlinks, so it
-reports main's mount rather than the name the user reached it by, and under the symlink layout it can never witness
-where the checkout actually lives. The CLI therefore carries its invocation directory into `ensure`, and convergence
+Convergence needs an observation the controller cannot make for itself. `current_dir(2)` reports main's mount rather
+than the name the user reached it by, and it witnesses where the checkout actually lives. The CLI therefore carries its invocation directory into `ensure`, and convergence
 fires only when that observation is unambiguous: the path sits inside main's mount, the checkout root above it resolves
 to that mount, that root lies outside cowshed's own storage — so the mount path is never mistaken for the user's
 checkout — and it differs from what is recorded. The layout is recorded from the same observation: a checkout that is a
-symlink is the symlink layout by construction, and one that is the mountpoint is direct mount. An `ensure` with no
+mount is direct mount by construction. An `ensure` with no
 observation converges nothing rather than guessing.
 
 ## `cowshed new <name>` — create a session workspace
@@ -243,14 +233,13 @@ says what the remote is — the main workspace — so `git fetch main`, `git log
 as what they do, and an agent that knows nothing about cowshed guesses it correctly on the first try.
 
 The URL is the canonical mount, never the recorded checkout path, and the two differ by checkout layout (see "Checkout
-layouts"): under direct mount they are the same directory, and under the symlink layout the checkout path is a symlink
-into the store's session namespace for main. Recording the symlink would put a path outside the workspace's read grants
+layout"): they are the same directory. Recording a separate checkout path would put a path outside the workspace's read grants
 into its git config and would dangle the moment the checkout moves; the canonical mount is the path the substrate owns,
 the path the grants already cover, and the path `cowshed mv` maintains. `mv` rewrites the remote in every mounted
 workspace as part of the same transaction that moves the mount, for the same reason it rewrites the volume label. A
 workspace that was detached while main moved has no volume to write into; `ensure` re-runs the same idempotent
 configuration when the workspace is next used, so the repair rides the front door a workspace already passes through
-rather than needing a verb of its own. Under the symlink layout main's mount never moves, and both paths are the
+rather than needing a verb of its own. Both paths are the
 idempotent no-op the remote configuration is built to be.
 
 A fresh mint starts from a clean slate: the workspace's `.git` arrives by CoW carrying every remote main had, network
@@ -301,9 +290,8 @@ gains three steps between attach and publication:
    worktree must not carry one — two registrations claiming the same worktree id is precisely the failure mode that
    makes cloning an already-linked worktree wrong (see the prototype report).
 2. Register the worktree against main's repository and plant the pointer file, using **main's canonical mount** as the
-   repository path. Under direct mount that is the checkout path; under the symlink layout it is
-   the store's session namespace path for main, and the registration must name it rather than the symlink for the same reason
-   the `main` remote does — a registration recorded through the checkout symlink breaks the moment the checkout moves,
+   repository path, which is the checkout path. The registration must name the real mount path rather than any alias
+   for the same reason the `main` remote does — a registration recorded through an alias breaks when it moves,
    and `git worktree repair` would then have two plausible paths and no way to choose. Because the tree is already
    present from the clone, nothing is checked out: cowshed registers with `--no-checkout`, relocates the pointer onto
    the mount root, and reconciles both directions with `git -C <main-canonical-mount> worktree repair <mount>`, which is
@@ -342,7 +330,7 @@ It is also a hole in the isolation, stated plainly. The sandbox needs read and w
 user's own repository. The profile carries that hole as a distinct, controller-owned carve-back on
 `<main-canonical-mount>/.git` and nothing wider, emitted after every deny that would otherwise close it (04_sandbox.md).
 It cannot be an ordinary read/write grant: grants are refused outright when they intersect a protected path, and main's
-mount is one under both layouts — inside cowshed's store under the symlink layout, and the denied project root under
+mount is one — the denied project root under
 direct mount. Main's working tree stays as unreachable as any other workspace's, and a workspace that did not ask for
 `--git-worktree` never has any of it.
 
@@ -702,7 +690,7 @@ eval "$(cowshed ensure --envrc)"
 **Self-healing stub**: the underlying (shadowed-when-mounted) mountpoint directory contains a one-line `.envrc` —
 `cowshed ensure --attach` — so `cd` into an unmounted workspace triggers direnv, cowshed re-attaches, and the real
 `.envrc` shadows the stub on the next prompt. Every `cd` is a repair opportunity. Main heals the same way in either
-checkout layout: under direct mount the checkout path _is_ the mountpoint, and under the symlink layout the symlink
+checkout path: it _is_ the mountpoint,
 resolves to the mountpoint whether or not it is mounted, so a `cd` to the familiar path reaches the stub either way.
 
 ## Tradeoffs

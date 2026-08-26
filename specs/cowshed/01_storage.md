@@ -156,10 +156,8 @@ For every mounted attachment:
 - Session workspaces mount under the host-configured mount root at
   `<mount-root>/<owner>/<repo>/<workspace>`. `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and
   the sidebar regardless of Finder preferences.
-- The **main workspace mounts where its project's checkout layout says** (02_workspaces.md): at the repository's
-  original path (written `<project-root>` below) under direct mount, or inside the store's session namespace with a
-  symlink at the original path under the symlink layout. Either way the user keeps working at the path they know, and
-  in both layouts sibling workspaces live under the shared mount root.
+- The **main workspace mounts at the checkout's original path** (written `<project-root>` below; 02_workspaces.md).
+  The user's path is the real thing, and sibling workspaces live under the shared mount root.
 - Mountpoint directories are created before attach and removed by `cowshed gc`; an empty mountpoint dir is the defined
   "detached" state, and the underlying dir holds a stub `.envrc` used for self-healing (see 02_workspaces.md).
 - Cwd resolution is granted only when the canonical input path is contained in exactly one currently mounted,
@@ -266,7 +264,7 @@ precious.
 
 There is one cowshed per machine, anchored to no account. `/private/cowshed/{store,caches}` are plain directories on
 Data created once at provision; they exist only as mountpoints and fstab targets. Per-user conveniences are
-unprivileged symlinks (`~/.cowshed → /private/cowshed/store`) written by `cowshed ensure` purely for muscle memory;
+a per-user `~/.cowshed/mnt` mount root (plain directories on Data) written by repair commands;
 no cowshed evidence, sandbox profile, or metadata derives a path from `$HOME`. Workspace images remain separate
 workspace images live under `<mount-root>/…`'s sibling layout on the store, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by
 sharing; concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and
