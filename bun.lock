@@ -46,7 +46,7 @@
     },
     "packages/cli": {
       "name": "@smoothbricks/cli",
-      "version": "0.10.21-next.0",
+      "version": "0.10.21",
       "bin": {
         "smoo": "./bin/smoo",
       },
@@ -79,7 +79,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.1.5-next.0",
+      "version": "0.1.5",
       "dependencies": {
         "typia": "13.2.0",
       },
