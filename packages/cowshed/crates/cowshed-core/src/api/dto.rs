@@ -4,6 +4,7 @@ pub use crate::metadata::{
     WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use crate::repository::RepoId;
+use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use base64::Engine;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -2354,6 +2355,8 @@ result_bodies!(
     MirrorInfo,
     AuditEvent,
     SkillInstallReport,
+    HostSetupReport,
+    UninstallReport,
     Vec<WorkspaceInfo>,
     Vec<ProjectWorkspaces>,
     Vec<JobInfo>,
