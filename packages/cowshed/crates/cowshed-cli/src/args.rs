@@ -75,6 +75,44 @@ pub enum Command {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectDiscovery {
+    Required,
+    Optional,
+    NotUsed,
+}
+
+impl Command {
+    pub const fn project_discovery(&self) -> ProjectDiscovery {
+        match self {
+            Self::Adopt(_)
+            | Self::New(_)
+            | Self::Fork(_)
+            | Self::Move(_)
+            | Self::Checkpoint(_)
+            | Self::Restore(_)
+            | Self::Ensure(_)
+            | Self::Path(_)
+            | Self::Exec(_)
+            | Self::Remove(_)
+            | Self::Attach(_)
+            | Self::Detach(_)
+            | Self::Resize(_)
+            | Self::Gc(_)
+            | Self::Push(_)
+            | Self::Rebase(_)
+            | Self::Land(_) => ProjectDiscovery::Required,
+            Self::List(args) if !args.all => ProjectDiscovery::Optional,
+            Self::Doctor => ProjectDiscovery::Optional,
+            Self::List(_)
+            | Self::Gateway(_)
+            | Self::Sccache(_)
+            | Self::Skill(_)
+            | Self::Help(_) => ProjectDiscovery::NotUsed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SkillCommand {
     Install,
 }
@@ -2550,6 +2588,47 @@ mod tests {
         // Nothing within two edits: no invented suggestion.
         let unrelated = parse_args(["frobnicate"]).unwrap_err();
         assert_eq!(unrelated.message, "unknown command `frobnicate`");
+    }
+
+    #[test]
+    fn every_command_declares_its_project_discovery_requirement() {
+        use ProjectDiscovery::{NotUsed, Optional, Required};
+
+        let cases: &[(&[&str], ProjectDiscovery)] = &[
+            (&["adopt", "/repo"], Required),
+            (&["new", "raven"], Required),
+            (&["fork", "raven", "falcon"], Required),
+            (&["mv", "raven", "falcon"], Required),
+            (&["checkpoint", "raven"], Required),
+            (&["restore", "raven", "saved"], Required),
+            (&["ensure"], Required),
+            (&["ls"], Optional),
+            (&["ls", "--all"], NotUsed),
+            (&["path", "raven"], Required),
+            (&["exec", "raven", "--", "true"], Required),
+            (&["rm", "raven"], Required),
+            (&["attach", "raven"], Required),
+            (&["detach", "raven"], Required),
+            (&["resize", "raven", "32GiB"], Required),
+            (&["gc"], Required),
+            (&["push", "raven"], Required),
+            (&["rebase", "raven"], Required),
+            (&["land", "raven"], Required),
+            (&["doctor"], Optional),
+            (&["gateway", "status"], NotUsed),
+            (&["sccache", "status"], NotUsed),
+            (&["skill", "install"], NotUsed),
+            (&["help"], NotUsed),
+        ];
+
+        for (arguments, expected) in cases {
+            let cli = parse_args(arguments.iter().copied()).expect("representative command parses");
+            assert_eq!(
+                cli.command.project_discovery(),
+                *expected,
+                "{arguments:?}"
+            );
+        }
     }
 
     /// The grammar a usage error hints is the option table printed, so the flags a verb accepts
