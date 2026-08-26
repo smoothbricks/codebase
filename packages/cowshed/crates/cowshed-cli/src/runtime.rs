@@ -20,6 +20,7 @@ use cowshed_core::api::{
     StdinSource as CoreStdinSource, WorkspaceInfo, WorkspacePath, WorkspaceState,
     validate_command_argv,
 };
+use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, SlotId, WorkspaceIncarnation,
@@ -27,11 +28,15 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
-use cowshed_core::storage::apfs::DEFAULT_IMAGE_CAPACITY;
+use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_core::storage::apfs::{
+    ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY,
+};
 use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, STORE_ROOT,
-    execute_host_setup, plan_host_setup,
+    ValidatedHostStorage, execute_host_setup, plan_host_setup,
 };
+use cowshed_core::storage::lifecycle::{MountState, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::storage::host_config::{
     RETIRED_LAYOUT_HINT, retired_layout_paths,
@@ -1580,25 +1585,71 @@ async fn detach_scoped_sessions(service: &mut dyn CliService) -> Result<()> {
 }
 
 async fn detach_store_wide() -> Result<()> {
+    let home = gateway_service::canonical_home()?;
+    let storage = validate_existing_host_storage(&home).await?;
+    let projects = NativeGatewayInventory::new(storage.clone())
+        .adopted_projects()
+        .await
+        .map_err(project_inventory_error)?;
     let mut detached = 0usize;
-    for project in adopted_projects().await? {
-        let mut bridge = ActorBridge::open_existing(&project.project_root).await?;
-        let primary = detach_project_sessions(&mut bridge).await;
-        let teardown = bridge.shutdown().await.err();
-        match primary {
-            Ok(count) => {
-                if let Some(error) = teardown {
-                    return Err(error);
-                }
-                detached += count;
-            }
-            Err(primary) => return Err(merge_primary(primary, teardown)),
-        }
+    for project in &projects {
+        detached += detach_project_sessions_from_store(&storage, project).await?;
     }
     if detached == 0 {
         return Err(no_attached_sessions());
     }
     Ok(())
+}
+
+/// Detach a project's mounted sessions from store metadata and kernel mount facts alone.
+///
+/// In particular, this does not open `project.project_root` as a Git repository. Store-wide
+/// detach must keep working when an adopted checkout's recorded remote name is stale or absent:
+/// the image sidecar and repository binding already provide every identity unmount needs.
+async fn detach_project_sessions_from_store(
+    storage: &ValidatedHostStorage,
+    project: &AdoptedProject,
+) -> Result<usize> {
+    let layout = StorageLayout::new(storage.store(), &project.repo_id)
+        .map_err(detach_store_storage_error)?;
+    let checkout_layout = layout
+        .checkout_layout()
+        .map_err(detach_store_storage_error)?;
+    let config = ApfsSubstrateConfig::new(
+        storage.store(),
+        storage.caches(),
+        &project.project_root,
+        checkout_layout,
+        ApfsCaseSensitivity::Sensitive,
+    );
+    let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())
+        .map_err(detach_store_storage_error)?;
+    let substrate = ApfsSubstrate::new(config, host);
+    let targets = substrate
+        .list(&project.repo_id)
+        .await
+        .map_err(detach_store_storage_error)?
+        .into_iter()
+        .filter(|derived| {
+            !derived.workspace.name().is_main()
+                && matches!(derived.mount_state, MountState::Mounted { .. })
+        })
+        .map(|derived| derived.workspace)
+        .collect::<Vec<_>>();
+    for target in &targets {
+        substrate
+            .unmount(target)
+            .await
+            .map_err(detach_store_storage_error)?;
+    }
+    Ok(targets.len())
+}
+
+fn detach_store_storage_error(error: impl std::fmt::Display) -> CowshedError {
+    CowshedError::integrity(
+        format!("store-wide detach could not read or unmount a session: {error}"),
+        "cowshed doctor --json",
+    )
 }
 
 async fn detach_project_sessions(service: &mut dyn CliService) -> Result<usize> {
@@ -2647,6 +2698,17 @@ where
             .map_err(output_error)?;
     }
     dispatch_and_shutdown(bridge, cli, stdin, output).await
+}
+
+pub async fn run_host_command<W, E>(
+    cli: Cli,
+    output: &mut Output<W, E>,
+) -> Result<DispatchExit>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    dispatch_host_command(cli, output, false).await
 }
 
 async fn dispatch_host_command<W, E>(
