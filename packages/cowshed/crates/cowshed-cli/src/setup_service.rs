@@ -27,8 +27,8 @@ use crate::sccache_service::{remove_stale_socket, sccache_launch_agent};
 use async_trait::async_trait;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostSetupPlan, HostSetupReport, HostUninstallPlan, UninstallFstabOutcome,
-    UninstallReport, VolumeOutcome, VolumeRole, VolumeState, execute_host_setup,
-    execute_host_uninstall, plan_host_setup, plan_host_uninstall,
+    UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeRole, VolumeState,
+    execute_host_setup, execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
 use cowshed_core::metadata::ImageFormat;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
@@ -61,9 +61,14 @@ pub enum WorkspaceCensus {
 }
 
 /// One host artifact teardown touched, in the order it was touched.
+///
+/// Typed rather than stringly, so the prose rendering is an exhaustive match and a new outcome
+/// cannot silently render as an old one. The stringly [`UninstallServiceOutcome`] is the wire
+/// shape at the edge, produced from this and never the other way round.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostArtifactRemoval {
-    /// What it is, in words: `dev.cowshed.gateway agent`, `installed cowshed binary`.
+    /// What it is, in words: `dev.cowshed.gateway agent`, `installed cowshed binary`. Frozen
+    /// vocabulary: it is both the stderr label and the JSON `what`.
     pub what: String,
     pub outcome: RemovalOutcome,
 }
@@ -73,6 +78,18 @@ impl HostArtifactRemoval {
         Self {
             what: what.into(),
             outcome,
+        }
+    }
+
+    /// The wire form. `already-absent` is hyphenated to match core's action vocabulary
+    /// (`already-current`, `marker-written`) even though the stderr prose reads "already absent".
+    fn to_wire(&self) -> UninstallServiceOutcome {
+        UninstallServiceOutcome {
+            what: self.what.clone(),
+            outcome: String::from(match self.outcome {
+                RemovalOutcome::Removed => "removed",
+                RemovalOutcome::AlreadyAbsent => "already-absent",
+            }),
         }
     }
 }
@@ -322,7 +339,12 @@ where
         output,
     )?;
     let removals = setup.remove_host_services().await?;
-    let report = setup.execute_uninstall().await?;
+    let mut report = setup.execute_uninstall().await?;
+    // Core owns the fstab half and reports it; the service half is this adapter's work, so the
+    // adapter is what puts it in the report. Without this the JSON surface would be narrower than
+    // the stderr surface, and a caller reading only the envelope would never learn that two
+    // LaunchAgents and two binaries had been deleted.
+    report.services = removals.iter().map(HostArtifactRemoval::to_wire).collect();
     if json {
         output.success(report).map_err(output_error)?;
     } else {
