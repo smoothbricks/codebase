@@ -29,6 +29,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use crate::error::{CowshedError, Result};
 
@@ -264,53 +265,71 @@ fn reconcile(
         mirrored.remove(relative);
     }
 
-    let mut hard_links: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+    let mut hard_link_primaries: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+    let mut hard_link_aliases = Vec::new();
+    let mut leaf_copies = Vec::new();
     for (relative, entry) in target {
-        if entry.is_hard_linked()
-            && let Some(primary) = hard_links.get(&(entry.device, entry.inode))
-        {
-            // A second name for an inode already materialized: link it instead
-            // of copying it. rsync was never asked to preserve hard links, so
-            // adopt used to expand a `.git` object store or a package store into
-            // independent copies, inflating the image against no benefit.
-            if link_leaf(&destination.join(primary), &destination.join(relative))? {
-                mirrored.insert(relative.clone(), Mirrored::from(entry));
+        if entry.kind == EntryKind::Directory {
+            if !outdated.contains(relative) {
+                continue;
+            }
+            let path = destination.join(relative);
+            let materialized =
+                relative.as_os_str().is_empty() || path.is_dir() || create_directory(&path)?;
+            if materialized {
+                mirrored.insert(
+                    relative.clone(),
+                    Mirrored {
+                        mode: DIRECTORY_STAGING_MODE,
+                        ..Mirrored::from(entry)
+                    },
+                );
+            } else {
+                mirrored.remove(relative);
             }
             continue;
         }
+
         if entry.is_hard_linked() {
-            hard_links.insert((entry.device, entry.inode), relative.clone());
-        }
-        if !outdated.contains(relative) {
-            continue;
-        }
-        let materialized = match entry.kind {
-            EntryKind::Directory => {
-                let path = destination.join(relative);
-                if relative.as_os_str().is_empty() || path.is_dir() {
-                    true
-                } else {
-                    create_directory(&path)?
-                }
+            let key = (entry.device, entry.inode);
+            if let Some(primary) = hard_link_primaries.get(&key) {
+                hard_link_aliases.push(HardLinkAlias {
+                    primary: primary.clone(),
+                    relative: relative.clone(),
+                    state: Mirrored::from(entry),
+                });
+                continue;
             }
-            EntryKind::File | EntryKind::Symlink => {
-                copy_leaf(&source.join(relative), &destination.join(relative))?
-            }
-        };
-        if !materialized {
-            // The entry vanished from the source mid-pass. That is churn, and
-            // the next observation reports it; nothing here needs to fail.
-            mirrored.remove(relative);
-            continue;
+            hard_link_primaries.insert(key, relative.clone());
         }
-        let state = match entry.kind {
-            EntryKind::Directory => Mirrored {
-                mode: DIRECTORY_STAGING_MODE,
-                ..Mirrored::from(entry)
-            },
-            EntryKind::File | EntryKind::Symlink => Mirrored::from(entry),
-        };
-        mirrored.insert(relative.clone(), state);
+
+        if outdated.contains(relative) {
+            leaf_copies.push(LeafCopy {
+                relative: relative.clone(),
+                state: Mirrored::from(entry),
+            });
+        }
+    }
+
+    for outcome in copy_leaves_parallel(source, destination, &leaf_copies)? {
+        if outcome.materialized {
+            mirrored.insert(outcome.relative, outcome.state);
+        } else {
+            mirrored.remove(&outcome.relative);
+        }
+    }
+
+    // A primary may have been recopied on this pass, so aliases are relinked after every primary
+    // copy has settled. This preserves one destination inode even when names cross worker batches.
+    for alias in hard_link_aliases {
+        if link_leaf(
+            &destination.join(&alias.primary),
+            &destination.join(&alias.relative),
+        )? {
+            mirrored.insert(alias.relative, alias.state);
+        } else {
+            mirrored.remove(&alias.relative);
+        }
     }
 
     for relative in staging.iter().rev() {
@@ -324,6 +343,77 @@ fn reconcile(
         mirrored.insert(relative.clone(), Mirrored::from(entry));
     }
     Ok(())
+}
+
+struct LeafCopy {
+    relative: PathBuf,
+    state: Mirrored,
+}
+
+struct LeafCopyOutcome {
+    relative: PathBuf,
+    state: Mirrored,
+    materialized: bool,
+}
+
+struct HardLinkAlias {
+    primary: PathBuf,
+    relative: PathBuf,
+    state: Mirrored,
+}
+
+fn copy_worker_count(job_count: usize) -> usize {
+    if job_count == 0 {
+        return 0;
+    }
+    thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(job_count)
+}
+
+/// Clone independent leaves with one bounded worker per available core.
+///
+/// Each worker gets a stable strided slice of the snapshot rather than taking work through a
+/// mutex. The source and destination paths are immutable, and aliases are deliberately excluded:
+/// their cross-subtree inode dependency is resolved after all workers join.
+fn copy_leaves_parallel(
+    source: &Path,
+    destination: &Path,
+    leaves: &[LeafCopy],
+) -> Result<Vec<LeafCopyOutcome>> {
+    let worker_count = copy_worker_count(leaves.len());
+    if worker_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            workers.push(scope.spawn(move || {
+                let mut outcomes = Vec::with_capacity(leaves.len().div_ceil(worker_count));
+                for leaf in leaves.iter().skip(worker).step_by(worker_count) {
+                    outcomes.push(LeafCopyOutcome {
+                        relative: leaf.relative.clone(),
+                        state: leaf.state,
+                        materialized: copy_leaf(
+                            &source.join(&leaf.relative),
+                            &destination.join(&leaf.relative),
+                        )?,
+                    });
+                }
+                Ok::<_, CowshedError>(outcomes)
+            }));
+        }
+
+        let mut outcomes = Vec::with_capacity(leaves.len());
+        for worker in workers {
+            let batch = worker
+                .join()
+                .map_err(|_| CowshedError::internal("repository copy worker panicked"))??;
+            outcomes.extend(batch);
+        }
+        Ok(outcomes)
+    })
 }
 
 /// Destination paths the source no longer has, or has under a different kind.
@@ -650,16 +740,32 @@ mod native {
         }
     }
 
-    /// `COPYFILE_CLONE` asks for a copy-on-write clone and falls back to a full
-    /// copy when the two paths are on different volumes, which they are during
-    /// adopt. Keeping it costs nothing and makes a same-volume copy free.
-    /// `COPYFILE_NOFOLLOW` copies a symlink as a symlink.
+    /// Ask APFS for a metadata-only clone first. Adoption usually crosses from the checkout's
+    /// volume into the staged image, where clonefile is unsupported; that is a per-entry fallback,
+    /// not a reason to abort the whole tree after earlier subtrees have completed.
     pub fn copy_leaf(source: &Path, destination: &Path) -> io::Result<()> {
-        copyfile(
+        let clone = copyfile(
             source,
             destination,
-            COPYFILE_ALL | libc::COPYFILE_CLONE | libc::COPYFILE_NOFOLLOW,
-        )
+            COPYFILE_ALL | libc::COPYFILE_CLONE_FORCE | libc::COPYFILE_NOFOLLOW,
+        );
+        match clone {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::EXDEV || code == libc::ENOTSUP
+                ) =>
+            {
+                match std::fs::remove_file(destination) {
+                    Ok(()) => {}
+                    Err(remove) if remove.kind() == io::ErrorKind::NotFound => {}
+                    Err(remove) => return Err(remove),
+                }
+                copyfile(source, destination, COPYFILE_ALL | libc::COPYFILE_NOFOLLOW)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Metadata only: the directory already exists and its contents were written
@@ -772,6 +878,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use proptest::prelude::*;
 
     use super::{
         CopyReport, DIRECTORY_STAGING_MODE, EntryKind, Snapshot, converge, copy_with_budget,
@@ -1248,5 +1356,59 @@ mod tests {
             assert_eq!(error.code.as_str(), "usage");
         }
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn resumed_parallel_copy_keeps_completed_leaves(file_count in 2_usize..80) {
+            let (root, source, destination) = copy_roots("parallel-resume");
+            let completed = file_count / 2;
+            for index in 0..completed {
+                let subtree = source.join(format!("subtree-{}", index % 8));
+                fs::create_dir_all(&subtree).expect("create initial subtree");
+                fs::write(subtree.join(format!("file-{index}")), index.to_le_bytes())
+                    .expect("write initial file");
+            }
+            run(&source, &destination, 6);
+            let initial_inodes = (0..completed)
+                .map(|index| {
+                    let path = destination
+                        .join(format!("subtree-{}", index % 8))
+                        .join(format!("file-{index}"));
+                    fs::symlink_metadata(path).expect("stat initial copy").ino()
+                })
+                .collect::<Vec<_>>();
+
+            for index in completed..file_count {
+                let subtree = source.join(format!("subtree-{}", index % 8));
+                fs::create_dir_all(&subtree).expect("create resumed subtree");
+                fs::write(subtree.join(format!("file-{index}")), index.to_le_bytes())
+                    .expect("write resumed file");
+            }
+            run(&source, &destination, 6);
+
+            for index in 0..file_count {
+                let path = destination
+                    .join(format!("subtree-{}", index % 8))
+                    .join(format!("file-{index}"));
+                prop_assert_eq!(
+                    fs::read(path).expect("read copied file"),
+                    index.to_le_bytes()
+                );
+            }
+            for (index, inode) in initial_inodes.into_iter().enumerate() {
+                let path = destination
+                    .join(format!("subtree-{}", index % 8))
+                    .join(format!("file-{index}"));
+                prop_assert_eq!(
+                    fs::symlink_metadata(path).expect("restat initial copy").ino(),
+                    inode,
+                    "a resumed copy must not reclone completed leaves"
+                );
+            }
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
     }
 }
