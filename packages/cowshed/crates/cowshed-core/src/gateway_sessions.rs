@@ -14,13 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use cowshed_gateway::{
     EgressGrant, GatewayControlClient, GatewayHandle, GatewayStatus, MirrorProtocol, MirrorRoute,
     WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
-    control_socket_path,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -28,8 +27,22 @@ use crate::error::{CowshedError, Result};
 use crate::gateway_inventory::{GatewaySessionFact, NativeGatewayInventory};
 use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
 use crate::repository::RepoId;
-use crate::storage::bootstrap::ValidatedHostStorage;
+use crate::storage::bootstrap::{STORE_ROOT, ValidatedHostStorage};
 use crate::storage::bootstrap::native::validate_existing_host_storage;
+
+/// The gateway control socket, at the store root.
+///
+/// Root-level keeps `sun_path` short (01_storage.md): a Unix socket address is capped near 104
+/// bytes, and a home-relative path spent that budget on the user's name before the gateway had
+/// said anything. The store is also the only location every peer agrees on — a LaunchAgent, the
+/// CLI, and a supervising runtime each know the store, while `HOME` differs between them.
+///
+/// Derived here rather than in `cowshed-gateway` because the canonical roots live in this crate
+/// and the gateway crate sits below it: one definition, no constant copied across a crate
+/// boundary.
+pub fn control_socket_path() -> PathBuf {
+    Path::new(STORE_ROOT).join("gateway.sock")
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReconcileReport {
@@ -445,7 +458,7 @@ where
 pub async fn reconcile_native_project(repo_id: &RepoId) -> Result<ReconcileReport> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
-    let control_socket = control_socket_path(storage.home());
+    let control_socket = control_socket_path();
     let inventory = NativeSessionInventory::new(storage);
     let control = GatewayControlClient::new(control_socket).map_err(control_error)?;
     reconcile_inventory_project(&inventory, &control, repo_id, effective_uid()).await

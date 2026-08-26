@@ -153,10 +153,10 @@ fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
 fn production_config_disables_tcp_and_uses_validated_roots_and_fixed_helper() {
     let paths = GatewayPaths {
         home: PathBuf::from("/Users/test"),
-        store: PathBuf::from("/Users/test/.cowshed"),
-        cache: PathBuf::from("/Users/test/.cowshed/caches/mirror"),
-        telemetry: PathBuf::from("/Users/test/.cowshed/telemetry/gateway"),
-        control_socket: PathBuf::from("/Users/test/.cowshed/gateway.sock"),
+        store: PathBuf::from("/private/cowshed/store"),
+        cache: PathBuf::from("/private/cowshed/caches/mirror"),
+        telemetry: PathBuf::from("/private/cowshed/store/telemetry/gateway"),
+        control_socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
     };
     let helper = PathBuf::from("/Applications/Cowshed.app/Contents/MacOS/cowshed");
     let config = paths.config(501, helper.clone());
@@ -195,7 +195,7 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
         CliGatewayStatus {
             installed: true,
             running: true,
-            socket: PathBuf::from("/Users/test/.cowshed/gateway.sock"),
+            socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
             cli_version: "1.4.0".into(),
             daemon_version: Some("1.3.0".into()),
             cache_entries: 0,
@@ -207,7 +207,7 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
     let (stdout, stderr) = output.into_inner();
     assert_eq!(
         stdout,
-        b"{\"ok\":true,\"result\":{\"installed\":true,\"running\":true,\"socket\":\"/Users/test/.cowshed/gateway.sock\",\"cliVersion\":\"1.4.0\",\"daemonVersion\":\"1.3.0\",\"cacheEntries\":0,\"cacheBytes\":0,\"activeWorkspaces\":2}}\n"
+        b"{\"ok\":true,\"result\":{\"installed\":true,\"running\":true,\"socket\":\"/private/cowshed/store/gateway.sock\",\"cliVersion\":\"1.4.0\",\"daemonVersion\":\"1.3.0\",\"cacheEntries\":0,\"cacheBytes\":0,\"activeWorkspaces\":2}}\n"
     );
     assert!(stderr.is_empty());
 }
@@ -242,7 +242,7 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
             CliGatewayStatus {
                 installed,
                 running,
-                socket: PathBuf::from("/Users/test/.cowshed/gateway.sock"),
+                socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
                 cli_version: "1.4.0".into(),
                 daemon_version: daemon_version.map(str::to_owned),
                 cache_entries: 0,
@@ -256,7 +256,7 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
         let stderr = String::from_utf8(stderr).expect("utf8 status");
         assert!(stderr.contains(state), "{stderr}");
         assert!(
-            stderr.contains("/Users/test/.cowshed/gateway.sock"),
+            stderr.contains("/private/cowshed/store/gateway.sock"),
             "{stderr}"
         );
         assert!(stderr.contains("cli 1.4.0"), "{stderr}");
