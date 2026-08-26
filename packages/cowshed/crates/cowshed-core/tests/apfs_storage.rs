@@ -17,8 +17,8 @@ use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, CheckoutLayout, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode,
-    MarkerExpectation, MetadataPolicy, PublicationError, RestoreStage, RetireExecutionError,
-    volume_key,
+    MarkerExpectation, MetadataPolicy, PublicationError, RestoreStage, ResumableStage,
+    RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
@@ -45,6 +45,7 @@ struct FakeState {
     next_mount_id: u64,
     paths: Vec<PathBuf>,
     mount_paths: Vec<PathBuf>,
+    resumable_adopt: Option<ResumableStage>,
 }
 
 #[derive(Clone)]
@@ -116,6 +117,12 @@ impl FakeHost {
                 volume_key: volume_key(workspace.repo(), workspace.name()),
             },
         );
+    }
+    fn resume_adopt_from(&self, image: impl Into<PathBuf>, format: ImageFormat) {
+        self.state.lock().expect("fake state").resumable_adopt = Some(ResumableStage {
+            image: image.into(),
+            format,
+        });
     }
 
     fn fail_next_marker(&self) {
@@ -267,6 +274,19 @@ impl ApfsExecutionHost for FakeHost {
         }
         self.record(format!("clone:{format:?}"));
         Ok(())
+    }
+    fn resumable_staged_adopt(
+        &self,
+        _: &ApfsSubstrateConfig,
+        _: &RepoId,
+        _: &OperationIdentity,
+    ) -> Result<Option<ResumableStage>, ApfsStorageError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("fake state")
+            .resumable_adopt
+            .clone())
     }
 
     fn attach_verified(
@@ -1035,6 +1055,39 @@ async fn adopt_uses_exact_format_and_verify_before_mount_order() {
     assert_eq!(
         substrate.caches_root().await.expect("caches"),
         PathBuf::from("/store/caches")
+    );
+}
+
+#[tokio::test]
+async fn interrupted_adopt_clones_the_partial_stage_and_resumes_tree_copy() {
+    let host = FakeHost::default();
+    host.resume_adopt_from(
+        "/store/acme/widget/.staging/main-partial.sparseimage",
+        ImageFormat::Sparse,
+    );
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_adopt(adopt_request(ImageFormat::Sparse))
+        .expect("adopt plan");
+
+    substrate
+        .execute_adopt_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .await
+        .expect("resumed adopt");
+
+    let events = host.events();
+    assert!(!events.iter().any(|event| event.starts_with("create:")));
+    let clone = events
+        .iter()
+        .position(|event| event == "clone:Sparse")
+        .expect("partial stage clone");
+    let copy = events
+        .iter()
+        .position(|event| event == "copy-until-quiescent")
+        .expect("convergent tree copy");
+    assert!(
+        clone < copy,
+        "the partial image must seed the resumed tree copy"
     );
 }
 

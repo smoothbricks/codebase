@@ -107,13 +107,18 @@ denied to sandboxes (01_storage.md).
 State is derived, never stored: the workspace clones are the registry (readdir / `zfs list`), the kernel mount table is
 the attachment state (getmntinfo), the controller-owned remote binding establishes repository identity, and an
 in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnation. There is **no mutable state
-database**. The persistent daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md),
-with the optional MCP socket server (12_mcp.md). Linux additionally has one ephemeral minimal connector per attached
-workspace; it is attachment plumbing and stores no authority. Runtime processes hold no sole authority: kill them and
-the next command rederives lifecycle from the host inventory — the images and mounts under `/private/cowshed/store/`, the marker
-each image carries (incarnation and lineage), the per-workspace grants files, and the controller lock — together with
-the protected in-volume job evidence. The trusted supervisor is nevertheless the sole live writer of that in-volume
-evidence; the controller emits each of its acts as a compact audit record to an optional sink.
+database**. Each project does have one bounded, controller-owned `lifecycle-intents.json` recovery journal: it persists
+the latest create/fork/remove intent per logical workspace before mutation, but never overrides the inventory. Startup
+reconciles pending intent against images, mounts, and markers, records the exact completed result, and retries only work
+whose publication is still absent.
+
+The persistent daemons are the gateway (one per host) and the per-workspace shell supervisors (11_shell.md), with the
+optional MCP socket server (12_mcp.md). Linux additionally has one ephemeral minimal connector per attached workspace;
+it is attachment plumbing and stores no authority. Runtime processes hold no sole authority: kill them and the next
+command rederives lifecycle from the host inventory — the images and mounts under `/private/cowshed/store/`, the marker
+each image carries (incarnation and lineage), the per-workspace grants files, the intent journal, and the controller
+lock — together with the protected in-volume job evidence. The trusted supervisor is nevertheless the sole live writer
+of that in-volume evidence; the controller emits each of its acts as a compact audit record to an optional sink.
 
 Observability is distributed tracing into Arrow columns (13_telemetry.md). Protected in-volume complete job batches and
 sealed artifacts own captured content within an origin incarnation/checkpoint boundary. Controller audit records carry
