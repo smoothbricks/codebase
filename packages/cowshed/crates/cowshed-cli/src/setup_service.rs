@@ -71,7 +71,11 @@ const NON_DESTRUCTIVE_PROMISE: &str =
 /// over work someone still wanted. Both cases are the caller's to override; neither is guessed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceCensus {
-    Counted { projects: usize, workspaces: usize },
+    Counted {
+        store: PathBuf,
+        repo_ids: Vec<String>,
+        workspaces: usize,
+    },
     Unknown { reason: String },
 }
 
@@ -203,7 +207,11 @@ impl HostSetup for NativeHostSetup {
             }
         }
         Ok(WorkspaceCensus::Counted {
-            projects: projects.len(),
+            store: storage.store().to_path_buf(),
+            repo_ids: projects
+                .iter()
+                .map(|project| project.repo_id.to_string())
+                .collect(),
             workspaces,
         })
     }
@@ -317,10 +325,13 @@ where
     } else {
         render_repair(&plan, &report, output)?;
     }
-    // Exit 0 even when a volume was reported and not repaired: `setup` reports what it did, and
-    // `doctor` owns the host's verdict (06_cli.md, "Onboarding and repair"). The unresolved state
-    // is never silent — it is a row, a status line, and a field in the JSON report.
     output.hint("cowshed doctor").map_err(output_error)?;
+    if matches!(
+        setup.census().await?,
+        WorkspaceCensus::Counted { workspaces: 0, .. }
+    ) {
+        output.hint("cowshed adopt").map_err(output_error)?;
+    }
     Ok(0)
 }
 
@@ -391,21 +402,23 @@ fn refuse_occupied(census: &WorkspaceCensus, force: bool) -> Option<CowshedError
     match census {
         WorkspaceCensus::Counted { workspaces: 0, .. } => None,
         WorkspaceCensus::Counted {
-            projects,
+            store,
+            repo_ids,
             workspaces,
         } => Some(CowshedError::conflict(
             format!(
-                "{workspaces} {} still {} on this host's volumes across {projects} adopted {}; \
+                "{workspaces} {} still {} on {} across {}; \
                  uninstall removes no volume and no image, so they would be left unmanaged",
                 plural(*workspaces, "workspace", "workspaces"),
                 if *workspaces == 1 { "exists" } else { "exist" },
-                plural(*projects, "project", "projects"),
+                store.display(),
+                format_repo_ids(repo_ids),
             ),
             "cowshed setup --uninstall --force",
         )),
         WorkspaceCensus::Unknown { reason } => Some(CowshedError::conflict(
             format!("could not establish what the volumes hold: {reason}"),
-            "cowshed setup --uninstall --force",
+            "mount first: cowshed setup",
         )),
     }
 }
@@ -633,7 +646,7 @@ fn state_phrase(state: &VolumeState) -> String {
         VolumeState::Absent => String::from("absent"),
         VolumeState::MountedValid => String::from("mounted at its canonical path"),
         VolumeState::MountedIncomplete => {
-            String::from("mounted with a missing or wrong volume marker")
+            String::from("mounted, but its contents could not be identified as this host's cowshed volume")
         }
         VolumeState::Detached => String::from("present but not mounted"),
         VolumeState::MisMounted { mounted_at } => {
@@ -730,15 +743,27 @@ fn uninstall_status(census: &WorkspaceCensus) -> String {
         WorkspaceCensus::Counted { workspaces: 0, .. } => String::from(
             "cowshed's host presence is removed; no workspaces existed and no volume was touched",
         ),
-        WorkspaceCensus::Counted { workspaces, .. } => format!(
-            "cowshed's host presence is removed; {workspaces} {} and {} still on the volumes, which were not touched",
+        WorkspaceCensus::Counted {
+            store,
+            repo_ids,
+            workspaces,
+        } => format!(
+            "cowshed's host presence is removed; {workspaces} {} ({}) and their images are still on {}, which was not touched",
             plural(*workspaces, "workspace", "workspaces"),
-            plural(*workspaces, "its image are", "their images are"),
+            format_repo_ids(repo_ids),
+            store.display(),
         ),
         WorkspaceCensus::Unknown { .. } => String::from(
             "cowshed's host presence is removed; volume contents were never inspected and no volume was touched",
         ),
     }
+}
+
+fn format_repo_ids(repo_ids: &[String]) -> String {
+    if repo_ids.is_empty() {
+        return String::from("no named repositories");
+    }
+    repo_ids.join(", ")
 }
 
 const fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {

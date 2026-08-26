@@ -7,7 +7,8 @@ Every cowshed command follows the same I/O discipline:
 - **Ordinary stdout** carries one control answer: a bare value, aligned table rows, or a bounded JSON envelope with
   `--json`. Job/status JSON contains lifecycle fields, typed artifact handles, byte counts, SHA-256 digests, bounded
   summaries, and may contain small `Inline.data` bytes tagged as `utf8` or `base64`. Foreground exec,
-  `cowshed job logs`, `cowshed job attach`, and artifact reads are the explicit interfaces for unbounded raw bytes.
+  supervisor-captured streams, `cowshed exec --session`, and artifact reads are the explicit interfaces for unbounded
+  raw bytes.
 - **stderr** carries progress, explanations, warnings, and self-driving guidance. Guidance lines are prefixed
   `cowshed:`; suggested follow-up commands are prefixed `next:`. Agents and humans read the same hints.
 - **Exit codes** are stable:
@@ -18,7 +19,7 @@ Every cowshed command follows the same I/O discipline:
 | 1    | internal error (bug — report it) | panic, unexpected hdiutil/diskutil failure                                                                                          |
 | 2    | usage                            | unknown flag, missing argument                                                                                                      |
 | 3    | not-found                        | no such workspace/project/checkpoint                                                                                                |
-| 4    | conflict                         | name in use, workspace busy, restore over unsaved state without `--force`                                                           |
+| 4    | conflict                         | name in use, workspace busy, restore over unsaved work                                                                              |
 | 5    | env-missing                      | gateway, storage, mount, or executable unavailable; configured devenv refresh failed                                                |
 | 6    | sandbox-denied                   | command blocked by the sandbox, confirmed by authoritative evidence; stderr names the path/domain and the grant that would allow it |
 | 7    | integrity                        | committed job content missing, mutated, rolled back, or from outside the workspace's lineage                                        |
@@ -34,7 +35,7 @@ The JSON envelope is uniform:
 
 ```
 $ cowshed new raven --json
-{"ok":true,"result":{"workspace":"raven","mount":"/Users/me/.cowshed/mnt/acme/widget/raven","baseCommit":"6f3a2c1"}}
+{"ok":true,"result":{"workspace":"raven","mount":"<project-root>/.cowshed/raven","baseCommit":"6f3a2c1"}}
 
 $ cowshed path nonesuch --json
 {"ok":false,"error":{"code":"not-found",
@@ -44,7 +45,7 @@ $ cowshed path nonesuch --json
 
 Errors with `--json` still exit with their code; stderr stays human-readable either way. A bounded `JobInfo` may encode
 small `Inline.data` bytes in a tagged `utf8` or `base64` form. The size bound is load-bearing: larger and live artifacts
-remain handles, and unbounded bytes require `cowshed job logs`, `cowshed job attach`, or an explicit artifact read.
+remain handles, and unbounded bytes require `cowshed exec --session`, a `--background` job id, or an explicit artifact read.
 
 ## Global flags
 
@@ -199,7 +200,7 @@ adopt, and `adopt` would ask for one.
 ```
 $ cd <project-root> && cowshed adopt
 cowshed: created dedicated volumes cowshed.store, cowshed.caches (space-sharing, excluded from backup)
-cowshed: creating image ~/.cowshed/acme/widget/main.asif (capacity 100g, sparse)
+cowshed: creating image /private/cowshed/store/acme/widget/main.asif (capacity 100g, asif)
 cowshed: copying 8,357,293 objects into the image (this is the one-time cost)
 cowshed: verifying tree against source ... ok
 cowshed: swapping <project-root> -> mountpoint (stub .envrc written beneath)
@@ -251,7 +252,7 @@ workspace name, state, branch, mountpoint (empty when detached).
 ```
 $ cowshed ls
 main   mounted   main           <project-root>
-raven  mounted   cowshed/raven  ~/.cowshed/mnt/acme/widget/raven
+raven  mounted   cowshed/raven  <project-root>/.cowshed/raven
 fox    detached  cowshed/fox
 ```
 
@@ -262,7 +263,7 @@ path. Plain output adds `repoId` as the first column and keeps projects contiguo
 ```
 $ cowshed ls --all
 acme/api  main   mounted  main           ~/src/api
-acme/api  raven  mounted  cowshed/raven  ~/.cowshed/mnt/acme/api/raven
+acme/api  raven  mounted  cowshed/raven  ~/src/api/.cowshed/raven
 acme/web  main   mounted  main           ~/src/web
 ```
 
@@ -272,12 +273,12 @@ With `--json`, the result is grouped explicitly as
 ### `cowshed path <name>`
 
 Bare mountpoint on stdout. Exit 3 if the workspace doesn't exist. A detached workspace is attached first, so the printed
-path is always live; pass `--no-attach` to skip the healing and get the would-be path with a `cowshed:` note instead.
+path is always live; pass `--no-attach` to skip the remount and get the would-be path with a `cowshed:` note instead.
 
 ### `cowshed path --slot <n>` — build slots and compiler-cache reuse
 
 A **build slot** is one stable mount path, occupied by one workspace at a time. `cowshed new <name> --slot 3` binds slot
-3, and that workspace mounts at `~/.cowshed/mnt/<owner>/<repo>/slot@3` instead of `.../<name>`. When it is removed or
+3, and that workspace mounts at `<project-root>/.cowshed/slot-3` instead of `.../<name>`. When it is removed or
 renamed the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
 
 That path identity is the entire feature, because compiler caches key on absolute paths:
@@ -339,8 +340,8 @@ next: land the workspace: cowshed land raven
 
 $ cowshed rm raven --abandon
 cowshed: abandoned 9 commits at 9b2e77d… that main (at 6f3a2c1…) did not contain
-cowshed: bundled to ~/.cowshed/store/acme/api/sessions/.trash/raven-9b2e77d….bundle
-next: cowshed gc   # reclaim space from old checkpoints too
+cowshed: bundled to /private/cowshed/store/acme/api/sessions/.trash/raven-9b2e77d….bundle
+next: cowshed gc   # free space from old checkpoints too
 ```
 
 Recover an abandoned bundle from main's repository, which holds its one prerequisite:
@@ -413,11 +414,12 @@ raven$ echo $PORT
 raven$ bun run dev          # vite reads $PORT; open http://localhost:40961 in your browser
 ```
 
-### `cowshed job list <name>` — background work
+### Background work
 
 Long commands auto-background at the soft timeout (default 120 s; `--timeout <dur>` tunes it, `--background` forces it
-immediately) and keep running under the workspace supervisor. `cowshed exec`/`cowshed shell` accept `--session <name>`
-for a persistent named shell whose cwd, variables, and jobs survive across calls.
+immediately) and keep running under the workspace supervisor. `cowshed exec` accepts `--session <name>` for a persistent
+named shell whose cwd, variables, and jobs survive across calls. There is no `cowshed job` verb; reattach with
+`cowshed exec --session` or print the numeric job id from `--background`.
 
 Every job has separate stdout/stderr `StreamInfo { storage, bytes, sha256, summary }` handles. `storage` is
 `Captured { artifact }` or `Redirect { source, artifact }`; `artifact` is `Inline { data: BinaryData }` or
@@ -427,15 +429,13 @@ not assume every short job creates `out` and `err` files.
 ```sh
 $ cowshed exec raven --background -- bun run build:everything
 42
-$ cowshed job list raven
-42	running	bun run build:everything	2m14s
-$ cowshed job logs raven 42 --follow      # raw stdout bytes; --stderr selects the other stream
-$ cowshed job attach raven 42             # re-attach live raw stdio
+$ cowshed exec raven --session build -- bun run build:everything
 ```
 
-Control/status JSON is bounded; it may carry tagged bytes only for a small inline artifact. Logs, attachments, and
-artifact reads resolve the canonical artifact independently of whether it is inline or spilled and preserve arbitrary
+Control/status JSON is bounded; it may carry tagged bytes only for a small inline artifact. Supervisor-captured streams
+and artifact reads resolve the canonical artifact independently of whether it is inline or spilled and preserve arbitrary
 binary output without UTF-8 assumptions or response-size growth.
+
 
 ### `cowshed ensure [--envrc]`
 
@@ -443,12 +443,12 @@ The fast auto-fix. Healthy fast-path is a marker read plus a statfs (~15–25 ms
 images after reboot or Finder ejects, repairs mount flags, re-arms the autosave agent, and reconciles anything drifted —
 synchronously, so when it returns you are standing in a valid workspace. Devenv-native repositories use
 `cowshed ensure --attach` as the explicit remount spelling. `--envrc` additionally prints POSIX shell exports for the
-current workspace:
+current workspace and must be run from inside that workspace — each directory has its own exports:
 
 ```sh
 $ cowshed ensure --envrc
-export GOENV='/Users/me/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env'
-export SCCACHE_SERVER_UDS='/Users/me/.cowshed/sccache.sock'
+export GOENV='<project-root>/.cowshed/raven/.cowshed/cache/go/env'
+export SCCACHE_SERVER_UDS='/private/cowshed/store/sccache.sock'
 export COWSHED_WORKSPACE_TOKEN='cw1_r4v3n…'
 export COWSHED_PORT_BASE='40960'
 ```
@@ -508,7 +508,7 @@ walkthrough, Expo included, is [ios.md](ios.md).
 
 ## Sandbox grants
 
-Workspaces start **closed**: write access to their own volume, `~/.cowshed/caches`, and temp; read access to the
+Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
 toolchains and system; egress to the localhost gateway only. Widen per workspace:
 
 ```
@@ -568,7 +568,7 @@ denial.
 ## Git
 
 Workspace git is **local-paths-only**: every workspace has the `host` remote (main's repository, a mounted path) and can
-clone from read-only mirrors under `~/.cowshed/caches/git` — nothing else. No remote URLs, no credentials, no credential
+clone from read-only mirrors under `/private/cowshed/caches/repo-mirrors` — nothing else. No remote URLs, no credentials, no credential
 helpers exist inside a workspace; pushing to real remotes (origin, GitHub) is coordinator work, done host-side with your
 normal git setup.
 
@@ -599,7 +599,7 @@ that path into the workspace. Mirrors are fetch-only, deduplicated fleet-wide, a
 
 ```
 $ cowshed exec raven -- cowshed repo clone https://github.com/tinylibs/tinybench
-cowshed: mirror ~/.cowshed/caches/git/github.com/tinylibs/tinybench.git (fetched via gateway)
+cowshed: mirror /private/cowshed/caches/repo-mirrors/github.com/tinylibs/tinybench.git (fetched via gateway)
 tinybench
 ```
 
@@ -632,7 +632,7 @@ files; a manifest commits every checkpoint-resident job byte. Recovery may disca
 Restore swaps the current image for the checkpoint (detach → clone → reattach, ~500 ms) and mints a new workspace
 incarnation. Protected content remains authoritative for the restored snapshot's origin boundary; the restored marker
 records the lineage, and the controller's audit record of the restore carries the hashes. Restore refuses over unsaved
-work without `--force` (exit 4), and the displaced image is kept as a `pre-restore-<ts>` checkpoint, so a restore is
+work (exit 4); the displaced image is kept as a `pre-restore-<timestamp>` checkpoint, so a restore is
 itself undoable. List checkpoints with `cowshed ls --json` or `cowshed du`.
 
 ```
@@ -665,7 +665,7 @@ these are idempotent, and a `--purge` with nothing installed says so rather than
   "ok": true,
   "result": {
     "running": true,
-    "socket": "/Users/me/.cowshed/gateway.sock",
+    "socket": "/private/cowshed/store/gateway.sock",
     "cacheEntries": 0,
     "cacheBytes": 0,
     "activeWorkspaces": 3
@@ -686,11 +686,11 @@ and then the compile cache. A host without sccache on PATH logs one line and ser
 inspection, and resizing.
 
 `start` installs and loads the per-user macOS LaunchAgent `dev.cowshed.sccache`, then waits until the server answers on
-its unix socket at `~/.cowshed/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ — a copy at
+its unix socket at `/private/cowshed/store/sccache.sock`. The mode-0600 plist runs the _sccache binary itself_ — a copy at
 `~/Library/Application Support/dev.cowshed/bin/sccache`, installed by `start` from the sccache it resolves on the
 invoking shell's PATH, so run it from a shell with the devenv/nix sccache available — as a foreground unix-socket server:
 `SCCACHE_START_SERVER=1` selects server mode, `SCCACHE_NO_DAEMON=1` keeps it under launchd supervision,
-`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at `~/.cowshed/caches/sccache`.
+`SCCACHE_IDLE_TIMEOUT=0` disables idle exit, and `SCCACHE_DIR` pins the shared store at `/private/cowshed/caches/sccache`.
 Stderr lands at `~/Library/Logs/cowshed/sccache-stderr.log`. `stop` boots out the agent and removes the plist; both
 operations are idempotent. The copy is what keeps the daemon alive across a devenv update or nix garbage collection: an
 sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies on byte drift and rewrites the plist
@@ -716,10 +716,10 @@ whenever it answers:
   "result": {
     "installed": true,
     "running": true,
-    "socket": "/Users/me/.cowshed/sccache.sock",
+    "socket": "/private/cowshed/store/sccache.sock",
     "stats": {
       "maxCacheSize": 42949672960,
-      "baseDirectories": ["/Users/me/.cowshed"],
+      "baseDirectories": ["/private/cowshed/store"],
       "compileRequests": 1204,
       "requestsExecuted": 1204,
       "hits": { "C/C++": 39, "Rust": 22 },
@@ -754,7 +754,7 @@ $ cowshed trace 4bf92f35a3…                             # terminal waterfall o
 ```
 
 There is no `.ndjson` or `.log` file to `tail`; `--ndjson` is an export encoding on the pipe. Under the hood these wrap
-the generic `lmao-inspect` reader over the Arrow segments in `~/.cowshed/telemetry/`.
+the generic `lmao-inspect` reader over the Arrow segments in `/private/cowshed/store/telemetry/`.
 
 ### `cowshed mcp serve`
 
@@ -766,7 +766,7 @@ workspace.
 ### `cowshed gc`
 
 Deletes orphaned images and stale mountpoint dirs, prunes expired checkpoints, compacts detached images, and reports
-what it reclaimed. Safe to run anytime; also runs opportunistically from other commands.
+what it freed. Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
 
 ### `cowshed doctor`
 

@@ -438,7 +438,7 @@ async fn all_nine_parser_commands_dispatch_and_obey_machine_output_contracts() {
     assert_eq!(stdout, b"/mnt/main\n");
     assert_eq!(
         stderr,
-        b"cowshed: image capacity 100g\nnext: cowshed new <name>\n"
+        b"cowshed: created main.asif for acme/widget (capacity 100g, asif)\nnext: cowshed new <name>\n"
     );
 
     let (_, stdout, stderr) = run(&mut service, ["new", "raven", "--browse"]).await;
@@ -608,7 +608,7 @@ async fn adopt_delegates_explicit_identity_and_quarantine_with_exact_output() {
     );
     assert_eq!(
         stderr,
-        b"cowshed: image capacity 100g\nnext: cowshed new <name>\n"
+        b"cowshed: created main.asif for acme/widget (capacity 100g, asif)\nnext: cowshed new <name>\n"
     );
     assert_eq!(
         service.adopt_options,
@@ -744,7 +744,7 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
     assert_eq!(stdout, b"0\n");
     assert_eq!(
         stderr,
-        b"cowshed: dry run examined 9 objects; 0 candidates, 0 bytes reclaimable\n"
+        b"cowshed: dry run examined 9 objects; 0 candidates, 0 bytes deletable\n"
     );
 
     let (_, stdout, stderr) = run(
@@ -1008,13 +1008,37 @@ async fn ensure_resolution_and_token_errors_emit_no_partial_machine_output() {
 }
 
 #[tokio::test]
+async fn ensure_envrc_outside_a_workspace_names_the_per_directory_requirement() {
+    let mut envrc_outside = FakeService {
+        ensure_error: Some(CowshedError::not_found(
+            "the current directory is not a cowshed workspace",
+            "cd into a workspace",
+        )),
+        ..FakeService::default()
+    };
+    let cli = parse_args(["ensure", "--envrc"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    let error = dispatch(&mut envrc_outside, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert_eq!(
+        error.message,
+        "ensure --envrc must run inside a workspace directory"
+    );
+    assert!(error.hint.contains("each workspace has its own exports"));
+    assert!(output.into_inner().0.is_empty());
+}
+
+
+#[tokio::test]
 async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
     let mut empty = FakeService::default();
     let (_, stdout, stderr) = run(&mut empty, ["gc", "--dry-run"]).await;
     assert_eq!(stdout, b"0\n");
     assert_eq!(
         stderr,
-        b"cowshed: dry run examined 9 objects; 0 candidates, 0 bytes reclaimable\n"
+        b"cowshed: dry run examined 9 objects; 0 candidates, 0 bytes deletable\n"
     );
 
     let candidate = GcCandidate {
@@ -1031,7 +1055,7 @@ async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
     assert_eq!(stdout, b"1234\n");
     assert_eq!(
         stderr,
-        b"cowshed: would reclaim /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expiredCheckpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes reclaimable\n"
+        b"cowshed: would delete /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expired checkpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes deletable\n"
     );
 
     let (_, stdout, stderr) = run(&mut populated, ["gc", "--dry-run", "--json"]).await;
@@ -1045,7 +1069,7 @@ async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
     );
     assert_eq!(
         stderr,
-        b"cowshed: would reclaim /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expiredCheckpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes reclaimable\n"
+        b"cowshed: would delete /tmp/\xe5\x9b\x9e\xe6\x94\xb6 space/checkpoint (1234 bytes; reason: expired checkpoint)\ncowshed: dry run examined 9 objects; 1 candidate, 1234 bytes deletable\n"
     );
 }
 
