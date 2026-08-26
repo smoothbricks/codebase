@@ -188,8 +188,8 @@ This is cowshed's layered capability model: the trusted coordinator holds policy
 - Workspace enumeration and attachment state derive from disk; the persistent supervisor owns only live process/job
   control and recovers from durable job ids plus controller telemetry. If a harness crashes, `cowshed ls` still tells
   the truth, clients reconnect to running jobs, and `cowshed rm` cleans up completely.
-- Run `cowshed ensure` at task start if your harness may outlive reboots; it is a no-op (~20 ms) when healthy and
-  repairs mounts when not.
+- Run `cowshed attach` at task start if your harness may outlive reboots; it is a no-op when the
+  workspace is already mounted and repairs attachment state when not.
 - `cowshed gc` is safe to run between tasks; it never touches live workspaces.
 
 ## What agents must not expect

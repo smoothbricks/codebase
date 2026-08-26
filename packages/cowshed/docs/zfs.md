@@ -17,7 +17,7 @@ chooses one.
 | What                                                     | Where                                                                                           |
 | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | Main workspace                                           | dataset `<pool>/cowshed/projects/<owner>/<repo>/main`, mounted at the original path             |
-| Session workspaces                                       | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`, mounted at `~/.cowshed/mnt/<owner>/<repo>/` |
+| Session workspaces                                       | `<pool>/cowshed/projects/<owner>/<repo>/ws/<name>`, mounted at `<mount-root>/<owner>/<repo>/<name>` |
 | Checkpoints                                              | `zfs snapshot`s on the workspace dataset                                                        |
 | Shared caches (Cargo, sccache, zig, Gradle, Go, Nix)     | `<pool>/cowshed/caches`, mounted at `~/.cowshed/caches`                                         |
 | Gateway registry/repository mirrors                      | `mirror/` and `repo-mirrors/` on caches; gateway-owned, sandbox-read-only                       |
@@ -27,7 +27,7 @@ chooses one.
 | Secrets                                                  | secret-service (GNOME Keyring/KWallet), service `dev.cowshed.gateway`                           |
 
 Mountpoints are ZFS properties and normally return at pool import. cowshed still writes the same underlying stub
-`.envrc` as APFS because an unimported pool also makes a mount disappear; `cowshed ensure` verifies the mount, identity,
+`.envrc` as APFS because an unimported pool also makes a mount disappear; `cowshed attach` verifies the mount, identity,
 wiring, and grants and heals it when possible.
 
 The dataset hierarchy is fixed, with three siblings:
@@ -77,7 +77,7 @@ cowshed: snapshot rpool/cowshed/projects/acme/widget/main@cowshed:raven
 cowshed: cloned to ws/raven (copy-on-write)
 cowshed: branch cowshed/raven created from main @ 6f3a2c1
 next: cowshed shell raven
-~/.cowshed/mnt/acme/widget/raven
+<mount-root>/acme/widget/raven
 ```
 
 - **`cowshed new` is tens of milliseconds.** Snapshot + clone are O(1) metadata operations, and the clone mounts as part
@@ -152,7 +152,7 @@ zfs send -i main@cowshed:raven rpool/cowshed/projects/acme/widget/ws/raven@ship 
 ```
 
 On the receiving side, `cowshed ls` sees the dataset immediately (there is no database to register it in);
-`cowshed ensure` mounts it and re-mints grants at the closed baseline — grants never travel, by design.
+`cowshed attach` mounts it and re-mints grants at the closed baseline — grants never travel, by design.
 
 ## ZFS on macOS?
 

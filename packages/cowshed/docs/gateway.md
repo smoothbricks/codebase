@@ -92,7 +92,7 @@ prompt. After the store is mounted at the canonical path it starts the gateway a
 sessions from repository bindings, mount/incarnation facts, grants, and validated workspace credentials. Detached and
 retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before exit.
 
-Every ordinary `exec`, `ensure`, and `doctor` invocation reconciles the current project before use. Attach, detach,
+Every ordinary `exec`, `attach`, and `doctor` invocation reconciles the current project before use. Attach, detach,
 restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed
 revisions/tokens and removing stale project sessions. The gateway's session table is a cache of host inventory, never an
 authority of its own: a session left behind by a project deleted out of band keeps its port block in the gateway while
@@ -129,7 +129,7 @@ followed. Credential rotation is observed on next use; nothing inside a workspac
 
 ## Client wiring (files, not hand-written env)
 
-Wiring is written at adopt/new/fork and revalidated by `ensure`. `portBlock` is optional and macOS-only. The exact
+Wiring is written at adopt/new/fork and revalidated by `attach`. `portBlock` is optional and macOS-only. The exact
 registry URLs are:
 
 | Client                | macOS                                           | Linux                                   |
@@ -233,5 +233,5 @@ Two different situations, kept distinct on purpose:
   work on a plane. Misses fail fast with a `cowshed:` note distinguishing "offline" from "denied" so agents don't
   request grants to fix a network outage.
 - **Gateway not running**: there is no local process to serve even cached artifacts, so registry requests fail until it
-  starts. `cowshed ensure` warns (and `doctor` exits 5 with the kickstart hint); builds that touch no registry keep
+  starts. `cowshed attach` warns (and `doctor` exits 5 with the kickstart hint); builds that touch no registry keep
   working.

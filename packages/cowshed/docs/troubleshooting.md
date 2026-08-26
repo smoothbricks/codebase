@@ -11,24 +11,24 @@ the truth.
 their allowed `.envrc` runs:
 
 ```sh
-$ cowshed ensure
-cowshed: reattached acme/widget/raven (image was healthy, mount was gone)
+$ cowshed attach
+cowshed: attached acme/widget/raven
 ```
 
 Adopted main workspaces retain the byte-stable stub `.envrc` cowshed wrote underneath the mountpoint. When unmounted,
-`cd <project-root>` exposes that stub, which runs `cowshed ensure --attach`; after the real workspace is mounted its own
+`cd <project-root>` exposes that stub, which runs `cowshed attach`; after the real workspace is mounted its own
 `.envrc` shadows the stub and direnv reloads. Cowshed does **not** authorize either file: run `direnv allow` once at
 each workspace path.
 
-Devenv's hook cannot activate from the bare mountpoint stub. For a devenv-native repository, remount explicitly with
-`cowshed ensure --attach`, evaluate `cowshed ensure --envrc` if the human shell needs cowshed's exports, then run the
-repository's `devenv:allow` command once at that workspace path. Cowshed never reads or writes devenv's trust database.
-The login LaunchAgent may attach permanent workspaces proactively, but explicit `ensure` remains the recovery command.
+Devenv's hook cannot activate from the bare mountpoint stub. For a devenv-native repository, run `cowshed attach`,
+then run the repository's `devenv:allow` command once at that workspace path. The mounted image's `.envrc` sources
+`.cowshed/env`; no command prints those exports on demand. Cowshed never reads or writes devenv's trust database.
+The login LaunchAgent may attach permanent workspaces proactively, but explicit `attach` remains the recovery command.
 
-**Finder ejected a volume** (or `hdiutil detach` by hand): use the same explicit `cowshed ensure --attach` recovery.
+**Finder ejected a volume** (or `hdiutil detach` by hand): use the same explicit `cowshed attach` recovery.
 
 **direnv says `.envrc is blocked` in a workspace.** This is expected until that clone path is authorized. Run
-`direnv allow`; `cowshed ensure` repairs mounts but deliberately does not change trust.
+`direnv allow`; `cowshed attach` repairs mounts but deliberately does not change trust.
 
 **devenv refresh fails during `cowshed exec`.** With `[devenv] dir` in `.cowshed.toml` (or a root `devenv.nix`), cowshed
 watches the configuration inputs and refreshes the environment before the next sandbox process. A missing configured
@@ -45,7 +45,7 @@ forever after) rather than working around the gate.
 **Attach fails.** `cowshed doctor` distinguishes: image/dataset missing, image verification failure on macOS, occupied
 mountpoint, or Linux attachment wiring failure. On Linux an attachment is healthy only when its private netns contains
 exactly one trusted connector bound to `127.0.0.1:7644` and that connector can open the mounted per-incarnation
-`/run/cowshed/gateway.sock`. `ensure` recreates missing runtime wiring; it never invents a Linux `portBlock`.
+`/run/cowshed/gateway.sock`. `attach` recreates missing runtime wiring; it never invents a Linux `portBlock`.
 
 **Repository identity conflict.** cowshed records the selected remote URL and its normalized lowercase `owner/repo`
 `repo_id`. If the URL no longer normalizes to that identity, open fails instead of mounting another repository's data.
@@ -78,7 +78,7 @@ and the gateway audit events for egress (`cowshed audit --denied | tail`). Commo
   it's in the image and every fork inherits it.
 - **Egress to an unmirrored host**: `cowshed grant <ws> --egress <host>` — applies immediately, no re-exec.
 - **Linux package/proxy client gets connection refused at `127.0.0.1:7644`**: do not point it at the Unix socket or a
-  macOS block base. Run `cowshed ensure`; `doctor` distinguishes a detached workspace, absent/dead connector, missing or
+  macOS block base. Run `cowshed attach`; `doctor` distinguishes a detached workspace, absent/dead connector, missing or
   wrong per-incarnation socket mount, and a dead host gateway. A healthy workspace uses
   `http://127.0.0.1:7644/{npm,cargo,go}` and the same base, with the token as userinfo
   (`http://cowshed:<token>@127.0.0.1:7644`), in `HTTP_PROXY`/`HTTPS_PROXY` (plus lowercase forms). Detach and restore
@@ -138,14 +138,14 @@ workspace's own registry state, and cowshed will not delete it to share the host
 
 **Nix cache/state points at the host filesystem.** On declarative hosts the module must own
 `~/.cache/nix → ~/.cowshed/caches/nix/cache` and `~/.local/state/nix → ~/.cowshed/caches/nix/state`; `adopt` and
-`ensure` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
+`doctor` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
 `cowshed adopt --imperative-host-setup` fallback is only for a host with no supported declarative owner; it is never an
 automatic recovery from mixed or broken ownership.
 
 ## Path-sensitive caches (why a fresh workspace rebuilds more than expected)
 
 Cargo incremental state and Xcode DerivedData key on **absolute paths**. Main (fixed path) reuses them perfectly; a
-workspace at `~/.cowshed/mnt/...` does not, so first builds there redo path-keyed work even though everything else is
+workspace at `<mount-root>/<owner>/<repo>/<workspace>` does not, so first builds there redo path-keyed work even though everything else is
 warm. This is physics, not breakage. Mitigations, in order: let sccache absorb it (shared, path-tolerant for most rustc
 invocations; already wired); add `--remap-path-prefix`/`trim-paths` to your cargo config if the rebuild tax bothers you;
 keep long-lived personal workspaces (their own paths stay stable, so their incremental state stays valid).
@@ -204,7 +204,7 @@ mirror refetches, sccache and registries rebuild. `cowshed doctor` suggests it w
 its workspaces, under a different workspace identity. The gateway's session table is a cache of host inventory, never an
 authority: the owner is a session left behind by a project that was deleted out of band
 (`rm -rf ~/.cowshed/<owner>/ <repo>` without ever running a verb against it again), and the host-global port-block
-allocator has since handed that block to a new workspace. Reconcile — which every `exec`, `ensure`, and `doctor` runs
+allocator has since handed that block to a new workspace. Reconcile — which every `exec`, `attach`, and `doctor` runs
 first — evicts such a session itself once the host inventory confirms no live workspace anywhere still carries that
 identity, then installs the workspace; the message does not recur. If `cowshed doctor --json` instead refuses with
 `gateway endpoint 127.0.0.1:<base> is assigned to workspace <id> by this project and still claimed by live workspace <id> of another project`,

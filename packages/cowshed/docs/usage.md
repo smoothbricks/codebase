@@ -103,20 +103,19 @@ cowshed gateway status --json
 The gateway owns credentials, registry mirrors, and egress policy. Workspaces receive an isolated endpoint and opaque
 workspace token; secrets are not copied into the workspace.
 
-Direnv repositories put the environment contract in `.envrc`; it heals the mount and exports the workspace-local `GOENV`
-and `COWSHED_*` values:
+Every published workspace image carries its environment in `.cowshed/env`. Cowshed creates a two-line `.envrc` when
+the checkout has none, or appends its marked source line exactly once when the project already owns `.envrc`:
 
 ```sh
-eval "$(cowshed ensure --envrc)"
+source_env_if_present .cowshed/env
 ```
 
-Devenv-native repositories have no hook that can run from a bare, unmounted mountpoint. After a reboot or manual eject,
-reattach explicitly, import the same cowshed exports into the human shell, and use the repository's `devenv:allow`
-command once for that mounted workspace:
+The sourced file exports workspace-local `GOENV` and `COWSHED_*` values and is rewritten whenever cowshed rotates the
+workspace token. After a reboot or manual eject, reattach explicitly; devenv-native repositories then use their own
+`devenv:allow` command once for that mounted workspace:
 
 ```sh
-cowshed ensure --attach
-eval "$(cowshed ensure --envrc)"
+cowshed attach
 npm run devenv:allow  # use the repository's equivalent script
 ```
 
@@ -130,7 +129,7 @@ dir = "tooling/devenv"
 The path must be relative and cannot contain `..`. Without that section, a `devenv.nix` at the workspace root selects
 the root; without either signal, exec behavior is unchanged.
 
-`ensure` is safe to run repeatedly. It does not install dependencies or fetch code, and cowshed never writes direnv or
+`attach` is safe to run repeatedly. It does not install dependencies or fetch code, and cowshed never writes direnv or
 devenv trust records.
 
 ## Daily human workflow
@@ -247,7 +246,7 @@ cowshed new agent-4821 --project ~/src/api --json
   "ok": true,
   "result": {
     "workspace": "agent-4821",
-    "mount": "/Users/me/.cowshed/mnt/acme/api/agent-4821",
+    "mount": "<mount-root>/acme/api/agent-4821",
     "baseCommit": "6f3a2c1000000000000000000000000000000000"
   }
 }
