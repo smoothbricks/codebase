@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 fn repo() -> cowshed_core::repository::RepoId {
     cowshed_core::repository::RepoId::parse("acme/widget").expect("repo id")
@@ -781,34 +781,23 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
 
 #[test]
 fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "cowshed-capability-compile-fail-{}-{nonce}",
-        std::process::id()
-    ));
-    let bins = root.join("src/bin");
-    fs::create_dir_all(&bins).expect("compile-fail fixture directory");
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"cowshed-capability-negative\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\ncowshed-core = {{ path = {:?} }}\nserde = \"1\"\n",
-            manifest_dir
-        ),
-    )
-    .expect("compile-fail manifest");
+    // rustc the deny snippet against the rlib this test already linked. A path-dep
+    // `cargo check` would compile cowshed-core again (~7 min cold on CI) and test
+    // the build graph, not the API surface.
+    let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-deny");
+    fs::create_dir_all(&work).expect("deny snippet directory");
+    let deps = cargo_debug_deps();
+    let cowshed_core = newest_rlib(&deps, "cowshed_core");
+    let serde = newest_rlib(&deps, "serde");
     let cases: [(&str, &str, &[&str]); 6] = [
         (
             "project_authority",
-            "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\nfn main() {}\n",
+            "use cowshed_core::Project;\nfn deny(value: &Project) { value.attach(); value.exec(); value.grant(); value.gc(); }\n",
             &["attach", "exec", "grant", "gc"],
         ),
         (
             "worker_authority",
-            "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.restore(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\nfn main() {}\n",
+            "use cowshed_core::WorkspaceHandle;\nfn deny(value: &WorkspaceHandle) { value.grant(); value.revoke(); value.restore(); value.destroy(); value.rebase(); value.land(); value.gc(); value.repo_mirror(); value.detach(); value.workspace(\"other\"); }\n",
             &[
                 "grant",
                 "revoke",
@@ -824,12 +813,12 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
         ),
         (
             "token_traits",
-            "use cowshed_core::CoordinatorToken;\nfn must_clone<T: Clone>() {} fn must_serialize<T: serde::Serialize>() {}\nfn main() { must_clone::<CoordinatorToken>(); must_serialize::<CoordinatorToken>(); }\n",
+            "use cowshed_core::CoordinatorToken;\nfn must_clone<T: Clone>() {} fn must_serialize<T: serde::Serialize>() {}\nfn deny() { must_clone::<CoordinatorToken>(); must_serialize::<CoordinatorToken>(); }\n",
             &["Clone", "Serialize"],
         ),
         (
             "private_construction",
-            "use cowshed_core::{CoordinatorToken,Cowshed,Project,WorkspaceHandle};\nfn main() { let _ = Cowshed {}; let _ = Project {}; let _ = WorkspaceHandle {}; let _ = CoordinatorToken {}; }\n",
+            "use cowshed_core::{CoordinatorToken,Cowshed,Project,WorkspaceHandle};\nfn deny() { let _ = Cowshed {}; let _ = Project {}; let _ = WorkspaceHandle {}; let _ = CoordinatorToken {}; }\n",
             &[
                 "Cowshed",
                 "Project",
@@ -840,71 +829,43 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
         ),
         (
             "port_block_construction",
-            "use cowshed_core::api::PortBlock;\nfn main() { let _ = PortBlock { base: 40960, size: 16 }; }\n",
+            "use cowshed_core::api::PortBlock;\nfn deny() { let _ = PortBlock { base: 40960, size: 16 }; }\n",
             &["PortBlock", "private"],
         ),
         (
             "null_success",
-            "use cowshed_core::api::JsonEnvelope;\nfn main() { let _ = JsonEnvelope::success(()); }\n",
-            &["ResultBody"],
+            "use cowshed_core::api::JsonEnvelope;\nfn deny() { let _ = JsonEnvelope::success(()); }\n",
+            &["success", "Sealed"],
         ),
     ];
-    for (name, source, _) in &cases {
-        fs::write(bins.join(format!("{name}.rs")), source).expect("compile-fail source");
-    }
-    // Keep dependency artifacts in Cargo's target tree and check every negative
-    // binary in one process. The fixtures remain isolated while Cargo can reuse
-    // cowshed-core and schedule the independent rustc checks concurrently.
-    let output = Command::new(env!("CARGO"))
-        .args([
-            "check",
-            "--quiet",
-            "--offline",
-            "--bins",
-            "--keep-going",
-            "--message-format=json",
-        ])
-        .current_dir(&root)
-        .env(
-            "CARGO_TARGET_DIR",
-            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-compile-fail"),
-        )
-        .output()
-        .expect("run cargo check");
-    assert!(
-        !output.status.success(),
-        "negative fixtures unexpectedly compiled"
-    );
-
-    let mut diagnostics = std::collections::HashMap::<String, String>::new();
-    for line in output.stdout.split(|byte| *byte == b'\n') {
-        let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        if message["reason"].as_str() != Some("compiler-message") {
-            continue;
-        }
-        let Some(name) = message
-            .pointer("/target/name")
-            .and_then(|name| name.as_str())
-        else {
-            continue;
-        };
-        diagnostics
-            .entry(name.to_owned())
-            .or_default()
-            .push_str(&String::from_utf8_lossy(line));
-    }
-    for (name, _, expected) in cases {
-        let diagnostic = diagnostics
-            .get(name)
-            .map(String::as_str)
-            .unwrap_or_default();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    for (name, source, expected) in cases {
+        let src = work.join(format!("{name}.rs"));
+        fs::write(&src, source).expect("deny snippet");
+        let output = Command::new(&rustc)
+            .arg("--edition=2024")
+            .arg("--crate-name")
+            .arg(name)
+            .arg("--crate-type=lib")
+            .arg("--emit=metadata")
+            .arg("--error-format=short")
+            .arg("--extern")
+            .arg(format!("cowshed_core={}", cowshed_core.display()))
+            .arg("--extern")
+            .arg(format!("serde={}", serde.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", deps.display()))
+            .arg("-o")
+            .arg(work.join(name))
+            .arg(&src)
+            .output()
+            .unwrap_or_else(|error| panic!("rustc {name}: {error}"));
         assert!(
-            !diagnostic.is_empty(),
-            "{name} did not emit a compile failure:\n{}",
+            !output.status.success(),
+            "{name} unexpectedly compiled:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
         for expected in expected {
             assert!(
                 diagnostic.contains(expected),
@@ -912,5 +873,48 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             );
         }
     }
-    fs::remove_dir_all(root).expect("remove compile-fail fixtures");
+}
+
+fn cargo_debug_deps() -> PathBuf {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    for ancestor in tmp.ancestors() {
+        let nested = ancestor.join("debug/deps");
+        if nested.is_dir() {
+            return nested;
+        }
+        if ancestor.file_name().is_some_and(|name| name == "debug") {
+            let deps = ancestor.join("deps");
+            if deps.is_dir() {
+                return deps;
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/deps")
+}
+
+fn newest_rlib(deps: &std::path::Path, crate_name: &str) -> PathBuf {
+    let prefix = format!("lib{crate_name}-");
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in
+        fs::read_dir(deps).unwrap_or_else(|error| panic!("read {}: {error}", deps.display()))
+    {
+        let entry = entry.expect("deps entry");
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(&prefix) && name.ends_with(".rlib")) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(stamp, _)| modified >= *stamp) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+    newest
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| panic!("no {prefix}*.rlib in {}", deps.display()))
 }
