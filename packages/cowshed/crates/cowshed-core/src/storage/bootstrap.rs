@@ -11,7 +11,15 @@ use thiserror::Error;
 
 use crate::process::fmt_command_failure;
 
+use super::fstab::FstabPin;
+
 pub mod native;
+pub use native::{
+    FstabOutcome, HostSetupPlan, HostSetupReport, HostUninstallPlan, UninstallFstabOutcome,
+    UninstallReport, VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall,
+    plan_host_setup, plan_host_uninstall,
+};
+
 
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
@@ -655,6 +663,7 @@ pub enum VolumeRef {
     ExistingExact(String),
 }
 
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExistingMarkerEvidence {
     Missing,
@@ -688,6 +697,13 @@ pub enum ExistingStorage {
     MisMountedIncomplete {
         exact_identifier: String,
         current_mountpoint: PathBuf,
+    },
+    /// A reserved-name volume exists, but not in the home volume's APFS container. It is never
+    /// treated as absent because creating another volume with the same name could hide user data.
+    FoundElsewhere {
+        container: String,
+        device: String,
+        mounted_at: Option<PathBuf>,
     },
 }
 
@@ -739,6 +755,7 @@ impl ExistingStorage {
             | Self::ExistingUnmounted {
                 exact_identifier, ..
             } => Some(exact_identifier),
+            Self::FoundElsewhere { device, .. } => Some(device),
         }
     }
 }
@@ -829,6 +846,13 @@ pub enum HostOperation {
         path: PathBuf,
         marker: VolumeMarker,
     },
+    PinVolumesInFstab {
+        pins: Vec<FstabPin>,
+    },
+    ReportVolumeIssue {
+        name: &'static str,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -849,6 +873,10 @@ impl BootstrapPlan {
 
     pub fn operations(&self) -> &[HostOperation] {
         &self.operations
+    }
+
+    pub(crate) fn push_operation(&mut self, operation: HostOperation) {
+        self.operations.push(operation);
     }
 }
 
@@ -1054,6 +1082,21 @@ fn plan_apfs_volume(
             ));
             operations.push(guard(mountpoint, role, SubstrateKind::Apfs));
         }
+        ExistingStorage::FoundElsewhere {
+            container,
+            device,
+            mounted_at,
+        } => {
+            let location = mounted_at
+                .as_ref()
+                .map_or_else(|| "detached".to_owned(), |path| path.display().to_string());
+            operations.push(HostOperation::ReportVolumeIssue {
+                name: volume_name,
+                detail: format!(
+                    "{volume_name} exists as {device} in APFS container {container} ({location}); inspect and move or recover that volume before retrying cowshed setup"
+                ),
+            });
+        }
     }
 }
 
@@ -1190,6 +1233,7 @@ fn validate_zfs_evidence(state: &ExistingStorage, expected: &str) -> Result<(), 
         ExistingStorage::MountedIncomplete { .. }
             | ExistingStorage::DetachedIncomplete { .. }
             | ExistingStorage::MisMountedIncomplete { .. }
+            | ExistingStorage::FoundElsewhere { .. }
     ) {
         return Err(PlanError::ImpossibleStorageTopology(
             "incomplete APFS provisioning evidence cannot describe a ZFS dataset",
@@ -1253,6 +1297,9 @@ fn plan_zfs_mounted_dataset(
         }
         ExistingStorage::MisMountedIncomplete { .. } => {
             unreachable!("incomplete APFS evidence was rejected for ZFS planning")
+        }
+        ExistingStorage::FoundElsewhere { .. } => {
+            unreachable!("cross-container APFS evidence was rejected for ZFS planning")
         }
     }
 }
@@ -1381,6 +1428,7 @@ pub trait BootstrapHost: Send + Sync {
         volumes: &[ApfsVolumeProvision],
     ) -> Result<(), HostError>;
     fn write_file_atomic(&self, path: &Path, contents: &[u8]) -> Result<(), HostError>;
+    fn pin_volumes_in_fstab(&self, pins: &[FstabPin]) -> Result<(), HostError>;
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1423,7 +1471,7 @@ pub async fn execute_bootstrap<H, L>(
     lane: &L,
 ) -> Result<(), BootstrapExecutionError>
 where
-    H: BootstrapHost + 'static,
+    H: BootstrapHost + ?Sized + 'static,
     L: BlockingLane,
 {
     for operation in plan.operations() {
@@ -1470,10 +1518,13 @@ fn resolve_operation(operation: &HostOperation) -> Result<HostOperation, Bootstr
     )))
 }
 
-fn apply_operation(
-    host: &dyn BootstrapHost,
+fn apply_operation<H>(
+    host: &H,
     operation: &HostOperation,
-) -> Result<(), BootstrapExecutionError> {
+) -> Result<(), BootstrapExecutionError>
+where
+    H: BootstrapHost + ?Sized,
+{
     match operation {
         HostOperation::VerifyZfsDelegation {
             pool,
@@ -1517,6 +1568,10 @@ fn apply_operation(
         HostOperation::ProvisionApfsVolumes { container, volumes } => host
             .provision_apfs_volumes(container, volumes)
             .map_err(BootstrapExecutionError::Host),
+        HostOperation::PinVolumesInFstab { pins } => host
+            .pin_volumes_in_fstab(pins)
+            .map_err(BootstrapExecutionError::Host),
+        HostOperation::ReportVolumeIssue { .. } => Ok(()),
         HostOperation::WriteMarkerAtomic { path, marker } => {
             let contents = marker.to_json().map_err(BootstrapExecutionError::Marker)?;
             host.write_file_atomic(path, &contents)
@@ -1525,10 +1580,13 @@ fn apply_operation(
     }
 }
 
-fn run_host_command(
-    host: &dyn BootstrapHost,
+fn run_host_command<H>(
+    host: &H,
     command: &HostCommand,
-) -> Result<HostCommandOutput, BootstrapExecutionError> {
+) -> Result<HostCommandOutput, BootstrapExecutionError>
+where
+    H: BootstrapHost + ?Sized,
+{
     let output = host
         .run_command(command)
         .map_err(BootstrapExecutionError::Host)?;

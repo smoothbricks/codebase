@@ -2,7 +2,7 @@
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "macos")]
 use std::ffi::{OsString, c_void};
-use std::fs;
+use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::fs::File;
 use std::io;
@@ -12,7 +12,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::CowshedError;
 use plist::{Dictionary, Value};
@@ -22,8 +22,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::oneshot;
 #[cfg(unix)]
@@ -36,6 +39,7 @@ use super::{
     SelectionError, StatFsEvidence, SubstrateKind, TokioBlockingLane, ValidatedHostStorage,
     VolumeRole, execute_bootstrap, plan_bootstrap, require_mounted_marker, select_substrate,
 };
+use crate::storage::fstab::{FstabPin, build_fstab};
 #[cfg(target_os = "macos")]
 use super::{ApfsProvisionKind, VOLUME_MARKER_FILE, VolumeMarker};
 
@@ -45,6 +49,10 @@ const MARKER_MODE: libc::mode_t = 0o600;
 const CHOWN: &str = "/usr/sbin/chown";
 #[cfg(target_os = "macos")]
 const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
+const FSTAB: &str = "/etc/fstab";
+#[cfg(target_os = "macos")]
+const INSTALL: &str = "/usr/bin/install";
 
 /// Whether native bootstrap may apply its mutating host plan.
 ///
@@ -55,6 +63,73 @@ const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
 pub enum NativeBootstrapMode {
     Provision,
     ExistingOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostSetupPlan {
+    pub actions: Vec<String>,
+    pub requires_authorization: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSetupReport {
+    pub volumes: Vec<VolumeOutcome>,
+    pub fstab: FstabOutcome,
+    pub authorized: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeOutcome {
+    pub name: String,
+    pub role: VolumeRole,
+    pub state_before: VolumeState,
+    pub action: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum VolumeState {
+    Absent,
+    MountedValid,
+    MountedIncomplete,
+    Detached,
+    MisMounted {
+        mounted_at: PathBuf,
+    },
+    FoundElsewhere {
+        container: String,
+        device: String,
+        mounted_at: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FstabOutcome {
+    Pinned,
+    AlreadyCurrent,
+    Skipped(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostUninstallPlan {
+    pub pins_to_remove: Vec<String>,
+    pub requires_authorization: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UninstallReport {
+    pub fstab: UninstallFstabOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UninstallFstabOutcome {
+    Removed,
+    AlreadyClean,
 }
 
 /// Stateless production host adapter for trusted storage bootstrap operations.
@@ -116,7 +191,92 @@ impl BootstrapHost for SystemBootstrapHost {
     fn write_file_atomic(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
         write_marker_atomic(path, contents)
     }
+    fn pin_volumes_in_fstab(&self, pins: &[FstabPin]) -> Result<(), HostError> {
+        ensure_supported_host()?;
+        #[cfg(target_os = "macos")]
+        {
+            let mut session = MacAuthorizationSession::acquire()?;
+            pin_volumes_in_fstab_with(&mut session, pins).map(|_| ())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pins;
+            Err(platform_host_error("fstab installation"))
+        }
+    }
 }
+
+#[cfg(target_os = "macos")]
+struct AuthorizedBootstrapHost {
+    session: Mutex<MacAuthorizationSession>,
+}
+
+#[cfg(target_os = "macos")]
+impl AuthorizedBootstrapHost {
+    fn new(session: MacAuthorizationSession) -> Self {
+        Self {
+            session: Mutex::new(session),
+        }
+    }
+
+    fn session(&self) -> Result<std::sync::MutexGuard<'_, MacAuthorizationSession>, HostError> {
+        self.session
+            .lock()
+            .map_err(|_| HostError::new("authorization session lock is poisoned"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl BootstrapHost for AuthorizedBootstrapHost {
+    fn verify_zfs_delegation(&self, pool: &str, required_root: &str) -> Result<(), HostError> {
+        SystemBootstrapHost.verify_zfs_delegation(pool, required_root)
+    }
+
+    fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError> {
+        SystemBootstrapHost.inspect_mountpoint(path)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<(), HostError> {
+        SystemBootstrapHost.create_dir_all(path)
+    }
+
+    fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError> {
+        SystemBootstrapHost.reclaim_mountpoint(path)
+    }
+
+    fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+        if command.program() == DISKUTIL {
+            return self.session()?.execute(command);
+        }
+        SystemBootstrapHost.run_command(command)
+    }
+
+    fn provision_apfs_volumes(
+        &self,
+        container: &str,
+        volumes: &[ApfsVolumeProvision],
+    ) -> Result<(), HostError> {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        provision_apfs_volumes_in_session(
+            container,
+            volumes,
+            uid,
+            gid,
+            &mut *self.session()?,
+            &SystemApfsProvisionIo,
+        )
+    }
+
+    fn write_file_atomic(&self, path: &Path, contents: &[u8]) -> Result<(), HostError> {
+        SystemBootstrapHost.write_file_atomic(path, contents)
+    }
+
+    fn pin_volumes_in_fstab(&self, pins: &[FstabPin]) -> Result<(), HostError> {
+        pin_volumes_in_fstab_with(&mut *self.session()?, pins).map(|_| ())
+    }
+}
+
 
 /// Gather authoritative APFS evidence, plan bootstrap purely, then execute it according to the
 /// explicit capability mode.
@@ -218,8 +378,398 @@ where
     Ok(ValidatedHostStorage::new(plan.roots().clone()))
 }
 
+#[derive(Clone, Debug)]
+enum PlannedFstab {
+    AlreadyCurrent,
+    NeedsPin(Vec<FstabPin>),
+    Deferred(String),
+}
+
+#[derive(Clone, Debug)]
+struct SetupSnapshot {
+    plan: BootstrapPlan,
+    volumes: Vec<VolumeOutcome>,
+    fstab: PlannedFstab,
+}
+
+fn prepare_setup_snapshot(
+    source: &mut impl EvidenceSource,
+    home: &Path,
+    existing_fstab: &str,
+) -> Result<SetupSnapshot, NativeBootstrapError> {
+    let gathered = gather_existing_apfs_evidence(source, home)?;
+    let selected = select_substrate(gathered.statfs, None)?;
+    let mut plan = plan_bootstrap(selected, home, gathered.bootstrap)?;
+    let pins = gathered
+        .volumes
+        .iter()
+        .filter_map(|volume| match &volume.storage {
+            ExistingStorage::Absent | ExistingStorage::FoundElsewhere { .. } => None,
+            _ => volume.volume_uuid.as_ref().map(|volume_uuid| FstabPin {
+                volume_uuid: volume_uuid.clone(),
+                mountpoint: volume.mountpoint.clone(),
+                label: volume.name.to_owned(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    let fstab = if pins.len() == gathered.volumes.len() {
+        let desired = build_fstab(existing_fstab, &pins)
+            .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
+        if desired.as_bytes() == existing_fstab.as_bytes() {
+            PlannedFstab::AlreadyCurrent
+        } else {
+            plan.push_operation(HostOperation::PinVolumesInFstab { pins: pins.clone() });
+            PlannedFstab::NeedsPin(pins)
+        }
+    } else {
+        let reason = if gathered
+            .volumes
+            .iter()
+            .any(|volume| matches!(volume.storage, ExistingStorage::FoundElsewhere { .. }))
+        {
+            "one or more cowshed volumes were found outside the home APFS container".to_owned()
+        } else {
+            "volume UUIDs will be available after provisioning".to_owned()
+        };
+        PlannedFstab::Deferred(reason)
+    };
+    let volumes = gathered
+        .volumes
+        .iter()
+        .map(|volume| VolumeOutcome {
+            name: volume.name.to_owned(),
+            role: volume.role,
+            state_before: volume_state(&volume.storage),
+            action: volume_action(&volume.storage).to_owned(),
+        })
+        .collect();
+    Ok(SetupSnapshot {
+        plan,
+        volumes,
+        fstab,
+    })
+}
+
+fn volume_state(storage: &ExistingStorage) -> VolumeState {
+    match storage {
+        ExistingStorage::Absent => VolumeState::Absent,
+        ExistingStorage::MountedValid { .. } => VolumeState::MountedValid,
+        ExistingStorage::MountedIncomplete { .. } => VolumeState::MountedIncomplete,
+        ExistingStorage::ExistingUnmounted { .. } | ExistingStorage::DetachedIncomplete { .. } => {
+            VolumeState::Detached
+        }
+        ExistingStorage::MisMountedIncomplete {
+            current_mountpoint,
+            ..
+        } => VolumeState::MisMounted {
+            mounted_at: current_mountpoint.clone(),
+        },
+        ExistingStorage::FoundElsewhere {
+            container,
+            device,
+            mounted_at,
+        } => VolumeState::FoundElsewhere {
+            container: container.clone(),
+            device: device.clone(),
+            mounted_at: mounted_at.clone(),
+        },
+    }
+}
+
+fn volume_action(storage: &ExistingStorage) -> &'static str {
+    match storage {
+        ExistingStorage::Absent => "provisioned",
+        ExistingStorage::MountedValid { .. } => "already-current",
+        ExistingStorage::MountedIncomplete { .. } => "repaired",
+        ExistingStorage::ExistingUnmounted { .. } | ExistingStorage::DetachedIncomplete { .. } => {
+            "mounted"
+        }
+        ExistingStorage::MisMountedIncomplete { .. } => "remounted",
+        ExistingStorage::FoundElsewhere { .. } => "reported",
+    }
+}
+
+fn host_setup_actions(snapshot: &SetupSnapshot) -> Vec<String> {
+    let mut actions = snapshot
+        .plan
+        .operations()
+        .iter()
+        .filter_map(|operation| match operation {
+            HostOperation::VerifyZfsDelegation { .. } | HostOperation::GuardMountpoint { .. } => {
+                None
+            }
+            HostOperation::EnsureDirectory(path) => {
+                Some(format!("create mountpoint {}", path.display()))
+            }
+            HostOperation::ReclaimMountpoint(path) => {
+                Some(format!("reclaim mountpoint {}", path.display()))
+            }
+            HostOperation::MountApfsVolume { mountpoint, .. } => {
+                Some(format!("mount APFS volume at {}", mountpoint.display()))
+            }
+            HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(format!(
+                "provision APFS volumes {}",
+                volumes
+                    .iter()
+                    .map(ApfsVolumeProvision::name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            HostOperation::RunCommand(command) => Some(format!(
+                "run {} {}",
+                command.program(),
+                command.args().join(" ")
+            )),
+            HostOperation::WriteMarkerAtomic { path, .. } => {
+                Some(format!("write volume marker {}", path.display()))
+            }
+            HostOperation::PinVolumesInFstab { .. } => {
+                Some("pin cowshed APFS volumes in /etc/fstab".to_owned())
+            }
+            HostOperation::ReportVolumeIssue { detail, .. } => Some(detail.clone()),
+        })
+        .collect::<Vec<_>>();
+    if matches!(snapshot.fstab, PlannedFstab::Deferred(_))
+        && snapshot
+            .plan
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, HostOperation::ProvisionApfsVolumes { .. }))
+    {
+        actions.push("pin cowshed APFS volumes in /etc/fstab after provisioning".to_owned());
+    }
+    actions
+}
+
+fn setup_requires_authorization(plan: &BootstrapPlan) -> bool {
+    plan.operations().iter().any(|operation| match operation {
+        HostOperation::ProvisionApfsVolumes { .. }
+        | HostOperation::PinVolumesInFstab { .. }
+        | HostOperation::MountApfsVolume { .. } => true,
+        HostOperation::RunCommand(command) => {
+            command.program() == DISKUTIL
+                && command
+                    .args()
+                    .first()
+                    .is_some_and(|argument| argument == "mount" || argument == "unmount")
+        }
+        _ => false,
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn gather_setup_snapshot(
+    home: &Path,
+    host: Arc<dyn BootstrapHost>,
+) -> Result<SetupSnapshot, NativeBootstrapError> {
+    let home = home.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let existing_fstab = read_fstab_text().map_err(NativeBootstrapError::Host)?;
+        let mut source = SystemEvidenceSource {
+            host: host.as_ref(),
+        };
+        prepare_setup_snapshot(&mut source, &home, &existing_fstab)
+    })
+    .await
+    .map_err(|error| {
+        NativeBootstrapError::Execution(BootstrapExecutionError::BlockingLane(error.to_string()))
+    })?
+}
+
+pub async fn plan_host_setup(home: &Path) -> crate::Result<HostSetupPlan> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        return Err(existing_host_storage_error(
+            NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let snapshot = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost))
+            .await
+            .map_err(existing_host_storage_error)?;
+        Ok(HostSetupPlan {
+            actions: host_setup_actions(&snapshot),
+            requires_authorization: setup_requires_authorization(&snapshot.plan),
+        })
+    }
+}
+
+pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        return Err(existing_host_storage_error(
+            NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let initial = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost))
+            .await
+            .map_err(existing_host_storage_error)?;
+        let authorized = setup_requires_authorization(&initial.plan);
+        let host: Arc<dyn BootstrapHost> = if authorized {
+            let session = tokio::task::spawn_blocking(MacAuthorizationSession::acquire)
+                .await
+                .map_err(|error| {
+                    existing_host_storage_error(NativeBootstrapError::Execution(
+                        BootstrapExecutionError::BlockingLane(error.to_string()),
+                    ))
+                })?
+                .map_err(NativeBootstrapError::Host)
+                .map_err(existing_host_storage_error)?;
+            Arc::new(AuthorizedBootstrapHost::new(session))
+        } else {
+            Arc::new(SystemBootstrapHost)
+        };
+        execute_bootstrap(&initial.plan, Arc::clone(&host), &TokioBlockingLane)
+            .await
+            .map_err(NativeBootstrapError::Execution)
+            .map_err(existing_host_storage_error)?;
+
+        let pinned_initially = matches!(initial.fstab, PlannedFstab::NeedsPin(_));
+        let needs_post_evidence = matches!(initial.fstab, PlannedFstab::Deferred(_))
+            || initial.plan.operations().iter().any(|operation| {
+                matches!(
+                    operation,
+                    HostOperation::ProvisionApfsVolumes { .. }
+                        | HostOperation::MountApfsVolume { .. }
+                        | HostOperation::ReclaimMountpoint(_)
+                ) || matches!(
+                    operation,
+                    HostOperation::RunCommand(command) if command.program() == DISKUTIL
+                )
+            });
+        let fstab = if needs_post_evidence {
+            let post = gather_setup_snapshot(home, Arc::clone(&host))
+                .await
+                .map_err(existing_host_storage_error)?;
+            if post.plan.operations().iter().any(|operation| {
+                matches!(operation, HostOperation::ProvisionApfsVolumes { .. })
+            }) {
+                return Err(existing_host_storage_error(NativeBootstrapError::Host(
+                    HostError::new(
+                        "post-setup evidence still proposes APFS provisioning; refusing a second create",
+                    ),
+                )));
+            }
+            match post.fstab {
+                PlannedFstab::AlreadyCurrent if pinned_initially => FstabOutcome::Pinned,
+                PlannedFstab::AlreadyCurrent => FstabOutcome::AlreadyCurrent,
+                PlannedFstab::NeedsPin(pins) => {
+                    let pin_host = Arc::clone(&host);
+                    tokio::task::spawn_blocking(move || pin_host.pin_volumes_in_fstab(&pins))
+                        .await
+                        .map_err(|error| {
+                            existing_host_storage_error(NativeBootstrapError::Execution(
+                                BootstrapExecutionError::BlockingLane(error.to_string()),
+                            ))
+                        })?
+                        .map_err(NativeBootstrapError::Host)
+                        .map_err(existing_host_storage_error)?;
+                    FstabOutcome::Pinned
+                }
+                PlannedFstab::Deferred(reason) => FstabOutcome::Skipped(reason),
+            }
+        } else {
+            match initial.fstab {
+                PlannedFstab::AlreadyCurrent => FstabOutcome::AlreadyCurrent,
+                PlannedFstab::NeedsPin(_) => FstabOutcome::Pinned,
+                PlannedFstab::Deferred(reason) => FstabOutcome::Skipped(reason),
+            }
+        };
+        Ok(HostSetupReport {
+            volumes: initial.volumes,
+            fstab,
+            authorized,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_uninstall_plan(home: &Path) -> Result<HostUninstallPlan, NativeBootstrapError> {
+    let existing = read_fstab_text().map_err(NativeBootstrapError::Host)?;
+    host_uninstall_plan_from_text(home, &existing)
+}
+
+fn host_uninstall_plan_from_text(
+    home: &Path,
+    existing: &str,
+) -> Result<HostUninstallPlan, NativeBootstrapError> {
+    require_canonical(home)?;
+    let pins_to_remove = existing
+        .lines()
+        .filter_map(|line| {
+            line.split_once("# cowshed created volume labelled")
+                .map(|(_, label)| label.trim().to_owned())
+        })
+        .collect::<Vec<_>>();
+    Ok(HostUninstallPlan {
+        requires_authorization: !pins_to_remove.is_empty(),
+        pins_to_remove,
+    })
+}
+
+pub async fn plan_host_uninstall(home: &Path) -> crate::Result<HostUninstallPlan> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        return Err(existing_host_storage_error(
+            NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = home.to_owned();
+        tokio::task::spawn_blocking(move || host_uninstall_plan(&home))
+            .await
+            .map_err(|error| {
+                existing_host_storage_error(NativeBootstrapError::Execution(
+                    BootstrapExecutionError::BlockingLane(error.to_string()),
+                ))
+            })?
+            .map_err(existing_host_storage_error)
+    }
+}
+
+pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallReport> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        return Err(existing_host_storage_error(
+            NativeBootstrapError::UnsupportedPlatform(std::env::consts::OS),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plan = plan_host_uninstall(home).await?;
+        if !plan.requires_authorization {
+            return Ok(UninstallReport {
+                fstab: UninstallFstabOutcome::AlreadyClean,
+            });
+        }
+        tokio::task::spawn_blocking(move || {
+            let mut session = MacAuthorizationSession::acquire()?;
+            pin_volumes_in_fstab_with(&mut session, &[]).map(|_| ())
+        })
+        .await
+        .map_err(|error| {
+            existing_host_storage_error(NativeBootstrapError::Execution(
+                BootstrapExecutionError::BlockingLane(error.to_string()),
+            ))
+        })?
+        .map_err(NativeBootstrapError::Host)
+        .map_err(existing_host_storage_error)?;
+        Ok(UninstallReport {
+            fstab: UninstallFstabOutcome::Removed,
+        })
+    }
+}
+
 fn existing_host_storage_error(error: NativeBootstrapError) -> CowshedError {
-    CowshedError::environment_missing(error.to_string(), "cowshed adopt")
+    CowshedError::environment_missing(error.to_string(), "cowshed setup")
 }
 
 /// Apply a previously planned native bootstrap with an explicit provisioning capability.
@@ -241,7 +791,7 @@ where
         if !actions.is_empty() {
             return Err(NativeBootstrapError::StorageSetupRequired {
                 actions,
-                hint: "cowshed adopt",
+                hint: "cowshed setup",
             });
         }
     }
@@ -273,6 +823,10 @@ fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
             HostOperation::WriteMarkerAtomic { path, .. } => {
                 Some(format!("write volume marker {}", path.display()))
             }
+            HostOperation::PinVolumesInFstab { .. } => {
+                Some("pin cowshed APFS volumes in /etc/fstab".to_owned())
+            }
+            HostOperation::ReportVolumeIssue { detail, .. } => Some(detail.clone()),
         })
         .collect()
 }
@@ -330,7 +884,9 @@ pub enum NativeBootstrapError {
         identifier: String,
         mountpoint: Option<PathBuf>,
     },
-    #[error("mountpoint {path:?} contains data but is not the exact expected APFS mount")]
+    #[error(
+        "mountpoint {path:?} contains data but is not the exact expected APFS mount; run cowshed setup"
+    )]
     MaskedMountpoint { path: PathBuf },
     #[error("mountpoint {path:?} conflicts with diskutil evidence for {identifier:?}")]
     MountEvidenceMismatch { path: PathBuf, identifier: String },
@@ -393,7 +949,7 @@ trait EvidenceSource {
 }
 
 struct SystemEvidenceSource<'a> {
-    host: &'a SystemBootstrapHost,
+    host: &'a dyn BootstrapHost,
 }
 
 impl EvidenceSource for SystemEvidenceSource<'_> {
@@ -467,6 +1023,16 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
 struct GatheredEvidence {
     statfs: StatFsEvidence,
     bootstrap: BootstrapEvidence,
+    volumes: Vec<ClassifiedVolume>,
+}
+
+#[derive(Clone, Debug)]
+struct ClassifiedVolume {
+    name: &'static str,
+    role: VolumeRole,
+    mountpoint: PathBuf,
+    storage: ExistingStorage,
+    volume_uuid: Option<String>,
 }
 
 fn plan_native_bootstrap(
@@ -520,36 +1086,116 @@ fn gather_existing_apfs_evidence(
         DISKUTIL,
         ["apfs", "list", "-plist", container_reference.as_str()],
     );
-    let output = source.run_command(&command)?;
-    if !output.succeeded() {
-        return Err(NativeBootstrapError::CommandFailed(
-            HostCommandFailure::new(command, output),
-        ));
-    }
-    let inventory = parse_apfs_inventory(&output.stdout)?;
+    let inventory = run_apfs_inventory_command(source, command)?;
     let container = inventory.containing_container(&mount_device)?;
     let roots = super::CanonicalRoots::for_home(home)?;
-    let store = classify_volume(
+    let mut store = classify_volume(
         source,
         container,
         APFS_STORE_VOLUME,
         roots.store(),
         VolumeRole::Store,
     )?;
-    let caches = classify_volume(
+    let mut caches = classify_volume(
         source,
         container,
         APFS_CACHES_VOLUME,
         roots.caches(),
         VolumeRole::Caches,
     )?;
+    if matches!(store, ExistingStorage::Absent) || matches!(caches, ExistingStorage::Absent) {
+        let global = run_apfs_inventory_command(
+            source,
+            HostCommand::new(DISKUTIL, ["apfs", "list", "-plist"]),
+        )?;
+        guard_absent_volume_globally(source, &global, APFS_STORE_VOLUME, &mut store)?;
+        guard_absent_volume_globally(source, &global, APFS_CACHES_VOLUME, &mut caches)?;
+    }
+    let classified = [
+        (APFS_STORE_VOLUME, VolumeRole::Store, roots.store(), &store),
+        (
+            APFS_CACHES_VOLUME,
+            VolumeRole::Caches,
+            roots.caches(),
+            &caches,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, role, mountpoint, storage)| ClassifiedVolume {
+        name,
+        role,
+        mountpoint: mountpoint.to_owned(),
+        storage: storage.clone(),
+        volume_uuid: container
+            .volumes
+            .iter()
+            .find(|volume| volume.name == name)
+            .map(|volume| volume.volume_uuid.clone()),
+    })
+    .collect();
     Ok(GatheredEvidence {
         statfs: StatFsEvidence::Apfs {
             mount_source: snapshot.mount_source,
             container: Some(container.reference.clone()),
         },
         bootstrap: BootstrapEvidence::Apfs { store, caches },
+        volumes: classified,
     })
+}
+
+fn run_apfs_inventory_command(
+    source: &mut impl EvidenceSource,
+    command: HostCommand,
+) -> Result<ApfsInventory, NativeBootstrapError> {
+    let output = source.run_command(&command)?;
+    if !output.succeeded() {
+        return Err(NativeBootstrapError::CommandFailed(
+            HostCommandFailure::new(command, output),
+        ));
+    }
+    parse_apfs_inventory(&output.stdout)
+}
+
+fn guard_absent_volume_globally(
+    source: &mut impl EvidenceSource,
+    inventory: &ApfsInventory,
+    name: &'static str,
+    state: &mut ExistingStorage,
+) -> Result<(), NativeBootstrapError> {
+    if !matches!(state, ExistingStorage::Absent) {
+        return Ok(());
+    }
+    let matches = inventory
+        .containers
+        .iter()
+        .flat_map(|container| {
+            container
+                .volumes
+                .iter()
+                .filter(move |volume| volume.name == name)
+                .map(move |volume| (container, volume))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(()),
+        [(container, volume)] => {
+            let mounted_at = match &volume.mountpoint {
+                Some(path) => Some(path.clone()),
+                None => source.volume_mountpoint(&volume.identifier)?,
+            };
+            *state = ExistingStorage::FoundElsewhere {
+                container: container.reference.clone(),
+                device: volume.identifier.clone(),
+                mounted_at,
+            };
+            Ok(())
+        }
+        _ => Err(NativeBootstrapError::AmbiguousVolume {
+            container: "all APFS containers".to_owned(),
+            name,
+            matches: matches.len(),
+        }),
+    }
 }
 
 fn require_canonical(path: &Path) -> Result<(), NativeBootstrapError> {
@@ -623,6 +1269,7 @@ struct ApfsVolume {
     name: String,
     identifier: String,
     mountpoint: Option<PathBuf>,
+    volume_uuid: String,
 }
 
 impl ApfsInventory {
@@ -697,6 +1344,7 @@ fn parse_volume(
     let volume = dictionary(value, &format!("{container}.Volumes[{index}]"))?;
     let name = required_string(volume, "Name", "volume")?;
     let identifier = required_string(volume, "DeviceIdentifier", "volume")?;
+    let volume_uuid = required_string(volume, "APFSVolumeUUID", "volume")?;
     if !valid_volume_identifier(identifier.as_bytes())
         || !identifier.strip_prefix(container).is_some_and(|slice| {
             slice.strip_prefix('s').is_some_and(|digits| {
@@ -720,6 +1368,7 @@ fn parse_volume(
     Ok(ApfsVolume {
         name,
         identifier,
+        volume_uuid,
         mountpoint,
     })
 }
@@ -1000,8 +1649,46 @@ fn provision_apfs_volumes_with<S>(
 where
     S: PrivilegedCommandSession,
 {
-    validate_provision_batch(container, volumes)?;
     let mut session = acquire()?;
+    provision_apfs_volumes_in_session(container, volumes, uid, gid, &mut session, io)
+}
+
+#[cfg(target_os = "macos")]
+fn provision_apfs_volumes_in_session<S>(
+    container: &str,
+    volumes: &[ApfsVolumeProvision],
+    uid: u32,
+    gid: u32,
+    session: &mut S,
+    io: &impl ApfsProvisionIo,
+) -> Result<(), HostError>
+where
+    S: PrivilegedCommandSession,
+{
+    validate_provision_batch(container, volumes)?;
+    let create_names = volumes
+        .iter()
+        .filter(|volume| matches!(volume.kind(), ApfsProvisionKind::Create))
+        .map(ApfsVolumeProvision::name)
+        .collect::<Vec<_>>();
+    if !create_names.is_empty() {
+        let inventory_command = HostCommand::new(DISKUTIL, ["apfs", "list", "-plist"]);
+        let output = run_privileged_command(session, &inventory_command)?;
+        let inventory = parse_apfs_inventory(&output.stdout)
+            .map_err(|error| HostError::new(error.to_string()))?;
+        if let Some((container, volume)) = inventory.containers.iter().find_map(|container| {
+            container
+                .volumes
+                .iter()
+                .find(|volume| create_names.iter().any(|name| *name == volume.name))
+                .map(|volume| (container, volume))
+        }) {
+            return Err(HostError::new(format!(
+                "refusing to create APFS volume {:?}: it already exists as {} in container {} at {:?}; run cowshed setup after inspecting that volume",
+                volume.name, volume.identifier, container.reference, volume.mountpoint
+            )));
+        }
+    }
     for volume in volumes {
         let exact_identifier = match volume.kind() {
             ApfsProvisionKind::Create => {
@@ -1017,12 +1704,12 @@ where
                         "-nomount",
                     ],
                 );
-                let output = run_privileged_command(&mut session, &create)?;
+                let output = run_privileged_command(session, &create)?;
                 let exact_identifier = super::parse_created_apfs_identifier(&output.stdout)
                     .map_err(|error| HostError::new(error.to_string()))?;
                 let info =
                     HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
-                let output = run_privileged_command(&mut session, &info)?;
+                let output = run_privileged_command(session, &info)?;
                 let mount_state = super::attest_created_apfs_info(
                     &output.stdout,
                     &exact_identifier,
@@ -1030,7 +1717,7 @@ where
                     volume.name(),
                 )
                 .map_err(|error| HostError::new(error.to_string()))?;
-                detach_auto_mounted_volume(&mut session, mount_state, &exact_identifier)?;
+                detach_auto_mounted_volume(session, mount_state, &exact_identifier)?;
                 let mountpoint = path_argument(volume.mountpoint())?;
                 let mount = HostCommand::new(
                     DISKUTIL,
@@ -1042,7 +1729,7 @@ where
                         exact_identifier.clone(),
                     ],
                 );
-                run_privileged_command(&mut session, &mount)?;
+                run_privileged_command(session, &mount)?;
                 exact_identifier
             }
             ApfsProvisionKind::RepairMounted { exact_identifier } => exact_identifier.clone(),
@@ -1050,7 +1737,7 @@ where
                 io.prepare_mountpoint(volume.mountpoint())?;
                 let info =
                     HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
-                let output = run_privileged_command(&mut session, &info)?;
+                let output = run_privileged_command(session, &info)?;
                 let mount_state = super::attest_created_apfs_info(
                     &output.stdout,
                     exact_identifier,
@@ -1058,7 +1745,7 @@ where
                     volume.name(),
                 )
                 .map_err(|error| HostError::new(error.to_string()))?;
-                detach_auto_mounted_volume(&mut session, mount_state, exact_identifier)?;
+                detach_auto_mounted_volume(session, mount_state, exact_identifier)?;
                 let mountpoint = path_argument(volume.mountpoint())?;
                 let mount = HostCommand::new(
                     DISKUTIL,
@@ -1070,7 +1757,7 @@ where
                         exact_identifier.clone(),
                     ],
                 );
-                run_privileged_command(&mut session, &mount)?;
+                run_privileged_command(session, &mount)?;
                 exact_identifier.clone()
             }
             ApfsProvisionKind::RepairMisMounted {
@@ -1080,7 +1767,7 @@ where
                 io.attest_mounted(current_mountpoint, exact_identifier, false)?;
                 let info =
                     HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
-                let output = run_privileged_command(&mut session, &info)?;
+                let output = run_privileged_command(session, &info)?;
                 attest_mounted_apfs_info(
                     &output.stdout,
                     exact_identifier,
@@ -1089,7 +1776,7 @@ where
                     current_mountpoint,
                 )?;
                 let unmount = HostCommand::new(DISKUTIL, ["unmount", exact_identifier.as_str()]);
-                run_privileged_command(&mut session, &unmount)?;
+                run_privileged_command(session, &unmount)?;
                 io.prepare_mountpoint(volume.mountpoint())?;
                 let mountpoint = path_argument(volume.mountpoint())?;
                 let mount = HostCommand::new(
@@ -1102,14 +1789,14 @@ where
                         exact_identifier.clone(),
                     ],
                 );
-                run_privileged_command(&mut session, &mount)?;
+                run_privileged_command(session, &mount)?;
                 exact_identifier.clone()
             }
         };
 
         io.attest_mounted(volume.mountpoint(), &exact_identifier, true)?;
         let info = HostCommand::new(DISKUTIL, ["info", "-plist", exact_identifier.as_str()]);
-        let output = run_privileged_command(&mut session, &info)?;
+        let output = run_privileged_command(session, &info)?;
         attest_mounted_apfs_info(
             &output.stdout,
             &exact_identifier,
@@ -1121,7 +1808,7 @@ where
         let owner = format!("{uid}:{gid}");
         let mountpoint = path_argument(volume.mountpoint())?;
         let chown = HostCommand::new(CHOWN, [owner, mountpoint]);
-        run_privileged_command(&mut session, &chown)?;
+        run_privileged_command(session, &chown)?;
         io.attest_owner(volume.mountpoint(), uid, gid)?;
 
         let marker = VolumeMarker::new(volume.role(), SubstrateKind::Apfs)
@@ -1214,6 +1901,65 @@ fn run_privileged_command(
         ));
     }
     Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn read_fstab_text() -> Result<String, HostError> {
+    match fs::read(FSTAB) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map_err(|_| HostError::new(format!("{FSTAB} is not valid UTF-8"))),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(host_io_error("read fstab", Path::new(FSTAB), source)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn desired_fstab(existing: &str, pins: &[FstabPin]) -> Result<String, HostError> {
+    build_fstab(existing, pins).map_err(|error| HostError::new(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn pin_volumes_in_fstab_with(
+    session: &mut impl PrivilegedCommandSession,
+    pins: &[FstabPin],
+) -> Result<bool, HostError> {
+    let existing = read_fstab_text()?;
+    let desired = desired_fstab(&existing, pins)?;
+    if desired.as_bytes() == existing.as_bytes() {
+        return Ok(false);
+    }
+
+    let temporary_path =
+        PathBuf::from(format!("/private/tmp/cowshed-fstab-{}", Uuid::new_v4()));
+    let result = (|| {
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary_path)
+            .map_err(|source| host_io_error("create temporary fstab", &temporary_path, source))?;
+        temporary
+            .write_all(desired.as_bytes())
+            .map_err(|source| host_io_error("write temporary fstab", &temporary_path, source))?;
+        temporary
+            .sync_all()
+            .map_err(|source| host_io_error("sync temporary fstab", &temporary_path, source))?;
+        drop(temporary);
+
+        let temporary = path_argument(&temporary_path)?;
+        let install = HostCommand::new(INSTALL, ["-m", "644", temporary.as_str(), FSTAB]);
+        run_privileged_command(session, &install)?;
+        Ok(true)
+    })();
+    match fs::remove_file(&temporary_path) {
+        Ok(()) => result,
+        Err(source) if result.is_ok() => Err(host_io_error(
+            "remove temporary fstab",
+            &temporary_path,
+            source,
+        )),
+        Err(_) => result,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1880,6 +2626,7 @@ mod tests {
         statfs_overrides: BTreeMap<PathBuf, StatFsSnapshot>,
         statfs_paths: Vec<PathBuf>,
         command_output: HostCommandOutput,
+        command_outputs: VecDeque<HostCommandOutput>,
         mountpoints: BTreeMap<PathBuf, MountpointState>,
         mounted_volumes: BTreeMap<PathBuf, MountedVolumeEvidence>,
         // Per-identifier answers for `volume_mountpoint`; an absent identifier means detached,
@@ -1904,7 +2651,10 @@ mod tests {
             command: &HostCommand,
         ) -> Result<HostCommandOutput, NativeBootstrapError> {
             self.commands.push(command.clone());
-            Ok(self.command_output.clone())
+            Ok(self
+                .command_outputs
+                .pop_front()
+                .unwrap_or_else(|| self.command_output.clone()))
         }
 
         fn inspect_mountpoint(
@@ -1961,7 +2711,7 @@ mod tests {
             .map(|path| format!("<key>MountPoint</key><string>{path}</string>"))
             .unwrap_or_default();
         format!(
-            "<dict><key>Name</key><string>{name}</string><key>DeviceIdentifier</key><string>{identifier}</string>{mountpoint}</dict>"
+            "<dict><key>Name</key><string>{name}</string><key>DeviceIdentifier</key><string>{identifier}</string><key>APFSVolumeUUID</key><string>{identifier}-UUID</string>{mountpoint}</dict>"
         )
     }
 
@@ -1976,6 +2726,7 @@ mod tests {
             statfs_overrides: BTreeMap::new(),
             statfs_paths: Vec::new(),
             command_output: HostCommandOutput::success(inventory),
+            command_outputs: VecDeque::new(),
             mountpoints: BTreeMap::from([
                 (
                     PathBuf::from("/Users/alice/.cowshed"),
@@ -2146,6 +2897,12 @@ mod tests {
             self.mutation_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
+        fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+            self.mutation_calls.fetch_add(1, Ordering::SeqCst);
+            self.authorization_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -2275,12 +3032,13 @@ mod tests {
             gathered.statfs,
             StatFsEvidence::Apfs { container: Some(ref value), .. } if value == "disk3"
         ));
-        assert_eq!(source.commands.len(), 1);
+        assert_eq!(source.commands.len(), 2);
         assert_eq!(source.commands[0].program(), "/usr/sbin/diskutil");
         assert_eq!(
             source.commands[0].args(),
             ["apfs", "list", "-plist", "disk3"]
         );
+        assert_eq!(source.commands[1].args(), ["apfs", "list", "-plist"]);
     }
 
     #[test]
@@ -2735,6 +3493,10 @@ mod tests {
     fn one_authorization_session_wraps_fixed_argv_for_all_new_volumes() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
+            Ok(HostCommandOutput::success(plist(&container(
+                "disk3",
+                &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+            )))),
             Ok(HostCommandOutput::success(
                 b"Created new APFS Volume disk3s8\n".to_vec(),
             )),
@@ -2827,7 +3589,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(commands.len(), 10);
+        assert_eq!(commands.len(), 11);
         assert!(
             commands
                 .iter()
@@ -2885,6 +3647,61 @@ mod tests {
                 .unwrap();
             assert!(chown < owner && owner < marker);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn execution_time_global_inventory_refuses_duplicate_create() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let global = plist(
+            &(container("disk3", &volume("Data", "disk3s5", None))
+                + &container(
+                    "disk7",
+                    &volume(
+                        APFS_STORE_VOLUME,
+                        "disk7s2",
+                        Some("/Volumes/cowshed.store"),
+                    ),
+                )),
+        );
+        let volume = ApfsVolumeProvision {
+            name: APFS_STORE_VOLUME,
+            mountpoint: PathBuf::from("/Users/alice/.cowshed"),
+            role: VolumeRole::Store,
+            kind: ApfsProvisionKind::Create,
+        };
+        let acquire_events = Rc::clone(&events);
+        let error = provision_apfs_volumes_with(
+            "disk3",
+            &[volume],
+            501,
+            20,
+            move || {
+                acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
+                Ok(FakePrivilegedSession {
+                    events: Rc::clone(&acquire_events),
+                    outputs: VecDeque::from([Ok(HostCommandOutput::success(global))]),
+                })
+            },
+            &FakeProvisionIo {
+                events: Rc::clone(&events),
+            },
+        )
+        .expect_err("an existing reserved-name volume must prevent addVolume");
+        assert!(error.to_string().contains("already exists as disk7s2"));
+        let events = events.borrow();
+        let commands = events
+            .iter()
+            .filter_map(|event| match event {
+                ProvisionEvent::Command { args, .. } => Some(args.as_slice()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(commands, [vec!["apfs", "list", "-plist"].as_slice()]);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProvisionEvent::Prepare(_) | ProvisionEvent::Marker(_, _)
+        )));
     }
 
     #[cfg(target_os = "macos")]
@@ -3200,6 +4017,10 @@ mod tests {
     fn an_auto_mounted_new_volume_is_detached_before_its_private_mount() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let outputs = VecDeque::from([
+            Ok(HostCommandOutput::success(plist(&container(
+                "disk3",
+                &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+            )))),
             Ok(HostCommandOutput::success(
                 b"Created new APFS Volume disk3s8\n".to_vec(),
             )),
@@ -3257,6 +4078,11 @@ mod tests {
             .collect();
         assert_eq!(
             commands[0].as_slice(),
+            ["apfs", "list", "-plist"],
+            "global inventory is rechecked inside the authorization session"
+        );
+        assert_eq!(
+            commands[1].as_slice(),
             [
                 "apfs",
                 "addVolume",
@@ -3267,14 +4093,14 @@ mod tests {
             ],
             "-nomount is still requested; the unmount is a fallback, not a replacement"
         );
-        assert_eq!(commands[1].as_slice(), ["info", "-plist", "disk3s8"]);
+        assert_eq!(commands[2].as_slice(), ["info", "-plist", "disk3s8"]);
         assert_eq!(
-            commands[2].as_slice(),
+            commands[3].as_slice(),
             ["unmount", "disk3s8"],
             "the default mount is dropped before the private mount"
         );
         assert_eq!(
-            commands[3].as_slice(),
+            commands[4].as_slice(),
             [
                 "mount",
                 "-nobrowse",
@@ -3445,7 +4271,10 @@ mod tests {
                 acquire_events.borrow_mut().push(ProvisionEvent::Acquire);
                 Ok(FakePrivilegedSession {
                     events: Rc::clone(&acquire_events),
-                    outputs: VecDeque::from([Ok(HostCommandOutput::failure(1, "child failed\n"))]),
+                    outputs: VecDeque::from([
+                        Ok(HostCommandOutput::success(plist(&container("disk3", "")))),
+                        Ok(HostCommandOutput::failure(1, "child failed\n")),
+                    ]),
                 })
             },
             &FakeProvisionIo {
@@ -3537,6 +4366,155 @@ mod tests {
         assert!(!mutating_setup_actions(&plan).is_empty());
     }
 
+    #[test]
+    fn global_inventory_prevents_create_when_reserved_volume_is_in_another_container() {
+        let scoped = plist(&container(
+            "disk3",
+            &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+        ));
+        let global = plist(
+            &(container(
+                "disk3",
+                &volume("Data", "disk3s5", Some("/System/Volumes/Data")),
+            ) + &container(
+                "disk7",
+                &volume(
+                    APFS_STORE_VOLUME,
+                    "disk7s2",
+                    Some("/Volumes/cowshed.store"),
+                ),
+            )),
+        );
+        let mut source = source(scoped.clone());
+        source.command_outputs = VecDeque::from([
+            HostCommandOutput::success(scoped),
+            HostCommandOutput::success(global),
+        ]);
+
+        let plan = plan_existing_host_storage(&mut source, Path::new("/Users/alice"))
+            .expect("cross-container volume must be reportable");
+        assert!(plan.operations().iter().any(|operation| matches!(
+            operation,
+            HostOperation::ReportVolumeIssue { name, detail }
+                if *name == APFS_STORE_VOLUME
+                    && detail.contains("disk7s2")
+                    && detail.contains("disk7")
+        )));
+        assert!(!plan.operations().iter().any(|operation| matches!(
+            operation,
+            HostOperation::ProvisionApfsVolumes { volumes, .. }
+                if volumes.iter().any(|volume| {
+                    volume.name() == APFS_STORE_VOLUME
+                        && matches!(volume.kind(), ApfsProvisionKind::Create)
+                })
+        )));
+        assert!(plan.operations().iter().any(|operation| matches!(
+            operation,
+            HostOperation::ProvisionApfsVolumes { volumes, .. }
+                if volumes.iter().any(|volume| {
+                    volume.name() == APFS_CACHES_VOLUME
+                        && matches!(volume.kind(), ApfsProvisionKind::Create)
+                })
+        )));
+        assert_eq!(source.commands[1].args(), ["apfs", "list", "-plist"]);
+    }
+
+    #[tokio::test]
+    async fn valid_manually_created_volumes_are_pinned_without_reprovisioning() {
+        let mut source = healthy_existing_source();
+        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
+            .expect("healthy manually-created volumes plan");
+        assert!(!snapshot.plan.operations().iter().any(|operation| matches!(
+            operation,
+            HostOperation::ProvisionApfsVolumes { .. }
+        )));
+        assert!(snapshot.plan.operations().iter().any(|operation| matches!(
+            operation,
+            HostOperation::PinVolumesInFstab { pins }
+                if pins.len() == 2
+                    && pins.iter().any(|pin| pin.volume_uuid == "disk3s8-UUID")
+                    && pins.iter().any(|pin| pin.volume_uuid == "disk3s9-UUID")
+        )));
+        assert!(setup_requires_authorization(&snapshot.plan));
+
+        let read_only_host = Arc::new(ReadOnlyValidationHost::default());
+        let error = execute_native_bootstrap_plan(
+            &snapshot.plan,
+            NativeBootstrapMode::ExistingOnly,
+            Arc::clone(&read_only_host),
+            &ValidationLane::default(),
+        )
+        .await
+        .expect_err("existing-only lane must reject fstab installation");
+        assert!(matches!(
+            error,
+            NativeBootstrapError::StorageSetupRequired { .. }
+        ));
+        assert_eq!(read_only_host.mutation_calls.load(Ordering::SeqCst), 0);
+
+        let host = Arc::new(ReadOnlyValidationHost::default());
+        execute_native_bootstrap_plan(
+            &snapshot.plan,
+            NativeBootstrapMode::Provision,
+            Arc::clone(&host),
+
+            &ValidationLane::default(),
+        )
+        .await
+        .expect("provision lane applies fstab pin");
+        assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn uninstall_plan_removes_only_tagged_pins_and_is_idempotent_when_clean() {
+        let tagged = "UUID=STORE /private/cowshed/store apfs rw # cowshed created volume labelled cowshed.store\n\
+LABEL=nix /nix apfs rw\n\
+UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled cowshed.caches\n";
+        let plan = host_uninstall_plan_from_text(Path::new("/Users/alice"), tagged)
+            .expect("tagged uninstall plan");
+        assert_eq!(
+            plan,
+            HostUninstallPlan {
+                pins_to_remove: vec![
+                    "cowshed.store".to_owned(),
+                    "cowshed.caches".to_owned()
+                ],
+                requires_authorization: true,
+            }
+        );
+
+        let clean = host_uninstall_plan_from_text(
+            Path::new("/Users/alice"),
+            "LABEL=nix /nix apfs rw\n",
+        )
+        .expect("clean uninstall plan");
+        assert_eq!(
+            clean,
+            HostUninstallPlan {
+                pins_to_remove: Vec::new(),
+                requires_authorization: false,
+            }
+        );
+    }
+
+    #[test]
+    fn healthy_host_with_current_fstab_has_zero_mutation_plan() {
+        let mut first_source = healthy_existing_source();
+        let first = prepare_setup_snapshot(&mut first_source, Path::new("/Users/alice"), "")
+            .expect("pin plan");
+        let PlannedFstab::NeedsPin(pins) = first.fstab else {
+            panic!("empty fstab must need pins");
+        };
+        let current = build_fstab("", &pins).expect("desired fstab");
+
+        let mut source = healthy_existing_source();
+        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), &current)
+            .expect("healthy setup plan");
+        assert_eq!(host_setup_actions(&snapshot), Vec::<String>::new());
+        assert!(!setup_requires_authorization(&snapshot.plan));
+        assert!(matches!(snapshot.fstab, PlannedFstab::AlreadyCurrent));
+    }
+
     #[tokio::test]
     async fn existing_host_storage_returns_roots_and_queries_only_home_without_mutation() {
         let mut source = healthy_existing_source();
@@ -3604,7 +4582,7 @@ mod tests {
             .expect_err("existing-only validation must reject marker repair");
 
         assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, "cowshed adopt");
+        assert_eq!(error.hint, "cowshed setup");
         assert!(error.message.contains("storage setup is required"));
         assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
         assert_eq!(host.inspections.load(Ordering::SeqCst), 0);
@@ -3613,7 +4591,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_marker_is_an_operational_adopt_error() {
+    fn wrong_marker_is_an_operational_setup_error() {
         let mut source = healthy_existing_source();
         source.mountpoints.insert(
             PathBuf::from("/Users/alice/.cowshed/caches"),
@@ -3634,7 +4612,7 @@ mod tests {
         ));
         let error = existing_host_storage_error(native);
         assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, "cowshed adopt");
+        assert_eq!(error.hint, "cowshed setup");
     }
 
     #[tokio::test]
@@ -3665,7 +4643,7 @@ mod tests {
                 .expect_err("existing-only validation rejects unsafe roots");
 
             assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-            assert_eq!(error.hint, "cowshed adopt");
+            assert_eq!(error.hint, "cowshed setup");
             assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
             assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
             assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
@@ -3689,7 +4667,7 @@ mod tests {
             .expect_err("existing-only validation rejects provisioning");
 
         assert_eq!(error.code, crate::error::ErrorCode::EnvironmentMissing);
-        assert_eq!(error.hint, "cowshed adopt");
+        assert_eq!(error.hint, "cowshed setup");
         assert_eq!(lane.dispatches.load(Ordering::SeqCst), 0);
         assert_eq!(host.mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(host.authorization_calls.load(Ordering::SeqCst), 0);
