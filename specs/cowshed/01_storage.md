@@ -227,6 +227,15 @@ detached, or mis-mounted and what will repair each state. A volume macOS auto-mo
 **mis-mounted**, not missing: repairing it is unprivileged `diskutil unmount` + mount-at-canonical-path work that
 `cowshed ensure`, `cowshed doctor`, and the gateway's RunAtLoad heal perform inline, without an authorization prompt.
 
+
+**`cowshed setup` owns this transaction.** It is a host-level verb needing no repository context: gather evidence,
+provision absent volumes, repair detached or mis-mounted ones, validate markers, and pin fstab — reporting each
+volume's observed state and the action taken. Storage-error hints across the CLI point at `cowshed setup`, never at
+adopting a directory. Diagnosis is canonical: the same volume evidence yields the same verdict regardless of
+incidental mountpoint contents, and reclaimable stubs are enumerated (by name) and reclaimed, not treated as fatal
+masking. A volume that exists but carries a wrong or missing marker is reported precisely (role, expected versus
+observed); it is never silently re-provisioned, because re-provisioning means deleteVolume.
+
 **Mount ordering and the unmounted-masking guard.** The layout nests: the caches volume and every workspace mount at
 directories that live _on_ the store volume, so validation and remount sequence store → caches → workspaces. When the
 store volume is not mounted, `/private/cowshed/store` is a bare directory on Data; the volume-root marker `.cowshed-volume.json` is

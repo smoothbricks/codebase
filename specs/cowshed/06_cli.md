@@ -14,6 +14,27 @@ make that possible and they are absolute:
    cowshed.caches at /private/cowshed/caches`). A silent SecurityAgent dialog behind an unrelated read-only verb is a
    contract violation, not a platform quirk to tolerate. Where the platform permits (fstab-pinned mounts), cowshed
    prefers designs in which no prompt can occur at all (01_storage.md).
+4. **Diagnosis is canonical and self-contained.** The same host state yields the same verdict from any directory,
+   regardless of unrelated details (a stray file in a mountpoint dir must change the wording, not the verdict). Every
+   finding names the observed evidence (which volume, mounted where, expected where, which stub files) and a `next:`
+   command that exists in the parser. Hinted verbs are contract-tested against the parser so guidance can never
+   reference a command that does not exist.
+
+## Onboarding and repair
+
+Two verbs own the host story, both runnable from any directory:
+
+- **`doctor`** is the universal diagnostician: version and install source, per-volume state (present/absent, current
+  versus canonical mountpoint, marker validity), service status, workspace inventory summary, project checks when an
+  adopted checkout resolves. It never mutates.
+- **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones, validate
+  markers precisely, pin `/etc/fstab` (01_storage.md). It announces an authorization prompt before raising one, then
+  performs everything that can require elevation inside that single session. Running it on a healthy host changes
+  nothing and says so.
+
+The stranded-user journey this contract exists for: after a reboot with unmounted volumes, `cowshed doctor` explains
+the exact divergence (volume present at macOS's default `/Volumes/<name>` instead of its canonical path, stubs listed
+by name, service status) and `cowshed setup` fixes it in one step.
 
 ```
 $ cowshed new raven
