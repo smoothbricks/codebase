@@ -885,7 +885,7 @@ impl BootstrapPlan {
         &self.operations
     }
 
-    pub(crate) fn push_operation(&mut self, operation: HostOperation) {
+    pub fn push_operation(&mut self, operation: HostOperation) {
         self.operations.push(operation);
     }
 }
@@ -1460,7 +1460,7 @@ impl HostError {
         }
     }
 
-    pub(crate) fn authorization_denied(message: impl Into<String>) -> Self {
+    pub fn authorization_denied(message: impl Into<String>) -> Self {
         Self {
             kind: HostErrorKind::AuthorizationDenied,
             message: message.into(),
@@ -1636,7 +1636,9 @@ where
 }
 
 #[cfg(target_os = "macos")]
-fn parse_created_apfs_identifier(stdout: &[u8]) -> Result<String, BootstrapExecutionError> {
+pub(crate) fn parse_created_apfs_identifier(
+    stdout: &[u8],
+) -> Result<String, BootstrapExecutionError> {
     let stdout = std::str::from_utf8(stdout).map_err(|_| {
         BootstrapExecutionError::CreatedVolumeOutput(
             "diskutil addVolume output is not UTF-8".to_owned(),
@@ -1690,7 +1692,7 @@ pub(crate) enum CreatedMountState {
 }
 
 #[cfg(target_os = "macos")]
-fn attest_created_apfs_info(
+pub(crate) fn attest_created_apfs_info(
     bytes: &[u8],
     expected_identifier: &str,
     expected_container: &str,
