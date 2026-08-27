@@ -21,6 +21,23 @@ const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/tsconfig.base.json',
 ];
 
+// The aggregate `build` pulls in platform-suffixed binary targets for THIS
+// machine only: `<tool>-<arch>-<os>` names matching the host (for example
+// cli-arm64-macos on Apple Silicon) build locally as part of `nx build`, while
+// every foreign platform stays publish-workflow-only. nx.json targetDefaults
+// cannot express "current platform" — its dependsOn lists are static — so the
+// inference plugin owns this edge.
+const HOST_PLATFORM_SUFFIX: string | null = (() => {
+  const os = process.platform === 'darwin' ? 'macos' : process.platform === 'linux' ? 'linux' : null;
+  const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : null;
+  return os !== null && arch !== null ? `-${arch}-${os}` : null;
+})();
+
+export function hostPlatformTargetNames(targetNames: Iterable<string>): string[] {
+  if (HOST_PLATFORM_SUFFIX === null) return [];
+  return [...new Set(targetNames)].filter((name) => name.endsWith(HOST_PLATFORM_SUFFIX)).sort();
+}
+
 //#region smoo!n/rust-output-target-inference
 // Cargo workspace inference: a package.json sitting next to a Cargo.toml that
 // declares [workspace] gets direct cargo-test/test targets, cargo-lint feeding
@@ -319,7 +336,11 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     targets.build = {
       executor: 'nx:noop',
       cache: true,
-      dependsOn: ['^build', ...BUILD_OUTPUT_DEPENDENCIES],
+      dependsOn: [
+        '^build',
+        ...BUILD_OUTPUT_DEPENDENCIES,
+        ...hostPlatformTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
+      ],
     };
   }
   if (hasAnyBuildOutputTarget) {

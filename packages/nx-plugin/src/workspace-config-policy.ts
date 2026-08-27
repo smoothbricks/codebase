@@ -186,6 +186,16 @@ function validateBuildTargetDefault(
   if (build?.cache !== true) {
     issues.push({ path: nxJsonPath, message: 'targetDefaults.build.cache must be true' });
   }
+  // dependsOn is owned by the inference plugin: the inferred aggregate carries
+  // the output families PLUS this host's platform-suffixed binary targets, and
+  // Nx gives targetDefaults precedence over inferred values — a static list
+  // here would clobber the host-aware edge on every project.
+  if (build !== null && 'dependsOn' in build) {
+    issues.push({
+      path: nxJsonPath,
+      message: 'targetDefaults.build.dependsOn must not be set; @smoothbricks/nx-plugin infers build dependencies',
+    });
+  }
   const outputs = build?.outputs;
   if (!isValidBuildOutputs(outputs)) {
     issues.push({
@@ -275,6 +285,10 @@ function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
   // repo decision the fixer must not clobber.
   if (!isValidBuildOutputs(build.outputs)) {
     changed = setStringArrayProperty(build, 'outputs', ['{projectRoot}/dist']) || changed;
+  }
+  if ('dependsOn' in build) {
+    delete build.dependsOn;
+    changed = true;
   }
   return changed;
 }
