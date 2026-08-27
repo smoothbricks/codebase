@@ -953,9 +953,9 @@ fn lookup_volume_password(
         }
     }
     if password.is_empty() {
-        return Err(HostError::new(format!(
-            "System.keychain password for {name} is empty"
-        )));
+        // AuthorizationExecuteWithPrivileges reports success and empty stdout when
+        // `security` exits 44 (item not found); stderr is not on the communications pipe.
+        return Ok(None);
     }
     Ok(Some(Zeroizing::new(password)))
 }
@@ -6150,6 +6150,24 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             commands[1].1.as_deref(),
             Some(b"already-stored-pass\n".as_slice())
         );
+    }
+
+    #[test]
+    fn encryption_treats_empty_privileged_lookup_as_missing() {
+        let (commands, received) = mpsc::channel();
+        let host = EncryptCommandHost {
+            commands,
+            existing_password: Some(""),
+        };
+        encrypt_volume_with(
+            &host,
+            APFS_STORE_VOLUME,
+            "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5",
+        )
+        .unwrap();
+        let commands = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(commands[1].0.args()[0], "add-generic-password");
+        assert_eq!(commands[2].0.args()[0], "apfs");
     }
 
     fn deadline_spawn(
