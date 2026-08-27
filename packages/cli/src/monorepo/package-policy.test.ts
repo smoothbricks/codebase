@@ -262,7 +262,7 @@ describe('Nx project name policy', () => {
       expect(external.nx).toBeUndefined();
       expect(tool.nx).toBeUndefined();
       expect(validateNxProjectNames(root)).toBe(0);
-      expect(listValidCommitScopes(root)).toEqual(new Set(['cli', 'release']));
+      expect(listValidCommitScopes(root)).toEqual(new Set(['cli', 'release', 'deps']));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -282,7 +282,7 @@ describe('Nx project name policy', () => {
       expect(tooling.version).toBeUndefined();
       expect(tooling.nx).toEqual({ name: 'tooling' });
       expect(validateNxProjectNames(root)).toBe(0);
-      expect(listValidCommitScopes(root)).toEqual(new Set(['release', 'tooling']));
+      expect(listValidCommitScopes(root)).toEqual(new Set(['release', 'deps', 'tooling']));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -304,8 +304,11 @@ describe('Nx project name policy', () => {
       });
 
       const validScopes = listValidCommitScopes(root);
-      expect(validScopes).toEqual(new Set(['release', 'tooling']));
+      expect(validScopes).toEqual(new Set(['release', 'deps', 'tooling']));
       expect(validateCommitMessage('fix(tooling): repair tooling\n', { validScopes })).toBeNull();
+      // `deps` is the ecosystem-standard dependency-update scope (Dependabot,
+      // Renovate) for changes that belong to no single Nx project.
+      expect(validateCommitMessage('chore(deps): bump bun-types\n', { validScopes })).toBeNull();
       expect(validateCommitMessage('fix(internal-tooling): repair tooling\n', { validScopes })).toContain(
         'Invalid conventional commit scope',
       );
