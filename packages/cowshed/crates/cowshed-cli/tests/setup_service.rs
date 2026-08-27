@@ -16,8 +16,8 @@ use cowshed_cli::setup_service::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
-    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeRole,
-    VolumeState,
+    HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
+    VolumeOutcome, VolumeRole, VolumeState,
 };
 use cowshed_core::{CowshedError, ErrorCode, Result, UnreachableMain};
 use std::path::PathBuf;
@@ -1100,17 +1100,22 @@ async fn uninstall_refuses_when_occupancy_cannot_be_established() {
     ));
 }
 
-/// Teardown's `--json` carries the whole outcome, not just core's half.
+/// Teardown's `--json` carries the whole outcome, not just either layer's half.
 ///
-/// Core returns `services` empty — the fstab pins are all it owns — so this asserts that the
-/// adapter fills it. Order matters and is frozen: both agents, then both binaries, because the
-/// gateway agent is `KeepAlive` and deleting its binary under a loaded agent would leave launchd
-/// respawning a vanished path. The `what` and `outcome` vocabularies are frozen here because this
-/// is the only place they are produced.
+/// Core removes the system mount daemon before the adapter reports the per-user agents and
+/// binaries. Order matters: the machine remounter first, then both agents, then both binaries.
+/// The gateway agent is `KeepAlive`, so deleting its binary under a loaded agent would leave
+/// launchd respawning a vanished path.
 #[tokio::test]
 async fn uninstall_json_reports_the_services_the_adapter_removed() {
     let mut host = FakeHost {
-        uninstall_report: uninstall_report(UninstallFstabOutcome::Removed),
+        uninstall_report: UninstallReport {
+            fstab: UninstallFstabOutcome::Removed,
+            services: vec![UninstallServiceOutcome {
+                what: String::from("dev.cowshed.storage system LaunchDaemon"),
+                outcome: String::from("removed"),
+            }],
+        },
         removals: vec![
             HostArtifactRemoval::new("dev.cowshed.gateway agent", RemovalOutcome::Removed),
             HostArtifactRemoval::new("dev.cowshed.sccache agent", RemovalOutcome::AlreadyAbsent),
@@ -1125,6 +1130,7 @@ async fn uninstall_json_reports_the_services_the_adapter_removed() {
     assert_eq!(
         streams.stdout,
         "{\"ok\":true,\"result\":{\"fstab\":\"removed\",\"services\":[\
+         {\"what\":\"dev.cowshed.storage system LaunchDaemon\",\"outcome\":\"removed\"},\
          {\"what\":\"dev.cowshed.gateway agent\",\"outcome\":\"removed\"},\
          {\"what\":\"dev.cowshed.sccache agent\",\"outcome\":\"already-absent\"},\
          {\"what\":\"installed cowshed binary\",\"outcome\":\"removed\"},\
@@ -1462,5 +1468,37 @@ async fn a_failed_run_never_observes_or_mentions_main_mounts() {
         host.events,
         ["plan", "execute"],
         "a failed run asks nothing further of the host"
+    );
+}
+
+#[tokio::test]
+async fn mount_service_install_is_disclosed_before_authorization() {
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![HostAction::InstallMountService {
+                label: String::from("dev.cowshed.storage"),
+            }],
+            true,
+        ),
+        report: HostSetupReport {
+            volumes: Vec::new(),
+            fstab: FstabOutcome::AlreadyCurrent,
+            authorized: true,
+            action_outcomes: Vec::new(),
+        },
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(streams.stderr.starts_with(
+        "cowshed: setup will request administrator authorization once, for the actions below\n\
+         cowshed: no volumes will be created or deleted; existing data is untouched\n\
+         cowshed: system LaunchDaemon dev.cowshed.storage will be installed to mount cowshed volumes before login\n"
+    ));
+    assert_eq!(
+        host.events,
+        ["plan", "execute", "unmounted-mains", "census"]
     );
 }
