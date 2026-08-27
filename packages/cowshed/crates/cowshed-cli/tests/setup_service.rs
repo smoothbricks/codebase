@@ -602,6 +602,28 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
     );
     assert!(!streams.stderr.contains("provision"));
 }
+/// Encryption is an in-place repair, but it changes the volume's security boundary. The
+/// pre-authorization disclosure must name both FileVault and the durable passphrase location.
+#[tokio::test]
+async fn filevault_encryption_announces_in_place_change_and_system_keychain() {
+    let mut host = FakeHost {
+        plan: setup_plan(
+            vec![HostAction::EncryptVolume {
+                name: String::from("cowshed.store"),
+                uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
+                size_bytes: 1_000_000_000_000,
+            }],
+            true,
+        ),
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert!(streams.stderr.contains(
+        "cowshed: cowshed.store exists (UUID 1D6F0E1A-0000-4000-8000-00000000AAAA, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain\n"
+    ));
+}
 
 /// A plan that creates a volume cannot make the safety promise, and must not.
 #[tokio::test]
@@ -1102,19 +1124,29 @@ async fn uninstall_refuses_when_occupancy_cannot_be_established() {
 
 /// Teardown's `--json` carries the whole outcome, not just either layer's half.
 ///
-/// Core removes the system mount daemon before the adapter reports the per-user agents and
-/// binaries. Order matters: the machine remounter first, then both agents, then both binaries.
-/// The gateway agent is `KeepAlive`, so deleting its binary under a loaded agent would leave
-/// launchd respawning a vanished path.
+/// Core removes the system mount daemon and System.keychain items before the adapter reports the
+/// per-user agents and binaries. Order matters: the machine remounter first, then its credentials,
+/// then both agents, then both binaries. The gateway agent is `KeepAlive`, so deleting its binary
+/// under a loaded agent would leave launchd respawning a vanished path.
 #[tokio::test]
 async fn uninstall_json_reports_the_services_the_adapter_removed() {
     let mut host = FakeHost {
         uninstall_report: UninstallReport {
             fstab: UninstallFstabOutcome::Removed,
-            services: vec![UninstallServiceOutcome {
-                what: String::from("dev.cowshed.storage system LaunchDaemon"),
-                outcome: String::from("removed"),
-            }],
+            services: vec![
+                UninstallServiceOutcome {
+                    what: String::from("dev.cowshed.storage system LaunchDaemon"),
+                    outcome: String::from("removed"),
+                },
+                UninstallServiceOutcome {
+                    what: String::from("cowshed.store System.keychain item"),
+                    outcome: String::from("removed"),
+                },
+                UninstallServiceOutcome {
+                    what: String::from("cowshed.caches System.keychain item"),
+                    outcome: String::from("already-absent"),
+                },
+            ],
         },
         removals: vec![
             HostArtifactRemoval::new("dev.cowshed.gateway agent", RemovalOutcome::Removed),
@@ -1131,6 +1163,8 @@ async fn uninstall_json_reports_the_services_the_adapter_removed() {
         streams.stdout,
         "{\"ok\":true,\"result\":{\"fstab\":\"removed\",\"services\":[\
          {\"what\":\"dev.cowshed.storage system LaunchDaemon\",\"outcome\":\"removed\"},\
+         {\"what\":\"cowshed.store System.keychain item\",\"outcome\":\"removed\"},\
+         {\"what\":\"cowshed.caches System.keychain item\",\"outcome\":\"already-absent\"},\
          {\"what\":\"dev.cowshed.gateway agent\",\"outcome\":\"removed\"},\
          {\"what\":\"dev.cowshed.sccache agent\",\"outcome\":\"already-absent\"},\
          {\"what\":\"installed cowshed binary\",\"outcome\":\"removed\"},\

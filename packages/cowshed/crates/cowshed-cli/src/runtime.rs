@@ -2164,11 +2164,20 @@ fn host_action_evidence(action: &HostAction) -> String {
             mounted_at.display(),
             mount_at.display()
         ),
+        HostAction::EncryptVolume {
+            name,
+            uuid,
+            size_bytes,
+        } => format!(
+            "FileVault-encrypt existing {name} ({uuid}, {size_bytes} bytes) in place and store its passphrase in System.keychain"
+        ),
         HostAction::PinFstab { uuid, mount_at } => {
             format!("pin volume {uuid} at {} in /etc/fstab", mount_at.display())
         }
         HostAction::InstallMountService { label } => {
-            format!("install system LaunchDaemon {label} to mount cowshed volumes before login")
+            format!(
+                "install system LaunchDaemon {label} to unlock and mount cowshed volumes before login"
+            )
         }
         HostAction::ReclaimStubs { paths } => format!(
             "reclaim mountpoint stubs: {}",
@@ -2285,17 +2294,31 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
                 path: Some(mount_at.clone()),
             },
             Some(
-                HostAction::PinFstab { .. }
+                HostAction::EncryptVolume { .. }
+                | HostAction::PinFstab { .. }
                 | HostAction::ReclaimStubs { .. }
                 | HostAction::InstallMountService { .. },
             ) => {
-                unreachable!("volume lookup only selects volume actions")
+                unreachable!("volume lookup only selects volume mount actions")
             }
         };
         findings.push(finding);
     }
     for action in &plan.actions {
         match action {
+            HostAction::EncryptVolume {
+                name,
+                uuid,
+                size_bytes,
+            } => findings.push(Finding {
+                code: "host-filevault".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "{name}: FileVault encryption or its System.keychain passphrase is not configured ({uuid}, {size_bytes} bytes)"
+                ),
+                hint: "cowshed setup".into(),
+                path: None,
+            }),
             HostAction::PinFstab { uuid, mount_at } => findings.push(Finding {
                 code: "host-fstab".into(),
                 severity: FindingSeverity::Error,
