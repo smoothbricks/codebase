@@ -729,16 +729,22 @@ agent and removes the plist; both operations are idempotent. The copy is what ke
 update or nix garbage collection: an sccache upgrade is picked up by rerunning `cowshed sccache start`, which recopies
 on byte drift and rewrites the plist only on drift.
 
+Cross-path Rust reuse — every workspace hitting one cache regardless of its mount path — requires an sccache that
+carries `patches/sccache-0.17.0-rust-basedir-cwd.patch`: it extends `SCCACHE_BASEDIRS` normalization to the Rust hasher
+and honors the per-request `SCCACHE_BASEDIR_CWD=1` client variable cowshed exports in every workspace, keying the cwd,
+the blanket `CARGO_*` environment values, and the argument bytes relative to the request cwd. Values rustc records as
+`# env-dep:` are never normalized, so a crate that compiles `env!("CARGO_MANIFEST_DIR")` into its output fail-closes
+across paths. Cargo's own `-C metadata` is path-independent for workspace members from cargo 1.97. An unpatched sccache
+still serves same-path (slot-tenant) reuse, nothing more.
+
 Two more variables are in that plist because sccache reads them once, at server start, and no client can supply them:
 
 - `SCCACHE_CACHE_SIZE` — the cap. sccache's own default is 10 GiB, which is smaller than one debug graph of a project
   cowshed hosts, so the default evicts the entries a second slot tenant came for. The derived default is the summed
   allocated size of every adopted project's `main` image, floored at **40 GiB** and rounded up to a whole gibibyte;
   `--capacity 120g` overrides it (same size grammar as `cowshed adopt`/`resize`).
-- `SCCACHE_BASEDIRS` — **plural**. sccache 0.16 has no `SCCACHE_BASEDIR` at all and ignores it silently, which is how a
-  host can look configured while `--show-stats` reports `Base directories (none)`. It is set to the store root. Do not
-  expect it to buy cross-path Rust reuse: measured, it changes nothing there, because cargo's `-C metadata` is a hash
-  sccache never sees. Build slots are what fix that.
+- `SCCACHE_BASEDIRS` — **plural**; set to the store root. With the patched binary it also participates in Rust key
+  normalization; the per-request cwd from `SCCACHE_BASEDIR_CWD` is what makes workspace paths interchangeable.
 
 `status` reports launchd and socket health without starting anything, and surfaces the daemon's own `--show-stats`
 whenever it answers:

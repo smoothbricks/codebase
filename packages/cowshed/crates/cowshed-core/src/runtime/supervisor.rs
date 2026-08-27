@@ -1278,15 +1278,19 @@ impl SpawnSink for SystemSpawnSink {
                 command.env(key, value);
             }
         }
-        // Rust through sccache is a slot-path privilege. Cargo's `-C metadata` and sccache's key
-        // both carry the absolute build path, so only a workspace mounted at a slot's stable path
-        // can reuse another generation's entries; the same trade turns incremental off, because
-        // incremental state is per-unit local output sccache cannot cache and cargo prefers it.
-        if crate::metadata::SlotId::from_mount_path(&request.sandbox.workspace_mount).is_some() {
-            command
-                .env("RUSTC_WRAPPER", "sccache")
-                .env("CARGO_INCREMENTAL", "0");
-        }
+        // Rust routes through sccache in EVERY workspace. Cargo's `-C metadata` is
+        // path-independent for workspace members (cargo >= 1.97, measured), and the bundled
+        // sccache normalizes the residual path-bearing key inputs (cwd, blanket CARGO_* env,
+        // argument bytes) against the request cwd when the client sets SCCACHE_BASEDIR_CWD=1 —
+        // so name-mounted workspaces share entries with each other, not just successive slot
+        // tenants. env-dep values stay unnormalized in the key, so a crate that compiles
+        // env!("CARGO_MANIFEST_DIR") into its output still fail-closes across paths.
+        // Incremental stays off: sccache refuses incremental compilations, and the shared
+        // cache is worth more to a fleet of clones than per-unit local state.
+        command
+            .env("RUSTC_WRAPPER", "sccache")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("SCCACHE_BASEDIR_CWD", "1");
         if let Some(directory) = developer_directory() {
             command.env("DEVELOPER_DIR", directory);
         }
