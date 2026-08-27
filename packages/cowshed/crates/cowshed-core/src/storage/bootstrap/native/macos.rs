@@ -921,6 +921,45 @@ fn random_volume_password() -> Result<Zeroizing<String>, HostError> {
     Ok(Zeroizing::new(password))
 }
 
+fn lookup_volume_password(
+    host: &dyn BootstrapHost,
+    name: &str,
+) -> Result<Option<Zeroizing<String>>, HostError> {
+    let command = HostCommand::new(
+        SECURITY,
+        [
+            "find-generic-password",
+            "-a",
+            name,
+            "-s",
+            name,
+            "-w",
+            SYSTEM_KEYCHAIN,
+        ],
+    );
+    let output = host.run_command(&command)?;
+    if !output.succeeded() {
+        return Ok(None);
+    }
+    let mut password = String::from_utf8(output.stdout).map_err(|_| {
+        HostError::new(format!(
+            "System.keychain password for {name} is not valid UTF-8"
+        ))
+    })?;
+    if password.ends_with('\n') {
+        password.pop();
+        if password.ends_with('\r') {
+            password.pop();
+        }
+    }
+    if password.is_empty() {
+        return Err(HostError::new(format!(
+            "System.keychain password for {name} is empty"
+        )));
+    }
+    Ok(Some(Zeroizing::new(password)))
+}
+
 fn encrypt_volume_with(host: &dyn BootstrapHost, name: &str, uuid: &str) -> Result<(), HostError> {
     if !matches!(name, APFS_STORE_VOLUME | APFS_CACHES_VOLUME) {
         return Err(HostError::new(format!(
@@ -929,33 +968,41 @@ fn encrypt_volume_with(host: &dyn BootstrapHost, name: &str, uuid: &str) -> Resu
     }
     Uuid::parse_str(uuid)
         .map_err(|_| HostError::new(format!("invalid APFS volume UUID {uuid:?}")))?;
-    let password = random_volume_password()?;
-    required_host_command(
-        host,
-        HostCommand::new(
-            SECURITY,
-            [
-                "add-generic-password",
-                "-a",
-                name,
-                "-s",
-                name,
-                "-l",
-                format!("{name} encryption password").as_str(),
-                "-D",
-                "Encrypted volume password",
-                "-w",
-                password.as_str(),
-                "-T",
-                SECURITY,
-                "-T",
-                APFS_USER_AGENT,
-                "-T",
-                CS_USER_AGENT,
-                SYSTEM_KEYCHAIN,
-            ],
-        ),
-    )?;
+    // Persist the passphrase before encryptVolume: a crash mid-encrypt must still have a
+    // keychain item. A leftover item from that crash is reused, never replaced.
+    let password = match lookup_volume_password(host, name)? {
+        Some(existing) => existing,
+        None => {
+            let password = random_volume_password()?;
+            required_host_command(
+                host,
+                HostCommand::new(
+                    SECURITY,
+                    [
+                        "add-generic-password",
+                        "-a",
+                        name,
+                        "-s",
+                        name,
+                        "-l",
+                        format!("{name} encryption password").as_str(),
+                        "-D",
+                        "Encrypted volume password",
+                        "-w",
+                        password.as_str(),
+                        "-T",
+                        SECURITY,
+                        "-T",
+                        APFS_USER_AGENT,
+                        "-T",
+                        CS_USER_AGENT,
+                        SYSTEM_KEYCHAIN,
+                    ],
+                ),
+            )?;
+            password
+        }
+    };
     let command = HostCommand::new(
         DISKUTIL,
         [
@@ -5948,6 +5995,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
     struct EncryptCommandHost {
         commands: mpsc::Sender<(HostCommand, Option<Vec<u8>>)>,
+        existing_password: Option<&'static str>,
     }
 
     impl BootstrapHost for EncryptCommandHost {
@@ -5975,6 +6023,19 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             self.commands
                 .send((command.clone(), None))
                 .expect("encryption command receiver remains alive");
+            if command
+                .args()
+                .first()
+                .is_some_and(|argument| argument == "find-generic-password")
+            {
+                return Ok(match self.existing_password {
+                    Some(password) => HostCommandOutput::success(format!("{password}\n")),
+                    None => HostCommandOutput::failure(
+                        44,
+                        "The specified item could not be found in the keychain.",
+                    ),
+                });
+            }
             Ok(HostCommandOutput::default())
         }
 
@@ -6009,19 +6070,24 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     #[test]
     fn encryption_stores_one_random_password_and_feeds_it_to_diskutil() {
         let (commands, received) = mpsc::channel();
-        let host = EncryptCommandHost { commands };
+        let host = EncryptCommandHost {
+            commands,
+            existing_password: None,
+        };
         let uuid = "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5";
         encrypt_volume_with(&host, APFS_STORE_VOLUME, uuid).unwrap();
         let commands = received.try_iter().collect::<Vec<_>>();
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 3);
         assert_eq!(commands[0].0.program(), SECURITY);
-        assert_eq!(commands[0].0.args()[0], "add-generic-password");
-        assert!(commands[0].0.args().windows(2).any(|pair| {
+        assert_eq!(commands[0].0.args()[0], "find-generic-password");
+        assert_eq!(commands[1].0.program(), SECURITY);
+        assert_eq!(commands[1].0.args()[0], "add-generic-password");
+        assert!(commands[1].0.args().windows(2).any(|pair| {
             pair == ["-a", APFS_STORE_VOLUME] || pair == ["-s", APFS_STORE_VOLUME]
         }));
         for trusted in [SECURITY, APFS_USER_AGENT, CS_USER_AGENT] {
             assert!(
-                commands[0]
+                commands[1]
                     .0
                     .args()
                     .windows(2)
@@ -6029,23 +6095,23 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             );
         }
         assert_eq!(
-            commands[0].0.args().last().map(String::as_str),
+            commands[1].0.args().last().map(String::as_str),
             Some(SYSTEM_KEYCHAIN)
         );
-        let password_index = commands[0]
+        let password_index = commands[1]
             .0
             .args()
             .iter()
             .position(|argument| argument == "-w")
             .expect("security password argument")
             + 1;
-        let password = &commands[0].0.args()[password_index];
+        let password = &commands[1].0.args()[password_index];
         assert_eq!(password.len(), 32);
         assert!(password.bytes().all(|byte| byte.is_ascii_hexdigit()));
 
-        assert_eq!(commands[1].0.program(), DISKUTIL);
+        assert_eq!(commands[2].0.program(), DISKUTIL);
         assert_eq!(
-            commands[1].0.args(),
+            commands[2].0.args(),
             [
                 "apfs",
                 "encryptVolume",
@@ -6057,7 +6123,33 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         );
         let mut expected_input = password.as_bytes().to_vec();
         expected_input.push(b'\n');
-        assert_eq!(commands[1].1.as_deref(), Some(expected_input.as_slice()));
+        assert_eq!(commands[2].1.as_deref(), Some(expected_input.as_slice()));
+    }
+
+    #[test]
+    fn encryption_reuses_an_existing_keychain_password() {
+        let (commands, received) = mpsc::channel();
+        let host = EncryptCommandHost {
+            commands,
+            existing_password: Some("already-stored-pass"),
+        };
+        let uuid = "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5";
+        encrypt_volume_with(&host, APFS_STORE_VOLUME, uuid).unwrap();
+        let commands = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].0.args()[0], "find-generic-password");
+        assert!(
+            !commands.iter().any(|(command, _)| command
+                .args()
+                .first()
+                .is_some_and(|argument| argument == "add-generic-password")),
+            "a stored passphrase must not be replaced"
+        );
+        assert_eq!(commands[1].0.args()[0], "apfs");
+        assert_eq!(
+            commands[1].1.as_deref(),
+            Some(b"already-stored-pass\n".as_slice())
+        );
     }
 
     fn deadline_spawn(
