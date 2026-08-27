@@ -91,8 +91,16 @@ in {
   # The environment supplies the cache endpoint — inside a cowshed workspace,
   # SCCACHE_SERVER_UDS points every wrapper invocation at the host-owned
   # sccache daemon (cowshed sccache start) — but this repository owns whether
-  # its compiler processes use the installed wrapper.
+  # its compiler processes use the installed wrapper. The overlay's patched
+  # sccache (nixpkgs-overlay/sccache-rust-basedir-cwd.patch) keys path-bearing
+  # hash inputs relative to the request cwd under SCCACHE_BASEDIR_CWD=1, so
+  # every checkout — cowshed workspace or plain clone — shares one cache at any
+  # mount path. Incremental is off to match: sccache refuses incremental
+  # compilations, and a shared hit beats per-checkout incremental state (the
+  # old regime left 24G of incremental dirs in packages/cowshed/target).
   env.RUSTC_WRAPPER = "sccache";
+  env.CARGO_INCREMENTAL = "0";
+  env.SCCACHE_BASEDIR_CWD = "1";
 
   # Nx otherwise defaults to three workers. Scale to the cores available in each
   # developer shell or CI runner; explicit --parallel flags still take precedence.
