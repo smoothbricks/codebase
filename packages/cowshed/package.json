@@ -4,7 +4,8 @@
   "type": "module",
   "sideEffects": false,
   "scripts": {
-    "test": "nx run cowshed:test --outputStyle=stream"
+    "test": "nx run cowshed:test --outputStyle=stream",
+    "cowshed": "nx run cowshed:run-cli --"
   },
   "bin": {
     "cowshed": "./dist/ts/cli.js"
@@ -67,6 +68,17 @@
         "options": {
           "cwd": "packages/cowshed",
           "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
+        }
+      },
+      "run-cli": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          "cli-arm64-macos"
+        ],
+        "options": {
+          "cwd": "packages/cowshed",
+          "command": "dist/bin/darwin-arm64/cowshed {args}"
         }
       },
       "cli-x64-macos": {
