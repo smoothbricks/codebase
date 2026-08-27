@@ -1529,7 +1529,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
     assert!(streams.stderr.starts_with(
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: no volumes will be created or deleted; existing data is untouched\n\
-         cowshed: system LaunchDaemon dev.cowshed.storage will be installed to mount cowshed volumes before login\n"
+         cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login\n"
     ));
     assert_eq!(
         host.events,
