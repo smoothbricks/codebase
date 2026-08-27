@@ -2167,6 +2167,9 @@ fn host_action_evidence(action: &HostAction) -> String {
         HostAction::PinFstab { uuid, mount_at } => {
             format!("pin volume {uuid} at {} in /etc/fstab", mount_at.display())
         }
+        HostAction::InstallMountService { label } => {
+            format!("install system LaunchDaemon {label} to mount cowshed volumes before login")
+        }
         HostAction::ReclaimStubs { paths } => format!(
             "reclaim mountpoint stubs: {}",
             paths
@@ -2281,7 +2284,11 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
                 hint: "cowshed setup".into(),
                 path: Some(mount_at.clone()),
             },
-            Some(HostAction::PinFstab { .. } | HostAction::ReclaimStubs { .. }) => {
+            Some(
+                HostAction::PinFstab { .. }
+                | HostAction::ReclaimStubs { .. }
+                | HostAction::InstallMountService { .. },
+            ) => {
                 unreachable!("volume lookup only selects volume actions")
             }
         };
@@ -2312,6 +2319,15 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
                 ),
                 hint: "cowshed setup".into(),
                 path: paths.first().cloned(),
+            }),
+            HostAction::InstallMountService { label } => findings.push(Finding {
+                code: "host-mount-service".into(),
+                severity: FindingSeverity::Error,
+                message: format!("system LaunchDaemon {label} is missing, outdated, or not loaded"),
+                hint: "cowshed setup".into(),
+                path: Some(PathBuf::from(
+                    "/Library/LaunchDaemons/dev.cowshed.storage.plist",
+                )),
             }),
             HostAction::CreateVolume { .. }
             | HostAction::MountExisting { .. }
@@ -2886,6 +2902,9 @@ mod tests {
                     size_bytes: 8192,
                     mount_at: PathBuf::from("/private/cowshed/caches"),
                 },
+                HostAction::InstallMountService {
+                    label: "dev.cowshed.storage".into(),
+                },
             ],
             requires_authorization: true,
             non_destructive: true,
@@ -2911,6 +2930,11 @@ mod tests {
             finding.code == "mount-stubs"
                 && finding.message.contains("gateway.stderr.log")
                 && finding.message.contains("stale.sock")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.code == "host-mount-service"
+                && finding.message.contains("dev.cowshed.storage")
+                && finding.hint == "cowshed setup"
         }));
         assert!(findings.iter().all(|finding| !finding.message.is_empty()));
     }

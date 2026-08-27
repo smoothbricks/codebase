@@ -26,7 +26,7 @@ use super::super::{
 use super::shared::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode, SystemBootstrapHost,
-    UninstallFstabOutcome, UninstallReport, VolumeOutcome, VolumeState,
+    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState,
     execute_native_bootstrap_plan, existing_host_storage_error, platform_host_error,
     setup_execution_error,
 };
@@ -38,10 +38,17 @@ const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
 const KILLALL: &str = "/usr/bin/killall";
 const MKDIR: &str = "/bin/mkdir";
 const RM: &str = "/bin/rm";
+const RMDIR: &str = "/bin/rmdir";
 const CHOWN: &str = "/usr/sbin/chown";
 const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
 const FSTAB: &str = "/etc/fstab";
 const INSTALL: &str = "/usr/bin/install";
+const LAUNCHCTL: &str = "/bin/launchctl";
+const MOUNT_SERVICE_LABEL: &str = "dev.cowshed.storage";
+const MOUNT_SERVICE_TARGET: &str = "system/dev.cowshed.storage";
+const MOUNT_SERVICE_DIRECTORY: &str = "/Library/Application Support/dev.cowshed";
+const MOUNT_SERVICE_SCRIPT: &str = "/Library/Application Support/dev.cowshed/mount-volumes.sh";
+const MOUNT_SERVICE_PLIST: &str = "/Library/LaunchDaemons/dev.cowshed.storage.plist";
 const AUTHORIZATION_DENIED: i32 = -60005;
 const AUTHORIZATION_CANCELED: i32 = -60006;
 
@@ -187,7 +194,7 @@ impl BootstrapHost for AuthorizedBootstrapHost {
                 })?;
             }
         }
-        if command.program() == DISKUTIL {
+        if [DISKUTIL, INSTALL, LAUNCHCTL, RM].contains(&command.program()) {
             return self.session()?.execute(command);
         }
         SystemBootstrapHost.run_command(command)
@@ -334,6 +341,183 @@ struct SetupSnapshot {
     fstab: PlannedFstab,
     actions: Vec<HostAction>,
     classified: Vec<ClassifiedVolume>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MountServiceFiles {
+    script: Vec<u8>,
+    plist: Vec<u8>,
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn desired_mount_service(pins: &[FstabPin]) -> Result<MountServiceFiles, NativeBootstrapError> {
+    let mut mounts = String::new();
+    for pin in pins {
+        Uuid::parse_str(&pin.volume_uuid).map_err(|_| {
+            NativeBootstrapError::MalformedPlist(format!(
+                "{} has invalid APFS volume UUID {:?}",
+                pin.label, pin.volume_uuid
+            ))
+        })?;
+        let mountpoint = pin.mountpoint.to_str().ok_or_else(|| {
+            NativeBootstrapError::Host(HostError::new(format!(
+                "mountpoint is not UTF-8: {:?}",
+                pin.mountpoint
+            )))
+        })?;
+        mounts.push_str(&format!(
+            "mount_volume {} {}\n",
+            shell_quote(&pin.volume_uuid),
+            shell_quote(mountpoint)
+        ));
+    }
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+umask 022
+
+mount_volume() {{
+    uuid=$1
+    mountpoint=$2
+    info=$(/usr/sbin/diskutil info -plist "$uuid")
+    current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -o - - 2>/dev/null || :)
+
+    if [ "$current" = "$mountpoint" ]; then
+        return 0
+    fi
+    if [ -n "$current" ]; then
+        echo "cowshed storage: $uuid is mounted at $current, expected $mountpoint" >&2
+        return 1
+    fi
+    if [ -L "$mountpoint" ]; then
+        echo "cowshed storage: refusing symlink mountpoint $mountpoint" >&2
+        return 1
+    fi
+    if [ ! -d "$mountpoint" ]; then
+        /bin/mkdir -p "$mountpoint"
+    fi
+    if [ -n "$(/bin/ls -A "$mountpoint")" ]; then
+        echo "cowshed storage: refusing nonempty mountpoint $mountpoint" >&2
+        return 1
+    fi
+
+    /usr/sbin/diskutil mount -nobrowse -mountPoint "$mountpoint" "$uuid"
+    info=$(/usr/sbin/diskutil info -plist "$uuid")
+    current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -o - -)
+    if [ "$current" != "$mountpoint" ]; then
+        echo "cowshed storage: $uuid mounted at $current, expected $mountpoint" >&2
+        return 1
+    fi
+}}
+
+{mounts}"#
+    );
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{MOUNT_SERVICE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>{MOUNT_SERVICE_SCRIPT}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+"#
+    );
+    Ok(MountServiceFiles {
+        script: script.into_bytes(),
+        plist: plist.into_bytes(),
+    })
+}
+
+fn mount_service_files(
+    snapshot: &SetupSnapshot,
+) -> Result<Option<MountServiceFiles>, NativeBootstrapError> {
+    let pins = snapshot
+        .classified
+        .iter()
+        .map(|volume| {
+            volume.volume_uuid.as_ref().map(|uuid| FstabPin {
+                volume_uuid: uuid.clone(),
+                mountpoint: volume.mountpoint.clone(),
+                label: volume.name.to_owned(),
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    pins.as_deref().map(desired_mount_service).transpose()
+}
+
+fn mount_service_loaded() -> bool {
+    Command::new(LAUNCHCTL)
+        .args(["print", MOUNT_SERVICE_TARGET])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn root_owned_path_has_mode(path: &Path, directory: bool, mode: u32) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let kind_matches = if directory {
+            metadata.file_type().is_dir()
+        } else {
+            metadata.file_type().is_file()
+        };
+        kind_matches
+            && metadata.uid() == 0
+            && metadata.gid() == 0
+            && metadata.mode() & 0o7777 == mode
+    })
+}
+
+fn mount_service_contents_are_current(
+    files: &MountServiceFiles,
+    script: Option<&[u8]>,
+    plist: Option<&[u8]>,
+    loaded: bool,
+) -> bool {
+    script == Some(files.script.as_slice()) && plist == Some(files.plist.as_slice()) && loaded
+}
+
+fn mount_service_is_current(files: &MountServiceFiles) -> bool {
+    let script = fs::read(MOUNT_SERVICE_SCRIPT).ok();
+    let plist = fs::read(MOUNT_SERVICE_PLIST).ok();
+    root_owned_path_has_mode(Path::new(MOUNT_SERVICE_DIRECTORY), true, 0o755)
+        && root_owned_path_has_mode(Path::new(MOUNT_SERVICE_SCRIPT), false, 0o755)
+        && root_owned_path_has_mode(Path::new(MOUNT_SERVICE_PLIST), false, 0o644)
+        && mount_service_contents_are_current(
+            files,
+            script.as_deref(),
+            plist.as_deref(),
+            mount_service_loaded(),
+        )
+}
+
+fn add_mount_service_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBootstrapError> {
+    if let Some(files) = mount_service_files(snapshot)?
+        && !mount_service_is_current(&files)
+    {
+        snapshot.actions.push(HostAction::InstallMountService {
+            label: MOUNT_SERVICE_LABEL.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn prepare_setup_snapshot(
@@ -579,20 +763,28 @@ fn host_setup_actions(snapshot: &SetupSnapshot) -> Vec<HostAction> {
     snapshot.actions.clone()
 }
 
-fn setup_requires_authorization(plan: &BootstrapPlan) -> bool {
-    plan.operations().iter().any(|operation| match operation {
-        HostOperation::ProvisionApfsVolumes { .. }
-        | HostOperation::PinVolumesInFstab { .. }
-        | HostOperation::MountApfsVolume { .. } => true,
-        HostOperation::RunCommand(command) => {
-            command.program() == DISKUTIL
-                && command
-                    .args()
-                    .first()
-                    .is_some_and(|argument| argument == "mount" || argument == "unmount")
-        }
-        _ => false,
-    })
+fn setup_requires_authorization(snapshot: &SetupSnapshot) -> bool {
+    snapshot
+        .actions
+        .iter()
+        .any(|action| matches!(action, HostAction::InstallMountService { .. }))
+        || snapshot
+            .plan
+            .operations()
+            .iter()
+            .any(|operation| match operation {
+                HostOperation::ProvisionApfsVolumes { .. }
+                | HostOperation::PinVolumesInFstab { .. }
+                | HostOperation::MountApfsVolume { .. } => true,
+                HostOperation::RunCommand(command) => {
+                    command.program() == DISKUTIL
+                        && command
+                            .args()
+                            .first()
+                            .is_some_and(|argument| argument == "mount" || argument == "unmount")
+                }
+                _ => false,
+            })
 }
 
 fn action_volume_name(action: &HostAction) -> Option<&str> {
@@ -600,7 +792,9 @@ fn action_volume_name(action: &HostAction) -> Option<&str> {
         HostAction::CreateVolume { name, .. }
         | HostAction::MountExisting { name, .. }
         | HostAction::RepairMounted { name, .. } => Some(name),
-        HostAction::PinFstab { .. } | HostAction::ReclaimStubs { .. } => None,
+        HostAction::PinFstab { .. }
+        | HostAction::ReclaimStubs { .. }
+        | HostAction::InstallMountService { .. } => None,
     }
 }
 
@@ -669,6 +863,143 @@ async fn execute_setup_operations(
     Ok(())
 }
 
+fn required_host_command(host: &dyn BootstrapHost, command: HostCommand) -> Result<(), HostError> {
+    let output = host.run_command(&command)?;
+    if output.succeeded() {
+        return Ok(());
+    }
+    Err(HostError::new(
+        HostCommandFailure::new(command, output).to_string(),
+    ))
+}
+
+fn write_mount_service_temporary(contents: &[u8], kind: &str) -> Result<PathBuf, HostError> {
+    let path = PathBuf::from(format!(
+        "/private/tmp/cowshed-mount-service-{}-{kind}",
+        Uuid::new_v4()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|source| host_io_error("create temporary mount service file", &path, source))?;
+    file.write_all(contents)
+        .map_err(|source| host_io_error("write temporary mount service file", &path, source))?;
+    file.sync_all()
+        .map_err(|source| host_io_error("sync temporary mount service file", &path, source))?;
+    Ok(path)
+}
+
+fn install_mount_service_with(
+    host: &dyn BootstrapHost,
+    files: &MountServiceFiles,
+) -> Result<(), HostError> {
+    let script_temporary = write_mount_service_temporary(&files.script, "script")?;
+    let plist_temporary = match write_mount_service_temporary(&files.plist, "plist") {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = fs::remove_file(&script_temporary);
+            return Err(error);
+        }
+    };
+    let result = (|| {
+        // A missing job is the normal first-install state. Every other command is required.
+        host.run_command(&HostCommand::new(
+            LAUNCHCTL,
+            ["bootout", MOUNT_SERVICE_TARGET],
+        ))?;
+        required_host_command(
+            host,
+            HostCommand::new(
+                INSTALL,
+                [
+                    "-d",
+                    "-o",
+                    "root",
+                    "-g",
+                    "wheel",
+                    "-m",
+                    "755",
+                    MOUNT_SERVICE_DIRECTORY,
+                ],
+            ),
+        )?;
+        let script_temporary = path_argument(&script_temporary)?;
+        required_host_command(
+            host,
+            HostCommand::new(
+                INSTALL,
+                [
+                    "-o",
+                    "root",
+                    "-g",
+                    "wheel",
+                    "-m",
+                    "755",
+                    script_temporary.as_str(),
+                    MOUNT_SERVICE_SCRIPT,
+                ],
+            ),
+        )?;
+        let plist_temporary = path_argument(&plist_temporary)?;
+        required_host_command(
+            host,
+            HostCommand::new(
+                INSTALL,
+                [
+                    "-o",
+                    "root",
+                    "-g",
+                    "wheel",
+                    "-m",
+                    "644",
+                    plist_temporary.as_str(),
+                    MOUNT_SERVICE_PLIST,
+                ],
+            ),
+        )?;
+        required_host_command(
+            host,
+            HostCommand::new(LAUNCHCTL, ["enable", MOUNT_SERVICE_TARGET]),
+        )?;
+        required_host_command(
+            host,
+            HostCommand::new(LAUNCHCTL, ["bootstrap", "system", MOUNT_SERVICE_PLIST]),
+        )?;
+        required_host_command(
+            host,
+            HostCommand::new(LAUNCHCTL, ["kickstart", "-k", MOUNT_SERVICE_TARGET]),
+        )
+    })();
+    let _ = fs::remove_file(script_temporary);
+    let _ = fs::remove_file(plist_temporary);
+    result
+}
+
+async fn install_mount_service(
+    snapshot: &SetupSnapshot,
+    host: Arc<dyn BootstrapHost>,
+) -> Result<(), CowshedError> {
+    let files = mount_service_files(snapshot)
+        .map_err(|error| setup_execution_error(error, "cowshed setup"))?
+        .ok_or_else(|| {
+            CowshedError::internal("mount service installation requires both APFS volume UUIDs")
+        })?;
+    tokio::task::spawn_blocking(move || install_mount_service_with(host.as_ref(), &files))
+        .await
+        .map_err(|error| {
+            setup_execution_error(
+                NativeBootstrapError::Execution(BootstrapExecutionError::BlockingLane(
+                    error.to_string(),
+                )),
+                "cowshed setup",
+            )
+        })?
+        .map_err(NativeBootstrapError::Host)
+        .map_err(|error| setup_execution_error(error, "cowshed setup"))
+}
+
 async fn execute_snapshot_actions(
     snapshot: &SetupSnapshot,
     host: Arc<dyn BootstrapHost>,
@@ -695,6 +1026,9 @@ async fn execute_snapshot_actions(
                     .collect::<Vec<_>>();
                 execute_setup_operations(&operations, Arc::clone(&host)).await
             }
+            HostAction::InstallMountService { .. } => {
+                install_mount_service(snapshot, Arc::clone(&host)).await
+            }
             HostAction::PinFstab { .. } => {
                 let pin_indices = (index..outcomes.len())
                     .filter(|candidate| {
@@ -716,10 +1050,11 @@ async fn execute_snapshot_actions(
                 };
                 match result {
                     Ok(()) => {
-                        for pin_index in pin_indices {
-                            outcomes[pin_index].outcome = HostActionResult::Done;
+                        for pin_index in &pin_indices {
+                            outcomes[*pin_index].outcome = HostActionResult::Done;
                         }
-                        return (outcomes, None);
+                        index = pin_indices.last().map_or(index + 1, |last| last + 1);
+                        continue;
                     }
                     Err(error) => {
                         for pin_index in pin_indices {
@@ -774,7 +1109,9 @@ async fn gather_setup_snapshot(
         let mut source = SystemEvidenceSource {
             host: host.as_ref(),
         };
-        prepare_setup_snapshot(&mut source, &home, &existing_fstab)
+        let mut snapshot = prepare_setup_snapshot(&mut source, &home, &existing_fstab)?;
+        add_mount_service_action(&mut snapshot)?;
+        Ok(snapshot)
     })
     .await
     .map_err(|error| {
@@ -789,7 +1126,7 @@ pub async fn plan_host_setup(home: &Path) -> crate::Result<HostSetupPlan> {
             .map_err(existing_host_storage_error)?;
         Ok(HostSetupPlan::new(
             host_setup_actions(&snapshot),
-            setup_requires_authorization(&snapshot.plan),
+            setup_requires_authorization(&snapshot),
         ))
     }
 }
@@ -799,7 +1136,7 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
         let initial = gather_setup_snapshot(home, Arc::new(SystemBootstrapHost))
             .await
             .map_err(existing_host_storage_error)?;
-        let authorized = setup_requires_authorization(&initial.plan);
+        let authorized = setup_requires_authorization(&initial);
         let host: Arc<dyn BootstrapHost> = if authorized {
             let session = tokio::task::spawn_blocking(MacAuthorizationSession::acquire)
                 .await
@@ -877,14 +1214,17 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
                     authorized,
                 });
             }
-            let mut pin_post = post.clone();
-            pin_post
-                .actions
-                .retain(|action| matches!(action, HostAction::PinFstab { .. }));
-            let (pin_outcomes, pin_failure) =
-                execute_snapshot_actions(&pin_post, Arc::clone(&host)).await;
-            action_outcomes.extend(pin_outcomes);
-            if let Some(error) = pin_failure {
+            let mut post_actions = post.clone();
+            post_actions.actions.retain(|action| {
+                matches!(
+                    action,
+                    HostAction::PinFstab { .. } | HostAction::InstallMountService { .. }
+                )
+            });
+            let (post_outcomes, post_failure) =
+                execute_snapshot_actions(&post_actions, Arc::clone(&host)).await;
+            action_outcomes.extend(post_outcomes);
+            if let Some(error) = post_failure {
                 return Ok(HostSetupReport {
                     action_outcomes,
                     volumes: initial.volumes,
@@ -914,9 +1254,17 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
     }
 }
 
+fn mount_service_artifacts_present() -> bool {
+    fs::symlink_metadata(MOUNT_SERVICE_SCRIPT).is_ok()
+        || fs::symlink_metadata(MOUNT_SERVICE_PLIST).is_ok()
+        || mount_service_loaded()
+}
+
 fn host_uninstall_plan(home: &Path) -> Result<HostUninstallPlan, NativeBootstrapError> {
     let existing = read_fstab_text().map_err(NativeBootstrapError::Host)?;
-    host_uninstall_plan_from_text(home, &existing)
+    let mut plan = host_uninstall_plan_from_text(home, &existing)?;
+    plan.requires_authorization |= mount_service_artifacts_present();
+    Ok(plan)
 }
 
 fn host_uninstall_plan_from_text(
@@ -960,9 +1308,27 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
                 services: Vec::new(),
             });
         }
+        let remove_service = mount_service_artifacts_present();
+        let remove_fstab = !plan.pins_to_remove.is_empty();
         tokio::task::spawn_blocking(move || {
             let mut session = MacAuthorizationSession::acquire()?;
-            pin_volumes_in_fstab_with(&mut session, &[]).map(|_| ())
+            if remove_service {
+                // A job which is already absent is still successfully uninstalled.
+                session.execute(&HostCommand::new(
+                    LAUNCHCTL,
+                    ["bootout", MOUNT_SERVICE_TARGET],
+                ))?;
+                run_privileged_command(
+                    &mut session,
+                    &HostCommand::new(RM, ["-f", MOUNT_SERVICE_PLIST, MOUNT_SERVICE_SCRIPT]),
+                )?;
+                // Keep the directory when another root-owned artifact shares it.
+                let _ = session.execute(&HostCommand::new(RMDIR, [MOUNT_SERVICE_DIRECTORY]));
+            }
+            if remove_fstab {
+                pin_volumes_in_fstab_with(&mut session, &[])?;
+            }
+            Ok::<_, HostError>(())
         })
         .await
         .map_err(|error| {
@@ -973,8 +1339,19 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
         .map_err(NativeBootstrapError::Host)
         .map_err(|error| setup_execution_error(error, "cowshed setup --uninstall"))?;
         Ok(UninstallReport {
-            fstab: UninstallFstabOutcome::Removed,
-            services: Vec::new(),
+            fstab: if remove_fstab {
+                UninstallFstabOutcome::Removed
+            } else {
+                UninstallFstabOutcome::AlreadyClean
+            },
+            services: if remove_service {
+                vec![UninstallServiceOutcome {
+                    what: format!("{MOUNT_SERVICE_LABEL} system LaunchDaemon"),
+                    outcome: "removed".to_owned(),
+                }]
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -2585,10 +2962,13 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use super::super::shared::mutating_setup_actions;
@@ -2596,6 +2976,188 @@ mod tests {
     use crate::storage::bootstrap::{BlockingJob, CACHES_ROOT, STORE_ROOT};
     use uuid::Uuid;
 
+    fn mount_service_pins() -> Vec<FstabPin> {
+        vec![
+            FstabPin {
+                volume_uuid: "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5".to_owned(),
+                mountpoint: PathBuf::from(STORE_ROOT),
+                label: APFS_STORE_VOLUME.to_owned(),
+            },
+            FstabPin {
+                volume_uuid: "D4B312DB-9378-4EC5-9B0B-8F244F1B38FA".to_owned(),
+                mountpoint: PathBuf::from(CACHES_ROOT),
+                label: APFS_CACHES_VOLUME.to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn boot_mount_service_is_a_root_owned_shell_contract_not_a_cowshed_command() {
+        let files = desired_mount_service(&mount_service_pins()).unwrap();
+        let script = String::from_utf8(files.script.clone()).unwrap();
+        let plist = String::from_utf8(files.plist.clone()).unwrap();
+
+        assert!(script.starts_with("#!/bin/sh\nset -eu\n"));
+        assert!(script.contains(
+            "mount_volume 'FEC35F46-22C8-40BC-943A-ADC4BD39CAE5' '/private/cowshed/store'"
+        ));
+        assert!(script.contains(
+            "mount_volume 'D4B312DB-9378-4EC5-9B0B-8F244F1B38FA' '/private/cowshed/caches'"
+        ));
+        assert!(script.contains("/usr/sbin/diskutil mount -nobrowse -mountPoint"));
+        assert!(!script.contains("cowshed setup"));
+        assert!(plist.contains("<string>dev.cowshed.storage</string>"));
+        assert!(plist.contains("<string>/bin/sh</string>"));
+        assert!(plist.contains(MOUNT_SERVICE_SCRIPT));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<key>SuccessfulExit</key>"));
+        Value::from_reader_xml(files.plist.as_slice()).expect("valid launchd plist");
+        let mut shell = Command::new("/bin/sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn system shell parser");
+        shell
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(&files.script)
+            .expect("write generated script");
+        assert!(shell.wait().expect("wait for shell parser").success());
+    }
+
+    #[test]
+    fn boot_mount_service_install_is_current_only_for_exact_loaded_contents() {
+        let files = desired_mount_service(&mount_service_pins()).unwrap();
+        assert!(mount_service_contents_are_current(
+            &files,
+            Some(&files.script),
+            Some(&files.plist),
+            true,
+        ));
+        assert!(!mount_service_contents_are_current(
+            &files,
+            Some(b"stale"),
+            Some(&files.plist),
+            true,
+        ));
+        assert!(!mount_service_contents_are_current(
+            &files,
+            Some(&files.script),
+            Some(&files.plist),
+            false,
+        ));
+    }
+
+    struct MountServiceInstallHost {
+        commands: mpsc::Sender<HostCommand>,
+    }
+
+    impl BootstrapHost for MountServiceInstallHost {
+        fn verify_zfs_delegation(
+            &self,
+            _pool: &str,
+            _required_root: &str,
+        ) -> Result<(), HostError> {
+            unreachable!("mount service install has no ZFS operation")
+        }
+
+        fn inspect_mountpoint(&self, _path: &Path) -> Result<MountpointState, HostError> {
+            unreachable!("mount service install has no mountpoint inspection")
+        }
+
+        fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("mount service install uses privileged install")
+        }
+
+        fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("mount service install reclaims nothing")
+        }
+
+        fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            self.commands
+                .send(command.clone())
+                .expect("install command receiver remains alive");
+            Ok(HostCommandOutput::default())
+        }
+
+        fn provision_apfs_volumes(
+            &self,
+            _container: &str,
+            _volumes: &[ApfsVolumeProvision],
+        ) -> Result<(), HostError> {
+            unreachable!("mount service install provisions no volume")
+        }
+
+        fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+            unreachable!("mount service install writes through privileged install")
+        }
+
+        fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+            unreachable!("mount service install does not pin fstab")
+        }
+    }
+
+    #[test]
+    fn boot_mount_service_install_uses_fixed_root_owned_artifacts_and_system_launchd() {
+        let (commands, received) = mpsc::channel();
+        let host = MountServiceInstallHost { commands };
+        let files = desired_mount_service(&mount_service_pins()).unwrap();
+        install_mount_service_with(&host, &files).unwrap();
+        let commands = received.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(HostCommand::program)
+                .collect::<Vec<_>>(),
+            [
+                LAUNCHCTL, INSTALL, INSTALL, INSTALL, LAUNCHCTL, LAUNCHCTL, LAUNCHCTL
+            ]
+        );
+        assert_eq!(
+            commands[0].args(),
+            ["bootout", "system/dev.cowshed.storage"]
+        );
+        assert_eq!(
+            commands[1].args(),
+            [
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "755",
+                MOUNT_SERVICE_DIRECTORY,
+            ]
+        );
+        assert_eq!(
+            commands[2].args().last().map(String::as_str),
+            Some(MOUNT_SERVICE_SCRIPT)
+        );
+        assert_eq!(
+            commands[3].args().last().map(String::as_str),
+            Some(MOUNT_SERVICE_PLIST)
+        );
+        assert_eq!(commands[4].args(), ["enable", "system/dev.cowshed.storage"]);
+        assert_eq!(
+            commands[5].args(),
+            ["bootstrap", "system", MOUNT_SERVICE_PLIST]
+        );
+        assert_eq!(
+            commands[6].args(),
+            ["kickstart", "-k", "system/dev.cowshed.storage"]
+        );
+    }
+
+    #[test]
+    fn boot_mount_service_rejects_non_uuid_identifiers_before_shell_rendering() {
+        let mut pins = mount_service_pins();
+        pins[0].volume_uuid = "disk3s8; touch /tmp/pwned".to_owned();
+        let error = desired_mount_service(&pins).unwrap_err();
+        assert!(matches!(error, NativeBootstrapError::MalformedPlist(_)));
+    }
     struct FakeEvidenceSource {
         statfs: StatFsSnapshot,
         statfs_overrides: BTreeMap<PathBuf, StatFsSnapshot>,
@@ -4596,7 +5158,7 @@ mod tests {
         )));
         let public_plan = HostSetupPlan::new(
             snapshot.actions.clone(),
-            setup_requires_authorization(&snapshot.plan),
+            setup_requires_authorization(&snapshot),
         );
         assert!(!public_plan.non_destructive);
         assert_eq!(source.commands[1].args(), ["apfs", "list", "-plist"]);
@@ -4621,7 +5183,7 @@ mod tests {
                     && pins.iter().any(|pin| pin.volume_uuid == "disk3s8-UUID")
                     && pins.iter().any(|pin| pin.volume_uuid == "disk3s9-UUID")
         )));
-        assert!(setup_requires_authorization(&snapshot.plan));
+        assert!(setup_requires_authorization(&snapshot));
         assert_eq!(
             snapshot.actions,
             vec![
@@ -4815,7 +5377,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), &current)
             .expect("healthy setup plan");
         assert_eq!(host_setup_actions(&snapshot), Vec::<HostAction>::new());
-        assert!(!setup_requires_authorization(&snapshot.plan));
+        assert!(!setup_requires_authorization(&snapshot));
         assert!(matches!(snapshot.fstab, PlannedFstab::AlreadyCurrent));
     }
 

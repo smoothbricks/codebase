@@ -29,10 +29,10 @@ Each `owner` and `repo` component is encoded independently as one filesystem com
 layout root, an owner component equal to a host namespace (`gateway`, `telemetry`, `caches`, `mnt`, or
 `.cowshed-volume.json`) is also percent-escaped, so a valid remote identity can never alias controller infrastructure.
 The `/` in `repo_id` is the one layout separator, never untrusted path text. Thus `acme/widget` maps to
-`/private/cowshed/store/acme/widget/`; containment is checked after joining and symlinks are refused. The repository binding is
-`/private/cowshed/store/acme/widget/repository.json`; trusted project policy is `/private/cowshed/store/acme/widget/policy.json`. Both are
-controller-owned, mode 0600, and never visible to a sandbox. Every path below uses the primary `repo_id` through this
-component-safe mapping.
+`/private/cowshed/store/acme/widget/`; containment is checked after joining and symlinks are refused. The repository
+binding is `/private/cowshed/store/acme/widget/repository.json`; trusted project policy is
+`/private/cowshed/store/acme/widget/policy.json`. Both are controller-owned, mode 0600, and never visible to a sandbox.
+Every path below uses the primary `repo_id` through this component-safe mapping.
 
 ## Directory layout
 
@@ -71,18 +71,18 @@ Workspace mountpoints live under one host-configured **mount root** (default `~/
 `cowshed setup --mount-root <dir>`), laid out `<mount-root>/<owner>/<repo>/<workspace>`. The root is a plain directory
 on Data: no volume mounts there, so the masked-mountpoint failure class cannot exist. Git identity inheritance follows
 the anchor of each `includeIf gitdir:` rule — rules anchored at an ancestor of the mount root (for example
-`gitdir:~/Dev/`) match workspaces with no additional configuration; rules anchored exactly at a project root do not,
-and `cowshed new`/`doctor` detect that divergence empirically by diffing `git config --show-origin` between the
-checkout and a probe repository at the candidate workspace path. Changing the root requires every workspace detached;
-`setup` refuses while any are attached because absolute paths are baked into detached metadata and sandbox profiles.
-This directory is distinct from the in-image `.cowshed/` namespace inside every clone.
+`gitdir:~/Dev/`) match workspaces with no additional configuration; rules anchored exactly at a project root do not, and
+`cowshed new`/`doctor` detect that divergence empirically by diffing `git config --show-origin` between the checkout and
+a probe repository at the candidate workspace path. Changing the root requires every workspace detached; `setup` refuses
+while any are attached because absolute paths are baked into detached metadata and sandbox profiles. This directory is
+distinct from the in-image `.cowshed/` namespace inside every clone.
 
-~/Library/LaunchAgents/dev.cowshed.*.plist   # launchd service definitions (gateway daemonizes to a system
-                                             # LaunchDaemon; sccache stays per-user); home-manager-owned on nix hosts
-                                             # (14_nix.md). The gateway/sccache binaries they run live at a host-stable
-                                             # install path, never inside a workspace mount.
-~/Library/Logs/cowshed/*.log                 # launchd stderr for pre-tracer-init crashes only; kept off the
-                                             # /private/cowshed/store mountpoint so a reboot cannot recreate a masking stub
+~/Library/LaunchAgents/dev.cowshed._.plist # launchd service definitions (gateway daemonizes to a system # LaunchDaemon;
+sccache stays per-user); home-manager-owned on nix hosts # (14_nix.md). The gateway/sccache binaries they run live at a
+host-stable # install path, never inside a workspace mount. ~/Library/Logs/cowshed/_.log # launchd stderr for
+pre-tracer-init crashes only; kept off the # /private/cowshed/store mountpoint so a reboot cannot recreate a masking
+stub
+
 ```
 
 Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Repository paths are safe because both `repo_id`
@@ -215,18 +215,24 @@ Both volumes are created once by explicit foreground `cowshed setup`
 free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
 provisioning authorization session described in 14_nix.md.
 
-**Boot mounting is pinned in `/etc/fstab`, not delegated to cowshed.** At provision, the same authorization session
-appends one idempotent, comment-tagged line per volume:
+**Boot mounting is owned by a root system LaunchDaemon.** At provision, the same authorization session appends one
+idempotent, comment-tagged fstab line per volume:
 
 ```
-UUID=<store-uuid>  /private/cowshed/store   apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.store
-UUID=<caches-uuid> /private/cowshed/caches  apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.caches
-```
 
-UUID form because labels are mutable (the same lesson nix-installer learned in DeterminateSystems/nix-installer#212).
-`diskarbitrationd` reads fstab in userspace — no SIP interaction — and mounts both volumes at these paths before login,
-so a reboot never depends on any cowshed binary existing: the remounter cannot live inside what it remounts. `nobrowse`
-keeps both volumes out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes` at all.
+UUID=<store-uuid> /private/cowshed/store apfs rw,noatime,noauto,nobrowse,noowners # cowshed created volume labelled
+cowshed.store UUID=<caches-uuid> /private/cowshed/caches apfs rw,noatime,noauto,nobrowse,noowners # cowshed created
+volume labelled cowshed.caches
+
+````
+
+UUID form is mandatory because labels are mutable (the same lesson nix-installer learned in
+DeterminateSystems/nix-installer#212). `noauto` prevents Disk Arbitration from racing the explicit remounter. Setup
+idempotently installs and loads the root-owned `dev.cowshed.storage` LaunchDaemon and its fixed `/bin/sh` mount script.
+The script contains only the two exact UUID-to-canonical-path bindings, uses system `diskutil`, and lives outside every
+user home and cowshed volume, so it mounts both volumes before login without depending on the cowshed binary or its
+version. It refuses a symlink, a nonempty bare mountpoint, or an exact volume already mounted at another path.
+`nobrowse` keeps both volumes out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes`.
 
 **`noowners` is deliberate.** The herd is machine-global and shared by every local account: with ownership honoring off,
 every user sees the same bytes as their own, which is exactly right for git checkouts (git tracks mode bits, never
@@ -243,10 +249,11 @@ and rewrites their fstab pins.
 
 
 **`cowshed setup` owns this transaction.** It is a host-level verb needing no repository context: gather evidence,
-provision absent volumes, repair detached or mis-mounted ones, validate markers, and pin fstab — reporting each
-volume's observed state and the action taken. Storage-error hints across the CLI point at `cowshed setup`, never at
-adopting a directory. Diagnosis is canonical: the same volume evidence yields the same verdict regardless of
-incidental mountpoint contents, and reclaimable stubs are enumerated (by name) and reclaimed, not treated as fatal
+provision absent volumes, repair detached or mis-mounted ones, validate markers, pin fstab, and converge the boot mount
+LaunchDaemon — reporting each volume's observed state and the action taken. Storage-error hints across the CLI point at
+`cowshed setup`, never at adopting a directory. Diagnosis is canonical: the same volume evidence yields the same
+verdict regardless of incidental mountpoint contents, and reclaimable stubs are enumerated (by name) and reclaimed, not
+treated as fatal
 masking. A volume that exists but carries a wrong or missing marker is reported precisely (role, expected versus
 observed); it is never silently re-provisioned, because re-provisioning means deleteVolume.
 
@@ -310,7 +317,7 @@ Written at adopt/new/fork/restore, at the volume root; travels with every clone:
   "forkedFrom": null, // workspace name when created by `cowshed fork`
   "createdTrace": "4bf92f…" // trace id of the new/fork/restore that created this image (13_telemetry.md)
 }
-```
+````
 
 `workspaceIncarnation` identifies one mutable workspace timeline. Checkpoints retain the incarnation in their copied job
 records; a fork destination and every restore result mint a fresh incarnation, so a reused numeric job id cannot collide
@@ -423,11 +430,12 @@ volume, where local snapshots pin their rewritten blocks and backup policy needs
 dedicated volumes cost nothing (container space-sharing) and reduce cowshed's `~/Library` footprint to the launchd
 plists that must live there.
 
-**A `store/` sub-mountpoint rejected.** Mounting the store volume at `/private/cowshed/store/store` left `/private/cowshed/store` as a real
-Data-volume directory holding one wrapper level that meant nothing to users ("store with nested telemetry"). Mounting
-the volume at `/private/cowshed/store` itself makes the dotdir a door, not a room: one empty mountpoint inode on Data, every other
-path one level shorter, and "cowshed stuff lives in the cowshed" is literally true. The costs — mount ordering and the
-bare-directory guard above — are machinery `ensure` already had for the workspaces.
+**A `store/` sub-mountpoint rejected.** Mounting the store volume at `/private/cowshed/store/store` left
+`/private/cowshed/store` as a real Data-volume directory holding one wrapper level that meant nothing to users ("store
+with nested telemetry"). Mounting the volume at `/private/cowshed/store` itself makes the dotdir a door, not a room: one
+empty mountpoint inode on Data, every other path one level shorter, and "cowshed stuff lives in the cowshed" is
+literally true. The costs — mount ordering and the bare-directory guard above — are machinery `ensure` already had for
+the workspaces.
 
 **Images on the caches volume rejected.** Co-locating images with caches unlocks no additional sharing: container
 volumes already pool free space, and the reflink boundary that matters is the image's _inner_ filesystem — clonefile
