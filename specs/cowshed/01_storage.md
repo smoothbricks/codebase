@@ -211,8 +211,18 @@ Both volumes are created once by explicit foreground `cowshed setup`
 free-space pool — no sizing, no space cost for the split. The complete create/mount/pin transaction uses the one
 provisioning authorization session described in 14_nix.md.
 
-**Boot mounting is owned by a root system LaunchDaemon.** At provision, the same authorization session appends one
-idempotent, comment-tagged fstab line per volume:
+**Boot mounting is owned by a root system LaunchDaemon, and both volumes are FileVault-encrypted.** At provision, the
+same authorization session:
+
+1. Creates absent volumes (`diskutil apfs addVolume … -nomount`) or mounts already-created ones at their canonical
+   paths. Existing volumes are never deleted.
+2. Encrypts each volume that is not already FileVaulted, in place:
+   `diskutil apfs encryptVolume <uuid> -user disk -stdinpassphrase` after it is mounted. A 32-character random
+   passphrase per volume is stored in `/Library/Keychains/System.keychain` (`add-generic-password -a <label> -s <label>`
+   with label `cowshed.store` / `cowshed.caches`, ACL limited to `/usr/bin/security` and the APFS user agents). A volume
+   that is already FileVaulted without a usable keychain item fails closed — setup does not invent a new password and
+   does not `deleteVolume`.
+3. Appends one idempotent, comment-tagged fstab line per volume:
 
 <!-- prettier-ignore -->
 ```
@@ -220,34 +230,43 @@ UUID=<store-uuid>  /private/cowshed/store   apfs rw,noatime,noauto,nobrowse,noow
 UUID=<caches-uuid> /private/cowshed/caches  apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.caches
 ```
 
+4. Installs and loads `dev.cowshed.storage` (`/Library/LaunchDaemons/dev.cowshed.storage.plist`) running a fixed
+   `/bin/sh` script at `/Library/Application Support/dev.cowshed/mount-volumes.sh`. The script does not invoke the
+   cowshed binary. For each UUID it: no-ops if already at the canonical path; fails if mounted elsewhere; otherwise
+   `security find-generic-password -a <label> -s <label> -w | diskutil apfs unlockVolume <uuid> -nomount -stdinpassphrase`
+   then `diskutil mount -nobrowse -mountPoint <canonical> <uuid>`. Missing keychain, symlink mountpoint, or nonempty
+   stub fails closed.
+
 UUID form is mandatory because labels are mutable (the same lesson nix-installer learned in
-DeterminateSystems/nix-installer#212). `noauto` prevents Disk Arbitration from racing the explicit remounter. Setup
-idempotently installs and loads the root-owned `dev.cowshed.storage` LaunchDaemon and its fixed `/bin/sh` mount script.
-The script contains only the two exact UUID-to-canonical-path bindings, uses system `diskutil`, and lives outside every
-user home and cowshed volume, so it mounts both volumes before login without depending on the cowshed binary or its
-version. It refuses a symlink, a nonempty bare mountpoint, or an exact volume already mounted at another path.
-`nobrowse` keeps both volumes out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes`.
+DeterminateSystems/nix-installer#212). `noauto` prevents Disk Arbitration from racing the credentialed remounter — Disk
+Arbitration cannot supply System.keychain secrets. The script lives outside every user home and cowshed volume, so it
+unlocks and mounts both volumes before login without depending on the cowshed binary or its version. `nobrowse` keeps
+both volumes out of Finder, the Desktop, and the sidebar; nothing lands under `/Volumes`.
 
 **`noowners` is deliberate.** The herd is machine-global and shared by every local account: with ownership honoring off,
 every user sees the same bytes as their own, which is exactly right for git checkouts (git tracks mode bits, never
 owners) and rebuildable caches. It also removes the entire class of "mounted by another uid" classification failures.
-The trust consequence is stated plainly: any local user can read or write anything on either volume. Cowshed is for
-machines whose local accounts trust each other; stronger isolation is a different product.
+FileVault here is at-rest protection for a stolen disk, not isolation between local accounts. The trust consequence is
+stated plainly: any local user can read or write anything on either volume once it is mounted. Cowshed is for machines
+whose local accounts trust each other; stronger isolation is a different product.
 
-If either dedicated volume is absent, or the mountpoint holds anything other than a reclaimable stub, existing-only
-commands fail before mutation with `environment-missing` and an explanation of exactly which volumes are missing,
-detached, or mis-mounted. A volume mounted at a retired home path or at `/Volumes/<name>` is **mis-mounted**, not
-missing. `cowshed doctor` reports the observed and canonical paths and prescribes `cowshed setup`; setup announces the
-complete repair, opens one authorization session, unmounts the existing volumes, remounts them at the canonical paths,
-and rewrites their fstab pins.
+If either dedicated volume is absent, unencrypted, missing its System.keychain item, or the mountpoint holds anything
+other than a reclaimable stub, existing-only commands fail before mutation with `environment-missing` and an explanation
+of exactly which volumes are missing, detached, unencrypted, or mis-mounted. A volume mounted at a retired home path or
+at `/Volumes/<name>` is **mis-mounted**, not missing. `cowshed doctor` reports the observed and canonical paths and
+prescribes `cowshed setup`; setup announces the complete repair — including in-place encryption of an existing
+unencrypted volume — opens one authorization session, and converges mounts, FileVault, keychain, fstab, and the boot
+daemon.
 
 **`cowshed setup` owns this transaction.** It is a host-level verb needing no repository context: gather evidence,
-provision absent volumes, repair detached or mis-mounted ones, validate markers, pin fstab, and converge the boot mount
-LaunchDaemon — reporting each volume's observed state and the action taken. Storage-error hints across the CLI point at
-`cowshed setup`, never at adopting a directory. Diagnosis is canonical: the same volume evidence yields the same verdict
-regardless of incidental mountpoint contents, and reclaimable stubs are enumerated (by name) and reclaimed, not treated
-as fatal masking. A volume that exists but carries a wrong or missing marker is reported precisely (role, expected
-versus observed); it is never silently re-provisioned, because re-provisioning means deleteVolume.
+provision absent volumes, repair detached or mis-mounted ones, encrypt unencrypted ones in place, store passphrases,
+validate markers, pin fstab, and converge the boot mount LaunchDaemon — reporting each volume's observed state and the
+action taken. Storage-error hints across the CLI point at `cowshed setup`, never at adopting a directory. Diagnosis is
+canonical: the same volume evidence yields the same verdict regardless of incidental mountpoint contents, and
+reclaimable stubs are enumerated (by name) and reclaimed, not treated as fatal masking. A volume that exists but carries
+a wrong or missing marker is reported precisely (role, expected versus observed); it is never silently re-provisioned,
+because re-provisioning means deleteVolume. `--uninstall` removes fstab pins, the system daemon and script, user agents,
+installed binaries, and both System.keychain items; it never deletes a volume.
 
 **Mount ordering and the unmounted-masking guard.** Store and caches are sibling mountpoints on Data; neither canonical
 root depends on the other, and each root's `.cowshed-volume.json` marker distinguishes a mounted cowshed volume from its
