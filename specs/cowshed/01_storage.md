@@ -77,12 +77,10 @@ a probe repository at the candidate workspace path. Changing the root requires e
 while any are attached because absolute paths are baked into detached metadata and sandbox profiles. This directory is
 distinct from the in-image `.cowshed/` namespace inside every clone.
 
-~/Library/LaunchAgents/dev.cowshed._.plist # launchd service definitions (gateway daemonizes to a system # LaunchDaemon;
-sccache stays per-user); home-manager-owned on nix hosts # (14_nix.md). The gateway/sccache binaries they run live at a
-host-stable # install path, never inside a workspace mount. ~/Library/Logs/cowshed/_.log # launchd stderr for
-pre-tracer-init crashes only; kept off the # /private/cowshed/store mountpoint so a reboot cannot recreate a masking
-stub
-
+<!-- prettier-ignore -->
+```
+~/Library/LaunchAgents/dev.cowshed.*.plist   # launchd: gateway is a user agent; boot mounts are system/dev.cowshed.storage
+~/Library/Logs/cowshed/*.log                 # launchd stderr for pre-tracer-init crashes; kept off /private/cowshed/store
 ```
 
 Workspace names match `[a-z0-9][a-z0-9-]{0,63}`; `main` is reserved. Repository paths are safe because both `repo_id`
@@ -100,14 +98,13 @@ dedicated volumes, outside Data's snapshots, backups, and fsck domain.
 
 ### Two `.cowshed` namespaces
 
-The name appears in two namespaces that must not be confused. **Host-absolute
-`/private/cowshed/{store,caches}`** exists once — the herd's store volume holds images, grants, and telemetry, while the
-cache volume holds rebuildable shared caches. **In-image relative `.cowshed/`** exists once _per workspace_, at each
-workspace volume root — the marker, token, CA certificate, in-image cache roots, and job spools — and travels with
-every clone. The wiring rule follows the split: shared state resolves to the appropriate host-absolute
-`/private/cowshed/{store,caches}/...` path (the same string in every context), while workspace-keyed state resolves to
-in-image relative `.cowshed/...` paths (correct in every clone automatically). Main and sessions use identical wiring;
-only the sandbox's permission mask differs.
+The name appears in two namespaces that must not be confused. **Host-absolute `/private/cowshed/{store,caches}`** exists
+once — the herd's store volume holds images, grants, and telemetry, while the cache volume holds rebuildable shared
+caches. **In-image relative `.cowshed/`** exists once _per workspace_, at each workspace volume root — the marker,
+token, CA certificate, in-image cache roots, and job spools — and travels with every clone. The wiring rule follows the
+split: shared state resolves to the appropriate host-absolute `/private/cowshed/{store,caches}/...` path (the same
+string in every context), while workspace-keyed state resolves to in-image relative `.cowshed/...` paths (correct in
+every clone automatically). Main and sessions use identical wiring; only the sandbox's permission mask differs.
 
 ## Images
 
@@ -156,11 +153,10 @@ attachment tools remain disjoint. Ownership is also guaranteed by the ASIF chown
 
 For every mounted attachment:
 
-- Session workspaces mount under the host-configured mount root at
-  `<mount-root>/<owner>/<repo>/<workspace>`. `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and
-  the sidebar regardless of Finder preferences.
-- The **main workspace mounts at the checkout's original path** (written `<project-root>` below; 02_workspaces.md).
-  The user's path is the real thing, and sibling workspaces live under the shared mount root.
+- Session workspaces mount under the host-configured mount root at `<mount-root>/<owner>/<repo>/<workspace>`.
+  `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and the sidebar regardless of Finder preferences.
+- The **main workspace mounts at the checkout's original path** (written `<project-root>` below; 02_workspaces.md). The
+  user's path is the real thing, and sibling workspaces live under the shared mount root.
 - Mountpoint directories are created before attach and removed by `cowshed gc`; an empty mountpoint dir is the defined
   "detached" state, and the underlying dir holds a stub `.envrc` used for self-healing (see 02_workspaces.md).
 - Cwd resolution is granted only when the canonical input path is contained in exactly one currently mounted,
@@ -173,10 +169,10 @@ For every mounted attachment:
 
 Three questions, three authorities, none of them the volume label:
 
-- **Which volumes are cowshed's?** Ownership is by location. Every backing image lives under `/private/cowshed/store`, and
-  enumeration is a `readdir` of that tree (`sessions/` plus the one canonical `main` image per project) — never a scan
-  of `diskutil list`. A volume cowshed did not create has no image there and is therefore invisible to enumeration, gc,
-  and crash-window classification regardless of what it is called.
+- **Which volumes are cowshed's?** Ownership is by location. Every backing image lives under `/private/cowshed/store`,
+  and enumeration is a `readdir` of that tree (`sessions/` plus the one canonical `main` image per project) — never a
+  scan of `diskutil list`. A volume cowshed did not create has no image there and is therefore invisible to enumeration,
+  gc, and crash-window classification regardless of what it is called.
 - **Which workspace is a given image?** The sibling `<image>.grants.json` metadata, cross-checked against the image's
   filename stem. This is what makes discovery and attach possible while detached.
 - **Is the volume mounted here ours?** The in-image marker `.cowshed/workspace.json`, matched on `repoId`, `workspace`,
@@ -205,10 +201,10 @@ cowshed churn at all:
   unique lives here, the nuclear recovery path is always safe: `diskutil apfs deleteVolume` + lazy recreate — the mirror
   refetches, sccache and registries rebuild. `cowshed doctor` offers it as the fix for cache-volume corruption;
   `cowshed gc` never needs more than it.
-- **`cowshed.store`**, mounted at `/private/cowshed/store` — images, grant sidecars, waivers, quarantine, gateway config and audit,
-  telemetry. Mostly rebuildable, with a small unique window: uncommitted work between autosaves (02_workspaces.md);
-  durability is still git. Same-volume clonefile is preserved by construction — main → sessions → checkpoints and trash
-  renames all stay within `cowshed.store`.
+- **`cowshed.store`**, mounted at `/private/cowshed/store` — images, grant sidecars, waivers, quarantine, gateway config
+  and audit, telemetry. Mostly rebuildable, with a small unique window: uncommitted work between autosaves
+  (02_workspaces.md); durability is still git. Same-volume clonefile is preserved by construction — main → sessions →
+  checkpoints and trash renames all stay within `cowshed.store`.
 
 Both volumes are created once by explicit foreground `cowshed setup`
 (`diskutil apfs addVolume <container> APFS <cowshed.caches|cowshed.store> -nomount`) and share the container's
@@ -218,13 +214,11 @@ provisioning authorization session described in 14_nix.md.
 **Boot mounting is owned by a root system LaunchDaemon.** At provision, the same authorization session appends one
 idempotent, comment-tagged fstab line per volume:
 
+<!-- prettier-ignore -->
 ```
-
-UUID=<store-uuid> /private/cowshed/store apfs rw,noatime,noauto,nobrowse,noowners # cowshed created volume labelled
-cowshed.store UUID=<caches-uuid> /private/cowshed/caches apfs rw,noatime,noauto,nobrowse,noowners # cowshed created
-volume labelled cowshed.caches
-
-````
+UUID=<store-uuid>  /private/cowshed/store   apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.store
+UUID=<caches-uuid> /private/cowshed/caches  apfs rw,noatime,noauto,nobrowse,noowners  # cowshed created volume labelled cowshed.caches
+```
 
 UUID form is mandatory because labels are mutable (the same lesson nix-installer learned in
 DeterminateSystems/nix-installer#212). `noauto` prevents Disk Arbitration from racing the explicit remounter. Setup
@@ -247,22 +241,20 @@ missing. `cowshed doctor` reports the observed and canonical paths and prescribe
 complete repair, opens one authorization session, unmounts the existing volumes, remounts them at the canonical paths,
 and rewrites their fstab pins.
 
-
 **`cowshed setup` owns this transaction.** It is a host-level verb needing no repository context: gather evidence,
 provision absent volumes, repair detached or mis-mounted ones, validate markers, pin fstab, and converge the boot mount
 LaunchDaemon — reporting each volume's observed state and the action taken. Storage-error hints across the CLI point at
-`cowshed setup`, never at adopting a directory. Diagnosis is canonical: the same volume evidence yields the same
-verdict regardless of incidental mountpoint contents, and reclaimable stubs are enumerated (by name) and reclaimed, not
-treated as fatal
-masking. A volume that exists but carries a wrong or missing marker is reported precisely (role, expected versus
-observed); it is never silently re-provisioned, because re-provisioning means deleteVolume.
+`cowshed setup`, never at adopting a directory. Diagnosis is canonical: the same volume evidence yields the same verdict
+regardless of incidental mountpoint contents, and reclaimable stubs are enumerated (by name) and reclaimed, not treated
+as fatal masking. A volume that exists but carries a wrong or missing marker is reported precisely (role, expected
+versus observed); it is never silently re-provisioned, because re-provisioning means deleteVolume.
 
 **Mount ordering and the unmounted-masking guard.** Store and caches are sibling mountpoints on Data; neither canonical
 root depends on the other, and each root's `.cowshed-volume.json` marker distinguishes a mounted cowshed volume from its
 bare mountpoint directory. The retired home layout nested `caches` beneath `store`, so its one-time migration unmounts
 the child caches volume before the parent store volume, then mounts both siblings at `/private/cowshed/{store,caches}`.
-launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`, never under either mountpoint, so a reboot cannot
-recreate a masking stub. A leftover `telemetry/` stub from an older plist is deleted before remount.
+launchd agents write pre-tracer stderr under `~/Library/Logs/cowshed/`, never under either mountpoint, so a reboot
+cannot recreate a masking stub. A leftover `telemetry/` stub from an older plist is deleted before remount.
 
 Why volumes and not paths on Data: Data takes hourly APFS local snapshots, and a snapshot pins every since-rewritten
 block of a multi-GB churning image — ghosts that path-level `tmutil addexclusion` does **not** prevent (exclusion stops
@@ -275,12 +267,11 @@ precious.
 
 There is one cowshed per machine, anchored to no account. `/private/cowshed/{store,caches}` are plain directories on
 Data created once at provision; they exist only as mountpoints and fstab targets. The per-user convenience is a
-`~/.cowshed/mnt` workspace mount root (plain directories on Data), configurable at setup. No cowshed evidence,
-sandbox profile, or metadata path derives from `$HOME`. Workspace images remain on the store volume while their live
-mounts appear under `<mount-root>/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by sharing;
-concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and
-cross-user `gc` policy is deliberately blunt: any user may retire any shed, because `noowners` already made the
-trust model explicit.
+`~/.cowshed/mnt` workspace mount root (plain directories on Data), configurable at setup. No cowshed evidence, sandbox
+profile, or metadata path derives from `$HOME`. Workspace images remain on the store volume while their live mounts
+appear under `<mount-root>/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged by sharing;
+concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and cross-user `gc`
+policy is deliberately blunt: any user may retire any shed, because `noowners` already made the trust model explicit.
 
 ## Runtime state: derived, never stored
 
@@ -317,7 +308,7 @@ Written at adopt/new/fork/restore, at the volume root; travels with every clone:
   "forkedFrom": null, // workspace name when created by `cowshed fork`
   "createdTrace": "4bf92f…" // trace id of the new/fork/restore that created this image (13_telemetry.md)
 }
-````
+```
 
 `workspaceIncarnation` identifies one mutable workspace timeline. Checkpoints retain the incarnation in their copied job
 records; a fork destination and every restore result mint a fresh incarnation, so a reused numeric job id cannot collide
