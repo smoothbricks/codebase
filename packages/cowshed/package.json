@@ -74,10 +74,11 @@
         "executor": "nx:run-commands",
         "cache": false,
         "dependsOn": [
+          "^build",
           "cli-arm64-macos"
         ],
         "options": {
-          "cwd": "packages/cowshed",
+          "cwd": "{projectRoot}",
           "command": "dist/bin/darwin-arm64/cowshed {args}"
         }
       },
