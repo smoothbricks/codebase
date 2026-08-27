@@ -76,9 +76,12 @@ identity cannot be derived unambiguously from its remotes.
 ### `cowshed setup [--uninstall] [--force] [--mount-root <dir>]`
 
 Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates
-absent volumes, remounts detached or mis-mounted ones at their canonical paths, validates each volume marker, and pins
-the boot mounts in `/etc/fstab`. It never deletes a volume. On a healthy host it changes nothing and says so. Every
-storage error in the CLI points here — a host with no volumes has no checkout to adopt.
+absent volumes, remounts detached or mis-mounted ones at their canonical paths, validates each volume marker, pins the
+boot mounts in `/etc/fstab`, and installs the root-owned `dev.cowshed.storage` system LaunchDaemon. That daemon runs a
+fixed `/bin/sh` script of the volume UUIDs and canonical paths
+(`/Library/Application Support/dev.cowshed/mount-volumes.sh`); it does not invoke the cowshed binary. fstab keeps
+`noauto` so Disk Arbitration does not race it. It never deletes a volume. On a healthy host it changes nothing and says
+so. Every storage error in the CLI points here — a host with no volumes has no checkout to adopt.
 
 `--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at
 `<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
@@ -179,11 +182,12 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 ```
 
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
-the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, and the
-installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data;
-everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while their occupancy cannot
-be established at all (an unmounted store looks empty to every cheap check), until `--force` says the caller means it
-anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed command line:
+the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `dev.cowshed.gateway` and
+`dev.cowshed.sccache` LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no
+workspace. Nothing it removes holds data; everything it leaves does. It therefore refuses while the volumes still hold
+workspaces, or while their occupancy cannot be established at all (an unmounted store looks empty to every cheap check),
+until `--force` says the caller means it anyway. There is no interactive prompt — the refusal is the prompt, and its
+hint is the completed command line:
 
 ```
 $ cowshed setup --uninstall
@@ -193,15 +197,15 @@ next: cowshed setup --uninstall --force
 ```
 
 With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab outcome
-and every service artifact it touched, in the order it touched them (both agents, then both binaries). A teardown that
-found nothing installed reports an empty `services` list rather than omitting the field:
+and every service artifact it touched, in the order it touched them (system daemon, then both user agents, then both
+binaries). A teardown that found nothing installed reports an empty `services` list rather than omitting the field:
 
 ```
 $ cowshed setup --json
 {"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"created"}],"fstab":"pinned","authorized":true}}
 
 $ cowshed setup --uninstall --force --json
-{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"installed sccache binary","outcome":"already-absent"}]}}
+{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"installed sccache binary","outcome":"already-absent"}]}}
 ```
 
 `outcome` is `removed` or `already-absent`; the stderr rendering of the same value reads `already absent`.
@@ -665,8 +669,9 @@ copies the running executable there when the bytes differ, and refuses a running
 rather than baking in a path that only exists once cowshed has mounted it. `stop` boots out the agent and removes the
 plist, leaving the installed binary — that copy is host state rather than agent state, and keeping it makes the next
 `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too, for a host that is done
-with the gateway rather than pausing it; `cowshed setup --uninstall` does the same for both services at once. All of
-these are idempotent, and a `--purge` with nothing installed says so rather than failing.
+with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user
+agents, and both installed binaries at once. All of these are idempotent, and a `--purge` with nothing installed says so
+rather than failing.
 
 `status` reports health without starting the service. Its JSON result is the standard frozen envelope:
 
