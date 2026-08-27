@@ -488,15 +488,16 @@ impl CheckoutLayoutRecord {
 
 /// A per-project build slot: one stable mount path, occupied by one workspace at a time.
 ///
-/// Compiler caches key on absolute paths. Cargo derives `-C metadata` and `-C extra-filename`
-/// from a package id that carries the absolute manifest directory, and sccache additionally
-/// hashes the compiler's physical working directory, so two checkouts of one repository at
-/// different paths share nothing. Measured with sccache 0.16 over a ten-crate workspace: 22/22
-/// Rust units hit when the second generation builds through the same absolute path, 9/22 across
-/// path-varying siblings (the 9 are registry crates, whose package ids carry no path). Neither
-/// `SCCACHE_BASEDIRS` nor a symlink moves that number — sccache and cargo both resolve the
-/// physical directory — so the mount path itself has to be the stable thing, which is what a
-/// slot is: successive tenants of slot n mount at `mnt/<owner>/<repo>/slot@n`.
+/// Slots predate path-independent cache sharing and are no longer what makes sccache hit.
+/// Cargo computes `-C metadata` / `-C extra-filename` path-independently for workspace members
+/// (measured on cargo 1.97: identical hashes for one workspace checked out at two paths), and
+/// the bundled sccache keys its residual path-bearing inputs — cwd, blanket `CARGO_*`
+/// environment values, argument bytes — relative to the request cwd when the client sets
+/// `SCCACHE_BASEDIR_CWD=1`, which every workspace now does. Cross-path sharing is therefore the
+/// default, with one deliberate exception: values rustc records as `# env-dep:` (a crate that
+/// compiles `env!("CARGO_MANIFEST_DIR")` into its output) are never normalized, so such crates
+/// fail closed across paths. A slot's remaining value is the stable absolute path itself, for
+/// tooling that persists paths across tenant generations.
 ///
 /// Slot numbering is shared with `coordinator.assignSlot`'s port blocks, hence the same upper
 /// bound: a slot has to be expressible as a `PORT_BLOCK_SIZE`-aligned base inside the 16-bit
