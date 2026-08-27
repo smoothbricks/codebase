@@ -69,6 +69,9 @@ pub enum HostAction {
     ReclaimStubs {
         paths: Vec<PathBuf>,
     },
+    InstallMountService {
+        label: String,
+    },
 }
 
 impl HostAction {

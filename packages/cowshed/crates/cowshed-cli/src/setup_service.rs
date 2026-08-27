@@ -506,15 +506,16 @@ where
         .execute_uninstall()
         .await
         .map_err(declined_authorization)?;
-    // Core owns the fstab half and reports it; the service half is this adapter's work, so the
-    // adapter is what puts it in the report. Without this the JSON surface would be narrower than
-    // the stderr surface, and a caller reading only the envelope would never learn that two
-    // LaunchAgents and two binaries had been deleted.
-    report.services = removals.iter().map(HostArtifactRemoval::to_wire).collect();
+    // Core reports the system mount daemon it removed; append the per-user agents and binaries
+    // owned by this adapter so both text and JSON describe the complete machine teardown.
+    let system_removals = report.services.clone();
+    report
+        .services
+        .extend(removals.iter().map(HostArtifactRemoval::to_wire));
     if json {
         output.success(report).map_err(output_error)?;
     } else {
-        render_uninstall(&census, &removals, &report, output)?;
+        render_uninstall(&census, &system_removals, &removals, &report, output)?;
     }
     output.hint("cowshed doctor").map_err(output_error)?;
     Ok(0)
@@ -686,6 +687,9 @@ fn action_intent(action: &HostAction) -> String {
             "/etc/fstab will pin UUID {uuid} at {} so it mounts at every boot",
             mount_at.display()
         ),
+        HostAction::InstallMountService { label } => format!(
+            "system LaunchDaemon {label} will be installed to mount cowshed volumes before login"
+        ),
         // Named, not counted: 01_storage.md requires reclaimable stubs to be enumerated, because
         // "3 files will be deleted" is not something a person can agree to.
         HostAction::ReclaimStubs { paths } => format!(
@@ -774,10 +778,20 @@ fn action_outcome_row(outcome: &HostActionOutcome) -> String {
 
 fn render_uninstall<W: Write, E: Write>(
     census: &WorkspaceCensus,
+    system_removals: &[UninstallServiceOutcome],
     removals: &[HostArtifactRemoval],
     report: &UninstallReport,
     output: &mut Output<W, E>,
 ) -> Result<()> {
+    for removal in system_removals {
+        output
+            .guidance(&format!(
+                "{}: {}",
+                removal.what,
+                removal.outcome.replace('-', " ")
+            ))
+            .map_err(output_error)?;
+    }
     for removal in removals {
         output
             .guidance(&format!(
