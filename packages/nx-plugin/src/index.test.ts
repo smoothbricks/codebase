@@ -351,6 +351,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         JSON.stringify({
           name: 'cowshed',
           scripts: { test: 'nx run cowshed:test --outputStyle=stream' },
+          nx: {
+            targets: {
+              'cli-arm64-macos': { executor: 'nx:run-commands', options: { command: 'true' } },
+              'cli-x64-linux': { executor: 'nx:run-commands', options: { command: 'true' } },
+            },
+          },
           napi: {
             binaryName: 'cowshed',
             targets: [
@@ -400,7 +406,28 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/linux-x64-gnu',
         env: { TARGET_CC: 'clang', TARGET_CXX: 'clang++' },
       });
-      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      // The aggregate build pulls in exactly the HOST's platform-suffixed
+      // targets (publish still owns foreign platforms). This suite runs on
+      // macOS and Linux hosts, so derive the expectation from the process.
+      const hostSuffix = `-${process.arch === 'arm64' ? 'arm64' : 'x64'}-${
+        process.platform === 'darwin' ? 'macos' : 'linux'
+      }`;
+      const hostNapiTargets = [
+        'cli-arm64-macos',
+        'cli-x64-linux',
+        'napi-arm64-macos',
+        'napi-x64-macos',
+        'napi-arm64-linux',
+        'napi-x64-linux',
+      ]
+        .filter((name) => name.endsWith(hostSuffix))
+        .sort();
+      expect(targets.build?.dependsOn).toEqual([...buildOutputDependencies, ...hostNapiTargets]);
+      for (const name of targets.build?.dependsOn ?? []) {
+        if (/-(?:arm64|x64)-(?:macos|linux)$/.test(name)) {
+          expect(name.endsWith(hostSuffix)).toBe(true);
+        }
+      }
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
