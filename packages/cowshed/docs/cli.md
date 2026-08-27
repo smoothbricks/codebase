@@ -76,12 +76,15 @@ identity cannot be derived unambiguously from its remotes.
 ### `cowshed setup [--uninstall] [--force] [--mount-root <dir>]`
 
 Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates
-absent volumes, remounts detached or mis-mounted ones at their canonical paths, validates each volume marker, pins the
-boot mounts in `/etc/fstab`, and installs the root-owned `dev.cowshed.storage` system LaunchDaemon. That daemon runs a
-fixed `/bin/sh` script of the volume UUIDs and canonical paths
-(`/Library/Application Support/dev.cowshed/mount-volumes.sh`); it does not invoke the cowshed binary. fstab keeps
-`noauto` so Disk Arbitration does not race it. It never deletes a volume. On a healthy host it changes nothing and says
-so. Every storage error in the CLI points here — a host with no volumes has no checkout to adopt.
+absent volumes, remounts detached or mis-mounted ones at their canonical paths, FileVault-encrypts unencrypted volumes
+in place, stores each independent random passphrase in `/Library/Keychains/System.keychain`, validates each volume
+marker, pins the boot mounts in `/etc/fstab`, and installs the root-owned `dev.cowshed.storage` system LaunchDaemon.
+That daemon runs a fixed `/bin/sh` script of the volume UUIDs and canonical paths
+(`/Library/Application Support/dev.cowshed/mount-volumes.sh`); before login and without invoking the cowshed binary, it
+reads each passphrase from System.keychain, runs `diskutil apfs unlockVolume -nomount`, then mounts the volume with
+`-nobrowse` at its canonical path. fstab keeps `noauto` so Disk Arbitration does not race it. Setup never deletes or
+recreates a volume: existing volumes are encrypted in place. On a healthy host it changes nothing and says so. Every
+storage error in the CLI points here — a host with no volumes has no checkout to adopt.
 
 `--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at
 `<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
@@ -101,7 +104,11 @@ cowshed: setup will request administrator authorization once, for the actions be
 cowshed: no volumes will be created or deleted; existing data is untouched
 cowshed: cowshed.store exists (UUID 1D6F0E1A-…-AAAA, 1.0 TB) and will be mounted at /private/cowshed/store
 cowshed: cowshed.caches exists (UUID 1D6F0E1A-…-BBBB, 2.0 TB) and will be mounted at /private/cowshed/caches
+cowshed: cowshed.store exists (UUID 1D6F0E1A-…-AAAA, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
+cowshed: cowshed.caches exists (UUID 1D6F0E1A-…-BBBB, 2.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
 cowshed: /etc/fstab will pin UUID 1D6F0E1A-…-AAAA at /private/cowshed/store so it mounts at every boot
+cowshed: /etc/fstab will pin UUID 1D6F0E1A-…-BBBB at /private/cowshed/caches so it mounts at every boot
+cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login
 cowshed: cowshed.store (store): present but not mounted -> mounted
 cowshed: cowshed.caches (caches): present but not mounted -> mounted
 cowshed: pinned the boot mounts in /etc/fstab
@@ -132,10 +139,19 @@ cowshed: setup will request administrator authorization once, for the actions be
 cowshed: no volumes will be created or deleted; existing data is untouched
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store
 cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be mounted at /private/cowshed/caches
+cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
+cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
+cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot
+cowshed: /etc/fstab will pin UUID …-B at /private/cowshed/caches so it mounts at every boot
+cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store: done
 cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be mounted at /private/cowshed/caches: FAILED — resource busy
+cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain: not attempted
+cowshed: cowshed.caches exists (UUID …-B, 2.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain: not attempted
 cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot: not attempted
-cowshed: host storage is NOT set up: 1 action done, 1 failed, 1 not attempted
+cowshed: /etc/fstab will pin UUID …-B at /private/cowshed/caches so it mounts at every boot: not attempted
+cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login: not attempted
+cowshed: host storage is NOT set up: 1 action done, 1 failed, 5 not attempted
 cowshed: cowshed.caches could not be mounted: resource busy
 next: cowshed doctor
 ```
@@ -182,12 +198,13 @@ cowshed: host storage is partially set up: 1 volume lives outside this host's co
 ```
 
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
-the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `dev.cowshed.gateway` and
-`dev.cowshed.sccache` LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no
-workspace. Nothing it removes holds data; everything it leaves does. It therefore refuses while the volumes still hold
-workspaces, or while their occupancy cannot be established at all (an unmounted store looks empty to every cheap check),
-until `--force` says the caller means it anyway. There is no interactive prompt — the refusal is the prompt, and its
-hint is the completed command line:
+the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `cowshed.store` and
+`cowshed.caches` items in `/Library/Keychains/System.keychain`, the `dev.cowshed.gateway` and `dev.cowshed.sccache`
+LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it
+removes holds data; everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while
+their occupancy cannot be established at all (an unmounted store looks empty to every cheap check), until `--force` says
+the caller means it anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed
+command line:
 
 ```
 $ cowshed setup --uninstall
@@ -197,15 +214,16 @@ next: cowshed setup --uninstall --force
 ```
 
 With `--json`, `setup` emits the frozen envelope carrying the per-volume report; `--uninstall` reports the fstab outcome
-and every service artifact it touched, in the order it touched them (system daemon, then both user agents, then both
-binaries). A teardown that found nothing installed reports an empty `services` list rather than omitting the field:
+and every service artifact it touched, in the order it touched them (system daemon, then both System.keychain items,
+then both user agents, then both binaries). A teardown that found nothing installed reports an empty `services` list
+rather than omitting the field:
 
 ```
 $ cowshed setup --json
 {"ok":true,"result":{"volumes":[{"name":"cowshed.store","role":"store","stateBefore":"absent","action":"created"}],"fstab":"pinned","authorized":true}}
 
 $ cowshed setup --uninstall --force --json
-{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"installed sccache binary","outcome":"already-absent"}]}}
+{"ok":true,"result":{"fstab":"removed","services":[{"what":"dev.cowshed.storage system LaunchDaemon","outcome":"removed"},{"what":"cowshed.store System.keychain item","outcome":"removed"},{"what":"cowshed.caches System.keychain item","outcome":"already-absent"},{"what":"dev.cowshed.gateway agent","outcome":"removed"},{"what":"dev.cowshed.sccache agent","outcome":"already-absent"},{"what":"installed cowshed binary","outcome":"removed"},{"what":"installed sccache binary","outcome":"already-absent"}]}}
 ```
 
 `outcome` is `removed` or `already-absent`; the stderr rendering of the same value reads `already absent`.
