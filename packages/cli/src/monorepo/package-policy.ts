@@ -54,7 +54,10 @@ import {
 export type { PackageTargetPolicyOptions as WorkspaceDependencyDefaultOptions, ResolvedProjectTargets };
 export { SMOO_NX_RELEASE_TAG_PATTERN, SMOO_NX_VERSION_ACTIONS };
 
-const extraCommitScopes = ['release'];
+// Cross-project scopes with no Nx project of their own: release bookkeeping,
+// and `deps` — the ecosystem-standard dependency-update scope (Dependabot and
+// Renovate both emit it) for lockfile/patch/root-manifest changes.
+const extraCommitScopes = ['release', 'deps'];
 const rootScriptPolicy: Record<string, string> = {
   clean: 'nx run-many -t clean; nx reset',
   'clean:node_modules': 'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
