@@ -2038,6 +2038,7 @@ fn emit_doctor<W: Write, E: Write>(output: &mut Output<W, E>, report: &DoctorRep
             b"unhealthy"
         })
         .map_err(output_error)?;
+    let mut hints = Vec::new();
     for finding in &report.findings {
         let severity = match finding.severity {
             FindingSeverity::Info => "info",
@@ -2050,9 +2051,12 @@ fn emit_doctor<W: Write, E: Write>(output: &mut Output<W, E>, report: &DoctorRep
                 finding.code, finding.message
             ))
             .map_err(output_error)?;
-        if !finding.hint.is_empty() {
-            output.hint(&finding.hint).map_err(output_error)?;
+        if !finding.hint.is_empty() && !hints.iter().any(|hint| *hint == finding.hint.as_str()) {
+            hints.push(finding.hint.as_str());
         }
+    }
+    for hint in hints {
+        output.hint(hint).map_err(output_error)?;
     }
     Ok(())
 }
@@ -3433,5 +3437,50 @@ mod tests {
             serde_json::to_vec(&sidecar).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn doctor_prints_status_then_findings_then_unique_hints() {
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+        emit_doctor(
+            &mut output,
+            &DoctorReport {
+                healthy: false,
+                findings: vec![
+                    Finding {
+                        code: "mount".into(),
+                        severity: FindingSeverity::Error,
+                        message: "cowshed.store: present, not mounted".into(),
+                        hint: "cowshed setup".into(),
+                        path: None,
+                    },
+                    Finding {
+                        code: "mount".into(),
+                        severity: FindingSeverity::Error,
+                        message: "cowshed.caches: present, not mounted".into(),
+                        hint: "cowshed setup".into(),
+                        path: None,
+                    },
+                    Finding {
+                        code: "gateway-down".into(),
+                        severity: FindingSeverity::Error,
+                        message: "gateway: launchd loaded; control socket does not answer".into(),
+                        hint: "cowshed gateway stop && cowshed gateway start".into(),
+                        path: None,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let (stdout, stderr) = output.into_inner();
+        assert_eq!(stdout, b"unhealthy\n");
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "cowshed: [error mount] cowshed.store: present, not mounted\n\
+             cowshed: [error mount] cowshed.caches: present, not mounted\n\
+             cowshed: [error gateway-down] gateway: launchd loaded; control socket does not answer\n\
+             next: cowshed setup\n\
+             next: cowshed gateway stop && cowshed gateway start\n"
+        );
     }
 }

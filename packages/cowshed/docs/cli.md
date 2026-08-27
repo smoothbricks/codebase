@@ -782,13 +782,17 @@ what it freed. Safe to run anytime; `rm`, `land`, and `restore` also run it oppo
 
 Invariant checks: every image has a marker, every mount matches an image, grants files parse, caches volume and gateway
 reachable, autosave fresh, and git identity at the workspace mount root matches the checkout (`includeIf gitdir:` files
-that would not apply under the mount root). Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5)
-with one `cowshed:` line per issue and a `next:` fix for each.
+that would not apply under the mount root). Exit 0 when healthy; otherwise the code of the most severe finding (3/4/5).
+Stdout is `healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:` commands those findings carry —
+findings first, hints after, never interleaved.
 
 ```
 $ cowshed doctor
-cowshed: gateway not running (last audit event 2d ago)
-next: launchctl kickstart -k gui/501/dev.cowshed.gateway
+unhealthy
+cowshed: [error mount] cowshed.store: present, not mounted; expected /private/cowshed/store
+cowshed: [error gateway-down] gateway: launchd loaded; control socket does not answer
+next: cowshed setup
+next: cowshed gateway stop && cowshed gateway start
 $ echo $?
 5
 ```
