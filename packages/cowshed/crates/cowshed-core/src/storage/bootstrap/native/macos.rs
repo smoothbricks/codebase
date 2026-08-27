@@ -13,6 +13,7 @@ use std::time::Duration;
 use plist::{Dictionary, Value};
 use tokio::sync::oneshot;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::super::{
     APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind, ApfsVolumeProvision, BlockingLane,
@@ -44,6 +45,11 @@ const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
 const FSTAB: &str = "/etc/fstab";
 const INSTALL: &str = "/usr/bin/install";
 const LAUNCHCTL: &str = "/bin/launchctl";
+const SECURITY: &str = "/usr/bin/security";
+const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
+const APFS_USER_AGENT: &str = "/System/Library/CoreServices/APFSUserAgent";
+const CS_USER_AGENT: &str = "/System/Library/CoreServices/CSUserAgent";
+const VOLUME_KEYCHAIN_LABELS: [&str; 2] = [APFS_STORE_VOLUME, APFS_CACHES_VOLUME];
 const MOUNT_SERVICE_LABEL: &str = "dev.cowshed.storage";
 const MOUNT_SERVICE_TARGET: &str = "system/dev.cowshed.storage";
 const MOUNT_SERVICE_DIRECTORY: &str = "/Library/Application Support/dev.cowshed";
@@ -194,10 +200,24 @@ impl BootstrapHost for AuthorizedBootstrapHost {
                 })?;
             }
         }
-        if [DISKUTIL, INSTALL, LAUNCHCTL, RM].contains(&command.program()) {
+        if [DISKUTIL, INSTALL, LAUNCHCTL, RM, SECURITY].contains(&command.program()) {
             return self.session()?.execute(command);
         }
         SystemBootstrapHost.run_command(command)
+    }
+
+    fn run_command_with_input(
+        &self,
+        command: &HostCommand,
+        input: &[u8],
+    ) -> Result<HostCommandOutput, HostError> {
+        if command.program() != DISKUTIL {
+            return Err(HostError::new(format!(
+                "refusing privileged standard input for {:?}",
+                command.program()
+            )));
+        }
+        self.session()?.execute_with_input(command, input)
     }
 
     fn provision_apfs_volumes(
@@ -369,7 +389,8 @@ fn desired_mount_service(pins: &[FstabPin]) -> Result<MountServiceFiles, NativeB
             )))
         })?;
         mounts.push_str(&format!(
-            "mount_volume {} {}\n",
+            "mount_volume {} {} {}\n",
+            shell_quote(&pin.label),
             shell_quote(&pin.volume_uuid),
             shell_quote(mountpoint)
         ));
@@ -380,8 +401,9 @@ set -eu
 umask 022
 
 mount_volume() {{
-    uuid=$1
-    mountpoint=$2
+    label=$1
+    uuid=$2
+    mountpoint=$3
     info=$(/usr/sbin/diskutil info -plist "$uuid")
     current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -o - - 2>/dev/null || :)
 
@@ -404,6 +426,8 @@ mount_volume() {{
         return 1
     fi
 
+    {SECURITY} find-generic-password -a "$label" -s "$label" -w {SYSTEM_KEYCHAIN} \
+        | /usr/sbin/diskutil apfs unlockVolume "$uuid" -nomount -stdinpassphrase
     /usr/sbin/diskutil mount -nobrowse -mountPoint "$mountpoint" "$uuid"
     info=$(/usr/sbin/diskutil info -plist "$uuid")
     current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -o - -)
@@ -674,6 +698,7 @@ fn build_host_actions(
             _ => std::cmp::Ordering::Equal,
         }
     });
+    let mut encrypt_actions = Vec::new();
     for volume in ordered_volumes {
         let existing_identity = || {
             let uuid = volume.volume_uuid.clone().ok_or_else(|| {
@@ -749,7 +774,16 @@ fn build_host_actions(
                 }
             }
         }
+        if volume.file_vault == Some(false) {
+            let (uuid, size_bytes) = existing_identity()?;
+            encrypt_actions.push(HostAction::EncryptVolume {
+                name: volume.name.to_owned(),
+                uuid,
+                size_bytes,
+            });
+        }
     }
+    actions.extend(encrypt_actions);
     if let PlannedFstab::NeedsPin(pins) = fstab {
         actions.extend(pins.iter().map(|pin| HostAction::PinFstab {
             uuid: pin.volume_uuid.clone(),
@@ -764,34 +798,36 @@ fn host_setup_actions(snapshot: &SetupSnapshot) -> Vec<HostAction> {
 }
 
 fn setup_requires_authorization(snapshot: &SetupSnapshot) -> bool {
-    snapshot
-        .actions
+    snapshot.actions.iter().any(|action| {
+        matches!(
+            action,
+            HostAction::EncryptVolume { .. } | HostAction::InstallMountService { .. }
+        )
+    }) || snapshot
+        .plan
+        .operations()
         .iter()
-        .any(|action| matches!(action, HostAction::InstallMountService { .. }))
-        || snapshot
-            .plan
-            .operations()
-            .iter()
-            .any(|operation| match operation {
-                HostOperation::ProvisionApfsVolumes { .. }
-                | HostOperation::PinVolumesInFstab { .. }
-                | HostOperation::MountApfsVolume { .. } => true,
-                HostOperation::RunCommand(command) => {
-                    command.program() == DISKUTIL
-                        && command
-                            .args()
-                            .first()
-                            .is_some_and(|argument| argument == "mount" || argument == "unmount")
-                }
-                _ => false,
-            })
+        .any(|operation| match operation {
+            HostOperation::ProvisionApfsVolumes { .. }
+            | HostOperation::PinVolumesInFstab { .. }
+            | HostOperation::MountApfsVolume { .. } => true,
+            HostOperation::RunCommand(command) => {
+                command.program() == DISKUTIL
+                    && command
+                        .args()
+                        .first()
+                        .is_some_and(|argument| argument == "mount" || argument == "unmount")
+            }
+            _ => false,
+        })
 }
 
 fn action_volume_name(action: &HostAction) -> Option<&str> {
     match action {
         HostAction::CreateVolume { name, .. }
         | HostAction::MountExisting { name, .. }
-        | HostAction::RepairMounted { name, .. } => Some(name),
+        | HostAction::RepairMounted { name, .. }
+        | HostAction::EncryptVolume { name, .. } => Some(name),
         HostAction::PinFstab { .. }
         | HostAction::ReclaimStubs { .. }
         | HostAction::InstallMountService { .. } => None,
@@ -871,6 +907,96 @@ fn required_host_command(host: &dyn BootstrapHost, command: HostCommand) -> Resu
     Err(HostError::new(
         HostCommandFailure::new(command, output).to_string(),
     ))
+}
+fn random_volume_password() -> Result<Zeroizing<String>, HostError> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| HostError::new(format!("cannot generate FileVault password: {error}")))?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut password = String::with_capacity(32);
+    for byte in random {
+        password.push(HEX[usize::from(byte >> 4)] as char);
+        password.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    Ok(Zeroizing::new(password))
+}
+
+fn encrypt_volume_with(host: &dyn BootstrapHost, name: &str, uuid: &str) -> Result<(), HostError> {
+    if !matches!(name, APFS_STORE_VOLUME | APFS_CACHES_VOLUME) {
+        return Err(HostError::new(format!(
+            "refusing to encrypt unexpected APFS volume {name:?}"
+        )));
+    }
+    Uuid::parse_str(uuid)
+        .map_err(|_| HostError::new(format!("invalid APFS volume UUID {uuid:?}")))?;
+    let password = random_volume_password()?;
+    required_host_command(
+        host,
+        HostCommand::new(
+            SECURITY,
+            [
+                "add-generic-password",
+                "-a",
+                name,
+                "-s",
+                name,
+                "-l",
+                format!("{name} encryption password").as_str(),
+                "-D",
+                "Encrypted volume password",
+                "-w",
+                password.as_str(),
+                "-T",
+                SECURITY,
+                "-T",
+                APFS_USER_AGENT,
+                "-T",
+                CS_USER_AGENT,
+                SYSTEM_KEYCHAIN,
+            ],
+        ),
+    )?;
+    let command = HostCommand::new(
+        DISKUTIL,
+        [
+            "apfs",
+            "encryptVolume",
+            uuid,
+            "-user",
+            "disk",
+            "-stdinpassphrase",
+        ],
+    );
+    let mut input = Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    input.extend_from_slice(password.as_bytes());
+    input.push(b'\n');
+    let output = host.run_command_with_input(&command, &input)?;
+    if output.succeeded() {
+        Ok(())
+    } else {
+        Err(HostError::new(
+            HostCommandFailure::new(command, output).to_string(),
+        ))
+    }
+}
+
+async fn encrypt_volume(
+    host: Arc<dyn BootstrapHost>,
+    name: String,
+    uuid: String,
+) -> Result<(), CowshedError> {
+    tokio::task::spawn_blocking(move || encrypt_volume_with(host.as_ref(), &name, &uuid))
+        .await
+        .map_err(|error| {
+            setup_execution_error(
+                NativeBootstrapError::Execution(BootstrapExecutionError::BlockingLane(
+                    error.to_string(),
+                )),
+                "cowshed setup",
+            )
+        })?
+        .map_err(NativeBootstrapError::Host)
+        .map_err(|error| setup_execution_error(error, "cowshed setup"))
 }
 
 fn write_mount_service_temporary(contents: &[u8], kind: &str) -> Result<PathBuf, HostError> {
@@ -1028,6 +1154,9 @@ async fn execute_snapshot_actions(
             }
             HostAction::InstallMountService { .. } => {
                 install_mount_service(snapshot, Arc::clone(&host)).await
+            }
+            HostAction::EncryptVolume { name, uuid, .. } => {
+                encrypt_volume(Arc::clone(&host), name.clone(), uuid.clone()).await
             }
             HostAction::PinFstab { .. } => {
                 let pin_indices = (index..outcomes.len())
@@ -1218,7 +1347,9 @@ pub async fn execute_host_setup(home: &Path) -> crate::Result<HostSetupReport> {
             post_actions.actions.retain(|action| {
                 matches!(
                     action,
-                    HostAction::PinFstab { .. } | HostAction::InstallMountService { .. }
+                    HostAction::EncryptVolume { .. }
+                        | HostAction::PinFstab { .. }
+                        | HostAction::InstallMountService { .. }
                 )
             });
             let (post_outcomes, post_failure) =
@@ -1259,11 +1390,34 @@ fn mount_service_artifacts_present() -> bool {
         || fs::symlink_metadata(MOUNT_SERVICE_PLIST).is_ok()
         || mount_service_loaded()
 }
+fn volume_keychain_item_present(label: &str) -> Result<bool, HostError> {
+    let command = HostCommand::new(
+        SECURITY,
+        [
+            "find-generic-password",
+            "-a",
+            label,
+            "-s",
+            label,
+            SYSTEM_KEYCHAIN,
+        ],
+    );
+    run_command_with(&command, |program, args| {
+        Command::new(program).args(args).output()
+    })
+    .map(|output| output.succeeded())
+}
 
 fn host_uninstall_plan(home: &Path) -> Result<HostUninstallPlan, NativeBootstrapError> {
     let existing = read_fstab_text().map_err(NativeBootstrapError::Host)?;
     let mut plan = host_uninstall_plan_from_text(home, &existing)?;
-    plan.requires_authorization |= mount_service_artifacts_present();
+    let has_keychain_items = VOLUME_KEYCHAIN_LABELS
+        .iter()
+        .try_fold(false, |found, label| {
+            volume_keychain_item_present(label).map(|present| found || present)
+        })
+        .map_err(NativeBootstrapError::Host)?;
+    plan.requires_authorization |= mount_service_artifacts_present() || has_keychain_items;
     Ok(plan)
 }
 
@@ -1310,7 +1464,13 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
         }
         let remove_service = mount_service_artifacts_present();
         let remove_fstab = !plan.pins_to_remove.is_empty();
-        tokio::task::spawn_blocking(move || {
+        let removed_keychain_labels = tokio::task::spawn_blocking(move || {
+            let mut keychain_labels = Vec::new();
+            for label in VOLUME_KEYCHAIN_LABELS {
+                if volume_keychain_item_present(label)? {
+                    keychain_labels.push(label);
+                }
+            }
             let mut session = MacAuthorizationSession::acquire()?;
             if remove_service {
                 // A job which is already absent is still successfully uninstalled.
@@ -1325,10 +1485,26 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
                 // Keep the directory when another root-owned artifact shares it.
                 let _ = session.execute(&HostCommand::new(RMDIR, [MOUNT_SERVICE_DIRECTORY]));
             }
+            for label in &keychain_labels {
+                run_privileged_command(
+                    &mut session,
+                    &HostCommand::new(
+                        SECURITY,
+                        [
+                            "delete-generic-password",
+                            "-a",
+                            *label,
+                            "-s",
+                            *label,
+                            SYSTEM_KEYCHAIN,
+                        ],
+                    ),
+                )?;
+            }
             if remove_fstab {
                 pin_volumes_in_fstab_with(&mut session, &[])?;
             }
-            Ok::<_, HostError>(())
+            Ok::<_, HostError>(keychain_labels)
         })
         .await
         .map_err(|error| {
@@ -1338,20 +1514,28 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
         })?
         .map_err(NativeBootstrapError::Host)
         .map_err(|error| setup_execution_error(error, "cowshed setup --uninstall"))?;
+        let mut services = Vec::new();
+        if remove_service {
+            services.push(UninstallServiceOutcome {
+                what: format!("{MOUNT_SERVICE_LABEL} system LaunchDaemon"),
+                outcome: "removed".to_owned(),
+            });
+        }
+        services.extend(
+            removed_keychain_labels
+                .into_iter()
+                .map(|label| UninstallServiceOutcome {
+                    what: format!("{label} System.keychain item"),
+                    outcome: "removed".to_owned(),
+                }),
+        );
         Ok(UninstallReport {
             fstab: if remove_fstab {
                 UninstallFstabOutcome::Removed
             } else {
                 UninstallFstabOutcome::AlreadyClean
             },
-            services: if remove_service {
-                vec![UninstallServiceOutcome {
-                    what: format!("{MOUNT_SERVICE_LABEL} system LaunchDaemon"),
-                    outcome: "removed".to_owned(),
-                }]
-            } else {
-                Vec::new()
-            },
+            services,
         })
     }
 }
@@ -1393,6 +1577,7 @@ trait EvidenceSource {
         &mut self,
         identifier: &str,
     ) -> Result<Option<PathBuf>, NativeBootstrapError>;
+    fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError>;
     fn invoking_identity(&mut self) -> (u32, u32);
 }
 
@@ -1466,6 +1651,24 @@ impl EvidenceSource for SystemEvidenceSource<'_> {
             _ => None,
         })
     }
+    fn keychain_item_usable(&mut self, label: &'static str) -> Result<bool, NativeBootstrapError> {
+        let command = HostCommand::new(
+            SECURITY,
+            [
+                "find-generic-password",
+                "-a",
+                label,
+                "-s",
+                label,
+                "-w",
+                SYSTEM_KEYCHAIN,
+            ],
+        );
+        self.host
+            .run_command(&command)
+            .map(|output| output.succeeded())
+            .map_err(NativeBootstrapError::Host)
+    }
     fn invoking_identity(&mut self) -> (u32, u32) {
         (unsafe { libc::getuid() }, unsafe { libc::getgid() })
     }
@@ -1487,12 +1690,14 @@ struct ClassifiedVolume {
     volume_uuid: Option<String>,
     size_bytes: Option<u64>,
     reclaimable_stubs: Vec<PathBuf>,
+    file_vault: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
 struct ClassifiedStorage {
     storage: ExistingStorage,
     reclaimable_stubs: Vec<PathBuf>,
+    file_vault: Option<bool>,
 }
 
 fn plan_native_bootstrap(
@@ -1568,8 +1773,8 @@ fn gather_existing_apfs_evidence(
             source,
             HostCommand::new(DISKUTIL, ["apfs", "list", "-plist"]),
         )?;
-        guard_absent_volume_globally(source, &global, APFS_STORE_VOLUME, &mut store.storage)?;
-        guard_absent_volume_globally(source, &global, APFS_CACHES_VOLUME, &mut caches.storage)?;
+        guard_absent_volume_globally(source, &global, APFS_STORE_VOLUME, &mut store)?;
+        guard_absent_volume_globally(source, &global, APFS_CACHES_VOLUME, &mut caches)?;
     }
 
     let classified = [
@@ -1613,9 +1818,24 @@ fn gather_existing_apfs_evidence(
             volume_uuid,
             size_bytes,
             reclaimable_stubs: classified.reclaimable_stubs.clone(),
+            file_vault: classified.file_vault,
         }
     })
-    .collect();
+    .collect::<Vec<_>>();
+    for volume in &classified {
+        if volume.file_vault == Some(true) && !source.keychain_item_usable(volume.name)? {
+            let uuid = volume.volume_uuid.clone().ok_or_else(|| {
+                NativeBootstrapError::MalformedPlist(format!(
+                    "{} has FileVault enabled but no APFS volume UUID",
+                    volume.name
+                ))
+            })?;
+            return Err(NativeBootstrapError::MissingVolumeKeychain {
+                name: volume.name,
+                uuid,
+            });
+        }
+    }
     Ok(GatheredEvidence {
         statfs: StatFsEvidence::Apfs {
             mount_source: snapshot.mount_source,
@@ -1646,8 +1866,9 @@ fn guard_absent_volume_globally(
     source: &mut impl EvidenceSource,
     inventory: &ApfsInventory,
     name: &'static str,
-    state: &mut ExistingStorage,
+    classified: &mut ClassifiedStorage,
 ) -> Result<(), NativeBootstrapError> {
+    let state = &mut classified.storage;
     if !matches!(state, ExistingStorage::Absent) {
         return Ok(());
     }
@@ -1676,6 +1897,7 @@ fn guard_absent_volume_globally(
                 size_bytes: container.capacity_bytes,
                 mounted_at,
             };
+            classified.file_vault = Some(volume.file_vault);
             Ok(())
         }
         _ => Err(NativeBootstrapError::AmbiguousVolume {
@@ -1759,6 +1981,7 @@ struct ApfsVolume {
     identifier: String,
     mountpoint: Option<PathBuf>,
     volume_uuid: String,
+    file_vault: bool,
 }
 
 impl ApfsInventory {
@@ -1859,11 +2082,21 @@ fn parse_volume(
             )));
         }
     };
+    let file_vault = match volume.get("FileVault") {
+        None => false,
+        Some(Value::Boolean(enabled)) => *enabled,
+        Some(_) => {
+            return Err(malformed(format!(
+                "volume {identifier:?} has invalid FileVault evidence"
+            )));
+        }
+    };
     Ok(ApfsVolume {
         name,
         identifier,
         volume_uuid,
         mountpoint,
+        file_vault,
     })
 }
 
@@ -2008,6 +2241,7 @@ fn classify_volume(
     Ok(ClassifiedStorage {
         storage,
         reclaimable_stubs,
+        file_vault: matches.first().map(|volume| volume.file_vault),
     })
 }
 
@@ -2034,6 +2268,16 @@ fn run_command_with(
 
 trait PrivilegedCommandSession {
     fn execute(&mut self, command: &HostCommand) -> Result<HostCommandOutput, HostError>;
+    fn execute_with_input(
+        &mut self,
+        command: &HostCommand,
+        _input: &[u8],
+    ) -> Result<HostCommandOutput, HostError> {
+        Err(HostError::new(format!(
+            "privileged session cannot provide standard input to {:?}",
+            command.program()
+        )))
+    }
 }
 
 trait ApfsProvisionIo {
@@ -2544,10 +2788,11 @@ impl MacAuthorizationSession {
         authorization_status("preauthorize privileged execution", status)?;
         Ok(session)
     }
-}
-
-impl PrivilegedCommandSession for MacAuthorizationSession {
-    fn execute(&mut self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+    fn execute_authorized(
+        &mut self,
+        command: &HostCommand,
+        input: Option<&[u8]>,
+    ) -> Result<HostCommandOutput, HostError> {
         if !Path::new(command.program()).is_absolute() {
             return Err(HostError::new(format!(
                 "refusing non-absolute authorized program {:?}",
@@ -2590,8 +2835,34 @@ impl PrivilegedCommandSession for MacAuthorizationSession {
                 "privileged command returned no communications pipe",
             ));
         }
+        if let Some(input) = input {
+            let written = unsafe { libc::fwrite(input.as_ptr().cast(), 1, input.len(), pipe) };
+            if written != input.len() || unsafe { libc::fflush(pipe) } != 0 {
+                let source = io::Error::last_os_error();
+                unsafe {
+                    libc::fclose(pipe);
+                }
+                return Err(HostError::new(format!(
+                    "cannot write privileged command input: {source}"
+                )));
+            }
+        }
         let stdout = read_authorized_output(pipe)?;
         Ok(HostCommandOutput::success(stdout))
+    }
+}
+
+impl PrivilegedCommandSession for MacAuthorizationSession {
+    fn execute(&mut self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+        self.execute_authorized(command, None)
+    }
+
+    fn execute_with_input(
+        &mut self,
+        command: &HostCommand,
+        input: &[u8],
+    ) -> Result<HostCommandOutput, HostError> {
+        self.execute_authorized(command, Some(input))
     }
 }
 
@@ -2999,11 +3270,19 @@ mod tests {
 
         assert!(script.starts_with("#!/bin/sh\nset -eu\n"));
         assert!(script.contains(
-            "mount_volume 'FEC35F46-22C8-40BC-943A-ADC4BD39CAE5' '/private/cowshed/store'"
+            "mount_volume 'cowshed.store' 'FEC35F46-22C8-40BC-943A-ADC4BD39CAE5' '/private/cowshed/store'"
         ));
         assert!(script.contains(
-            "mount_volume 'D4B312DB-9378-4EC5-9B0B-8F244F1B38FA' '/private/cowshed/caches'"
+            "mount_volume 'cowshed.caches' 'D4B312DB-9378-4EC5-9B0B-8F244F1B38FA' '/private/cowshed/caches'"
         ));
+        assert!(script.contains(
+            "/usr/bin/security find-generic-password -a \"$label\" -s \"$label\" -w /Library/Keychains/System.keychain"
+        ));
+        assert!(
+            script.contains(
+                "/usr/sbin/diskutil apfs unlockVolume \"$uuid\" -nomount -stdinpassphrase"
+            )
+        );
         assert!(script.contains("/usr/sbin/diskutil mount -nobrowse -mountPoint"));
         assert!(!script.contains("cowshed setup"));
         assert!(plist.contains("<string>dev.cowshed.storage</string>"));
@@ -3169,6 +3448,7 @@ mod tests {
         // Per-identifier answers for `volume_mountpoint`; an absent identifier means detached,
         // mirroring what `diskutil info -plist` reports with an empty MountPoint.
         volume_mountpoints: BTreeMap<String, Option<PathBuf>>,
+        keychain_items: BTreeMap<&'static str, bool>,
         commands: Vec<HostCommand>,
         invoking_identity: (u32, u32),
     }
@@ -3224,6 +3504,12 @@ mod tests {
         ) -> Result<Option<PathBuf>, NativeBootstrapError> {
             Ok(self.volume_mountpoints.get(identifier).cloned().flatten())
         }
+        fn keychain_item_usable(
+            &mut self,
+            label: &'static str,
+        ) -> Result<bool, NativeBootstrapError> {
+            Ok(self.keychain_items.get(label).copied().unwrap_or(false))
+        }
 
         fn invoking_identity(&mut self) -> (u32, u32) {
             self.invoking_identity
@@ -3244,11 +3530,21 @@ mod tests {
     }
 
     fn volume(name: &str, identifier: &str, mountpoint: Option<&str>) -> String {
+        volume_with_filevault(name, identifier, mountpoint, true)
+    }
+
+    fn volume_with_filevault(
+        name: &str,
+        identifier: &str,
+        mountpoint: Option<&str>,
+        file_vault: bool,
+    ) -> String {
         let mountpoint = mountpoint
             .map(|path| format!("<key>MountPoint</key><string>{path}</string>"))
             .unwrap_or_default();
+        let file_vault = if file_vault { "<true/>" } else { "<false/>" };
         format!(
-            "<dict><key>Name</key><string>{name}</string><key>DeviceIdentifier</key><string>{identifier}</string><key>APFSVolumeUUID</key><string>{identifier}-UUID</string>{mountpoint}</dict>"
+            "<dict><key>Name</key><string>{name}</string><key>DeviceIdentifier</key><string>{identifier}</string><key>APFSVolumeUUID</key><string>{identifier}-UUID</string><key>FileVault</key>{file_vault}{mountpoint}</dict>"
         )
     }
 
@@ -3297,6 +3593,7 @@ mod tests {
                 ),
             ]),
             volume_mountpoints: BTreeMap::new(),
+            keychain_items: BTreeMap::from([(APFS_STORE_VOLUME, true), (APFS_CACHES_VOLUME, true)]),
             invoking_identity: (501, 20),
             commands: Vec::new(),
         }
@@ -5584,6 +5881,183 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert!(write_marker_atomic(&marker, b"attack").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"unchanged");
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn unencrypted_existing_volumes_mount_before_encrypting_in_place() {
+        let volumes = volume("Data", "disk3s5", Some("/System/Volumes/Data"))
+            + &volume_with_filevault(APFS_STORE_VOLUME, "disk3s8", None, false)
+            + &volume_with_filevault(APFS_CACHES_VOLUME, "disk3s9", None, false);
+        let mut source = healthy_existing_source();
+        source.command_output = HostCommandOutput::success(plist(&container("disk3", &volumes)));
+        for path in [
+            Path::new("/private/cowshed/store"),
+            Path::new("/private/cowshed/caches"),
+        ] {
+            source
+                .mountpoints
+                .insert(path.to_owned(), MountpointState::Missing);
+            source.mounted_volumes.remove(path);
+        }
+
+        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "").unwrap();
+        assert!(matches!(
+            &snapshot.actions[0],
+            HostAction::MountExisting { name, .. } if name == APFS_STORE_VOLUME
+        ));
+        assert!(matches!(
+            &snapshot.actions[1],
+            HostAction::MountExisting { name, .. } if name == APFS_CACHES_VOLUME
+        ));
+        assert!(matches!(
+            &snapshot.actions[2],
+            HostAction::EncryptVolume { name, .. } if name == APFS_STORE_VOLUME
+        ));
+        assert!(matches!(
+            &snapshot.actions[3],
+            HostAction::EncryptVolume { name, .. } if name == APFS_CACHES_VOLUME
+        ));
+    }
+
+    #[test]
+    fn filevault_volumes_with_usable_keychain_items_do_not_plan_encryption() {
+        let mut source = healthy_existing_source();
+        let snapshot = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "").unwrap();
+        assert!(
+            !snapshot
+                .actions
+                .iter()
+                .any(|action| matches!(action, HostAction::EncryptVolume { .. }))
+        );
+    }
+
+    #[test]
+    fn filevault_volume_without_usable_keychain_item_fails_closed() {
+        let mut source = healthy_existing_source();
+        source.keychain_items.insert(APFS_STORE_VOLUME, false);
+        let error = prepare_setup_snapshot(&mut source, Path::new("/Users/alice"), "")
+            .expect_err("FileVault without its unlock credential must fail");
+        assert!(matches!(
+            error,
+            NativeBootstrapError::MissingVolumeKeychain {
+                name: APFS_STORE_VOLUME,
+                ..
+            }
+        ));
+    }
+
+    struct EncryptCommandHost {
+        commands: mpsc::Sender<(HostCommand, Option<Vec<u8>>)>,
+    }
+
+    impl BootstrapHost for EncryptCommandHost {
+        fn verify_zfs_delegation(
+            &self,
+            _pool: &str,
+            _required_root: &str,
+        ) -> Result<(), HostError> {
+            unreachable!("FileVault encryption has no ZFS operation")
+        }
+
+        fn inspect_mountpoint(&self, _path: &Path) -> Result<MountpointState, HostError> {
+            unreachable!("volume was mounted and attested before encryption")
+        }
+
+        fn create_dir_all(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("volume was mounted before encryption")
+        }
+
+        fn reclaim_mountpoint(&self, _path: &Path) -> Result<(), HostError> {
+            unreachable!("FileVault encryption reclaims nothing")
+        }
+
+        fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
+            self.commands
+                .send((command.clone(), None))
+                .expect("encryption command receiver remains alive");
+            Ok(HostCommandOutput::default())
+        }
+
+        fn run_command_with_input(
+            &self,
+            command: &HostCommand,
+            input: &[u8],
+        ) -> Result<HostCommandOutput, HostError> {
+            self.commands
+                .send((command.clone(), Some(input.to_vec())))
+                .expect("encryption command receiver remains alive");
+            Ok(HostCommandOutput::default())
+        }
+
+        fn provision_apfs_volumes(
+            &self,
+            _container: &str,
+            _volumes: &[ApfsVolumeProvision],
+        ) -> Result<(), HostError> {
+            unreachable!("encryption does not provision a volume")
+        }
+
+        fn write_file_atomic(&self, _path: &Path, _contents: &[u8]) -> Result<(), HostError> {
+            unreachable!("encryption writes no marker")
+        }
+
+        fn pin_volumes_in_fstab(&self, _pins: &[FstabPin]) -> Result<(), HostError> {
+            unreachable!("encryption does not pin fstab")
+        }
+    }
+
+    #[test]
+    fn encryption_stores_one_random_password_and_feeds_it_to_diskutil() {
+        let (commands, received) = mpsc::channel();
+        let host = EncryptCommandHost { commands };
+        let uuid = "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5";
+        encrypt_volume_with(&host, APFS_STORE_VOLUME, uuid).unwrap();
+        let commands = received.try_iter().collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].0.program(), SECURITY);
+        assert_eq!(commands[0].0.args()[0], "add-generic-password");
+        assert!(commands[0].0.args().windows(2).any(|pair| {
+            pair == ["-a", APFS_STORE_VOLUME] || pair == ["-s", APFS_STORE_VOLUME]
+        }));
+        for trusted in [SECURITY, APFS_USER_AGENT, CS_USER_AGENT] {
+            assert!(
+                commands[0]
+                    .0
+                    .args()
+                    .windows(2)
+                    .any(|pair| { pair[0] == "-T" && pair[1] == trusted })
+            );
+        }
+        assert_eq!(
+            commands[0].0.args().last().map(String::as_str),
+            Some(SYSTEM_KEYCHAIN)
+        );
+        let password_index = commands[0]
+            .0
+            .args()
+            .iter()
+            .position(|argument| argument == "-w")
+            .expect("security password argument")
+            + 1;
+        let password = &commands[0].0.args()[password_index];
+        assert_eq!(password.len(), 32);
+        assert!(password.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        assert_eq!(commands[1].0.program(), DISKUTIL);
+        assert_eq!(
+            commands[1].0.args(),
+            [
+                "apfs",
+                "encryptVolume",
+                uuid,
+                "-user",
+                "disk",
+                "-stdinpassphrase",
+            ]
+        );
+        let mut expected_input = password.as_bytes().to_vec();
+        expected_input.push(b'\n');
+        assert_eq!(commands[1].1.as_deref(), Some(expected_input.as_slice()));
     }
 
     fn deadline_spawn(
