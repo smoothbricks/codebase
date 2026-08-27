@@ -647,10 +647,11 @@ fn emit<W: Write, E: Write>(escalating: bool, line: &str, output: &mut Output<W,
 
 /// The exact intent for one action, in the second person's terms rather than cowshed's.
 ///
-/// Every arm names the volume and where it will end up, because "will be mounted" without a path
-/// is not intent a person can consent to. No default branch: an action core adds stops compiling
-/// here rather than being silently announced as something it is not — and an unannounced action
-/// behind an authorization dialog is precisely the contract violation rule 3 exists to prevent.
+/// Every volume arm names its identity and intended change; mount and repair arms also name the
+/// destination because "will be mounted" without a path is not intent a person can consent to. No
+/// default branch: an action core adds stops compiling here rather than being silently announced as
+/// something it is not — and an unannounced action behind an authorization dialog is precisely the
+/// contract violation rule 3 exists to prevent.
 fn action_intent(action: &HostAction) -> String {
     match action {
         HostAction::CreateVolume {
@@ -683,12 +684,20 @@ fn action_intent(action: &HostAction) -> String {
             mounted_at.display(),
             mount_at.display()
         ),
+        HostAction::EncryptVolume {
+            name,
+            uuid,
+            size_bytes,
+        } => format!(
+            "{name} exists (UUID {uuid}, {}) and will be FileVault-encrypted in place; passphrase stored in System.keychain",
+            decimal_size(*size_bytes)
+        ),
         HostAction::PinFstab { uuid, mount_at } => format!(
             "/etc/fstab will pin UUID {uuid} at {} so it mounts at every boot",
             mount_at.display()
         ),
         HostAction::InstallMountService { label } => format!(
-            "system LaunchDaemon {label} will be installed to mount cowshed volumes before login"
+            "system LaunchDaemon {label} will be installed to unlock and mount cowshed volumes before login"
         ),
         // Named, not counted: 01_storage.md requires reclaimable stubs to be enumerated, because
         // "3 files will be deleted" is not something a person can agree to.
