@@ -62,6 +62,11 @@ pub enum HostAction {
         mounted_at: PathBuf,
         mount_at: PathBuf,
     },
+    EncryptVolume {
+        name: String,
+        uuid: String,
+        size_bytes: u64,
+    },
     PinFstab {
         uuid: String,
         mount_at: PathBuf,
@@ -309,6 +314,10 @@ pub enum NativeBootstrapError {
         name: &'static str,
         matches: usize,
     },
+    #[error(
+        "FileVault volume {name:?} ({uuid}) has no usable System.keychain password; refusing to replace its unlock credential"
+    )]
+    MissingVolumeKeychain { name: &'static str, uuid: String },
     #[error("APFS volume {identifier:?} has invalid mountpoint evidence {mountpoint:?}")]
     InvalidVolumeMountpoint {
         identifier: String,

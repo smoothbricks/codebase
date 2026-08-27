@@ -1430,6 +1430,16 @@ pub trait BootstrapHost: Send + Sync {
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError>;
     fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError>;
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError>;
+    fn run_command_with_input(
+        &self,
+        command: &HostCommand,
+        _input: &[u8],
+    ) -> Result<HostCommandOutput, HostError> {
+        Err(HostError::new(format!(
+            "host cannot provide standard input to {:?}",
+            command.program()
+        )))
+    }
     fn provision_apfs_volumes(
         &self,
         container: &str,
