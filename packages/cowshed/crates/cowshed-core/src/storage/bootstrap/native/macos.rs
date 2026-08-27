@@ -3112,6 +3112,20 @@ fn inspect_system_mountpoint(path: &Path) -> Result<MountpointState, HostError> 
     }
 }
 
+/// Inventory a masked mountpoint's contents when every entry is cowshed-authored,
+/// disposable residue; `None` means something real lives there and the mountpoint
+/// stays fail-closed masked.
+///
+/// Beyond launchd/telemetry stubs and empty scaffolding, two writers race the
+/// store mount and plant regenerable state on the bare Data volume: the
+/// `dev.cowshed.sccache` LaunchAgent binds its socket and creates its cache
+/// directory before the volumes are remounted, and the gateway's project heal
+/// creates `mnt/` mountpoint parents. Treating those as a mask wedges the host
+/// permanently — the gateway crash-loops on exit 5 and no verb can repair it —
+/// so an idle daemon socket, the sccache compile cache (disposable by
+/// contract), directory-only `mnt/` scaffolding, and a `caches/` mountpoint
+/// holding only such residue are reclaimable. One foreign entry anywhere keeps
+/// the masked verdict.
 fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(path)
@@ -3120,22 +3134,30 @@ fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError
         let entry = entry
             .map_err(|source| host_io_error("read mountpoint directory entry", path, source))?;
         let entry_path = entry.path();
+        let name = entry.file_name();
         let file_type = entry
             .file_type()
             .map_err(|source| host_io_error("inspect mountpoint entry", &entry_path, source))?;
-        let safe = if entry.file_name() == ".DS_Store" {
+        let safe = if name == ".DS_Store" {
             file_type.is_file()
-        } else if entry.file_name() == "telemetry" && file_type.is_dir() {
+        } else if name == "telemetry" && file_type.is_dir() {
             is_reclaimable_telemetry_dir(&entry_path)?
+        } else if name == "sccache.sock" {
+            // The daemon rebinds on start; an existing socket file is never load-bearing.
+            std::os::unix::fs::FileTypeExt::is_socket(&file_type)
+        } else if name == "sccache" && file_type.is_dir() {
+            // The shared compile cache: disposable by contract, whatever it holds.
+            true
+        } else if name == "mnt" && file_type.is_dir() {
+            // Workspace mountpoint scaffolding: directories all the way down, nothing else.
+            is_directory_only_tree(&entry_path)?
+        } else if name == "caches" && file_type.is_dir() {
+            // The caches-volume mountpoint nests under the store root, so residue that
+            // masks the store usually masks it too; the same whitelist judges its
+            // contents, and an empty directory is trivially safe.
+            is_empty_directory(&entry_path)? || reclaimable_stub_paths(&entry_path)?.is_some()
         } else if file_type.is_dir() {
-            fs::read_dir(&entry_path)
-                .map_err(|source| host_io_error("read empty mountpoint stub", &entry_path, source))?
-                .next()
-                .transpose()
-                .map_err(|source| {
-                    host_io_error("read empty mountpoint stub entry", &entry_path, source)
-                })?
-                .is_none()
+            is_empty_directory(&entry_path)?
         } else {
             false
         };
@@ -3150,6 +3172,32 @@ fn reclaimable_stub_paths(path: &Path) -> Result<Option<Vec<PathBuf>>, HostError
         paths.sort();
         Ok(Some(paths))
     }
+}
+
+fn is_empty_directory(path: &Path) -> Result<bool, HostError> {
+    Ok(fs::read_dir(path)
+        .map_err(|source| host_io_error("read empty mountpoint stub", path, source))?
+        .next()
+        .transpose()
+        .map_err(|source| host_io_error("read empty mountpoint stub entry", path, source))?
+        .is_none())
+}
+
+/// Whether `path` contains only directories, recursively — mountpoint scaffolding, no data.
+fn is_directory_only_tree(path: &Path) -> Result<bool, HostError> {
+    for entry in fs::read_dir(path)
+        .map_err(|source| host_io_error("read scaffold directory", path, source))?
+    {
+        let entry = entry
+            .map_err(|source| host_io_error("read scaffold directory entry", path, source))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| host_io_error("inspect scaffold entry", &entry.path(), source))?;
+        if !file_type.is_dir() || !is_directory_only_tree(&entry.path())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn is_reclaimable_telemetry_dir(path: &Path) -> Result<bool, HostError> {
@@ -5905,6 +5953,50 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             None
         );
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The exact wedge the residue arms exist for: the sccache agent and the
+    /// gateway heal plant socket/cache/mnt state on the bare Data volume before
+    /// the store volume is remounted, and that residue must inventory as
+    /// reclaimable — not read as a masked mountpoint that fail-closes every
+    /// later validation.
+    #[test]
+    fn cowshed_runtime_residue_is_reclaimable_but_foreign_data_masks() {
+        // A bound unix socket path must fit SUN_LEN (104 bytes on macOS); the
+        // default temp_dir's /var/folders/... prefix does not, so this fixture
+        // lives under /tmp.
+        let root = PathBuf::from(format!("/tmp/cowshed-residue-{}", Uuid::new_v4().simple()));
+        fs::create_dir(&root).unwrap();
+
+        // Daemon socket, workspace mountpoint scaffolding, compile cache, telemetry stub.
+        std::os::unix::net::UnixListener::bind(root.join("sccache.sock")).unwrap();
+        fs::create_dir_all(root.join("mnt/acme/widget/slot@1")).unwrap();
+        fs::create_dir_all(root.join("caches/sccache/0")).unwrap();
+        fs::write(root.join("caches/sccache/0/entry.bin"), b"cache").unwrap();
+        fs::create_dir(root.join("telemetry")).unwrap();
+        fs::write(root.join("telemetry/daemon-stderr.log"), b"").unwrap();
+        let paths = reclaimable_stub_paths(&root)
+            .expect("inspect residue")
+            .expect("residue is reclaimable");
+        assert_eq!(
+            paths,
+            vec![
+                root.join("caches"),
+                root.join("mnt"),
+                root.join("sccache.sock"),
+                root.join("telemetry"),
+            ]
+        );
+
+        // A regular file inside mnt/ is data, not scaffolding: fail closed.
+        fs::write(root.join("mnt/acme/widget/notes.txt"), b"mine").unwrap();
+        assert_eq!(reclaimable_stub_paths(&root).expect("inspect data"), None);
+        fs::remove_file(root.join("mnt/acme/widget/notes.txt")).unwrap();
+
+        // Any foreign entry at the root keeps the masked verdict.
+        fs::write(root.join("keep.txt"), b"user data").unwrap();
+        assert_eq!(reclaimable_stub_paths(&root).expect("inspect data"), None);
+        fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn atomic_marker_is_mode_0600_and_refuses_symlink_destination() {
