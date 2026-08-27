@@ -1,5 +1,6 @@
 [install]
 linker = "isolated"
+globalStore = true
 
 [run]
 preload = ["@smoothbricks/validation/bun/preload"]
