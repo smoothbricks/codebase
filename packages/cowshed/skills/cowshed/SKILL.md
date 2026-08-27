@@ -22,74 +22,45 @@ Every command follows one I/O discipline, and reading it correctly is most of th
 
 - **stdout** carries the one machine answer: a bare value, aligned table rows, or — with `--json` — a single envelope
   (`{"ok":true,"result":{…}}` / `{"ok":false,"error":{…}}`). Parse stdout; never scrape stderr.
-- **stderr** carries progress and guidance prefixed `cowshed:` plus suggested follow-up commands prefixed `next:` —
-  each hint names a command that exists in the parser. Exactly one `next:` prefix per line.
+- **stderr** carries progress and guidance prefixed `cowshed:` plus suggested follow-up commands prefixed `next:` — each
+  hint names a command that exists in the parser. Exactly one `next:` prefix per line. `doctor` prints every finding,
+  then the distinct `next:` commands; they are never interleaved.
 - **exit codes** are stable and are the fastest branch: `0` ok, `1` internal bug (report it), `2` usage, `3` not-found,
   `4` conflict/busy, `5` environment missing (a host volume absent or unmounted), `6` denied — a sandbox denial cowshed
   has authoritative evidence for, or a declined `setup` authorization, which means nothing changed — `7` integrity.
 
-Under `cowshed exec`, the child's exit code passes through unchanged; failures of cowshed's own exec wrapper use
-100–106 so they can never collide with a child's status.
+Under `cowshed exec`, the child's exit code passes through unchanged; failures of cowshed's own exec wrapper use 100–106
+so they can never collide with a child's status.
 
-Use `--json` whenever a result is consumed programmatically, and `-q`/`--quiet` to drop guidance while keeping hints
-and errors.
+Use `--json` whenever a result is consumed programmatically, and `-q`/`--quiet` to drop guidance while keeping hints and
+errors.
 
 `cowshed --help` lists every command and `cowshed <command> --help` prints its full grammar with one line per flag —
 both on stdout, exit 0. Ask the binary before guessing a flag: the usage line is generated from the parser's own option
 table, so it is never behind the CLI. A mistyped verb is corrected rather than merely refused.
 
-## The host: one herd, two volumes
+## Host storage
 
-Cowshed is installed once per machine and anchored to no user account. All of its bytes live on two dedicated APFS
-volumes:
+Bytes live on two volumes: `/private/cowshed/store` (images and metadata) and `/private/cowshed/caches` (shared package
+and compiler caches). Session workspaces mount at `<mount-root>/<owner>/<repo>/<workspace>`; the mount root defaults to
+`~/.cowshed/mnt`.
 
-- `/private/cowshed/store` — every `main` and workspace image, checkpoints, grant sidecars, and metadata.
-- `/private/cowshed/caches` — the shared package and compiler caches.
+Exit 5 means host storage is missing or unmounted. Run `cowshed doctor` — it mutates nothing — then the `next:` command
+it prints (usually `cowshed setup`). Do not `diskutil`, edit `/etc/fstab`, or `launchctl`. `setup` may ask for
+administrator authorization; declining exits 6 and changes nothing.
 
-At setup, one comment-tagged line per volume is appended to `/etc/fstab`
-(`UUID=<uuid> /private/cowshed/<role> apfs rw,noatime,noauto,nobrowse,noowners`), so macOS mounts both at their
-canonical paths before login, with no cowshed binary involved — the remounter does not live inside what it remounts.
-`noowners` is deliberate: the herd is machine-global and every local account sees the same bytes, which is right for
-git checkouts (git tracks mode bits, never owners) and rebuildable caches.
-
-Workspaces other than `main` mount at `<mount-root>/<owner>/<repo>/<workspace>`; the mount root defaults to
-`~/.cowshed/mnt` and is set with `cowshed setup --mount-root <dir>`.
-
-Two LaunchAgents, `dev.cowshed.gateway` and `dev.cowshed.sccache`, run binaries copied to a host-stable install path —
-never a path inside a workspace mount, which would vanish with the mount and strand launchd in a restart loop. The
-gateway agent runs at load: after a reboot it validates storage, mounts every adopted project's workspaces back at
-their canonical paths — each project's `main` included, because a main workspace is **always mounted** — starts the
-sccache daemon, and only then serves.
-
-A workspace's environment lives inside its image as `.cowshed/env`: plain `source`-able exports (`GOENV`,
-`COWSHED_WORKSPACE_TOKEN`, and on macOS `COWSHED_PORT_BASE`), rewritten whenever cowshed rotates the token, so never
-hand-edit or cache its values. direnv users need nothing per shell: cowshed writes a two-line `.envrc` sourcing that
-file when the checkout has none, and appends the same single line under a marker comment when the project tracks its
-own `.envrc`. No CLI verb prints these values on demand.
-
-The service verbs are for repair and inspection, not daily use: `cowshed gateway start|stop|status|run` (an ordinary
-`stop` keeps the installed binary so the next `start` is cheap; `stop --purge` deletes it) and
-`cowshed sccache start [--capacity <size>]|stop|status`. The gateway starts the sccache agent itself, so a healthy host
-already has both.
-
-**When anything is off, the sequence is `cowshed doctor`, then `cowshed setup`.** `doctor` is the universal
-diagnostician: version and install source, per-volume state, service health (flagging CLI-versus-daemon version skew),
-workspace inventory, project checks whenever an adopted checkout resolves, and a critical finding for any `main` it
-cannot reach. It mutates nothing and runs from any directory. `setup` is idempotent host repair, likewise runnable from
-anywhere with no repository: it creates absent volumes, remounts detached or mis-mounted ones at their canonical paths,
-validates markers, mounts every adopted project's `main` — a healthy report means every main is reachable — and pins
-fstab. Before any
-authorization dialog appears it announces the exact intent of every action — name, UUID, size, destination — and
-everything that can require elevation happens inside that single session. On a healthy host it changes nothing and says
-so; a declined dialog changes nothing and exits 6. Existing volumes are never deleted.
+A workspace's environment is `.cowshed/env` inside the image (`GOENV`, `COWSHED_WORKSPACE_TOKEN`, on macOS
+`COWSHED_PORT_BASE`). Never hand-edit or cache those values. direnv users need nothing extra: cowshed writes a two-line
+`.envrc` sourcing that file when the checkout has none, and appends the same line under a marker when the project tracks
+its own `.envrc`.
 
 ## Onboarding: adopt the repository
 
 `adopt` converts an existing checkout into that repository's image-backed `main` workspace. It **renames the existing
 checkout to `<root>.pre-cowshed`**, copies the whole tree into the image, and mounts the image back at the original
-path. `cowshed rm main --restore` puts the original tree back and unbinds the project. Adoption scans for secrets
-before copying: findings refuse the adopt (exit 4) unless `--quarantine` relocates them instead — there is no "adopt
-anyway", because main's image is cloned to every future workspace.
+path. `cowshed rm main --restore` puts the original tree back and unbinds the project. Adoption scans for secrets before
+copying: findings refuse the adopt (exit 4) unless `--quarantine` relocates them instead — there is no "adopt anyway",
+because main's image is cloned to every future workspace.
 
 `adopt` has no exclude rules — it copies the entire tree — and it moves the checkout out from under anything holding its
 path. Both facts make the following the normal flow, not an optional tidy-up.
@@ -139,9 +110,8 @@ it never shrinks.
 
 Only `cowshed setup` — and, on a host where it has not run yet, the first `cowshed adopt` — may create host storage;
 only those two ever raise an authorization prompt. Every other command opens storage existing-only: with a volume
-absent, detached, or mis-mounted it fails (exit 5), names each volume's observed state, and prints
-`next: cowshed setup`. Storage guidance across the CLI points at `cowshed setup`, never at adopting a directory — a
-host with no volumes has no checkout to adopt.
+absent, detached, or mis-mounted it fails (exit 5) and prints `next: cowshed setup`. A host with no volumes has no
+checkout to adopt.
 
 ## Per agent: create, locate, destroy
 
@@ -161,18 +131,17 @@ path-keyed compiler caches survive successive tenants, `--browse` shows the volu
 
 `ls` lists the project selected by cwd or `--project`; `ls --all` is store-wide — every adopted project on the host,
 with its `owner/repo` id as the first column. `fork <src> <dst>` clones one running workspace from another.
-`detach <ws>` parks a workspace at the cost of one closed file — its mountpoint directory disappears with it.
-`attach` brings detached session workspaces back: `attach <ws>` mounts one, bare `attach` inside a project attaches
-that project's detached sessions, and `attach --all` sweeps every project store-wide. Mains are always mounted and
-never attach targets.
-`checkpoint <ws> [label]` snapshots the image crash-consistently and `restore <ws> <label>` rolls back to a snapshot
-(keeping the displaced image as a `pre-restore-<timestamp>` checkpoint). `mv` renames a workspace, or moves the adopted
-checkout with `cowshed mv main <new-path>`. `resize` grows an image.
+`detach <ws>` parks a workspace at the cost of one closed file — its mountpoint directory disappears with it. `attach`
+brings detached session workspaces back: `attach <ws>` mounts one, bare `attach` inside a project attaches that
+project's detached sessions, and `attach --all` sweeps every project store-wide. Mains are always mounted and never
+attach targets. `checkpoint <ws> [label]` snapshots the image crash-consistently and `restore <ws> <label>` rolls back
+to a snapshot (keeping the displaced image as a `pre-restore-<timestamp>` checkpoint). `mv` renames a workspace, or
+moves the adopted checkout with `cowshed mv main <new-path>`. `resize` grows an image.
 
 Verbs that act on a workspace **in place** — `rebase`, `push`, `checkpoint`, `path` — accept an omitted name and act on
-the workspace your cwd stands in. Verbs that **retire, replace, move, or remount** one — `rm`, `land`, `restore`,
-`mv`, `detach`, `exec` — require the name, so losing the workspace you are standing in is always something you asked
-for by name rather than something the working directory decided.
+the workspace your cwd stands in. Verbs that **retire, replace, move, or remount** one — `rm`, `land`, `restore`, `mv`,
+`detach`, `exec` — require the name, so losing the workspace you are standing in is always something you asked for by
+name rather than something the working directory decided.
 
 Give every agent its own workspace and let `land` be the cleanup. Do not share one workspace between concurrent agents —
 the branch and the working tree are single-writer.
@@ -189,8 +158,8 @@ what it destroyed.
 your current directory — its standalone git root, validated against cowshed's repository binding — which fails when you
 are outside any adopted checkout, so coordinators driving several repositories should always pass `--project`.
 
-A project's `main` workspace **is** the primary checkout — the directory you had before adopting, always mounted at
-that original path. Editing it edits the shared tree everyone lands onto; landing a workspace fast-forwards that same
+A project's `main` workspace **is** the primary checkout — the directory you had before adopting, always mounted at that
+original path. Editing it edits the shared tree everyone lands onto; landing a workspace fast-forwards that same
 directory. Treat `main` as shared state, never as your scratch space.
 
 ## Git semantics
@@ -208,7 +177,7 @@ This maps directly onto a rebase-then-fast-forward coordinator flow:
 | Agent commits                    | ordinary `git commit` inside the workspace, on `cowshed/<name>`                                                                                                 |
 | Agent rebases onto main          | `cowshed rebase <ws>` — runs `git rebase main/main` inside the workspace                                                                                        |
 | Coordinator lands                | `cowshed land <ws> --target main --check '<verify cmd>'` — rebases, runs the check, then `git merge --ff-only` in the host checkout, then retires the workspace |
-| Deliver a branch without merging | `cowshed push <ws> --branch <name>` — delivers the branch into main's repository under a specific name                                                           |
+| Deliver a branch without merging | `cowshed push <ws> --branch <name>` — delivers the branch into main's repository under a specific name                                                          |
 
 Write the check as a **bare command** — `just verify`, `cargo test --workspace`. The sandbox `PATH` is already the
 project's pinned toolchain resolved to store paths, so wrapping it in `devenv shell -q --` or a direnv re-evaluation
@@ -242,20 +211,15 @@ each agent rediscover it.
   workspace's full build size, which is what `gc` reclaims.
 - Because `target/` lives inside the workspace image, each agent already has a private warm build directory. Do not
   point agents at a shared external build directory — that reintroduces the contention the clone removed.
-- Outside a workspace, `/bin/cp -c -R <src> <dst>` performs the same clone on APFS. Spell it `/bin/cp`: a GNU `cp`
-  earlier on PATH has no `-c` and fails. This is per-file and therefore **not atomic across a directory** — quiesce
-  writers before cloning a live multi-file store such as a write-ahead log plus its sidecars. A workspace clone has no
-  such hazard: one image file is cloned, so the whole tree is captured at a single point in time.
 
 ## Caches
 
-`/private/cowshed/caches` — the second volume — holds the shared package and compiler caches: cargo's registry and
-git-extraction caches, sccache, Go module and build caches, and others, plus the gateway's download mirrors, which
-workspaces read but never write. Shared caches are **shared across workspaces, never cloned** — correct for immutable
-downloads, and the reason a warm workspace does not re-download dependencies. Build _output_ stays per workspace: it
-lives in the workspace image, warm because the image was cloned from main. (bun's install cache is deliberately
-in-image too, because `bun install` materializes `node_modules` by reflinking from it, and APFS clones cannot cross
-volume boundaries.)
+`/private/cowshed/caches` holds the shared package and compiler caches: cargo's registry and git-extraction caches,
+sccache, Go module and build caches, and others, plus the gateway's download mirrors, which workspaces read but never
+write. Shared caches are **shared across workspaces, never cloned** — correct for immutable downloads, and the reason a
+warm workspace does not re-download dependencies. Build _output_ stays per workspace: it lives in the workspace image,
+warm because the image was cloned from main. (bun's install cache is deliberately in-image too, because `bun install`
+materializes `node_modules` by reflinking from it, and APFS clones cannot cross volume boundaries.)
 
 ## Installing this skill
 
