@@ -1,10 +1,11 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
-import synchronizedPrettier from '@prettier/sync';
 import {
   LINUX_PLATFORM_TARGET_GLOBS,
   MACOS_PLATFORM_TARGET_GLOBS,
 } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { makeModuleSynchronized } from 'make-synchronized';
+import type * as PrettierModule from 'prettier';
 import type { Options as PrettierOptions } from 'prettier';
 import { isSmoothBricksCodebasePackageName } from '../lib/cli-package.js';
 import { renderRunsOnLine, type WorkflowRunsOn } from './github-runs-on.js';
@@ -14,6 +15,16 @@ const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
   printWidth: 120,
   proseWrap: 'always',
 } satisfies PrettierOptions);
+
+// @prettier/sync is unusable here: its module body eagerly instantiates a
+// synchronized module for the bare specifier "prettier", which resolves from
+// make-synchronized's own package directory inside its worker. Under Bun's
+// isolated install store that directory only sees make-synchronized's declared
+// dependencies, so the import throws a ResolveMessage that Bun then fails to
+// structured-clone across postMessage ("Cannot serialize worker response").
+// Resolving the entry HERE keys resolution to this package, which declares
+// prettier, and hands the worker an absolute URL that loads in any store layout.
+const synchronizedPrettier = makeModuleSynchronized<typeof PrettierModule>(import.meta.resolve('prettier'));
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
 export type PublishWorkflowCondition = 'version-mode-not-none' | 'deploy-production' | 'failure' | 'always';
