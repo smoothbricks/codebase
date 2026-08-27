@@ -20,19 +20,6 @@
   "targetDefaults": {
     "build": {
       "cache": true,
-      "dependsOn": [
-        "^build",
-        "*-js",
-        "*-web",
-        "*-html",
-        "*-css",
-        "*-ios",
-        "*-android",
-        "*-native",
-        "*-napi",
-        "*-bun",
-        "*-wasm"
-      ],
       "outputs": ["{projectRoot}/dist"]
     },
     "typecheck": {
