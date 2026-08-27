@@ -83,7 +83,8 @@
   },
   "patchedDependencies": {
     "@conloca/content-api@0.1.16": "patches/@conloca%2Fcontent-api@0.1.16.patch",
-    "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch"
+    "@conloca/astro-cms@0.1.16": "patches/@conloca%2Fastro-cms@0.1.16.patch",
+    "bun-types@1.4.0": "patches/bun-types@1.4.0.patch"
   },
   "overrides": {
     "typia": "13.2.0"
