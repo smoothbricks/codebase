@@ -299,33 +299,85 @@ async fn a_workspace_whose_work_is_nowhere_upstream_is_wholly_unlanded() {
     assert!(!landing.commits.fully_landed());
 }
 
-/// A merge commit has no patch-id, so its equivalence cannot be computed — and equivalence that
-/// cannot be computed must not be asserted. Git's own `cherry` omits merges from its output
-/// entirely; deriving `unlanded` by subtraction is what puts them on the refusing side instead of
-/// silently dropping them from both counts.
+/// An *evil merge* — one whose combined diff is non-empty — authored a conflict resolution that
+/// exists in neither parent, so retiring the workspace destroys it. `git cherry` omits every merge
+/// from its output, so a check built on cherry alone cannot see this work at all: measured on a real
+/// workspace, three of its four merges carried 6, 5 and 2 files that neither parent had.
 #[tokio::test]
-async fn a_merge_commit_in_the_range_counts_as_unlanded_because_it_has_no_patch_identity() {
-    let fixture = Fixture::new("merge");
-    let mount = fixture.clone_workspace("vo-protocol-guard");
+async fn an_evil_merge_counts_as_unlanded_because_its_resolution_exists_in_no_parent() {
+    let fixture = Fixture::new("evil-merge");
+    let mount = fixture.clone_workspace("greenfield-formats");
     workspace_commit(&mount, "guard.txt", "guard\n", "guard work");
-    git(&mount, ["checkout", "-q", "-b", "side"]);
+    let guard = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    git(&mount, ["checkout", "-q", "-b", "side", "HEAD~1"]);
     workspace_commit(&mount, "side.txt", "side\n", "side work");
-    git(&mount, ["checkout", "-q", "vo-protocol-guard"]);
-    git(&mount, ["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+    let side = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    git(&mount, ["checkout", "-q", "greenfield-formats"]);
 
-    // Both non-merge commits land upstream by content, so patch-id alone would say "all landed".
-    fixture.land_content_separately("guard.txt", "guard\n", "guard work upstream");
-    fixture.land_content_separately("side.txt", "side\n", "side work upstream");
+    // The parents touch disjoint files, so the merge itself resolves cleanly — and then authors a
+    // file neither parent has. That is an evil merge in its purest form: the only copy of
+    // `evil.txt` in existence is the merge commit.
+    git(&mount, ["merge", "-q", "--no-ff", "--no-commit", "side"]);
+    fs::write(mount.join("evil.txt"), "authored by the merge\n").expect("evil merge content");
+    git(&mount, ["add", "-A"]);
+    commit(&mount, "merge side");
+
+    // Both parents' patches reach the target verbatim, by cherry-pick rather than re-authoring, so
+    // patch identity really does match and patch-id alone would call the whole branch landed.
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("greenfield-formats"),
+            OsStr::new("side"),
+        ],
+    );
+    git(fixture.parent(), ["cherry-pick", &guard]);
+    git(fixture.parent(), ["cherry-pick", &side]);
 
     let landing = measured(&fixture, &mount).await;
+    let (unlanded, landed, _) = counts(&landing);
     assert_eq!(
-        counts(&landing),
-        (1, 2, 2),
-        "the two patches are landed; the merge itself is not provably anywhere"
+        (unlanded, landed),
+        (1, 2),
+        "both patches are held; only the merge's own content is unaccounted for"
     );
     assert!(
         !landing.commits.fully_landed(),
         "a merge whose resolution exists only here must block a no-flag removal"
+    );
+}
+
+/// A merge with an empty combined diff authored nothing: it is topology, and retiring the workspace
+/// loses no content. Counting it as unheld would mean a branch of already-landed commits joined by
+/// clean merges could never be reported landed — exactly the false positive the landed filter exists
+/// to remove.
+#[tokio::test]
+async fn a_clean_merge_does_not_block_a_workspace_whose_commits_are_all_held() {
+    let fixture = Fixture::new("clean-merge");
+    let mount = fixture.clone_workspace("land-wave");
+    workspace_commit(&mount, "guard.txt", "guard\n", "guard work");
+    git(&mount, ["checkout", "-q", "-b", "side"]);
+    workspace_commit(&mount, "side.txt", "side\n", "side work");
+    git(&mount, ["checkout", "-q", "land-wave"]);
+    // Disjoint files, so the merge resolves itself and contributes nothing.
+    git(&mount, ["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+
+    fixture.land_content_separately("guard.txt", "guard\n", "guard work upstream");
+    fixture.land_content_separately("side.txt", "side\n", "side work upstream");
+
+    let landing = measured(&fixture, &mount).await;
+    let (unlanded, landed, _) = counts(&landing);
+    assert_eq!(
+        (unlanded, landed),
+        (0, 3),
+        "two held patches plus a merge that authored nothing"
+    );
+    assert!(
+        landing.commits.fully_landed(),
+        "structural merge scaffolding must not force --abandon"
     );
 }
 
