@@ -1794,6 +1794,58 @@ mod tests {
         );
     }
 
+    /// Identity uniqueness is scoped to *live* projects, which is the case a careless
+    /// implementation breaks.
+    ///
+    /// The two halves pin opposite failures. Drop former identities from the membership check and
+    /// the live half fails at the `merged` lookup:
+    ///
+    ///     panicked at gateway_inventory.rs: live project owns it
+    ///
+    /// Keep the identities in a registry that outlives the binding — anything other than reading
+    /// them back out of `repository.json` — and the retired half fails instead, refusing to adopt a
+    /// name whose only claimant no longer exists.
+    #[test]
+    fn a_retired_projects_former_identity_stops_blocking_adoption() {
+        let fixture = Fixture::new("retired-former-identity");
+        let monorepo = RepoId::parse("acme/monorepo").expect("monorepo");
+        let merged = RepoId::parse("acme/widget").expect("merged repository");
+        fixture.bind(&monorepo);
+        let paths = StorageLayout::new(fixture.storage.store(), &monorepo)
+            .expect("layout")
+            .project()
+            .clone();
+        let binding: RepositoryBinding =
+            crate::metadata::read_json(&paths.repository_binding).expect("binding");
+        let merged_in = binding
+            .rename_primary(merged.clone())
+            .expect("adopt as the merged identity")
+            .rename_primary(monorepo.clone())
+            .expect("rename onto the monorepo identity");
+        assert_eq!(merged_in.former_identities, vec![merged.clone()]);
+        write_json(&paths.repository_binding, &merged_in).expect("republish binding");
+
+        // While the monorepo is live it owns both names, so neither is free.
+        for identity in [&monorepo, &merged] {
+            let owner = identity_owner(fixture.storage.store(), identity)
+                .expect("owner lookup")
+                .expect("live project owns it");
+            assert_eq!(owner.current(), &monorepo);
+        }
+
+        // Retirement deletes the binding, which is what makes the project stop existing. Its former
+        // identities go with it.
+        fs::remove_file(&paths.repository_binding).expect("retire the project");
+        for identity in [&monorepo, &merged] {
+            assert!(
+                identity_owner(fixture.storage.store(), identity)
+                    .expect("owner lookup")
+                    .is_none(),
+                "{identity} is free once the project holding it is retired"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn attached_inventory_is_sorted_complete_and_secret_redacted() {
         let fixture = Fixture::new("attached");
