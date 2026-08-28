@@ -1,8 +1,8 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { rm } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as adapterExports from '@smoothbricks/lmao-ttsc';
+import { makeBuildOutputRoot } from './build-output-root.js';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/typed-op.ts', import.meta.url));
 const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.meta.url));
@@ -12,7 +12,7 @@ test('the exported Bun adapter applies the explicitly selected native plugin', a
   if (typeof adapterFactory !== 'function') {
     throw new TypeError('@smoothbricks/lmao-ttsc did not export a Bun adapter factory');
   }
-  const outputDir = await mkdtemp(join(dirname(fixturePath), '.bun-adapter-'));
+  const outputDir = await makeBuildOutputRoot('bun-adapter');
 
   try {
     const result = await Bun.build({
