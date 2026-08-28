@@ -15,19 +15,17 @@ pub(crate) enum PeerCredentialsError {
     SocketTypeSizeOverflow,
     SocketTypeQueryFailed,
     NotStream,
-    PeerCredentialSizeOverflow,
     PeerCredentialQueryFailed,
-    UnsupportedPlatform,
 }
 
 /// Reads the peer uid after requiring a stream socket. The uid is the authorization boundary;
 /// platform credential APIs may also provide a gid, but it is intentionally not consulted.
-/// On targets other than macOS and Linux, this returns `Err(PeerCredentialsError::UnsupportedPlatform)`.
+/// On targets other than macOS and Linux, this returns `Err(PeerCredentialsError::PeerCredentialQueryFailed)`.
 pub(crate) fn peer_uid(descriptor: &OwnedFd) -> Result<libc::uid_t, PeerCredentialsError> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = descriptor;
-        return Err(PeerCredentialsError::UnsupportedPlatform);
+        return Err(PeerCredentialsError::PeerCredentialQueryFailed);
     }
     let fd = descriptor.as_raw_fd();
     let mut socket_type: libc::c_int = 0;
@@ -54,7 +52,7 @@ pub(crate) fn peer_uid(descriptor: &OwnedFd) -> Result<libc::uid_t, PeerCredenti
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn platform_peer_uid(_fd: libc::c_int) -> Result<libc::uid_t, PeerCredentialsError> {
-    Err(PeerCredentialsError::UnsupportedPlatform)
+    Err(PeerCredentialsError::PeerCredentialQueryFailed)
 }
 
 #[cfg(all(test, not(any(target_os = "macos", target_os = "linux"))))]
@@ -64,6 +62,6 @@ fn unsupported_platform_fails_closed() {
     let descriptor: OwnedFd = stream.into();
     assert_eq!(
         peer_uid(&descriptor),
-        Err(PeerCredentialsError::UnsupportedPlatform)
+        Err(PeerCredentialsError::PeerCredentialQueryFailed)
     );
 }
