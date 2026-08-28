@@ -259,6 +259,59 @@ impl LifecycleIntentJournal {
         Ok(())
     }
 }
+pub(crate) fn prepared_retirement_unreadable(
+    workspace: &WorkspaceName,
+    expected_mount: &Path,
+    cause: CowshedError,
+) -> CowshedError {
+    CowshedError::new(
+        cause.code,
+        format!(
+            "cannot establish retirement state for workspace {workspace} at {}: {}",
+            expected_mount.display(),
+            cause.message
+        ),
+        format!(
+            "retirement record for {workspace} was kept deliberately; make {} and its workspace \
+             image readable, then reopen cowshed",
+            expected_mount.display()
+        ),
+    )
+}
+
+#[cfg(test)]
+mod prepared_retirement_diagnostic_tests {
+    use std::path::Path;
+
+    use crate::error::{CowshedError, ErrorCode};
+    use crate::metadata::WorkspaceName;
+
+    use super::prepared_retirement_unreadable;
+
+    #[test]
+    fn unreadable_state_names_the_target_and_preserves_the_recovery_record() {
+        let workspace = WorkspaceName::new("unreadable").expect("workspace");
+        let error = prepared_retirement_unreadable(
+            &workspace,
+            Path::new("/tmp/cowshed/example/unreadable"),
+            CowshedError::environment_missing(
+                "workspace metadata could not be read",
+                "repair the metadata",
+            ),
+        );
+
+        assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+        assert!(error.message.contains("workspace unreadable"));
+        assert!(error.message.contains("/tmp/cowshed/example/unreadable"));
+        assert!(error.message.contains("metadata could not be read"));
+        assert!(
+            error
+                .hint
+                .contains("record for unreadable was kept deliberately")
+        );
+        assert!(error.hint.contains("make /tmp/cowshed/example/unreadable"));
+    }
+}
 
 static MAIN_NAME: LazyLock<WorkspaceName> =
     LazyLock::new(|| WorkspaceName::new("main").expect("fixed main workspace name"));
