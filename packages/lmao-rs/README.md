@@ -19,11 +19,11 @@ Nx targets for this project: `build` (via `cargo-wasm`), `test` (`cargo test --w
 | `lmao-arrow`  | Two-pass tree walk → one Arrow `RecordBatch` per flush (pass 1 dictionary accumulation, sorted-dict finalize, pass 2 memcpy columns)                                                                                                                                                       | `01k`, `01f`                                       |
 | `lmao-macros` | `define_log_schema!` / `span!` proc-macros — compile-time replacement for the TS `new Function()` codegen and AST transformer                                                                                                                                                              | `01a`, `01g`, `01j`, `01o`, `01b6`                 |
 | `lmao-wasm`   | `cdylib` for `wasm32-unknown-unknown` exporting the allocator ABI (stable names, sentinel returns, packed-u64 identity convention, `--import-memory`) consumed directly by `wasmAllocator.ts`                                                                                              | `01q`                                              |
-| `lmao-query`  | Tracer-agnostic assertion/query surface (selector → count/never), Arrow + SQLite backends behind features                                                                                                                                                                                  | `AxE/specs/sim/08-trace-testing.md`                |
+| `lmao-query`  | Tracer-agnostic assertion/query surface (selector → count/never), Arrow + SQLite backends behind features                                                                                                                                                                                  | trace-testing spec                                 |
 
-## AxE determinism constraints (non-negotiable design rules)
+## Determinism constraints (non-negotiable design rules)
 
-From `AxE/specs/sim/01-deterministic-scheduler.md` and `08-trace-testing.md`:
+These constraints are defined by the deterministic scheduler and trace-testing specs:
 
 1. **No ambient time or entropy.** Wall/monotonic time only via `lmao_core::Clock`; randomness only via
    `lmao_core::Entropy`. A sim run injects seeded impls and must get **bit-identical trace bytes** for the same
@@ -45,7 +45,7 @@ Red → green → mutate:
    criteria for the next implementation step (arena alloc/free, `SpanBuffer::append`, `convert_span_trees`). Un-ignore
    the one you're implementing; watch it fail.
 2. **Green:** implement until `just proptest-heavy` passes (10k cases).
-3. **Mutate:** `just mutants` — classify survivors per the AxE kernel rule (equivalent / invalid / budget-timeout /
+3. **Mutate:** `just mutants` — classify survivors per the kernel rule (equivalent / invalid / budget-timeout /
    unreached / oracle-gap). Remove the corresponding `exclude_re` entry in `mutants.toml` as each stub becomes real.
 
 ## Commands
@@ -56,7 +56,7 @@ just test            # fast tier: unit + property tests (green suite)
 just proptest-heavy  # heavy tier: 10k proptest cases, includes TDD-red ignored tests
 just mutants         # mutation tier (cargo install cargo-mutants)
 just wasm            # wasm32 ABI build (rustup target add wasm32-unknown-unknown)
-just bench           # criterion harness for the AxE overhead gates
+just bench           # criterion harness for the overhead gates
 just check           # cargo check + clippy -D warnings
 ```
 
@@ -76,7 +76,7 @@ Without `just`: the same commands are spelled out in `justfile`, and `.cargo/con
 ## Backlog (downstream consumers depend on these)
 
 - **`lmao-inspect`** — a thin generic CLI over `lmao-query`: tail/follow Arrow segment dirs, run selectors and SQL,
-  render tables, export `--json`/`--ndjson`. Reusable by cowshed, AxE, and jcode; spec at
+  render tables, export `--json`/`--ndjson`. Reusable by cowshed, downstream consumers, and jcode; spec at
   `specs/lmao/04_inspect_cli.md`.
 - **W3C `traceparent` interop** — the runtime adopts an inbound `TRACEPARENT` (env / carrier) at tracer init as the root
   span context, and stamps outbound `fetch`/HTTP requests with the current span's `traceparent`. This is what lets a

@@ -6,9 +6,8 @@
 //! This module also pins the **serialized undo-entry contract**: vm.zig
 //! defines `FlatUndoOp`/`FlatUndoEntry` (vm.zig:142/193) as `extern struct`
 //! bytes that travel inside exported delta/fork segments consumed by the
-//! Scenario fork navigator (superset_root.zig
-//! `#region axe!n/reducer-speculation-scenario-fork`, specs/axe/
-//! 10d-reducer-speculation.md). The entry is "self-contained in the 24-byte
+//! scenario-fork navigator (superset_root.zig's
+//! `#region reducer-speculation-scenario-fork`, `10d-reducer-speculation.md`).
 //! entry (no out-of-band region)" — vm.zig:171. The in-memory ring buffers,
 //! overflow shadow snapshot (wasm-static vs native-dynamic split), change-flag
 //! save/restore, and the delta export surface are vm.zig globals and belong

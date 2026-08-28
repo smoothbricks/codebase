@@ -16,7 +16,7 @@ use proptest::prelude::*;
 
 proptest! {
     /// Sorted-dictionary determinism: any permutation of the same value multiset
-    /// finalizes to the identical dictionary. This is the foundation of AxE's
+    /// finalizes to the identical dictionary. This is the foundation of the
     /// "same seed → bit-identical trace bytes" requirement at the encoding layer.
     #[test]
     fn dictionary_is_permutation_invariant(
@@ -582,7 +582,7 @@ proptest! {
 
 proptest! {
     /// Identical input event sequences serialize to bit-identical IPC bytes
-    /// (AxE H-SIM-4 style trace-byte identity).
+    /// (deterministic trace-byte identity).
     #[test]
     fn identical_trees_serialize_identically(n in 0usize..50) {
         let empty_catalog = StableVocabularyCatalog::EMPTY;

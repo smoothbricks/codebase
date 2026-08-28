@@ -1,8 +1,8 @@
 //! Columnar buffers for parsed events (`parsing/columns.zig`, unified).
 //!
-//! Drift audit: the axe-runtime copy is the columine file minus the whole
+//! Drift audit: the consumer variant omits the whole
 //! `EventColumns` base path (296 deleted lines; its 5 added lines are
-//! comments). The unified port keeps both storage types; the event-processor
+//! comments). This crate keeps both storage types; the event-processor
 //! crate parameterizes which path is wired.
 //!
 //! Arrow compatibility (same as Zig):
@@ -50,7 +50,8 @@ fn write_u32(bytes: &mut [u8], index: usize, value: u32) {
 }
 
 /// Columnar buffers for the base 4-column event schema
-/// (columns.zig `EventColumns`; columine-only — the axe fork deleted it).
+/// (columns.zig `EventColumns`; retained by this crate and omitted by the
+/// consumer variant).
 ///
 /// Buffer capacities are the Zig estimates and hard limits: exceeding them
 /// is `BUFFER_OVERFLOW`, exactly like the fixed Zig allocations.

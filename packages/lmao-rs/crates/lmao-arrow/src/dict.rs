@@ -421,7 +421,7 @@ pub struct ColumnDictionary<'a> {
 #[derive(Debug)]
 pub struct FinalizedDictionary<'a> {
     /// Sorted, deduplicated values. Sorted order is deterministic for a given
-    /// multiset regardless of observation order — load-bearing for AxE's
+    /// multiset regardless of observation order — load-bearing for
     /// bit-identical trace bytes.
     pub values: Vec<&'a str>,
     index: FxHashMap<&'a str, u32>,

@@ -1,4 +1,4 @@
-//! Rust port of the columine VM core — stage 2 of `specs/axe/91-zig-to-rust-port.md`.
+//! Rust port of the columine VM core — stage 2 of the Zig-to-Rust port specification.
 //!
 //! Slice 1 ports `packages/columine/src/vm/state_init.zig` plus the minimal
 //! surface of its sibling modules that state initialization and slot growth

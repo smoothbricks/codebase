@@ -97,7 +97,7 @@ fn bench_span_50_logs(c: &mut Criterion) {
     });
 }
 
-/// Per-event append cost in isolation on a warm buffer (the AxE zero-alloc gate
+/// Per-event append cost in isolation on a warm buffer (the zero-alloc gate
 /// path): reset write_index by rebuilding is avoided by using a large buffer and
 /// measuring batches of 1000 appends without overflow.
 fn bench_append_only(c: &mut Criterion) {

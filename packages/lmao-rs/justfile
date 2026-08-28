@@ -21,7 +21,7 @@ wasm:
     cp target/wasm32-unknown-unknown/release/lmao_wasm.wasm dist/lmao_wasm.wasm
     @ls -la dist/lmao_wasm.wasm
 
-# AxE overhead gates placeholder (criterion). Real gate: traced-vs-untraced ≤20%
+# Overhead gates placeholder (criterion). Real gate: traced-vs-untraced ≤20%
 # throughput delta + zero-alloc test (tests/alloc_gate.rs, currently TDD-red).
 bench:
     cargo bench -p lmao-core
@@ -30,7 +30,7 @@ check:
     cargo check --workspace --all-targets
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Proof-only timestamp artifacts consumed by AxE's timestamp accuracy harness.
+# Proof-only timestamp artifacts consumed by the timestamp accuracy harness.
 # WASM preserves the original shared, imported 16-page memory contract; NAPI
 # accepts ArrayBuffer directly and is renamed to Node's conventional .node suffix.
 timestamp-proof-artifacts:

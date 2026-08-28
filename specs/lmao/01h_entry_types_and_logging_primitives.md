@@ -79,8 +79,8 @@ Span completion entry types (all written to row 1):
   - Duration measures the failed attempt (not including retry delay)
 
 - **`span-detach`** - Detached-Op dispatch complete, business result pending - **Row 2+ (appended)**
-  - Written when an Op handler returns the detached-pending sentinel (AxE `31d-streaming-ops`): the dispatch succeeded,
-    the business result arrives through a later execution
+  - Written when an Op handler returns the detached-pending sentinel (the streaming-operations contract): the dispatch
+    succeeded, the business result arrives through a later execution
   - The span still closes normally at row 1 (`span-ok` = the dispatch itself succeeded)
   - Continuation executions (pumps, re-attach, post-restart delivery) are separate spans linked by identity — see
     "Detach Entry Type" below
@@ -276,10 +276,10 @@ span-ok: op:fetchPayment (success on attempt 3)
 ### Detach Entry Type <a id="smoo/lmao!n/lmao-entry-detach-entry-type"></a>
 
 The `span-detach` entry type provides inspector legibility for **detached Ops** — Ops whose execution outlives their
-dispatch (AxE `31d-streaming-ops`: the handler returns the pending sentinel; the business result arrives later via a
-poller, webhook, or journal attach). It adds **no execution semantics**: retry, result delivery, and suspension are
-unchanged. It exists so one logical Op renders as one story across detach, re-attach, and process restart instead of as
-orphan spans.
+dispatch (the streaming-operations contract: the handler returns the pending sentinel; the business result arrives later
+via a poller, webhook, or journal attach). It adds **no execution semantics**: retry, result delivery, and suspension
+are unchanged. It exists so one logical Op renders as one story across detach, re-attach, and process restart instead of
+as orphan spans.
 
 **When written:**
 

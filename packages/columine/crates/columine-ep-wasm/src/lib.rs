@@ -4,8 +4,8 @@
 //! Parse and CPB1 Compact share the same retained, validated Arrow schema
 //! handle and caller-owned output-buffer protocol.
 //!
-//! Buffer protocol (`src/parse-backend.ts` contract, unlike the axe EP's
-//! `ep_input_ptr` handshake): the caller owns the geometry. JS writes request
+//! Buffer protocol (`src/parse-backend.ts` contract): unlike the earlier EP's
+//! `ep_input_ptr` handshake, the caller owns the geometry. JS writes request
 //! bytes at an offset it chose in the exported memory and passes
 //! `(input_ptr, input_len, output_ptr, output_len)` per call; the result is
 //! `[ResultHeader][Arrow IPC]` at `output_ptr`.
@@ -22,13 +22,13 @@ use columine_event_processor::{
     RESULT_HEADER_SIZE, ResultCode, ResultDiagnostic, write_compact_result_header,
 };
 
-/// Same wire version as the axe EP artifact (one event_processor lineage).
+/// Same wire version as the consumer EP artifact (one event_processor lineage).
 pub const VERSION: u32 = 2;
 
-/// Capacity honesty (post-parity): the deleted Zig silently clamped every
-/// wasm instance to 256 events regardless of the requested capacity; the
-/// requested capacity is honored now. A sanity ceiling guards against
-/// unreasonable requests corrupting the address space.
+/// Capacity honesty (post-parity): the earlier implementation silently
+/// clamped every wasm instance to 256 events regardless of the requested
+/// capacity; the requested capacity is honored now. A sanity ceiling guards
+/// against unreasonable requests corrupting the address space.
 const MAX_EVENT_CAPACITY: u32 = 1 << 20;
 
 struct EpInstance {
