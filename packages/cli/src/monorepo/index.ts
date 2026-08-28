@@ -6,7 +6,12 @@ import { readProjectTargets } from '../nx/index.js';
 import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
-import { applyManagedFiles, printResults, warnOnManagedFileDrift } from './managed-files.js';
+import {
+  applyManagedFiles,
+  printResults,
+  validateDevenvModuleImport,
+  warnOnManagedFileDrift,
+} from './managed-files.js';
 import {
   applyFixableMonorepoDefaults,
   applyNxReleaseDefaults,
@@ -125,7 +130,8 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validatePublicTags(root) +
     validatePublicPackageMetadata(root) +
     validateTestFileLocations(root) +
-    validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets });
+    validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +
+    validateDevenvModuleImport(root);
   if (results.some((result) => result.action === 'drifted') || packageFailures > 0) {
     throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
   }
