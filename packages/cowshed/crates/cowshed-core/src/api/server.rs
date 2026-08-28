@@ -427,6 +427,7 @@ pub const CAPABILITY_METHODS: &[&str] = &[
     "workspace.info",
     "workspace.attach",
     "workspace.grants",
+    "coordinator.rename",
     "coordinator.adopt",
     "coordinator.create",
     "coordinator.fork",
