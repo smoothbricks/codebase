@@ -54,6 +54,7 @@ export function Amount<C extends string>(value: bigint): Amount<C> {
  * Math stays in Basis precision to avoid intermediate rounding.
  * BigInt provides arbitrary precision for intermediate rate calculations.
  */
+export type Basis<C extends string = string> = BigIntBrand<typeof __basisBrand, C>;
 
 /**
  * Constructor for Basis<C>. Currency is a phantom type, not stored at runtime.
