@@ -206,6 +206,7 @@ export interface NxRunManyOptions {
   projects?: string;
   configuration?: string;
   collectOutputs?: string;
+  collectOutputsSourceSha?: string;
   allowEmptyProjects?: boolean;
   projectsWithTargets?: string;
 }
@@ -361,7 +362,11 @@ export async function githubCiNxRunMany(root: string, options: NxRunManyOptions)
   }
   if (options.collectOutputs) {
     const { collectNxOutputs } = await loadOutputBoundary();
-    const sourceSha = await readGitHeadSha(root);
+    // Ambient HEAD identifies the source only when the collecting job is also the
+    // job that publishes it. A job that versions independently commits its own
+    // bump, so its HEAD is a coordinate no other job can name; such callers must
+    // declare the shared coordinate their consumer validates against instead.
+    const sourceSha = options.collectOutputsSourceSha ?? (await readGitHeadSha(root));
     await collectNxOutputs(root, options.collectOutputs, expandNxTargetDependencyRuns(expanded.runs), sourceSha);
   }
   return expanded;

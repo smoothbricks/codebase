@@ -192,6 +192,32 @@ describe('collected Nx outputs', () => {
     });
   });
 
+  it('records the declared source sha when the collecting job commits after checkout', async () => {
+    await withNxRunManyFixture(async ({ root, artifact }) => {
+      const dispatchSha = await readGitHeadSha(root);
+      // Every release-candidate job commits its version bump before building, so
+      // HEAD stops naming the commit the publishing job validates against. Matrix
+      // producers commit once per leg, so ambient HEAD cannot be that identity.
+      await writeFile(join(root, 'bumped.txt'), 'version bump');
+      await $`git add bumped.txt`.cwd(root).quiet();
+      await $`git -c user.name=Test -c user.email=test@example.com commit -q -m bump`.cwd(root).quiet();
+      expect(await readGitHeadSha(root)).not.toBe(dispatchSha);
+
+      await githubCiNxRunMany(root, {
+        targets: '*-linux',
+        projects: 'app',
+        collectOutputs: artifact,
+        collectOutputsSourceSha: dispatchSha,
+      });
+
+      expect(JSON.parse(await readFile(join(artifact, 'manifest.json'), 'utf8'))).toEqual({
+        version: 2,
+        sourceSha: dispatchSha,
+        files: [],
+      });
+    });
+  });
+
   it('runs test for projects selected by platform target ownership', async () => {
     await withNxRunManyFixture(async ({ root }) => {
       await writeFile(join(root, 'packages/app/test-target.ts'), "await Bun.write('test-ran.txt', 'tested');\n");

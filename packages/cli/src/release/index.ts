@@ -264,10 +264,16 @@ export async function releaseCollectPlatformOutputs(
       : `Release platform outputs: building current outputs for ${packageSummary(currentPackages)}.`,
   );
   const outputRoot = resolve(root, options.output);
+  // This job already committed its own version bump, so its HEAD is a coordinate
+  // only it knows. The publishing job validates these outputs against the
+  // dispatch commit, the one identity every producer shares -- including each
+  // architecture of a matrix producer, whose legs each commit separately.
+  const currentSourceSha = options.ref ? await gitSha(root, options.ref) : await gitHead(root);
   const currentRuns = await githubCiNxRunMany(root, {
     targets: options.targets,
     projects: releasePackageProjects(currentPackages),
     collectOutputs: join(outputRoot, 'current'),
+    collectOutputsSourceSha: currentSourceSha,
     allowEmptyProjects: true,
   });
 
