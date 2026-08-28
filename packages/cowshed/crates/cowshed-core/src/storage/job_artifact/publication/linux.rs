@@ -1,7 +1,7 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 
 use super::{ArtifactError, Parent, PublicationStage, publication_error};
 
