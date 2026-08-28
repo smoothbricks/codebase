@@ -1787,6 +1787,20 @@ impl NativeProjectRuntimeHost {
         next.begin(operation);
         self.replace_lifecycle_intents(next).await
     }
+    async fn mark_lifecycle_intent_mutating(&mut self, workspace: &WorkspaceName) -> Result<()> {
+        let mut next = self.lifecycle_intents.clone();
+        next.mark_mutating(workspace)?;
+        self.replace_lifecycle_intents(next).await
+    }
+    async fn discard_prepared_retire_intent(&mut self, workspace: &WorkspaceName) -> Result<()> {
+        let mut next = self.lifecycle_intents.clone();
+        if !next.discard_prepared_retirement(workspace) {
+            return Err(CowshedError::internal(format!(
+                "prepared retirement for {workspace} disappeared during recovery"
+            )));
+        }
+        self.replace_lifecycle_intents(next).await
+    }
 
     async fn complete_lifecycle_intent(
         &mut self,
@@ -1828,25 +1842,29 @@ impl NativeProjectRuntimeHost {
         }
     }
 
-    /// Finishes the create/fork/remove/adopt work a crash left pending, then records the exact
-    /// result so a later start does not repeat it. Reports whether any intent was acted on: the
-    /// completions mutate images and mounts, so a caller holding a host inventory read before
-    /// this call must discard it when the answer is `true`.
+    /// Finishes create/fork/adopt work and authorized retire mutations a crash left pending, then
+    /// records the exact result so a later start does not repeat it. A prepared retirement has not
+    /// mutated anything and is discarded: it may be the residue of a safety refusal, not durable
+    /// authorization to delete on every later command. Reports whether recovery mutated images or
+    /// mounts, so a caller can discard an inventory read only when necessary.
     async fn recover_lifecycle_intents(&mut self) -> Result<bool> {
-        use crate::storage::recovery::{LifecycleIntent, LifecycleIntentCompletion};
+        use crate::storage::recovery::{
+            LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentPhase,
+        };
 
         let pending = self
             .lifecycle_intents
             .records()
             .filter(|(_, record)| record.completion.is_none())
-            .map(|(_, record)| record.operation.clone())
+            .map(|(_, record)| record.clone())
             .collect::<Vec<_>>();
         if pending.is_empty() {
             return Ok(false);
         }
         async {
-            for operation in pending {
-                match operation {
+            for record in pending {
+                let phase = record.phase;
+                match record.operation {
                     LifecycleIntent::Adopt { options } => match self.current(&main_name()).await {
                         Ok(current) => {
                             self.complete_lifecycle_intent(
@@ -1897,6 +1915,31 @@ impl NativeProjectRuntimeHost {
                         }
                         Err(error) => return Err(error),
                     },
+                    LifecycleIntent::Retire {
+                        workspace,
+                        options: _,
+                    } if phase == LifecycleIntentPhase::Prepared => {
+                        match self.current(&workspace).await {
+                            // Existing authoritative state proves retirement never published.
+                            // Discarding this request prevents a refusal from becoming a deferred
+                            // deletion on every later command.
+                            Ok(_) => {
+                                self.discard_prepared_retire_intent(&workspace).await?;
+                            }
+                            // Absence is the publication fence: an older process crossed it but
+                            // died before recording the result, so retain idempotent completion.
+                            Err(error) if error.code == ErrorCode::NotFound => {
+                                self.complete_lifecycle_intent(
+                                    &workspace,
+                                    LifecycleIntentCompletion::Retire(RemoveReport::default()),
+                                )
+                                .await?;
+                            }
+                            // An unreadable target is not evidence either way. Fail closed rather
+                            // than throwing away the only recovery record.
+                            Err(error) => return Err(error),
+                        }
+                    }
                     LifecycleIntent::Retire { workspace, options } => {
                         match self.current(&workspace).await {
                             Ok(_) => {
@@ -4684,6 +4727,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     if !was_pending {
                         self.begin_lifecycle_intent(intent.clone()).await?;
                     }
+                    self.mark_lifecycle_intent_mutating(&workspace).await?;
                     self.remove_project_binding_after_restore().await?;
                     let report = RemoveReport::default();
                     self.complete_lifecycle_intent(
@@ -4697,7 +4741,6 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             }
             Err(error) => return Err(error),
         };
-        self.begin_lifecycle_intent(intent).await?;
 
         if options.restore {
             let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
@@ -4724,6 +4767,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     return Err(error);
                 }
             }
+            if !was_pending {
+                self.begin_lifecycle_intent(intent.clone()).await?;
+            }
+            self.mark_lifecycle_intent_mutating(&workspace).await?;
             let incarnation = current.derived.workspace.incarnation().clone();
             self.stop_supervisor(&workspace).await?;
             let current = self.current(&workspace).await?;
@@ -4790,6 +4837,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let abandoning = self
                 .require_removal_safe(&workspace, options, &final_fence)
                 .await?;
+            if !was_pending {
+                self.begin_lifecycle_intent(intent).await?;
+            }
+            self.mark_lifecycle_intent_mutating(&workspace).await?;
             // The bundle goes in before anything is destroyed: a belt written after the image is
             // gone would have nothing left to read.
             let abandoned = match abandoning {
