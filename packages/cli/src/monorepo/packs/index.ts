@@ -2,6 +2,7 @@ import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { printCommandOutput, runResult, runStatus } from '../../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../../nx/index.js';
+import { validateGoToolchainAgreement } from '../go-toolchain.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
 import { warnOnManagedFileDrift } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
@@ -90,12 +91,17 @@ const packs: MonorepoPack[] = [
       // never a stored template — outside devenv the PATH is not authoritative,
       // mirroring the init-time syncRuntime gate above.
       const runtimeFailures = ctx.syncRuntime ? await validateRootRuntimeVersions(ctx.root) : 0;
+      // Same gate, same reason: the vendored-SDK comparison reads the devenv
+      // profile's own go, so outside devenv there is no authoritative Go to
+      // compare against.
+      const goFailures = ctx.syncRuntime ? await validateGoToolchainAgreement(ctx.root) : 0;
       // Managed-file drift is derived state (CLI template x pinned version) with
       // its own remediation flow; it warns instead of failing so validation only
       // blocks on actual package issues. See warnOnManagedFileDrift.
       await warnOnManagedFileDrift(ctx.root);
       return (
         runtimeFailures +
+        goFailures +
         validateRootPackagePolicy(ctx.root) +
         (await validateToolConfig(ctx.root)) +
         validateNxProjectNames(ctx.root) +
