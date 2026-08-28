@@ -1869,7 +1869,7 @@ mod tests {
     #[tokio::test]
     async fn a_legacy_direct_mount_project_materializes_layout_and_serves_main() {
         let fixture = Fixture::with_checkout_layout("direct-mount", CheckoutLayout::DirectMount);
-        let repo = RepoId::parse("hyperide/axe").expect("repo");
+        let repo = RepoId::parse("example-org/example-app").expect("repo");
         fixture.bind(&repo);
         let (storage, mounted) = fixture.workspace(
             &repo,
@@ -1882,7 +1882,7 @@ mod tests {
         let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
         fs::remove_file(&layout.project().checkout_layout).expect("simulate legacy adoption");
         let (mount, path) = mounted.expect("mounted fixture");
-        assert_eq!(path, fixture.root.join("checkout-axe"));
+        assert_eq!(path, fixture.root.join("checkout-example-app"));
         let source = Arc::new(FixtureSource::default());
         source.projects.lock().expect("source").insert(
             repo.clone(),
@@ -1916,7 +1916,7 @@ mod tests {
     async fn a_malformed_checkout_layout_never_gets_reinterpreted_as_direct_mount() {
         let fixture =
             Fixture::with_checkout_layout("malformed-layout", CheckoutLayout::DirectMount);
-        let repo = RepoId::parse("hyperide/axe").expect("repo");
+        let repo = RepoId::parse("example-org/example-app").expect("repo");
         fixture.bind(&repo);
         let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
         fs::write(&layout.project().checkout_layout, b"{not json").expect("malformed layout");
