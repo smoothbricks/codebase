@@ -1,17 +1,14 @@
-//! The Zig ABI's tombstone: the opcode/undo/rete registries and dispatched
-//! byte sets harvested from the Zig sources at cutover (rust-port, 2026-07-14,
-//! the commit that deleted them). The Zig implementation is gone; these
-//! frozen sets ARE the ground truth the audits compare the Rust registries
-//! against. A deliberate ABI change edits this fixture in the same commit
-//! that changes the registry — the audit failing means the two moved apart
-//! UNINTENTIONALLY.
+//! Frozen registry snapshots used as the ABI audit tripwire. These snapshots
+//! were captured at the Rust port cutover and are the ground truth against
+//! which the live registries are checked. A deliberate ABI change edits this
+//! fixture in the same commit as the registry; an audit failure means the two
+//! moved apart unintentionally.
 //!
-//! `registry_audit` compares each Rust registry against the frozen declaration
-//! sets below. The original Zig sources are not present after cutover; an
-//! intentional ABI change updates the corresponding set with its registry and
-//! `cargo test -p columine-types`.
+//! Each audit compares a Rust registry against the corresponding frozen
+//! declaration set below. Intentional ABI changes update the set together
+//! with its registry and `cargo test -p columine-types`.
 
-pub const TYPES_ZIG_OPCODES: &[(&str, u8)] = &[
+pub const TYPES_OPCODE_REGISTRY: &[(&str, u8)] = &[
     ("batchaggcount", 0x41),
     ("batchaggcountif", 0x45),
     ("batchaggmax", 0x43),
@@ -75,7 +72,7 @@ pub const TYPES_ZIG_OPCODES: &[(&str, u8)] = &[
     ("slotstructmap", 0x18),
     ("slotstructmap2", 0x1b),
 ];
-pub const OPCODES_ZIG_OPCODES: &[(&str, u8)] = &[
+pub const OPCODES_OPCODE_REGISTRY: &[(&str, u8)] = &[
     ("batchaggcount", 0x41),
     ("batchaggcountif", 0x45),
     ("batchaggmax", 0x43),
@@ -135,7 +132,7 @@ pub const OPCODES_ZIG_OPCODES: &[(&str, u8)] = &[
     ("slotstructmap", 0x18),
     ("slotstructmap2", 0x1b),
 ];
-pub const ZIG_DISPATCHED_BYTES: &[u8] = &[
+pub const DISPATCHED_OPCODE_BYTES: &[u8] = &[
     0x00, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e,
     0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x40,
     0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x80, 0x81, 0x82, 0x83, 0x84,
