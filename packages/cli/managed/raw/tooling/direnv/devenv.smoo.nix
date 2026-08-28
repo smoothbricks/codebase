@@ -53,10 +53,15 @@
 
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
   # is part of a cache key, so two of them mean two caches. devenv pins it through
-  # the lock. ttsc's bundled Go is a separate, unavoidable second toolchain: it
-  # exposes no override — which is why its cache is placed in the shared store
-  # rather than left per checkout.
-  languages.go.enable = true;
+  # the lock.
+  #
+  # It arrives via `packages`, NOT `languages.go.enable`, because that option also
+  # exports GOROOT. ttsc ships its own Go SDK and no override for it, so an
+  # exported GOROOT from a different patch release makes its plugin build fail
+  # with `compile: version does not match go tool version`. On PATH only, both
+  # toolchains resolve their own GOROOT and coexist; ttsc's cache lands in the
+  # shared store, which is what stops it costing a rebuild per checkout.
+  packages = [pkgs.go];
 
   enterShell = lib.mkMerge [
     # Prologue, in order:
@@ -104,7 +109,12 @@
     #    relative to the request cwd so workspaces share one cache at any mount
     #    path; crates that compile env!("CARGO_MANIFEST_DIR") into their output fail
     #    closed.
-    # 7. On Darwin, drop nix CC/CXX so xcodebuild finds Xcode's clang (it supports
+    # 7. GOROOT is unset rather than set: ttsc ships its own Go SDK, and any GOROOT
+    #    naming a different patch release makes its plugin build fail with
+    #    `compile: version does not match go tool version`. Both toolchains resolve
+    #    their own GOROOT from their own binary when the variable is absent, so an
+    #    inherited one is always wrong for at least one of them.
+    # 8. On Darwin, drop nix CC/CXX so xcodebuild finds Xcode's clang (it supports
     #    -index-store-path); bun/node native addons find compilers through
     #    node-gyp.
     (lib.mkBefore ''
@@ -121,6 +131,7 @@
         mkdir -p "$TTSC_CACHE_DIR"
       fi
       export GOFLAGS="''${GOFLAGS:--trimpath}"
+      unset GOROOT
       bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
 
       if [ -n "''${SCCACHE_DIR:-}" ] || [ -d "$HOME/.cowshed/caches/sccache" ]; then
