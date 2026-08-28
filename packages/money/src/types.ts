@@ -34,7 +34,8 @@ function brandString(value: string): string {
  * invoice totals, and payment amounts.
  *
  * Precision is defined by the currency registry's `decimals` field.
- * i64 in Zig, giving massive headroom (e.g., $92 quadrillion for USD cents).
+ * BigInt has arbitrary precision, so values retain substantial headroom (e.g.,
+ * $92 quadrillion for USD cents).
  */
 export type Amount<C extends string = string> = BigIntBrand<typeof __amountBrand, C>;
 
@@ -51,9 +52,8 @@ export function Amount<C extends string>(value: bigint): Amount<C> {
  * (e.g., 10 for USD, 18 for ETH).
  *
  * Math stays in Basis precision to avoid intermediate rounding.
- * i128 in Zig for headroom.
+ * BigInt provides arbitrary precision for intermediate rate calculations.
  */
-export type Basis<C extends string = string> = BigIntBrand<typeof __basisBrand, C>;
 
 /**
  * Constructor for Basis<C>. Currency is a phantom type, not stored at runtime.

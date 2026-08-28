@@ -33,7 +33,7 @@ criterion = { version = "0.5", default-features = false }
 lto = true
 codegen-units = 1
 
-# wasm32 export size matters (parity with Zig ReleaseSmall build of allocator.wasm)
+# wasm32 export size matters for the allocator module consumed by the TypeScript host.
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"

@@ -1,10 +1,8 @@
 //! # lmao-wasm
 //!
-//! Drop-in replacement for `dist/allocator.wasm` (built from
-//! `packages/lmao/src/lib/wasm/allocator.zig`). The TS host
-//! (`packages/lmao/src/lib/wasm/wasmAllocator.ts`) does raw
+//! WASM allocator module for the TypeScript host. The host does raw
 //! `WebAssembly.instantiate` with manual `env` imports — NO wasm-bindgen here;
-//! we match that low-level ABI exactly:
+//! this crate exposes the low-level ABI directly:
 //!
 //! - JS owns the memory (`import_memory` semantics): built with
 //!   `-C link-arg=--import-memory` (see .cargo/config.toml in the workspace).
@@ -12,7 +10,8 @@
 //! - Sentinel returns: offset 0 = null/OOM; no Result marshaling across the boundary.
 //! - Packed u64 convention preserved: `alloc_identity_root_for_js_write` returns
 //!   `(identity_offset << 32) | trace_id_field_offset`.
-//! - Export names mirror allocator.zig's export list 1:1, including debug exports.
+//! - Export names match the allocator export list consumed by the TypeScript
+//!   host, including debug exports.
 //!
 //! All logic lives in `lmao_arena::raw`, generic over [`lmao_arena::Mem`]; this
 //! crate only supplies the linear-memory backend ([`WasmMem`]: absolute-offset
@@ -55,17 +54,16 @@ fn date_now() -> f64 {
 }
 
 /// [`Mem`] over WASM linear memory: absolute byte offsets from address 0
-/// (valid on wasm32 — memory starts at 0, mirroring Zig's `allowzero`), with
-/// `memory.size`/`memory.grow` for growth. All accesses are unaligned-safe
-/// (`read_unaligned`/`write_unaligned`) because column values sit at arbitrary
-/// byte offsets after the null bitmap.
+/// (memory starts at 0), with `memory.size`/`memory.grow` for growth. All accesses
+/// are unaligned-safe (`read_unaligned`/`write_unaligned`) because column values
+/// sit at arbitrary byte offsets after the null bitmap.
 #[cfg(target_arch = "wasm32")]
 struct WasmMem;
 
-/// Absolute offset → pointer, laundered through `black_box` so LLVM cannot
-/// prove offset 0 is a null pointer: the header legitimately lives at address 0
-/// of WASM linear memory (Zig needed `allowzero` for the same reason; without
-/// this, LLVM folds header writes into `unreachable` and `reset()` traps).
+/// Absolute offset → pointer, laundered through `black_box` so LLVM cannot prove
+/// offset 0 is a null pointer: the header legitimately lives at address 0 of WASM
+/// linear memory. Without this, LLVM folds header writes into `unreachable` and
+/// `reset()` traps.
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn laundered(off: u32) -> *mut u8 {

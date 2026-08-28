@@ -1,7 +1,6 @@
 //! Arena micro-benchmarks: alloc/free churn, tier churn, and the span hot path
 //! over arena blocks. Shapes mirror benchmarks/js-vs-wasm.bench.ts in
-//! packages/lmao so numbers are comparable across JS / Zig-WASM / Rust-WASM /
-//! native Rust.
+//! packages/lmao so numbers are comparable across JS / Rust-WASM / native Rust.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lmao_arena::raw::{self};

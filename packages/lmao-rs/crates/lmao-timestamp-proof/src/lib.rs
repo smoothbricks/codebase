@@ -1,10 +1,9 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 //! `span_start.{wasm,node}` — timestamp-accuracy proof instrumentation.
 //!
-//! Ports the shared `timestamp_proof_{layout,wasm,napi}.zig` artifacts (228 LOC) into
-//! lmao-rs: this is LMAO proof machinery (measures span-timestamp accuracy
-//! for the proof harness `proofs/timestamp-accuracy.proof.ts`), not
-//! runtime code. Export names are byte-compatible with the Zig artifacts.
+//! This crate implements the proof machinery (measuring span-timestamp accuracy
+//! for the proof harness `proofs/timestamp-accuracy.proof.ts`), not runtime code.
+//! Its WASM and Node-API exports share the fixed proof-buffer layout.
 
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
@@ -16,9 +15,9 @@ pub mod layout;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    //! The `span_start.wasm` exports (timestamp_proof_wasm.zig): JS supplies
-    //! `performanceNow`/`dateNow` and owns the memory (workspace-wide
-    //! `--import-memory`); pointers are u32 offsets into that memory.
+    //! The `span_start.wasm` exports use `performanceNow`/`dateNow`; JS supplies
+    //! both host clocks and owns the imported memory. Pointers are u32 offsets
+    //! into that memory.
 
     use crate::layout;
 
@@ -111,10 +110,9 @@ mod wasm {
 #[cfg_attr(test, allow(dead_code))]
 #[cfg(all(feature = "napi", not(target_arch = "wasm32")))]
 mod node {
-    //! The `span_start.node` surface (timestamp_proof_napi.zig, napi-rs
-    //! replaces napigen): trace-root anchors keyed by the ArrayBuffer's
-    //! data pointer, wall-clock captured at init, monotonic elapsed via
-    //! `Instant` (the `std.time.Timer` equivalent).
+    //! The `span_start.node` surface is the Node-API implementation: trace-root
+    //! anchors are keyed by the ArrayBuffer's data pointer, wall-clock time is
+    //! captured at init, and monotonic elapsed time comes from `Instant`.
 
     use crate::layout;
     use napi::JsArrayBuffer;

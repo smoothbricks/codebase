@@ -1,13 +1,12 @@
-//! Property tests for the arena — the acceptance criteria for the allocator.zig port.
+//! Property tests for the arena's allocation and ownership invariants.
 //!
-//! Semantics note (discovered while porting): buddy merges are ADDRESS-based
-//! (right buddy = offset + block_size). Bump allocation aligns to 8 bytes, so two
-//! consecutively bump-allocated blocks are adjacent ONLY when the block size is a
-//! multiple of 8 (span_system always is; column blocks usually are not because of
-//! the null-bitmap prefix). Merges are therefore guaranteed within SPLIT FAMILIES
-//! (children of one buddy split are exactly adjacent) — the conservation property
-//! is stated over split families, matching the Zig behavior, not over arbitrary
-//! bump-allocated neighbors.
+//! Buddy merges are ADDRESS-based (right buddy = offset + block_size). Bump
+//! allocation aligns to 8 bytes, so two consecutively bump-allocated blocks are
+//! adjacent ONLY when the block size is a multiple of 8 (span_system always is;
+//! column blocks usually are not because of the null-bitmap prefix). Merges are
+//! therefore guaranteed within SPLIT FAMILIES (children of one buddy split are
+//! exactly adjacent) — the conservation property is stated over split families,
+//! not over arbitrary bump-allocated neighbors.
 
 use lmao_arena::raw::{self};
 use lmao_arena::{Arena, Mem, SizeClass, block_size};

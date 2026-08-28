@@ -1,11 +1,10 @@
 //! # lmao-arena
 //!
-//! Port of the buddy/tiered-freelist allocator in
-//! `packages/lmao/src/lib/wasm/allocator.zig` (948 lines), which realizes
-//! `specs/lmao/01q_wasm_memory_architecture.md`.
+//! Arena implementation for the tiered-freelist allocator used by the lmao WASM
+//! host integration.
 //!
-//! Layout facts pinned here MUST stay byte-identical to the Zig side while both
-//! implementations coexist (the TS host reads these structs from linear memory):
+//! Layout facts pinned here MUST stay byte-identical to the TypeScript/WASM ABI
+//! (the TS host reads these structs from linear memory):
 //! - `Header`   = 192 bytes (3 cache lines), 28 freelist heads + identity freelist
 //! - `Identity` = 128 bytes (write_index, span_id, trace_id_len, trace_id[119])
 //! - `TraceRoot` = 16 bytes (wall_clock_nanos i64, monotonic_ms f64)
@@ -20,9 +19,9 @@
 
 /// Minimum span-buffer capacity (rows) — tier 0.
 pub const MIN_CAPACITY: u32 = 8;
-/// Maximum arena capacity tier (rows). NOTE: the arena tops out at 512 (per
-/// allocator.zig); the per-schema ratchet in lmao-core allows 1024 for the pure-Rust
-/// heap path. Do not "fix" one to match the other.
+/// Maximum arena capacity tier (rows). The arena tops out at 512; the per-schema
+/// ratchet in lmao-core allows 1024 for the pure-Rust heap path. Do not "fix" one
+/// to match the other.
 pub const MAX_CAPACITY: u32 = 512;
 pub const NUM_TIERS: usize = 7;
 pub const NUM_SIZE_CLASSES: usize = 4;
@@ -33,7 +32,7 @@ pub const IDENTITY_SIZE: usize = 128;
 pub const TRACE_ROOT_SIZE: usize = 16;
 pub const FREE_BLOCK_SIZE: usize = 20;
 
-/// Size classes, discriminants shared with the Zig/TS ABI.
+/// Size classes, with discriminants shared by the TypeScript/WASM ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SizeClass {
@@ -43,8 +42,8 @@ pub enum SizeClass {
     Col8B = 3,
 }
 
-/// Arena header at offset 0 (mirrors `Header` in allocator.zig; field order and
-/// padding are ABI, verified by the const asserts below).
+/// Arena header at offset 0; field order and padding are ABI, verified by the
+/// const asserts below.
 #[repr(C)]
 #[derive(Debug)]
 pub struct Header {
@@ -60,7 +59,7 @@ pub struct Header {
     _reserved: [u8; 47],
 }
 
-/// Per-span identity block (mirrors `Identity`).
+/// Per-span identity block in the linear-memory ABI.
 #[repr(C)]
 #[derive(Debug)]
 pub struct Identity {
@@ -70,7 +69,7 @@ pub struct Identity {
     pub trace_id: [u8; 119],
 }
 
-/// Per-trace timing anchor (mirrors `TraceRoot`).
+/// Per-trace timing anchor in the linear-memory ABI.
 #[repr(C)]
 #[derive(Debug)]
 pub struct TraceRoot {
@@ -78,7 +77,7 @@ pub struct TraceRoot {
     pub monotonic_ms: f64,
 }
 
-/// Freelist node overlaid on freed block memory (mirrors `FreeBlock`).
+/// Freelist node overlaid on freed block memory in the linear-memory ABI.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FreeBlock {
@@ -94,7 +93,7 @@ const _: () = assert!(size_of::<Identity>() == IDENTITY_SIZE);
 const _: () = assert!(size_of::<TraceRoot>() == TRACE_ROOT_SIZE);
 const _: () = assert!(size_of::<FreeBlock>() == FREE_BLOCK_SIZE);
 
-/// Capacity (power of 2, 8..=512) → tier index 0..=6. `@ctz` trick from the Zig.
+/// Capacity (power of 2, 8..=512) → tier index 0..=6.
 #[inline]
 pub fn capacity_to_tier(capacity: u32) -> usize {
     debug_assert!(capacity.is_power_of_two() && (MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity));
@@ -187,8 +186,8 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// Initialize with a zeroed header and bump pointer at `HEADER_SIZE`
-    /// (mirrors `init()` in allocator.zig).
+    /// Initialize with a zeroed header and bump pointer at `HEADER_SIZE` by
+    /// calling the idempotent raw allocator initializer.
     pub fn new(initial_bytes: usize) -> Self {
         assert!(initial_bytes >= HEADER_SIZE);
         let mut mem = VecMem(vec![0u8; initial_bytes]);
