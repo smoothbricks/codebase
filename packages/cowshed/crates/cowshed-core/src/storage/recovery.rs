@@ -60,6 +60,19 @@ pub enum LifecycleIntentCompletion {
     Workspace(WorkspaceIncarnation),
     Retire(RemoveReport),
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LifecycleIntentPhase {
+    #[default]
+    Prepared,
+    Mutating,
+}
+
+impl LifecycleIntentPhase {
+    fn is_prepared(&self) -> bool {
+        *self == Self::Prepared
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -67,6 +80,10 @@ pub struct LifecycleIntentRecord {
     pub operation: LifecycleIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<LifecycleIntentCompletion>,
+    /// `Prepared` means no irreversible mutation has begun. Recovery may discard a prepared
+    /// retirement; only `Mutating` retirement records carry enough evidence to resume deletion.
+    #[serde(default, skip_serializing_if = "LifecycleIntentPhase::is_prepared")]
+    pub phase: LifecycleIntentPhase,
 }
 
 impl LifecycleIntentRecord {
@@ -74,6 +91,7 @@ impl LifecycleIntentRecord {
         Self {
             operation,
             completion: None,
+            phase: LifecycleIntentPhase::Prepared,
         }
     }
 }
@@ -143,6 +161,39 @@ impl LifecycleIntentJournal {
             operation.target().clone(),
             LifecycleIntentRecord::pending(operation),
         );
+    }
+    pub fn mark_mutating(&mut self, workspace: &WorkspaceName) -> CowshedResult<()> {
+        let record = self.entries.get_mut(workspace).ok_or_else(|| {
+            CowshedError::integrity(
+                format!("lifecycle intent for {workspace} disappeared before mutation"),
+                "reopen cowshed to reconcile lifecycle state",
+            )
+        })?;
+        if record.completion.is_some() {
+            return Err(CowshedError::integrity(
+                format!("completed lifecycle intent for {workspace} cannot begin mutation"),
+                "reopen cowshed to reconcile lifecycle state",
+            ));
+        }
+        record.phase = LifecycleIntentPhase::Mutating;
+        self.validate()
+    }
+
+    /// Forgets one retirement which was proven not to have crossed its mutation fence.
+    ///
+    /// The caller must first observe that the target workspace still exists. Older journals have
+    /// no phase field and deserialize as `Prepared`; host state, not journal age, decides whether
+    /// those records are safe to discard.
+    pub fn discard_prepared_retirement(&mut self, workspace: &WorkspaceName) -> bool {
+        let discard = self.entries.get(workspace).is_some_and(|record| {
+            record.completion.is_none()
+                && record.phase == LifecycleIntentPhase::Prepared
+                && matches!(record.operation, LifecycleIntent::Retire { .. })
+        });
+        if discard {
+            self.entries.remove(workspace);
+        }
+        discard
     }
 
     pub fn complete(
