@@ -5,7 +5,8 @@
 ## Read First
 
 - `CLAUDE.md` — short high-retention rule sheet
-- `.claude/commands/test-results.md` — inspect `.trace-results.db` failures before re-running large suites
+- "Errors, Tracing, And Testing" below — what the trace sink is for, and how to read failures out of it instead of
+  re-running a large suite
 - `specs/lmao/00_package_architecture.md` — read first when changing `packages/lmao` or `packages/arrow-builder`
 
 ## Core Rules
@@ -284,6 +285,10 @@ failures and mapped to platform responses (e.g. Lambda SQS `batchItemFailures`),
 
 `span-err`: expected operational error represented via `ctx.err(...)` / `Err`. `span-exception`: unexpected thrown
 exception (bug/invariant break).
+
+The distinction is asserted over, not merely displayed: a test proves a failure path is operational by matching
+`span-err`, and a `span-exception` surfacing where `span-err` was expected is a bug the trace catches. Keep the two
+honest.
 
 ### NoOpTracer policy
 
@@ -582,11 +587,31 @@ explicitly!
   Direct `bun test` is diagnostic-only, not the standard validation path.
 
 **Repository requirement:** Every package test suite (except `packages/lmao`) MUST be LMAO-traced and MUST flush traces
-through a SQLite sink (local `.trace-results.db` or worker D1 binding such as `TRACE_RESULTS`). Configure SQLite once in
-the package-local tracer module (`src/test-suite-tracer.ts` or vitest equivalent), not in individual tests.
-Preload/setup files must stay wiring-only (one call to setup helper + runner mock bridge when needed). If a
-runner-specific package needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner harness module, not
-in setup files.
+through a SQLite sink (worker packages: a D1 binding such as `TRACE_RESULTS`). Configure SQLite once in the
+package-local tracer module (`src/test-suite-tracer.ts` or vitest equivalent), not in individual tests. Preload/setup
+files must stay wiring-only (one call to setup helper + runner mock bridge when needed). If a runner-specific package
+needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner harness module, not in setup files.
+
+**Why the sink exists — two consumers, both load-bearing:**
+
+1. **Assertions.** Traces are the observable output a test asserts over. Selectors match span name/TEMPLATE and typed
+   columns, never rendered text; negative assertions ("this event never appears") are first-class; ordering asserts use
+   span parentage, not wall-clock. `lmao-query` runs the same selector against the SQLite sink and against in-process
+   Arrow batches, so the sink is an assertion oracle — not a log file, and not optional decoration.
+2. **Post-run inspection.** `.claude/commands/test-results.md` reads failures out of the sink so a human or agent
+   diagnoses them _without re-running the suite_, pulling detail on request instead of scrolling output. CI collects the
+   databases as build artifacts for the same reason.
+
+**Consequences that are easy to get wrong:**
+
+- **The sink's integrity is a correctness dependency of the suite,** not a convenience. Parallel test workers share one
+  database (hence `busy_timeout`), so a journal mode with no on-disk rollback lets one killed worker corrupt the traces
+  the surviving workers assert over — turning a crashed run into a false result rather than a lost diagnostic.
+- **One exported harness constant owns the sink's path.** Never restate the literal in a package, a CI glob, or a doc.
+- **It must live under a directory name project walkers and watchers ignore.** A database in a compiled package's root
+  makes its own per-transaction journal churn look like the project tree changing mid-compile, which breaks
+  transform-generation caching in tools that verify directory membership.
+- **A run that dies is exactly the run whose trace you want.** Never reason about the sink as disposable output.
 
 ### Property-Based Testing with fast-check
 
@@ -731,9 +756,13 @@ TypedArray assignment only
 
 Unified enum for ALL trace events:
 
-**Span lifecycle**: span-start, span-ok, span-err, span-exception **Logging**: info, debug, warn, error **Structured
-data**: tag **Feature flags**: ff-access, ff-usage Entry types use compile-time enum mapping to Uint8Array for 1-byte
-storage.
+**Span lifecycle**: `span-start` 1, `span-ok` 2, `span-err` 3, `span-exception` 4, `span-retry` 5. **Logging**: `trace`
+6, `debug` 7, `info` 8, `warn` 9, `error` 10. **Feature flags**: `ff-access` 11, `ff-usage` 12. **Metrics**:
+`period-start` 13, op counters/durations 14–21, buffer counters 22–24. `ENTRY_TYPE_NAMES` in `schema/systemSchema.ts` is
+authoritative — index it rather than restating these numbers elsewhere.
+
+`tag` is **not** an entry type: tags write attributes onto a row that already exists, so a tagged span produces no extra
+row. Entry types use compile-time enum mapping to Uint8Array for 1-byte storage.
 
 ## Critical Performance Rules (See specs/lmao/01b1_buffer_performance_optimizations.md)
 
