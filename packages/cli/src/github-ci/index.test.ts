@@ -123,15 +123,15 @@ describe('GitHub CI Nx target expansion', () => {
     const project: ProjectTargets = {
       project: 'native',
       root: 'packages/native',
-      targets: ['build', 'compile-linux', 'package-linux'],
+      targets: ['build', 'compile-js', 'package-js'],
       targetDependencies: new Map([
-        ['build', ['compile-*', 'compile-linux']],
-        ['compile-linux', ['package-linux', '^build']],
+        ['build', ['compile-*', 'compile-js']],
+        ['compile-js', ['package-js', '^build']],
       ]),
       targetOutputs: new Map([
         ['build', ['{projectRoot}/dist']],
-        ['compile-linux', ['{projectRoot}/dist/**/*.bin']],
-        ['package-linux', ['{projectRoot}/dist/**/*.tar']],
+        ['compile-js', ['{projectRoot}/dist/**/*.bin']],
+        ['package-js', ['{projectRoot}/dist/**/*.tar']],
       ]),
     };
 
@@ -139,7 +139,7 @@ describe('GitHub CI Nx target expansion', () => {
       expandNxTargetDependencyRuns([{ target: 'build', projects: [project] }]).map(
         (run) => `${run.projects.map((owner) => owner.project).join(',')}:${run.target}`,
       ),
-    ).toEqual(['native:package-linux', 'native:compile-linux', 'native:build']);
+    ).toEqual(['native:package-js', 'native:compile-js', 'native:build']);
   });
 
   it('adds optional stage and streaming before the generic target skip tag only to nx-smart', () => {
@@ -220,15 +220,15 @@ describe('collected Nx outputs', () => {
 
   it('collects aggregate same-project dependency outputs once with dependency ownership', async () => {
     await withOutputFixture(async ({ root, artifact, outputProject }) => {
-      outputProject.targets = ['build', 'compile-linux', 'package-linux'];
+      outputProject.targets = ['build', 'compile-js', 'package-js'];
       outputProject.targetDependencies = new Map([
-        ['build', ['compile-linux']],
-        ['compile-linux', ['package-linux']],
+        ['build', ['compile-js']],
+        ['compile-js', ['package-js']],
       ]);
       outputProject.targetOutputs = new Map([
         ['build', ['{projectRoot}/dist']],
-        ['compile-linux', ['{projectRoot}/dist/**/*.bin']],
-        ['package-linux', ['{projectRoot}/dist/package/**/*.tar']],
+        ['compile-js', ['{projectRoot}/dist/**/*.bin']],
+        ['package-js', ['{projectRoot}/dist/package/**/*.tar']],
       ]);
       await mkdir(join(root, 'packages/app/dist/package'), { recursive: true });
       await writeFile(join(root, 'packages/app/dist/result.bin'), 'linux binary');
@@ -238,9 +238,36 @@ describe('collected Nx outputs', () => {
       const manifest = await collectNxOutputs(root, artifact, runs, SOURCE_SHA);
 
       expect(manifest.files.map((file) => `${file.project}:${file.target}:${file.path}`)).toEqual([
-        'app:package-linux:packages/app/dist/package/release.tar',
-        'app:compile-linux:packages/app/dist/result.bin',
+        'app:package-js:packages/app/dist/package/release.tar',
+        'app:compile-js:packages/app/dist/result.bin',
       ]);
+    });
+  });
+
+  it('leaves platform dependency outputs to the step that selects the platform target', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      outputProject.targets = ['build', 'cli-x64-linux', 'napi-arm64-macos'];
+      outputProject.targetDependencies = new Map([['build', ['cli-x64-linux', 'napi-arm64-macos']]]);
+      outputProject.targetOutputs = new Map([
+        ['build', ['{projectRoot}/dist/ts/**/*.js']],
+        ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']],
+        ['napi-arm64-macos', ['{projectRoot}/dist/native/darwin-arm64']],
+      ]);
+      await mkdir(join(root, 'packages/app/dist/bin/linux-x64-gnu'), { recursive: true });
+      await mkdir(join(root, 'packages/app/dist/native/darwin-arm64'), { recursive: true });
+      await mkdir(join(root, 'packages/app/dist/ts'), { recursive: true });
+      await writeFile(join(root, 'packages/app/dist/ts/index.js'), 'javascript');
+      await writeFile(join(root, 'packages/app/dist/bin/linux-x64-gnu/app'), 'linux binary');
+      await writeFile(join(root, 'packages/app/dist/native/darwin-arm64/app.node'), 'macos binding');
+
+      const buildRuns = expandNxTargetDependencyRuns([{ target: 'build', projects: [outputProject] }]);
+      expect(buildRuns.map((run) => run.target)).toEqual(['build']);
+      const manifest = await collectNxOutputs(root, artifact, buildRuns, SOURCE_SHA);
+      expect(manifest.files.map((file) => file.path)).toEqual(['packages/app/dist/ts/index.js']);
+
+      expect(
+        expandNxTargetDependencyRuns([{ target: 'cli-x64-linux', projects: [outputProject] }]).map((run) => run.target),
+      ).toEqual(['cli-x64-linux']);
     });
   });
 
