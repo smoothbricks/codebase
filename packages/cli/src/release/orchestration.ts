@@ -48,13 +48,29 @@ export interface ReleaseRepairOutputsShell<Package extends ReleasePackageInfo = 
   collectRepairTargetOutputs(target: ReleaseTarget<Package>): Promise<void>;
 }
 
+/**
+ * Versioning computes and writes the release commit. It deliberately has no
+ * tag-creation capability: a candidate that has not yet built, linted, and
+ * tested must not leave a tag behind, and the macOS matrix legs version
+ * concurrently on their own clones. Tags are created once, by the publishing
+ * job, through `runReleaseTag`.
+ */
 export interface ReleaseVersionShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   releasePackagesAtHead(): Promise<Package[]>;
   releaseVersionPackages(bump: string): Promise<Package[]>;
-  ensureLocalReleaseTags(packages: Package[]): Promise<void>;
   gitHead(): Promise<string>;
   runNxReleaseVersion(packages: Package[], bump: string, dryRun: boolean): Promise<Package[]>;
   assertCleanGitTree(): Promise<void>;
+}
+
+export interface ReleaseTagShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
+  releasePackagesAtHead(): Promise<Package[]>;
+  ensureLocalReleaseTags(packages: Package[]): Promise<void>;
+}
+
+export interface ReleaseTagResult<Package extends ReleasePackageInfo = ReleasePackageInfo> {
+  packages: Package[];
+  status: 'tagged' | 'dry-run' | 'no-release';
 }
 
 export interface ReleaseVersionResult<Package extends ReleasePackageInfo = ReleasePackageInfo> {
@@ -70,7 +86,6 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   if (!options.dryRun) {
     const localRelease = await shell.releasePackagesAtHead();
     if (localRelease.length > 0) {
-      await shell.ensureLocalReleaseTags(localRelease);
       return { mode: 'none', packages: localRelease, status: 'already-release-target' };
     }
   }
@@ -93,7 +108,6 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   await shell.assertCleanGitTree();
   const headAfterVersioning = await shell.gitHead();
   const releasedPackages = await shell.releasePackagesAtHead();
-  await shell.ensureLocalReleaseTags(releasedPackages);
   if (headAfterVersioning === headBeforeVersioning) {
     if (releasedPackages.length > 0) {
       return { mode: 'none', packages: releasedPackages, status: 'already-release-target' };
@@ -104,9 +118,31 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
     return { mode: 'none', packages: [], status: 'no-release-needed' };
   }
   if (releasedPackages.length === 0) {
-    throw new Error('Nx created a release commit without current package release tags at HEAD.');
+    throw new Error('Nx created a release commit that versions none of the current release packages.');
   }
   return { mode: 'new', packages: releasedPackages, status: 'new-release' };
+}
+
+/**
+ * Create the annotated release tags at HEAD, and nothing else. This runs in the
+ * publishing job immediately before the npm publish: tag-then-publish spans git
+ * and npm and cannot be made atomic, so the tag is deliberately the earlier of
+ * the two writes and `smoo release repair-pending` reconciles the
+ * tagged-but-not-published window on a later run.
+ */
+export async function runReleaseTag<Package extends ReleasePackageInfo>(
+  shell: ReleaseTagShell<Package>,
+  options: { dryRun: boolean },
+): Promise<ReleaseTagResult<Package>> {
+  const packages = await shell.releasePackagesAtHead();
+  if (packages.length === 0) {
+    return { packages: [], status: 'no-release' };
+  }
+  if (options.dryRun) {
+    return { packages, status: 'dry-run' };
+  }
+  await shell.ensureLocalReleaseTags(packages);
+  return { packages, status: 'tagged' };
 }
 
 export async function completeReleaseAtHead<Package extends ReleasePackageInfo>(
