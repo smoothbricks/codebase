@@ -143,19 +143,54 @@ the next `cowshed exec` plants them. A real directory sitting where a link belon
 workspace's own registry state, and cowshed will not delete it to share the host's.
 
 **Nix cache/state points at the host filesystem.** On declarative hosts the module must own
-`~/.cache/nix → /private/cowshed/caches/nix/cache` and `~/.local/state/nix → /private/cowshed/caches/nix/state`; `adopt` and
-`doctor` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
+`~/.cache/nix → /private/cowshed/caches/nix/cache` and `~/.local/state/nix → /private/cowshed/caches/nix/state`; `adopt`
+and `doctor` only validate. Fix the declarative configuration rather than allowing cowshed to mutate it. The explicit
 `cowshed adopt --imperative-host-setup` fallback is only for a host with no supported declarative owner; it is never an
 automatic recovery from mixed or broken ownership.
 
 ## Path-sensitive caches (why a fresh workspace rebuilds more than expected)
 
 Cargo incremental state and Xcode DerivedData key on **absolute paths**. Main (fixed path) reuses them perfectly; a
-workspace at `<mount-root>/<owner>/<repo>/<workspace>` does not, so first builds there redo path-keyed work even though everything else is
-warm. This is physics, not breakage. Mitigations, in order: let sccache absorb it (shared, path-tolerant for most rustc
-invocations; already wired); add `--remap-path-prefix`/`trim-paths` to your cargo config if the rebuild tax bothers you;
-keep long-lived personal workspaces (their own paths stay stable, so their incremental state stays valid).
-`bun install`, `node_modules`, zig, and gradle caches are path-independent — unaffected.
+workspace at `<mount-root>/<owner>/<repo>/<workspace>` does not, so first builds there redo path-keyed work even though
+everything else is warm. This is physics, not breakage. Mitigations, in order: let sccache absorb it (shared,
+path-tolerant for most rustc invocations; already wired); add `--remap-path-prefix`/`trim-paths` to your cargo config if
+the rebuild tax bothers you; keep long-lived personal workspaces (their own paths stay stable, so their incremental
+state stays valid). `bun install`, `node_modules`, zig, and gradle caches are path-independent — unaffected.
+
+## sccache reports a 0% hit rate and the shared cache never grows
+
+A misdirected cache looks exactly like a broken one. Check where the client is actually writing before believing
+anything about hit rates: from a directory outside every workspace, with `SCCACHE_DIR` and `SCCACHE_CONF` unset,
+
+```
+$ sccache --show-stats | head -3
+Cache location                  Local disk: "/private/cowshed/caches/sccache"
+Max cache size                     200 GiB
+```
+
+`Cache location` must be `/private/cowshed/caches/sccache`. If it names something under `~/Library/Caches` or
+`~/.cache`, that client is filling a private cache nobody reads, the shared store is serving nothing, and the 0% is the
+consequence rather than the fault. `--show-stats` reports the resolved configuration without starting a server, so this
+is safe to run against a live host.
+
+The fix is `cowshed setup`, which writes and owns the `[cache.disk]` table in sccache's own config file (see
+[cli.md](cli.md#cowshed-setup---uninstall---force---mount-root-dir)). Run it and look at the line it prints about that
+file. If it says it **left the file alone**, cowshed found a `cache.disk.dir` it did not write and refused to overwrite
+it; the line names the directory it found. Point that `dir` at `/private/cowshed/caches/sccache` yourself, or delete the
+`[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody chose
+deliberately is not cowshed's to move.
+
+Two symptoms of the same cause worth recognising. **Orphaned stores**: every directory that was ever a wrong destination
+keeps whatever it accumulated, so a host that ran misconfigured for a while has gigabytes in
+`~/Library/Caches/Mozilla.sccache` (and possibly older per-home paths) doing nothing. They are disposable by contract —
+delete them once `--show-stats` names the shared store. **A shrinking shared cache**: a client that finds no daemon
+starts a server of its own over whatever directory its config names, with sccache's 10 GiB default cap unless the config
+says otherwise, and that server will evict a larger shared store down to 10 GiB. This is why the file `setup` writes
+carries a `size` beside the `dir`, and why a hand-edited `[cache.disk]` should carry one too.
+
+A build _inside_ a workspace never depends on any of this: the supervisor exports `SCCACHE_DIR` and
+`SCCACHE_SERVER_UDS`, and the environment beats the config file. The config governs exactly the store-less case — which
+is also why you cannot verify it from a shell that has the project environment loaded.
 
 ## Backup and durability (read once, remember forever)
 
