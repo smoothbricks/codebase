@@ -36,11 +36,11 @@ use crate::undo_log::{
     self, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, SMF_BIT_SET, SMF_ROW_ABSENT,
     SMR_ROW_ABSENT,
 };
+use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
-    PROGRAM_HEADER_SIZE, PROGRAM_MAGIC, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC,
-    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
-    struct_field_size,
+    PROGRAM_HEADER_SIZE, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
+    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -830,10 +830,31 @@ fn state_bytes_entry(offset: u32, len: u8, value: &[u8]) -> FlatUndoEntry {
 }
 
 /// The Zig module globals as one long-lived VM instance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Vm {
     pub undo: UndoState,
     pub bitmap_env: BitmapEnv,
+    accepted_program_magics: &'static [u32],
+}
+
+impl Vm {
+    /// Construct a VM that admits exactly the supplied program magic values.
+    ///
+    /// The slice is `'static` so `Vm` does not carry a viral lifetime parameter;
+    /// embedders with a runtime-computed set can provide a leaked boxed slice.
+    pub fn new(accepted_program_magics: &'static [u32]) -> Self {
+        Self {
+            undo: UndoState::default(),
+            bitmap_env: BitmapEnv::default(),
+            accepted_program_magics,
+        }
+    }
+}
+
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS)
+    }
 }
 
 /// Split-borrow view implementing the container-ops hooks boundary: the undo
@@ -2689,7 +2710,10 @@ impl Vm {
             return INVALID_PROGRAM;
         }
         let content = &program[PROGRAM_HASH_PREFIX as usize..];
-        if bytes::read_u32(content, 0) != PROGRAM_MAGIC {
+        if !state_init::accepts_program_magic(
+            bytes::read_u32(content, 0),
+            self.accepted_program_magics,
+        ) {
             return INVALID_PROGRAM;
         }
         // Content header: magic(4) version(2) numSlots(1) numInputs(1)

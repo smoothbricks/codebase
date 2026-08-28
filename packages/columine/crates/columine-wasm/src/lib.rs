@@ -26,11 +26,11 @@
 // stash and vm_ax_eval's bindings window), which keep their own docs.
 #![allow(clippy::missing_safety_doc)]
 
+use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::ErrorCode;
 use columine_vm::bitmap_ops;
 use columine_vm::state_init;
 use columine_vm::vm::{self as vmops, Vm};
-
 // =============================================================================
 // Runtime statics
 // =============================================================================
@@ -168,7 +168,10 @@ fn err_code(r: Result<(), ErrorCode>) -> u32 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vm_calculate_state_size(program_ptr: *const u8, program_len: u32) -> u32 {
-    state_init::calculate_state_size(unsafe { buf(program_ptr, program_len) })
+    state_init::calculate_state_size(
+        unsafe { buf(program_ptr, program_len) },
+        DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -178,10 +181,14 @@ pub unsafe extern "C" fn vm_init_state(
     program_len: u32,
 ) -> u32 {
     let program = unsafe { buf(program_ptr, program_len) };
-    let size = state_init::calculate_state_size(program);
+    let size = state_init::calculate_state_size(program, DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     __register_region(state_ptr, size as usize);
     let state = unsafe { buf_mut(state_ptr, size) };
-    err_code(state_init::init_state(state, program))
+    err_code(state_init::init_state(
+        state,
+        program,
+        DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -191,9 +198,13 @@ pub unsafe extern "C" fn vm_reset_state(
     program_len: u32,
 ) -> u32 {
     let program = unsafe { buf(program_ptr, program_len) };
-    let size = state_init::calculate_state_size(program);
+    let size = state_init::calculate_state_size(program, DEFAULT_ACCEPTED_PROGRAM_MAGICS);
     let state = unsafe { buf_mut(state_ptr, size) };
-    err_code(state_init::reset_state(state, program))
+    err_code(state_init::reset_state(
+        state,
+        program,
+        DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    ))
 }
 
 #[unsafe(no_mangle)]

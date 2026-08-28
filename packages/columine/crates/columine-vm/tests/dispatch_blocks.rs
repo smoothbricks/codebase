@@ -4,6 +4,7 @@
 //! struct-map iteration + growth through dispatch, and array fields in
 //! struct-map rows. Scenarios and expected values mirror the Zig blocks.
 
+use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, align8,
 };
@@ -25,7 +26,8 @@ const TYPE_A: u32 = 1001;
 fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8> {
     let init_len = init.len() + 1;
     let mut prog = vec![0u8; 32];
-    prog.extend([0x41, 0x58, 0x45, 0x31, 1, 0, num_slots, num_inputs, 0, 0]);
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, num_slots, num_inputs, 0, 0]);
     prog.extend((init_len as u16).to_le_bytes());
     prog.extend((reduce.len() as u16).to_le_bytes());
     prog.extend_from_slice(init);
@@ -50,10 +52,18 @@ fn flat_map(offsets_col: u8, parent_ts_col: u8, inner: &[u8]) -> Vec<u8> {
 }
 
 fn init(prog: &[u8]) -> Vec<u8> {
-    let size = calculate_state_size(prog);
+    let size = calculate_state_size(
+        prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, prog).expect("init_state");
+    init_state(
+        &mut state,
+        prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init_state");
     state
 }
 
@@ -1060,7 +1070,7 @@ fn hashmap_no_timestamp_rejects_latest_max_min_opcodes() {
 #[test]
 fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
     let hex = "0000000000000000000000000000000000000000000000000000000000000000\
-               415845310100010000000a001a0018000600040304040000e001010100000010\
+               434c4d310100010000000a001a0018000600040304040000e001010100000010\
                00e103ff0b00810004030400050106020000";
     let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
     let prog: Vec<u8> = (0..hex.len())
