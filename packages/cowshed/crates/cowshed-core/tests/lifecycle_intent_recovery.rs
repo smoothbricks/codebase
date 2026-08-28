@@ -64,6 +64,12 @@ fn intent(operation: &str) -> LifecycleIntent {
         other => panic!("unknown crash fixture operation {other}"),
     }
 }
+fn retire(name: &str, options: RemoveOptions) -> LifecycleIntent {
+    LifecycleIntent::Retire {
+        workspace: workspace(name),
+        options,
+    }
+}
 
 fn state_path(root: &Path, operation: &str) -> PathBuf {
     match operation {
@@ -175,6 +181,98 @@ fn crash_then_recover(operation: &str) {
         fs::read_to_string(root.path().join("effects")).expect("read effect log"),
         "effect\n",
         "recovery and retry must not apply the lifecycle mutation twice"
+    );
+}
+#[test]
+fn read_only_startup_discards_a_refused_retirement_before_listing() {
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(retire("dirty", RemoveOptions::default()));
+
+    let discarded = journal.discard_prepared_retirement(&workspace("dirty"));
+
+    assert!(discarded);
+    assert!(
+        journal.records().next().is_none(),
+        "a safety refusal must not become read-only startup work"
+    );
+}
+
+#[test]
+fn refused_retirement_cannot_hide_a_later_force_authorization() {
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(retire("dirty", RemoveOptions::default()));
+    assert!(
+        journal.discard_prepared_retirement(&workspace("dirty")),
+        "startup must discard the earlier unforced request before dispatch"
+    );
+
+    journal.begin(retire(
+        "dirty",
+        RemoveOptions {
+            force: true,
+            ..RemoveOptions::default()
+        },
+    ));
+    let record = journal.get(&workspace("dirty")).expect("forced request");
+    let LifecycleIntent::Retire { options, .. } = &record.operation else {
+        panic!("retire request")
+    };
+    assert!(options.force);
+}
+
+#[test]
+fn refused_retirement_cannot_hide_a_later_abandon_authorization() {
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(retire("unlanded", RemoveOptions::default()));
+    assert!(
+        journal.discard_prepared_retirement(&workspace("unlanded")),
+        "startup must discard the earlier non-abandoning request before dispatch"
+    );
+
+    journal.begin(retire(
+        "unlanded",
+        RemoveOptions {
+            abandon: true,
+            ..RemoveOptions::default()
+        },
+    ));
+    let record = journal
+        .get(&workspace("unlanded"))
+        .expect("abandon request");
+    let LifecycleIntent::Retire { options, .. } = &record.operation else {
+        panic!("retire request")
+    };
+    assert!(options.abandon);
+}
+
+#[test]
+fn prepared_retirement_of_one_workspace_cannot_block_an_unrelated_command() {
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(retire("unrelated", RemoveOptions::default()));
+    journal.begin(LifecycleIntent::Create {
+        workspace: workspace("requested"),
+        options: CreateOptions::default(),
+    });
+
+    assert!(journal.discard_prepared_retirement(&workspace("unrelated")));
+    assert!(
+        journal.get(&workspace("requested")).is_some(),
+        "discarding an unstarted retirement must preserve unrelated lifecycle work"
+    );
+}
+#[test]
+fn mutating_retirement_remains_recoverable_after_a_crash() {
+    let name = workspace("retiring");
+    let mut journal = LifecycleIntentJournal::default();
+    journal.begin(retire("retiring", RemoveOptions::default()));
+    journal
+        .mark_mutating(&name)
+        .expect("cross the retirement mutation fence");
+
+    assert!(!journal.discard_prepared_retirement(&name));
+    assert!(
+        journal.get(&name).is_some(),
+        "a crash after mutation begins must retain its recovery record"
     );
 }
 
