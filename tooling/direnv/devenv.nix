@@ -33,11 +33,12 @@ in {
       # The toolchain itself comes from ./devenv.smoo.nix (one nightly for every
       # repository, pinned by devenv.lock). Only this repository's extra targets
       # are declared here, below, via languages.rust.targets.
-      just # Task runner for packages/columine (mirrors lmao-rs/axe justfiles)
+      just # Task runner for packages/columine (mirrors the lmao-rs justfile)
       cargo-nextest # Rust test runner
       cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
-      # Go toolchain for packages/lmao-ttsc/plugin (ttsc transform plugin)
-      go
+      # Go comes from ./devenv.smoo.nix (languages.go), one version for every
+      # repository for the same reason as the Rust toolchain: a compiler is part
+      # of a cache key. packages/lmao-ttsc/plugin builds against it.
       sccache # Rust compiler cache; client of the host-owned daemon (cowshed sccache start)
       # Git hooks and formatters
       git-format-staged
