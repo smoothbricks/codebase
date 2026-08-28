@@ -170,8 +170,9 @@ impl StorageLayout {
     }
     /// Establishes the per-project storage boundary before any project-local metadata is written.
     ///
-    /// Path derivation remains side-effect free; only the adopt provisioning path calls this.
-    #[cfg(target_os = "macos")]
+    /// Path derivation remains side-effect free; only the macOS adopt path calls this in production.
+    /// Test builds retain the platform-neutral filesystem boundary checks on every host.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn provision_project(&self) -> Result<(), StorageLayoutError> {
         verify_no_symlinks(&self.project.store_root, &self.project.project_root)?;
         fs::create_dir_all(&self.project.project_root).map_err(|source| StorageLayoutError::Io {
@@ -533,7 +534,6 @@ mod tests {
         root
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn adopt_provisioning_creates_project_root_before_the_first_journal_write() {
         use crate::api::dto::AdoptOptions;
