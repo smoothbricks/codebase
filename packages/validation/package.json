@@ -57,7 +57,7 @@
   ],
   "dependencies": {
     "tslib": "^2.8.1",
-    "typia": "13.2.0"
+    "typia": "14.0.2"
   },
   "devDependencies": {
     "@ttsc/unplugin": "0.25.0",
