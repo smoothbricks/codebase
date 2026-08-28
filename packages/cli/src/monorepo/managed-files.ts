@@ -187,6 +187,11 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/devenv.smoo.nix',
+    target: 'tooling/direnv/devenv.smoo.nix',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/git-hooks/pre-commit.sh',
     target: 'tooling/git-hooks/pre-commit.sh',
     executable: true,
@@ -509,6 +514,28 @@ export async function validateManagedFiles(root: string): Promise<number> {
     console.error('Managed monorepo files are out of date. Run: smoo monorepo update');
   }
   return failures;
+}
+
+/** The devenv module is inert until the repo-owned devenv.nix imports it. */
+export const DEVENV_MODULE_IMPORT = './devenv.smoo.nix';
+
+/**
+ * Report, never rewrite: the import belongs to a repo-owned Nix file whose
+ * shape this tool has no business editing. A missing import would otherwise be
+ * silent — the managed module simply would not apply.
+ */
+export function validateDevenvModuleImport(root: string): number {
+  const target = join(root, 'tooling/direnv/devenv.nix');
+  if (!existsSync(target)) {
+    return 0;
+  }
+  if (readFileSync(target, 'utf8').includes(DEVENV_MODULE_IMPORT)) {
+    return 0;
+  }
+  console.error(
+    `tooling/direnv/devenv.nix does not import ${DEVENV_MODULE_IMPORT}: add "imports = [${DEVENV_MODULE_IMPORT}];" so the managed shell contract applies`,
+  );
+  return 1;
 }
 
 /**
