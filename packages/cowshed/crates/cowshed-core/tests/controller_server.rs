@@ -277,6 +277,43 @@ async fn assert_clean_disconnect(client: TestClient, server: JoinHandle<cowshed_
         .expect("clean close");
 }
 
+/// Changing a project's identity is coordinator-tier, and stays that way.
+///
+/// The decision that a workspace credential may remain valid across an identity rename rests
+/// entirely on workers being unable to perform one: a credential pins `repo_id`, `workspace` and a
+/// random `workspace_incarnation`, and set-validating the identity axis is only safe while the
+/// holder of such a credential cannot move that axis itself. That is asserted here rather than left
+/// true by inspection, so widening the workspace-authority surface fails a test instead of quietly
+/// changing what the credential means.
+#[tokio::test]
+async fn a_workspace_authority_cannot_reach_any_identity_verb() {
+    const IDENTITY_VERBS: &[&str] = &["coordinator.changeRepoId", "coordinator.adopt"];
+    for verb in IDENTITY_VERBS {
+        assert!(
+            CAPABILITY_METHODS.contains(verb),
+            "{verb} must be a real capability method for this test to mean anything"
+        );
+        assert!(
+            !WORKER_METHODS.contains(verb),
+            "{verb} is an identity operation and must never be reachable by a workspace authority"
+        );
+    }
+
+    let (router, mut records, _actor) = recording_router();
+    let (mut worker, worker_server) = TestClient::connect(worker_authority(), router).await;
+    for verb in IDENTITY_VERBS {
+        let response = worker.request(verb, worker_params(verb), None).await;
+        assert!(
+            !response.envelope.ok,
+            "a workspace authority reached {verb}"
+        );
+        assert!(response.envelope.error.is_some());
+    }
+    // Refused at the authority gate, so the project router never saw them.
+    assert!(records.try_recv().is_err());
+    assert_clean_disconnect(worker, worker_server).await;
+}
+
 #[tokio::test]
 async fn every_capability_method_is_explicitly_routed_or_rejected_by_authority() {
     let (router, mut records, _actor) = recording_router();
