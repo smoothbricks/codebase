@@ -6,6 +6,7 @@ pub mod output;
 pub mod probe;
 pub mod run;
 pub mod runtime;
+pub mod sccache_client_config;
 pub mod sccache_service;
 pub mod setup_service;
 pub mod skill;
