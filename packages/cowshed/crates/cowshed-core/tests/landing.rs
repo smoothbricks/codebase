@@ -19,7 +19,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cowshed_core::api::{LandingCommits, WorkspaceLanding};
 use cowshed_core::landing::{measure, resolve_target};
 
-const GIT: &str = "/usr/bin/git";
 const TARGET: &str = "main";
 
 /// A parent repository plus clones of it, deleted with the test.
@@ -103,7 +102,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(GIT)
+    let output = Command::new("git")
         .arg("-C")
         .arg(root.as_ref())
         .args(args)
@@ -128,7 +127,7 @@ where
 /// intends them to: patch-id ignores the commit header, and pinning it keeps that fact honest
 /// rather than accidental.
 fn commit(root: impl AsRef<Path>, message: &str) {
-    let output = Command::new(GIT)
+    let output = Command::new("git")
         .arg("-C")
         .arg(root.as_ref())
         .args(["commit", "-q", "-m", message])
@@ -265,7 +264,7 @@ async fn content_that_reached_the_target_by_squash_or_rewrite_is_landed_without_
     // And ancestry genuinely disagrees, which is exactly why the gate needed this. Asked in the
     // workspace with main's object store attached, because that is the only place both oids
     // resolve at once — itself a demonstration of why the production path attaches it.
-    let ancestry = Command::new(GIT)
+    let ancestry = Command::new("git")
         .arg("-C")
         .arg(&mount)
         .args(["merge-base", "--is-ancestor", &head, &tip])
@@ -401,7 +400,7 @@ async fn a_clean_merge_does_not_block_a_workspace_whose_commits_are_all_held() {
 async fn an_empty_commit_in_the_range_counts_as_unlanded() {
     let fixture = Fixture::new("empty-commit");
     let mount = fixture.clone_workspace("marker");
-    let output = Command::new(GIT)
+    let output = Command::new("git")
         .arg("-C")
         .arg(&mount)
         .args(["commit", "-q", "--allow-empty", "-m", "a marker commit"])
@@ -416,7 +415,7 @@ async fn an_empty_commit_in_the_range_counts_as_unlanded() {
     assert!(output.status.success(), "empty commit");
 
     // The target gets an empty commit too, so a naive "same patch" rule would match them.
-    let upstream = Command::new(GIT)
+    let upstream = Command::new("git")
         .arg("-C")
         .arg(fixture.parent())
         .args(["commit", "-q", "--allow-empty", "-m", "an upstream marker"])
@@ -455,7 +454,7 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
             OsStr::new("main"),
         ],
     );
-    let rebase = Command::new(GIT)
+    let rebase = Command::new("git")
         .arg("-C")
         .arg(&mount)
         .args(["rebase", "FETCH_HEAD"])
@@ -469,7 +468,7 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
     );
     fs::write(mount.join("base.txt"), "upstream and workspace\n").expect("resolve conflict");
     git(&mount, ["add", "-A"]);
-    let resolved = Command::new(GIT)
+    let resolved = Command::new("git")
         .arg("-C")
         .arg(&mount)
         .args(["-c", "core.editor=true", "rebase", "--continue"])
@@ -587,7 +586,7 @@ async fn alternate_object_store_is_what_makes_the_comparison_possible() {
         .trim()
         .to_owned();
 
-    let visible = Command::new(GIT)
+    let visible = Command::new("git")
         .arg("-C")
         .arg(&mount)
         .args(["cat-file", "-e", &tip])

@@ -10,11 +10,6 @@ use tokio::process::Command;
 
 use crate::error::{CowshedError, Result};
 
-#[cfg(target_os = "macos")]
-pub const GIT: &str = "/usr/bin/git";
-#[cfg(not(target_os = "macos"))]
-pub const GIT: &str = "git";
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {
     pub name: String,
@@ -1852,7 +1847,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::new(GIT);
+    let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(root)
@@ -1951,7 +1946,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CowshedUpstream, FALLBACK_MAIN_REMOTE, GIT, GitRepository, MAIN_REMOTE, MainRemote,
+        CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository, MAIN_REMOTE, MainRemote,
         ensure_git_success, git_message, parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -1967,14 +1962,14 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create test repository");
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .arg(&root)
             .status()
             .expect("run git init");
         assert!(status.success());
         fs::write(root.join("README"), "test\n").expect("write fixture");
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&root)
             .args([
@@ -1988,7 +1983,7 @@ mod tests {
             .status()
             .expect("run git add");
         assert!(status.success());
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&root)
             .args([
@@ -2150,7 +2145,7 @@ mod tests {
     #[tokio::test]
     async fn detached_head_has_no_current_branch() {
         let root = repository();
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&root)
             .args(["switch", "--detach", "--quiet", "HEAD"])
@@ -2270,7 +2265,7 @@ mod tests {
     #[tokio::test]
     async fn prepares_standalone_workspace_branch_and_only_the_local_main_remote() {
         let root = repository();
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&root)
             .args([
@@ -2315,7 +2310,7 @@ mod tests {
     }
 
     fn git_stdout(root: &Path, args: &[&str]) -> String {
-        let output = Command::new(GIT)
+        let output = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(args)
@@ -2479,7 +2474,7 @@ mod tests {
     async fn adoption_refuses_a_branch_or_registration_main_already_holds() {
         let main = repository();
         let mount = clone_image(&main);
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&main)
             .args(["branch", "cowshed/raven"])
@@ -2691,7 +2686,7 @@ mod tests {
             .await
             .expect("prepare workspace");
 
-        let output = Command::new(GIT)
+        let output = Command::new("git")
             .arg("-C")
             .arg(&root)
             .args(["remote", "get-url", MAIN_REMOTE])
@@ -2733,7 +2728,7 @@ mod tests {
                 .await
                 .expect("local head is not remotely preserved")
         );
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&host)
             .args(["update-ref", "refs/remotes/origin/main", &host_head])
@@ -2748,7 +2743,7 @@ mod tests {
         );
 
         let session = host.with_extension("session");
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .args(["clone", "-q"])
             .arg(&host)
             .arg(&session)
@@ -2756,7 +2751,7 @@ mod tests {
             .expect("clone session");
         assert!(status.success());
         fs::write(session.join("session-only"), "unpublished\n").expect("write session change");
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&session)
             .args([
@@ -2770,7 +2765,7 @@ mod tests {
             .status()
             .expect("stage session change");
         assert!(status.success());
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&session)
             .args([
@@ -2796,7 +2791,7 @@ mod tests {
                 .expect("absent session object is not preserved")
         );
 
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(&session)
             .args(["push", "-q", "origin", "HEAD:refs/cowshed/raven/heads/main"])
@@ -2838,14 +2833,14 @@ mod tests {
     /// Commit `label` on top of whatever is checked out in `root`, and answer the new head.
     fn commit_on(root: &Path, label: &str) -> String {
         fs::write(root.join(label), format!("{label}\n")).expect("write fixture change");
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["add", "."])
             .status()
             .expect("run git add");
         assert!(status.success());
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(root)
             .args([
@@ -2860,7 +2855,7 @@ mod tests {
             .status()
             .expect("run git commit");
         assert!(status.success());
-        let output = Command::new(GIT)
+        let output = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "HEAD"])
@@ -2874,7 +2869,7 @@ mod tests {
     }
 
     fn git(root: &Path, args: &[&str]) {
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(args)
@@ -2984,7 +2979,7 @@ mod tests {
             std::process::id(),
             NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let status = Command::new(GIT)
+        let status = Command::new("git")
             .args(["clone", "-q"])
             .arg(&main)
             .arg(&workspace)
@@ -3053,7 +3048,7 @@ mod tests {
         ));
         fs::create_dir_all(&recovery).expect("create empty recovery");
         git(&recovery, &["init", "-q", "--bare", "."]);
-        let verify = Command::new(GIT)
+        let verify = Command::new("git")
             .arg("-C")
             .arg(&recovery)
             .args(["bundle", "verify"])
