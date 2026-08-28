@@ -1,9 +1,9 @@
 //! Test-support parsers for the Zig↔Rust opcode-registry audit tripwire.
 //!
 //! WHY this lives in the library (doc-hidden) instead of a test module: the
-//! audit runs in three crates (columine-types, columine-vm, axe-rete) against
-//! the in-repo Zig sources, and integration tests cannot share code across
-//! crates any other way without duplicating the parser. The module is
+//! audit runs in three crates (columine-types, columine-vm, and a RETE
+//! consumer crate) against the in-repo Zig sources; integration tests cannot
+//! share code across crates any other way without duplicating the parser. The module is
 //! `#[doc(hidden)]`, compiled only when referenced, and has zero runtime
 //! callers.
 //!

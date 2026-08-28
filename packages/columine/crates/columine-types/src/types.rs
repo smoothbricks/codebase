@@ -69,7 +69,7 @@ impl SlotMetaOffset {
 }
 
 /// Bytecode encoding for duration units from the Ax expression language
-/// (specs/axe/10d-ax-expression-language.md). The Zig variants use the short
+/// (the expression-language specification). The Zig variants use the short
 /// forms the JS compiler normalizes to: s, m, h, d, w, M (month), Q (quarter),
 /// y — Rust spells them out; the discriminants are the contract.
 #[repr(u8)]
