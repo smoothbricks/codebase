@@ -19,10 +19,11 @@ use cowshed_core::storage::job_artifact::ArtifactConfig;
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
-    ArtifactSeal, ArtifactSink, ArtifactWrite, CheckpointBarrier, CommitmentDraft, CommitmentSink,
-    DevenvCommandOutput, OutputStream, ProcessEvent, ProcessExit, ProcessSignal,
-    ProcessSpawnRequest, RunningProcess, SessionToken, SpawnSink, WorkspaceAuthoritySnapshot,
-    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
+    CommitmentDraft, CommitmentSink, DevenvCommandOutput, OutputStream, ProcessEvent, ProcessExit,
+    ProcessSignal, ProcessSpawnRequest, RunningProcess, SessionToken, SpawnSink,
+    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    WorkspaceSupervisorHandle,
 };
 
 #[derive(Debug)]
@@ -151,6 +152,7 @@ enum OrderObservation {
 
 struct FakeArtifactSink {
     next: JobId,
+    next_barrier: u64,
     quota: u64,
     jobs: BTreeMap<JobId, FakeArtifactJob>,
     observations: mpsc::UnboundedSender<ArtifactObservation>,
@@ -224,7 +226,9 @@ impl ArtifactSink for FakeArtifactSink {
             .seal(state)
     }
 
-    fn checkpoint(&mut self, barrier_id: u64) -> Result<CheckpointBarrier> {
+    fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
+        let barrier_id = self.next_barrier;
+        self.next_barrier += 1;
         self.observations
             .send(ArtifactObservation::Barrier(barrier_id))
             .expect("artifact observer");
@@ -431,11 +435,58 @@ fn harness_with_devenv_outputs(
         }),
         Box::new(FakeArtifactSink {
             next: JobId::new(start_id).unwrap(),
+            next_barrier: 1,
             quota,
             jobs: BTreeMap::new(),
             observations: artifact_tx,
             order: order_tx.clone(),
         }),
+        Box::new(FakeCommitments {
+            next_order: 1,
+            observations: commitment_tx,
+            order: order_tx,
+        }),
+    )
+    .unwrap();
+    Harness {
+        handle,
+        spawned,
+        process,
+        artifacts,
+        commitments,
+        order,
+        devenv_requests,
+    }
+}
+
+/// A harness whose artifact sink is the production [`ArtifactStoreSink`] over the config's
+/// workspace root, so barrier state persists across supervisors exactly as it does across
+/// `cowshed checkpoint` processes.
+fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
+    let (spawn_tx, spawned) = mpsc::unbounded_channel();
+    let (process_tx, process) = mpsc::unbounded_channel();
+    let (_artifact_tx, artifacts) = mpsc::unbounded_channel();
+    let (commitment_tx, commitments) = mpsc::unbounded_channel();
+    let (order_tx, order) = mpsc::unbounded_channel();
+    let (devenv_tx, devenv_requests) = mpsc::unbounded_channel();
+    let store = ArtifactStoreSink::open(
+        supervisor_config.workspace_root.clone(),
+        &supervisor_config.authority,
+        supervisor_config.artifacts.clone(),
+    )
+    .expect("open artifact store");
+    let handle = WorkspaceSupervisor::start_with_sinks(
+        supervisor_config,
+        Box::new(FakeSpawner {
+            spawned: spawn_tx,
+            process_observations: process_tx,
+            fail_next: false,
+            backpressure: false,
+            order: order_tx.clone(),
+            devenv_requests: devenv_tx,
+            devenv_outputs: VecDeque::new(),
+        }),
+        Box::new(store),
         Box::new(FakeCommitments {
             next_order: 1,
             observations: commitment_tx,
@@ -1085,7 +1136,7 @@ async fn checkpoint_barrier_orders_artifact_digest_before_commitment() {
     let mut h = harness(1, 1024, false, false);
     let barrier = h
         .handle
-        .checkpoint_barrier("checkpoint-1".into(), 1)
+        .checkpoint_barrier("checkpoint-1".into())
         .await
         .unwrap();
     assert_eq!(
@@ -1113,14 +1164,38 @@ async fn checkpoint_barrier_orders_artifact_digest_before_commitment() {
         checkpoint.manifest_batch_sha256,
         barrier.manifest_batch_sha256
     );
-    assert_eq!(
-        h.handle
-            .checkpoint_barrier("checkpoint-2".into(), 1)
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::Conflict
-    );
+    // The sink owns allocation: the next barrier over the same sink is simply the next id.
+    let next = h
+        .handle
+        .checkpoint_barrier("checkpoint-2".into())
+        .await
+        .unwrap();
+    assert_eq!(next.barrier_id, 2);
+}
+
+/// One `cowshed checkpoint` per process: each invocation starts a fresh supervisor over the same
+/// durable artifact store. The barrier sequence is owned by the store, so a later supervisor must
+/// continue where the previous one stopped — and a checkpoint that fails after its barrier must
+/// not wedge the sequence for every checkpoint that follows.
+#[tokio::test]
+async fn a_fresh_supervisor_continues_the_durable_barrier_sequence() {
+    let (supervisor_config, _root) = isolated_config("barrier-durability");
+
+    let first = real_store_harness(supervisor_config.clone())
+        .handle
+        .checkpoint_barrier("checkpoint-1".into())
+        .await
+        .expect("first barrier over an empty store");
+    assert_eq!(first.barrier_id, 1);
+
+    // A second process over the same workspace. The durable store already holds barrier 1;
+    // no session-local counter may contradict it.
+    let second = real_store_harness(supervisor_config)
+        .handle
+        .checkpoint_barrier("checkpoint-2".into())
+        .await
+        .expect("a fresh supervisor must continue the durable barrier sequence");
+    assert_eq!(second.barrier_id, 2);
 }
 
 #[tokio::test]
