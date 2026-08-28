@@ -18,10 +18,10 @@ import {
   createPipeline,
   ErrorCode,
   HEADER_SIZE,
-  MAGIC,
   Opcode,
   type ParseCompactBackend,
   PROGRAM_HASH_PREFIX,
+  PROGRAM_MAGIC,
   SlotType,
   ValueType,
 } from '../index.js';
@@ -77,11 +77,11 @@ function buildProgram(opts: {
   // [32..] content header + init + reduce
 
   const base = PROGRAM_HASH_PREFIX;
-  // Magic "AXE1" (little-endian)
-  program[base + 0] = MAGIC & 0xff;
-  program[base + 1] = (MAGIC >> 8) & 0xff;
-  program[base + 2] = (MAGIC >> 16) & 0xff;
-  program[base + 3] = (MAGIC >> 24) & 0xff;
+  // Program magic is encoded as little-endian bytes.
+  program[base + 0] = PROGRAM_MAGIC & 0xff;
+  program[base + 1] = (PROGRAM_MAGIC >> 8) & 0xff;
+  program[base + 2] = (PROGRAM_MAGIC >> 16) & 0xff;
+  program[base + 3] = (PROGRAM_MAGIC >> 24) & 0xff;
 
   // Version 1.0
   program[base + 4] = 1;

@@ -21,10 +21,10 @@ import {
   createPipeline,
   ErrorCode,
   HEADER_SIZE,
-  MAGIC,
   Opcode,
   type ParseCompactBackend,
   PROGRAM_HASH_PREFIX,
+  PROGRAM_MAGIC,
   type ReducerProgram,
   SlotType,
   SlotTypeFlag,
@@ -102,6 +102,7 @@ function buildProgram(opts: {
     | { type: 'condition-tree' }
   >;
   numInputs: number;
+  magic?: number;
   reduceOps: number[];
 }): Uint8Array {
   const initCode: number[] = [];
@@ -147,11 +148,12 @@ function buildProgram(opts: {
   // [32..] content header + init + reduce
 
   const base = PROGRAM_HASH_PREFIX;
-  // Magic "AXE1" (little-endian)
-  program[base + 0] = MAGIC & 0xff;
-  program[base + 1] = (MAGIC >> 8) & 0xff;
-  program[base + 2] = (MAGIC >> 16) & 0xff;
-  program[base + 3] = (MAGIC >> 24) & 0xff;
+  const magic = opts.magic ?? PROGRAM_MAGIC;
+  // Program magic is encoded as little-endian bytes.
+  program[base + 0] = magic & 0xff;
+  program[base + 1] = (magic >> 8) & 0xff;
+  program[base + 2] = (magic >> 16) & 0xff;
+  program[base + 3] = (magic >> 24) & 0xff;
 
   // Version 1.0
   program[base + 4] = 1;
@@ -181,6 +183,33 @@ function buildProgram(opts: {
 
   return program;
 }
+
+// =============================================================================
+// Program magic admission
+// =============================================================================
+
+describe('Program magic admission', () => {
+  let backend: ColumineBackend;
+
+  beforeAll(async () => {
+    if (!WASM_EXISTS) return;
+    backend = await loadColumineWasm(WASM_PATH);
+  });
+
+  it.skipIf(!WASM_EXISTS)('rejects foreign magics by default and admits an embedder-provided magic', async () => {
+    const foreignMagic = 0xdead_beef;
+    const bytecode = buildProgram({
+      slots: [{ type: 'hashset', capacity: 4 }],
+      numInputs: 1,
+      reduceOps: [],
+      magic: foreignMagic,
+    });
+
+    await expect(backend.loadProgram(bytecode)).rejects.toThrow('Invalid program: bad magic');
+    const program = await backend.loadProgram(bytecode, [PROGRAM_MAGIC, foreignMagic]);
+    expect(program.numSlots).toBe(1);
+  });
+});
 
 // =============================================================================
 // SC1: Reduce stage for aggregation
