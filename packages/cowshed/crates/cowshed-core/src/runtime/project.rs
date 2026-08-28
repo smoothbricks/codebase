@@ -1919,6 +1919,7 @@ impl NativeProjectRuntimeHost {
                         workspace,
                         options: _,
                     } if phase == LifecycleIntentPhase::Prepared => {
+                        let expected_mount = self.workspace_mount_path(&workspace)?;
                         match self.current(&workspace).await {
                             // Existing authoritative state proves retirement never published.
                             // Discarding this request prevents a refusal from becoming a deferred
@@ -1936,8 +1937,17 @@ impl NativeProjectRuntimeHost {
                                 .await?;
                             }
                             // An unreadable target is not evidence either way. Fail closed rather
-                            // than throwing away the only recovery record.
-                            Err(error) => return Err(error),
+                            // than throwing away the only recovery record, and say which target
+                            // must become readable before startup can decide safely.
+                            Err(error) => {
+                                return Err(
+                                    crate::storage::recovery::prepared_retirement_unreadable(
+                                        &workspace,
+                                        &expected_mount,
+                                        error,
+                                    ),
+                                );
+                            }
                         }
                     }
                     LifecycleIntent::Retire { workspace, options } => {
