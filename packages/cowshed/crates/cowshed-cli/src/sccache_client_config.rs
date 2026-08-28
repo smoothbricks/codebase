@@ -37,6 +37,9 @@ use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+mod native;
+use native::config_directories;
+
 /// The leaf name sccache looks for in its config directory.
 const CONFIG_LEAF: &str = "config";
 
@@ -188,29 +191,6 @@ pub fn client_config_path(home: &Path) -> PathBuf {
                 .expect("every platform has at least one sccache config directory")
                 .join(CONFIG_LEAF)
         })
-}
-
-/// Every directory sccache consults, in the order it consults them.
-#[cfg(target_os = "macos")]
-fn config_directories(home: &Path) -> Vec<PathBuf> {
-    let bundle = "Mozilla.sccache";
-    vec![
-        home.join("Library/Application Support").join(bundle),
-        home.join("Library/Preferences").join(bundle),
-    ]
-}
-
-/// `$XDG_CONFIG_HOME/sccache`, falling back to `~/.config/sccache`.
-///
-/// A relative `XDG_CONFIG_HOME` is ignored rather than joined, exactly as the XDG specification
-/// and the `directories` crate treat it.
-#[cfg(not(target_os = "macos"))]
-fn config_directories(home: &Path) -> Vec<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".config"));
-    vec![base.join("sccache")]
 }
 
 /// Read the file sccache would load, decide, and act — the only function here that touches disk.
