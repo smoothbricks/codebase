@@ -1,6 +1,5 @@
 pub mod native;
 
-use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,10 +45,6 @@ pub struct ApfsSubstrateConfig {
     pub checkout_layout: CheckoutLayout,
     pub case_sensitivity: ApfsCaseSensitivity,
     pub capacity: ImageCapacity,
-    /// The identities this project's binding records having held before, shared so that building a
-    /// [`MarkerExpectation`] per mount costs an atomic increment. Empty for a project that has
-    /// never changed identity, which is every project until `cowshed mv main --repo-id` runs.
-    pub former_repo_ids: Arc<BTreeSet<RepoId>>,
 }
 
 impl ApfsSubstrateConfig {
@@ -67,7 +62,6 @@ impl ApfsSubstrateConfig {
             checkout_layout,
             case_sensitivity,
             capacity: DEFAULT_IMAGE_CAPACITY,
-            former_repo_ids: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -97,23 +91,29 @@ impl ApfsSubstrateConfig {
         }
     }
 
-    /// The same project, answering to a different identity.
+    /// Every identity the project answering to `current` owns, read from its own binding.
     ///
-    /// Carries the same whole-config-clone discipline as [`Self::rebind_checkout`] and for the same
-    /// reason: an outstanding clone must never see a marker expectation built from one identity set
-    /// while its host validates against another.
-    pub fn rebind_former_repo_ids(&self, former_repo_ids: BTreeSet<RepoId>) -> Self {
-        Self {
-            former_repo_ids: Arc::new(former_repo_ids),
-            ..self.clone()
-        }
-    }
-
-    /// The full owned set for one of this project's workspaces. `current` comes from the workspace
-    /// handle in hand rather than the config, because the config describes a project and the
-    /// question is always asked about a specific workspace of it.
+    /// Read at the point of use rather than carried in the config, because the config is built in
+    /// two places — the project runtime, which holds the binding, and the gateway inventory host,
+    /// which does not — and a set that only one of them could populate is a set the other would
+    /// silently narrow to nothing. The binding beside the project directory is the authority both
+    /// can reach.
+    ///
+    /// A binding that is absent, unreadable, or does not answer to `current` yields the tightest
+    /// possible set. Widening acceptance on no evidence is never the safe direction.
     pub fn owned_repo_ids(&self, current: &RepoId) -> OwnedRepoIds {
-        OwnedRepoIds::from_parts(current.clone(), Arc::clone(&self.former_repo_ids))
+        let Ok(layout) = StorageLayout::new(&self.store_root, current) else {
+            return OwnedRepoIds::sole(current.clone());
+        };
+        let Ok(binding) = crate::metadata::read_json::<crate::repository::RepositoryBinding>(
+            &layout.project().repository_binding,
+        ) else {
+            return OwnedRepoIds::sole(current.clone());
+        };
+        match binding.owned_repo_ids() {
+            Ok(owned) if owned.current() == current => owned,
+            _ => OwnedRepoIds::sole(current.clone()),
+        }
     }
 
     pub fn with_capacity(mut self, capacity: ImageCapacity) -> Self {

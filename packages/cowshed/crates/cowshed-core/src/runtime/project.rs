@@ -1723,13 +1723,6 @@ impl NativeProjectRuntimeHost {
             &git_root,
             checkout_layout,
             crate::apfs::ApfsCaseSensitivity::Sensitive,
-        )
-        .rebind_former_repo_ids(
-            binding
-                .owned_repo_ids()
-                .map_err(native_integrity_error)?
-                .former()
-                .clone(),
         );
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
             crate::apfs::SystemCommandRunner,
@@ -1770,7 +1763,11 @@ impl NativeProjectRuntimeHost {
         })??;
         let verified_facts = verified_recovery_facts(&facts, &pending);
         if let Some(origin) = origin.as_ref() {
-            validate_workspace_origin_against_inventory(origin, &verified_facts)?;
+            validate_workspace_origin_against_inventory(
+                origin,
+                &binding.owned_repo_ids().map_err(native_integrity_error)?,
+                &verified_facts,
+            )?;
         }
         // Authority is the inventory itself: an incarnation that is both an active storage fact
         // and a retired (trashed) one is a host-side integrity fault, found here in one pass —
@@ -2313,21 +2310,17 @@ impl NativeProjectRuntimeHost {
     /// Rebuild the substrate after the repository namespace has moved.
     ///
     /// Carries the same swap-the-whole-triple discipline as [`Self::rebind_checkout`], and adds the
-    /// binding's newly recorded former identity to the config so that marker and certificate
-    /// validation keeps accepting images the change could not reach. The Git checkout stays where
-    /// it is and its remote is deliberately untouched.
+    /// same reason. The Git checkout stays where it is and its remote is deliberately untouched.
     fn rebind_repo_id(
         &mut self,
         repo_id: RepoId,
         binding: RepositoryBinding,
         layout: crate::storage::StorageLayout,
     ) -> Result<()> {
-        let former = binding
-            .owned_repo_ids()
-            .map_err(native_integrity_error)?
-            .former()
-            .clone();
-        let config = self.substrate_config.rebind_former_repo_ids(former);
+        // The config carries no identity: `owned_repo_ids` reads the binding beside the project
+        // directory, which the namespace move has already put in place. Rebuilding the triple is
+        // still required, because the layout the host derives paths from has changed.
+        let config = self.substrate_config.clone();
         self.rebind_substrate(config)?;
         self.layout = layout;
         self.descriptor.repo_id = repo_id;
@@ -5152,7 +5145,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(native_storage_error)?;
         let main_mount = self.workspace_mount_path(&main_name())?;
         let project_root = self.descriptor.git_root.clone();
-        self.repair_one_workspace_record(&current, &main_name(), &main_mount, &project_root)
+        // Re-read after mounting: `current` was resolved while main was still detached, and the
+        // repair takes the mounted branch — the one that reaches the in-image marker — only for a
+        // workspace it observes as mounted.
+        let mounted_main = self.current(&main_name()).await?;
+        self.repair_one_workspace_record(&mounted_main, &main_name(), &main_mount, &project_root)
             .await?;
         // The volume label is human-facing and carries no identity — nothing parses it and nothing
         // classifies a volume by it — so relabelling is cosmetic and needs no recovery. It is done
@@ -6247,7 +6244,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         crate::storage::lifecycle::MountState::Mounted { .. } => {
                             let marker_path =
                                 expected_mount.join(crate::storage::WORKSPACE_MARKER_PATH);
-                            let expected_repo = self.descriptor.repo_id.clone();
+                            let expected_repos = self.owned_repo_ids()?;
                             let expected_workspace = workspace_name.clone();
                             let expected_incarnation =
                                 workspace.derived.workspace.incarnation().clone();
@@ -6262,7 +6259,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                                 Ok(Ok(marker)) => findings.extend(diagnose_mounted_marker(
                                     &workspace_name,
                                     &marker,
-                                    &expected_repo,
+                                    &expected_repos,
                                     &expected_workspace,
                                     &expected_incarnation,
                                     &expected_project_root,
@@ -6940,13 +6937,30 @@ async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<Work
     }))
 }
 
+/// Does the marker the caller was reached through name a workspace the store still has?
+///
+/// The repository axis is a membership test, because the marker is the one stamp an identity change
+/// cannot reach inside an image it is not mounting. A project that has been renamed is reached
+/// through a marker naming an identity it recorded as former, and refusing that would refuse to open
+/// the very project the change produced. The workspace name and its random incarnation still have to
+/// match a live storage fact exactly, so a marker from some other workspace is still refused.
 #[cfg(target_os = "macos")]
 fn validate_workspace_origin_against_inventory(
     origin: &WorkspaceOrigin,
+    owned_repo_ids: &OwnedRepoIds,
     facts: &[&crate::storage::lifecycle::StorageFact],
 ) -> Result<()> {
+    if !owned_repo_ids.accepts(&origin.repo_id) {
+        return Err(CowshedError::conflict(
+            format!(
+                "workspace marker identity {} is not owned by project {owned_repo_ids}",
+                origin.repo_id
+            ),
+            "reopen from a workspace whose marker matches active storage",
+        ));
+    }
     if facts.iter().any(|fact| {
-        fact.workspace.repo() == &origin.repo_id
+        owned_repo_ids.accepts(fact.workspace.repo())
             && fact.workspace.name() == &origin.workspace
             && fact.workspace.incarnation() == &origin.workspace_incarnation
     }) {
@@ -8673,14 +8687,17 @@ fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> boo
 fn diagnose_mounted_marker(
     workspace_name: &WorkspaceName,
     marker: &crate::metadata::WorkspaceMarker,
-    expected_repo: &crate::repository::RepoId,
+    expected_repos: &OwnedRepoIds,
     expected_workspace: &WorkspaceName,
     expected_incarnation: &crate::metadata::WorkspaceIncarnation,
     expected_project_root: &Path,
     marker_path: PathBuf,
 ) -> Vec<crate::api::dto::Finding> {
     let mut findings = Vec::new();
-    if marker.repo_id != *expected_repo
+    // A marker naming an identity this project recorded as former is a stamp an identity change
+    // could not reach, not a fault: the volume is this workspace's, and attach converges the stamp.
+    // Reporting it as an error would leave a healthy renamed project permanently red.
+    if !expected_repos.accepts(&marker.repo_id)
         || marker.workspace != *expected_workspace
         || marker.workspace_incarnation != *expected_incarnation
     {
@@ -8878,7 +8895,7 @@ mod doctor_hint_tests {
         let findings = diagnose_mounted_marker(
             &workspace,
             &marker("/tmp/recorded-checkout", "raven"),
-            &repo,
+            &OwnedRepoIds::sole(repo.clone()),
             &workspace,
             &incarnation,
             &actual,
@@ -8915,7 +8932,7 @@ mod doctor_hint_tests {
         let findings = diagnose_mounted_marker(
             &workspace,
             &marker("/tmp/same-checkout", "raven"),
-            &repo,
+            &OwnedRepoIds::sole(repo.clone()),
             &workspace,
             &incarnation,
             &root,
@@ -8931,7 +8948,7 @@ mod doctor_hint_tests {
         let findings = diagnose_mounted_marker(
             &workspace,
             &marker("/tmp/same-checkout", "other"),
-            &repo,
+            &OwnedRepoIds::sole(repo.clone()),
             &workspace,
             &incarnation,
             &root,
@@ -9361,10 +9378,19 @@ mod workspace_origin_tests {
             ),
             volume_key: "disk-stale-session".to_owned(),
         };
-        validate_workspace_origin_against_inventory(&origin, &[&stale_session_fact])
+        let owned = OwnedRepoIds::sole(origin.repo_id.clone());
+        validate_workspace_origin_against_inventory(&origin, &owned, &[&stale_session_fact])
             .expect_err("marker and active storage incarnations must agree");
-        validate_workspace_origin_against_inventory(&origin, &[&session_fact])
+        validate_workspace_origin_against_inventory(&origin, &owned, &[&session_fact])
             .expect("marker repo, workspace, and incarnation match storage");
+        // A marker naming an identity the project does not own is still refused, which is what
+        // keeps the membership test from becoming "any repo id".
+        validate_workspace_origin_against_inventory(
+            &origin,
+            &OwnedRepoIds::sole(RepoId::parse("acme/unrelated").expect("repo")),
+            &[&session_fact],
+        )
+        .expect_err("a marker identity the project does not own must be refused");
 
         let session_incarnation = incarnation("00000000000000000000000000000001");
         let session_workspace = DerivedWorkspace {

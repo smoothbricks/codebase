@@ -1505,6 +1505,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// nothing classifies a volume by it — so the marker, written under the same staging fence
     /// that stamps the label, is the only thing that separates our volume from an unrelated one
     /// mounted at the same path. A marker that cannot be read is not ours.
+    ///
+    /// The repository axis is a membership test for the same reason [`MarkerExpectation`] carries a
+    /// set: an identity change cannot reach the marker inside an image it is not mounting, so a
+    /// renamed project legitimately re-mounts a volume still stamped with a name it used to hold.
+    /// The workspace name and its random incarnation still have to match exactly.
     fn mount_carries_marker(
         &self,
         mount_point: &Path,
@@ -1512,8 +1517,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         workspace: &WorkspaceName,
         incarnation: &WorkspaceIncarnation,
     ) -> bool {
+        let owned = self.config.owned_repo_ids(repo);
         WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH)).is_ok_and(|marker| {
-            marker.repo_id == *repo
+            owned.accepts(&marker.repo_id)
                 && marker.workspace == *workspace
                 && marker.workspace_incarnation == *incarnation
         })
