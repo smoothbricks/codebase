@@ -37,16 +37,23 @@
     # 5. enter-shell.ts chdirs to the workspace root and runs setup-environment.ts;
     #    a failed bootstrap aborts shell entry instead of yielding a half-working
     #    shell.
-    # 6. rustc is wrapped only where a compile cache is actually owned. A cowshed
-    #    workspace is a short-lived fork whose target/ arrived by clone, and one
-    #    host daemon serves every workspace on the machine, so a shared cache is
-    #    the right trade. The socket path is a fixed convention rather than
-    #    something cowshed injects: a client that finds no daemon compiles
+    # 6. rustc is wrapped wherever a compile cache is owned, and CARGO_INCREMENTAL
+    #    is deliberately left unset. sccache only refuses when that variable is
+    #    set: with it unset, cargo keeps incremental for local dev units (sccache
+    #    reports them non-cacheable and forwards them, which costs nothing because
+    #    an agent's own edit is novel input that could never hit) while every unit
+    #    cargo compiles non-incrementally — registry dependencies, `incremental =
+    #    false` profiles, release and platform builds — goes through the cache and
+    #    can hit work another workspace already did. Setting CARGO_INCREMENTAL=0
+    #    bought nothing and surrendered the inner loop.
+    #
+    #    A cowshed workspace is a short-lived fork whose target/ arrived by clone,
+    #    and one host daemon serves every workspace on the machine, so the shared
+    #    store is the right trade. The socket path is a fixed convention rather
+    #    than something cowshed injects: a client that finds no daemon compiles
     #    uncached, which is why the workspace shell exports the endpoint itself.
-    #    Main is the one long-lived checkout you keep rebuilding — incrementality
-    #    beats the cache there and sccache refuses incremental compilations
-    #    outright — so main stays unwrapped, as does a plain clone, which would
-    #    otherwise grow a store nobody ever reclaims. A CI runner that owns a
+    #    Main and plain clones stay unwrapped — nothing owns a store there, and an
+    #    unowned store is one nobody ever reclaims. A CI runner that owns a
     #    persistent SCCACHE_DIR opts in the same way. The endpoint is derived only
     #    inside the branch that uses it, so re-entering the shell cannot promote
     #    main into the wrapped branch. SCCACHE_BASEDIR_CWD=1 activates the patched
@@ -70,11 +77,9 @@
         export SCCACHE_SERVER_UDS="''${SCCACHE_SERVER_UDS:-$HOME/.cowshed/sccache.sock}"
         export RUSTC_WRAPPER=sccache
         export SCCACHE_BASEDIR_CWD=1
-        export CARGO_INCREMENTAL=0
       elif [ -n "''${SCCACHE_DIR:-}" ]; then
         export RUSTC_WRAPPER=sccache
         export SCCACHE_BASEDIR_CWD=1
-        export CARGO_INCREMENTAL=0
       fi
 
       ${lib.optionalString pkgs.stdenv.isDarwin "unset CC CXX"}
