@@ -5,6 +5,11 @@ import {
   checkWorkspaceBoundedTestTargetPolicy,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
 import {
+  CARGO_CROSS_LINT_TARGET,
+  CROSS_CHECK_SCRIPT_COMMAND,
+  CROSS_CHECK_SCRIPT_NAME,
+} from '@smoothbricks/nx-plugin/cross-check-policy';
+import {
   applyPackageTargetPolicy,
   checkPackageTargetPolicy,
   type PackageTargetPolicyOptions,
@@ -59,6 +64,10 @@ export { SMOO_NX_RELEASE_TAG_PATTERN, SMOO_NX_VERSION_ACTIONS };
 // Renovate both emit it) for lockfile/patch/root-manifest changes.
 const extraCommitScopes = ['release', 'deps'];
 const rootScriptPolicy: Record<string, string> = {
+  // The Linux compile gate's developer entry point. Installed by `smoo` into
+  // every repo alongside the managed devenv profile it activates, so the fleet
+  // rule that devenv equals CI holds for the cross arm too.
+  [CROSS_CHECK_SCRIPT_NAME]: CROSS_CHECK_SCRIPT_COMMAND,
   clean: 'nx run-many -t clean; nx reset',
   'clean:node_modules': 'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
   'format:changed': 'git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged',
@@ -458,6 +467,7 @@ export function validatePublicPackageMetadata(root: string): number {
 export function validateWorkspaceDependencies(root: string, options: PackageTargetPolicyOptions = {}): number {
   let failures = 0;
   failures += validateCiSkipTags(root, options);
+  failures += validateCargoCrossLintTargets(root, options);
   const workspaceNames = new Set(getWorkspacePackages(root).map((pkg) => pkg.name));
   for (const pkg of listPackageJsonRecords(root)) {
     for (const field of workspaceDependencyFields) {
@@ -514,6 +524,35 @@ function validateCiSkipTags(root: string, options: PackageTargetPolicyOptions): 
         failures++;
       }
     }
+  }
+  return failures;
+}
+
+/**
+ * Every Cargo workspace must carry the Linux cross-lint target. The plugin
+ * infers it, so an absence means the target was declared away, the plugin is
+ * stale, or the project is no longer recognised as a Cargo workspace — and in all
+ * three cases a Rust project silently stops being checked against the platform CI
+ * actually validates on. That silence is the whole defect class this target
+ * exists to end, so it is reported rather than repaired: which of the three
+ * causes applies changes the correct fix, and guessing would hide the reason.
+ *
+ * Keyed off `cargo-lint`, the sibling target inferred from the same `[workspace]`
+ * Cargo.toml, so this check needs no second opinion about what a Rust project is.
+ */
+function validateCargoCrossLintTargets(root: string, options: PackageTargetPolicyOptions): number {
+  let failures = 0;
+  for (const pkg of getWorkspacePackages(root)) {
+    const resolved = options.resolvedTargetsByProject?.get(pkg.projectName);
+    const resolvedTargets = resolved && 'targets' in resolved ? resolved.targets : resolved;
+    if (!resolvedTargets?.has('cargo-lint') || resolvedTargets.has(CARGO_CROSS_LINT_TARGET)) {
+      continue;
+    }
+    console.error(
+      `${pkg.path}: Cargo workspace has cargo-lint but no ${CARGO_CROSS_LINT_TARGET}, so its Linux arm is never compiled. ` +
+        `Remove any local ${CARGO_CROSS_LINT_TARGET} override, or rebuild @smoothbricks/nx-plugin if it is stale.`,
+    );
+    failures++;
   }
   return failures;
 }
