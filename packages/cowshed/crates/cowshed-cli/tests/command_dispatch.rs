@@ -342,6 +342,7 @@ fn workspace_for(repo_id: &str, name: &str, state: WorkspaceState) -> WorkspaceI
         created_at: Some(UtcTimestamp::new("2026-07-14T00:00:00Z").unwrap()),
         checkpoints: Vec::new(),
         snapshot_stale: false,
+        landing: None,
     }
 }
 

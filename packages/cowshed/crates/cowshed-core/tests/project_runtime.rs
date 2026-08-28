@@ -238,6 +238,7 @@ impl FakeHost {
                 created_at: None,
                 checkpoints: workspace.checkpoints.clone(),
                 snapshot_stale: false,
+                landing: None,
             },
             grants: workspace.grants.clone(),
             lifecycle_revision: workspace.lifecycle_revision,

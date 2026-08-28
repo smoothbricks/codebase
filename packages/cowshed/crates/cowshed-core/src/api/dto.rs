@@ -476,6 +476,71 @@ pub struct WorkspaceInfo {
     pub created_at: Option<UtcTimestamp>,
     pub checkpoints: Vec<CheckpointInfo>,
     pub snapshot_stale: bool,
+    /// Filled in only for a caller that asked to pay for the measurement; absent everywhere else,
+    /// including in every controller response, so `default` is what keeps decoding those honest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<WorkspaceLanding>,
+}
+
+/// What a landing measurement found for one workspace.
+///
+/// Present only when a caller asked for it: reading it costs one process per workspace, which a
+/// default listing must not pay.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceLanding {
+    /// Paths the working tree reports as added, changed, deleted, or untracked.
+    ///
+    /// `None` means the tree could not be read, which is a different fact from a clean tree and is
+    /// reported as a different fact. Measured independently of the target, because an uncommitted
+    /// tree is worth knowing about even when the target cannot be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_files: Option<u64>,
+    pub commits: LandingCommits,
+}
+
+/// Where a workspace's commits stand relative to the branch that outlives it.
+///
+/// A sum rather than a struct of optionals so that "measured" and "could not measure" cannot be
+/// confused by a reader or a script: there is no shape in which a count is absent but a verdict is
+/// still available, and none in which the absence of a count reads as zero.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum LandingCommits {
+    /// Compared against `target_branch` as it stands *now* in the project's main workspace.
+    /// `landed + unlanded` is the number of commits in `target..HEAD`.
+    #[serde(rename_all = "camelCase")]
+    Measured {
+        target_branch: String,
+        target_head: GitOid,
+        /// Commits whose content the target does not hold, by ancestry or by patch equivalence.
+        /// Zero is the only value that authorizes removing the workspace without `--abandon`.
+        unlanded: u64,
+        /// Commits the target already holds the patch of, including ones that reached it by
+        /// squash-merge, cherry-pick, or a history rewrite rather than by ancestry.
+        landed: u64,
+        /// Commits the target has that the workspace does not.
+        behind: u64,
+    },
+    /// Nothing was compared and nothing may be inferred. This never means landed: every consumer
+    /// treats it exactly as it treats unlanded work.
+    #[serde(rename_all = "camelCase")]
+    Indeterminate { reason: String },
+}
+
+impl LandingCommits {
+    /// Whether every commit the workspace carries is already in the target branch.
+    pub const fn fully_landed(&self) -> bool {
+        matches!(self, Self::Measured { unlanded: 0, .. })
+    }
+
+    /// The tip the workspace was compared against, when a comparison happened.
+    pub const fn target_head(&self) -> Option<&GitOid> {
+        match self {
+            Self::Measured { target_head, .. } => Some(target_head),
+            Self::Indeterminate { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

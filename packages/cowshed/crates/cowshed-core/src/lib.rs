@@ -9,6 +9,7 @@ pub mod exec;
 mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;
+pub mod landing;
 pub mod metadata;
 mod process;
 pub mod repository;

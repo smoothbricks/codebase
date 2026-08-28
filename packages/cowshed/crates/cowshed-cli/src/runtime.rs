@@ -15,11 +15,11 @@ use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointInfo, CheckpointOptions, CheckpointResult,
     CommandArg, Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
     ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason, GcReport,
-    GitOid, JobInfo, JobStream, LandOptions, LandReport, MountResult, OutputPublication,
-    PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions, RemoveReport,
-    ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    GitOid, JobInfo, JobStream, LandOptions, LandReport, LandingCommits, MountResult,
+    OutputPublication, PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions,
+    RemoveReport, ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
+    WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -789,20 +789,12 @@ where
                         .workspaces
                         .sort_by(|left, right| left.workspace.cmp(&right.workspace));
                 }
-                if json {
-                    output.success(projects).map_err(output_error)?;
-                } else {
-                    emit_project_workspaces_table(output, &projects)?;
-                }
+                emit_project_listing(output, json, args, projects).await?;
             } else {
                 let mut workspaces = service.list().await?;
                 workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
                 let empty = workspaces.is_empty();
-                if json {
-                    output.success(workspaces).map_err(output_error)?;
-                } else {
-                    emit_workspace_table(output, &workspaces)?;
-                }
+                emit_workspace_listing(output, json, args, None, workspaces).await?;
                 if empty {
                     let others = service.other_adopted_project_count().await?;
                     let noun = if others == 1 {
@@ -1585,6 +1577,7 @@ fn store_workspace_info(
             })
             .collect(),
         snapshot_stale: snapshot.is_some_and(|snapshot| snapshot.stale),
+        landing: None,
     })
 }
 
@@ -1945,6 +1938,283 @@ fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport)
         })
         .and_then(|()| output.bare(b"\n"))
         .map_err(output_error)
+}
+
+/// The branch `ls` measures against, which is the same constant `land` merges into and `rm` gates
+/// on. Sharing it is the point: a listing that reported against a different branch than the gate
+/// enforces would be a listing that lies about what `rm` will do.
+const LANDING_TARGET_BRANCH: &str = cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
+
+/// The landing measurement is opt-in, and `--landed` opts in by implication: a filter on a fact
+/// nobody measured would filter on nothing.
+const fn landing_requested(args: crate::args::ListArgs) -> bool {
+    args.landing || args.landed
+}
+
+async fn emit_project_listing<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    json: bool,
+    args: crate::args::ListArgs,
+    mut projects: Vec<ProjectWorkspaces>,
+) -> Result<()> {
+    if landing_requested(args) {
+        for project in &mut projects {
+            annotate_landing(&mut project.workspaces).await;
+        }
+    }
+    if args.landed {
+        for project in &mut projects {
+            let withheld = retain_fully_landed(&mut project.workspaces);
+            emit_withheld(output, Some(&project.repo_id), &withheld)?;
+        }
+    }
+    if json {
+        return output.success(projects).map_err(output_error);
+    }
+    if args.landing {
+        let rows = std::iter::once(landing_header(true))
+            .chain(projects.iter().flat_map(|project| {
+                project
+                    .workspaces
+                    .iter()
+                    .map(|workspace| landing_row(Some(&project.repo_id), workspace))
+            }))
+            .collect::<Vec<_>>();
+        return emit_aligned_rows(output, &rows);
+    }
+    if args.landed {
+        return emit_bare_names(
+            output,
+            projects.iter().flat_map(|project| &project.workspaces),
+        );
+    }
+    emit_project_workspaces_table(output, &projects)
+}
+
+async fn emit_workspace_listing<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    json: bool,
+    args: crate::args::ListArgs,
+    repo_id: Option<&RepoId>,
+    mut workspaces: Vec<WorkspaceInfo>,
+) -> Result<()> {
+    if landing_requested(args) {
+        annotate_landing(&mut workspaces).await;
+    }
+    if args.landed {
+        let withheld = retain_fully_landed(&mut workspaces);
+        emit_withheld(output, repo_id, &withheld)?;
+    }
+    if json {
+        return output.success(workspaces).map_err(output_error);
+    }
+    if args.landing {
+        let rows = std::iter::once(landing_header(repo_id.is_some()))
+            .chain(
+                workspaces
+                    .iter()
+                    .map(|workspace| landing_row(repo_id, workspace)),
+            )
+            .collect::<Vec<_>>();
+        return emit_aligned_rows(output, &rows);
+    }
+    if args.landed {
+        return emit_bare_names(output, workspaces.iter());
+    }
+    emit_workspace_table(output, &workspaces)
+}
+
+/// Measure every session workspace against the project's own main workspace.
+///
+/// Main is left unmeasured because main *is* the target: comparing it to itself answers nothing, and
+/// a zero-unlanded row for main would make it look retirable to anything reading the column.
+///
+/// One task per workspace, because the measurement is process-bound rather than CPU-bound and the
+/// serial version costs the sum of every workspace's history walk — which on a project whose main
+/// has been rewritten is the slowest thing `ls` could be asked to do.
+async fn annotate_landing(workspaces: &mut [WorkspaceInfo]) {
+    let Some(main) = workspaces
+        .iter()
+        .find(|workspace| workspace.role == WorkspaceRole::Main)
+    else {
+        let reason = String::from(
+            "this project records no main workspace, so there is no branch to compare against",
+        );
+        for workspace in workspaces.iter_mut() {
+            workspace.landing = Some(indeterminate_landing(reason.clone()));
+        }
+        return;
+    };
+    let target = std::sync::Arc::new(
+        cowshed_core::landing::resolve_target(&main.mount, LANDING_TARGET_BRANCH).await,
+    );
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, workspace) in workspaces.iter().enumerate() {
+        if workspace.role == WorkspaceRole::Main {
+            continue;
+        }
+        if workspace.state == WorkspaceState::Detached {
+            continue;
+        }
+        let target = std::sync::Arc::clone(&target);
+        let mount = workspace.mount.clone();
+        tasks.spawn(async move {
+            (
+                index,
+                cowshed_core::landing::measure(&target, &mount, "HEAD").await,
+            )
+        });
+    }
+    for workspace in workspaces.iter_mut() {
+        if workspace.role != WorkspaceRole::Main && workspace.state == WorkspaceState::Detached {
+            workspace.landing = Some(indeterminate_landing(String::from(
+                "workspace is detached, so its repository is not mounted to be read",
+            )));
+        }
+    }
+    while let Some(finished) = tasks.join_next().await {
+        match finished {
+            Ok((index, landing)) => workspaces[index].landing = Some(landing),
+            // A panicked measurement is still an unanswered question, and the row it belongs to is
+            // no longer identifiable — so every row left unmeasured says so below.
+            Err(_) => continue,
+        }
+    }
+    for workspace in workspaces.iter_mut() {
+        if workspace.role != WorkspaceRole::Main && workspace.landing.is_none() {
+            workspace.landing = Some(indeterminate_landing(String::from(
+                "the measurement did not complete",
+            )));
+        }
+    }
+}
+
+fn indeterminate_landing(reason: String) -> WorkspaceLanding {
+    WorkspaceLanding {
+        dirty_files: None,
+        commits: LandingCommits::Indeterminate { reason },
+    }
+}
+
+/// Keep only the workspaces `--landed` may name, and report which of the rest went unanswered.
+///
+/// The output of `--landed` is meant to be piped into `rm`, so the bar for staying in it is a
+/// measurement that says nothing is unlanded — never an absent measurement, and never main. Rows
+/// dropped for having real unlanded work need no explanation; a row dropped because the question
+/// could not be answered does, or the silence reads as "nothing here".
+fn retain_fully_landed(workspaces: &mut Vec<WorkspaceInfo>) -> Vec<(String, String)> {
+    let mut withheld = Vec::new();
+    workspaces.retain(|workspace| {
+        if workspace.role == WorkspaceRole::Main {
+            return false;
+        }
+        match workspace.landing.as_ref().map(|landing| &landing.commits) {
+            Some(LandingCommits::Indeterminate { reason }) => {
+                withheld.push((workspace.workspace.as_str().to_owned(), reason.clone()));
+                false
+            }
+            Some(commits) => commits.fully_landed(),
+            None => {
+                withheld.push((
+                    workspace.workspace.as_str().to_owned(),
+                    String::from("no landing measurement was taken"),
+                ));
+                false
+            }
+        }
+    });
+    withheld
+}
+
+fn emit_withheld<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    repo_id: Option<&RepoId>,
+    withheld: &[(String, String)],
+) -> Result<()> {
+    for (workspace, reason) in withheld {
+        let scope = match repo_id {
+            Some(repo_id) => format!("{}/{workspace}", repo_id.as_str()),
+            None => workspace.clone(),
+        };
+        output
+            .guidance(&format!(
+                "{scope} withheld: cannot determine whether its work is landed — {reason}"
+            ))
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn emit_bare_names<'a, W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    workspaces: impl Iterator<Item = &'a WorkspaceInfo>,
+) -> Result<()> {
+    for workspace in workspaces {
+        output
+            .bare_line(workspace.workspace.as_str().as_bytes())
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+/// The one place `--landing` prints a header, because four bare integers per row are unreadable
+/// without one. `--landed`, whose output is consumed by `rm`, prints names and never a header.
+fn landing_header(with_repo: bool) -> Vec<String> {
+    let mut row = Vec::with_capacity(9);
+    if with_repo {
+        row.push(String::from("REPOSITORY"));
+    }
+    for column in [
+        "WORKSPACE",
+        "STATE",
+        "UNLANDED",
+        "LANDED",
+        "BEHIND",
+        "DIRTY",
+        "BRANCH",
+        "MOUNT",
+    ] {
+        row.push(String::from(column));
+    }
+    row
+}
+
+fn landing_row(repo_id: Option<&RepoId>, workspace: &WorkspaceInfo) -> Vec<String> {
+    let mut row = workspace_row(repo_id, workspace);
+    // `workspace_row` ends with branch then mount; the counts belong before them, where a reader
+    // finds them without crossing a mountpoint.
+    let tail = row.split_off(row.len() - 2);
+    row.extend(landing_cells(workspace));
+    row.extend(tail);
+    row
+}
+
+/// `-` where nothing was measured by design, `?` where the answer could not be had. Keeping those
+/// two apart is the whole point: one is main, the other is a workspace nobody can vouch for.
+fn landing_cells(workspace: &WorkspaceInfo) -> [String; 4] {
+    let unknown = || String::from("?");
+    let Some(landing) = workspace.landing.as_ref() else {
+        return std::array::from_fn(|_| String::from("-"));
+    };
+    let dirty = landing
+        .dirty_files
+        .map_or_else(unknown, |count| count.to_string());
+    match &landing.commits {
+        LandingCommits::Measured {
+            unlanded,
+            landed,
+            behind,
+            ..
+        } => [
+            unlanded.to_string(),
+            landed.to_string(),
+            behind.to_string(),
+            dirty,
+        ],
+        LandingCommits::Indeterminate { .. } => {
+            [unknown(), unknown(), unknown(), dirty]
+        }
+    }
 }
 
 fn emit_workspace_table<W: Write, E: Write>(
@@ -2800,7 +3070,7 @@ where
             }
             Ok(success())
         }
-        Command::List(_) => {
+        Command::List(args) => {
             let mut projects = list_all_adopted_projects().await?;
             projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
             for project in &mut projects {
@@ -2808,11 +3078,7 @@ where
                     .workspaces
                     .sort_by(|left, right| left.workspace.cmp(&right.workspace));
             }
-            if cli.global.json {
-                output.success(projects).map_err(output_error)?;
-            } else {
-                emit_project_workspaces_table(output, &projects)?;
-            }
+            emit_project_listing(output, cli.global.json, args, projects).await?;
             Ok(success())
         }
         Command::Doctor => {

@@ -71,6 +71,17 @@ pub fn workspace_remote_name(workspace: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct GitRepository {
     root: PathBuf,
+    /// One extra object store, attached read-only for the lifetime of this handle.
+    ///
+    /// This is how a workspace is compared against main's *current* branch tip without fetching.
+    /// Do not "simplify" it back into a `git fetch main`: the workspace's `main` remote is a
+    /// clone-time artifact whose URL has been observed pointing at a directory that is no longer a
+    /// repository, and a fetch would write FETCH_HEAD and pack objects into every workspace during
+    /// what a caller reasonably expects to be a read-only listing. Attaching main's object store
+    /// instead reads the same objects with no writes anywhere and no dependence on a remote URL.
+    /// A fetch is also no use as a fallback: if main's object store cannot be read then its objects
+    /// cannot be obtained by any route, so the honest answer is still "cannot determine".
+    alternate_objects: Option<PathBuf>,
 }
 
 impl GitRepository {
@@ -79,9 +90,7 @@ impl GitRepository {
         let path = path.as_ref();
         let output = run_git_at(path, ["rev-parse", "--show-toplevel"]).await?;
         if output.status.success() {
-            return Ok(Self {
-                root: parse_one_path(&output.stdout, "git root")?,
-            });
+            return Ok(Self::from_root(parse_one_path(&output.stdout, "git root")?));
         }
 
         let git_dir_output =
@@ -91,9 +100,7 @@ impl GitRepository {
             if git_dir.file_name() == Some(OsStr::new(".git"))
                 && let Some(root) = git_dir.parent()
             {
-                return Ok(Self {
-                    root: root.to_path_buf(),
-                });
+                return Ok(Self::from_root(root));
             }
         }
 
@@ -107,7 +114,31 @@ impl GitRepository {
     }
 
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            alternate_objects: None,
+        }
+    }
+
+    /// Attach `objects` as an additional read-only object store for every command run through this
+    /// handle, so revisions living only in that store resolve here.
+    ///
+    /// Refused rather than silently mangled for a path git cannot express in
+    /// `GIT_ALTERNATE_OBJECT_DIRECTORIES`, whose entries are colon-separated: a store under such a
+    /// path would be dropped, and a dropped object store reads as "these commits do not exist".
+    pub fn with_alternate_objects(mut self, objects: impl Into<PathBuf>) -> Result<Self> {
+        let objects = objects.into();
+        if objects.as_os_str().as_encoded_bytes().contains(&b':') {
+            return Err(CowshedError::conflict(
+                format!(
+                    "git cannot attach an object store whose path contains a colon: {}",
+                    objects.display()
+                ),
+                "move the cowshed store to a path without a colon",
+            ));
+        }
+        self.alternate_objects = Some(objects);
+        Ok(self)
     }
 
     pub fn root(&self) -> &Path {
@@ -501,15 +532,7 @@ impl GitRepository {
             Some(exclude) => format!("{exclude}..{head}"),
             None => head.to_owned(),
         };
-        let count = self
-            .read_one(["rev-list", "--count", range.as_str()], "count commits")
-            .await?;
-        count.parse().map_err(|_| {
-            CowshedError::integrity(
-                format!("git reported an unparseable commit count: {count}"),
-                "repair the git repository",
-            )
-        })
+        self.count_range(&range).await
     }
 
     /// Write a Git bundle of the commits `head` has and `exclude` does not.
@@ -552,6 +575,170 @@ impl GitRepository {
             Some(exclude) => self.resolve_commit(exclude).await,
             None => Ok(None),
         }
+    }
+
+    /// How many paths the working tree reports as added, changed, deleted, or untracked.
+    ///
+    /// Counted by record rather than by NUL, because a rename or copy record carries two paths in
+    /// two NUL-separated fields and would otherwise be reported as two changes.
+    pub async fn dirty_file_count(&self) -> Result<u64> {
+        let output = self
+            .run(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("count working tree changes", &output));
+        }
+        let mut fields = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty());
+        let mut count = 0_u64;
+        while let Some(record) = fields.next() {
+            count = count.checked_add(1).ok_or_else(|| {
+                CowshedError::integrity(
+                    "working tree change count overflow",
+                    "repair the git repository",
+                )
+            })?;
+            // `XY` status pair, then the path; a rename or copy adds the original path as its own
+            // field, which belongs to the record already counted.
+            if record
+                .get(..2)
+                .is_some_and(|status| status.iter().any(|code| *code == b'R' || *code == b'C'))
+            {
+                fields.next();
+            }
+        }
+        Ok(count)
+    }
+
+    /// The absolute path of this repository's own object store.
+    ///
+    /// `--path-format=absolute` is load-bearing: the bare form answers relative to the repository
+    /// root, and this path is handed to a *different* repository as an alternate object store,
+    /// where a relative path resolves against the wrong directory.
+    pub async fn object_directory(&self) -> Result<PathBuf> {
+        let output = self
+            .run(["rev-parse", "--path-format=absolute", "--git-path", "objects"])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("locate the git object store", &output));
+        }
+        parse_one_path(&output.stdout, "git object store")
+    }
+
+    /// How many commits `head` has that `revision` does not.
+    ///
+    /// Strict where [`Self::commits_ahead`] is lenient: an endpoint this repository cannot see is
+    /// refused rather than dropped from the range. Dropping it silently would turn "I cannot see
+    /// the target" into a plausible-looking count, which is the one failure mode a landing check
+    /// must not have.
+    pub async fn commits_ahead_of(&self, revision: &str, head: &str) -> Result<u64> {
+        for endpoint in [revision, head] {
+            if !self.has_commit(endpoint).await? {
+                return Err(CowshedError::conflict(
+                    format!("{endpoint} is not a commit this repository can see"),
+                    "attach the object store that holds it, then retry",
+                ));
+            }
+        }
+        self.count_range(&format!("{revision}..{head}")).await
+    }
+
+    /// How many of `revision..head`'s commits `revision` already holds the patch of.
+    ///
+    /// `git cherry` semantics, and the semantics matter: equivalence is decided by patch-id, so a
+    /// commit that reached `revision` by squash-merge, cherry-pick, or a history rewrite counts as
+    /// held even though it is not an ancestor. A rebase that resolved a conflict produces a
+    /// different patch and correctly does not count.
+    ///
+    /// Commits with no computable patch identity are never counted, which is what keeps the error on
+    /// the safe side: callers derive `unlanded` by subtracting this from the total ahead count, so
+    /// anything unprovable lands on the refusing side. Two kinds qualify, and they need different
+    /// handling because git treats them differently:
+    ///
+    /// * **Merges** have no patch-id and `git cherry` omits them from its output entirely, so
+    ///   subtraction alone already puts them on the unlanded side.
+    /// * **Commits with an empty diff** are *not* omitted, and this is the trap. Their patch-id is
+    ///   the identity of nothing, which matches the identity of any other empty commit, so git
+    ///   happily reports one workspace's marker commit as equivalent to an unrelated upstream one.
+    ///   That is a false equivalence, so they are excluded here by intersecting git's answer with
+    ///   the commits that actually change something.
+    pub async fn patch_equivalent_count(&self, revision: &str, head: &str) -> Result<u64> {
+        let output = self.run(["cherry", revision, head]).await?;
+        if !output.status.success() {
+            return Err(git_internal("compare commit patch identities", &output));
+        }
+        let mut equivalent = Vec::new();
+        for line in parse_lines(&output.stdout, "patch identity comparison")? {
+            let (marker, oid) = line.split_at_checked(2).ok_or_else(|| {
+                CowshedError::integrity(
+                    format!("git reported an unreadable patch identity line: {line}"),
+                    "repair the git installation",
+                )
+            })?;
+            match marker {
+                "- " => equivalent.push(oid.to_owned()),
+                "+ " => {}
+                // Anything else means git changed the format this proof is read out of, and a
+                // miscount here authorizes a deletion. Refuse instead of guessing.
+                _ => {
+                    return Err(CowshedError::integrity(
+                        format!("git reported an unreadable patch identity line: {line}"),
+                        "repair the git installation",
+                    ));
+                }
+            }
+        }
+        if equivalent.is_empty() {
+            return Ok(0);
+        }
+        let substantive = self.commits_changing_something(revision, head).await?;
+        Ok(equivalent
+            .iter()
+            .filter(|oid| substantive.contains(oid.as_str()))
+            .count() as u64)
+    }
+
+    /// The commits of `revision..head` whose diff is not empty.
+    ///
+    /// A pathspec of `.` makes git drop every commit that changes nothing, which is exactly the
+    /// "no patch to identify" set. `--no-merges` keeps the answer to commits patch-id is defined
+    /// for, and `--full-history` suppresses the parent rewriting that pathspec filtering would
+    /// otherwise apply, so the surviving oids are the real commits and not simplified stand-ins.
+    async fn commits_changing_something(
+        &self,
+        revision: &str,
+        head: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let output = self
+            .run([
+                "rev-list",
+                "--no-merges",
+                "--full-history",
+                &format!("{revision}..{head}"),
+                "--",
+                ".",
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("list commits that change something", &output));
+        }
+        Ok(parse_lines(&output.stdout, "commit identity")?
+            .into_iter()
+            .collect())
+    }
+
+    async fn count_range(&self, range: &str) -> Result<u64> {
+        let count = self
+            .read_one(["rev-list", "--count", range], "count commits")
+            .await?;
+        count.parse().map_err(|_| {
+            CowshedError::integrity(
+                format!("git reported an unparseable commit count: {count}"),
+                "repair the git repository",
+            )
+        })
     }
 
     /// Configure local-only workspace Git and create its session branch.
@@ -929,7 +1116,7 @@ impl GitRepository {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        run_git_at(&self.root, args).await
+        run_git_at_with_objects(&self.root, self.alternate_objects.as_deref(), args).await
     }
 }
 
@@ -938,19 +1125,33 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(GIT)
+    run_git_at_with_objects(root, None, args).await
+}
+
+async fn run_git_at_with_objects<I, S>(
+    root: &Path,
+    alternate_objects: Option<&Path>,
+    args: I,
+) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new(GIT);
+    command
         .arg("-C")
         .arg(root)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!("cannot execute git: {error}"),
-                "install the macOS command line developer tools, then retry",
-            )
-        })
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(objects) = alternate_objects {
+        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
+    }
+    command.output().await.map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot execute git: {error}"),
+            "install the macOS command line developer tools, then retry",
+        )
+    })
 }
 
 fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
