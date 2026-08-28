@@ -78,3 +78,9 @@ target/
 
 # Zig build cache (17.9 MB of build.exe/.pdb/.obj was committed by mistake)
 .zig-cache/
+
+# stray devenv state from running `devenv` at the repo root; the real shell
+# lives in tooling/direnv/, whose devenv.lock IS tracked and pins every tool.
+# Root-anchored so the nested tracked lock is unaffected.
+/.devenv/
+/devenv.lock
