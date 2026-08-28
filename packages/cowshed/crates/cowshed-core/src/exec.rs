@@ -1,11 +1,16 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxProfileRole, seatbelt_profile};
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod other;
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -113,6 +118,14 @@ pub struct SystemSpawnRunner;
 
 const DESCRIPTOR_PREPARATION_ERRNO: libc::c_int = libc::EOWNERDEAD;
 const SUPERVISOR_FD_CEILING: usize = 4_096;
+#[cfg(target_os = "linux")]
+use linux::prepare_child_descriptors as prepare_child_descriptors_platform;
+#[cfg(target_os = "macos")]
+use macos::prepare_child_descriptors as prepare_child_descriptors_platform;
+#[cfg(all(test, target_os = "macos"))]
+use macos::{mark_macos_non_stdio_close_on_exec, validate_fd_listing_size};
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use other::prepare_child_descriptors as prepare_child_descriptors_platform;
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn descriptor_limit_with<GetLimit>(get_limit: GetLimit) -> io::Result<libc::rlim_t>
@@ -129,55 +142,6 @@ where
 #[cfg(any(not(target_os = "macos"), test))]
 fn descriptor_limit() -> io::Result<libc::rlim_t> {
     descriptor_limit_with(|limit| unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit) })
-}
-
-#[cfg(target_os = "macos")]
-fn validate_fd_listing_size(bytes: libc::c_int, capacity: usize) -> io::Result<usize> {
-    if bytes < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let bytes = bytes as usize;
-    if bytes > capacity || !bytes.is_multiple_of(std::mem::size_of::<libc::proc_fdinfo>()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "open descriptor listing exceeds the supervisor FD ceiling",
-        ));
-    }
-    Ok(bytes / std::mem::size_of::<libc::proc_fdinfo>())
-}
-
-#[cfg(target_os = "macos")]
-fn mark_macos_non_stdio_close_on_exec(
-    descriptors: &mut [std::mem::MaybeUninit<libc::proc_fdinfo>],
-) -> io::Result<()> {
-    let capacity = std::mem::size_of_val(descriptors);
-    let required = unsafe {
-        libc::proc_pidinfo(
-            libc::getpid(),
-            libc::PROC_PIDLISTFDS,
-            0,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    validate_fd_listing_size(required, capacity)?;
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            libc::getpid(),
-            libc::PROC_PIDLISTFDS,
-            0,
-            descriptors.as_mut_ptr().cast(),
-            capacity as libc::c_int,
-        )
-    };
-    let count = validate_fd_listing_size(bytes, capacity)?;
-    for descriptor in &descriptors[..count] {
-        let descriptor = unsafe { descriptor.assume_init_ref() }.proc_fd;
-        if descriptor > libc::STDERR_FILENO {
-            mark_descriptor_close_on_exec(descriptor)?;
-        }
-    }
-    Ok(())
 }
 
 fn mark_descriptor_close_on_exec_with<Fcntl, LastError>(
@@ -278,47 +242,17 @@ where
         Err(error) => Err(error),
     }
 }
-
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(all(test, target_os = "linux"))]
+use linux::mark_non_stdio_close_on_exec;
+#[cfg(all(test, not(target_os = "macos"), not(target_os = "linux")))]
+use other::mark_non_stdio_close_on_exec;
+#[cfg(all(test, target_os = "macos"))]
 fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        mark_non_stdio_close_on_exec_with(
-            limit,
-            |first, last, flags| {
-                let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags) };
-                close_range_result_with(result, io::Error::last_os_error)
-            },
-            mark_descriptor_close_on_exec,
-        )
-    }
-
-    #[cfg(not(target_os = "linux"))]
     mark_descriptor_range_close_on_exec_with(limit, mark_descriptor_close_on_exec)
 }
 
 pub(crate) fn prepare_child_descriptors(command: &mut Command) -> Result<(), SpawnFailure> {
-    #[cfg(not(target_os = "macos"))]
-    let descriptor_limit = descriptor_limit().map_err(|source| SpawnFailure {
-        stage: WrapperStage::PrepareChildDescriptors,
-        source,
-    })?;
-    #[cfg(target_os = "macos")]
-    let mut descriptors = Box::<[libc::proc_fdinfo]>::new_uninit_slice(SUPERVISOR_FD_CEILING);
-
-    unsafe {
-        #[cfg(target_os = "macos")]
-        command.pre_exec(move || {
-            mark_macos_non_stdio_close_on_exec(&mut descriptors)
-                .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
-        });
-        #[cfg(not(target_os = "macos"))]
-        command.pre_exec(move || {
-            mark_non_stdio_close_on_exec(descriptor_limit)
-                .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
-        });
-    }
-    Ok(())
+    prepare_child_descriptors_platform(command)
 }
 
 pub(crate) fn classify_spawn_error(source: io::Error) -> SpawnFailure {
