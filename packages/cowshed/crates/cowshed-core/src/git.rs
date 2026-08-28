@@ -645,26 +645,35 @@ impl GitRepository {
         self.count_range(&format!("{revision}..{head}")).await
     }
 
-    /// How many of `revision..head`'s commits `revision` already holds the patch of.
+    /// How many of `revision..head`'s commits contribute no content `revision` does not already
+    /// hold.
     ///
-    /// `git cherry` semantics, and the semantics matter: equivalence is decided by patch-id, so a
-    /// commit that reached `revision` by squash-merge, cherry-pick, or a history rewrite counts as
-    /// held even though it is not an ancestor. A rebase that resolved a conflict produces a
-    /// different patch and correctly does not count.
+    /// `git cherry` semantics for ordinary commits, and the semantics matter: equivalence is decided
+    /// by patch-id, so a commit that reached `revision` by squash-merge, cherry-pick, or a history
+    /// rewrite counts as held even though it is not an ancestor. A rebase that resolved a conflict
+    /// produces a different patch and correctly does not count.
     ///
-    /// Commits with no computable patch identity are never counted, which is what keeps the error on
-    /// the safe side: callers derive `unlanded` by subtracting this from the total ahead count, so
-    /// anything unprovable lands on the refusing side. Two kinds qualify, and they need different
-    /// handling because git treats them differently:
+    /// Callers derive `unlanded` by subtracting this from the total ahead count, so anything this
+    /// does not count blocks a no-flag removal. Three kinds need care, because git treats them
+    /// differently and only one of them is safe to wave through:
     ///
-    /// * **Merges** have no patch-id and `git cherry` omits them from its output entirely, so
-    ///   subtraction alone already puts them on the unlanded side.
-    /// * **Commits with an empty diff** are *not* omitted, and this is the trap. Their patch-id is
-    ///   the identity of nothing, which matches the identity of any other empty commit, so git
-    ///   happily reports one workspace's marker commit as equivalent to an unrelated upstream one.
-    ///   That is a false equivalence, so they are excluded here by intersecting git's answer with
-    ///   the commits that actually change something.
-    pub async fn patch_equivalent_count(&self, revision: &str, head: &str) -> Result<u64> {
+    /// * **Merges with a non-empty combined diff** — *evil merges*, whose conflict resolution exists
+    ///   in no parent. `git cherry` omits every merge from its output, so a check built on cherry
+    ///   alone cannot see them at all: measured on one real workspace, three of its four merges
+    ///   carried 6, 5 and 2 files that neither parent had. That is unlanded work a naive count
+    ///   destroys, so it is never counted here.
+    /// * **Merges with an empty combined diff** are counted, because they author nothing. They are
+    ///   topology, and retiring the workspace loses no content. Refusing on them would mean a branch
+    ///   of already-landed commits joined by clean merges could never be reported landed — exactly
+    ///   the false positive the landed filter exists to remove.
+    /// * **Ordinary commits with an empty diff** are *not* counted, and this asymmetry is
+    ///   deliberate. Git does not omit them from `cherry`, and their patch-id is the identity of
+    ///   nothing, which matches the identity of any *other* empty commit — so git reports one
+    ///   workspace's marker commit as equivalent to an unrelated upstream one. A clean merge's
+    ///   emptiness is structural and means the same thing every time; an empty commit is a
+    ///   deliberate marker whose message is its whole content, and a false equivalence between two
+    ///   unrelated markers is not a proof of anything.
+    pub async fn commits_already_held(&self, revision: &str, head: &str) -> Result<u64> {
         let output = self.run(["cherry", revision, head]).await?;
         if !output.status.success() {
             return Err(git_internal("compare commit patch identities", &output));
@@ -690,14 +699,64 @@ impl GitRepository {
                 }
             }
         }
-        if equivalent.is_empty() {
-            return Ok(0);
+        let mut held = self.content_free_merge_count(revision, head).await?;
+        if !equivalent.is_empty() {
+            let substantive = self.commits_changing_something(revision, head).await?;
+            for oid in &equivalent {
+                if substantive.contains(oid.as_str()) {
+                    held = held.checked_add(1).ok_or_else(|| {
+                        CowshedError::integrity(
+                            "held commit count overflow",
+                            "repair the git repository",
+                        )
+                    })?;
+                }
+            }
         }
-        let substantive = self.commits_changing_something(revision, head).await?;
-        Ok(equivalent
-            .iter()
-            .filter(|oid| substantive.contains(oid.as_str()))
-            .count() as u64)
+        Ok(held)
+    }
+
+    /// Merges in `revision..head` that authored nothing of their own.
+    ///
+    /// The combined diff (`--diff-merges=combined`) shows only content present in *no* parent, which
+    /// is exactly what a merge commit contributes over its parents. Empty means the merge is pure
+    /// topology; non-empty means it carries a conflict resolution that exists nowhere else.
+    ///
+    /// The record separator is a NUL, because the alternative is ambiguous: a header line has to be
+    /// distinguishable from a pathname, and a pathname can contain anything except NUL.
+    async fn content_free_merge_count(&self, revision: &str, head: &str) -> Result<u64> {
+        let output = self
+            .run([
+                "log",
+                "--merges",
+                "--diff-merges=combined",
+                "--name-only",
+                "--pretty=format:%x00%H",
+                &format!("{revision}..{head}"),
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("inspect merge combined diffs", &output));
+        }
+        let mut count = 0_u64;
+        for record in output.stdout.split(|byte| *byte == 0) {
+            // The first field is whatever preceded the first header, which is nothing.
+            let mut lines = record
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty());
+            if lines.next().is_none() {
+                continue;
+            }
+            if lines.next().is_none() {
+                count = count.checked_add(1).ok_or_else(|| {
+                    CowshedError::integrity(
+                        "content-free merge count overflow",
+                        "repair the git repository",
+                    )
+                })?;
+            }
+        }
+        Ok(count)
     }
 
     /// The commits of `revision..head` whose diff is not empty.
