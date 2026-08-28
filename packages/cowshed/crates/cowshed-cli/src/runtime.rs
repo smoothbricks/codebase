@@ -2724,7 +2724,8 @@ fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
             message: format!(
                 "could not inspect detached metadata for retired mount paths: {error}"
             ),
-            hint: "cowshed doctor --json".into(),
+            hint: "inspect the store; re-running doctor does not repair unread detached metadata"
+                .into(),
             path: Some(store_root.to_path_buf()),
         }],
     }
@@ -2822,7 +2823,7 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
             code: "sccache-status".into(),
             severity: FindingSeverity::Warning,
             message: error.message,
-            hint: "cowshed sccache status".into(),
+            hint: "inspect sccache; the status query failed".into(),
             path: None,
         }),
     }
@@ -3656,6 +3657,22 @@ mod tests {
         assert!(!doctor_report(findings).healthy);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unread_retired_layout_scan_does_not_hint_re_running_doctor() {
+        let findings = retired_mount_layout_findings(Path::new("/dev/null"));
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.code, "retired-mount-layout-scan");
+        assert_eq!(finding.severity, FindingSeverity::Error);
+        assert!(
+            !finding.hint.contains("cowshed doctor"),
+            "re-running doctor cannot repair unread metadata; hint was {}",
+            finding.hint
+        );
+        assert!(finding.hint.contains("inspect the store"));
+        assert!(!doctor_report(findings).healthy);
     }
 
     #[test]
