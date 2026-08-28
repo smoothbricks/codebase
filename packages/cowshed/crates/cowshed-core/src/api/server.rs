@@ -432,6 +432,7 @@ pub const CAPABILITY_METHODS: &[&str] = &[
     "coordinator.create",
     "coordinator.fork",
     "coordinator.moveCheckout",
+    "coordinator.changeRepoId",
     "coordinator.grant",
     "coordinator.revoke",
     "coordinator.rebase",

@@ -21,6 +21,7 @@ use crate::metadata::{
     CheckoutLayout, CheckoutLayoutRecord, DetachedWorkspaceMetadata, MetadataError,
     WorkspaceMarker, read_json, sidecar_path, write_json,
 };
+use crate::repository::RepoId;
 use crate::storage::WORKSPACE_MARKER_PATH;
 
 /// Where one project's recorded checkout path is durably held.
@@ -63,6 +64,40 @@ impl CheckoutRecord {
         if let Some(info) = metadata.info_snapshot.as_mut() {
             info.project_root = project_root.to_owned();
         }
+        metadata.validate(&self.image)?;
+        write_json(&sidecar, &metadata)?;
+        Ok(true)
+    }
+    /// Rewrite the recorded repository identity in both the marker and the sidecar.
+    ///
+    /// The marker is published first because a cold open uses it to identify the project. A
+    /// journaled identity transaction retries the sidecar and path namespace until both records
+    /// agree; writing the marker first keeps an interrupted update attributable to the target.
+    pub fn rewrite_repo_id(&self, repo_id: &RepoId) -> Result<bool, MetadataError> {
+        let marker_path = self.mount_point.join(WORKSPACE_MARKER_PATH);
+        let mut marker = WorkspaceMarker::read_from(&marker_path)?;
+        let sidecar = sidecar_path(&self.image);
+        let mut metadata = DetachedWorkspaceMetadata::read_for_image(&self.image)?;
+        if marker.repo_id == *repo_id && metadata.repo_id == *repo_id {
+            return Ok(false);
+        }
+        marker.repo_id = repo_id.clone();
+        marker.validate()?;
+        write_json(&marker_path, &marker)?;
+        metadata.repo_id = repo_id.clone();
+        metadata.validate(&self.image)?;
+        write_json(&sidecar, &metadata)?;
+        Ok(true)
+    }
+
+    /// Rewrite the store-side repository identity while this workspace is detached.
+    pub fn rewrite_detached_repo_id(&self, repo_id: &RepoId) -> Result<bool, MetadataError> {
+        let sidecar = sidecar_path(&self.image);
+        let mut metadata = DetachedWorkspaceMetadata::read_for_image(&self.image)?;
+        if metadata.repo_id == *repo_id {
+            return Ok(false);
+        }
+        metadata.repo_id = repo_id.clone();
         metadata.validate(&self.image)?;
         write_json(&sidecar, &metadata)?;
         Ok(true)

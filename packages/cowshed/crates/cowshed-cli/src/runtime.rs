@@ -79,6 +79,11 @@ pub trait CliService: Send {
     async fn fork(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
     async fn rename(&mut self, source: &str, destination: &str) -> Result<WorkspaceInfo>;
     async fn move_checkout(&mut self, destination: &Path) -> Result<WorkspaceInfo>;
+    async fn change_repo_id(&mut self, _repo_id: RepoId) -> Result<WorkspaceInfo> {
+        Err(CowshedError::internal(
+            "repository identity changes are unavailable for this CLI service",
+        ))
+    }
     async fn checkpoint(&mut self, workspace: &str, options: CheckpointOptions) -> Result<String>;
     async fn restore(&mut self, workspace: &str, label: &str) -> Result<WorkspaceInfo>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceInfo>;
@@ -343,6 +348,14 @@ impl CliService for ActorBridge {
         Ok(self
             .coordinator()?
             .move_checkout(destination)
+            .await?
+            .into_info())
+    }
+
+    async fn change_repo_id(&mut self, repo_id: RepoId) -> Result<WorkspaceInfo> {
+        Ok(self
+            .coordinator()?
+            .change_repo_id(&repo_id)
             .await?
             .into_info())
     }
@@ -731,12 +744,16 @@ where
             let info = match &args.destination {
                 MoveDestination::Workspace(name) => service.rename(&args.source, name).await?,
                 MoveDestination::Checkout(path) => service.move_checkout(path).await?,
+                MoveDestination::RepoId(repo_id) => service.change_repo_id(repo_id.clone()).await?,
             };
-            service.reconcile_gateway().await?;
+            if !matches!(&args.destination, MoveDestination::RepoId(_)) {
+                service.reconcile_gateway().await?;
+            }
             emit_mount(output, json, &info)?;
             let hint = match &args.destination {
                 MoveDestination::Workspace(name) => format!("cowshed exec {name} -- <cmd>"),
                 MoveDestination::Checkout(path) => format!("cd {}", path.display()),
+                MoveDestination::RepoId(repo_id) => format!("cowshed --project {} ls", repo_id),
             };
             output.hint(&hint).map_err(output_error)?;
             Ok(success())

@@ -28,7 +28,7 @@ use crate::exec::{
     SandboxExecRequest, SpawnFailure, classify_spawn_error, plan_exec, prepare_child_descriptors,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
-use crate::repository::RepoId;
+use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{SandboxConfig, SandboxProfileRole, seatbelt_profile};
 use crate::storage::audit::AuditSinkError;
 use crate::storage::job_artifact::{
@@ -56,6 +56,10 @@ pub struct WorkspaceAuthoritySnapshot {
 #[derive(Clone, Debug)]
 pub struct WorkspaceSupervisorConfig {
     pub authority: WorkspaceAuthoritySnapshot,
+    /// Every identity the project owns. Kept beside the authority rather than inside it: the
+    /// authority is the single pinned identity a workspace acts under, while artifact frames the
+    /// workspace already wrote may be stamped with an identity the project has since left behind.
+    pub owned_repo_ids: OwnedRepoIds,
     pub workspace_root: PathBuf,
     pub default_cwd: Option<WorkspacePath>,
     pub sandbox: SandboxConfig,
@@ -108,6 +112,9 @@ impl Default for WorkspaceSupervisorConfig {
                 grant_revision: 0,
                 lifecycle_revision: 0,
             },
+            owned_repo_ids: OwnedRepoIds::sole(
+                RepoId::parse("local/default").expect("static repo id"),
+            ),
             workspace_root: workspace_root.clone(),
             default_cwd: Some(WorkspacePath::new("work").expect("static cwd")),
             sandbox: SandboxConfig {
@@ -318,12 +325,13 @@ pub struct ArtifactStoreSink {
 impl ArtifactStoreSink {
     pub fn open(
         workspace_root: impl Into<PathBuf>,
+        owned_repo_ids: &OwnedRepoIds,
         authority: &WorkspaceAuthoritySnapshot,
         config: ArtifactConfig,
     ) -> Result<Self> {
         let store = ArtifactStore::open(
             workspace_root,
-            authority.repo_id.clone(),
+            owned_repo_ids.clone(),
             authority.workspace_incarnation.clone(),
             config,
         )
@@ -1771,6 +1779,7 @@ impl WorkspaceSupervisor {
         config.validate()?;
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
+            &config.owned_repo_ids,
             &config.authority,
             config.artifacts.clone(),
         )?;
@@ -3847,7 +3856,7 @@ mod lifecycle_commitment_tests {
 
         let mut artifacts = ArtifactStore::open(
             &workspace_root,
-            repo_id.clone(),
+            OwnedRepoIds::sole(repo_id.clone()),
             source.clone(),
             ArtifactConfig::default(),
         )
@@ -3931,6 +3940,7 @@ mod lifecycle_commitment_tests {
                 grant_revision: 8,
                 lifecycle_revision: 2,
             },
+            owned_repo_ids: OwnedRepoIds::sole(repo_id.clone()),
             workspace_root: workspace_root.clone(),
             default_cwd: None,
             sandbox: SandboxConfig {
@@ -3956,7 +3966,7 @@ mod lifecycle_commitment_tests {
 
         let mut unintroduced = ArtifactStore::open(
             &unintroduced_root,
-            repo_id.clone(),
+            OwnedRepoIds::sole(repo_id.clone()),
             foreign_only.clone(),
             ArtifactConfig::default(),
         )
@@ -3974,7 +3984,7 @@ mod lifecycle_commitment_tests {
         assert!(matches!(
             ArtifactStore::open(
                 &unintroduced_root,
-                repo_id,
+                OwnedRepoIds::sole(repo_id),
                 destination,
                 ArtifactConfig {
                     historical_incarnations: admitted,
