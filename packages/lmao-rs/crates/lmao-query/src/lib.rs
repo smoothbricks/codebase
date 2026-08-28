@@ -5,7 +5,7 @@
 //! - "The query layer must not care which tracer produced the table" — the same
 //!   [`Selector`] runs against in-process Arrow RecordBatches ([`ArrowTraceQuery`],
 //!   always available; DataFusion SQL under the `datafusion` feature) and SQLite
-//!   (`.trace-results.db` / `SQLiteTracer` parity, `sqlite` feature).
+//!   (`.cache/trace-results.db` / `SQLiteTracer` parity, `sqlite` feature).
 //! - Assertions select by TEMPLATE/name + typed columns, never rendered text.
 //! - Negative assertions ("this event never appears") are first-class.
 //! - Ordering asserts use span parentage, not wall-clock across threads:
