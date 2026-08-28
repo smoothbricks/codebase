@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -27,7 +28,9 @@ use crate::api::server::{
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
-use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
+#[cfg(target_os = "macos")]
+use crate::repository::OwnedRepoIds;
+use crate::repository::{RepoId, RepositoryBinding};
 
 const ROUTER_CAPACITY: usize = 64;
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
@@ -3917,6 +3920,7 @@ fn repoint_checkout_symlink(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn replace_checkout_symlink(
     checkout: &Path,
     old_target: &Path,

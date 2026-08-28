@@ -1092,10 +1092,10 @@ pub(crate) fn discover_owned_identities(
 /// wrong, and it is raised here rather than from the store-wide scan so that the refusal lands on
 /// the one operation that asked, instead of taking down the whole inventory.
 ///
-/// macOS-only because its only callers are the APFS adoption and identity-change paths, which are
-/// themselves `cfg(target_os = "macos")`. Without the gate a Linux `cargo check` of the library
-/// alone sees no caller and `-D dead-code` fails the build.
-#[cfg(target_os = "macos")]
+/// The product caller is macOS-only, but the ownership rule is platform-neutral and its test
+/// should keep running on every host. Test builds therefore retain the function while Linux
+/// library builds omit a product path they cannot reach.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn identity_owner(
     store_root: &Path,
     repo_id: &RepoId,
