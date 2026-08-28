@@ -77,40 +77,66 @@ describe('readGoToolchainPair', () => {
 
   test('an installed ttsc whose vendored SDK is missing is an error, never a silent pass', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-go-toolchain-'));
-    mkdirSync(join(root, 'node_modules', 'ttsc'), { recursive: true });
-    writeFileSync(join(root, 'node_modules', 'ttsc', 'package.json'), JSON.stringify({ version: '0.28.3' }));
+    installTtsc(root, '0.28.3');
     const result = readGoToolchainPair(root, 'go', 'go version go1.26.7 darwin/arm64');
-    expect(result).toBeInstanceOf(Error);
-    expect((result as Error).message).toContain('vendored Go SDK VERSION file was not found');
+    if (!(result instanceof Error)) {
+      throw new Error(`expected an Error for a missing vendored SDK, read ${JSON.stringify(result)} instead`);
+    }
+    expect(result.message).toContain('vendored Go SDK VERSION file was not found');
   });
 
   test('reads the pair from the bun store layout, which is where a real install puts it', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-go-toolchain-'));
-    mkdirSync(join(root, 'node_modules', 'ttsc'), { recursive: true });
-    writeFileSync(join(root, 'node_modules', 'ttsc', 'package.json'), JSON.stringify({ version: '0.28.3' }));
-    const platformPackage = ttscPlatformPackage(process.platform, process.arch);
-    expect(platformPackage).not.toBeNull();
-    const storePath = vendoredVersionCandidates(root, platformPackage as string, '0.28.3')[1] as string;
+    installTtsc(root, '0.28.3');
+    const storePath = bunStoreVersionPath(root, '0.28.3');
     mkdirSync(join(storePath, '..'), { recursive: true });
     writeFileSync(storePath, 'go1.26.7\ntime 2026-08-18T21:44:21Z\n');
 
     const result = readGoToolchainPair(root, 'go', 'go version go1.26.7 darwin/arm64');
-    expect(result).not.toBeInstanceOf(Error);
+    if (result === null || result instanceof Error) {
+      throw new Error(`expected a readable pair, got ${result === null ? 'null' : result.message}`);
+    }
     expect(result).toMatchObject({ devenv: 'go1.26.7', vendored: 'go1.26.7', ttscVersion: '0.28.3' });
-    expect(validateGoToolchainPair(result as never)).toBe(0);
+    expect(validateGoToolchainPair(result)).toBe(0);
   });
 
   test('an unreadable devenv go version is an error rather than a pass', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-go-toolchain-'));
-    mkdirSync(join(root, 'node_modules', 'ttsc'), { recursive: true });
-    writeFileSync(join(root, 'node_modules', 'ttsc', 'package.json'), JSON.stringify({ version: '0.28.3' }));
-    const platformPackage = ttscPlatformPackage(process.platform, process.arch) as string;
-    const storePath = vendoredVersionCandidates(root, platformPackage, '0.28.3')[1] as string;
+    installTtsc(root, '0.28.3');
+    const storePath = bunStoreVersionPath(root, '0.28.3');
     mkdirSync(join(storePath, '..'), { recursive: true });
     writeFileSync(storePath, 'go1.26.7\n');
 
     const result = readGoToolchainPair(root, 'go', 'bash: go: command not found');
-    expect(result).toBeInstanceOf(Error);
-    expect((result as Error).message).toContain('no recognisable Go version');
+    if (!(result instanceof Error)) {
+      throw new Error(`expected an Error for an unreadable devenv go version, read ${JSON.stringify(result)} instead`);
+    }
+    expect(result.message).toContain('no recognisable Go version');
   });
 });
+
+function installTtsc(root: string, version: string): void {
+  mkdirSync(join(root, 'node_modules', 'ttsc'), { recursive: true });
+  writeFileSync(join(root, 'node_modules', 'ttsc', 'package.json'), JSON.stringify({ version }));
+}
+
+/**
+ * The bun store candidate for this platform's vendored VERSION file. Index 1 is
+ * the store layout a real `bun install` produces, which is the case these tests
+ * exist to cover; naming it keeps the magic index out of the test bodies.
+ *
+ * Throws rather than narrowing by cast: an unsupported platform or a shortened
+ * candidate list means the fixture no longer describes a real install, which is
+ * a broken test, not a failing invariant, and must not be silently coerced.
+ */
+function bunStoreVersionPath(root: string, ttscVersion: string): string {
+  const platformPackage = ttscPlatformPackage(process.platform, process.arch);
+  if (platformPackage === null) {
+    throw new Error(`ttsc publishes no native package for ${process.platform}/${process.arch}`);
+  }
+  const storePath = vendoredVersionCandidates(root, platformPackage, ttscVersion)[1];
+  if (storePath === undefined) {
+    throw new Error('vendoredVersionCandidates no longer yields a bun store candidate at index 1');
+  }
+  return storePath;
+}
