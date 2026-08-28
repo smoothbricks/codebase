@@ -13,6 +13,7 @@ import {
   definePublishWorkflow,
   type PublishWorkflowBump,
   type PublishWorkflowCallbacks,
+  type PublishWorkflowDefinitionOptions,
   type PublishWorkflowNxTarget,
   type PublishWorkflowVersionOutputs,
   renderPublishWorkflowYaml,
@@ -21,13 +22,21 @@ import {
 
 const nixosRunsOn = ['nixos-latest-x64', 'self-hosted'] as const;
 
+/**
+ * What `smoo monorepo` derives from this repository's own Nx graph: macOS and
+ * Linux platform families (no iOS targets exist here) built for two
+ * architectures. The checked-in workflow copy is rendered from exactly these.
+ */
+const codebaseWorkflowOptions: PublishWorkflowDefinitionOptions = {
+  repoName: '@smoothbricks/codebase',
+  platformTargetGlobs: ['*-macos', '*-linux'],
+  macosPlatformArchitectures: ['arm64', 'x64'],
+  runsOn: [...nixosRunsOn],
+};
+
 describe('publish workflow definition', () => {
   it('renders the checked-in local publish workflow copy', async () => {
-    const rendered = renderPublishWorkflowYaml({
-      repoName: '@smoothbricks/codebase',
-      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
-      runsOn: [...nixosRunsOn],
-    });
+    const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
     const packageRoot = join(import.meta.dir, '..', '..', '..');
     await expect(readFile(join(packageRoot, '..', '..', '.github/workflows/publish.yml'), 'utf8')).resolves.toBe(
       rendered,
@@ -35,11 +44,7 @@ describe('publish workflow definition', () => {
   });
 
   it('renders workflow bytes that are stable under the repository Prettier config', async () => {
-    const rendered = renderPublishWorkflowYaml({
-      repoName: '@smoothbricks/codebase',
-      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
-      runsOn: [...nixosRunsOn],
-    });
+    const rendered = renderPublishWorkflowYaml(codebaseWorkflowOptions);
 
     await expect(
       format(rendered, {
@@ -206,6 +211,52 @@ describe('publish workflow definition', () => {
       'smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ' +
         '"${{ runner.temp }}/publish-artifacts/publish-macos-outputs-${{ github.run_id }}/current"',
     );
+  });
+
+  it('fans the macOS producer out over one runner per architecture', () => {
+    const matrixed = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      macosPlatformArchitectures: ['arm64', 'x64'],
+    });
+    const macosPlatform = matrixed.slice(
+      matrixed.indexOf('  macos-platform:'),
+      matrixed.indexOf('  publish-on-linux:'),
+    );
+    const finalJob = matrixed.slice(matrixed.indexOf('  publish-on-linux:'));
+
+    expect(macosPlatform).toContain('      fail-fast: false');
+    expect(macosPlatform).toContain('        arch: [arm64, x64]');
+    expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
+      'smoo release build-platform-outputs --bump "${{ inputs.bump }}" --ref "${{ github.sha }}" ' +
+        '--targets "*-${{ matrix.arch }}-macos,*-${{ matrix.arch }}-ios" ' +
+        '--output "${{ runner.temp }}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"',
+    );
+    // Foreign-architecture binaries cannot execute on the runner that built them.
+    expect(macosPlatform).toContain("if: matrix.arch == 'arm64' && steps.platform-outputs.outputs.projects != ''");
+    expect(macosPlatform).toContain('name: publish-macos-${{ matrix.arch }}-outputs-${{ github.run_id }}');
+    expect(macosPlatform).not.toContain('name: publish-macos-outputs-');
+    expect(foldedRunCommand(finalJob, '🍎 Apply verified macOS outputs')).toBe(
+      'smoo github-ci apply-outputs --source-sha "${{ github.sha }}" ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/current" ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/current"',
+    );
+    expect(foldedRunCommand(finalJob, '🧯 Repair pending releases')).toBe(
+      'smoo release repair-pending --ref "${{ github.sha }}" --platform-outputs ' +
+        '"${{ runner.temp }}/publish-artifacts/publish-macos-arm64-outputs-${{ github.run_id }}/repairs,' +
+        '${{ runner.temp }}/publish-artifacts/publish-macos-x64-outputs-${{ github.run_id }}/repairs" ' +
+        '--dry-run "${{ inputs.dry_run }}"',
+    );
+
+    const single = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      macosPlatformArchitectures: ['arm64'],
+    });
+    const singleMacos = single.slice(single.indexOf('  macos-platform:'), single.indexOf('  publish-on-linux:'));
+    expect(singleMacos).not.toContain('strategy:');
+    expect(singleMacos).toContain('name: publish-macos-outputs-${{ github.run_id }}');
+    expect(singleMacos).toContain("if: steps.platform-outputs.outputs.projects != ''");
   });
 
   it('limits trusted publishing permission to final publish and preserves mode, deploy, and dry-run gates', () => {

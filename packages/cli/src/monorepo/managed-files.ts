@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import type { NxTargetConfig, PackageJson } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
@@ -147,6 +147,7 @@ interface ManagedFileContext {
   nodeModulesCacheKey: string;
   repoName: string;
   platformTargetGlobs: string[];
+  macosPlatformArchitectures: string[];
 }
 
 interface DeployTargetInfo {
@@ -336,6 +337,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         deployProvider: context.productionDeployProvider,
         repoName: context.repoName,
         platformTargetGlobs: context.platformTargetGlobs,
+        macosPlatformArchitectures: context.macosPlatformArchitectures,
         runsOn: context.ciRunsOn,
       });
     }
@@ -380,6 +382,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,
+    macosPlatformArchitectures: macosPlatformArchitecturesForTest(targetNames),
   };
 }
 
@@ -393,6 +396,31 @@ export function platformTargetGlobsForTest(targetNames: Iterable<string>): strin
     const suffix = glob.startsWith('*') ? glob.slice(1) : glob;
     return names.some((name) => name.endsWith(suffix));
   });
+}
+
+/**
+ * Test seam: the architectures the macOS platform job must fan out over,
+ * derived from the target names themselves so a repository that ships one
+ * architecture renders one matrix leg. Each leg owns one architecture's
+ * targets, which is what lets them build on separate runners: cargo takes an
+ * exclusive lock on a package's whole `target/` directory, so same-runner
+ * platform builds serialize no matter how many workers Nx is given.
+ */
+export function macosPlatformArchitecturesForTest(targetNames: Iterable<string>): string[] {
+  const families = MACOS_PLATFORM_TARGET_GLOBS.map((glob) => glob.slice(1));
+  const architectures = new Set<string>();
+  for (const name of targetNames) {
+    for (const family of families) {
+      if (!name.endsWith(family)) {
+        continue;
+      }
+      const architecture = name.slice(0, -family.length).split('-').pop();
+      if (architecture) {
+        architectures.add(architecture);
+      }
+    }
+  }
+  return [...architectures].sort((left, right) => left.localeCompare(right));
 }
 
 /** Test seam: deploy configuration presence/provider from graph nodes. */

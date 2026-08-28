@@ -162,7 +162,7 @@ function buildProgram(): Command {
     .description('Repair incomplete older release commits before releasing the current HEAD')
     .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
     .option('--ref <ref>', 'fixed release graph ref to inspect')
-    .option('--platform-outputs <path>', 'cross-platform repair outputs grouped by release SHA')
+    .option('--platform-outputs <paths>', 'comma-separated cross-platform repair output roots grouped by release SHA')
     .action(async (options: { dryRun?: string | boolean; platformOutputs?: string; ref?: string }) => {
       // The source self-hosting shim has no Typia transform; release commands import transformed output validators.
       const { releaseRepairPending } = await import('./release/index.js');
