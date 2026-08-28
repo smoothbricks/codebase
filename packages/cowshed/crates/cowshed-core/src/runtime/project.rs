@@ -1,3 +1,4 @@
+use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,7 @@ use crate::api::server::{
 };
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
-use crate::repository::{RepoId, RepositoryBinding};
+use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
 
 const ROUTER_CAPACITY: usize = 64;
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
@@ -102,6 +103,11 @@ pub trait ProjectRuntimeHost: Send + 'static {
     ) -> Result<WorkspaceSnapshot>;
     /// Move the project's checkout to a new path, keeping every record of where it lives in step.
     async fn move_checkout(&mut self, destination: PathBuf) -> Result<WorkspaceSnapshot>;
+    async fn change_repo_id(&mut self, _repo_id: RepoId) -> Result<WorkspaceSnapshot> {
+        Err(CowshedError::internal(
+            "repository identity changes are unavailable for this runtime host",
+        ))
+    }
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()>;
     async fn detach(&mut self, workspace: WorkspaceName) -> Result<()>;
     async fn resize(
@@ -366,6 +372,7 @@ impl ProjectActor {
             "coordinator.fork" => self.coordinator_fork(request).await,
             "coordinator.rename" => self.coordinator_rename(request).await,
             "coordinator.moveCheckout" => self.coordinator_move_checkout(request).await,
+            "coordinator.changeRepoId" => self.coordinator_change_repo_id(request).await,
             "coordinator.grant" => self.coordinator_grant(request, false).await,
             "coordinator.revoke" => self.coordinator_grant(request, true).await,
             "coordinator.rebase" => self.coordinator_rebase(request).await,
@@ -559,6 +566,17 @@ impl ProjectActor {
         let params: MoveCheckoutParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         let snapshot = self.host.move_checkout(params.destination).await?;
+        workspace_response(&snapshot)
+    }
+
+    async fn coordinator_change_repo_id(
+        &mut self,
+        request: RouterRequest,
+    ) -> Result<RouterResponse> {
+        require_coordinator(request.authority())?;
+        let params: ChangeRepoIdParams = decode_params(request.params(), request.method())?;
+        self.require_repo(&params.repo_id)?;
+        let snapshot = self.host.change_repo_id(params.new_repo_id).await?;
         workspace_response(&snapshot)
     }
 
@@ -1064,6 +1082,12 @@ struct MoveCheckoutParams {
     destination: PathBuf,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChangeRepoIdParams {
+    repo_id: RepoId,
+    new_repo_id: RepoId,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RestoreParams {
@@ -1582,6 +1606,7 @@ impl NativeProjectRuntimeHost {
             &bootstrap_mode,
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly
         );
+        recover_repository_identity_intent(bootstrap.roots().store()).await?;
         let origin = if existing_only {
             workspace_origin_from_marker(&git_root).await?
         } else {
@@ -1630,19 +1655,44 @@ impl NativeProjectRuntimeHost {
                 .await
                 .map_err(native_integrity_error)?;
         }
-        let (repo_id, layout, binding) = if let Some((repo_id, layout, binding)) = session_project {
-            (repo_id, layout, binding)
+        let (repo_id, layout, binding) = if let Some(resolved) = session_project {
+            resolved
         } else {
-            let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
-            let repo_id = candidate
-                .primary()
-                .map_err(native_integrity_error)?
-                .repo_id
-                .clone();
-            let layout = crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
-                .map_err(native_integrity_error)?;
-            let binding = load_or_validate_binding(&layout, candidate, &git).await?;
-            (repo_id, layout, binding)
+            let recorded = match binding_repo_id.as_ref() {
+                Some(repo_id) => project_owning_repo_id(bootstrap.roots().store(), repo_id).await?,
+                None => None,
+            };
+            match recorded {
+                // The store already records what this project is called, so that record decides.
+                // The remotes are still checked, but only against the remote each identity itself
+                // recorded — an identity carrying none (which is what an in-place rename leaves)
+                // has nothing for Git to contradict.
+                Some((layout, binding)) => {
+                    let repo_id = binding
+                        .primary()
+                        .map_err(native_integrity_error)?
+                        .repo_id
+                        .clone();
+                    let remotes = git.remotes().await?;
+                    validate_binding_against_remotes(&binding, &remotes)?;
+                    (repo_id, layout, binding)
+                }
+                // Nothing adopted under this identity: the remotes are the only source left, and
+                // this is the adoption path that derives an identity from them for the first time.
+                None => {
+                    let candidate = binding_from_git(&git, binding_repo_id.as_ref()).await?;
+                    let repo_id = candidate
+                        .primary()
+                        .map_err(native_integrity_error)?
+                        .repo_id
+                        .clone();
+                    let layout =
+                        crate::storage::StorageLayout::new(bootstrap.roots().store(), &repo_id)
+                            .map_err(native_integrity_error)?;
+                    let binding = load_or_validate_binding(&layout, candidate, &git).await?;
+                    (repo_id, layout, binding)
+                }
+            }
         };
         if !existing_only {
             let provision_layout = layout.clone();
@@ -1673,6 +1723,13 @@ impl NativeProjectRuntimeHost {
             &git_root,
             checkout_layout,
             crate::apfs::ApfsCaseSensitivity::Sensitive,
+        )
+        .rebind_former_repo_ids(
+            binding
+                .owned_repo_ids()
+                .map_err(native_integrity_error)?
+                .former()
+                .clone(),
         );
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
             crate::apfs::SystemCommandRunner,
@@ -2247,6 +2304,48 @@ impl NativeProjectRuntimeHost {
         let config = self
             .substrate_config
             .rebind_checkout(checkout_path, checkout_layout);
+        self.rebind_substrate(config)?;
+        self.descriptor.git_root = checkout_path.to_owned();
+        self.git = crate::git::GitRepository::from_root(checkout_path);
+        Ok(())
+    }
+
+    /// Rebuild the substrate after the repository namespace has moved.
+    ///
+    /// Carries the same swap-the-whole-triple discipline as [`Self::rebind_checkout`], and adds the
+    /// binding's newly recorded former identity to the config so that marker and certificate
+    /// validation keeps accepting images the change could not reach. The Git checkout stays where
+    /// it is and its remote is deliberately untouched.
+    fn rebind_repo_id(
+        &mut self,
+        repo_id: RepoId,
+        binding: RepositoryBinding,
+        layout: crate::storage::StorageLayout,
+    ) -> Result<()> {
+        let former = binding
+            .owned_repo_ids()
+            .map_err(native_integrity_error)?
+            .former()
+            .clone();
+        let config = self.substrate_config.rebind_former_repo_ids(former);
+        self.rebind_substrate(config)?;
+        self.layout = layout;
+        self.descriptor.repo_id = repo_id;
+        self.descriptor.binding = binding;
+        self.lifecycle_intents_path = self
+            .layout
+            .project()
+            .project_root
+            .join(crate::storage::recovery::LIFECYCLE_INTENTS_FILE);
+        Ok(())
+    }
+
+    /// The one place the config, the execution host and the substrate are swapped together. Every
+    /// rebind goes through here so no caller can leave the three disagreeing.
+    fn rebind_substrate(
+        &mut self,
+        config: crate::storage::apfs::ApfsSubstrateConfig,
+    ) -> Result<()> {
         let host = crate::storage::apfs::native::MacOsApfsExecutionHost::new(
             crate::apfs::SystemCommandRunner,
             config.clone(),
@@ -2254,9 +2353,15 @@ impl NativeProjectRuntimeHost {
         .map_err(native_storage_error)?;
         self.substrate = crate::storage::apfs::ApfsSubstrate::new(config.clone(), host);
         self.substrate_config = config;
-        self.descriptor.git_root = checkout_path.to_owned();
-        self.git = crate::git::GitRepository::from_root(checkout_path);
         Ok(())
+    }
+
+    /// Every identity this project owns, read from the binding it is holding right now.
+    fn owned_repo_ids(&self) -> Result<OwnedRepoIds> {
+        self.descriptor
+            .binding
+            .owned_repo_ids()
+            .map_err(native_integrity_error)
     }
 
     /// Bring every workspace's own record of the project into line with where the project is now.
@@ -2327,13 +2432,19 @@ impl NativeProjectRuntimeHost {
             crate::storage::lifecycle::MountState::Mounted { .. }
         );
         let rewrite_root = project_root.to_owned();
+        let repo_id = self.descriptor.repo_id.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
+            // Identity moves with the project root because both are the same kind of fact: this
+            // workspace's own record of the project it belongs to. A mounted workspace has both
+            // copies in reach, the in-image marker and the store-side sidecar; a detached one has
+            // only the sidecar, and its marker keeps naming an identity the binding records as
+            // former until it is next attached and lands here with the marker in reach.
             if mounted {
-                record.rewrite_project_root(&rewrite_root).map(|_| ())
+                record.rewrite_project_root(&rewrite_root)?;
+                record.rewrite_repo_id(&repo_id).map(|_| ())
             } else {
-                record
-                    .rewrite_detached_project_root(&rewrite_root)
-                    .map(|_| ())
+                record.rewrite_detached_project_root(&rewrite_root)?;
+                record.rewrite_detached_repo_id(&repo_id).map(|_| ())
             }
         })
         .await
@@ -3364,6 +3475,7 @@ impl NativeProjectRuntimeHost {
                 grant_revision: current.metadata.grants.revision,
                 lifecycle_revision: current.derived.workspace.revision().get(),
             },
+            owned_repo_ids: self.owned_repo_ids()?,
             workspace_root: mount,
             default_cwd: None,
             sandbox,
@@ -3484,6 +3596,359 @@ fn occupied_move_destination(destination: &Path) -> CowshedError {
         format!("{} already exists", destination.display()),
         "remove the occupant or choose another destination",
     )
+}
+
+#[cfg(target_os = "macos")]
+async fn recover_repository_identity_intent(store_root: &Path) -> Result<()> {
+    let store_root = store_root.to_owned();
+    crate::storage::lifecycle::dispatch_blocking(move || {
+        let Some(intent) = crate::storage::recovery::RepositoryIdentityIntent::load(&store_root)?
+        else {
+            return Ok(());
+        };
+        // `Prepared` is written before the mutation fence, with nothing renamed and the project's
+        // volumes already unmounted, so there is nothing to finish and nothing to undo. Detached is
+        // a state `cowshed attach` resolves.
+        if intent.phase == crate::storage::recovery::LifecycleIntentPhase::Prepared {
+            return crate::storage::recovery::RepositoryIdentityIntent::clear(&store_root);
+        }
+        apply_identity_change(&intent)?;
+        crate::storage::recovery::RepositoryIdentityIntent::clear(&store_root)
+    })
+    .await
+    .map_err(|error| {
+        CowshedError::internal(format!("repository identity recovery task failed: {error}"))
+    })?
+}
+
+/// Apply the durable half of an identity change, from whatever state the store is in right now.
+///
+/// Every step derives what to do from authoritative state — which directory exists, what the
+/// binding says, where the symlink points — and every step is a no-op once applied. The forward
+/// transaction and recovery therefore call this one function rather than keeping two
+/// implementations that can disagree, and the journal is asked only *whether* a change is owed,
+/// never how far it got.
+///
+/// In-image workspace markers are deliberately not touched. A detached image's marker is out of
+/// reach by definition, and reaching it would mean mounting images mid-transaction — which is what
+/// stranded detached sessions behind a doctor hint before. The marker keeps naming an identity the
+/// binding now records as former, [`OwnedRepoIds`] accepts it, and the next attach converges it.
+///
+/// Synchronous and blocking on purpose: from the first rename until the last sidecar is rewritten
+/// the store has two namespaces in play, and nothing else may enumerate it in between.
+#[cfg(target_os = "macos")]
+fn apply_identity_change(
+    intent: &crate::storage::recovery::RepositoryIdentityIntent,
+) -> Result<()> {
+    move_identity_namespace(
+        "store",
+        &intent.old_project_root,
+        &intent.new_project_root,
+        intent,
+    )?;
+    converge_binding_identity(
+        &intent
+            .new_project_root
+            .join(crate::repository::REPOSITORY_BINDING_FILE),
+        &intent.old_repo_id,
+        &intent.new_repo_id,
+    )?;
+    // A project whose workspaces were never mounted has no mount root at all, which is why this is
+    // conditional rather than required.
+    if intent.old_mount_root.exists() || intent.new_mount_root.exists() {
+        move_identity_namespace(
+            "workspace mount",
+            &intent.old_mount_root,
+            &intent.new_mount_root,
+            intent,
+        )?;
+    }
+    rewrite_sidecar_identities(
+        &intent.new_project_root,
+        &intent.old_repo_id,
+        &intent.new_repo_id,
+    )?;
+    repoint_checkout_symlink(intent)
+}
+
+/// Rename one of the project's two namespaces, refusing every state that is not one-or-the-other.
+///
+/// Both present is the state that must never be guessed at: one of them holds the project and the
+/// other holds whatever a previous interruption left, and picking wrong loses a workspace image.
+/// Neither present is equally unguessable — the directory the intent names is simply gone.
+#[cfg(target_os = "macos")]
+fn move_identity_namespace(
+    namespace: &str,
+    old: &Path,
+    new: &Path,
+    intent: &crate::storage::recovery::RepositoryIdentityIntent,
+) -> Result<()> {
+    match (old.exists(), new.exists()) {
+        (false, true) => return Ok(()),
+        (true, true) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "repository identity change {} -> {} has both {namespace} namespaces: {} and {}",
+                    intent.old_repo_id,
+                    intent.new_repo_id,
+                    old.display(),
+                    new.display()
+                ),
+                format!(
+                    "inspect {} and {} with `cowshed doctor`, then remove whichever is not the \
+                     project — cowshed will not choose",
+                    old.display(),
+                    new.display()
+                ),
+            ));
+        }
+        (false, false) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "repository identity change {} -> {} has neither {namespace} namespace: \
+                     neither {} nor {} exists",
+                    intent.old_repo_id,
+                    intent.new_repo_id,
+                    old.display(),
+                    new.display()
+                ),
+                "restore the project directory from backup, then reopen cowshed",
+            ));
+        }
+        (true, false) => {}
+    }
+    if let Some(parent) = new.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot create {namespace} identity directory {}: {error}",
+                    parent.display()
+                ),
+                "repair the store filesystem and reopen cowshed",
+            )
+        })?;
+    }
+    fs::rename(old, new).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot move {namespace} namespace {} to {}: {error}",
+                old.display(),
+                new.display()
+            ),
+            "repair the store filesystem and reopen cowshed",
+        )
+    })
+}
+
+/// Bring the binding at `path` onto the new identity, recording the old one as former.
+///
+/// Idempotent by inspection of what it already says: still the old identity means the rename is
+/// owed, already the new one means it is done. Anything else is a binding this transaction has no
+/// business rewriting, and is refused rather than overwritten.
+#[cfg(target_os = "macos")]
+fn converge_binding_identity(
+    path: &Path,
+    old_repo_id: &RepoId,
+    new_repo_id: &RepoId,
+) -> Result<()> {
+    let binding: RepositoryBinding = crate::metadata::read_json(path).map_err(|error| {
+        CowshedError::integrity(
+            format!("cannot read repository binding {}: {error}", path.display()),
+            "repair the repository binding, then reopen cowshed",
+        )
+    })?;
+    let owned = binding.owned_repo_ids().map_err(native_integrity_error)?;
+    if owned.current() == new_repo_id && owned.accepts(old_repo_id) {
+        return Ok(());
+    }
+    if owned.current() != old_repo_id {
+        return Err(CowshedError::integrity(
+            format!(
+                "repository binding {} names {owned}, which is neither {old_repo_id} nor \
+                 {new_repo_id}",
+                path.display()
+            ),
+            "repair the repository binding, then reopen cowshed",
+        ));
+    }
+    let renamed = binding
+        .rename_primary(new_repo_id.clone())
+        .map_err(native_integrity_error)?;
+    crate::metadata::write_json(path, &renamed).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot publish repository binding {}: {error}",
+                path.display()
+            ),
+            "repair the store filesystem and reopen cowshed",
+        )
+    })
+}
+
+/// Move every workspace image's store-side identity stamp onto the new identity.
+///
+/// The sidecar is always in reach — it lives beside its image in the store, mounted or not — and it
+/// is what enumeration, publication recovery and mount-path derivation read. Leaving one behind
+/// makes the image invisible to the project that owns it, which is why this walks the whole project
+/// directory rather than only the workspaces the caller happened to enumerate.
+#[cfg(target_os = "macos")]
+fn rewrite_sidecar_identities(
+    project_root: &Path,
+    old_repo_id: &RepoId,
+    new_repo_id: &RepoId,
+) -> Result<()> {
+    for sidecar in project_sidecars(project_root)? {
+        let mut metadata: crate::metadata::DetachedWorkspaceMetadata =
+            crate::metadata::read_json(&sidecar).map_err(|error| {
+                CowshedError::integrity(
+                    format!(
+                        "cannot read workspace sidecar {}: {error}",
+                        sidecar.display()
+                    ),
+                    "repair the workspace sidecar, then reopen cowshed",
+                )
+            })?;
+        if metadata.repo_id != *old_repo_id {
+            continue;
+        }
+        let image = crate::metadata::image_from_sidecar_path(&sidecar).ok_or_else(|| {
+            CowshedError::integrity(
+                format!("workspace sidecar {} names no image", sidecar.display()),
+                "repair the workspace sidecar, then reopen cowshed",
+            )
+        })?;
+        metadata.repo_id = new_repo_id.clone();
+        metadata.validate(&image).map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "cannot validate workspace sidecar {}: {error}",
+                    sidecar.display()
+                ),
+                "repair the workspace sidecar, then reopen cowshed",
+            )
+        })?;
+        crate::metadata::write_json(&sidecar, &metadata).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot publish workspace sidecar {}: {error}",
+                    sidecar.display()
+                ),
+                "repair the store filesystem and reopen cowshed",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Every detached-metadata sidecar under a project directory, including staged and retired images.
+///
+/// Symlinks are never followed and never descended: the store is cowshed's own tree, and a symlink
+/// inside it is either not ours or is an attempt to make this walk write outside the project.
+#[cfg(target_os = "macos")]
+fn project_sidecars(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut sidecars = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "cannot enumerate project directory {}: {error}",
+                        directory.display()
+                    ),
+                    "repair the store filesystem and reopen cowshed",
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot read project directory entry in {}: {error}",
+                        directory.display()
+                    ),
+                    "repair the store filesystem and reopen cowshed",
+                )
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("cannot inspect {}: {error}", path.display()),
+                    "repair the store filesystem and reopen cowshed",
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if crate::metadata::image_from_sidecar_path(&path).is_some() {
+                sidecars.push(path);
+            }
+        }
+    }
+    Ok(sidecars)
+}
+
+/// Repoint a symlinked checkout at the moved mount root, if it still names the old one.
+///
+/// Under `CheckoutLayout::DirectMount` there is no symlink and nothing to do; under
+/// `CheckoutLayout::Symlink` a checkout already naming the new target is a completed step, and one
+/// naming neither belongs to the user rather than to this transaction.
+#[cfg(target_os = "macos")]
+fn repoint_checkout_symlink(
+    intent: &crate::storage::recovery::RepositoryIdentityIntent,
+) -> Result<()> {
+    let old_target = intent.old_mount_root.join(main_name().as_str());
+    let Ok(actual) = fs::read_link(&intent.checkout_path) else {
+        return Ok(());
+    };
+    if actual != old_target {
+        return Ok(());
+    }
+    replace_checkout_symlink(
+        &intent.checkout_path,
+        &old_target,
+        &intent.new_mount_root.join(main_name().as_str()),
+    )
+    .map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot repoint checkout {} at the moved workspace mount: {error}",
+                intent.checkout_path.display()
+            ),
+            "repair the checkout symlink and reopen cowshed",
+        )
+    })
+}
+
+fn replace_checkout_symlink(
+    checkout: &Path,
+    old_target: &Path,
+    new_target: &Path,
+) -> std::io::Result<()> {
+    let actual = std::fs::read_link(checkout)?;
+    if actual != old_target {
+        return Err(std::io::Error::other(format!(
+            "checkout {} points at {}, expected {}",
+            checkout.display(),
+            actual.display(),
+            old_target.display()
+        )));
+    }
+    let parent = checkout
+        .parent()
+        .ok_or_else(|| std::io::Error::other("checkout has no parent"))?;
+    let temporary = parent.join(format!(".cowshed-repo-id-link-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    std::os::unix::fs::symlink(new_target, &temporary)?;
+    if let Err(error) = std::fs::rename(&temporary, checkout) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(target_os = "macos")]
@@ -3869,6 +4334,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "list the existing main workspace",
             ));
         }
+        refuse_identity_owned_by_a_live_project(
+            &self.substrate_config.store_root,
+            &self.descriptor.repo_id,
+            &self.descriptor.repo_id,
+        )
+        .await?;
         if options
             .repo_id
             .as_ref()
@@ -4523,6 +4994,182 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         self.snapshot_named(&main).await
     }
 
+    /// Change the project's repository identity in place.
+    ///
+    /// Identity is a cowshed record, not a Git fact: the remote is deliberately untouched, and the
+    /// binding records the identity it is leaving as a former one. That record is what keeps every
+    /// stamp this operation cannot reach — a detached image's marker, a CA certificate subject, an
+    /// artifact frame already appended — valid afterwards, through [`OwnedRepoIds`].
+    ///
+    /// The durable half is [`apply_identity_change`], shared with recovery. Everything here is the
+    /// live half: refuse what must not proceed, get the volumes down, cross the fence, and bring the
+    /// project back up under its new name.
+    async fn change_repo_id(&mut self, new_repo_id: RepoId) -> Result<WorkspaceSnapshot> {
+        use crate::storage::apfs::ApfsExecutionHost;
+        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
+        use crate::storage::recovery::{LifecycleIntentPhase, RepositoryIdentityIntent};
+
+        let old_repo_id = self.descriptor.repo_id.clone();
+        if old_repo_id == new_repo_id {
+            return Err(CowshedError::usage(
+                format!("project already uses repository identity {new_repo_id}"),
+                "choose a different identity or run cowshed ls",
+            ));
+        }
+        let target_layout =
+            crate::storage::StorageLayout::new(&self.substrate_config.store_root, &new_repo_id)
+                .map_err(native_integrity_error)?;
+        let old_project_root = self.layout.project().project_root.clone();
+        let new_project_root = target_layout.project().project_root.clone();
+        let old_mount_root = self.layout.project().mount_root.clone();
+        let new_mount_root = target_layout.project().mount_root.clone();
+        refuse_identity_owned_by_a_live_project(
+            &self.substrate_config.store_root,
+            &new_repo_id,
+            &old_repo_id,
+        )
+        .await?;
+        for (namespace, path) in [
+            ("repository store", &new_project_root),
+            ("workspace mount root", &new_mount_root),
+        ] {
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "{namespace} {} for repository identity {new_repo_id} is already in use",
+                        path.display()
+                    ),
+                    format!(
+                        "move {} aside, then retry the identity change",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+
+        let workspaces = self.authoritative().await?;
+        let main = workspaces
+            .iter()
+            .find(|workspace| workspace.derived.workspace.name().is_main())
+            .ok_or_else(|| {
+                CowshedError::not_found(
+                    "workspace main does not exist",
+                    "run cowshed ls and repair the adopted project before changing its identity",
+                )
+            })?;
+        // Main has to be mounted so its in-image marker can be brought onto the new identity in the
+        // same operation. Every other workspace may stay detached: its marker keeps the identity the
+        // binding now records as former, and the next attach converges it.
+        if !matches!(main.derived.mount_state, MountState::Mounted { .. }) {
+            return Err(CowshedError::conflict(
+                "workspace main is detached, so its in-image identity marker is out of reach",
+                "run cowshed attach main, then retry the identity change",
+            ));
+        }
+        let attached_sessions: Vec<_> = workspaces
+            .iter()
+            .filter(|workspace| !workspace.derived.workspace.name().is_main())
+            .filter(|workspace| matches!(workspace.derived.mount_state, MountState::Mounted { .. }))
+            .map(|workspace| workspace.derived.workspace.name().to_string())
+            .collect();
+        if !attached_sessions.is_empty() {
+            return Err(CowshedError::conflict(
+                format!(
+                    "project {old_repo_id} has attached session workspace(s): {}",
+                    attached_sessions.join(", ")
+                ),
+                format!(
+                    "detach those workspaces first: {}",
+                    attached_sessions
+                        .iter()
+                        .map(|workspace| format!("cowshed detach {workspace}"))
+                        .collect::<Vec<_>>()
+                        .join(" && ")
+                ),
+            ));
+        }
+        let new_binding = self
+            .descriptor
+            .binding
+            .rename_primary(new_repo_id.clone())
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("cannot rewrite repository binding for {old_repo_id}: {error}"),
+                    "repair the repository binding, then retry the identity change",
+                )
+            })?;
+        let main_workspace = main.derived.workspace.clone();
+        let intent = RepositoryIdentityIntent {
+            old_repo_id: old_repo_id.clone(),
+            new_repo_id: new_repo_id.clone(),
+            checkout_path: self.substrate_config.checkout_path.clone(),
+            old_project_root,
+            new_project_root,
+            old_mount_root,
+            new_mount_root,
+            phase: LifecycleIntentPhase::Prepared,
+        };
+        intent.persist(&self.substrate_config.store_root)?;
+
+        // Everything above the fence is reversible by doing nothing: a `Prepared` record is
+        // discarded on the next open, leaving a project that is merely detached.
+        self.stop_supervisor(&main_name()).await?;
+        self.substrate
+            .unmount(&main_workspace)
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.to_ascii_lowercase().contains("resource busy") {
+                    CowshedError::conflict(
+                        format!("project {old_repo_id} main mount is busy: {message}"),
+                        "leave the checkout and every workspace mount, then retry the identity \
+                         change",
+                    )
+                } else {
+                    native_storage_error(error)
+                }
+            })?;
+
+        // The fence. Nothing of this project is mounted, so every namespace rename below is free to
+        // proceed and recovery from here is always forward.
+        let mutating = RepositoryIdentityIntent {
+            phase: LifecycleIntentPhase::Mutating,
+            ..intent.clone()
+        };
+        mutating.persist(&self.substrate_config.store_root)?;
+        let durable = mutating.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || apply_identity_change(&durable))
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("repository identity change task failed: {error}"))
+            })??;
+
+        self.rebind_repo_id(new_repo_id, new_binding, target_layout)?;
+        let current = self.current(&main_name()).await?;
+        self.substrate
+            .ensure_mounted(&current.derived.workspace, MountIntent { browse: false })
+            .await
+            .map_err(native_storage_error)?;
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let project_root = self.descriptor.git_root.clone();
+        self.repair_one_workspace_record(&current, &main_name(), &main_mount, &project_root)
+            .await?;
+        // The volume label is human-facing and carries no identity — nothing parses it and nothing
+        // classifies a volume by it — so relabelling is cosmetic and needs no recovery. It is done
+        // here, with main mounted, because Finder shows this string in place of the checkout
+        // directory's name and leaving the old repository name there is simply wrong.
+        self.substrate
+            .host()
+            .rename_volume(
+                &main_mount,
+                &crate::storage::apfs::volume_label(&self.descriptor.repo_id, &main_name()),
+            )
+            .map_err(native_storage_error)?;
+        self.ensure_supervisor(&main_name()).await?;
+        RepositoryIdentityIntent::clear(&self.substrate_config.store_root)?;
+        self.snapshot_named(&main_name()).await
+    }
+
     async fn attach(&mut self, workspace: WorkspaceName, options: AttachOptions) -> Result<()> {
         use crate::storage::lifecycle::{MountIntent, Substrate};
         self.validate_binding().await?;
@@ -4548,6 +5195,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             self.advance_gateway_revision(&current).await?;
         }
         self.ensure_supervisor(&workspace).await?;
+        // `observed` is where the caller actually stands, which is the only evidence that a
+        // hand-moved checkout produces. Repairing against `descriptor.git_root` instead would
+        // rewrite the record to the path the controller already believes, so a moved checkout
+        // would never be discovered and every later verb would keep aiming at the old path.
         if let Some(observed) = options.observed_path {
             self.converge_checkout_record(&observed).await?;
         }
@@ -6372,6 +7023,105 @@ async fn read_persisted_binding(
     .map_err(native_integrity_error)
 }
 
+/// The adopted project that owns `repo_id`, which outranks its Git remotes.
+///
+/// Identity is a cowshed record, not a Git fact. `cowshed mv main --repo-id` changes it in place
+/// and deliberately never touches the remote, so afterwards the recorded identity and the remote
+/// legitimately disagree — that divergence is the feature, not a fault. Deriving identity from the
+/// remotes whenever the store already records one would refuse to open the very project a rename
+/// had just produced.
+///
+/// The lookup is by ownership rather than by path because the identity being asked about may be one
+/// the project has left behind: a detached session's marker, or main's own marker when recovery
+/// finished a change the marker rewrite never reached. The store path is tried first, since it
+/// answers in one stat for every project that has never been renamed, and the scan runs only when
+/// that misses.
+///
+/// `None` means no adopted project owns this identity, which is the only case where the remotes get
+/// to decide what the project is called — that is adoption.
+#[cfg(target_os = "macos")]
+async fn project_owning_repo_id(
+    store_root: &Path,
+    repo_id: &RepoId,
+) -> Result<Option<(crate::storage::StorageLayout, RepositoryBinding)>> {
+    let layout =
+        crate::storage::StorageLayout::new(store_root, repo_id).map_err(native_integrity_error)?;
+    if let Some(binding) = read_persisted_binding(&layout).await? {
+        let owned = binding.owned_repo_ids().map_err(native_integrity_error)?;
+        if owned.current() != repo_id {
+            return Err(CowshedError::conflict(
+                format!(
+                    "repository binding under {} names {owned}",
+                    layout.project().project_root.display()
+                ),
+                "repair the repository binding before opening cowshed",
+            ));
+        }
+        return Ok(Some((layout, binding)));
+    }
+    let Some(owner) = identity_owner_in_store(store_root, repo_id).await? else {
+        return Ok(None);
+    };
+    let layout = crate::storage::StorageLayout::new(store_root, owner.current())
+        .map_err(native_integrity_error)?;
+    let binding = read_persisted_binding(&layout).await?.ok_or_else(|| {
+        CowshedError::integrity(
+            format!(
+                "adopted project {} lost its repository binding while it was being read",
+                owner.current()
+            ),
+            "cowshed doctor --json",
+        )
+    })?;
+    Ok(Some((layout, binding)))
+}
+
+/// The live project that owns `repo_id`, found by scanning the store's bindings.
+#[cfg(target_os = "macos")]
+async fn identity_owner_in_store(
+    store_root: &Path,
+    repo_id: &RepoId,
+) -> Result<Option<OwnedRepoIds>> {
+    let store_root = store_root.to_owned();
+    let repo_id = repo_id.clone();
+    crate::storage::lifecycle::dispatch_blocking(move || {
+        crate::gateway_inventory::identity_owner(&store_root, &repo_id)
+            .map_err(native_integrity_error)
+    })
+    .await
+    .map_err(|error| CowshedError::internal(error.to_string()))?
+}
+
+/// Refuse an identity a live project already owns, as its current identity or a recorded former one.
+///
+/// Identity uniqueness is scoped to live projects on purpose. Retirement deletes the binding, so a
+/// retired project's former identities stop being anybody's and an archived original or a fork may
+/// be adopted under a name a since-renamed project once used. Several repositories merged into one
+/// monorepo likewise leave their old identities recorded in the monorepo alone, where they block
+/// nothing but a second live claim on the same name.
+#[cfg(target_os = "macos")]
+async fn refuse_identity_owned_by_a_live_project(
+    store_root: &Path,
+    repo_id: &RepoId,
+    // The project asking, which may of course own the identity: adoption re-running against its own
+    // binding, and an identity change back onto a name this project itself recorded as former.
+    asking: &RepoId,
+) -> Result<()> {
+    let Some(owner) = identity_owner_in_store(store_root, repo_id).await? else {
+        return Ok(());
+    };
+    if owner.current() == asking {
+        return Ok(());
+    }
+    Err(CowshedError::conflict(
+        format!("repository identity {repo_id} is already owned by adopted project {owner}"),
+        format!(
+            "choose another identity, or retire {} first",
+            owner.current()
+        ),
+    ))
+}
+
 /// Resolve a session invocation through the store binding, without opening the recorded checkout.
 ///
 /// A session's marker names main's checkout, not the session repository the caller is standing
@@ -6391,21 +7141,14 @@ async fn project_binding_from_workspace_origin(
         return Ok(None);
     }
     let repo_id = origin.repo_id.clone();
-    let layout =
-        crate::storage::StorageLayout::new(store_root, &repo_id).map_err(native_integrity_error)?;
-    let binding = read_persisted_binding(&layout).await?.ok_or_else(|| {
-        CowshedError::integrity(
-            format!("adopted project {repo_id} has no persisted repository binding"),
-            "cowshed doctor --json",
-        )
-    })?;
-    binding.validate().map_err(native_integrity_error)?;
-    if binding.primary().map_err(native_integrity_error)?.repo_id != repo_id {
-        return Err(CowshedError::conflict(
-            "workspace marker identity differs from the persisted repository binding",
-            "repair the repository binding before opening cowshed",
-        ));
-    }
+    let (layout, binding) = project_owning_repo_id(store_root, &repo_id)
+        .await?
+        .ok_or_else(|| {
+            CowshedError::integrity(
+                format!("adopted project {repo_id} has no persisted repository binding"),
+                "cowshed doctor --json",
+            )
+        })?;
     Ok(Some((repo_id, layout, binding)))
 }
 

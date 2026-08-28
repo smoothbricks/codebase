@@ -1,5 +1,6 @@
 pub mod native;
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ pub use crate::metadata::CheckoutLayout;
 use crate::metadata::{
     ImageCapacity, ImageFormat, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
-use crate::repository::RepoId;
+use crate::repository::{OwnedRepoIds, RepoId};
 
 use super::lifecycle::{
     AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef, CreatePlan,
@@ -45,6 +46,10 @@ pub struct ApfsSubstrateConfig {
     pub checkout_layout: CheckoutLayout,
     pub case_sensitivity: ApfsCaseSensitivity,
     pub capacity: ImageCapacity,
+    /// The identities this project's binding records having held before, shared so that building a
+    /// [`MarkerExpectation`] per mount costs an atomic increment. Empty for a project that has
+    /// never changed identity, which is every project until `cowshed mv main --repo-id` runs.
+    pub former_repo_ids: Arc<BTreeSet<RepoId>>,
 }
 
 impl ApfsSubstrateConfig {
@@ -62,6 +67,7 @@ impl ApfsSubstrateConfig {
             checkout_layout,
             case_sensitivity,
             capacity: DEFAULT_IMAGE_CAPACITY,
+            former_repo_ids: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -91,6 +97,25 @@ impl ApfsSubstrateConfig {
         }
     }
 
+    /// The same project, answering to a different identity.
+    ///
+    /// Carries the same whole-config-clone discipline as [`Self::rebind_checkout`] and for the same
+    /// reason: an outstanding clone must never see a marker expectation built from one identity set
+    /// while its host validates against another.
+    pub fn rebind_former_repo_ids(&self, former_repo_ids: BTreeSet<RepoId>) -> Self {
+        Self {
+            former_repo_ids: Arc::new(former_repo_ids),
+            ..self.clone()
+        }
+    }
+
+    /// The full owned set for one of this project's workspaces. `current` comes from the workspace
+    /// handle in hand rather than the config, because the config describes a project and the
+    /// question is always asked about a specific workspace of it.
+    pub fn owned_repo_ids(&self, current: &RepoId) -> OwnedRepoIds {
+        OwnedRepoIds::from_parts(current.clone(), Arc::clone(&self.former_repo_ids))
+    }
+
     pub fn with_capacity(mut self, capacity: ImageCapacity) -> Self {
         self.capacity = capacity;
         self
@@ -117,18 +142,36 @@ pub enum MetadataPolicy {
     PendingFence,
 }
 
+/// What a mounted volume's in-image marker has to say for the volume to be this workspace's.
+///
+/// The repository axis is a set rather than one identity: an in-place identity change cannot reach
+/// the marker sealed inside a detached image, so a renamed project legitimately mounts an image
+/// still stamped with an identity it used to hold. Every other field is exact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarkerExpectation {
-    pub repo: RepoId,
+    pub repos: OwnedRepoIds,
     pub workspace: WorkspaceName,
     pub incarnation: WorkspaceIncarnation,
     pub format: ImageFormat,
 }
 
 impl MarkerExpectation {
-    fn from_workspace(workspace: &LifecycleWorkspace) -> Self {
+    /// For a marker written at some earlier time, which is every already-published image. The
+    /// identity it carries may be one the project has since changed away from.
+    fn owned(config: &ApfsSubstrateConfig, workspace: &LifecycleWorkspace) -> Self {
         Self {
-            repo: workspace.repo().clone(),
+            repos: config.owned_repo_ids(workspace.repo()),
+            workspace: workspace.name().clone(),
+            incarnation: workspace.incarnation().clone(),
+            format: workspace.format(),
+        }
+    }
+
+    /// For a marker this same operation just stamped, where the current identity is the only one
+    /// the marker can possibly carry, so the expectation stays exact.
+    fn freshly_stamped(workspace: &LifecycleWorkspace) -> Self {
+        Self {
+            repos: OwnedRepoIds::sole(workspace.repo().clone()),
             workspace: workspace.name().clone(),
             incarnation: workspace.incarnation().clone(),
             format: workspace.format(),
@@ -949,9 +992,10 @@ where
         }
         let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
         let applied = self
             .lane
-            .dispatch(move || commit_prepared_clone(host.as_ref(), prepared))
+            .dispatch(move || commit_prepared_clone(host.as_ref(), &config, prepared))
             .await?;
         match applied {
             Applied::Lifecycle(receipt) => Ok(receipt),
@@ -1111,9 +1155,10 @@ where
         }
         let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);
+        let config = Arc::clone(&self.config);
         let committed = self
             .lane
-            .dispatch(move || commit_prepared_restore(host.as_ref(), prepared))
+            .dispatch(move || commit_prepared_restore(host.as_ref(), &config, prepared))
             .await?;
         let CommittedRestore::Pending(pending) = committed else {
             let CommittedRestore::Verified(receipt) = committed else {
@@ -1415,7 +1460,7 @@ where
                 .map(|candidate| candidate.mount_state)
                 .ok_or(ApfsStorageError::InvalidPlan("workspace is not published"))?;
             if matches!(state, MountState::Mounted { .. }) {
-                host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))?;
+                host.validate_marker(&mount_point, &MarkerExpectation::owned(&config, &workspace))?;
                 return Ok(mount_point);
             }
             let canonical = canonical_image_path(&config, &workspace)?;
@@ -1430,7 +1475,7 @@ where
                 .and_then(|()| {
                     host.validate_marker(
                         &mount_point,
-                        &MarkerExpectation::from_workspace(&workspace),
+                        &MarkerExpectation::owned(&config, &workspace),
                     )
                 })
             {
@@ -1936,7 +1981,10 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                 &staged_companion,
             )?;
             host.write_marker(&mount_point, &workspace, None, identity)?;
-            host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&workspace))
+            host.validate_marker(
+                &mount_point,
+                &MarkerExpectation::freshly_stamped(&workspace),
+            )
         });
     if let Err(primary) = prepared {
         let cleanup = detach_and_reclaim_adopt(host, attachment, &created.path, created.format);
@@ -2003,7 +2051,7 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
         .and_then(|()| {
             host.validate_marker(
                 &stage.mount_point,
-                &MarkerExpectation::from_workspace(&stage.workspace),
+                &MarkerExpectation::freshly_stamped(&stage.workspace),
             )
         })
     {
@@ -2046,9 +2094,21 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
         {
             return Err(primary.into_source());
         }
-        mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
+        mount_canonical(
+            host,
+            config,
+            &canonical_image,
+            &canonical_mount,
+            &stage.workspace,
+        )?;
     } else {
-        mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
+        mount_canonical(
+            host,
+            config,
+            &canonical_image,
+            &canonical_mount,
+            &stage.workspace,
+        )?;
         if let Err(primary) =
             host.link_adopted_checkout(&canonical_mount, &source_checkout, &pre_cowshed_checkout)
         {
@@ -2141,7 +2201,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             )?;
             host.validate_marker(
                 &staging_mount,
-                &MarkerExpectation::from_workspace(&workspace),
+                &MarkerExpectation::freshly_stamped(&workspace),
             )
         });
     if let Err(primary) = prepared {
@@ -2192,6 +2252,7 @@ fn detach_and_reclaim_clone<H: ApfsExecutionHost>(
 
 fn commit_prepared_clone<H: ApfsExecutionHost>(
     host: &H,
+    config: &ApfsSubstrateConfig,
     prepared: PreparedClone<H::Attachment>,
 ) -> Result<Applied, ApfsStorageError> {
     let PreparedClone {
@@ -2206,7 +2267,7 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
         .and_then(|()| {
             host.validate_marker(
                 &stage.mount_point,
-                &MarkerExpectation::from_workspace(&stage.workspace),
+                &MarkerExpectation::freshly_stamped(&stage.workspace),
             )
         })
     {
@@ -2232,7 +2293,13 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
         };
         return combine_cleanup("clone publication", primary.into_source(), cleanup);
     }
-    mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)?;
+    mount_canonical(
+        host,
+        config,
+        &canonical_image,
+        &canonical_mount,
+        &stage.workspace,
+    )?;
     Ok(Applied::Lifecycle(LifecycleReceipt {
         resulting_revision: stage.workspace.revision(),
         workspace: stage.workspace,
@@ -2342,7 +2409,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         let mounted = host
             .mount(&attachment, &mount_point, MountAccess::ReadOnly, false)
             .and_then(|()| {
-                host.validate_marker(&mount_point, &MarkerExpectation::from_workspace(&current))
+                host.validate_marker(&mount_point, &MarkerExpectation::owned(config, &current))
             });
         if let Err(primary) = mounted {
             return detach_after_failure(host, attachment, primary, "restore verification mount");
@@ -2424,7 +2491,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
             host.write_marker(&staging_mount, &replacement, None, identity)?;
             host.validate_marker(
                 &staging_mount,
-                &MarkerExpectation::from_workspace(&replacement),
+                &MarkerExpectation::freshly_stamped(&replacement),
             )
         });
     if let Err(primary) = prepared {
@@ -2485,6 +2552,7 @@ fn detach_and_reclaim_restore<H: ApfsExecutionHost>(
 
 fn commit_prepared_restore<H: ApfsExecutionHost>(
     host: &H,
+    config: &ApfsSubstrateConfig,
     prepared: PreparedRestore<H::Attachment>,
 ) -> Result<CommittedRestore, ApfsStorageError> {
     let PreparedRestore::Replace(prepared) = prepared else {
@@ -2511,7 +2579,7 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         .and_then(|()| {
             host.validate_marker(
                 &stage.mount_point,
-                &MarkerExpectation::from_workspace(&stage.workspace),
+                &MarkerExpectation::freshly_stamped(&stage.workspace),
             )
         })
     {
@@ -2538,16 +2606,24 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
     if let Err(primary) = host.restore_swap(&staged_image, &canonical_image, &undo_image) {
         let cleanup = host
             .reclaim_image(&staged_image, stage.workspace.format())
-            .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
+            .and_then(|()| {
+                mount_canonical(host, config, &canonical_image, &canonical_mount, &current)
+            });
         return combine_cleanup("restore swap", primary, cleanup);
     }
-    if let Err(primary) =
-        mount_canonical(host, &canonical_image, &canonical_mount, &stage.workspace)
-    {
+    if let Err(primary) = mount_canonical(
+        host,
+        config,
+        &canonical_image,
+        &canonical_mount,
+        &stage.workspace,
+    ) {
         let cleanup = host
             .detach_mounted(&stage.workspace, DetachIntent::Release)
             .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
-            .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
+            .and_then(|()| {
+                mount_canonical(host, config, &canonical_image, &canonical_mount, &current)
+            });
         return combine_cleanup("restore rollback", primary, cleanup);
     }
     let fact = match host.publish_restored_metadata(
@@ -2563,7 +2639,9 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
             let cleanup = host
                 .detach_mounted(&stage.workspace, DetachIntent::Release)
                 .and_then(|()| host.rollback_restore(&canonical_image, &undo_image, &staged_image))
-                .and_then(|()| mount_canonical(host, &canonical_image, &canonical_mount, &current));
+                .and_then(|()| {
+                    mount_canonical(host, config, &canonical_image, &canonical_mount, &current)
+                });
             return combine_cleanup("restore metadata publication", primary, cleanup);
         }
     };
@@ -2643,6 +2721,7 @@ fn apply_retire<H: ApfsExecutionHost>(
 
 fn mount_canonical<H: ApfsExecutionHost>(
     host: &H,
+    config: &ApfsSubstrateConfig,
     image: &Path,
     mount_point: &Path,
     workspace: &LifecycleWorkspace,
@@ -2651,7 +2730,7 @@ fn mount_canonical<H: ApfsExecutionHost>(
     if let Err(primary) = host
         .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
         .and_then(|()| {
-            host.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))
+            host.validate_marker(mount_point, &MarkerExpectation::owned(config, workspace))
         })
     {
         return detach_after_failure(host, attachment, primary, "canonical validation");
@@ -2954,6 +3033,10 @@ pub fn volume_key(repo: &RepoId, workspace: &WorkspaceName) -> String {
 /// directory's own name. It is therefore purely human-facing: it carries no identity, nothing
 /// parses it, and nothing classifies a volume by it. Renaming a volume by hand changes nothing
 /// but the label.
+///
+/// It still names the repository, so an identity change relabels every volume — but because the
+/// label is not an authority, a relabel interrupted partway leaves nothing but a cosmetic
+/// disagreement, which is why recovery does not have to redo it.
 pub fn volume_label(repo: &RepoId, workspace: &WorkspaceName) -> String {
     if workspace.is_main() {
         repo.repo().to_owned()

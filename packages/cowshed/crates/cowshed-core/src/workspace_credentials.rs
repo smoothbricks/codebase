@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 use crate::metadata::{
     Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes,
 };
-use crate::repository::RepoId;
+use crate::repository::{OwnedRepoIds, RepoId};
 use crate::storage::lifecycle::LifecycleWorkspace;
 use crate::workspace_environment::{WorkspaceEnvironmentError, write_workspace_environment};
 
@@ -128,7 +128,14 @@ pub fn mint_workspace_credentials(
     write_workspace_environment(mount_point, workspace_mount, &token, platform, port_block)?;
     sync_directory(&credential_directory, "syncing credential directory")?;
 
-    validate_workspace_credentials(workspace, mount_point, private_key_path)
+    // A certificate minted a line above carries the current identity, so the tightest possible
+    // owned set is the honest one to read it back with.
+    validate_workspace_credentials(
+        &OwnedRepoIds::sole(workspace.repo().clone()),
+        workspace,
+        mount_point,
+        private_key_path,
+    )
 }
 
 pub fn validate_private_key(path: &Path) -> Result<(), WorkspaceCredentialError> {
@@ -141,19 +148,26 @@ pub fn validate_private_key(path: &Path) -> Result<(), WorkspaceCredentialError>
 }
 
 pub fn validate_public_workspace_assets(
-    repo: &RepoId,
+    owned_repo_ids: &OwnedRepoIds,
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,
     mount_point: &Path,
 ) -> Result<(), WorkspaceCredentialError> {
     let certificate_path = mount_point.join(CA_CERTIFICATE_PATH);
     validate_certificate(&certificate_path, |certificate| {
-        validate_certificate_identity(certificate, repo, workspace, incarnation, &certificate_path)
+        validate_certificate_identity(
+            certificate,
+            owned_repo_ids,
+            workspace,
+            incarnation,
+            &certificate_path,
+        )
     })?;
     validate_token(&mount_point.join(WORKSPACE_TOKEN_PATH))
 }
 
 pub fn validate_workspace_credentials(
+    owned_repo_ids: &OwnedRepoIds,
     workspace: &LifecycleWorkspace,
     mount_point: &Path,
     private_key_path: &Path,
@@ -169,7 +183,7 @@ pub fn validate_workspace_credentials(
     validate_certificate(&certificate_path, |certificate| {
         validate_certificate_identity(
             certificate,
-            workspace.repo(),
+            owned_repo_ids,
             workspace.name(),
             workspace.incarnation(),
             &certificate_path,
@@ -182,14 +196,16 @@ pub fn validate_workspace_credentials(
     })?;
     validate_token(&mount_point.join(WORKSPACE_TOKEN_PATH))
 }
+
 /// Validate identity, file type, permissions, certificate/key pairing, and token encoding before
 /// returning the exact bounded credential contents needed by the gateway.
 pub fn read_gateway_workspace_credentials(
+    owned_repo_ids: &OwnedRepoIds,
     workspace: &LifecycleWorkspace,
     mount_point: &Path,
     private_key_path: &Path,
 ) -> Result<GatewayWorkspaceCredentials, WorkspaceCredentialError> {
-    validate_workspace_credentials(workspace, mount_point, private_key_path)?;
+    validate_workspace_credentials(owned_repo_ids, workspace, mount_point, private_key_path)?;
 
     let token_path = mount_point.join(WORKSPACE_TOKEN_PATH);
     let certificate_path = mount_point.join(CA_CERTIFICATE_PATH);
@@ -296,9 +312,15 @@ fn validate_certificate<T>(
     validate(&certificate)
 }
 
+/// The certificate subject is the one identity stamp sealed inside a workspace image that cannot
+/// be corrected without re-minting, and re-minting needs the image mounted — which is exactly what
+/// reading the subject gates. Splitting the subject back into its three fields and asking the
+/// binding whether it owns the repository named there breaks that cycle on the single axis an
+/// identity change moves. The workspace name and its random incarnation still have to match
+/// exactly, so a credential remains pinned to one workspace of one project.
 fn validate_certificate_identity(
     certificate: &X509Certificate<'_>,
-    repo: &RepoId,
+    owned_repo_ids: &OwnedRepoIds,
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,
     path: &Path,
@@ -306,13 +328,35 @@ fn validate_certificate_identity(
     let mut common_names = certificate.subject().iter_common_name();
     let common_name = common_names
         .next()
-        .and_then(|attribute| attribute.as_str().ok());
-    if common_name != Some(credential_subject(repo, workspace, incarnation).as_str())
-        || common_names.next().is_some()
+        .and_then(|attribute| attribute.as_str().ok())
+        .ok_or_else(|| invalid("CA certificate identity", path))?;
+    if common_names.next().is_some() {
+        return Err(invalid("CA certificate identity", path));
+    }
+    let (repo, subject_workspace, subject_incarnation) = parse_credential_subject(common_name)
+        .ok_or_else(|| invalid("CA certificate identity", path))?;
+    if subject_workspace != workspace.as_str()
+        || subject_incarnation != incarnation.as_str()
+        || !RepoId::parse(repo).is_ok_and(|repo| owned_repo_ids.accepts(&repo))
     {
         return Err(invalid("CA certificate identity", path));
     }
     Ok(())
+}
+
+/// The three fields [`credential_subject`] encodes, split back out. `None` for any subject that is
+/// not exactly `cowshed:<owner/repo>:<workspace>:<incarnation>`, so a subject with a stray
+/// separator or a missing field is refused rather than partially believed.
+fn parse_credential_subject(subject: &str) -> Option<(&str, &str, &str)> {
+    let mut fields = subject.split(':');
+    let prefix = fields.next()?;
+    let repo = fields.next()?;
+    let workspace = fields.next()?;
+    let incarnation = fields.next()?;
+    if prefix != "cowshed" || fields.next().is_some() {
+        return None;
+    }
+    Some((repo, workspace, incarnation))
 }
 
 fn validate_token(path: &Path) -> Result<(), WorkspaceCredentialError> {
@@ -425,6 +469,11 @@ mod tests {
     use super::*;
     use crate::metadata::{ImageFormat, WorkspaceRole};
     use crate::storage::lifecycle::Revision;
+
+    /// The tightest owned set for a workspace: exactly the identity it answers to.
+    fn sole(workspace: &LifecycleWorkspace) -> OwnedRepoIds {
+        OwnedRepoIds::sole(workspace.repo().clone())
+    }
 
     fn workspace(incarnation: &str) -> LifecycleWorkspace {
         LifecycleWorkspace::new(
@@ -550,7 +599,7 @@ mod tests {
         let workspace = workspace("00112233445566778899aabbccddeeff");
 
         mint_credentials(&workspace, &mount, &key_path).expect("mint credentials");
-        validate_workspace_credentials(&workspace, &mount, &key_path)
+        validate_workspace_credentials(&sole(&workspace), &workspace, &mount, &key_path)
             .expect("validate credentials");
 
         for path in [
@@ -594,7 +643,13 @@ mod tests {
             fs::read(second_mount.join(WORKSPACE_TOKEN_PATH)).expect("second token")
         );
         assert!(
-            validate_workspace_credentials(&first_workspace, &first_mount, &second_key).is_err(),
+            validate_workspace_credentials(
+                &sole(&first_workspace),
+                &first_workspace,
+                &first_mount,
+                &second_key
+            )
+            .is_err(),
             "a key from another workspace must not validate"
         );
 
@@ -643,8 +698,9 @@ mod tests {
         let expected_certificate =
             String::from_utf8(fs::read(mount.join(CA_CERTIFICATE_PATH)).unwrap()).unwrap();
         let expected_key = String::from_utf8(fs::read(&key_path).unwrap()).unwrap();
-        let credentials = read_gateway_workspace_credentials(&workspace, &mount, &key_path)
-            .expect("validated gateway credentials");
+        let credentials =
+            read_gateway_workspace_credentials(&sole(&workspace), &workspace, &mount, &key_path)
+                .expect("validated gateway credentials");
         assert_eq!(credentials.token(), expected_token);
         assert_eq!(credentials.certificate_pem(), expected_certificate);
         assert_eq!(credentials.private_key_pem(), expected_key);
@@ -666,7 +722,10 @@ mod tests {
         let mode_key = root.join("mode.ca.key");
         mint_credentials(&subject, &mode_mount, &mode_key).unwrap();
         fs::set_permissions(&mode_key, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_gateway_workspace_credentials(&subject, &mode_mount, &mode_key).is_err());
+        assert!(
+            read_gateway_workspace_credentials(&sole(&subject), &subject, &mode_mount, &mode_key)
+                .is_err()
+        );
 
         let symlink_mount = root.join("symlink");
         fs::create_dir(&symlink_mount).unwrap();
@@ -677,7 +736,13 @@ mod tests {
         fs::rename(&token_path, &outside_token).unwrap();
         symlink(&outside_token, &token_path).unwrap();
         assert!(
-            read_gateway_workspace_credentials(&subject, &symlink_mount, &symlink_key).is_err()
+            read_gateway_workspace_credentials(
+                &sole(&subject),
+                &subject,
+                &symlink_mount,
+                &symlink_key
+            )
+            .is_err()
         );
 
         let pair_mount = root.join("pair");
@@ -693,14 +758,20 @@ mod tests {
             &other_key,
         )
         .unwrap();
-        assert!(read_gateway_workspace_credentials(&subject, &pair_mount, &other_key).is_err());
+        assert!(
+            read_gateway_workspace_credentials(&sole(&subject), &subject, &pair_mount, &other_key)
+                .is_err()
+        );
 
         let token_mount = root.join("token");
         fs::create_dir(&token_mount).unwrap();
         let token_key = root.join("token.ca.key");
         mint_credentials(&subject, &token_mount, &token_key).unwrap();
         fs::write(token_mount.join(WORKSPACE_TOKEN_PATH), b"not-a-valid-token").unwrap();
-        assert!(read_gateway_workspace_credentials(&subject, &token_mount, &token_key).is_err());
+        assert!(
+            read_gateway_workspace_credentials(&sole(&subject), &subject, &token_mount, &token_key)
+                .is_err()
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }

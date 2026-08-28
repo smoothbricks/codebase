@@ -17,7 +17,7 @@ use crate::metadata::{
     CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
     WorkspaceIncarnation, WorkspaceName, sidecar_path,
 };
-use crate::repository::{RepoId, RepositoryBinding};
+use crate::repository::{OwnedRepoIds, RepoId, RepositoryBinding};
 use crate::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
@@ -130,6 +130,14 @@ pub enum GatewayInventoryError {
     },
     #[error("repository identity {0} occurs more than once in the store hierarchy")]
     DuplicateRepository(RepoId),
+    #[error(
+        "repository identity {repo_id} is claimed by two adopted projects, {first} and {second}"
+    )]
+    AmbiguousIdentity {
+        repo_id: RepoId,
+        first: RepoId,
+        second: RepoId,
+    },
     #[error("macOS port block base {0} is assigned to more than one workspace")]
     DuplicatePortBlock(u16),
     #[error("project root {0} is claimed by more than one repository binding")]
@@ -915,6 +923,14 @@ impl NativeGatewayInventory {
                 message: error.to_string(),
             }
         })?;
+        // Read once per project: the certificate subject inside a workspace image names whichever
+        // identity was current when the image was minted, which after an identity change is one of
+        // the project's former identities.
+        let owned_repo_ids = load_binding_candidate(
+            self.storage.store(),
+            &layout.project().project_root,
+            &layout.project().repository_binding,
+        )?;
         let mut facts = Vec::new();
         for workspace in derived {
             let MountState::Mounted { mount_id } = workspace.mount_state else {
@@ -952,6 +968,7 @@ impl NativeGatewayInventory {
                 }
             })?;
             let credentials = read_gateway_workspace_credentials(
+                &owned_repo_ids,
                 &workspace.workspace,
                 mount,
                 image_paths.ca_private_key(),
@@ -1012,8 +1029,23 @@ fn is_not_a_project_namespace(path: &Path, name: &str) -> bool {
 pub(crate) fn discover_repositories(
     store_root: &Path,
 ) -> Result<Vec<RepoId>, GatewayInventoryError> {
+    Ok(discover_owned_identities(store_root)?
+        .into_iter()
+        .map(|owned| owned.current().clone())
+        .collect())
+}
+
+/// The same scan, keeping every identity each live project owns rather than only its current one.
+///
+/// This is what "an identity is taken" means: a live project's binding either answers to it now or
+/// records having answered to it. Retirement deletes `repository.json`, so a retired project drops
+/// out of this scan entirely and its former identities stop being anybody's.
+pub(crate) fn discover_owned_identities(
+    store_root: &Path,
+) -> Result<Vec<OwnedRepoIds>, GatewayInventoryError> {
     ensure_directory(store_root, "opening validated store root")?;
-    let mut repositories = BTreeSet::new();
+    let mut current: BTreeSet<RepoId> = BTreeSet::new();
+    let mut owned = Vec::new();
     for owner in read_directory(store_root, "enumerating store owners")? {
         let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -1034,19 +1066,55 @@ pub(crate) fn discover_repositories(
             {
                 continue;
             }
-            let binding_path = project.join("repository.json");
+            let binding_path = project.join(crate::repository::REPOSITORY_BINDING_FILE);
             // Unreadable is "not a project"; only a binding that is present and readable is held
             // to the project contract.
             if !binding_path_exists(&binding_path).unwrap_or(false) {
                 continue;
             }
             let repo = load_binding_candidate(store_root, &project, &binding_path)?;
-            if !repositories.insert(repo.clone()) {
-                return Err(GatewayInventoryError::DuplicateRepository(repo));
+            if !current.insert(repo.current().clone()) {
+                return Err(GatewayInventoryError::DuplicateRepository(
+                    repo.current().clone(),
+                ));
             }
+            owned.push(repo);
         }
     }
-    Ok(repositories.into_iter().collect())
+    owned.sort_by(|left, right| left.current().cmp(right.current()));
+    Ok(owned)
+}
+
+/// The live project that owns `repo_id` — as its current identity or as one it recorded holding.
+///
+/// `None` means the identity is free: no adopted project claims it, so adoption may take it and a
+/// rename may move onto it. Two live projects claiming one identity is cowshed's own state gone
+/// wrong, and it is raised here rather than from the store-wide scan so that the refusal lands on
+/// the one operation that asked, instead of taking down the whole inventory.
+///
+/// macOS-only because its only callers are the APFS adoption and identity-change paths, which are
+/// themselves `cfg(target_os = "macos")`. Without the gate a Linux `cargo check` of the library
+/// alone sees no caller and `-D dead-code` fails the build.
+#[cfg(target_os = "macos")]
+pub(crate) fn identity_owner(
+    store_root: &Path,
+    repo_id: &RepoId,
+) -> Result<Option<OwnedRepoIds>, GatewayInventoryError> {
+    let mut found: Option<OwnedRepoIds> = None;
+    for owned in discover_owned_identities(store_root)? {
+        if !owned.accepts(repo_id) {
+            continue;
+        }
+        if let Some(first) = found {
+            return Err(GatewayInventoryError::AmbiguousIdentity {
+                repo_id: repo_id.clone(),
+                first: first.current().clone(),
+                second: owned.current().clone(),
+            });
+        }
+        found = Some(owned);
+    }
+    Ok(found)
 }
 
 fn validate_requested_repository(
@@ -1071,11 +1139,11 @@ fn validate_requested_repository(
         }
     })?;
     let found = load_binding_candidate(store_root, &paths.project_root, &binding_path)?;
-    if found != *repo_id {
+    if found.current() != repo_id {
         return Err(GatewayInventoryError::ForeignBinding {
             path: binding_path,
             expected: repo_id.clone(),
-            actual: found,
+            actual: found.current().clone(),
         });
     }
     Ok(true)
@@ -1085,7 +1153,7 @@ fn load_binding_candidate(
     store_root: &Path,
     project_root: &Path,
     binding_path: &Path,
-) -> Result<RepoId, GatewayInventoryError> {
+) -> Result<OwnedRepoIds, GatewayInventoryError> {
     verify_no_symlinks(store_root, project_root).map_err(|error| {
         GatewayInventoryError::InvalidBinding {
             path: project_root.to_owned(),
@@ -1103,14 +1171,14 @@ fn load_binding_candidate(
             path: binding_path.to_owned(),
             message: error.to_string(),
         })?;
-    let actual = binding
-        .primary()
-        .map_err(|error| GatewayInventoryError::InvalidBinding {
-            path: binding_path.to_owned(),
-            message: error.to_string(),
-        })?
-        .repo_id
-        .clone();
+    let owned =
+        binding
+            .owned_repo_ids()
+            .map_err(|error| GatewayInventoryError::InvalidBinding {
+                path: binding_path.to_owned(),
+                message: error.to_string(),
+            })?;
+    let actual = owned.current().clone();
     let expected_paths = StorageLayout::new(store_root, &actual)
         .map(|layout| layout.project().clone())
         .map_err(|error| GatewayInventoryError::InvalidBinding {
@@ -1131,7 +1199,7 @@ fn load_binding_candidate(
             message: error.to_string(),
         }
     })?;
-    Ok(actual)
+    Ok(owned)
 }
 
 fn project_root_identity(project_root: &Path) -> Option<RepoId> {

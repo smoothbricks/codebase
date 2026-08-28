@@ -14,7 +14,7 @@ use cowshed_core::api::{
     PublicationPolicy, Sha256Digest, StreamInfo, TerminalCommitment, WorkspaceIncarnation,
     WorkspacePath,
 };
-use cowshed_core::repository::RepoId;
+use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, JobArtifactToken, OutputTargets, ProtectedRecord,
     PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
@@ -72,7 +72,7 @@ fn make_writable_recursive(path: &Path) -> std::io::Result<()> {
 fn store(root: &Path, config: ArtifactConfig) -> ArtifactStore {
     ArtifactStore::open(
         root,
-        RepoId::parse("acme/widget").unwrap(),
+        OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
         WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
         config,
     )
@@ -119,7 +119,7 @@ fn invalid_configs_are_rejected_before_creating_protected_layout() {
         assert!(matches!(
             ArtifactStore::open(
                 root.path(),
-                RepoId::parse("acme/widget").unwrap(),
+                OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
                 WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
                 config,
             ),
@@ -899,7 +899,7 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
     drop(store);
     let reopened = ArtifactStore::open(
         root.path(),
-        RepoId::parse("acme/widget").unwrap(),
+        OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
         WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
         ArtifactConfig::default(),
     )
@@ -935,7 +935,7 @@ fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
     assert!(matches!(
         ArtifactStore::open(
             root.path(),
-            RepoId::parse("acme/widget").unwrap(),
+            OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             ArtifactConfig::default(),
         ),
@@ -949,7 +949,7 @@ fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
     assert!(matches!(
         ArtifactStore::open(
             root.path(),
-            RepoId::parse("acme/widget").unwrap(),
+            OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             ArtifactConfig::default(),
         ),
@@ -965,7 +965,7 @@ fn open_rejects_missing_corrupt_and_swapped_file_backed_streams() {
     assert!(matches!(
         ArtifactStore::open(
             root.path(),
-            RepoId::parse("acme/widget").unwrap(),
+            OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
             WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
             ArtifactConfig::default(),
         ),
@@ -1096,7 +1096,7 @@ fn verified_file_rejects_each_metadata_length_and_hash_violation() {
             assert!(matches!(
                 ArtifactStore::open(
                     root.path(),
-                    RepoId::parse("acme/widget").unwrap(),
+                    OwnedRepoIds::sole(RepoId::parse("acme/widget").unwrap()),
                     WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").unwrap(),
                     ArtifactConfig::default(),
                 ),

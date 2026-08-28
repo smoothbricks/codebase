@@ -1329,6 +1329,14 @@ impl Coordinator {
         )
         .await
     }
+    /// Change the adopted project's repository identity — `cowshed mv main --repo-id`.
+    pub async fn change_repo_id(&self, repo_id: &RepoId) -> Result<WorkspaceRef> {
+        self.workspace_result(
+            "coordinator.changeRepoId",
+            json!({ "repoId": self.project.repo_id, "newRepoId": repo_id }),
+        )
+        .await
+    }
 
     pub async fn fork(&self, source: &str, destination: &str) -> Result<WorkspaceRef> {
         let source = WorkspaceName::new(source).map_err(|error| {

@@ -13,7 +13,7 @@ use cowshed_core::api::{
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
-use cowshed_core::repository::RepoId;
+use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::ArtifactConfig;
 use tokio::sync::mpsc;
@@ -363,6 +363,7 @@ fn config() -> WorkspaceSupervisorConfig {
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
     WorkspaceSupervisorConfig {
         authority: authority(),
+        owned_repo_ids: OwnedRepoIds::sole(authority().repo_id),
         workspace_root: workspace_root.clone(),
         default_cwd: Some(WorkspacePath::new("packages/app").unwrap()),
         sandbox: SandboxConfig {
@@ -471,6 +472,7 @@ fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
     let (devenv_tx, devenv_requests) = mpsc::unbounded_channel();
     let store = ArtifactStoreSink::open(
         supervisor_config.workspace_root.clone(),
+        &supervisor_config.owned_repo_ids,
         &supervisor_config.authority,
         supervisor_config.artifacts.clone(),
     )

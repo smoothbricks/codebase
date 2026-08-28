@@ -29,7 +29,7 @@ use crate::api::dto::{
     validate_command_argv,
 };
 use crate::metadata::WorkspaceIncarnation;
-use crate::repository::RepoId;
+use crate::repository::{OwnedRepoIds, RepoId};
 mod publication;
 use crate::storage::verify_no_symlinks;
 
@@ -464,7 +464,7 @@ pub struct RecoveryReport {
 pub struct ArtifactStore {
     workspace_root: PathBuf,
     token_namespace: Sha256Digest,
-    repo_id: RepoId,
+    owned_repo_ids: OwnedRepoIds,
     workspace_incarnation: WorkspaceIncarnation,
     config: ArtifactConfig,
     budget: BufferBudget,
@@ -521,7 +521,7 @@ fn reconcile_capacity_growth(
 impl ArtifactStore {
     pub fn open(
         workspace_root: impl Into<PathBuf>,
-        repo_id: RepoId,
+        owned_repo_ids: OwnedRepoIds,
         workspace_incarnation: WorkspaceIncarnation,
         config: ArtifactConfig,
     ) -> Result<Self, ArtifactError> {
@@ -531,13 +531,12 @@ impl ArtifactStore {
         let mut recovery =
             recover_records_with_budget(&records_path, config.retained_recovery_budget_bytes)?;
         for frame in &recovery.frames {
-            if frame.record.repo_id() != &repo_id {
+            if !owned_repo_ids.accepts(frame.record.repo_id()) {
                 return Err(ArtifactError::Integrity {
                     offset: 0,
                     message: format!(
-                        "record repo identity {} does not match attached repo {}",
+                        "record repo identity {} is not owned by attached project {owned_repo_ids}",
                         frame.record.repo_id(),
-                        repo_id
                     ),
                 });
             }
@@ -618,7 +617,7 @@ impl ArtifactStore {
         Ok(Self {
             workspace_root,
             token_namespace,
-            repo_id,
+            owned_repo_ids,
             workspace_incarnation,
             budget: BufferBudget {
                 used: 0,
@@ -673,7 +672,7 @@ impl ArtifactStore {
         secure_redirect_target(&self.workspace_root, &mut targets.stdout)?;
         secure_redirect_target(&self.workspace_root, &mut targets.stderr)?;
         let admission = JobArtifactRecord {
-            repo_id: self.repo_id.clone(),
+            repo_id: self.owned_repo_ids.current().clone(),
             workspace_incarnation: self.workspace_incarnation.clone(),
             job_id,
             sequence: 0,
@@ -774,7 +773,7 @@ impl ArtifactStore {
         };
         let record = CheckpointManifestRecord {
             version: RECORD_SCHEMA_VERSION as u16,
-            repo_id: self.repo_id.clone(),
+            repo_id: self.owned_repo_ids.current().clone(),
             origin_incarnation: self.workspace_incarnation.clone(),
             barrier_id,
             visible_jobs: visible.into_values().collect(),
@@ -1126,7 +1125,7 @@ impl ArtifactStore {
                 live.stderr
                     .finish(&self.workspace_root, &mut self.budget, token.job_id)?;
             let record = JobArtifactRecord {
-                repo_id: self.repo_id.clone(),
+                repo_id: self.owned_repo_ids.current().clone(),
                 workspace_incarnation: self.workspace_incarnation.clone(),
                 job_id: token.job_id,
                 sequence: 0,
@@ -3726,7 +3725,7 @@ mod tests {
     }
 
     fn store_at(root: &Path, config: ArtifactConfig) -> ArtifactStore {
-        ArtifactStore::open(root, repo(), incarnation(), config).unwrap()
+        ArtifactStore::open(root, OwnedRepoIds::sole(repo()), incarnation(), config).unwrap()
     }
 
     fn inline_stream(bytes: &[u8]) -> StreamInfo {
@@ -4029,7 +4028,7 @@ mod tests {
         assert!(matches!(
             ArtifactStore::open(
                 &historical_root,
-                repo(),
+                OwnedRepoIds::sole(repo()),
                 incarnation(),
                 ArtifactConfig::default()
             ),
@@ -4037,7 +4036,7 @@ mod tests {
         ));
         let mut historical_store = ArtifactStore::open(
             &historical_root,
-            repo(),
+            OwnedRepoIds::sole(repo()),
             incarnation(),
             ArtifactConfig {
                 historical_incarnations: BTreeSet::from([historical]),
@@ -4071,7 +4070,7 @@ mod tests {
         for origin in [&older, &ancestor, &ancestor] {
             let mut store = ArtifactStore::open(
                 &root,
-                repo(),
+                OwnedRepoIds::sole(repo()),
                 origin.clone(),
                 ArtifactConfig {
                     historical_incarnations: lineage.clone(),
@@ -4510,6 +4509,48 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn former_repository_identity_is_accepted_but_foreign_identity_is_not() {
+        let root = temp_root("former-repo-id");
+        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        let first = repo();
+        let binding =
+            crate::repository::RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+                repo_id: first.clone(),
+                remote_name: None,
+                remote_url: None,
+                primary: true,
+            }])
+            .unwrap();
+        let binding = binding
+            .rename_primary(RepoId::parse("acme/renamed").unwrap())
+            .unwrap()
+            .rename_primary(RepoId::parse("acme/final").unwrap())
+            .unwrap();
+        let owned = binding.owned_repo_ids().unwrap();
+        assert_eq!(owned.current(), &RepoId::parse("acme/final").unwrap());
+        let accepted = ArtifactStore::open(
+            &root,
+            owned.clone(),
+            incarnation(),
+            ArtifactConfig::default(),
+        );
+        assert!(
+            accepted.is_ok(),
+            "record from the first identity remains readable after two renames"
+        );
+        let rejected = ArtifactStore::open(
+            &root,
+            OwnedRepoIds::sole(owned.current().clone()),
+            incarnation(),
+            ArtifactConfig::default(),
+        );
+        assert!(matches!(
+            rejected,
+            Err(ArtifactError::Integrity { message, .. }) if message.contains("is not owned by")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn redirect_fcntl_failure_is_typed_and_precedes_admission() {
         let root = temp_root("fcntl-failure");

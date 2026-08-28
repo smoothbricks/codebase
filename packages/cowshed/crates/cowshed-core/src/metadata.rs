@@ -1103,6 +1103,17 @@ pub fn sidecar_path(image_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The image a sidecar belongs to, or `None` for a path that is not a sidecar. Exact inverse of
+/// [`sidecar_path`], so a walk of the store can recognise sidecars without re-deriving image names.
+pub fn image_from_sidecar_path(sidecar: &Path) -> Option<PathBuf> {
+    let name = sidecar.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".grants.json")?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(sidecar.with_file_name(stem))
+}
+
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, MetadataError> {
     let file = File::open(path).map_err(|source| io_error(path, source))?;
     serde_json::from_reader(BufReader::new(file)).map_err(|source| MetadataError::Json {

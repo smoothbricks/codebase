@@ -1,12 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 const BINDING_VERSION: u32 = 1;
+/// The one file that makes a store directory an adopted project. Its presence is what discovery
+/// keys on, and retirement deletes it.
+pub const REPOSITORY_BINDING_FILE: &str = "repository.json";
 const RESERVED_LAYOUT_OWNERS: &[&str] = &[
     "gateway",
     "telemetry",
@@ -377,6 +381,8 @@ pub struct BoundIdentity {
 pub struct RepositoryBinding {
     pub version: u32,
     pub identities: Vec<BoundIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_identities: Vec<RepoId>,
 }
 
 impl RepositoryBinding {
@@ -384,6 +390,7 @@ impl RepositoryBinding {
         let binding = Self {
             version: BINDING_VERSION,
             identities,
+            former_identities: Vec::new(),
         };
         binding.validate()?;
         Ok(binding)
@@ -445,6 +452,16 @@ impl RepositoryBinding {
                 _ => return Err(BindingError::IncompleteRemote),
             }
         }
+
+        // A former identity that is also a current one, or listed twice, would let one identity be
+        // owned along two paths and make the owner scan report an ambiguous claim. Keep the two
+        // halves of the owned set disjoint so `OwnedRepoIds` is a set by construction.
+        let mut former_ids: HashSet<&RepoId> = HashSet::with_capacity(self.former_identities.len());
+        for former in &self.former_identities {
+            if repo_ids.contains(former) || !former_ids.insert(former) {
+                return Err(BindingError::DuplicateRepoId(former.clone()));
+            }
+        }
         Ok(())
     }
 
@@ -454,6 +471,115 @@ impl RepositoryBinding {
             .iter()
             .find(|identity| identity.primary)
             .ok_or(BindingError::PrimaryCount(0))
+    }
+
+    /// Every identity this project owns. This is what identity validation is asked about, and the
+    /// only place the set is derived, so no reader can widen it by construction.
+    pub fn owned_repo_ids(&self) -> Result<OwnedRepoIds, BindingError> {
+        Ok(OwnedRepoIds::new(
+            self.primary()?.repo_id.clone(),
+            self.former_identities.iter().cloned().collect(),
+        ))
+    }
+
+    /// Return the binding after changing its primary project identity.
+    ///
+    /// The old remote URL remains a Git concern: identity repair deliberately does not retarget
+    /// Git, and retaining a URL whose normalized owner/repo is now stale would make the binding
+    /// reject its own explicit identity. Dropping only the primary's remote association leaves
+    /// the URL untouched in Git while making the durable binding honest about what it identifies.
+    ///
+    /// Renaming back onto a name this project already recorded as former moves that name out of the
+    /// former list, because current and former are disjoint halves of one owned set.
+    pub fn rename_primary(&self, repo_id: RepoId) -> Result<Self, BindingError> {
+        let mut binding = self.clone();
+        let primary = binding
+            .identities
+            .iter_mut()
+            .find(|identity| identity.primary)
+            .ok_or(BindingError::PrimaryCount(0))?;
+        let former = std::mem::replace(&mut primary.repo_id, repo_id.clone());
+        primary.remote_name = None;
+        primary.remote_url = None;
+        binding.former_identities.retain(|entry| *entry != repo_id);
+        if !binding.former_identities.contains(&former) {
+            binding.former_identities.push(former);
+        }
+        binding.validate()?;
+        Ok(binding)
+    }
+}
+
+/// Every repository identity one adopted project owns: the identity it answers to now, plus every
+/// identity its binding records having held before.
+///
+/// Durable state inside a workspace image is stamped with whichever identity was current when it
+/// was written — the in-image marker, the CA certificate subject, an appended artifact frame. An
+/// in-place identity change rewrites the store-side copies it can reach and cannot reach the ones
+/// sealed inside a detached image, so every reader asks "does this project own that identity"
+/// through [`OwnedRepoIds::accepts`] instead of "is that identity the current one".
+///
+/// The set is exactly what one binding records. Nothing widens it: there is no configuration that
+/// admits an extra identity, and the only constructors take a binding's own current and former
+/// identities. Broadening acceptance on the identity axis therefore never reaches past a single
+/// project's own history, while a workspace credential still pins the workspace name and its
+/// random incarnation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedRepoIds {
+    current: RepoId,
+    /// Shared so that threading the set through per-mount validation costs an atomic increment
+    /// rather than a tree clone; it is immutable once built.
+    former: Arc<BTreeSet<RepoId>>,
+}
+
+impl OwnedRepoIds {
+    pub fn new(current: RepoId, former: BTreeSet<RepoId>) -> Self {
+        Self {
+            current,
+            former: Arc::new(former),
+        }
+    }
+
+    /// Pair a current identity with an already-shared former set, so a caller holding the set for a
+    /// whole project pays nothing per workspace.
+    pub fn from_parts(current: RepoId, former: Arc<BTreeSet<RepoId>>) -> Self {
+        Self { current, former }
+    }
+
+    /// A project that has never changed identity, so it owns exactly the one it answers to.
+    pub fn sole(current: RepoId) -> Self {
+        Self::new(current, BTreeSet::new())
+    }
+
+    pub fn current(&self) -> &RepoId {
+        &self.current
+    }
+
+    pub fn former(&self) -> &BTreeSet<RepoId> {
+        &self.former
+    }
+
+    /// The one membership check. Every identity comparison against durable workspace state goes
+    /// through here so that "owned" has a single definition.
+    pub fn accepts(&self, candidate: &RepoId) -> bool {
+        self.current == *candidate || self.former.contains(candidate)
+    }
+}
+
+impl fmt::Display for OwnedRepoIds {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.current.as_str())?;
+        if self.former.is_empty() {
+            return Ok(());
+        }
+        formatter.write_str(" (formerly ")?;
+        for (index, former) in self.former.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            formatter.write_str(former.as_str())?;
+        }
+        formatter.write_str(")")
     }
 }
 
@@ -498,18 +624,20 @@ impl<'de> Deserialize<'de> for RepositoryBinding {
         struct RawBinding {
             version: u32,
             identities: Vec<BoundIdentity>,
+            #[serde(default)]
+            former_identities: Vec<RepoId>,
         }
 
         let raw = RawBinding::deserialize(deserializer)?;
         let binding = Self {
             version: raw.version,
             identities: raw.identities,
+            former_identities: raw.former_identities,
         };
         binding.validate().map_err(serde::de::Error::custom)?;
         Ok(binding)
     }
 }
-
 impl<'de> Deserialize<'de> for BoundIdentity {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -566,7 +694,7 @@ impl ProjectPaths {
         let mount_root = checked_join(&host_mount_root, [owner.as_str(), repo.as_str()])?;
 
         Ok(Self {
-            repository_binding: checked_join(&project_root, ["repository.json"])?,
+            repository_binding: checked_join(&project_root, [REPOSITORY_BINDING_FILE])?,
             checkout_layout: checked_join(&project_root, ["checkout-layout.json"])?,
             slot_bindings: checked_join(&project_root, ["slot-bindings.json"])?,
             policy: checked_join(&project_root, ["policy.json"])?,
@@ -872,6 +1000,64 @@ mod tests {
         assert_eq!(
             RepositoryBinding::new(vec![not_primary]),
             Err(BindingError::PrimaryCount(0))
+        );
+    }
+
+    #[test]
+    fn identity_rename_appends_former_ids_without_touching_git() {
+        let primary = BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".into()),
+            remote_url: Some("https://github.com/acme/widget.git".into()),
+            primary: true,
+        };
+        let binding = RepositoryBinding::new(vec![primary]).unwrap();
+        assert_eq!(
+            binding.owned_repo_ids().unwrap(),
+            OwnedRepoIds::sole(repo_id("acme/widget"))
+        );
+
+        let renamed = binding
+            .rename_primary(repo_id("acme/renamed"))
+            .expect("first identity rename");
+        assert_eq!(renamed.primary().unwrap().repo_id, repo_id("acme/renamed"));
+        assert_eq!(renamed.former_identities, vec![repo_id("acme/widget")]);
+        assert!(renamed.primary().unwrap().remote_name.is_none());
+        let owned = renamed.owned_repo_ids().unwrap();
+        assert_eq!(owned.current(), &repo_id("acme/renamed"));
+        assert!(owned.accepts(&repo_id("acme/widget")));
+        assert!(owned.accepts(&repo_id("acme/renamed")));
+        assert!(!owned.accepts(&repo_id("acme/unrelated")));
+
+        let renamed_again = renamed
+            .rename_primary(repo_id("acme/final"))
+            .expect("second identity rename");
+        assert_eq!(
+            renamed_again.former_identities,
+            vec![repo_id("acme/widget"), repo_id("acme/renamed")]
+        );
+        let owned = renamed_again.owned_repo_ids().unwrap();
+        assert!(owned.accepts(&repo_id("acme/widget")));
+        assert!(owned.accepts(&repo_id("acme/renamed")));
+        assert_eq!(
+            owned.to_string(),
+            "acme/final (formerly acme/renamed, acme/widget)"
+        );
+    }
+
+    #[test]
+    fn binding_refuses_a_former_identity_it_also_holds_now() {
+        let mut binding = RepositoryBinding::new(vec![BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: None,
+            remote_url: None,
+            primary: true,
+        }])
+        .unwrap();
+        binding.former_identities.push(repo_id("acme/widget"));
+        assert_eq!(
+            binding.validate(),
+            Err(BindingError::DuplicateRepoId(repo_id("acme/widget")))
         );
     }
 
