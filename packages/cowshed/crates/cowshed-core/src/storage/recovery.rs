@@ -259,6 +259,14 @@ impl LifecycleIntentJournal {
         Ok(())
     }
 }
+
+/// The refusal a retained `Prepared` retirement produces when its target state cannot be read.
+///
+/// macOS-only because its sole caller is the APFS lifecycle recovery path, which is itself
+/// `cfg(target_os = "macos")`. Without the gate a Linux `cargo check` of the library alone sees
+/// no caller and `-D dead-code` fails the build, while a local `--all-targets` run hides it
+/// behind the test below.
+#[cfg(target_os = "macos")]
 pub(crate) fn prepared_retirement_unreadable(
     workspace: &WorkspaceName,
     expected_mount: &Path,
@@ -279,7 +287,7 @@ pub(crate) fn prepared_retirement_unreadable(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod prepared_retirement_diagnostic_tests {
     use std::path::Path;
 

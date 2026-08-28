@@ -11,6 +11,7 @@
 //! - rows are padded to 4 bytes (`(row + 3) & !3`), and that padded value is
 //!   stored in slot metadata;
 //! - arenas reserve `capacity * 64` bytes rather than `capacity * 4`.
+//!
 //! Suffixes `_padded` and `_64` keep these domains distinct at call sites.
 //!
 //! `calculate_state_size` returns 0 for an invalid program. Stateful entry
