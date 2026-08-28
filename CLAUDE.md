@@ -35,11 +35,16 @@ sink (worker suites: a D1 binding like `TRACE_RESULTS`). Keep preload/setup file
 behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`, `@smoothbricks/lmao/testing/vitest`) plus
 package-local typed tracer modules.
 
-**The sink's location and durability are load-bearing.** One exported harness constant owns the path — never hardcode it
-in a package, a workflow glob, or a doc. It must sit under a directory name project walkers and watchers ignore, because
-a database inside a compiled package's root makes its own journal churn look like the project tree changing mid-compile.
-Parallel test workers share one database, so never trade on-disk rollback for quiet: a journal mode without it lets one
-killed worker corrupt the traces the other workers assert over.
+**The sink's location and durability are load-bearing.** `DEFAULT_TRACE_DB_PATH` in
+`packages/lmao/src/lib/sqlite/trace-db-path.ts` (re-exported from `@smoothbricks/lmao/testing{,/bun,/vitest}`, with
+`TRACE_DB_DIRECTORY`/`TRACE_DB_FILENAME` for joining onto a root) owns the path; never restate the literal. Sole
+exception: the CI artifact glob, since `packages/cli` cannot depend on `@smoothbricks/lmao` and the glob needs a
+`packages/*/` prefix plus a trailing `*` for the WAL sidecars. It must sit under a directory name project walkers and
+watchers ignore, because a database inside a compiled package's root makes its own journal churn look like the project
+tree changing mid-compile. Parallel test workers share one database, so never trade on-disk rollback for quiet.
+Measured: with the journal held in memory, a SIGKILLed writer left 12 uncommitted rows _visible_ while
+`PRAGMA integrity_check` reported ok — phantom data that reads as valid, which is worse for an assertion oracle than a
+file that fails to open.
 
 **Tracing policy — No default `NoOpTracer`:** `NoOpTracer` may exist in `@smoothbricks/lmao` for API proof, comparison,
 and overhead benchmarking, but it is not the normal repo pattern. Require tracing context from callers, use child spans,

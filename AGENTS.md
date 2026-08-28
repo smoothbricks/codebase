@@ -605,9 +605,17 @@ needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner har
 **Consequences that are easy to get wrong:**
 
 - **The sink's integrity is a correctness dependency of the suite,** not a convenience. Parallel test workers share one
-  database (hence `busy_timeout`), so a journal mode with no on-disk rollback lets one killed worker corrupt the traces
-  the surviving workers assert over — turning a crashed run into a false result rather than a lost diagnostic.
-- **One exported harness constant owns the sink's path.** Never restate the literal in a package, a CI glob, or a doc.
+  database (hence `busy_timeout`), so a journal mode with no on-disk rollback lets a killed worker leave rows that never
+  committed readable by the survivors. Measured: a SIGKILLed writer under `journal_mode = MEMORY` left 12 uncommitted
+  rows visible while `PRAGMA integrity_check` reported ok. That is a false test result, not a lost diagnostic — which is
+  why `SQLiteTraceWriter` reads the pragma back and refuses a file-backed sink that settled on `memory` or `off`.
+- **`DEFAULT_TRACE_DB_PATH` owns the sink's path** (`packages/lmao/src/lib/sqlite/trace-db-path.ts`, re-exported from
+  `@smoothbricks/lmao/testing{,/bun,/vitest}`; `TRACE_DB_DIRECTORY` and `TRACE_DB_FILENAME` join onto a root). Never
+  restate the literal in a package or a doc. The CI artifact glob is the one legitimate exception: `packages/cli`
+  depends only on nx-plugin and validation, so importing the constant would add a package dependency to interpolate a
+  string, and the glob needs a shape the constant does not have — a `packages/*/` prefix and a trailing `*` so a
+  SIGKILLed run's WAL sidecars are collected. Without the sidecars the uploaded database reads `no such table: spans`,
+  because the committed frames are still in the `-wal`.
 - **It must live under a directory name project walkers and watchers ignore.** A database in a compiled package's root
   makes its own per-transaction journal churn look like the project tree changing mid-compile, which breaks
   transform-generation caching in tools that verify directory membership.
