@@ -3701,6 +3701,81 @@ enum NativeAdoptRollbackState {
     Complete,
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod rebase_recovery_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run fixture git command")
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = git(root, args);
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit_file(root: &Path, contents: &str, message: &str) {
+        std::fs::write(root.join("README.md"), contents).expect("write fixture file");
+        run_git(root, &["add", "README.md"]);
+        run_git(root, &["commit", "-m", message]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebase_restores_the_attached_branch_and_allows_the_next_rebase() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-rebase-recovery-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create fixture repository");
+        run_git(&root, &["init", "--initial-branch=main"]);
+        run_git(&root, &["config", "user.name", "Cowshed Test"]);
+        run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
+        commit_file(&root, "base\n", "base");
+        run_git(&root, &["checkout", "-b", "squashed-feature"]);
+        commit_file(&root, "feature\n", "feature side");
+        let source_head = git_oid(&root).await.expect("source head");
+        run_git(&root, &["checkout", "main"]);
+        commit_file(&root, "main\n", "main side");
+        run_git(&root, &["checkout", "squashed-feature"]);
+
+        let error = run_git_rebase_atomically(&root, "main", &source_head)
+            .await
+            .expect_err("the conflicting rebase fails");
+        assert!(
+            error.message.contains("could not apply"),
+            "git's conflict remains the reported failure: {}",
+            error.message
+        );
+
+        let branch = git(&root, &["symbolic-ref", "--short", "HEAD"]);
+        assert!(
+            branch.status.success(),
+            "workspace HEAD remained detached after failed rebase: {}",
+            String::from_utf8_lossy(&branch.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            "squashed-feature"
+        );
+        assert_eq!(git_oid(&root).await.expect("restored head"), source_head);
+        assert!(!root.join(".git/rebase-merge").exists());
+        assert!(!root.join(".git/rebase-apply").exists());
+
+        run_git_rebase_atomically(&root, source_head.as_str(), &source_head)
+            .await
+            .expect("a following cowshed rebase can start");
+        std::fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+}
 #[cfg(target_os = "macos")]
 #[async_trait]
 impl ProjectRuntimeHost for NativeProjectRuntimeHost {
@@ -5162,7 +5237,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "refresh the destination revision and retry rebase",
             ));
         }
-        run_git(&root, ["rebase", onto.as_str()]).await?;
+        run_git_rebase_atomically(&root, &onto, &source_head).await?;
         git_oid(&root).await
     }
 
@@ -6910,6 +6985,105 @@ async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
             CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
         })?;
     require_git_success("git operation", &output)
+}
+#[cfg(target_os = "macos")]
+async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid) -> Result<()> {
+    async fn invoke(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+        tokio::process::Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .await
+            .map_err(|error| {
+                CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
+            })
+    }
+
+    let source_ref_output = invoke(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    require_git_success("resolve workspace branch", &source_ref_output)?;
+    let source_ref = String::from_utf8(source_ref_output.stdout)
+        .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
+    let source_ref = source_ref.trim_end();
+
+    let git_dir_output = invoke(root, &["rev-parse", "--absolute-git-dir"]).await?;
+    require_git_success("resolve git directory", &git_dir_output)?;
+    let git_dir = String::from_utf8(git_dir_output.stdout)
+        .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
+    let git_dir = PathBuf::from(git_dir.trim_end());
+    let rebase_state = [git_dir.join("rebase-merge"), git_dir.join("rebase-apply")];
+    let had_rebase_state = rebase_state.iter().any(|path| path.exists());
+
+    let output = invoke(root, &["rebase", onto]).await?;
+    let primary = match require_git_success("git operation", &output) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    // A state that predates this command belongs to the user. Never turn a refused retry into
+    // authority to abort or delete an operation cowshed did not start.
+    if had_rebase_state {
+        return Err(primary);
+    }
+
+    let owns_rebase_state = rebase_state.iter().any(|path| path.exists());
+    let current_ref = invoke(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    let current_ref_matches = current_ref.status.success()
+        && String::from_utf8_lossy(&current_ref.stdout).trim_end() == source_ref;
+    let current_head = invoke(root, &["rev-parse", "--verify", "HEAD"]).await?;
+    let current_head_matches = current_head.status.success()
+        && String::from_utf8_lossy(&current_head.stdout).trim_end() == source_head.as_str();
+    if !owns_rebase_state && current_ref_matches && current_head_matches {
+        return Err(primary);
+    }
+
+    // Abort is the lossless path because Git owns the sequencer state. A damaged sequencer may
+    // refuse abort, so cowshed then removes only the two rebase directories it just created and
+    // restores the exact ref and commit captured before mutation.
+    let _ = invoke(root, &["rebase", "--abort"]).await;
+    for path in &rebase_state {
+        if path.exists() {
+            let _ = tokio::fs::remove_dir_all(path).await;
+        }
+    }
+    let _ = invoke(root, &["symbolic-ref", "HEAD", source_ref]).await;
+    let _ = invoke(root, &["reset", "--hard", source_head.as_str()]).await;
+
+    let mut failures = Vec::new();
+    for path in &rebase_state {
+        match tokio::fs::try_exists(path).await {
+            Ok(false) => {}
+            Ok(true) => failures.push(format!("{} still exists", path.display())),
+            Err(error) => failures.push(format!("cannot inspect {}: {error}", path.display())),
+        }
+    }
+    let restored_ref = invoke(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    if !restored_ref.status.success()
+        || String::from_utf8_lossy(&restored_ref.stdout).trim_end() != source_ref
+    {
+        failures.push(format!("HEAD is not attached to {source_ref}"));
+    }
+    match git_oid(root).await {
+        Ok(restored) if &restored == source_head => {}
+        Ok(restored) => failures.push(format!(
+            "HEAD is {}, expected {}",
+            restored.as_str(),
+            source_head.as_str()
+        )),
+        Err(error) => failures.push(format!("cannot resolve restored HEAD: {}", error.message)),
+    }
+
+    if failures.is_empty() {
+        Err(primary)
+    } else {
+        Err(CowshedError::integrity(
+            format!(
+                "{}; automatic rebase rollback failed: {}",
+                primary.message,
+                failures.join("; ")
+            ),
+            "inspect git status and run cowshed doctor --json",
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
