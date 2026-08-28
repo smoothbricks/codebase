@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBunTtscPlugin } from '../index.js';
+import { makeBuildOutputRoot } from './build-output-root.js';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/specialized-message-parity.ts', import.meta.url));
 const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.meta.url));
@@ -72,7 +73,7 @@ async function executeFixture(entrypoint: string): Promise<FixtureResult> {
 }
 
 test('plugin ON selects specialized capacity-64 static-50 while OFF stays current with identical semantics', async () => {
-  const temporaryRoot = await mkdtemp(join(dirname(fixturePath), '.specialized-message-parity-'));
+  const temporaryRoot = await makeBuildOutputRoot('specialized-message-parity');
   try {
     const [offEntrypoint, onEntrypoint] = await Promise.all([
       buildFixture(false, join(temporaryRoot, 'off')),

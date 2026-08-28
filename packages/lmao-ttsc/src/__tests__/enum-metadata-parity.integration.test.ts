@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBunTtscPlugin } from '../index.js';
+import { makeBuildOutputRoot } from './build-output-root.js';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/enum-metadata-parity.ts', import.meta.url));
 const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.meta.url));
@@ -61,7 +62,7 @@ async function executeFixture(entrypoint: string): Promise<FixtureResult> {
 }
 
 test('plugin OFF and ON preserve exact enum value/null bytes while ON reuses plan-bound encoders', async () => {
-  const temporaryRoot = await mkdtemp(join(dirname(fixturePath), '.enum-metadata-parity-'));
+  const temporaryRoot = await makeBuildOutputRoot('enum-metadata-parity');
   try {
     const [offBuild, onBuild] = await Promise.all([
       buildFixture(false, join(temporaryRoot, 'off')),

@@ -1,8 +1,9 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBunTtscPlugin } from '../index.js';
+import { makeBuildOutputRoot } from './build-output-root.js';
 
 const fixturePath = fileURLToPath(new URL('./fixtures/structured-log-parity.ts', import.meta.url));
 const projectPath = fileURLToPath(new URL('../../tsconfig.test.json', import.meta.url));
@@ -61,7 +62,7 @@ async function executeFixture(entrypoint: string): Promise<FixtureResult> {
 }
 
 test('plugin OFF and ON preserve decoded facts and effects while ON uses dense vocabulary rows', async () => {
-  const temporaryRoot = await mkdtemp(join(dirname(fixturePath), '.structured-log-parity-'));
+  const temporaryRoot = await makeBuildOutputRoot('structured-log-parity');
   try {
     const offDir = join(temporaryRoot, 'off');
     const onDir = join(temporaryRoot, 'on');
