@@ -14,7 +14,7 @@
 //!
 //! Ranges the Zig registry reserves for PLANNED opcodes (kept for tooling):
 //! nested-container slot defs 0x15-0x17; time filters 0x50-0x53 (0x50+ range
-//! also reserved for RETE in the axe-runtime superset binary); expressions
+//! also reserved for RETE in the VM superset binary); expressions
 //! 0x60-0x69; JS callbacks 0x70-0x71; nested map ops 0x90-0x96 (partially
 //! implemented per types.zig: 0x90, 0x92, 0x95).
 
@@ -190,7 +190,7 @@ pub enum DurationUnit {
     Year = 8,
 }
 
-/// "AXE1" in little-endian.
+/// Program-format magic in little-endian wire order.
 pub const PROGRAM_MAGIC: u32 = 0x3145_5841;
 /// Reserved bytes at program start for SHA-256 hash.
 pub const PROGRAM_HASH_PREFIX: u32 = 32;

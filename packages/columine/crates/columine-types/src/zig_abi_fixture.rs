@@ -6,9 +6,10 @@
 //! that changes the registry — the audit failing means the two moved apart
 //! UNINTENTIONALLY.
 //!
-//! Harvested mechanically by `columine_types::zig_audit` parsers from:
-//! columine/src/vm/{types,opcodes,vm}.zig + axe-runtime/src/vm/rete.zig.
-//! Names are in `zig_audit::norm` form (lowercased, separators dropped).
+//! `registry_audit` compares each Rust registry against the frozen declaration
+//! sets below. The original Zig sources are not present after cutover; an
+//! intentional ABI change updates the corresponding set with its registry and
+//! `cargo test -p columine-types`.
 
 pub const TYPES_ZIG_OPCODES: &[(&str, u8)] = &[
     ("batchaggcount", 0x41),
