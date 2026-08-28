@@ -69,6 +69,9 @@ describe('tool configuration validation', () => {
 }
 `,
       );
+      // The lock, not a constant in the CLI, decides the ttsc pin. A version no
+      // release ever used proves the value is read rather than restated.
+      await writeFile(join(root, 'bun.lock'), lockfileWithTtsc('9.9.9'));
 
       expect(await validateToolConfig(root)).toBeGreaterThan(0);
       await applyToolConfigDefaults(root);
@@ -81,36 +84,37 @@ describe('tool configuration validation', () => {
       expect(rootPackage.devDependencies['@smoothbricks/nx-plugin']).toBe('workspace:*');
       expect(rootPackage.devDependencies['eslint-stdout']).toBe('workspace:*');
       expect(rootPackage.devDependencies.nx).toBe('23.1.0');
-      expect(rootPackage.devDependencies.ttsc).toBe('0.25.0');
+      expect(rootPackage.devDependencies.ttsc).toBe('9.9.9');
       expect(rootPackage.devDependencies.typescript).toBe('^6.0.3');
       expect(rootPackage.devDependencies['@typescript/native']).toBe('npm:typescript@^7.0.2');
       expect(rootPackage.patchedDependencies?.['ttsc@0.19.3']).toBeUndefined();
       expect(rootPackage.workspaces).toContain('tooling');
       expect(toolingPackage.name).toBe('@smoothbricks/tooling');
       expect(toolingPackage.dependencies['@smoothbricks/cli']).toBe('workspace:*');
-      expect(devenv).toContain('nodejs_latest');
       expect(devenv).toContain('coreutils');
       expect(devenv).toContain('git-format-staged');
-      expect(devenv).toContain('go # Builds ttsc source plugins');
+      // Go and Node come from ./devenv.smoo.nix, pinned fleet-wide. Writing them
+      // here would shadow the pins with default-channel and `latest` versions.
+      expect(devenv).not.toContain('nodejs');
+      expect(devenv).not.toMatch(/^\s*go\s*(#.*)?$/m);
       expect(devenv).not.toContain('sccache');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('requires Go for managed TypeScript source-plugin builds without forcing Rust tools', async () => {
+  it('leaves Go and Node to the managed module, and rejects a repo-owned bare go', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {
       const devenvPath = join(root, 'tooling/direnv/devenv.nix');
       await mkdir(dirname(devenvPath), { recursive: true });
-      await writeFile(
-        devenvPath,
-        `{
+      const packageList = (extra: string) => `{
   pkgs,
   ...
 }: {
+  imports = [./devenv.smoo.nix];
+
   packages = with pkgs; [
-    nodejs_latest
     bun
     git
     git-format-staged
@@ -118,17 +122,27 @@ describe('tool configuration validation', () => {
     alejandra
     coreutils
     gnutar
-  ];
+${extra}  ];
 }
-`,
-      );
+`;
 
-      expect(validateDevenvPackages(root)).toBe(1);
-      applyDevenvPackageDefaults(root);
+      // Neither Go nor a nodejs provider appears, and that is complete: the
+      // imported module supplies pinned Go and an explicit Node major.
+      await writeFile(devenvPath, packageList(''));
       expect(validateDevenvPackages(root)).toBe(0);
-      const devenv = await readFile(devenvPath, 'utf8');
-      expect(devenv).toContain('go # Builds ttsc source plugins');
-      expect(devenv).not.toContain('sccache');
+      applyDevenvPackageDefaults(root);
+      expect(await readFile(devenvPath, 'utf8')).toBe(packageList(''));
+
+      // A comment may name Go without being a package entry.
+      await writeFile(devenvPath, packageList('    # Go comes from ./devenv.smoo.nix (languages.go)\n'));
+      expect(validateDevenvPackages(root)).toBe(0);
+
+      // A bare `go` entry shadows the pinned toolchain on PATH; that is the skew
+      // that fails as `compile: version does not match go tool version`.
+      await writeFile(devenvPath, packageList('    go\n'));
+      expect(validateDevenvPackages(root)).toBe(1);
+      await writeFile(devenvPath, packageList('    go # Builds ttsc source plugins\n'));
+      expect(validateDevenvPackages(root)).toBe(1);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -150,7 +164,6 @@ describe('tool configuration validation', () => {
   ...
 }: {
   packages = with pkgs; [
-    nodejs_latest
     bun
     git
     git-format-staged
@@ -158,7 +171,6 @@ describe('tool configuration validation', () => {
     alejandra
     coreutils
     gnutar
-    go
     stdenv.cc.cc.lib
   ];
 }
@@ -205,6 +217,8 @@ describe('tool configuration validation', () => {
           'ttsc@0.19.3': '',
         },
       });
+      // package.json agrees with the lock, so ttsc is not what this test measures.
+      await writeFile(join(root, 'bun.lock'), lockfileWithTtsc('0.25.0'));
       await writeJson(join(root, 'tooling/package.json'), {
         name: '@fixture/tooling',
         private: true,
@@ -219,7 +233,6 @@ describe('tool configuration validation', () => {
   ...
 }: {
   packages = with pkgs; [
-    nodejs_latest
     bun
     git
     git-format-staged
@@ -227,7 +240,6 @@ describe('tool configuration validation', () => {
     alejandra
     coreutils
     gnutar
-    go
   ];
 }
 `,
@@ -404,6 +416,24 @@ function latestRegistryVersion(packageName: string): string {
     throw new Error(`empty mocked registry versions for ${packageName}`);
   }
   return latest;
+}
+
+/**
+ * A bun text lockfile carrying one resolved package entry, in the shape bun
+ * writes: `"<name>": ["<name>@<version>", …]`. Deliberately includes the
+ * dependency-map spelling too, so a reader that confuses the two is caught.
+ */
+function lockfileWithTtsc(version: string): string {
+  return `{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": { "name": "fixture", "devDependencies": { "ttsc": "${version}" } }
+  },
+  "packages": {
+    "ttsc": ["ttsc@${version}", "", {}, "sha512-fixture"]
+  }
+}
+`;
 }
 
 async function writeJson(path: string, value: Record<string, unknown>): Promise<void> {
