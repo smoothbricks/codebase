@@ -5451,6 +5451,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         match self.authoritative().await {
             Ok(workspaces) => {
+                let main_mount = self.workspace_mount_path(&main_name()).ok();
                 for workspace in workspaces {
                     let workspace_name = workspace.derived.workspace.name().clone();
                     let expected_mount = match self.workspace_mount_path(&workspace_name) {
@@ -5500,47 +5501,82 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             let expected_project_root = self.descriptor.git_root.clone();
                             let checked_marker_path = marker_path.clone();
                             let marker = crate::storage::lifecycle::dispatch_blocking(move || {
-                                let marker = crate::metadata::WorkspaceMarker::read_from(
-                                    &checked_marker_path,
-                                )
-                                .map_err(|error| error.to_string())?;
-                                if marker.repo_id != expected_repo
-                                    || marker.workspace != expected_workspace
-                                    || marker.workspace_incarnation != expected_incarnation
-                                    || !names_one_root(
-                                        &marker.project_root,
-                                        &expected_project_root,
-                                    )
-                                {
-                                    return Err(format!(
-                                        "workspace marker identity does not match {expected_workspace}"
-                                    ));
-                                }
-                                Ok(())
+                                crate::metadata::WorkspaceMarker::read_from(&checked_marker_path)
+                                    .map_err(|error| error.to_string())
                             })
                             .await;
                             match marker {
-                                Ok(Ok(())) => {}
+                                Ok(Ok(marker)) => findings.extend(diagnose_mounted_marker(
+                                    &workspace_name,
+                                    &marker,
+                                    &expected_repo,
+                                    &expected_workspace,
+                                    &expected_incarnation,
+                                    &expected_project_root,
+                                    marker_path.clone(),
+                                )),
                                 Ok(Err(error)) => findings.push(crate::api::dto::Finding {
                                     code: "marker".into(),
                                     severity: crate::api::dto::FindingSeverity::Error,
                                     message: format!(
-                                        "workspace {workspace_name} marker is invalid: {error}"
+                                        "workspace {workspace_name} marker is unreadable: {error}"
                                     ),
-                                    hint: format!(
-                                        "cowshed detach {workspace_name} && cowshed attach {workspace_name}"
-                                    ),
+                                    hint: "inspect the workspace image; an unreadable marker is not rewritten by detach or attach".into(),
                                     path: Some(marker_path),
                                 }),
                                 Err(error) => findings.push(crate::api::dto::Finding {
                                     code: "marker".into(),
                                     severity: crate::api::dto::FindingSeverity::Error,
                                     message: format!(
-                                        "could not validate workspace {workspace_name} marker: {error}"
+                                        "could not read workspace {workspace_name} marker: {error}"
                                     ),
-                                    hint: "cowshed doctor --json".into(),
+                                    hint: "inspect the workspace image; cowshed could not read the marker".into(),
                                     path: Some(marker_path),
                                 }),
+                            }
+                            match crate::git::GitRepository::from_root(&expected_mount)
+                                .inspect_merge_drivers()
+                                .await
+                            {
+                                Ok(drivers) => {
+                                    for driver in drivers {
+                                        if let Some(finding) = merge_driver_finding(
+                                            &workspace_name,
+                                            &driver,
+                                            expected_mount.clone(),
+                                        ) {
+                                            findings.push(finding);
+                                        }
+                                    }
+                                }
+                                Err(error) => findings.push(native_finding(
+                                    "merge-driver",
+                                    crate::api::dto::FindingSeverity::Error,
+                                    error,
+                                )),
+                            }
+                            if !workspace_name.is_main()
+                                && let Some(main_mount) = main_mount.as_ref()
+                            {
+                                match crate::git::GitRepository::from_root(&expected_mount)
+                                    .inspect_cowshed_upstream(main_mount)
+                                    .await
+                                {
+                                    Ok(upstream) => {
+                                        if let Some(finding) = cowshed_upstream_finding(
+                                            &workspace_name,
+                                            &upstream,
+                                            expected_mount.clone(),
+                                        ) {
+                                            findings.push(finding);
+                                        }
+                                    }
+                                    Err(error) => findings.push(native_finding(
+                                        "main-remote",
+                                        crate::api::dto::FindingSeverity::Error,
+                                        error,
+                                    )),
+                                }
                             }
                         }
                     }
@@ -7685,6 +7721,114 @@ fn is_git_worktree(metadata: &crate::metadata::DetachedWorkspaceMetadata) -> boo
         .is_some_and(|info| info.git_worktree)
 }
 
+/// Split a mounted workspace marker into identity vs project-root findings.
+///
+/// Those are different conditions with different remedies: remounting replaces a stale volume,
+/// but `projectRoot` lives inside the image and is rewritten by `attach`, not by unmounting.
+#[cfg(target_os = "macos")]
+fn diagnose_mounted_marker(
+    workspace_name: &WorkspaceName,
+    marker: &crate::metadata::WorkspaceMarker,
+    expected_repo: &crate::repository::RepoId,
+    expected_workspace: &WorkspaceName,
+    expected_incarnation: &crate::metadata::WorkspaceIncarnation,
+    expected_project_root: &Path,
+    marker_path: PathBuf,
+) -> Vec<crate::api::dto::Finding> {
+    let mut findings = Vec::new();
+    if marker.repo_id != *expected_repo
+        || marker.workspace != *expected_workspace
+        || marker.workspace_incarnation != *expected_incarnation
+    {
+        findings.push(crate::api::dto::Finding {
+            code: "marker".into(),
+            severity: crate::api::dto::FindingSeverity::Error,
+            message: format!(
+                "workspace {workspace_name} marker identity does not match the store: recorded {}/{}/{}",
+                marker.repo_id, marker.workspace, marker.workspace_incarnation
+            ),
+            hint: format!(
+                "cowshed detach {workspace_name} && cowshed attach {workspace_name}"
+            ),
+            path: Some(marker_path.clone()),
+        });
+    }
+    if !names_one_root(&marker.project_root, expected_project_root) {
+        findings.push(crate::api::dto::Finding {
+            code: "project-root".into(),
+            severity: crate::api::dto::FindingSeverity::Error,
+            message: format!(
+                "workspace {workspace_name} records project root {} but the checkout is {}",
+                marker.project_root.display(),
+                expected_project_root.display()
+            ),
+            hint: format!("cowshed attach {workspace_name}"),
+            path: Some(marker_path),
+        });
+    }
+    findings
+}
+
+#[cfg(target_os = "macos")]
+fn merge_driver_finding(
+    workspace_name: &WorkspaceName,
+    driver: &crate::git::MergeDriver,
+    path: PathBuf,
+) -> Option<crate::api::dto::Finding> {
+    match &driver.state {
+        crate::git::MergeDriverState::Relative => None,
+        crate::git::MergeDriverState::Relativized { to } => Some(crate::api::dto::Finding {
+            code: "merge-driver".into(),
+            severity: crate::api::dto::FindingSeverity::Error,
+            message: format!(
+                "workspace {workspace_name} merge driver {} uses an absolute program; the repository-relative spelling is {to}",
+                driver.name
+            ),
+            hint: format!("cowshed attach {workspace_name}"),
+            path: Some(path),
+        }),
+        crate::git::MergeDriverState::Unresolvable { program } => Some(crate::api::dto::Finding {
+            code: "merge-driver".into(),
+            severity: crate::api::dto::FindingSeverity::Error,
+            message: format!(
+                "workspace {workspace_name} merge driver {} names {program}, which is not in this repository; cowshed will not guess a replacement",
+                driver.name
+            ),
+            hint: format!(
+                "point merge.{}.driver at a program that exists in the repository, or remove the driver — cowshed attach cannot invent one",
+                driver.name
+            ),
+            path: Some(path),
+        }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cowshed_upstream_finding(
+    workspace_name: &WorkspaceName,
+    upstream: &crate::git::CowshedUpstream,
+    path: PathBuf,
+) -> Option<crate::api::dto::Finding> {
+    if upstream.repository {
+        return None;
+    }
+    let location = upstream
+        .url
+        .as_ref()
+        .map(|url| format!(" ({})", url.display()))
+        .unwrap_or_default();
+    Some(crate::api::dto::Finding {
+        code: "main-remote".into(),
+        severity: crate::api::dto::FindingSeverity::Error,
+        message: format!(
+            "workspace {workspace_name} remote {} does not resolve to a repository{location}",
+            upstream.remote_name
+        ),
+        hint: format!("cowshed attach {workspace_name}"),
+        path: Some(path),
+    })
+}
+
 /// Decide which path a checkout-identity check should actually inspect.
 ///
 /// Exactly one symlink is legitimate at a checkout path: the one adoption plants there, aimed at
@@ -7740,6 +7884,211 @@ fn native_finding(
         message: error.message,
         hint: error.hint,
         path: None,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod doctor_hint_tests {
+    use super::*;
+    use crate::git::{CowshedUpstream, MergeDriver, MergeDriverState};
+    use crate::metadata::{
+        ImageFormat, METADATA_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole,
+    };
+    use std::path::PathBuf;
+
+    fn marker(project_root: &str, workspace: &str) -> WorkspaceMarker {
+        WorkspaceMarker {
+            version: METADATA_VERSION,
+            repo_id: crate::repository::RepoId::parse("acme/widget").expect("repo"),
+            project_root: PathBuf::from(project_root),
+            workspace: WorkspaceName::new(workspace).expect("workspace"),
+            workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
+                .expect("incarnation"),
+            role: WorkspaceRole::Workspace,
+            image_format: ImageFormat::Asif,
+            base_commit: "8f31c2d".into(),
+            created_at: "2026-07-11T12:00:00Z".into(),
+            forked_from: None,
+            created_trace: "trace".into(),
+            lineage: None,
+        }
+    }
+
+    fn expected() -> (
+        crate::repository::RepoId,
+        WorkspaceName,
+        WorkspaceIncarnation,
+    ) {
+        (
+            crate::repository::RepoId::parse("acme/widget").expect("repo"),
+            WorkspaceName::new("raven").expect("workspace"),
+            WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80").expect("incarnation"),
+        )
+    }
+
+    #[test]
+    fn stale_project_root_is_its_own_finding_and_hints_attach_without_detach() {
+        let (repo, workspace, incarnation) = expected();
+        let recorded = PathBuf::from("/tmp/recorded-checkout");
+        let actual = PathBuf::from("/tmp/actual-checkout");
+        let findings = diagnose_mounted_marker(
+            &workspace,
+            &marker("/tmp/recorded-checkout", "raven"),
+            &repo,
+            &workspace,
+            &incarnation,
+            &actual,
+            PathBuf::from("/mnt/raven/.cowshed/workspace.json"),
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code, "project-root");
+        assert_eq!(
+            findings[0].severity,
+            crate::api::dto::FindingSeverity::Error
+        );
+        assert!(
+            findings[0].message.contains(recorded.to_str().unwrap()),
+            "{}",
+            findings[0].message
+        );
+        assert!(
+            findings[0].message.contains(actual.to_str().unwrap()),
+            "{}",
+            findings[0].message
+        );
+        assert_eq!(findings[0].hint, "cowshed attach raven");
+        assert!(
+            !findings[0].hint.contains("detach"),
+            "detach cannot rewrite projectRoot inside the image; hint was {}",
+            findings[0].hint
+        );
+    }
+
+    #[test]
+    fn matching_project_root_is_not_a_finding() {
+        let (repo, workspace, incarnation) = expected();
+        let root = PathBuf::from("/tmp/same-checkout");
+        let findings = diagnose_mounted_marker(
+            &workspace,
+            &marker("/tmp/same-checkout", "raven"),
+            &repo,
+            &workspace,
+            &incarnation,
+            &root,
+            PathBuf::from("/mnt/raven/.cowshed/workspace.json"),
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn marker_identity_mismatch_still_hints_remount() {
+        let (repo, workspace, incarnation) = expected();
+        let root = PathBuf::from("/tmp/same-checkout");
+        let findings = diagnose_mounted_marker(
+            &workspace,
+            &marker("/tmp/same-checkout", "other"),
+            &repo,
+            &workspace,
+            &incarnation,
+            &root,
+            PathBuf::from("/mnt/raven/.cowshed/workspace.json"),
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].code, "marker");
+        assert!(
+            findings[0].message.contains("acme/widget/other/"),
+            "{}",
+            findings[0].message
+        );
+        assert_eq!(
+            findings[0].hint,
+            "cowshed detach raven && cowshed attach raven"
+        );
+    }
+
+    #[test]
+    fn relativized_merge_driver_hints_attach_and_unresolvable_requires_a_decision() {
+        let workspace = WorkspaceName::new("raven").expect("workspace");
+        let relativized = merge_driver_finding(
+            &workspace,
+            &MergeDriver {
+                name: "ledger-union".into(),
+                state: MergeDriverState::Relativized {
+                    to: "scripts/merge-ledger.py %O %A %B".into(),
+                },
+            },
+            PathBuf::from("/mnt/raven"),
+        )
+        .expect("relativized is a finding");
+        assert_eq!(relativized.code, "merge-driver");
+        assert_eq!(relativized.hint, "cowshed attach raven");
+        assert!(relativized.message.contains("scripts/merge-ledger.py"));
+
+        let unresolvable = merge_driver_finding(
+            &workspace,
+            &MergeDriver {
+                name: "appenddoc-union".into(),
+                state: MergeDriverState::Unresolvable {
+                    program: "/gone/scripts/merge-append-doc.py".into(),
+                },
+            },
+            PathBuf::from("/mnt/raven"),
+        )
+        .expect("unresolvable is a finding");
+        assert_eq!(unresolvable.code, "merge-driver");
+        assert!(
+            !unresolvable.hint.starts_with("cowshed attach"),
+            "attach cannot invent a missing program; hint was {}",
+            unresolvable.hint
+        );
+        assert!(unresolvable.hint.contains("merge.appenddoc-union.driver"));
+        assert!(
+            unresolvable
+                .message
+                .contains("/gone/scripts/merge-append-doc.py")
+        );
+
+        assert!(
+            merge_driver_finding(
+                &workspace,
+                &MergeDriver {
+                    name: "already-relative".into(),
+                    state: MergeDriverState::Relative,
+                },
+                PathBuf::from("/mnt/raven"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn dead_cowshed_upstream_hints_attach() {
+        let workspace = WorkspaceName::new("raven").expect("workspace");
+        let finding = cowshed_upstream_finding(
+            &workspace,
+            &CowshedUpstream {
+                remote_name: "main".into(),
+                url: Some(PathBuf::from("/tmp/gone-checkout")),
+                repository: false,
+            },
+            PathBuf::from("/mnt/raven"),
+        )
+        .expect("dead upstream is a finding");
+        assert_eq!(finding.code, "main-remote");
+        assert!(finding.message.contains("/tmp/gone-checkout"));
+        assert_eq!(finding.hint, "cowshed attach raven");
+        assert!(
+            cowshed_upstream_finding(
+                &workspace,
+                &CowshedUpstream {
+                    remote_name: "main".into(),
+                    url: Some(PathBuf::from("/tmp/live")),
+                    repository: true,
+                },
+                PathBuf::from("/mnt/raven"),
+            )
+            .is_none()
+        );
     }
 }
 
