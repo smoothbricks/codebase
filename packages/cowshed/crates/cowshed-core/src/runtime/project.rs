@@ -2193,7 +2193,8 @@ impl NativeProjectRuntimeHost {
     ///
     /// * its **marker** (`.cowshed/workspace.json`) and its **detached sidecar**, both of which
     ///   name `projectRoot`. Rewriting only main's pair — which is all this used to do — is what
-    ///   left three minigraf sessions naming a directory that had stopped being a repository, and
+    ///   left every session of a relocated project naming a directory that had stopped being a
+    ///   repository, and
     ///   what made `doctor` report "workspace marker identity does not match" with no remedy in
     ///   sight;
     /// * its **`main` remote**, or its **linked-worktree registration** when it is a git-worktree
@@ -8131,7 +8132,7 @@ mod workspace_origin_tests {
         let source = temp.join("missing-retired-checkout");
         let destination = temp.join("explicit-destination");
         let store = temp.join("store");
-        let repo_id = RepoId::parse("example-org/minigraf").expect("live repository identity");
+        let repo_id = RepoId::parse("example-org/example-app").expect("live repository identity");
         let layout = crate::storage::StorageLayout::with_mount_root(
             &store,
             temp.join("current-mnt"),
@@ -8142,7 +8143,7 @@ mod workspace_origin_tests {
         let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
             repo_id,
             remote_name: Some("origin".to_owned()),
-            remote_url: Some("https://example.test/example-org/minigraf.git".to_owned()),
+            remote_url: Some("https://example.test/example-org/example-app.git".to_owned()),
             primary: true,
         }])
         .expect("validated live binding");
@@ -8151,12 +8152,12 @@ mod workspace_origin_tests {
             .expect("current main mount");
         let invoking_home = Path::new("/Users/alice");
         let historical_main_mount =
-            Path::new("/Users/alice/.cowshed/mnt/example-org/minigraf/main");
+            Path::new("/Users/alice/.cowshed/mnt/example-org/example-app/main");
         let targets = known_retired_main_targets(&current_main_mount, invoking_home, &binding)
             .expect("same-repository retired roots");
         assert!(targets.contains(&historical_main_mount.to_owned()));
         assert!(targets.contains(
-            &Path::new("/private/cowshed/store/mnt/example-org/minigraf/main").to_owned()
+            &Path::new("/private/cowshed/store/mnt/example-org/example-app/main").to_owned()
         ));
         assert_eq!(
             targets.len(),
@@ -8168,7 +8169,7 @@ mod workspace_origin_tests {
                 .expect("duplicate home and current root"),
             vec![
                 historical_main_mount.to_owned(),
-                Path::new("/private/cowshed/store/mnt/example-org/minigraf/main").to_owned(),
+                Path::new("/private/cowshed/store/mnt/example-org/example-app/main").to_owned(),
             ],
             "an unchanged current home root is listed only once"
         );
@@ -8382,7 +8383,7 @@ mod workspace_origin_tests {
     #[test]
     fn sandbox_denial_detection_fires_on_eperm_and_nothing_else() {
         let denial = sandbox_denial_in(
-            "error: failed to run custom build command for `foo`\n  cat: /Users/danny/Dev/_fork/minigraf/Cargo.toml: Operation not permitted",
+            "error: failed to run custom build command for `foo`\n  cat: /Users/dev/projects/example-app/Cargo.toml: Operation not permitted",
         )
         .expect("EPERM wording must classify as a denial");
         assert!(denial.contains("Operation not permitted"));
@@ -8515,21 +8516,21 @@ mod binding_tests {
     #[test]
     fn a_remote_without_a_derivable_identity_is_skipped_not_fatal() {
         let remotes = [
-            remote("origin", "https://example.com/example-org/minigraf.git"),
-            remote("backup", "/Volumes/Backup/Dev/_fork/minigraf.git"),
+            remote("origin", "https://example.com/example-org/example-app.git"),
+            remote("backup", "/Volumes/Backup/example-app.git"),
         ];
 
         let binding =
             binding_from_remotes(&remotes, None).expect("the usable remote identifies it");
 
         let primary = binding.primary().expect("primary");
-        assert_eq!(primary.repo_id, repo_id("example-org/minigraf"));
+        assert_eq!(primary.repo_id, repo_id("example-org/example-app"));
         assert_eq!(primary.remote_name.as_deref(), Some("origin"));
     }
 
     #[test]
     fn a_checkout_whose_every_remote_is_unusable_reports_what_it_skipped() {
-        let remotes = [remote("backup", "/Volumes/Backup/Dev/_fork/minigraf.git")];
+        let remotes = [remote("backup", "/Volumes/Backup/example-app.git")];
 
         let error =
             binding_from_remotes(&remotes, None).expect_err("nothing identifies the repository");
@@ -8537,7 +8538,7 @@ mod binding_tests {
         assert!(error.message.contains("backup"), "{}", error.message);
 
         // An explicit identity is still enough to proceed.
-        let requested = repo_id("example-org/minigraf");
+        let requested = repo_id("example-org/example-app");
         let binding =
             binding_from_remotes(&remotes, Some(&requested)).expect("explicit identity suffices");
         assert_eq!(binding.primary().expect("primary").repo_id, requested);

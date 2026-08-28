@@ -563,11 +563,11 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
                     name: String::from("cowshed.store"),
                     uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
                     size_bytes: 1_000_000_000_000,
-                    mount_at: PathBuf::from("/Users/danny/.cowshed"),
+                    mount_at: PathBuf::from("/Users/dev/.cowshed"),
                 },
                 HostAction::PinFstab {
                     uuid: String::from("1D6F0E1A-0000-4000-8000-00000000AAAA"),
-                    mount_at: PathBuf::from("/Users/danny/.cowshed"),
+                    mount_at: PathBuf::from("/Users/dev/.cowshed"),
                 },
             ],
             true,
@@ -592,8 +592,8 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: no volumes will be created or deleted; existing data is untouched\n\
-         cowshed: cowshed.store exists (UUID 1D6F0E1A-0000-4000-8000-00000000AAAA, 1.0 TB) and will be mounted at /Users/danny/.cowshed\n\
-         cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /Users/danny/.cowshed so it mounts at every boot\n\
+         cowshed: cowshed.store exists (UUID 1D6F0E1A-0000-4000-8000-00000000AAAA, 1.0 TB) and will be mounted at /Users/dev/.cowshed\n\
+         cowshed: /etc/fstab will pin UUID 1D6F0E1A-0000-4000-8000-00000000AAAA at /Users/dev/.cowshed so it mounts at every boot\n\
          cowshed: cowshed.store (store): present but not mounted -> mounted\n\
          cowshed: pinned the boot mounts in /etc/fstab\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
