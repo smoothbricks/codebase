@@ -37,7 +37,10 @@ impl Fixture {
         ));
         fs::create_dir_all(&root).expect("fixture root");
         let fixture = Self(root);
-        git(fixture.parent_unchecked(), ["init", "-q", "-b", TARGET, "."]);
+        git(
+            fixture.parent_unchecked(),
+            ["init", "-q", "-b", TARGET, "."],
+        );
         fixture.write_parent("base.txt", "base\n");
         git(fixture.parent_unchecked(), ["add", "-A"]);
         commit(fixture.parent_unchecked(), "base");
@@ -231,17 +234,25 @@ async fn a_workspace_whose_head_the_target_contains_is_landed_by_ancestry() {
 /// The case the whole feature exists for: the content is upstream, the commit is not an ancestor of
 /// anything, and strict ancestry therefore calls a safe removal unsafe.
 #[tokio::test]
-async fn content_that_reached_the_target_by_squash_or_rewrite_is_landed_without_being_an_ancestor() {
+async fn content_that_reached_the_target_by_squash_or_rewrite_is_landed_without_being_an_ancestor()
+{
     let fixture = Fixture::new("patch-id-only");
     let mount = fixture.clone_workspace("dollarbash");
     workspace_commit(&mount, "feature.txt", "feature\n", "the feature");
     let head = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
 
-    fixture.land_content_separately("feature.txt", "feature\n", "the feature, landed differently");
+    fixture.land_content_separately(
+        "feature.txt",
+        "feature\n",
+        "the feature, landed differently",
+    );
     let tip = git(fixture.parent(), ["rev-parse", "refs/heads/main"])
         .trim()
         .to_owned();
-    assert_ne!(head, tip, "the fixture must not accidentally build an ancestor");
+    assert_ne!(
+        head, tip,
+        "the fixture must not accidentally build an ancestor"
+    );
 
     let landing = measured(&fixture, &mount).await;
     assert_eq!(
@@ -363,7 +374,10 @@ async fn a_clean_merge_does_not_block_a_workspace_whose_commits_are_all_held() {
     workspace_commit(&mount, "side.txt", "side\n", "side work");
     git(&mount, ["checkout", "-q", "land-wave"]);
     // Disjoint files, so the merge resolves itself and contributes nothing.
-    git(&mount, ["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+    git(
+        &mount,
+        ["merge", "-q", "--no-ff", "side", "-m", "merge side"],
+    );
 
     fixture.land_content_separately("guard.txt", "guard\n", "guard work upstream");
     fixture.land_content_separately("side.txt", "side\n", "side work upstream");
@@ -449,7 +463,10 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("run git rebase");
-    assert!(!rebase.status.success(), "the fixture depends on a conflict");
+    assert!(
+        !rebase.status.success(),
+        "the fixture depends on a conflict"
+    );
     fs::write(mount.join("base.txt"), "upstream and workspace\n").expect("resolve conflict");
     git(&mount, ["add", "-A"]);
     let resolved = Command::new(GIT)
@@ -626,5 +643,93 @@ async fn classification_follows_head_and_not_a_registered_branch_that_has_drifte
     assert!(
         !landing.commits.fully_landed(),
         "a workspace whose HEAD holds unlanded work must never be reported landed"
+    );
+}
+
+/// The defect this whole module routes around, tested from the outside.
+///
+/// A workspace's `refs/remotes/main/main` is a clone-time snapshot. Nothing refreshes it, so it
+/// freezes at whatever main's tip was when the workspace was minted — on this host, seven
+/// workspaces each frozen at a different commit, some hundreds behind. A check that resolves its
+/// target through that ref is confidently wrong in *both* directions: it under-reports how far
+/// behind a workspace is, and it calls work unlanded that the real main has held for months.
+///
+/// So the property is not "the cache is preferred less"; it is that the cache has no influence at
+/// all. Both halves are asserted, because a check that read the cache would fail exactly one of
+/// them and pass the other.
+#[tokio::test]
+async fn a_stale_cached_remote_ref_has_no_influence_on_the_verdict() {
+    let fixture = Fixture::new("stale-remote-cache");
+    let mount = fixture.clone_workspace("greenfield-formats");
+    let clone_time_tip = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+
+    // Half one: work that is nowhere upstream, against a main that has moved on. Freeze the cache
+    // at clone time and point the remote itself at a directory that stopped being a repository,
+    // which is the exact state a moved checkout leaves behind.
+    workspace_commit(&mount, "formats.txt", "formats\n", "format work");
+    git(
+        &mount,
+        ["update-ref", "refs/remotes/main/main", &clone_time_tip],
+    );
+    git(
+        &mount,
+        [
+            "remote",
+            "add",
+            "main",
+            "/Users/nobody/.cowshed/mnt/gone/main",
+        ],
+    );
+    for index in 0..5 {
+        fixture.parent_commit(
+            &format!("upstream-{index}.txt"),
+            "upstream\n",
+            &format!("upstream {index}"),
+        );
+    }
+    let real_tip = git(fixture.parent(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_ne!(
+        real_tip, clone_time_tip,
+        "the fixture must actually diverge"
+    );
+
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(
+        counts(&landing),
+        (1, 0, 5),
+        "the target is main's live tip, so the workspace is five behind and not zero"
+    );
+    match &landing.commits {
+        LandingCommits::Measured { target_head, .. } => {
+            assert_eq!(
+                target_head.as_str(),
+                real_tip,
+                "the reported target head must be main's live tip, never the cached ref"
+            );
+        }
+        LandingCommits::Indeterminate { reason } => panic!("expected a measurement: {reason}"),
+    }
+
+    // Half two, the destructive direction: the workspace's content is now in the real main, while
+    // the frozen cache still predates it. A check reading the cache calls this unlanded and demands
+    // `--abandon`; a check reading main calls it landed, which it is.
+    fixture.land_content_separately("formats.txt", "formats\n", "format work upstream");
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(counts(&landing), (0, 1, 6));
+    assert!(
+        landing.commits.fully_landed(),
+        "content the live main holds is landed however stale the cached ref is"
+    );
+
+    // And the cache is still exactly where it was, so the verdicts above were not the result of
+    // something quietly refreshing it.
+    assert_eq!(
+        git(&mount, ["rev-parse", "refs/remotes/main/main"])
+            .trim()
+            .to_owned(),
+        clone_time_tip,
+        "nothing may fetch: a refreshed cache would hide the property under test"
     );
 }

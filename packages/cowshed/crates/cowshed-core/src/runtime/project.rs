@@ -2186,39 +2186,102 @@ impl NativeProjectRuntimeHost {
         Ok(())
     }
 
-    /// Point every mounted workspace's link to main at main's current mount: the `main` remote for
-    /// a standalone workspace, the linked-worktree registration for a git-worktree one.
+    /// Bring every workspace's own record of the project into line with where the project is now.
+    ///
+    /// A workspace records the project in four independent places, and a relocation invalidates all
+    /// four at once:
+    ///
+    /// * its **marker** (`.cowshed/workspace.json`) and its **detached sidecar**, both of which
+    ///   name `projectRoot`. Rewriting only main's pair — which is all this used to do — is what
+    ///   left three minigraf sessions naming a directory that had stopped being a repository, and
+    ///   what made `doctor` report "workspace marker identity does not match" with no remedy in
+    ///   sight;
+    /// * its **`main` remote**, or its **linked-worktree registration** when it is a git-worktree
+    ///   workspace;
+    /// * its **merge drivers**, whose absolute program paths die with the old checkout and take
+    ///   every rebase in the project with them.
     ///
     /// Under direct mount main's mount *is* the checkout, so moving the checkout moves the URL
     /// every workspace fetches from and the gitdir every git-worktree workspace points at; under
-    /// the symlink layout the mount never moves and this is the idempotent re-run that
+    /// the symlink layout the mount never moves and the remote repair is the idempotent re-run
     /// `configure_main_remote` is built for. One code path covers both because the layout is
     /// exactly the thing `workspace_mount_path` already answers.
     ///
-    /// Detached workspaces are skipped rather than mounted: there is nothing to write into an
-    /// unmounted volume, and `attach` repairs the link when the workspace is next used.
-    async fn rewrite_main_remotes(&mut self) -> Result<()> {
+    /// A detached workspace has no reachable marker and no reachable config, so only its sidecar
+    /// moves; `attach` finishes the pair. Every workspace is attempted before any failure is
+    /// raised: a project half-repaired by a refusal in the middle is worse than one fully
+    /// repaired except for the workspace that genuinely could not be written, and re-running the
+    /// same verb is the remedy either way.
+    async fn repair_workspace_records(&mut self, project_root: &Path) -> Result<()> {
         let main_mount = self.workspace_mount_path(&main_name())?;
+        let mut failures = Vec::new();
         for workspace in self.authoritative().await? {
             let name = workspace.derived.workspace.name().clone();
-            if name.is_main()
-                || !matches!(
-                    workspace.derived.mount_state,
-                    crate::storage::lifecycle::MountState::Mounted { .. }
-                )
+            if let Err(error) = self
+                .repair_one_workspace_record(&workspace, &name, &main_mount, project_root)
+                .await
             {
-                continue;
+                failures.push(format!("{name}: {}", error.message));
             }
-            let mount = self.workspace_mount_path(&name)?;
-            if is_git_worktree(&workspace.metadata) {
-                repair_git_worktree_link(&main_mount, &mount).await?;
-                continue;
-            }
-            crate::git::GitRepository::from_root(&mount)
-                .configure_main_remote(&main_mount)
-                .await?;
         }
-        Ok(())
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(CowshedError::integrity(
+            format!(
+                "could not repair every workspace's record of {}: {}",
+                project_root.display(),
+                failures.join("; ")
+            ),
+            "cowshed doctor --json",
+        ))
+    }
+
+    async fn repair_one_workspace_record(
+        &self,
+        workspace: &NativeWorkspace,
+        name: &WorkspaceName,
+        main_mount: &Path,
+        project_root: &Path,
+    ) -> Result<()> {
+        let record = crate::checkout::CheckoutRecord {
+            mount_point: self.workspace_mount_path(name)?,
+            image: workspace.image.clone(),
+        };
+        let mounted = matches!(
+            workspace.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        );
+        let rewrite_root = project_root.to_owned();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            if mounted {
+                record.rewrite_project_root(&rewrite_root).map(|_| ())
+            } else {
+                record
+                    .rewrite_detached_project_root(&rewrite_root)
+                    .map(|_| ())
+            }
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("checkout record task failed: {error}")))?
+        .map_err(native_integrity_error)?;
+        if !mounted {
+            return Ok(());
+        }
+        let mount = self.workspace_mount_path(name)?;
+        crate::git::GitRepository::from_root(&mount)
+            .repair_merge_drivers()
+            .await?;
+        if name.is_main() {
+            return Ok(());
+        }
+        if is_git_worktree(&workspace.metadata) {
+            return repair_git_worktree_link(main_mount, &mount).await;
+        }
+        crate::git::GitRepository::from_root(&mount)
+            .configure_main_remote(main_mount)
+            .await
+            .map(|_| ())
     }
 
     /// Converge the recorded checkout path onto where the checkout is actually observed.
@@ -2291,7 +2354,12 @@ impl NativeProjectRuntimeHost {
         .await
         .map_err(|error| CowshedError::internal(format!("layout record task failed: {error}")))?
         .map_err(native_integrity_error)?;
-        self.rebind_checkout(&checkout, layout)
+        self.rebind_checkout(&checkout, layout)?;
+        // A hand-moved checkout invalidates every workspace's record of the project, not just
+        // main's, so the convergence that repairs main's has to repair theirs in the same breath.
+        // Reached only when the record actually changed: the guard above returns early otherwise,
+        // so an agreeing project pays nothing for this.
+        self.repair_workspace_records(&checkout).await
     }
 
     /// Refuse a checkout destination that cannot be moved onto, before anything is mutated.
@@ -2317,12 +2385,9 @@ impl NativeProjectRuntimeHost {
         if destination == source {
             return Err(CowshedError::usage(
                 format!("the checkout is already at {}", source.display()),
-                "choose a different destination path",
+                "nothing to move; run cowshed doctor to see whether a workspace's records lag",
             ));
         }
-        // The store is cowshed's own; a checkout inside it would make the project root and the
-        // image tree alias each other, and every enumeration that walks the store would descend
-        // into the user's working tree.
         if destination.starts_with(&self.descriptor.store_root)
             || self.descriptor.store_root.starts_with(destination)
             || destination.starts_with(source)
@@ -4245,7 +4310,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 CowshedError::internal(format!("checkout record task failed: {error}"))
             })?
             .map_err(native_integrity_error)?;
-            self.rewrite_main_remotes().await?;
+            self.repair_workspace_records(&destination).await?;
             self.ensure_supervisor(&main).await?;
             return self.snapshot_named(&main).await;
         }
@@ -4310,7 +4375,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .await
                 .map_err(native_storage_error)?;
         }
-        self.rewrite_main_remotes().await?;
+        self.repair_workspace_records(&destination).await?;
         self.ensure_supervisor(&main).await?;
         self.snapshot_named(&main).await
     }
@@ -4343,20 +4408,16 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if let Some(observed) = options.observed_path {
             self.converge_checkout_record(&observed).await?;
         }
-        if !workspace.is_main() {
-            // A workspace detached while main moved still names main's old mount. Attachment is
-            // the reconciliation front door, so repair both standalone remotes and linked
-            // worktree registrations before admitting work.
-            let main_mount = self.workspace_mount_path(&main_name())?;
-            let mount = self.workspace_mount_path(&workspace)?;
-            if is_git_worktree(&current.metadata) {
-                repair_git_worktree_link(&main_mount, &mount).await?;
-            } else {
-                crate::git::GitRepository::from_root(&mount)
-                    .configure_main_remote(&main_mount)
-                    .await?;
-            }
-        }
+        // A workspace that was detached while the project moved still records main's old mount as
+        // its `projectRoot`, still fetches from the old path, and still runs merge drivers spelt
+        // against it. Attachment is the reconciliation front door and is what `doctor` sends the
+        // operator to, so the whole record is repaired here rather than the remote alone — a hint
+        // that names a command which cannot fix the condition it names is worse than no hint.
+        let attached = self.current(&workspace).await?;
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let project_root = self.descriptor.git_root.clone();
+        self.repair_one_workspace_record(&attached, &workspace, &main_mount, &project_root)
+            .await?;
         Ok(())
     }
 
