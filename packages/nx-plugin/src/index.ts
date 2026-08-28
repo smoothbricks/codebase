@@ -296,7 +296,8 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   }
 
   if (napiConfig) {
-    Object.assign(targets, createNapiTargets(projectRoot, napiConfig));
+    const napiTargets = createNapiTargets(projectRoot, napiConfig);
+    Object.assign(targets, napiTargets.targets);
     if (
       !('napi-test' in (packageJson.nx?.targets ?? {})) &&
       existsSync(join(absoluteProjectRoot, 'src/native.test.ts'))
@@ -304,6 +305,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       targets['napi-test'] = createNapiTestTarget(
         projectRoot,
         existsSync(join(absoluteProjectRoot, 'bunfig.napi-test.toml')),
+        napiTargets.hostProvider,
       );
     }
   }
@@ -569,10 +571,32 @@ function resolveNapiConfig(
   return { binaryName, cargoPackage, manifestPath, targets };
 }
 
-function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Record<string, TargetConfiguration> {
+function createNapiTargets(
+  projectRoot: string,
+  config: ResolvedNapiConfig,
+): { targets: Record<string, TargetConfiguration>; hostProvider: string } {
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage}`;
-  const targets: Record<string, TargetConfiguration> = {
-    'cargo-napi': {
+  const hostPlatformTargetName = HOST_PLATFORM_SUFFIX === null ? null : `napi${HOST_PLATFORM_SUFFIX}`;
+  let nativeHostTargetName: string | null = null;
+  if (hostPlatformTargetName !== null) {
+    for (const triple of config.targets) {
+      const convention = NAPI_TARGET_CONVENTIONS[triple];
+      const targetName = convention ? `napi-${convention.architecture}-${convention.targetFamily}` : null;
+      if (targetName === hostPlatformTargetName && !convention?.useNapiCross) {
+        nativeHostTargetName = targetName;
+        break;
+      }
+    }
+  }
+  const hostProvider = nativeHostTargetName ?? 'cargo-napi';
+  const targets: Record<string, TargetConfiguration> = {};
+
+  if (nativeHostTargetName === null) {
+    // The platform target for this host triple is the same compilation, so a
+    // second cargo-napi invocation only buys a duplicate dependency graph in
+    // target/release; native.ts already resolves the identical platform-suffixed
+    // filename from dist/native/<platform-dir> after dist/native/host.
+    targets['cargo-napi'] = {
       executor: 'nx:run-commands',
       cache: true,
       dependsOn: ['^build'],
@@ -582,8 +606,8 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
         cwd: projectRoot,
         command: `napi build --release --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir dist/native/host`,
       },
-    },
-  };
+    };
+  }
 
   for (const triple of config.targets) {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
@@ -629,18 +653,22 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
       },
     };
   }
-  return targets;
+  return { targets, hostProvider };
 }
 
-function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean): TargetConfiguration {
+function createNapiTestTarget(
+  projectRoot: string,
+  hasDedicatedBunfig: boolean,
+  hostProvider: string,
+): TargetConfiguration {
   const configFlag = hasDedicatedBunfig ? ' --config=../bunfig.napi-test.toml' : ' --config=../bunfig.toml';
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
-    dependsOn: ['cargo-test', 'cargo-napi', 'tsc-js', '^build', 'build'],
+    dependsOn: ['cargo-test', hostProvider, 'tsc-js', '^build', 'build'],
     options: {
-      // cwd is src/, not the package root: `bun test <arg>` treats the arg as
-      // a FILTER and scans the whole cwd tree for test files, and a Rust
+      // cwd is src/, not the package root: `bun test <arg>` treats the arg as a
+      // FILTER and scans the whole cwd tree for test files, and a Rust
       // package's cargo target/ directory turns that scan into tens of
       // seconds. bun only auto-loads bunfig from the cwd, so the package
       // config is passed explicitly.
