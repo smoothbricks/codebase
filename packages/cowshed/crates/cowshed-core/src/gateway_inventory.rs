@@ -26,8 +26,8 @@ use crate::storage::apfs::{
 };
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::lifecycle::{
-    DerivationError, KernelMountFact, LifecycleWorkspace, MountIntent, MountState, StorageFact,
-    Substrate, derive_workspaces,
+    CheckpointFact, DerivationError, KernelMountFact, LifecycleWorkspace, MountIntent, MountState,
+    StorageFact, Substrate, derive_workspaces,
 };
 use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
@@ -155,10 +155,18 @@ pub enum GatewayInventoryError {
     Blocking(String),
 }
 
+/// One project's complete substrate reading, as one value.
+///
+/// Every field is a fact the derivation needs, and the derivation takes all of them. Checkpoints
+/// are here rather than fetched at each use site because the store-wide listing and the
+/// project-scoped listing report the same `checkpoints` field: sourcing them separately is exactly
+/// how one of the two came to hand `derive_workspaces` an empty list and report "no checkpoint
+/// exists" over a pinned one.
 #[derive(Clone)]
 struct ProjectInventoryFacts {
     storage: Vec<StorageFact>,
     mounts: Vec<KernelMountFact>,
+    checkpoints: Vec<CheckpointFact>,
     mount_paths: BTreeMap<String, PathBuf>,
 }
 
@@ -215,9 +223,11 @@ impl InventorySource for NativeInventorySource {
         let mount_paths = expected_mount_paths(&config, &layout, &storage_facts)?;
         reject_ambiguous_native_mounts(&captured, &mount_paths)?;
         let mounts = host.mounts(repo)?;
+        let checkpoints = host.checkpoints(repo)?;
         Ok(ProjectInventoryFacts {
             storage: storage_facts,
             mounts,
+            checkpoints,
             mount_paths,
         })
     }
@@ -814,7 +824,11 @@ impl NativeGatewayInventory {
     ) -> Result<ProjectWorkspaces, GatewayInventoryError> {
         let authoritative = self.source.project_facts(&self.storage, repo_id)?;
         reject_duplicate_mount_facts(&authoritative.mounts)?;
-        let derived = derive_workspaces(authoritative.storage, authoritative.mounts, [])?;
+        let derived = derive_workspaces(
+            authoritative.storage,
+            authoritative.mounts,
+            authoritative.checkpoints,
+        )?;
         let layout = StorageLayout::new(self.storage.store(), repo_id).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
                 path: self.storage.store().to_owned(),
@@ -890,7 +904,11 @@ impl NativeGatewayInventory {
     ) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
         let authoritative = self.source.project_facts(&self.storage, repo_id)?;
         reject_duplicate_mount_facts(&authoritative.mounts)?;
-        let derived = derive_workspaces(authoritative.storage, authoritative.mounts, [])?;
+        let derived = derive_workspaces(
+            authoritative.storage,
+            authoritative.mounts,
+            authoritative.checkpoints,
+        )?;
         let layout = StorageLayout::new(self.storage.store(), repo_id).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
                 path: self.storage.store().to_owned(),
@@ -1295,7 +1313,7 @@ fn existing_main_image(layout: &StorageLayout) -> Result<Option<PathBuf>, Gatewa
 fn main_mount_defect(
     facts: ProjectInventoryFacts,
 ) -> Result<Option<String>, GatewayInventoryError> {
-    let derived = derive_workspaces(facts.storage, facts.mounts, [])?;
+    let derived = derive_workspaces(facts.storage, facts.mounts, facts.checkpoints)?;
     let Some(main) = derived
         .into_iter()
         .find(|workspace| workspace.workspace.name().is_main())
@@ -1467,8 +1485,9 @@ mod tests {
         write_json,
     };
     use crate::repository::{BoundIdentity, RepositoryBinding};
+    use crate::storage::CheckpointLabel;
     use crate::storage::bootstrap::CanonicalRoots;
-    use crate::storage::lifecycle::{LifecycleWorkspace, Revision};
+    use crate::storage::lifecycle::{LifecycleWorkspace, Pin, Revision};
     use crate::workspace_credentials::mint_workspace_credentials;
 
     use super::*;
@@ -1733,6 +1752,7 @@ mod tests {
                 ProjectInventoryFacts {
                     storage: vec![storage],
                     mounts: vec![mount.clone()],
+                    checkpoints: Vec::new(),
                     mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
             );
@@ -1816,12 +1836,14 @@ mod tests {
                     ProjectInventoryFacts {
                         storage: vec![valid_storage],
                         mounts: vec![valid_mount.clone()],
+                        checkpoints: Vec::new(),
                         mount_paths: BTreeMap::from([(valid_mount.volume_key, valid_path)]),
                     },
                 ),
                 (
                     stale_repo.clone(),
                     ProjectInventoryFacts {
+                        checkpoints: Vec::new(),
                         mount_paths: BTreeMap::from([(
                             stale_storage.volume_key.clone(),
                             stale_path.clone(),
@@ -1863,6 +1885,76 @@ mod tests {
         assert_eq!(valid.workspaces[0].state, WorkspaceState::Attached);
     }
 
+    /// `checkpoints` is a safety interlock: triage reads it to decide whether a preserved copy of a
+    /// workspace exists before destroying the workspace. The store-wide listing used to hand the
+    /// derivation an empty checkpoint list and then serialize the result as fact, so a `--keep`
+    /// pinned checkpoint present on disk was reported as no checkpoint at all — a false negative on
+    /// the interlock, in the direction that destroys the only copy.
+    #[tokio::test]
+    async fn store_wide_listing_reports_a_pinned_checkpoint_rather_than_an_empty_list() {
+        let fixture = Fixture::new("checkpoint-visibility");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let workspace = WorkspaceName::new("raven").expect("workspace");
+        let (storage, mounted) = fixture.workspace(
+            &repo,
+            workspace.clone(),
+            "00000000000000000000000000000001",
+            4,
+            true,
+            true,
+        );
+        let (mount, path) = mounted.expect("mounted fixture");
+        let source = Arc::new(FixtureSource::default());
+        source.projects.lock().expect("source").insert(
+            repo.clone(),
+            ProjectInventoryFacts {
+                storage: vec![storage],
+                mounts: vec![mount.clone()],
+                checkpoints: vec![
+                    CheckpointFact {
+                        repo: repo.clone(),
+                        workspace: workspace.clone(),
+                        label: CheckpointLabel::new("pre-fresh-rebase").expect("label"),
+                        revision: Revision::new(3),
+                        pin: Pin::Pinned,
+                    },
+                    CheckpointFact {
+                        repo: repo.clone(),
+                        workspace: workspace.clone(),
+                        label: CheckpointLabel::new("autosave").expect("label"),
+                        revision: Revision::new(2),
+                        pin: Pin::Automatic,
+                    },
+                ],
+                mount_paths: BTreeMap::from([(mount.volume_key, path)]),
+            },
+        );
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        let projects = inventory.all_projects().await.expect("store-wide list");
+        let listed = projects
+            .iter()
+            .find(|project| project.repo_id == repo)
+            .expect("project listed")
+            .workspaces
+            .iter()
+            .find(|info| info.workspace == workspace)
+            .expect("workspace listed");
+        assert_eq!(
+            listed
+                .checkpoints
+                .iter()
+                .map(|checkpoint| (checkpoint.label.as_str(), checkpoint.pinned))
+                .collect::<Vec<_>>(),
+            [("autosave", false), ("pre-fresh-rebase", true)],
+            "the store-wide listing reports the checkpoints that exist, pin state included"
+        );
+    }
+
     /// A legacy direct-mount project's main volume is mounted at the adopted checkout even though
     /// adoption predated `checkout-layout.json`. Observation materializes that now-mandatory record
     /// before deriving any mount paths, so the gateway both serves the project and leaves future
@@ -1890,6 +1982,7 @@ mod tests {
             ProjectInventoryFacts {
                 storage: vec![storage],
                 mounts: vec![mount.clone()],
+                checkpoints: Vec::new(),
                 mount_paths: BTreeMap::from([(mount.volume_key, path.clone())]),
             },
         );
@@ -2003,6 +2096,7 @@ mod tests {
                 ProjectInventoryFacts {
                     storage: vec![legacy, detached],
                     mounts: vec![mount.clone()],
+                    checkpoints: Vec::new(),
                     mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
             )])),
@@ -2045,6 +2139,7 @@ mod tests {
                 ProjectInventoryFacts {
                     storage: vec![storage],
                     mounts: vec![mount.clone(), duplicate],
+                    checkpoints: Vec::new(),
                     mount_paths: BTreeMap::from([(mount.volume_key, path)]),
                 },
             )])),
@@ -2348,6 +2443,7 @@ mod tests {
                 ProjectInventoryFacts {
                     storage: vec![storage],
                     mounts,
+                    checkpoints: Vec::new(),
                     mount_paths,
                 },
             );
