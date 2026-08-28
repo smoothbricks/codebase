@@ -471,7 +471,9 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         '        uses: actions/upload-artifact@v7.0.1',
         '        with:',
         `          name: trace-results-${githubExpression('github.run_id')}`,
-        '          path: packages/*/.trace-results.db',
+        // The trailing wildcard collects the WAL sidecars too: a killed worker leaves its last commits there, and
+        // those are exactly the traces worth downloading.
+        '          path: packages/*/.cache/trace-results.db*',
         '          if-no-files-found: ignore',
         '          retention-days: 14',
         '          include-hidden-files: true',
