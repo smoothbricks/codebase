@@ -111,7 +111,6 @@ export interface GrantDelta {
 
 export interface RebaseOptions {
   readonly onto?: RevisionTarget;
-  readonly fresh?: boolean;
   readonly expectedWorkspaceIncarnation?: string;
   readonly expectedSourceHead?: string;
   readonly expectedOntoHead?: string;

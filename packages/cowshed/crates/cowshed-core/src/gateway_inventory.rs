@@ -1915,7 +1915,7 @@ mod tests {
                     CheckpointFact {
                         repo: repo.clone(),
                         workspace: workspace.clone(),
-                        label: CheckpointLabel::new("pre-fresh-rebase").expect("label"),
+                        label: CheckpointLabel::new("release-snapshot").expect("label"),
                         revision: Revision::new(3),
                         pin: Pin::Pinned,
                     },
@@ -1950,7 +1950,7 @@ mod tests {
                 .iter()
                 .map(|checkpoint| (checkpoint.label.as_str(), checkpoint.pinned))
                 .collect::<Vec<_>>(),
-            [("autosave", false), ("pre-fresh-rebase", true)],
+            [("autosave", false), ("release-snapshot", true)],
             "the store-wide listing reports the checkpoints that exist, pin state included"
         );
     }

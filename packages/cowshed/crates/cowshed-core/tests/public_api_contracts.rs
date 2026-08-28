@@ -736,7 +736,6 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
 
     let rebase = RebaseOptions {
         onto: Some(RevisionTarget::Branch(BranchName::new("main").unwrap())),
-        fresh: true,
         expected_workspace_incarnation: Some(incarnation()),
         expected_source_head: Some(oid('a')),
         expected_onto_head: None,

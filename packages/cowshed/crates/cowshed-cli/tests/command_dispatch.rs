@@ -748,7 +748,6 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
             "raven",
             "--onto",
             "refs/heads/release",
-            "--fresh",
             "--expected-workspace-incarnation",
             incarnation,
             "--expected-source-head",
@@ -766,7 +765,6 @@ async fn lifecycle_commands_delegate_exact_options_and_keep_stdout_machine_only(
             onto: Some(RevisionTarget::Ref(
                 GitRef::new("refs/heads/release").unwrap()
             )),
-            fresh: true,
             expected_workspace_incarnation: Some(WorkspaceIncarnation::new(incarnation).unwrap()),
             expected_source_head: Some(GitOid::new(source).unwrap()),
             expected_onto_head: Some(GitOid::new(destination).unwrap()),

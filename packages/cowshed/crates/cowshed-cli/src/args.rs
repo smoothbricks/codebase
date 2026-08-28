@@ -331,7 +331,6 @@ pub struct PushArgs {
 pub struct RebaseArgs {
     pub workspace: Option<String>,
     pub onto: Option<OsString>,
-    pub fresh: bool,
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
     pub expected_onto_head: Option<OsString>,
@@ -642,7 +641,6 @@ fn cli_command() -> ClapCommand {
         ]))
         .subcommand(leaf("rebase").arg(positional("workspace", 0..=1)).args([
             value("onto"),
-            flag("fresh"),
             value("expected-workspace-incarnation"),
             value("expected-source-head"),
             value("expected-onto-head"),
@@ -1809,7 +1807,7 @@ const GC: CommandSpec = CommandSpec {
     about: &[
         "Reclaims five kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned` and `freedBytes`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
         "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main or were deliberately abandoned. Safe. Note what is *not* in this category: the `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are never reclaimed, so abandoned commits stay fetchable and their disk use accumulates until you delete them yourself.",
-        "`orphanStagingImage` and `orphanStagingMetadata` — an image with no metadata sidecar, or a sidecar with no image, under `sessions/.staging/`. Each is half of a lifecycle transaction — create, fork, `rebase --fresh`, restore — that died between writing the image and publishing it. Neither half was ever published under a workspace name, so nothing ever used it. Safe.",
+        "`orphanStagingImage` and `orphanStagingMetadata` — an image with no metadata sidecar, or a sidecar with no image, under `sessions/.staging/`. Each is half of a lifecycle transaction — create, fork, restore — that died between writing the image and publishing it. Neither half was ever published under a workspace name, so nothing ever used it. Safe.",
         "`expiredCheckpoint` — an automatic checkpoint that is neither one of the five most recent for its workspace nor younger than fourteen days. This is the category that can delete something you still want: an automatic checkpoint is a real crash-consistent copy of that workspace, and past those two thresholds it goes. Pinned checkpoints are never candidates, and `cowshed checkpoint --keep` or any explicitly labelled checkpoint is pinned; `retainedPinned` in the report counts what was spared for that reason.",
         "`detachedImageCompaction` — punches holes in an unmounted sparse image so the filesystem stops charging for blocks the image no longer uses. This deletes no data: the image's contents are unchanged and it stays fully usable. Only unmounted sparse images qualify.",
     ],
@@ -1879,10 +1877,6 @@ const REBASE: CommandSpec = CommandSpec {
             meaning: "rebase onto this revision instead of main",
         },
         Opt {
-            spelling: "--fresh",
-            meaning: "shed accumulated image divergence: replay the branch onto a brand-new clone of current main and transplant the workspace's identity onto it; refused on a dirty tree",
-        },
-        Opt {
             spelling: "--expected-workspace-incarnation <id>",
             meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
         },
@@ -1902,7 +1896,6 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Rebase(RebaseArgs {
         workspace: optional_workspace(matches, "workspace", false, USAGE)?,
         onto: os(matches, "onto"),
-        fresh: flagged(matches, "fresh"),
         expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
         expected_source_head: os(matches, "expected-source-head"),
         expected_onto_head: os(matches, "expected-onto-head"),

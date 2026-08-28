@@ -2128,7 +2128,6 @@ pub struct GcOptions {
 pub struct RebaseOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onto: Option<RevisionTarget>,
-    pub fresh: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     #[serde(skip_serializing_if = "Option::is_none")]
