@@ -1,15 +1,9 @@
-//! Rust port of `packages/columine/src/vm/nested.zig` — nested container
-//! slots: arena-allocated inner maps, sets, and aggregates.
+//! Nested container slots: arena-allocated inner maps, sets, and aggregates.
 //!
-//! `Map<K, Set<V>>` / `Map<K, Map<K2, V>>` / `Map<K, Agg>`: the outer hash
-//! table maps u32 keys → u32 arena offsets; inner containers are
-//! bump-allocated in a per-slot arena. Inner growth allocates 2× in the
-//! arena and abandons the old space; `vm_grow_state` (state_init/slot_growth,
-//! slice 1) walks the tree and reclaims dead arena space at grow time.
-//!
-//! The two `e2e —` test blocks in nested.zig drive `vm.zig`'s
-//! `vm_calculate_state_size` / `vm_init_state` / `vm_execute_batch` and are
-//! deferred to the dispatch slice (see README).
+//! `Map<K, Set<V>>`, `Map<K, Map<K2, V>>`, and `Map<K, Agg>` use an outer hash
+//! table whose values are offsets into a bump arena. Inner containers are
+//! initialized on first sight of an outer key and grow by rehashing into a new
+//! arena allocation.
 
 use crate::meta::SlotMetaView;
 use crate::{aggregates, bytes, hash_table};
@@ -17,11 +11,11 @@ use columine_types::types::{
     ChangeFlag, EMPTY_KEY, ErrorCode, SlotType, TOMBSTONE, hash_key, next_power_of_2,
 };
 
-/// nested.zig:87 — prefix stored at the start of a NESTED slot's data:
+/// Prefix stored at the start of a nested slot's data:
 /// `[inner_type:u8][inner_initial_cap:u16 le][inner_agg_type:u8][depth:u8][reserved:3]`.
 pub const NESTED_PREFIX_SIZE: u32 = 8;
 
-/// nested.zig Arena.HDR_SIZE — `[capacity:u32][used:u32]`.
+/// Arena header: `[capacity:u32][used:u32]`.
 pub const ARENA_HDR_SIZE: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +27,7 @@ pub struct NestedPrefix {
     pub depth: u8,
 }
 
-/// nested.zig:107-115 `writeNestedPrefix`.
+/// Write a nested-slot prefix.
 pub fn write_nested_prefix(state: &mut [u8], slot_offset: u32, prefix: NestedPrefix) {
     let base = slot_offset as usize;
     state[base] = prefix.inner_type as u8;
@@ -44,8 +38,8 @@ pub fn write_nested_prefix(state: &mut [u8], slot_offset: u32, prefix: NestedPre
     state[base + 5..base + 8].fill(0);
 }
 
-/// nested.zig:96-105 `readNestedPrefix`. The stored inner type is an
-/// invariant this crate wrote; an invalid low nibble is a programmer bug.
+/// Read a nested-slot prefix. The stored inner type is an invariant this
+/// crate wrote; an invalid low nibble is a programmer error.
 pub fn read_nested_prefix(state: &[u8], slot_offset: u32) -> NestedPrefix {
     let base = slot_offset as usize;
     let inner_type = SlotType::from_u8(state[base] & 0x0f).unwrap_or_else(|| {
@@ -65,27 +59,27 @@ pub fn read_nested_prefix(state: &[u8], slot_offset: u32) -> NestedPrefix {
     }
 }
 
-/// nested.zig:121-123.
+/// Offset of the outer key table.
 pub const fn outer_keys_offset(slot_offset: u32) -> u32 {
     slot_offset + NESTED_PREFIX_SIZE
 }
 
-/// nested.zig:125-127.
+/// Offset of the outer pointer table.
 pub const fn outer_ptrs_offset(slot_offset: u32, capacity: u32) -> u32 {
     outer_keys_offset(slot_offset) + capacity * 4
 }
 
-/// nested.zig:129-133.
+/// Offset of the arena header.
 pub const fn arena_header_offset(slot_offset: u32, capacity: u32) -> u32 {
     outer_ptrs_offset(slot_offset, capacity) + capacity * 4
 }
 
-/// nested.zig:135-137.
+/// Offset of arena data.
 pub const fn arena_data_offset(slot_offset: u32, capacity: u32) -> u32 {
     arena_header_offset(slot_offset, capacity) + ARENA_HDR_SIZE
 }
 
-/// nested.zig:143-152 `innerContainerSize` — inline-header container sizes.
+/// Compute inline-header size for an inner container.
 pub fn inner_container_size(inner_type: SlotType, capacity: u32, inner_agg_type_byte: u8) -> u32 {
     match inner_type {
         SlotType::HashMap => hash_table::hashmap_byte_size(capacity),
@@ -95,9 +89,8 @@ pub fn inner_container_size(inner_type: SlotType, capacity: u32, inner_agg_type_
     }
 }
 
-/// nested.zig:155-158 `nestedSlotDataSize`:
-/// prefix + outer keys + outer ptrs + arena header + `outer_cap` pre-sized
-/// inner containers (each align8-rounded).
+/// Compute nested slot data size: prefix + outer keys + outer pointers + arena
+/// header + pre-sized inner containers, each rounded to eight-byte alignment.
 pub fn nested_slot_data_size(
     outer_cap: u32,
     inner_initial_cap: u32,
@@ -119,10 +112,9 @@ pub fn write_arena_header(state: &mut [u8], header_offset: u32, arena_capacity: 
 }
 
 // =============================================================================
-// Arena — bump allocator within the slot data region (nested.zig:37-81)
-// =============================================================================
+// Arena — bump allocator within the slot data region
 
-/// nested.zig:42-44 — arena header field offsets.
+/// Arena header field offsets.
 const ARENA_HDR_USED: u32 = 4;
 
 /// A bound arena view. Carries offsets, never pointers (see `bytes`).
@@ -135,7 +127,7 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// nested.zig:46 `bind`.
+    /// Bind to an arena header.
     pub const fn bind(hdr_offset: u32) -> Self {
         Self {
             hdr_offset,
@@ -143,18 +135,18 @@ impl Arena {
         }
     }
 
-    /// nested.zig:54 `initAt` — write `[cap][used=0]` and bind.
+    /// Initialize `[capacity][used=0]` and bind.
     pub fn init_at(state: &mut [u8], hdr_offset: u32, cap: u32) -> Self {
         write_arena_header(state, hdr_offset, cap);
         Self::bind(hdr_offset)
     }
 
-    /// nested.zig:60 `capacity`.
+    /// Read arena capacity.
     pub fn capacity(&self, state: &[u8]) -> u32 {
         bytes::read_u32(state, self.hdr_offset)
     }
 
-    /// nested.zig:64 `used`.
+    /// Read arena usage.
     pub fn used(&self, state: &[u8]) -> u32 {
         bytes::read_u32(state, self.hdr_offset + ARENA_HDR_USED)
     }
@@ -163,8 +155,8 @@ impl Arena {
         bytes::write_u32(state, self.hdr_offset + ARENA_HDR_USED, val);
     }
 
-    /// nested.zig:73 `alloc` — bump-allocate `size` bytes (align8-rounded).
-    /// Returns the ABSOLUTE offset, or None when the arena is full.
+    /// Bump-allocate `size` bytes with eight-byte alignment. Return the
+    /// absolute offset, or `None` when the arena is full.
     pub fn alloc(&self, state: &mut [u8], size: u32) -> Option<u32> {
         let u = self.used(state);
         let aligned = columine_types::types::align8(size);
@@ -178,10 +170,9 @@ impl Arena {
 }
 
 // =============================================================================
-// Outer hash table — typed access to keys + arena pointers (nested.zig:164-252)
-// =============================================================================
+// Outer hash table — typed access to keys and arena pointers
 
-/// nested.zig:191 `resolve` result.
+/// Result of resolving an outer key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Resolved {
     /// Absolute offset of the inner container.
@@ -189,7 +180,7 @@ pub struct Resolved {
     pub is_new: bool,
 }
 
-/// nested.zig:164 `OuterTable` — a bound view carrying offsets.
+/// Bound outer-table view carrying offsets.
 #[derive(Clone, Copy, Debug)]
 pub struct OuterTable {
     pub cap: u32,
@@ -202,7 +193,7 @@ pub struct OuterTable {
 }
 
 impl OuterTable {
-    /// nested.zig:172 `bind`.
+    /// Bind to a nested slot's outer table.
     pub fn bind(meta: &SlotMetaView) -> Self {
         let slot_off = meta.offset;
         let cap = meta.capacity;
@@ -227,26 +218,20 @@ impl OuterTable {
         bytes::read_u32(state, self.size_off)
     }
 
-    /// nested.zig:191 `resolve` — outer key → inner container offset,
-    /// allocating and initializing the inner container on first sight.
-    /// None = sentinel key, outer load factor exceeded, arena full, or probe
-    /// exhaustion (all CAPACITY_EXCEEDED at the op layer).
+    /// Resolve an outer key to an inner-container offset, allocating and
+    /// initializing the inner container on first sight. `None` means a
+    /// sentinel key, exceeded load factor, full arena, or probe exhaustion;
+    /// the operation layer maps these to `CAPACITY_EXCEEDED`.
     ///
-    /// The insertion probe uses the unified probe-then-reuse policy
-    /// (post-parity: the deleted Zig claimed a tombstone immediately, so
-    /// resolve could shadow a live outer key sitting past it while lookup
-    /// probed on — an asymmetry that made resolve and lookup disagree).
+    /// The insertion probe scans past tombstones and reuses the first one only
+    /// when the key is absent, keeping lookup and insertion symmetric.
     ///
-    /// WHY a new AGGREGATE inner stays ZEROED (deliberate, not drift): the
-    /// arena hands back zeroed memory for free, and every nested MIN/MAX
-    /// reader guards with `count == 0` (nested.zig:217/329 convention)
-    /// instead of `init_agg_slot`'s ±infinity sentinels — writing sentinels
-    /// per inner would cost a write per allocation to change no observable
-    /// behavior (pinned by the nested model proptests). The `count == 0`
-    /// guard is also the algebra-correct shape (~/Dev/_wt/TREAT.md §1):
-    /// count is group-invertible, so emptiness is exactly maintainable and
-    /// is the right emptiness signal for min/max, whose values are the
-    /// support-scan class and carry no meaningful sentinel under deltas.
+    /// Arena memory is zeroed, and nested MIN/MAX readers guard `count == 0`
+    /// instead of writing per-inner sentinels. Avoiding those writes saves one
+    /// initialization pass without changing observable values.
+    /// The `count == 0` guard is algebra-correct: count is group-invertible,
+    /// so emptiness is exactly maintainable and is the right signal for
+    /// min/max, whose values carry no meaningful sentinel under deltas.
     pub fn resolve(
         &self,
         state: &mut [u8],
@@ -286,7 +271,7 @@ impl OuterTable {
                     inner_container_size(prefix.inner_type, inner_cap, prefix.inner_agg_type_byte);
                 let inner_off = self.arena.alloc(state, inner_size)?;
 
-                // Initialize the inner container (nested.zig:214-219).
+                // Initialize the inner container.
                 match prefix.inner_type {
                     SlotType::HashSet => {
                         hash_table::FlatTable::init(
@@ -324,9 +309,8 @@ impl OuterTable {
         None
     }
 
-    /// nested.zig:232 `lookup` — inner container offset for `outer_key`, or
-    /// 0 when absent. Only EMPTY_KEY terminates the probe; TOMBSTONE cells
-    /// are probed past — symmetric with `resolve` post-parity.
+    /// Look up an outer key's inner-container offset, or return zero when
+    /// absent. Only `EMPTY_KEY` terminates the probe; tombstones are skipped.
     pub fn lookup(&self, state: &[u8], outer_key: u32) -> u32 {
         let mut pos = hash_key(outer_key, self.cap);
         for _ in 0..self.cap {
@@ -342,9 +326,8 @@ impl OuterTable {
         0
     }
 
-    /// nested.zig:245 `updatePtr` — repoint an EXISTING outer key at a grown
-    /// inner container. The Zig loop is unbounded (absence is a programmer
-    /// bug); here the probe is bounded by `cap` and panics past it.
+    /// Repoint an existing outer key at a grown inner container. The probe is
+    /// bounded by `cap`; absence is a programmer error.
     pub fn update_ptr(&self, state: &mut [u8], outer_key: u32, new_offset: u32) {
         let mut pos = hash_key(outer_key, self.cap);
         for _ in 0..self.cap {
@@ -359,10 +342,9 @@ impl OuterTable {
 }
 
 // =============================================================================
-// Public operations (nested.zig:258-347)
-// =============================================================================
+// Public nested-container operations
 
-/// nested.zig:259 `nestedSetInsert` — `Map<outer_key, Set>.add(elem)`.
+/// Insert an element into an outer-keyed inner set.
 pub fn nested_set_insert(
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -387,8 +369,7 @@ pub fn nested_set_insert(
         return ErrorCode::Ok;
     }
 
-    // Inner needs growth — allocate 2×, rehash, update outer pointer
-    // (nested.zig:272-280).
+    // Inner needs growth — allocate 2×, rehash, and update the outer pointer.
     let new_size = hash_table::hashset_byte_size(inner.cap * 2);
     let Some(new_off) = outer.arena.alloc(state, new_size) else {
         return ErrorCode::CapacityExceeded;
@@ -401,7 +382,7 @@ pub fn nested_set_insert(
     ErrorCode::Ok
 }
 
-/// nested.zig:284 `nestedMapUpsertLast` — `Map<outer_key, Map<inner_key, v>>`.
+/// Upsert a value into an outer-keyed inner map.
 pub fn nested_map_upsert_last(
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -429,9 +410,7 @@ pub fn nested_map_upsert_last(
         return ErrorCode::Ok;
     }
 
-    // Inner needs growth (nested.zig:297-305). The change flag reflects
-    // what actually happened post-parity: INSERTED only on genuine inserts
-    // (the deleted Zig set INSERTED unconditionally, even for overwrites).
+    // Inner needs growth. Mark INSERTED only for genuine inserts.
     let new_size = hash_table::hashmap_byte_size(inner.cap * 2);
     let Some(new_off) = outer.arena.alloc(state, new_size) else {
         return ErrorCode::CapacityExceeded;
@@ -458,8 +437,8 @@ const AGG_COUNT: u8 = 2;
 const AGG_MIN: u8 = 3;
 const AGG_MAX: u8 = 4;
 
-/// nested.zig:309 `nestedAggUpdate` — `Map<outer_key, Agg>.update(value)`.
-/// `value_bits` carries the f64 bit pattern exactly like the Zig u64 param.
+/// Update an outer-keyed inner aggregate. `value_bits` carries the f64 bit
+/// pattern in the aggregate value lane.
 pub fn nested_agg_update(
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -513,15 +492,14 @@ pub fn nested_agg_update(
 }
 
 // =============================================================================
-// Read operations (nested.zig:353-384)
-// =============================================================================
+// Nested-container read operations
 
-/// nested.zig:353 `getInnerOffset` — 0 when the outer key is absent.
+/// Return zero when the outer key is absent.
 pub fn get_inner_offset(state: &[u8], meta: &SlotMetaView, outer_key: u32) -> u32 {
     OuterTable::bind(meta).lookup(state, outer_key)
 }
 
-/// nested.zig:357 `getInnerSetSize`.
+/// Return the size of an inner set, or zero when absent.
 pub fn get_inner_set_size(state: &[u8], inner_offset: u32) -> u32 {
     if inner_offset == 0 {
         return 0;
@@ -529,7 +507,7 @@ pub fn get_inner_set_size(state: &[u8], inner_offset: u32) -> u32 {
     hash_table::FlatTable::bind(state, inner_offset, hash_table::ENTRY_NONE).size(state)
 }
 
-/// nested.zig:362 `innerSetContains`.
+/// Test membership in an inner set.
 pub fn inner_set_contains(state: &[u8], inner_offset: u32, elem: u32) -> bool {
     if inner_offset == 0 {
         return false;
@@ -537,7 +515,7 @@ pub fn inner_set_contains(state: &[u8], inner_offset: u32, elem: u32) -> bool {
     hash_table::FlatTable::bind(state, inner_offset, hash_table::ENTRY_NONE).contains(state, elem)
 }
 
-/// nested.zig:367 `innerMapGet` — EMPTY_KEY when absent (either level).
+/// Read an inner-map value, returning `EMPTY_KEY` when absent.
 pub fn inner_map_get(state: &[u8], inner_offset: u32, key: u32) -> u32 {
     if inner_offset == 0 {
         return EMPTY_KEY;
@@ -547,7 +525,7 @@ pub fn inner_map_get(state: &[u8], inner_offset: u32, key: u32) -> u32 {
         .unwrap_or(EMPTY_KEY)
 }
 
-/// nested.zig:373 `innerAggGetF64`.
+/// Read an inner aggregate f64 value, returning zero when absent.
 pub fn inner_agg_get_f64(state: &[u8], inner_offset: u32) -> f64 {
     if inner_offset == 0 {
         return 0.0;
@@ -555,7 +533,7 @@ pub fn inner_agg_get_f64(state: &[u8], inner_offset: u32) -> f64 {
     bytes::read_f64(state, inner_offset)
 }
 
-/// nested.zig:379 `innerAggGetCount` — count at offset 0 for COUNT, 8 otherwise.
+/// Read an inner aggregate count: offset zero for COUNT, offset eight otherwise.
 pub fn inner_agg_get_count(state: &[u8], inner_offset: u32, agg_type_byte: u8) -> u64 {
     if inner_offset == 0 {
         return 0;

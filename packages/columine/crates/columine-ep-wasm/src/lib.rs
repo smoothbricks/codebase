@@ -39,7 +39,7 @@ const NO_INSTANCE: Option<Box<EpInstance>> = None;
 static mut HANDLES: [Option<Box<EpInstance>>; 256] = [NO_INSTANCE; 256];
 static mut NEXT_HANDLE: u32 = 1;
 
-/// Single-threaded wasm: the handle-table mirror of Zig's globals.
+/// Single-threaded wasm: the handle table is the sole mutable global.
 #[allow(static_mut_refs)]
 fn handles() -> &'static mut [Option<Box<EpInstance>>; 256] {
     unsafe { &mut HANDLES }
@@ -77,9 +77,8 @@ fn new_instance(capacity: u32, schema_config: DynamicSchemaConfig) -> Option<Box
         return None;
     }
     let column_capacity = capacity;
-    // Columine has no dedup (EpWiring::columine()); the policy parameter in
-    // the core signature is vestigial on this path — Latest is what the Zig
-    // hardcoded.
+    // Columine has no deduplication, so the policy argument is unused on this
+    // path; `Latest` satisfies the shared core signature.
     let ep = EventProcessor::with_column_capacity(
         EpWiring::columine(),
         capacity,
@@ -199,9 +198,8 @@ pub unsafe extern "C" fn ep_create_log_entry(
     if (output_len as usize) < RESULT_HEADER_SIZE {
         return ResultCode::OutOfMemory as u32;
     }
-    // WHY: a format byte outside the enum refuses loudly (the deleted Zig was UB —2,3} is
-    // UB under ReleaseSmall; checked INVALID_FORMAT here. Intended fix: keep
-    // the checked behavior at the sweep.
+    // Reject format bytes outside the ABI enum rather than interpreting them
+    // as an unchecked value.
     let format = match format {
         0 => InputFormat::Json,
         1 => InputFormat::Msgpack,

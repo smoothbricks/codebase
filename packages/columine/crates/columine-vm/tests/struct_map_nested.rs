@@ -1,16 +1,9 @@
-//! Translated test blocks from `packages/columine/src/vm/struct_map.zig`
-//! (2/2) and `packages/columine/src/vm/nested.zig` (13/15 — the two `e2e —`
-//! blocks drive vm.zig's init/execute entrypoints and are deferred to the
-//! dispatch slice; see the crate README), plus row byte-image pinning and
-//! proptest properties the Zig tree lacks.
+//! Coverage for struct-map and nested-container behavior, including row
+//! byte-image pinning, arena growth, and randomized properties.
 //!
-//! Scaffolding note: the Zig nested tests hand-build a `SlotMeta` STRUCT with
-//! size/change-flag pointers at arbitrary scratch offsets (nested.zig:392).
-//! That is test scaffolding, not contract — here the scaffold builds a real
-//! 48-byte metadata record (like containers.rs) and binds `SlotMetaView`, so
-//! the ops read size/flags from their metadata offsets. Assertions are the
-//! Zig ones unchanged. Randomized Zig tests use a deterministic LCG instead
-//! of `std.Random.DefaultPrng` (the PRNG stream is not contract).
+//! Scaffolding builds real 48-byte metadata records and binds `SlotMetaView`;
+//! assertions exercise metadata offsets and change flags directly. Randomized
+//! tests use a deterministic LCG because the random stream is not contract.
 
 use columine_types::types::{
     ChangeFlag, EMPTY_KEY, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, StructFieldType,
@@ -30,9 +23,8 @@ use proptest::prelude::*;
 const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48; // one 48-byte slot-meta record
 
 // ---------------------------------------------------------------------------
-// struct_map scaffolding — mirrors the manual metadata writes in
-// struct_map.zig:215-243 (metadata byte reuse: 13 num_fields, 15 bitset,
-// 16-17 row_size).
+// Struct-map scaffolding: manual metadata writes use byte 13 for field count,
+// byte 15 for bitset size, and bytes 16–17 for row size.
 // ---------------------------------------------------------------------------
 
 fn mk_struct_map_state(
@@ -66,7 +58,7 @@ fn mk_struct_map_state(
     state
 }
 
-/// struct_map.zig `test "StructMapSlot — bind and upsert"`
+///  `test "StructMapSlot — bind and upsert"`
 #[test]
 fn struct_map_bind_and_upsert() {
     // 2 fields (UINT32, STRING): bitset 1, row = 1 + 4 + 4 = 9 → padded 12.
@@ -79,7 +71,7 @@ fn struct_map_bind_and_upsert() {
     assert!(result.is_new);
     assert_eq!(smap.size(&state), 1);
 
-    // Write fields to the row (the Zig block writes raw LE ints directly).
+    // Write fields to the row as raw little-endian values.
     let row = smap.row_off(result.pos);
     smap.clear_bitset(&mut state, row);
     StructMapSlot::set_field_bit(&mut state, row, 0);
@@ -109,10 +101,10 @@ fn struct_map_bind_and_upsert() {
     assert_eq!(smap.size(&state), 1); // unchanged
 }
 
-/// struct_map.zig `test "StructMapSlot — CAPACITY_EXCEEDED"`
+///  `test "StructMapSlot — CAPACITY_EXCEEDED"`
 #[test]
 fn struct_map_capacity_exceeded() {
-    // 1 field UINT32: bitset 1, row_size 5 (unpadded, as the Zig block writes).
+    // One UINT32 field: bitset 1 and unpadded row size 5.
     let mut state = mk_struct_map_state(8192, 16, &[0], 1, 5);
     let smap = StructMapSlot::bind(&state, 0);
 
@@ -126,7 +118,7 @@ fn struct_map_capacity_exceeded() {
     assert!(smap.upsert(&mut state, 12).is_none());
 }
 
-/// Row byte-image + placement pinning (no Zig counterpart): the row region
+/// Row byte-image + placement pinning (additional coverage): the row region
 /// bytes after known writes, with the key's hash placement asserted from
 /// `hash_key` — the byte contract `vm_struct_map_get_row_ptr` exposes to TS.
 #[test]
@@ -165,8 +157,7 @@ fn struct_map_row_byte_image() {
 }
 
 // ---------------------------------------------------------------------------
-// nested scaffolding — real metadata record replacing nested.zig:392's
-// hand-built SlotMeta struct (see file header).
+// Nested scaffolding uses a real metadata record and `SlotMetaView`.
 // ---------------------------------------------------------------------------
 
 fn mk_nested_state(
@@ -199,7 +190,7 @@ fn mk_nested_state(
         state[off..off + 4].copy_from_slice(&EMPTY_KEY.to_le_bytes());
     }
 
-    // Arena over the remainder of the buffer (nested.zig:413-416)
+    // Arena over the remainder of the buffer ()
     let arena_start = arena_data_offset(SLOT_OFFSET, outer_cap);
     let arena_cap = state_len as u32 - arena_start;
     Arena::init_at(
@@ -215,7 +206,7 @@ fn meta_of(state: &[u8]) -> SlotMetaView {
     SlotMetaView::read(state, 0)
 }
 
-/// nested.zig `test "nested set — basic insert and contains"`
+///  `test "nested set — basic insert and contains"`
 #[test]
 fn nested_set_basic_insert_and_contains() {
     let mut state = mk_nested_state(4096, 16, SlotType::HashSet, 16, 1);
@@ -226,7 +217,7 @@ fn nested_set_basic_insert_and_contains() {
     assert_eq!(nested_set_insert(&mut state, &meta, 200, 42), ErrorCode::Ok);
 
     assert_eq!(meta.size(&state), 2);
-    // The INSERTED change flag is observable (Zig sets it via setChangeFlag).
+    // The INSERTED change flag is observable through metadata.
     assert_ne!(meta.change_flags(&state) & ChangeFlag::INSERTED, 0);
 
     let inner_100 = get_inner_offset(&state, &meta, 100);
@@ -237,7 +228,7 @@ fn nested_set_basic_insert_and_contains() {
     assert!(!inner_set_contains(&state, inner_100, 44));
 }
 
-/// nested.zig `test "nested set — duplicate insert is idempotent"`
+///  `test "nested set — duplicate insert is idempotent"`
 #[test]
 fn nested_set_duplicate_idempotent() {
     let mut state = mk_nested_state(4096, 16, SlotType::HashSet, 16, 1);
@@ -253,7 +244,7 @@ fn nested_set_duplicate_idempotent() {
     );
 }
 
-/// nested.zig `test "nested map — upsert last-write-wins"`
+///  `test "nested map — upsert last-write-wins"`
 #[test]
 fn nested_map_upsert_last_write_wins() {
     let mut state = mk_nested_state(4096, 16, SlotType::HashMap, 16, 1);
@@ -268,7 +259,7 @@ fn nested_map_upsert_last_write_wins() {
     assert_eq!(inner_map_get(&state, inner, 11), 200);
 }
 
-/// nested.zig `test "nested aggregate — count per outer key"`
+///  `test "nested aggregate — count per outer key"`
 #[test]
 fn nested_aggregate_count_per_outer_key() {
     let mut state = mk_nested_state(4096, 16, SlotType::Aggregate, 0, 2); // COUNT
@@ -289,7 +280,7 @@ fn nested_aggregate_count_per_outer_key() {
     );
 }
 
-/// nested.zig `test "nested aggregate — sum f64 per outer key"`
+///  `test "nested aggregate — sum f64 per outer key"`
 #[test]
 fn nested_aggregate_sum_f64_per_outer_key() {
     let mut state = mk_nested_state(4096, 16, SlotType::Aggregate, 0, 1); // SUM
@@ -305,7 +296,7 @@ fn nested_aggregate_sum_f64_per_outer_key() {
     assert!((sum2 - 50.0).abs() < 0.001);
 }
 
-/// nested.zig `test "nested set — inner growth on load factor exceeded"`
+///  `test "nested set — inner growth on load factor exceeded"`
 #[test]
 fn nested_set_inner_growth_on_load_factor() {
     let mut state = mk_nested_state(16384, 16, SlotType::HashSet, 4, 1);
@@ -322,7 +313,7 @@ fn nested_set_inner_growth_on_load_factor() {
     }
 }
 
-/// nested.zig `test "stress — arena accounting: each outer key allocates one
+///  `test "stress — arena accounting: each outer key allocates one
 /// inner set"`
 #[test]
 fn stress_arena_accounting() {
@@ -380,13 +371,13 @@ fn nested_randomized_ground_truth(seed: u64) {
     }
 }
 
-/// nested.zig `test "stress — randomized Map<K, Set<V>> with ground truth"`
+///  `test "stress — randomized Map<K, Set<V>> with ground truth"`
 #[test]
 fn stress_randomized_map_of_sets() {
     nested_randomized_ground_truth(0xDEAD_BEEF);
 }
 
-/// nested.zig `test "stress — multi-seed randomized Map<K, Set<V>>"`
+///  `test "stress — multi-seed randomized Map<K, Set<V>>"`
 #[test]
 fn stress_multi_seed_randomized() {
     for seed in [0xDEAD_BEEFu64, 0xCAFE_BABE, 0x1234_5678, 0xFEED_FACE] {
@@ -394,7 +385,7 @@ fn stress_multi_seed_randomized() {
     }
 }
 
-/// nested.zig `test "stress — CAPACITY_EXCEEDED when arena exhausted"`
+///  `test "stress — CAPACITY_EXCEEDED when arena exhausted"`
 #[test]
 fn stress_capacity_exceeded_when_arena_exhausted() {
     let mut state = mk_nested_state(1024, 16, SlotType::HashSet, 4, 1);
@@ -411,7 +402,7 @@ fn stress_capacity_exceeded_when_arena_exhausted() {
     assert!(meta.size(&state) > 0);
 }
 
-/// nested.zig `test "stress — inner growth cascade tracks arena fragmentation"`
+///  `test "stress — inner growth cascade tracks arena fragmentation"`
 #[test]
 fn stress_inner_growth_cascade_fragmentation() {
     let mut state = mk_nested_state(131072, 16, SlotType::HashSet, 4, 1);
@@ -430,11 +421,9 @@ fn stress_inner_growth_cascade_fragmentation() {
     let arena = Arena::bind(arena_header_offset(SLOT_OFFSET, 16));
     assert!(arena.used(&state) > 0);
 
-    // The Zig assertion verbatim (nested.zig:743-747): abandoned capacities
-    // plus the live table bound the arena usage from below. (Zig's comment
-    // says growth starts at 4, but nextPowerOf2 clamps the initial inner cap
-    // to 16 — the `>=` bound holds either way, which is why the Zig test
-    // passes today; ported unchanged.)
+    // Abandoned capacities plus the live table bound arena usage from below.
+    // Growth starts at an inner capacity of 16, so the bound holds across
+    // every abandoned allocation.
     let dead_space = hashset_byte_size(4)
         + hashset_byte_size(8)
         + hashset_byte_size(16)
@@ -444,7 +433,7 @@ fn stress_inner_growth_cascade_fragmentation() {
     assert!(arena.used(&state) >= live_size + dead_space);
 }
 
-/// nested.zig `test "stress — many outer keys fill arena to capacity"`
+///  `test "stress — many outer keys fill arena to capacity"`
 #[test]
 fn stress_many_outer_keys_fill_arena() {
     let mut state = mk_nested_state(65536, 128, SlotType::HashSet, 4, 1);
@@ -471,7 +460,7 @@ fn stress_many_outer_keys_fill_arena() {
     }
 }
 
-/// nested.zig `test "stress — inner map growth preserves all entries"`
+///  `test "stress — inner map growth preserves all entries"`
 #[test]
 fn stress_inner_map_growth_preserves_entries() {
     let mut state = mk_nested_state(131072, 16, SlotType::HashMap, 4, 1);
@@ -492,8 +481,7 @@ fn stress_inner_map_growth_preserves_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// Proptests (no Zig counterparts)
-// ---------------------------------------------------------------------------
+// Property tests cover arbitrary scalar schemas and nested-container updates.
 
 /// Arbitrary scalar-field schemas: write via `write_scalar_field`, read every
 /// field back through `field_offset`, and check the bitset — the row is the
@@ -565,7 +553,7 @@ proptest! {
     }
 
     /// Nested Map<K, Set<V>> under arbitrary interleavings vs a std model —
-    /// every reported-Ok insert is observable, sizes match, absent keys read 0.
+    /// every recovered-Ok insert is observable, sizes match, absent keys read 0.
     #[test]
     fn prop_nested_set_matches_model(
         ops in prop::collection::vec((1u32..=40, 1u32..=300), 1..300),

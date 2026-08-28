@@ -1,11 +1,9 @@
-//! Columnar buffers for parsed events (`parsing/columns.zig`, unified).
+//! Columnar buffers for parsed events.
 //!
-//! Drift audit: the consumer variant omits the whole
-//! `EventColumns` base path (296 deleted lines; its 5 added lines are
-//! comments). This crate keeps both storage types; the event-processor
-//! crate parameterizes which path is wired.
+//! Event processing can use the base four-column schema or dynamic
+//! schema-driven columns; both storage types live here.
 //!
-//! Arrow compatibility (same as Zig):
+//! Arrow compatibility:
 //! - String columns use offset/length encoding: `offsets[i]` = start of
 //!   string `i`, `offsets[count]` = total data length (n+1 offsets).
 //! - Null bitmaps use Arrow's LSB-first bit packing.
@@ -23,9 +21,8 @@ pub const MAX_STRING_BYTES: u32 = 1024 * 1024; // 1MB
 /// Maximum bytes for a value column (serialized JSON/msgpack).
 pub const MAX_VALUE_BYTES: u32 = 16 * 1024 * 1024; // 16MB
 
-/// Error codes for parsing operations. The `u32` discriminants match the
-/// TypeScript `EventLogError` codes (JS interop contract; columns.zig:33-42)
-/// and are pinned by `parse_error_codes_match_ts`.
+/// TypeScript `EventLogError` discriminants (the JS interop contract), pinned
+/// by `parse_error_codes_match_ts`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ParseError {
@@ -49,12 +46,10 @@ fn write_u32(bytes: &mut [u8], index: usize, value: u32) {
     bytes[start..start + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Columnar buffers for the base 4-column event schema
-/// (columns.zig `EventColumns`; retained by this crate and omitted by the
-/// consumer variant).
+/// Columnar buffers for the base four-column event schema.
 ///
-/// Buffer capacities are the Zig estimates and hard limits: exceeding them
-/// is `BUFFER_OVERFLOW`, exactly like the fixed Zig allocations.
+/// Buffer capacities use per-event estimates and hard limits: exceeding a
+/// limit returns `BufferOverflow`.
 #[derive(Clone, Debug)]
 pub struct EventColumns {
     /// Number of events.
@@ -84,8 +79,8 @@ pub struct EventColumns {
 
 impl EventColumns {
     /// Initialize with the given capacity, clamped to
-    /// [`MAX_EVENTS_PER_BATCH`]. Buffer sizes are the Zig per-event
-    /// estimates (id 36 B, type 64 B, value 256 B).
+    /// [`MAX_EVENTS_PER_BATCH`]. Buffer sizes use per-event estimates
+    /// (id 36 B, type 64 B, value 256 B).
     pub fn new(capacity: u32) -> Self {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH);
         let offsets_len = (cap as usize + 1) * 4;
@@ -115,9 +110,9 @@ impl EventColumns {
         self.value_nulls.fill(0);
     }
 
-    /// Add an event (columns.zig `addEvent`): strings are copied into the
-    /// internal data buffers; hitting a fixed buffer limit is
-    /// `BufferOverflow`, a full batch is `TooManyEvents`.
+    /// Add an event: strings are copied into internal data buffers; hitting a
+    /// fixed buffer limit returns `BufferOverflow`, and a full batch returns
+    /// `TooManyEvents`.
     pub fn add_event(
         &mut self,
         id: &[u8],
@@ -220,8 +215,7 @@ impl EventColumns {
         Some(&self.value_data[start..end])
     }
 
-    // IPC-writer views (columns.zig exposes the raw slices; here they are
-    // explicit borrow methods over the byte-backed storage).
+    // IPC-writer views over the byte-backed storage.
 
     pub fn id_offsets_bytes(&self) -> &[u8] {
         &self.id_offsets[..(self.count as usize + 1) * 4]
@@ -249,7 +243,7 @@ impl EventColumns {
     }
 }
 
-/// Column type determines storage layout (columns.zig `ColumnType`).
+/// Column type determines storage layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColumnType {
     /// Variable-length string: offsets + data.
@@ -264,8 +258,8 @@ pub enum ColumnType {
     Binary,
 }
 
-/// Storage for a single column of typed data (columns.zig `ColumnStorage`).
-/// All columns are nullable (validity bitmap always present).
+/// Storage for a single typed column. All columns are nullable, so a validity
+/// bitmap is always present.
 #[derive(Clone, Debug)]
 pub struct ColumnStorage {
     pub col_type: ColumnType,
@@ -339,9 +333,8 @@ impl ColumnStorage {
         Self::with_fixed_width(ColumnType::Int64, capacity, MAX_VALUE_BYTES, 4)
     }
 
-    /// Reset for reuse. Grown variable-width allocations are retained
-    /// (pinned by the Zig warm-pointer test; here pinned as retained
-    /// capacity).
+    /// Reset for reuse. Grown variable-width allocations are retained rather
+    /// than reallocated.
     pub fn reset(&mut self) {
         self.validity.fill(0);
         self.data_len = 0;
@@ -351,9 +344,8 @@ impl ColumnStorage {
     }
 
     /// Grow the variable-width data buffer geometrically, capped at
-    /// `max_data_bytes` (columns.zig `ensureVariableCapacityPreserving`).
-    /// Only `preserve_end` bytes survive the reallocation, exactly like the
-    /// Zig alloc+memcpy+free (bytes past it are NOT carried over).
+    /// `max_data_bytes`. Only `preserve_end` bytes survive reallocation; bytes
+    /// past it are scratch.
     fn ensure_variable_capacity_preserving(
         &mut self,
         required: usize,
@@ -402,8 +394,7 @@ impl ColumnStorage {
     pub fn data_bytes(&self) -> Option<&[u8]> {
         Some(&self.data.as_ref()?[..self.data_len as usize])
     }
-    /// Full retained data capacity (Zig exposes the slice; tests pin
-    /// warm-reuse via this).
+    /// Full retained data capacity, useful for checking warm reuse.
     pub fn data_capacity(&self) -> Option<usize> {
         Some(self.data.as_ref()?.len())
     }
@@ -467,13 +458,12 @@ fn variable_error(code: ParseError) -> VariableValueError {
     }
 }
 
-/// Transactional writer for one variable-width cell (columns.zig
-/// `VariableValueReservation`): capacity growth is retained, but offset,
-/// length, and validity are published only by `commit`, so a parser failure
-/// leaves the column logically unchanged.
+/// Transactional writer for one variable-width cell: capacity growth is
+/// retained, but offset, length, and validity are published only by `commit`,
+/// so a parser failure leaves the column logically unchanged.
 ///
-/// The Zig version holds a raw column pointer; the Rust port names the
-/// column by index and borrows the parent per call (no aliasing).
+/// The reservation identifies the column by index and borrows the parent only
+/// for each operation, preventing aliasing.
 #[derive(Clone, Copy, Debug)]
 pub struct VariableValueReservation {
     pub col_idx: u32,
@@ -518,8 +508,8 @@ impl VariableValueReservation {
         &mut data[self.start as usize..]
     }
 
-    /// Publish the cell: offset, data length, and validity (columns.zig
-    /// `commit`).
+    /// Publish the cell's offset, data length, and validity after a
+    /// successful transactional write.
     pub fn commit(
         &self,
         cols: &mut DynamicColumns,
@@ -545,9 +535,8 @@ impl VariableValueReservation {
     }
 }
 
-/// Dynamic columnar buffers for N-column extraction (columns.zig
-/// `DynamicColumns`). All value.* columns are nullable because events may
-/// not contain all declared fields (sparse data).
+/// Dynamic columnar buffers for N-column extraction. All value.* columns are
+/// nullable because events may omit declared fields (sparse data).
 #[derive(Clone, Debug)]
 pub struct DynamicColumns {
     /// Number of rows.
@@ -565,9 +554,9 @@ pub struct DynamicColumns {
 use crate::schema::{ArrowType, SignalSchemaField};
 
 impl DynamicColumns {
-    /// Initialize from schema field metadata (columns.zig `init`): each
-    /// Arrow type maps to its storage layout; `Null` is stored as utf8
-    /// ("treat null type as empty strings").
+    /// Initialize from schema field metadata: each Arrow type maps to its
+    /// storage layout; `Null` is stored as utf8 ("treat null type as empty
+    /// strings").
     pub fn new(field_metadata: &[SignalSchemaField], capacity: u32) -> Self {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH);
         let columns = field_metadata
@@ -600,14 +589,14 @@ impl DynamicColumns {
         }
     }
 
-    /// Begin a new row; false when at capacity (columns.zig `beginRow` —
-    /// note it does NOT allocate row state; appends target `self.count`).
+    /// Begin a new row; false when at capacity. Appends target `self.count`;
+    /// no row state is allocated until a value is written.
     pub fn begin_row(&mut self) -> bool {
         self.count < self.capacity
     }
 
     /// Complete the current row: bump the count and publish the n+1 offset
-    /// for every variable-length column (columns.zig `endRow`).
+    /// for every variable-length column.
     pub fn end_row(&mut self) {
         self.count += 1;
         let count = self.count as usize;
@@ -619,19 +608,16 @@ impl DynamicColumns {
         }
     }
 
-    /// WHY (fix the deleted Zig lacked): Zig had no abandonRow — its extractor error paths simply
-    /// never call endRow, leaving appended bytes/validity for the dead row
-    /// unpublished (count is not bumped). Dropping the pending row here is
-    /// the same observable behavior; kept as an explicit method because the
-    /// Rust extractors call it on their error paths.
+    /// Abandon the current row without bumping the count. Appended bytes and
+    /// validity bits remain outside the logical row count, so failed extraction
+    /// cannot publish a partial row.
     pub fn abandon_row(&mut self) {
         // Appends target row `count`; without end_row the row never becomes
         // visible. Validity bits set for the dead row are masked by count on
-        // every read path, exactly as in Zig.
+        // Every read path masks validity bits by the logical row count.
     }
 
-    /// Reserve a transactional writer for a binary cell (columns.zig
-    /// `reserveBinaryValue`).
+    /// Reserve a transactional writer for a binary cell.
     pub fn reserve_binary_value(
         &mut self,
         col_idx: u32,
@@ -650,7 +636,7 @@ impl DynamicColumns {
         })
     }
 
-    /// Append a UTF-8 string value (columns.zig `appendUtf8`).
+    /// Append a UTF-8 string value.
     ///
     /// Faithful append semantics: the row's offset is set to the CURRENT
     /// data_len and bytes are appended. A second append to the same cell in
@@ -702,7 +688,7 @@ impl DynamicColumns {
         self.append_int64(col_idx, value)
     }
 
-    /// Append an Int64 value (columns.zig `appendInt64`).
+    /// Append an Int64 value.
     pub fn append_int64(&mut self, col_idx: u32, value: i64) -> Result<(), ParseError> {
         if col_idx >= self.field_count {
             return Err(ParseError::InvalidFieldType);
@@ -726,7 +712,7 @@ impl DynamicColumns {
         Ok(())
     }
 
-    /// Append a Float64 value (columns.zig `appendFloat64`).
+    /// Append a Float64 value.
     pub fn append_float64(&mut self, col_idx: u32, value: f64) -> Result<(), ParseError> {
         if col_idx >= self.field_count {
             return Err(ParseError::InvalidFieldType);
@@ -745,7 +731,7 @@ impl DynamicColumns {
         Ok(())
     }
 
-    /// Append a boolean value (columns.zig `appendBool`, Arrow LSB-first).
+    /// Append a boolean value (Arrow LSB-first).
     pub fn append_bool(&mut self, col_idx: u32, value: bool) -> Result<(), ParseError> {
         if col_idx >= self.field_count {
             return Err(ParseError::InvalidFieldType);
@@ -766,8 +752,7 @@ impl DynamicColumns {
         Ok(())
     }
 
-    /// Append binary data (columns.zig `appendBinary` — same storage as
-    /// UTF-8).
+    /// Append binary data using the same variable-width storage as UTF-8.
     pub fn append_binary(&mut self, col_idx: u32, value: &[u8]) -> Result<(), ParseError> {
         self.append_utf8(col_idx, value)
     }
@@ -802,7 +787,7 @@ mod tests {
 
     #[test]
     fn parse_error_codes_match_ts() {
-        // columns.zig:33-42 — values match TypeScript EventLogError codes.
+        // Values match the TypeScript EventLogError codes.
         assert_eq!(ParseError::Ok as u32, 0);
         assert_eq!(ParseError::InvalidJson as u32, 1);
         assert_eq!(ParseError::InvalidMsgpack as u32, 2);
@@ -1022,9 +1007,7 @@ mod tests {
                 cols.append_binary(0, &payload).unwrap();
                 cols.end_row();
             }
-            // Zig pins the warm pointer; Vec addresses aren't stable to
-            // observe, so the retained-capacity contract is pinned instead:
-            // no growth happens on warm reuse.
+            // Retained capacity avoids growth during warm reuse.
             assert_eq!(cols.columns[0].data_capacity().unwrap(), warm_capacity);
             assert_eq!(cols.columns[0].data_len, 96_000);
         }
@@ -1092,14 +1075,9 @@ mod tests {
         assert_eq!(col.data_len, 0);
     }
 
-    // Zig's OOM-preservation test simulates allocator failure; Rust's global
-    // allocator aborts instead, so the preserved-slice contract is pinned on
-    // the overflow path above (published slice untouched after refusal).
-
-    /// Duplicate JSON keys hit the same declared column twice in one row:
-    /// Zig append semantics move the offset and leave the first bytes dead
-    /// in the data buffer — observable in the IPC body image. NOT a bug to
-    /// fix silently; byte parity depends on it until cutover.
+    /// Duplicate JSON keys hit the same declared column twice in one row.
+    /// The final offset points at the last append, while bytes from earlier
+    /// appends remain in the backing buffer and are excluded from the cell.
     #[test]
     fn duplicate_append_leaves_dead_bytes() {
         let fields = [field(ArrowType::Utf8, false)];
@@ -1115,10 +1093,8 @@ mod tests {
         assert_eq!(read_u32(cols.columns[0].offsets.as_ref().unwrap(), 0), 5);
     }
 
-    /// The appendNull-then-appendBinary sequence the extractor performs on
-    /// the fallback column (json_extractor.zig:257-271): appendNull is a
-    /// no-op, so no dead bytes and validity comes only from appendBinary —
-    /// the "double-append" flagged in the 4a review is in fact benign.
+    /// A null append is a no-op, so appending binary data afterward publishes
+    /// only the binary value and its validity bit.
     #[test]
     fn fallback_null_then_binary_is_clean() {
         let fields = [field(ArrowType::Binary, true)];

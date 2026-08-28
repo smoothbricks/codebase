@@ -1,37 +1,23 @@
-//! Replaces `packages/columine/src/vm/state_init.zig` — program bytecode →
-//! state buffer lifecycle:
+//! Program bytecode and state-buffer lifecycle:
 //!
-//! - [`calculate_state_size`] — `vm_calculate_state_size`
-//! - [`init_state`] — `vm_init_state`
-//! - [`reset_state`] — `vm_reset_state`
-//! - [`calculate_grown_state_size`] — `vm_calculate_grown_state_size`
-//! - [`grow_state`] — `vm_grow_state`
-//! - [`needs_growth_slot`] — `vm_get_needs_growth_slot`
+//! - [`calculate_state_size`] computes the required state size.
+//! - [`init_state`] initializes the state buffer.
+//! - [`reset_state`] reinitializes it in place.
+//! - [`calculate_grown_state_size`] and [`grow_state`] resize one slot.
+//! - [`needs_growth_slot`] reports the slot that requested growth.
 //!
-//! Struct-layout helpers used by both init and execution also live here, as
-//! in the Zig file. IMPORTANT DRIFT: state_init.zig carries its OWN copies of
-//! `computeStructRowLayout` / `arenaInitialCapacity` that DIFFER from the
-//! types.zig copies ported into `columine-types`:
+//! Struct-layout helpers used by initialization and execution live here.
+//! Their formulas intentionally differ from the general type helpers:
+//! - rows are padded to 4 bytes (`(row + 3) & !3`), and that padded value is
+//!   stored in slot metadata;
+//! - arenas reserve `capacity * 64` bytes rather than `capacity * 4`.
+//! Suffixes `_padded` and `_64` keep these domains distinct at call sites.
 //!
-//! - state_init pads each struct row to 4 bytes (`(row + 3) & !3`);
-//!   types.zig does not pad. The padded value is what init writes into slot
-//!   metadata, so it is the value the whole running VM observes.
-//! - state_init sizes arenas at `capacity * 64`; types.zig uses
-//!   `capacity * 4`.
-//!
-//! Both drifted pairs are live in Zig today. This module ports state_init's
-//! local versions verbatim (suffixed `_padded` / `_64` so a caller can never
-//! pick one by accident); the container-family slice must resolve the drift
-//! on the Zig side or prove the types.zig copies are dead code.
-//!
-//! Error contract: `calculate_state_size` returns 0 for an invalid program
-//! (the Zig ABI contract). The stateful entry points return
-//! `Result<(), ErrorCode>` — the wasm/NAPI wrappers (stage 5) map `Err` back
-//! to the numeric codes. An undersized state buffer is a caller bug (the
-//! contract requires `calculate_state_size` bytes) and panics via slice
-//! bounds instead of Zig's silent out-of-bounds write. Where Zig hits UB on
-//! malformed-but-length-valid bytecode (invalid slot-type nibbles), this port
-//! returns `InvalidProgram`/0 — strictly-defined behavior, noted per site.
+//! `calculate_state_size` returns 0 for an invalid program. Stateful entry
+//! points return `Result<(), ErrorCode>`, which wrappers map to numeric codes.
+//! An undersized state buffer is a caller bug and panics through slice bounds.
+//! Malformed-but-length-valid bytecode with invalid slot-type nibbles returns
+//! `InvalidProgram`/0 rather than invoking undefined behavior.
 
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 pub use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
@@ -43,10 +29,8 @@ use columine_types::types::{
 };
 use core::sync::atomic::{AtomicU8, Ordering};
 
-/// vm.zig:129 `g_needs_growth_slot`. The dispatch loop (later slice) stores
-/// the overflowing slot here; JS reads it via `vm_get_needs_growth_slot`.
-/// Zig uses a plain global (single-threaded wasm); relaxed atomics keep the
-/// same semantics without Rust `static mut`.
+/// Slot that triggered `NEEDS_GROWTH`, or `0xFF` when none is pending.
+/// Relaxed atomics preserve the single-threaded wasm global without `static mut`.
 pub static NEEDS_GROWTH_SLOT: AtomicU8 = AtomicU8::new(0xff);
 
 /// `vm_get_needs_growth_slot` — the slot that triggered NEEDS_GROWTH, or 0xFF.
@@ -57,22 +41,20 @@ pub fn needs_growth_slot() -> u32 {
 pub const EVICTION_ENTRY_SIZE: u32 = 16;
 
 // =============================================================================
-// Struct Layout Helpers — state_init.zig's LOCAL (drifted) versions
+// Struct layout helpers — initialization-specific formulas
 // =============================================================================
 
-/// state_init.zig:91 — arena header is `[arena_capacity:u32][arena_used:u32]`.
+/// Arena header: `[arena_capacity:u32][arena_used:u32]`.
 pub const ARENA_HEADER_SIZE: u32 = 8;
 
-/// state_init.zig:94-96 `arenaInitialCapacity` — 64 bytes per hash entry.
-/// The one authoritative helper set lives HERE (the deleted Zig carried a
-/// drifted types.zig twin — cap*4, unpadded rows — deleted post-parity).
+/// Initial arena capacity: 64 bytes per hash entry.
+/// This helper is deliberately distinct from the general type sizing helper.
 pub const fn arena_initial_capacity_64(hash_capacity: u32) -> u32 {
     hash_capacity * 64
 }
 
-/// state_init.zig:100-111 `computeStructRowLayout` — unlike the types.zig
-/// copy, the row is padded to 4 bytes "for clean addressing", and this padded
-/// value is what init stores in slot metadata byte 16-17.
+/// Compute a struct row layout padded to four-byte addressing boundaries.
+/// The padded size is what initialization stores in slot metadata.
 pub fn compute_struct_row_layout_padded(
     num_fields: u8,
     field_types: &[u8],
@@ -95,16 +77,15 @@ pub fn compute_struct_row_layout_padded(
     }
 }
 
-/// state_init.zig:114-121 `structFieldOffset` (byte offset within a row,
-/// after the presence bitset). Identical math to the types.zig copy; kept
-/// here because grow's arena compaction calls state_init's version.
+/// Byte offset of a struct field within a row, after the presence bitset.
+/// This uses the shared field-offset math because growth compaction requires
+/// the same offsets.
 pub fn struct_field_offset(num_fields: u8, field_types: &[u8], target_field: u8) -> u32 {
     columine_types::types::struct_field_offset(num_fields, field_types, target_field)
 }
 
-/// state_init.zig:84-89 `hasArrayFields` — deliberately a RAW-BYTE check
-/// (`byte >= 5`), not an enum check: bytes above 9 (invalid field types) also
-/// count as arrays here in Zig. Byte semantics preserved.
+/// Detect array fields from raw descriptor bytes (`byte >= 5`), not enum
+/// values; bytes above 9 also count as arrays for this layout check.
 pub fn has_array_fields_raw(num_fields: u8, field_types: &[u8]) -> bool {
     field_types
         .iter()
@@ -112,9 +93,8 @@ pub fn has_array_fields_raw(num_fields: u8, field_types: &[u8]) -> bool {
         .any(|&b| b >= 5)
 }
 
-/// state_init.zig:70-77 `arenaElemSize` — `unreachable` on non-array types
-/// (types.zig's copy returns 0 instead). Panics: reaching this with a
-/// non-array field is a programmer bug.
+/// Return the element size for an array field. A non-array field is a
+/// programmer error and panics.
 pub fn arena_elem_size_strict(field_type_byte: u8) -> u32 {
     match field_type_byte {
         // ARRAY_U32, ARRAY_STRING
@@ -127,8 +107,7 @@ pub fn arena_elem_size_strict(field_type_byte: u8) -> u32 {
     }
 }
 
-/// state_init.zig:125-127 `getStructMapSlotDataSize`:
-/// `[descriptor][keys u32 × cap][rows × cap][timestamps f64 × cap]?`.
+/// STRUCT_MAP slot data: descriptor + keys + rows + optional timestamps.
 pub const fn struct_map_slot_data_size(
     descriptor_size: u32,
     capacity: u32,
@@ -146,7 +125,7 @@ pub const fn struct_map2_slot_data_size(descriptor_size: u32, capacity: u32, row
     descriptor_size + capacity * 8 + capacity * row_size
 }
 
-/// state_init.zig:129-137 `getTTLSideBufferSize`.
+/// Size of the optional TTL eviction side buffer.
 pub const fn ttl_side_buffer_size(has_ttl: bool, has_evict_trigger: bool, capacity: u32) -> u32 {
     if !has_ttl {
         return 0;
@@ -176,8 +155,7 @@ pub(crate) fn accepts_program_magic(magic: u32, accepted_program_magics: &[u32])
     accepted_program_magics.contains(&magic)
 }
 
-/// The magic/length prologue every Zig entry point repeats. Returns None on
-/// the conditions where Zig returns 0 / INVALID_PROGRAM.
+/// Parse the shared program header and return `None` for an invalid program.
 fn parse_program<'a>(
     program: &'a [u8],
     accepted_program_magics: &[u32],
@@ -414,8 +392,8 @@ fn validated_program<'a>(
 // State Size Calculation — vm_calculate_state_size
 // =============================================================================
 
-/// state_init.zig:145-381 `vm_calculate_state_size`.
-/// Returns the required buffer size in bytes, or 0 if the program is invalid.
+/// Calculate the required state-buffer size, or return 0 for an invalid
+/// program.
 pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> u32 {
     let Some(view) = validated_program(program, accepted_program_magics) else {
         return 0;
@@ -435,8 +413,7 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
             let type_flags = SlotTypeFlags::from_byte(init_code[pc + 1]);
             let cap_lo = init_code[pc + 2];
             let cap_hi = init_code[pc + 3];
-            // Zig hits UB on an invalid slot-type nibble; this port treats it
-            // as an invalid program.
+            // Invalid slot-type nibbles make the program invalid.
             let Some((slot_type, capacity)) = slot_def_capacity(type_flags, cap_lo, cap_hi) else {
                 return 0;
             };
@@ -591,7 +568,8 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
             if inner_initial_cap == 0 {
                 inner_initial_cap = 16;
             }
-            // Zig truncates to u4 then @enumFromInt (UB for 10-15) — port as invalid.
+            // Truncate the inner type to its low nibble; invalid values reject
+            // the program instead of reaching an unchecked enum conversion.
             let Some(inner_type) = SlotType::from_u8(inner_type_byte & 0x0f) else {
                 return 0;
             };
@@ -623,7 +601,7 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
 // State Initialization — vm_init_state / vm_reset_state
 // =============================================================================
 
-/// state_init.zig:388-437 `writeSlotMeta` (the 48-byte slot metadata record).
+/// Write the 48-byte slot metadata record.
 #[allow(clippy::too_many_arguments)]
 fn write_slot_meta(
     state: &mut [u8],
@@ -666,9 +644,9 @@ fn write_slot_meta(
     state[(meta + 47) as usize] = 0;
 }
 
-/// state_init.zig:442-914 `vm_init_state`.
-/// `state` must be at least `calculate_state_size(program)` bytes and zeroed
-/// (Zig relies on zeroed values regions; both TS backends allocate zeroed).
+/// Initialize a state buffer. `state` must be at least
+/// `calculate_state_size(program)` bytes and zeroed so value regions start
+/// deterministic.
 pub fn init_state(
     state: &mut [u8],
     program: &[u8],
@@ -1073,8 +1051,8 @@ pub fn init_state(
             state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = outer_type_flags_byte;
             state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize] = inner_agg;
             state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
-            // Note: unlike SLOT_STRUCT_MAP, Zig does NOT clear metadata bytes
-            // 15-47 here — it relies on the zeroed buffer. Same here.
+            // Metadata bytes 15–47 remain zero from the initialized buffer,
+            // matching the layout's untouched reserved region.
 
             nested::write_nested_prefix(
                 state,
@@ -1109,12 +1087,10 @@ pub fn init_state(
     Ok(())
 }
 
-/// state_init.zig:917-924 `vm_reset_state` — re-initialize in place.
+/// Reinitialize a state buffer in place.
 ///
-/// The buffer is zeroed first so reset restores the exact fresh-allocation
-/// contract: init never writes a HASHMAP's values side-array (it relies on
-/// zeroed memory), and the deleted Zig's reset left stale value bytes behind
-/// on a dirty buffer — unobservable through lookups, but a byte-level lie.
+/// Zeroing first restores the fresh-allocation contract, including HASHMAP
+/// values side-arrays that initialization leaves untouched.
 pub fn reset_state(
     state: &mut [u8],
     program: &[u8],
@@ -1127,12 +1103,11 @@ pub fn reset_state(
     init_state(state, program, accepted_program_magics)
 }
 // =============================================================================
-// Slot Growth — vm_calculate_grown_state_size / vm_grow_state
+// Slot growth — calculate, allocate, copy, and rehash
 // =============================================================================
 //
-// When a HashMap/HashSet exceeds 70% load during executeBatch, the VM returns
-// NEEDS_GROWTH. JS then queries the slot, computes the grown size, allocates,
-// grows, and retries the batch (state_init.zig:929-936).
+// When a HashMap or HashSet exceeds 70% load, the VM reports NEEDS_GROWTH so
+// the caller can allocate the larger state and retry the batch.
 
 /// Per-slot facts the growth walkers re-derive from old-state metadata.
 struct OldSlotMeta {
@@ -1196,9 +1171,9 @@ fn ordered_list_primary_size_from_meta(old_state: &[u8], meta_base: u32, cap: u3
     }
 }
 
-/// state_init.zig:947-1008 `vm_calculate_grown_state_size` — state size with
-/// 2x capacity for `grown_slot_idx`, read from OLD STATE metadata (not the
-/// program), so already-grown states grow again correctly.
+/// Calculate grown-state size with 2× capacity for `grown_slot_idx`, reading
+/// the slot metadata from the old state so already-grown states grow again
+/// correctly.
 pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 {
     let num_slots = u32::from(old_state[9]);
     let mut total_size = align8(STATE_HEADER_SIZE + num_slots * SLOT_META_SIZE);
@@ -1246,9 +1221,9 @@ pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 
     total_size
 }
 
-/// state_init.zig:1013-1300 `vm_grow_state` — copy old state into `new_state`
-/// (which must be zeroed and `calculate_grown_state_size` bytes), rehashing
-/// the grown slot and recomputing every slot's offsets.
+/// Copy old state into `new_state` (which must be zeroed and large enough for
+/// [`calculate_grown_state_size`]), rehashing the grown slot and recomputing
+/// every slot's offsets.
 pub fn grow_state(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -1344,10 +1319,8 @@ pub fn grow_state(
                     bytes::write_u32(new_state, meta_base + 8, rehashed);
                 }
                 SlotType::Bitmap => {
-                    // Alloc, memset, and copy all size by the ONE canonical
-                    // formula (fixed semantics of telos idea i-87c94893 —
-                    // Zig's grow allocation used a drifted smaller formula
-                    // and overran; see slot_growth tests for the invariant).
+                    // Recompute storage bounds from the canonical bitmap
+                    // capacity formula before copying the payload.
                     let old_storage_size = columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
                         + bitmap_ops::bitmap_payload_capacity(old_cap);
                     let new_storage_size = columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
@@ -1410,8 +1383,8 @@ pub fn grow_state(
                             }
                             let row_base = new_rows_base + ki * rs;
                             for fi in 0..nf {
-                                // Raw-byte array check, exactly as Zig's
-                                // isArrayFieldType(@enumFromInt(byte)).
+                                // Array detection is based on the raw field byte;
+                                // values below 5 are scalar fields.
                                 let ft_byte = field_types[fi as usize];
                                 if ft_byte < 5 {
                                     continue;

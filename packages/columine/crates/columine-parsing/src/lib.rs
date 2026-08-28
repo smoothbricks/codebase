@@ -1,10 +1,8 @@
-//! Rust port of Columine's JSON and MessagePack parsing pipeline.
+//! JSON and MessagePack parsing into Arrow-compatible columnar storage.
 //!
-//! The five modules mirror the Zig parsing inventory. Column storage and
-//! schema metadata are the real Arrow-layout implementations from
-//! `columine-arrow` (the former stage-4B boundary stand-ins are gone);
-//! [`ColumnValue`] remains as the extractors' typed-token carrier and the
-//! tests' readable cell view.
+//! The parsers share scanners and typed extraction diagnostics; column storage
+//! and schema metadata live in [`columine-arrow`]. [`ColumnValue`] remains the
+//! extractors' typed-token carrier and the tests' readable cell view.
 
 use std::collections::HashMap;
 
@@ -50,11 +48,10 @@ pub enum ColumnValue {
     Binary(Vec<u8>),
 }
 
-/// Dispatch one extracted value to the real typed append
-/// (json_extractor.zig routes each token type to appendUtf8/appendInt64/…;
-/// `None` is `appendNull`). The `ColumnValue` materialization mirrors the
-/// parser's owned tokens — an efficiency residual for the perf pass, not a
-/// semantic one.
+/// Dispatch an extracted value to the matching typed append operation.
+///
+/// [`ColumnValue`] materialization mirrors the parser's owned tokens; it is
+/// useful for tests and keeps storage concerns out of the token stream.
 pub(crate) fn append_cell(
     columns: &mut DynamicColumns,
     column: usize,
@@ -96,8 +93,7 @@ pub(crate) struct FieldLookup {
     pub arrow_type: ArrowType,
 }
 
-/// Schema-name lookup for extraction (json_extractor.zig
-/// `buildExtractionConfig`): O(1) name → column/type, plus the
+/// Schema-name lookup for extraction: O(1) name → column/type, plus the
 /// `value.$extra` fallback column when declared.
 #[derive(Clone, Debug)]
 pub struct ExtractionConfig {
@@ -194,8 +190,7 @@ pub fn build_extraction_config(
     })
 }
 
-/// Rust owns allocation, so dropping the configuration is the direct
-/// equivalent of Zig's explicit `freeExtractionConfig`.
+/// Release an extraction configuration.
 pub fn free_extraction_config(config: ExtractionConfig) {
     drop(config);
 }
@@ -319,8 +314,8 @@ mod properties {
                 SignalSchemaField::new(ArrowType::Int64, true),
             ];
             let config = build_extraction_config(&fields, &["id", "type", "timestamp", "quantity"]).unwrap();
-            // Capacity 2 for a 1-event batch: the ported Zig capacity check
-            // rejects exactly-capacity batches (count >= capacity).
+            // An exactly-capacity batch is legal; this input has spare
+            // capacity and therefore must be accepted.
             let mut typed = DynamicColumns::new(&fields, 2);
             let mut work = [0_u8; 128];
             assert_eq!(msgpack_extractor::extract_msgpack_events(&input, &config, &mut typed, &mut work, true).unwrap(), 1);

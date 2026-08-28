@@ -1,4 +1,4 @@
-//! Replaces `packages/columine/src/parsing/msgpack_extractor.zig`.
+//! MessagePack event extraction into typed columns.
 
 use crate::msgpack_scanner::Reader;
 use crate::{
@@ -19,9 +19,8 @@ pub fn extract_msgpack_events(
     }
     let mut reader = Reader::new(input);
     let mut count = 0;
-    // Refuse only when MORE events follow a full batch — an exactly-capacity
-    // batch is legal. (The deleted Zig checked `count >= capacity` after
-    // every event, rejecting full batches.)
+    // An exactly-capacity stream is legal; reject only when more events
+    // follow a full batch.
     if stream {
         while !reader.at_end() {
             extract_msgpack_event(&mut reader, config, columns, work_buffer)?;
@@ -53,8 +52,8 @@ fn extract_msgpack_event(
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
 ) -> Result<(), ExtractionError> {
-    // Zig order: map header parses BEFORE beginRow, so an invalid header
-    // never opens a row.
+    // Parse the map header before opening a row, so an invalid header never
+    // leaves a partially initialized row.
     let fields = reader
         .read_map_header()
         .ok_or(ExtractionError::InvalidJson)?;
@@ -63,7 +62,7 @@ fn extract_msgpack_event(
     }
     let result = extract_msgpack_fields(reader, fields, config, columns, work_buffer);
     if result.is_err() {
-        // Zig never reaches endRow on the error path; abandon, don't commit.
+        // Abandon the row on error; failed extraction must not commit it.
         columns.abandon_row();
     }
     result
@@ -82,10 +81,9 @@ fn extract_msgpack_fields(
     columns.columns_seen.fill(false);
     let mut extra_count: u32 = 0;
     let mut extra_end: usize = 0;
-    // A fallback column with an unusably small work buffer (< 5 bytes: not
-    // even the msgpack header fits) is a configuration error — refuse loudly
-    // instead of silently dropping undeclared fields (the deleted Zig
-    // skipped them and nulled the fallback column).
+    // A fallback column with an unusably small work buffer (< 5 bytes, where
+    // even the MessagePack header cannot fit) is a configuration error. Refuse
+    // rather than silently dropping undeclared fields.
     if config.fallback_column.is_some() && work_buffer.len() < 5 {
         return Err(ExtractionError::OutOfMemory);
     }
@@ -94,8 +92,7 @@ fn extract_msgpack_fields(
         let key_start = reader.position();
         let key = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
         let key_end = reader.position();
-        // Zig looks the raw key bytes up in a byte-keyed map; a non-UTF-8 key
-        // is simply never declared, it is NOT a parse error.
+        // A non-UTF-8 key is undeclared, not a parse error.
         let lookup = std::str::from_utf8(key)
             .ok()
             .and_then(|name| config.field_map.get(name));
@@ -250,12 +247,10 @@ fn extract_typed_value(
                 reader.skip_value();
                 None
             } else if matches!(first, 0xc4..=0xc6) {
-                // msgpack_extractor.zig `.Binary`: internal typed persistence
-                // pre-encodes Binary/S.unknown values as an opaque canonical
-                // MessagePack document carried by a standard bin value. Store
-                // that bin PAYLOAD directly; wrapping the bin token itself
-                // would require a second decode after Arrow materialization
-                // and corrupt raw bytes.
+                // Binary values are stored as the payload of their canonical
+                // MessagePack bin representation. Keeping the payload avoids a
+                // second decode after Arrow materialization and preserves raw
+                // bytes.
                 let payload = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
                 Some(ColumnValue::Binary(payload.to_vec()))
             } else {
@@ -393,8 +388,8 @@ mod tests {
     }
     #[test]
     fn extract_msgpack_events_accepts_exactly_capacity_batch() {
-        // Post-parity fix pin: a stream ending exactly at capacity is legal
-        // (the deleted Zig rejected it); one event past capacity refuses.
+        // A stream ending exactly at capacity is legal; one event past
+        // capacity is rejected.
         let fields = [field(ArrowType::Utf8)];
         let mut input = vec![0x81];
         str_(&mut input, "id");
@@ -510,9 +505,9 @@ mod tests {
 
     #[test]
     fn extract_msgpack_events_tiny_work_buffer_refuses() {
-        // Post-parity fix pin: fallback configured but work_buffer < 5 bytes
-        // is a configuration error — loud refusal, never a silent drop (the
-        // deleted Zig skipped undeclared fields and nulled $extra).
+        // A configured fallback with a work buffer smaller than five bytes is
+        // a configuration error: refuse loudly rather than silently dropping
+        // undeclared fields.
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
         let mut input = vec![0x82];
         str_(&mut input, "id");
@@ -559,7 +554,7 @@ mod tests {
     }
     #[test]
     fn extract_msgpack_events_non_utf8_key_goes_to_extra() {
-        // Zig keys a byte map; a non-UTF-8 key is undeclared, not an error.
+        // A non-UTF-8 key is undeclared, not a parse error.
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
         let mut input = vec![0x82];
         str_(&mut input, "id");

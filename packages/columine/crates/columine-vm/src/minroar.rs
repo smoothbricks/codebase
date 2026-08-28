@@ -1,14 +1,10 @@
-//! Minimal RoaringFormatSpec bitmap — replaces the `roaring` crate in the
-//! shipped artifact (35.3K of the wasm size budget) with exactly the surface
-//! `bitmap_ops` uses. Byte-format compatible with rawr (the Zig side's
-//! roaring library): the serializer mirrors rawr `serialize.zig` layout
-//! byte-for-byte and the container-choice rules mirror rawr's semantics —
-//! array→bitset promotion when a 4096-full array receives an add
-//! (rawr `bitmap.zig:394` addToContainer), NO bitset→array demotion on
-//! remove (rawr `bitmap.zig:463`), run containers stay runs under
-//! add/remove, and `optimize` applies rawr `optimize.zig:11` runOptimize:
-//! array→run when `n_runs*4 < cardinality*2`, bitset→run when
-//! `n_runs*4 < 8192`, runs never demote.
+//! Minimal RoaringFormatSpec bitmap for the wasm artifact. It implements the
+//! exact surface used by `bitmap_ops` while keeping the shipped binary small.
+//! The serializer follows the portable Roaring format (cookies 12346/12347).
+//! Container choices are stable: arrays promote to bitsets at 4096 entries,
+//! bitsets do not demote on remove, runs remain runs under add/remove, and
+//! `optimize` selects runs when `n_runs*4 < cardinality*2` for arrays or
+//! `n_runs*4 < 8192` for bitsets.
 //!
 //! The `roaring` crate remains a DEV-dependency only: differential proptests
 //! in `tests/bitmap.rs` use it as the read/write oracle.
@@ -233,7 +229,7 @@ impl Container {
         }
     }
 
-    /// rawr optimize.zig runOptimize for one container.
+    /// Optimize one container using the run thresholds above.
     fn run_optimize(&mut self) {
         let n_runs = match self {
             Container::Array(v) => {
@@ -457,7 +453,7 @@ impl MiniRoaring {
     }
 
     // ---------------------------------------------------------------------
-    // Portable RoaringFormatSpec (mirrors rawr serialize.zig)
+    // Portable RoaringFormatSpec serialization
     // ---------------------------------------------------------------------
 
     pub fn serialized_size(&self) -> usize {

@@ -1,16 +1,14 @@
-//! Rust port of `packages/columine/src/vm/hashset_ops.zig` — HashSet batch
-//! operations over `FlatHashTable(void)` (keys only).
+//! HashSet batch operations over a key-only `FlatTable`.
 //!
-//! BITMAP fallback: HASHSET-verb opcodes on a BITMAP-typed slot delegate to
-//! vm.zig's bitmap ops — that crossing goes through `hooks::VmHooks` until
-//! the bitmap_ops slice lands.
+//! HASHSET operations on BITMAP-typed slots delegate through
+//! `hooks::VmHooks`.
 
 use crate::hash_table::{ENTRY_NONE, FlatTable};
 use crate::hooks::{MutationOp, MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType, TOMBSTONE};
 
-/// hashset_ops.zig:25 `bindSlotSet`.
+/// Bind the key-only table for a HASHSET slot.
 pub fn bind_slot_set(meta: &SlotMetaView) -> FlatTable {
     FlatTable::bind_external(
         meta.offset,
@@ -20,9 +18,8 @@ pub fn bind_slot_set(meta: &SlotMetaView) -> FlatTable {
     )
 }
 
-/// hashset_ops.zig:30 `batchSetInsert`. `ts_col` is required per-element
-/// when the slot has TTL (the Zig `.?` unwrap is a panic here too —
-/// a missing timestamp column on a TTL slot is a programmer bug).
+/// Insert a batch of elements. A TTL slot requires one timestamp per element;
+/// a missing timestamp column is a programmer error.
 pub fn batch_set_insert(
     delta_mode: bool,
     state: &mut [u8],
@@ -32,7 +29,7 @@ pub fn batch_set_insert(
     ts_col: Option<&[f64]>,
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
-    // BITMAP fallback (hashset_ops.zig:40).
+    // BITMAP fallback.
     if meta.slot_type() == SlotType::Bitmap {
         return hooks.batch_bitmap_add(delta_mode, state, meta, slot_idx, elems, ts_col);
     }
@@ -50,7 +47,7 @@ pub fn batch_set_insert(
             0.0
         };
 
-        // Skip EMPTY_KEY/TOMBSTONE (hashset_ops.zig:54).
+        // Skip EMPTY_KEY and TOMBSTONE sentinels.
         let Some(probe) = tbl.find_insert(state, elem) else {
             continue;
         };
@@ -103,7 +100,7 @@ pub fn batch_set_insert(
             continue;
         }
 
-        // Already present — just refresh TTL (hashset_ops.zig:87).
+        // Already present — refresh TTL.
         if meta.has_ttl() {
             let ttl_result = hooks.insert_with_ttl(state, meta, elem, ts);
             if ttl_result != ErrorCode::Ok {
@@ -123,7 +120,7 @@ pub fn batch_set_insert(
     ErrorCode::Ok
 }
 
-/// hashset_ops.zig:104 `batchSetRemove`.
+/// Remove a batch of elements.
 pub fn batch_set_remove(
     delta_mode: bool,
     state: &mut [u8],
@@ -146,8 +143,7 @@ pub fn batch_set_remove(
         };
 
         if hooks.undo_enabled() {
-            // Capture the key's latest TTL timestamp for undo
-            // (hashset_ops.zig:126-134).
+            // Capture the key's latest TTL timestamp for undo.
             let prev_ts_bits: u64 = if meta.has_ttl() {
                 hooks
                     .latest_eviction_ts(state, meta, elem)
@@ -187,7 +183,7 @@ pub fn batch_set_remove(
     }
 }
 
-/// hashset_ops.zig:154 `singleSetInsert` — FOR_EACH body dispatch.
+/// Insert one element for per-element dispatch.
 pub fn single_set_insert(
     delta_mode: bool,
     state: &mut [u8],
@@ -249,7 +245,7 @@ pub fn single_set_insert(
         return ErrorCode::Ok;
     }
 
-    // Already present — refresh TTL (hashset_ops.zig:194).
+    // Already present — refresh TTL.
     if meta.has_ttl() {
         let ttl_result = hooks.insert_with_ttl(state, meta, elem, ts);
         if ttl_result != ErrorCode::Ok {
@@ -259,7 +255,7 @@ pub fn single_set_insert(
     ErrorCode::Ok
 }
 
-/// hashset_ops.zig:202 `singleSetRemove`.
+/// Remove one element for per-element dispatch.
 pub fn single_set_remove(
     delta_mode: bool,
     state: &mut [u8],

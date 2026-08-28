@@ -1,11 +1,8 @@
-//! Dynamic RecordBatch encoder (`arrow/dynamic_record_batch.zig`).
+//! Dynamic RecordBatch encoder.
 //!
-//! Drift audit: the two artifact variants are byte-identical today — the
-//! `recordBatchMetadataSize` + in-place-body optimization was forward-ported
-//! to this crate before this port. The RecordBatch FlatBuffer is hand-emitted
-//! in place, field by field; no FlatBuffer library, no intermediate model.
-//! The emitted bytes ARE the contract (Flechette/arrow-js parses them), so
-//! every offset below mirrors the Zig source line-for-line.
+//! The RecordBatch FlatBuffer is hand-emitted in place, field by field; no
+//! FlatBuffer library or intermediate model is needed. The emitted bytes are
+//! the contract consumed by Flechette and arrow-js, so every offset is explicit.
 
 use crate::schema::{ArrowType, SignalSchemaField};
 
@@ -362,13 +359,11 @@ fn put_i64(out: &mut [u8], at: usize, value: i64) {
 }
 
 /// Result of [`encode_record_batch_dynamic`]: total bytes written into
-/// `output` from its start, `0` when the buffer is too small (the Zig
-/// sentinel contract).
+/// `output` from its start, or `0` when the buffer is too small.
 ///
 /// Layout: `[continuation 0xFFFFFFFF][metadata_size u32][FlatBuffer][body]`.
-/// When the body was already built at its final IPC position inside
-/// `output` (the 1-copy strategy), the final body memcpy is skipped —
-/// mirrored from the Zig pointer guard via range comparison.
+/// When the body is already at its final IPC position inside `output`, the
+/// final body copy is skipped by the range comparison.
 pub fn encode_record_batch_dynamic(
     output: &mut [u8],
     row_count: i64,
@@ -381,7 +376,7 @@ pub fn encode_record_batch_dynamic(
     let field_count = field_nodes.len() as u32;
     let buffer_count = buffer_descs.len() as u32;
 
-    // Metadata size mirrors dynamic_record_batch.zig:563-576.
+    // Compute metadata size from the field and buffer vectors.
     let buffers_vec_size = 4 + buffer_count as usize * 16;
     let metadata_size = record_batch_metadata_size(field_count, buffer_count);
 
@@ -401,8 +396,7 @@ pub fn encode_record_batch_dynamic(
     // Clear metadata area, then build the FlatBuffer in place.
     output[metadata_start..metadata_start + metadata_size].fill(0);
 
-    // FlatBuffer layout (offsets relative to metadata_start), verbatim from
-    // dynamic_record_batch.zig:601-681:
+    // FlatBuffer layout (offsets relative to metadata_start):
     //   0: root offset -> Message table at 20
     //   8: Message vtable, 20: Message table
     //  42: RecordBatch vtable, 52: RecordBatch table
@@ -542,7 +536,7 @@ mod tests {
         assert_eq!(col.arrow_type, ArrowType::Utf8);
         assert!(!col.nullable);
         let int_col = DynamicColumn::int64(2, false, None, &[]);
-        // Post-parity fix pin: the tag tells the truth (Zig tagged Int32).
+        // The tag is authoritative for the column's Arrow type.
         assert_eq!(int_col.arrow_type, ArrowType::Int64);
         assert!(int_col.offsets.is_none());
     }

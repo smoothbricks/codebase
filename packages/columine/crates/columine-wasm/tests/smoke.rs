@@ -31,7 +31,7 @@ fn meta_u32(state: &[u8], slot: u8, field_off: u32) -> u32 {
     u32::from_le_bytes(state[off..off + 4].try_into().unwrap())
 }
 
-/// vm_test.zig:82 `buildTestProgram` — HASHMAP(LAST) cap 16 + AGG COUNT.
+/// Build a HASHMAP(LAST) capacity-16 program with an AGG COUNT operation.
 fn test_program() -> Vec<u8> {
     let mut prog = vec![0u8; 32];
     prog.extend(PROGRAM_MAGIC.to_le_bytes());

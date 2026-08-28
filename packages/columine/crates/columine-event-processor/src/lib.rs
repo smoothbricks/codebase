@@ -1,19 +1,14 @@
 //! Unified event processor: parse → columns → (dedup) → Arrow IPC.
 //!
-//! Ports BOTH drifted `event_processor.zig` variants as one core
-//! parameterized by artifact wiring (`EpWiring`):
+//! [`EpWiring`] parameterizes the two published artifact configurations:
 //!
-//! - **Consumer artifact** (`event_processor.zig`, VERSION 2):
-//!   dynamic-only extraction, dedup (bloom + checkpoint), diagnostic bytes
-//!   in the result header, JSON fallback-workspace growth, NO msgpack
-//!   workspace growth.
-//! - **Columine npm artifact** (`event_processor.zig`, VERSION 1): no dedup,
-//!   base 4-column path for `field_count == 4` schemas (scanners +
-//!   `EventColumns`), workspace growth on BOTH json and msgpack extraction.
+//! - **Consumer configuration**: dynamic-only extraction, deduplication
+//!   (bloom + checkpoint), diagnostic bytes in the result header, JSON
+//!   fallback-workspace growth, and no MessagePack workspace growth.
+//! - **Columine configuration**: no deduplication, a base four-column path for
+//!   four-field schemas, and workspace growth for both JSON and MessagePack.
 //!
-//! The wasm `ep_*` export surface (handle table, host buffers, ep_alloc)
-//! is the bindings slice; this crate is the library core those thin
-//! wrappers call.
+//! The `ep_*` wasm exports are thin bindings around this library core.
 
 pub mod bloom;
 pub mod checkpoint;
@@ -74,13 +69,12 @@ pub const RESULT_HEADER_SIZE: usize = 32;
 pub const DIAGNOSTIC_ABI_VERSION: u8 = 1;
 
 /// Extraction diagnostic packed into the header's reserved bytes
-/// (consumer variant; `ResultDiagnostic`, 12 bytes: version u8 | stage u8 |
-/// detail u8 | expected_type u8 | actual_type u8 | reserved0 u8 |
+/// (consumer configuration; `ResultDiagnostic`, 12 bytes: version u8 | stage u8
+/// | detail u8 | expected_type u8 | actual_type u8 | reserved0 u8 |
 /// field_index u16 | row_index u16 | reserved1 u16).
 ///
-/// JSON extraction threads the per-field `ExtractionDiagnostic` from the
-/// failure site; the msgpack extractor does not carry one, so its
-/// stage/detail derive from the error at this level (as in the Zig EP).
+/// JSON extraction threads the per-field diagnostic from the failure site;
+/// the MessagePack extractor derives stage/detail from its error here.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResultDiagnostic {
     pub stage: u8,
@@ -91,13 +85,12 @@ pub struct ResultDiagnostic {
     pub row_index: u16,
 }
 
-/// Diagnostic byte vocabularies and NO_FIELD live with the extractor that
-/// populates them — one source of truth for the ABI order (a local copy here
-/// once drifted two detail values AND two stage values from the Zig enums).
+/// Diagnostic byte vocabularies and `NO_FIELD` live with the extractor that
+/// populates them, keeping one source of truth for the ABI order.
 pub use columine_parsing::json_extractor::{NO_FIELD, diagnostic_detail, diagnostic_stage};
 
-/// Parse-path wiring: the dimension on which the two Zig artifacts differ
-/// (`addEpModules` equivalent).
+/// Parse-path wiring that distinguishes the two published artifact
+/// configurations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EpWiring {
     /// Dedup by event id (the consumer artifact wires it; columine does not).
@@ -161,8 +154,7 @@ pub struct EventProcessor {
 impl EventProcessor {
     /// Init with schema + field names (the primary path; names enable JSON
     /// key matching). `capacity` sizes both the batch columns and, when
-    /// dedup is wired, the bloom filter (as in the Zig where the same
-    /// `capacity` feeds both).
+    /// deduplication is enabled, the bloom filter.
     pub fn new(
         wiring: EpWiring,
         capacity: u32,
@@ -173,10 +165,9 @@ impl EventProcessor {
     }
 
     /// Init with a batch-column capacity distinct from the dedup capacity.
-    /// The wasm artifact caps columns at `WASM_EVENT_CAPACITY` (256) to fit
-    /// linear memory while the bloom filter still sizes from the caller's
-    /// full `capacity` (event_processor.zig `initCommon`: `event_cap =
-    /// @min(capacity, WASM_EVENT_CAPACITY)` on wasm32, full elsewhere).
+    /// The wasm configuration caps columns at `WASM_EVENT_CAPACITY` (256) to
+    /// fit linear memory while the bloom filter uses the caller's full
+    /// `capacity`; native columns use the requested capacity.
     pub fn with_column_capacity(
         wiring: EpWiring,
         capacity: u32,
@@ -189,8 +180,7 @@ impl EventProcessor {
                 .map_err(EpInitError::Metadata)?;
 
         // Empty-names init keeps an empty extraction config: JSON extraction
-        // then fails (keys cannot be matched to columns), exactly like the
-        // Zig no-names path.
+        // cannot match keys to columns without field names.
         let extraction_config = if schema_config.field_names.is_empty() {
             None
         } else {
@@ -366,10 +356,7 @@ impl EventProcessor {
                 .map_err(|_| ResultCode::ParseError),
             InputFormat::MsgpackStream => msgpack_scanner::parse_msgpack_stream(input, cols)
                 .map_err(|_| ResultCode::ParseError),
-            // ARROW_PASSTHROUGH refuses uniformly post-parity (the deleted
-            // Zig's base path answered OK with empty columns while the
-            // extraction path refused INVALID_FORMAT — one input format,
-            // two answers).
+            // Arrow passthrough is unsupported on the base path.
             InputFormat::ArrowPassthrough => Err(ResultCode::InvalidFormat),
         };
         if parse_result.is_err() {
@@ -435,9 +422,8 @@ impl EventProcessor {
                 _ => ResultCode::ParseError,
             };
             if self.wiring.diagnostics {
-                // JSON extraction carries the per-field diagnostic from the
-                // failure site; the msgpack extractor does not thread one, so
-                // its stage/detail derive from the error (as in the Zig EP).
+                // JSON carries a per-field diagnostic; MessagePack derives
+                // stage/detail from its error at this level.
                 let diagnostic = if format == InputFormat::Json {
                     ResultDiagnostic {
                         stage: extraction_diagnostic.stage,
@@ -556,9 +542,8 @@ impl EventProcessor {
             match result {
                 Err(json_extractor::ExtractionError::BufferOverflow) => {
                     let fallback = format == InputFormat::Json;
-                    // Zig retries ONLY a workspace overflow (diagnostic says
-                    // msgpack/buffer_overflow); a column-limit overflow
-                    // surfaces immediately (`extractJsonEventsWithWorkspaceGrowth`).
+                    // Retry only workspace overflow; a column-limit overflow
+                    // surfaces immediately.
                     let workspace_overflow = !fallback
                         || (diagnostic.stage == diagnostic_stage::MSGPACK
                             && diagnostic.detail == diagnostic_detail::BUFFER_OVERFLOW);
@@ -593,7 +578,7 @@ impl EventProcessor {
     }
 
     /// Packed dedup stats (`ep_get_stats`):
-    /// `total_events as u32 | duplicates as u32 << 32` (Zig truncates).
+    /// `total_events as u32 | duplicates as u32 << 32` (u32 truncation is ABI).
     pub fn stats(&self) -> u64 {
         let Some(state) = self.dedup_state.as_ref() else {
             return 0;
@@ -807,13 +792,11 @@ mod tests {
     }
 
     /// Base and extraction paths emit byte-identical IPC for the same
-    /// 4-column content (extends the columine-arrow writer-unification pin
-    /// through the full EP pipeline). Two deliberate per-path differences
-    /// are compensated for, both faithful to Zig: the base json_scanner
-    /// converts numeric timestamps ms→µs (×1000) while the extractor stores
-    /// them raw, and the base path stores raw JSON value bytes where the
-    /// extractor stores typed msgpack — so the shared case is a 3-field
-    /// event with the timestamp pre-scaled on the extraction side.
+    /// four-column content. Their representation differences are compensated:
+    /// the base JSON scanner converts numeric timestamps ms→µs (×1000), while
+    /// extraction stores them raw; the base path stores raw JSON value bytes,
+    /// while extraction stores typed MessagePack. The shared test case
+    /// pre-scales the extraction timestamp.
     #[test]
     fn base_and_dynamic_pipelines_agree() {
         let names = b"id\0type\0timestamp\0value\0";
@@ -947,8 +930,8 @@ mod tests {
             row_index: 9,
         };
         write_result_header_with_diagnostic(&mut out, ResultCode::OutOfMemory, &diagnostic);
-        // detail byte 4 = buffer_overflow in the Zig DiagnosticDetail order
-        // (decoded by lib.ts DIAGNOSTIC_DETAILS — the ABI this test pins).
+        // Diagnostic detail byte 4 is buffer_overflow in the ABI order decoded
+        // by the TypeScript diagnostic vocabulary.
         assert_eq!(
             out[20..32],
             [1, 3, 4, 3, 4, 0, 7, 0, 9, 0, 0, 0],

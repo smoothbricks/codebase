@@ -1,29 +1,24 @@
 //! `columine.wasm` — the generic reducer-VM export layer (VM without RETE).
 //!
-//! Replaces columine's Zig `columine.wasm` build: 56 `vm_*` function exports
-//! plus EXPORTED memory, enumerated from the Zig artifact's export section
-//! and pinned by `tests/export_checklist.rs`. The surface is the superset
-//! artifact minus the RETE/ax_eval/condition-tree families — the
-//! published @smoothbricks/columine npm package ships this artifact as
+//! The artifact exports 56 `vm_*` functions plus memory, enumerated by
+//! `tests/export_checklist.rs`. Its surface is the superset artifact minus the
+//! RETE/ax_eval/condition-tree families. The published
+//! `@smoothbricks/columine` npm package ships this artifact as
 //! `dist/columine.wasm` (`"./wasm"` export).
 //!
-//! The wrapper layer is an adapted copy of the superset wasm wrapper (that
-//! crate additionally wires RETE/eval into its Runtime); both surfaces are
-//! pinned by their own export checklists and smoke tests, which is what
-//! catches wrapper drift. Unify via a shared extern-core macro when this
-//! surface next changes.
+//! This wrapper is an adapted copy of the superset wasm wrapper; both surfaces
+//! are pinned by export checklists and smoke tests to catch wrapper drift.
 //!
 //! Statics policy: single-threaded wasm assumed (one caller per instance).
-//! Pointer policy: wasm32 pointers bounded by linear memory; native tests
+//! Pointer policy: wasm32 pointers are bounded by linear memory; native tests
 //! register regions explicitly.
-
 // WHY one crate-level allow instead of 50 identical `# Safety` sections:
-// every unsafe extern here has the SAME contract — the module-doc "Pointer
-// bounding policy" above (Zig `[*]u8` semantics: caller owns the memory for
-// the duration of the call; wasm bounds by linear memory, native by
-// registered regions). Restating it per function would be noise that hides
-// the two genuinely different contracts (resume_when's cross-call pointer
-// stash and vm_ax_eval's bindings window), which keep their own docs.
+// every unsafe extern here has the SAME contract — this module's pointer
+// bounding policy (the caller owns memory for the duration of the call; wasm
+// uses linear-memory bounds, native tests use registered regions). Repeating it
+// per function would hide the two genuinely different contracts
+// (`resume_when`'s cross-call pointer stash and `vm_ax_eval`'s bindings window),
+// which keep their own docs.
 #![allow(clippy::missing_safety_doc)]
 
 use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
@@ -37,13 +32,11 @@ use columine_vm::vm::{self as vmops, Vm};
 
 struct Runtime {
     vm: Vm,
-    /// `vm_set_rbmp_scratch` bookkeeping. In Zig this wires a
-    /// FixedBufferAllocator for in-call temporaries; Rust's global allocator
-    /// makes that machinery observable only through these two getters.
+    /// `vm_set_rbmp_scratch` bookkeeping. Rust's global allocator makes the
+    /// scratch range observable only through these two getters.
     rbmp_scratch: (u32, u32),
-    /// Serialized delta-segment lanes. Zig returns pointers into the global
-    /// FlatUndoEntry rings; Rust serializes on `vm_delta_export_segment` and
-    /// the `_ptr` exports return these stable buffers.
+    /// Serialized delta-segment lanes. Rust materializes them after export so
+    /// the `_ptr` results remain stable until the next export.
     delta_undo: Vec<u8>,
     delta_redo: Vec<u8>,
     /// Count from the last successful `vm_evict_all_expired` call.
@@ -51,7 +44,6 @@ struct Runtime {
     #[cfg(not(target_arch = "wasm32"))]
     regions: Vec<(usize, usize)>,
 }
-
 impl Runtime {
     fn new() -> Self {
         Runtime {
@@ -68,9 +60,7 @@ impl Runtime {
 
 static mut RUNTIME: Option<Runtime> = None;
 
-/// Single-threaded wasm: the one mutable global, initialized on first use.
-/// (`static_mut_refs` is precisely the pattern superset_root.zig's globals
-/// are; the shared-memory variant replaces this with a locked cell.)
+/// Single-threaded wasm: one mutable global, initialized on first use.
 #[allow(static_mut_refs)]
 fn rt() -> &'static mut Runtime {
     unsafe { RUNTIME.get_or_insert_with(Runtime::new) }
@@ -100,8 +90,8 @@ fn bound_of(ptr: usize) -> usize {
         })
 }
 
-/// Native tests register the buffers they pass by raw pointer (wasm32 needs
-/// no registration — linear memory is the bound, as it is for Zig).
+/// Native tests register the buffers they pass by raw pointer; wasm32 needs no
+/// registration because linear memory supplies the bound.
 #[doc(hidden)]
 pub fn __register_region(ptr: *const u8, len: usize) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -118,8 +108,7 @@ pub fn __register_region(ptr: *const u8, len: usize) {
 }
 
 /// # Safety
-/// `base` must point into memory the caller owns for the duration of the
-/// call (Zig's `[*]u8` contract).
+/// `base` must point into memory the caller owns for the duration of the call.
 unsafe fn state_mut<'a>(base: *mut u8) -> &'a mut [u8] {
     let start = base as usize;
     unsafe { core::slice::from_raw_parts_mut(base, bound_of(start) - start) }
@@ -144,8 +133,8 @@ unsafe fn buf_mut<'a, T>(ptr: *mut T, len: u32) -> &'a mut [T] {
     unsafe { core::slice::from_raw_parts_mut(ptr, len as usize) }
 }
 
-/// Column-pointer array → bounded slices (each column bounded like a state
-/// pointer; Zig passes them unbounded).
+/// Column-pointer array → bounded slices (each column is bounded like a state
+/// pointer).
 unsafe fn cols_vec<'a>(col_ptrs: *const *const u8, num_cols: u32) -> Vec<&'a [u8]> {
     let mut cols = Vec::with_capacity(num_cols as usize);
     for i in 0..num_cols as usize {
@@ -163,7 +152,7 @@ fn err_code(r: Result<(), ErrorCode>) -> u32 {
 }
 
 // =============================================================================
-// State lifecycle + growth (state_init.zig exports)
+// State lifecycle and growth exports
 // =============================================================================
 
 #[unsafe(no_mangle)]
@@ -241,7 +230,7 @@ pub unsafe extern "C" fn vm_grow_state(
 }
 
 // =============================================================================
-// Batch execution (vm.zig exports)
+// Batch execution exports
 // =============================================================================
 
 #[unsafe(no_mangle)]
@@ -297,7 +286,7 @@ pub extern "C" fn vm_get_evicted_count() -> u32 {
 }
 
 // =============================================================================
-// Map/set/struct-map reads + iteration (vm.zig exports)
+// Map/set/struct-map reads and iteration exports
 // =============================================================================
 
 #[unsafe(no_mangle)]
@@ -400,11 +389,9 @@ pub unsafe extern "C" fn vm_struct_map_get_row_ptr(
     key: u32,
 ) -> u32 {
     let state = unsafe { state_ref(state_base_ptr) };
-    // STATE-RELATIVE, not absolute: Zig's getRowPtrByKey returns a
-    // state-relative row offset (0xFFFFFFFF = not found) and the TS consumer
-    // adds statePtr itself (reducer-vm-integration.test.ts "rowBase =
-    // state.statePtr + rowPtr"). A previous absolute conversion here
-    // double-added the base and sent readers out of bounds.
+    // STATE-RELATIVE, not absolute: the row offset is relative to `state_base`,
+    // and the TypeScript consumer adds that base before reading the row. An
+    // absolute conversion would double-add the base and go out of bounds.
     vmops::vm_struct_map_get_row_ptr(state, slot_offset, capacity, num_fields, row_size, key)
 }
 
@@ -541,7 +528,7 @@ pub unsafe extern "C" fn vm_struct_map2_iter_key2(
 }
 
 // =============================================================================
-// Undo / checkpoint / delta segments (vm.zig exports)
+// Undo, checkpoint, and delta-segment exports
 // =============================================================================
 
 #[unsafe(no_mangle)]
@@ -580,9 +567,8 @@ pub unsafe extern "C" fn vm_delta_export_segment(
 ) -> u32 {
     let r = rt();
     let count = r.vm.delta_export_segment(from_pos, to_pos);
-    // Zig's `_ptr` exports point straight into the global rings; Rust
-    // materializes both lanes here so the pointers stay stable until the
-    // next export (same caller contract).
+    // Materialize both lanes so the returned pointers remain stable until the
+    // next export.
     r.delta_undo = r.vm.delta_export_undo_bytes();
     r.delta_redo = r.vm.delta_export_redo_bytes();
     count
@@ -640,7 +626,7 @@ pub unsafe extern "C" fn vm_delta_apply_rollforward_segment(
 }
 
 // =============================================================================
-// Roaring bitmap surface (bitmap_ops.zig exports)
+// Roaring bitmap exports
 // =============================================================================
 
 fn bitmap_slot(
@@ -654,9 +640,8 @@ fn bitmap_slot(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vm_set_rbmp_scratch(ptr: u32, len: u32) {
-    // Zig wires a FixedBufferAllocator over [ptr..ptr+len] for in-call
-    // temporaries; Rust's allocator makes that unobservable — only the
-    // getters remain part of the contract.
+    // Rust's allocator makes the scratch range unobservable; only the getters
+    // remain part of the contract.
     rt().rbmp_scratch = (ptr, len);
 }
 

@@ -1,8 +1,5 @@
-//! Acceptance oracle for the state_init.zig port: every relevant Zig
-//! `test` block from state_init.zig (and the init/size-only tests from
-//! vm_test.zig) has a counterpart here, plus proptest invariants Zig's
-//! example-based tests only sample. Comments name the Zig test each block
-//! mirrors.
+//! Acceptance coverage for state sizing, initialization, reset, growth, and
+//! their property invariants.
 
 use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
@@ -20,7 +17,7 @@ use proptest::prelude::*;
 
 const HASH_PREFIX: usize = PROGRAM_HASH_PREFIX as usize;
 
-/// state_init.zig:1312-1340 `buildSingleSlotProgram` — one SLOT_DEF + HALT.
+///  `buildSingleSlotProgram` — one SLOT_DEF + HALT.
 fn build_single_slot_program(type_flags_byte: u8, cap_lo: u8, cap_hi: u8) -> [u8; 64] {
     let mut prog = [0u8; 64];
     let content = &mut prog[HASH_PREFIX..];
@@ -200,7 +197,7 @@ fn map_get(state: &[u8], offset: u32, cap: u32, key: u32) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// state_init.zig tests 1-3: computeStructRowLayout (LOCAL padded version)
+//  tests 1-3: computeStructRowLayout (LOCAL padded version)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -237,9 +234,8 @@ fn compute_struct_row_layout_8_fields_all_uint32() {
     assert_eq!(layout.descriptor_size, 8);
 }
 
-/// The one authoritative layout helper set (the deleted Zig carried a
-/// drifted types.zig twin — unpadded rows, cap*4 arenas — deleted
-/// post-parity along with its Rust port).
+/// The authoritative initialization helpers intentionally use four-byte row
+/// padding and 64 bytes per arena entry; this test pins both formulas.
 #[test]
 fn authoritative_layout_helpers_are_padded_and_cap64() {
     let fields = [
@@ -252,7 +248,7 @@ fn authoritative_layout_helpers_are_padded_and_cap64() {
 }
 
 // ---------------------------------------------------------------------------
-// state_init.zig test 4: structFieldOffset
+//  test 4: structFieldOffset
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -278,7 +274,7 @@ fn struct_field_offset_3_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// state_init.zig tests 4-6: arenaInitialCapacity, getStructMapSlotDataSize,
+//  tests 4-6: arenaInitialCapacity, getStructMapSlotDataSize,
 // getTTLSideBufferSize
 // ---------------------------------------------------------------------------
 
@@ -320,7 +316,7 @@ fn ttl_side_buffer_size_ttl_plus_evict_trigger() {
 }
 
 // ---------------------------------------------------------------------------
-// state_init.zig tests 7-8: vm_calculate_state_size
+//  tests 7-8: vm_calculate_state_size
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -404,7 +400,7 @@ fn condition_tree_derived_facts_use_sixteen_bytes_per_cell() {
 }
 
 // ---------------------------------------------------------------------------
-// state_init.zig tests 9-11: vm_init_state
+//  tests 9-11: vm_init_state
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -510,7 +506,7 @@ fn init_state_hashset_keys_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// state_init.zig test 12: vm_calculate_grown_state_size
+//  test 12: vm_calculate_grown_state_size
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -539,10 +535,10 @@ fn calculate_grown_state_size_hashmap_cap_doubles() {
 }
 
 // ---------------------------------------------------------------------------
-// vm_test.zig extracts (init/size-only)
+//  extracts (init/size-only)
 // ---------------------------------------------------------------------------
 
-// vm_test.zig "hashmap no-timestamp slot reduces state size"
+//  "hashmap no-timestamp slot reduces state size"
 #[test]
 fn hashmap_no_timestamp_slot_reduces_state_size() {
     let with_ts = build_single_slot_program(0x00, 4, 0);
@@ -560,7 +556,7 @@ fn hashmap_no_timestamp_slot_reduces_state_size() {
     assert_eq!(with_ts_size - no_ts_size, 16 * 8);
 }
 
-// vm_test.zig "hashmap invalid no-timestamp+ttl flag combination is rejected"
+//  "hashmap invalid no-timestamp+ttl flag combination is rejected"
 #[test]
 fn hashmap_no_timestamp_plus_ttl_combination_rejected() {
     let prog = build_single_slot_ttl_program(0x40, 4, 0, 10.0, 0.0, false);
@@ -765,9 +761,8 @@ fn init_state_ttl_hashset_writes_eviction_metadata() {
     assert_eq!(state[(meta + 15) as usize], 1); // timestamp_field_idx
 }
 
-// ---------------------------------------------------------------------------
-// Growth end-to-end (manual insertion in place of vm_execute_batch, which is
-// the dispatch slice; mirrors vm_test.zig "growth preserves entries")
+// Growth end-to-end: manual insertion stands in for the batch executor while
+// checking that grown state preserves entries.
 // ---------------------------------------------------------------------------
 
 fn insert_into_hashmap(state: &mut [u8], offset: u32, cap: u32, key: u32, value: u32) {
@@ -936,11 +931,8 @@ fn grow_state_struct_map_rehashes_rows() {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    // Size is 8-aligned and monotonic in requested capacity for every
-    // capacity-bearing SLOT_DEF type. Capacity starts at 1: a requested
-    // capacity of 0 means "use the 1024 default" (state_init.zig:184), so
-    // monotonicity deliberately does not hold across 0 — that default is
-    // pinned by `capacity_zero_means_default_1024` below.
+    // Size is 8-aligned and monotonic for positive requested capacities.
+    // Capacity zero means the 1024 default, so monotonicity does not cross 0.
     #[test]
     fn state_size_aligned_and_monotonic(
         flags in prop_oneof![Just(0x00u8), Just(0x01), Just(0x03), Just(0x08), Just(0x40)],
@@ -963,8 +955,7 @@ proptest! {
         prop_assert!(size_lo <= size_hi);
     }
 
-    // state_init.zig:184 — requested capacity 0 defaults to 1024 for every
-    // non-fixed-size slot type, so size(0) == size(1024).
+    // Requested capacity zero defaults to 1024 for every non-fixed-size slot.
     #[test]
     fn capacity_zero_means_default_1024(
         flags in prop_oneof![Just(0x00u8), Just(0x01), Just(0x03), Just(0x08), Just(0x40)],
@@ -983,12 +974,9 @@ proptest! {
         );
     }
 
-    // Reset restores every region init actually writes. Faithfully-ported
-    // Zig semantics: a HASHMAP's VALUES side-array is never written by init
-    // (it relies on the buffer being zeroed exactly once, at allocation), so
-    // reset does NOT restore scribbled values — only keys, timestamps,
-    // header, and metadata. Keys all being EMPTY_KEY makes the stale values
-    // unobservable through map lookups.
+    // Reset restores every region initialization writes. HASHMAP values are
+    // intentionally untouched by init and therefore remain stale after reset;
+    // EMPTY_KEY keys make those bytes unobservable through lookups.
     #[test]
     fn reset_state_restores_init_written_regions(
         flags in prop_oneof![Just(0x00u8), Just(0x01), Just(0x02), Just(0x05)],

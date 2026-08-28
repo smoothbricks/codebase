@@ -1,8 +1,6 @@
-//! The remaining vm_test.zig dispatch blocks: mixed FOR_EACH bodies (agg +
-//! FLAT_MAP), depth-2 FLAT_MAP, LATEST with parent-timestamp inheritance,
-//! ORDERED_LIST (LIST_APPEND / LIST_APPEND_STRUCT / undo / inside FLAT_MAP),
-//! struct-map iteration + growth through dispatch, and array fields in
-//! struct-map rows. Scenarios and expected values mirror the Zig blocks.
+//! Dispatch-block tests cover mixed FOR_EACH bodies, nested FLAT_MAP, parent
+//! timestamp inheritance, ORDERED_LIST, struct-map iteration/growth, and array
+//! fields. Scenarios pin the corresponding ABI behavior.
 
 use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
@@ -199,14 +197,12 @@ fn unknown_block_scalar_subtype_rejects_before_mutation_or_undo() {
     assert_eq!(vm.undo_checkpoint(), checkpoint);
 }
 // =============================================================================
-// FLAT_MAP + event-level AGG_SUM (vm_test.zig:2748)
-// =============================================================================
+// FLAT_MAP plus event-level AGG_SUM
 
 #[test]
 fn flat_map_plus_event_level_agg_sum_in_same_for_each_block() {
-    // Slot 0 STRUCT_MAP, slot 1 AGGREGATE SUM (SLOT_DEF cap_lo=0 quirk kept:
-    // the Zig builder writes AggType byte 0 here and SUM semantics come from
-    // the aggregate defaulting — faithful byte-for-byte).
+    // Slot 0 is STRUCT_MAP and slot 1 is AGGREGATE SUM. The initializer's
+    // type byte 0 selects the aggregate defaulting behavior.
     let mut init_sec = vec![0x18, 0, 6, 4, 0, 2, 0, 4];
     init_sec.extend([0x10, 1, 2, 0, 0]);
 
@@ -241,7 +237,7 @@ fn flat_map_plus_event_level_agg_sum_in_same_for_each_block() {
 }
 
 // =============================================================================
-// Nested FLAT_MAP depth-2 (vm_test.zig:2895)
+// Nested FLAT_MAP depth-2 ()
 // =============================================================================
 
 #[test]
@@ -280,7 +276,7 @@ fn nested_flat_map_depth_2_groups_items_struct_map() {
 }
 
 // =============================================================================
-// FLAT_MAP LATEST — parent timestamp overrides child ts_col (vm_test.zig:3044)
+// FLAT_MAP LATEST — parent timestamp overrides child ts_col ()
 // =============================================================================
 
 #[test]
@@ -323,10 +319,10 @@ fn flat_map_latest_parent_timestamp_overrides_child_ts_col() {
 }
 
 // =============================================================================
-// ORDERED_LIST (vm_test.zig:3172-3462)
+// ORDERED_LIST ()
 // =============================================================================
 
-/// vm_test.zig:3097 `buildScalarListTestProgram`.
+///  `buildScalarListTestProgram`.
 fn build_scalar_list_program(type_id: u32) -> Vec<u8> {
     let init_sec = [0x19u8, 0, 6, 8, 0, 0]; // SLOT_ORDERED_LIST, elem UINT32
     let body = [0x84u8, 0, 1];
@@ -371,7 +367,7 @@ fn ordered_list_scalar_growth_triggers_needs_growth() {
 
 #[test]
 fn ordered_list_struct_append() {
-    // vm_test.zig:3272 `buildStructListTestProgram` — ORDERED_LIST with
+    //  `buildStructListTestProgram` — ORDERED_LIST with
     // elem_type=0xFF (struct) + 2 fields.
     let init_sec = [0x19u8, 0, 7, 8, 0, 0xFF, 2, 0, 4];
     let body = [0x85u8, 0, 2, 1, 0, 2, 1];
@@ -518,7 +514,7 @@ fn ordered_list_inside_flat_map() {
 }
 
 // =============================================================================
-// Struct map iteration + growth through dispatch (vm_test.zig:1038, 1091)
+// Struct map iteration + growth through dispatch (, 1091)
 // =============================================================================
 
 fn build_struct_map_program() -> Vec<u8> {
@@ -609,10 +605,10 @@ fn struct_map_growth_preserves_entries() {
 }
 
 // =============================================================================
-// Array fields in struct-map rows (vm_test.zig:3640-3917)
+// Array fields in struct-map rows ()
 // =============================================================================
 
-/// vm_test.zig:3556 `buildArrayFieldTestProgram`.
+///  `buildArrayFieldTestProgram`.
 fn build_array_field_program(type_id: u32) -> Vec<u8> {
     let init_sec = [0x18u8, 0, 6, 4, 0, 2, 0, 5]; // UINT32 + ARRAY_U32
     let body = [0x80u8, 0, 1, 1, 2, 0, 1, 3, 4, 1];
@@ -777,8 +773,7 @@ fn struct_map_array_field_overwrite_last_wins_old_arena_data_abandoned() {
 }
 
 // =============================================================================
-// Nested slots through the full VM pipeline (nested.zig:647-733 e2e blocks,
-// deferred by the struct_map/nested slice until the dispatch loop existed)
+// Nested slots through the full VM pipeline
 // =============================================================================
 
 use columine_vm::meta::SlotMetaView;
@@ -787,7 +782,7 @@ use columine_vm::nested::{
     inner_agg_get_f64, inner_map_get, inner_set_contains, read_nested_prefix,
 };
 
-/// nested.zig `buildNestedSetE2EProgram`.
+///  `buildNestedSetE2EProgram`.
 fn build_nested_set_e2e_program(type_id: u32) -> Vec<u8> {
     // SLOT_NESTED: outer HASHSET-keyed table cap 32, inner HASHSET cap 8.
     let init_sec = [0x1Au8, 0, 0x09, 32, 0, 1, 8, 0, 1];
@@ -1019,7 +1014,7 @@ fn nested_aggregate_delta_restores_prior_value_count_and_arena_pointer() {
 }
 
 // =============================================================================
-// No-timestamp hashmap rejections through dispatch (vm_test.zig:325)
+// No-timestamp hashmap rejections through dispatch ()
 // =============================================================================
 
 #[test]
@@ -1057,16 +1052,11 @@ fn hashmap_no_timestamp_rejects_latest_max_min_opcodes() {
 // BATCH_STRUCT_MAP_UPSERT_FIRST (0x81) — parity regression
 // =============================================================================
 
-/// Parity regression (scenario-delta-fork.test.ts "struct keepValue(first)"):
-/// 0x81 was missing from the Rust body length table, body arm, top-level arm,
-/// and BOTH opcode registries (types.rs and opcodes.rs) — opcodes.zig:236 has
-/// it, and vm.zig dispatches it at 1774 (top level) and 2747/2775 (body).
-/// The body pass's unknown-byte skip-1 misparsed the operand bytes as opcodes
-/// and the whole upsert vanished: the TS registry read back empty. Program
-/// bytes are the exact TS-compiled flatMap→mapRecord→keyBy('key')
-/// →keepValue(first('quantity')) capture (hash prefix included): FOR_EACH
-/// (col=1, id=1) wrapping FLAT_MAP(offsets_col=3) wrapping
-/// `81 00 04 03 (04,00)(05,01)(06,02) 00`.
+/// The 0x81 regression covers the body-length table, body arm, top-level arm,
+/// and both opcode registries. A prior missing entry caused operand bytes to be
+/// misparsed and the upsert to disappear. The test uses the exact
+/// TypeScript-compiled flatMap→mapRecord→keyBy('key')→keepValue(first('quantity'))
+/// capture, including its hash prefix and FLAT_MAP field mapping.
 #[test]
 fn ts_struct_map_upsert_first_keeps_first_row_and_rolls_back() {
     let hex = "0000000000000000000000000000000000000000000000000000000000000000\

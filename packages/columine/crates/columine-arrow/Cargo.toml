@@ -1,6 +1,6 @@
 [package]
 name = "columine-arrow"
-description = "Columnar event buffers + Arrow IPC stream writer (ports columine's parsing/columns.zig and arrow/{dynamic_schema,dynamic_record_batch,ipc_writer}.zig)"
+description = "Columnar event buffers and Arrow IPC stream writer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

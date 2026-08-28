@@ -1,8 +1,8 @@
-//! Pins the Rust wasm export surface against the five-function Zig baseline
-//! plus Columine's CPB1 Compact extension.
+//! Pins the Rust wasm export surface against the five-function baseline plus
+//! Columine's CPB1 Compact extension.
 
-/// Every function export of the Zig columine event_processor.wasm.
-pub const ZIG_COLUMINE_EP_EXPORTS: [&str; 5] = [
+/// Expected function exports of the Columine event-processor wasm artifact.
+pub const EXPECTED_COLUMINE_EP_EXPORTS: [&str; 5] = [
     "ep_version",
     "ep_create_with_schema",
     "ep_create_with_schema_and_names",
@@ -62,8 +62,8 @@ fn wasm_exports(bytes: &[u8]) -> Vec<(String, u8)> {
 #[test]
 fn export_lists_are_complete_and_deduped() {
     assert_eq!(
-        &COLUMINE_EP_EXPORTS[..ZIG_COLUMINE_EP_EXPORTS.len()],
-        &ZIG_COLUMINE_EP_EXPORTS
+        &COLUMINE_EP_EXPORTS[..EXPECTED_COLUMINE_EP_EXPORTS.len()],
+        &EXPECTED_COLUMINE_EP_EXPORTS
     );
     let mut names: Vec<&str> = COLUMINE_EP_EXPORTS.to_vec();
     names.sort_unstable();
@@ -74,7 +74,7 @@ fn export_lists_are_complete_and_deduped() {
 /// `just wasm-ep` (columine justfile) runs this against the built artifact.
 #[test]
 #[ignore = "needs target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm (run `just wasm-ep`)"]
-fn built_wasm_exports_every_zig_symbol_and_memory() {
+fn built_wasm_exports_expected_symbols_and_memory() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"

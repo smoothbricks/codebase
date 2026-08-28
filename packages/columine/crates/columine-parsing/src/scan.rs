@@ -25,9 +25,8 @@ pub fn find_string_special(input: &[u8], from: usize) -> usize {
     }
 }
 
-/// Zig std.json's whitespace predicate — space, `\t`, `\r`, `\n` only
-/// (Scanner.zig:1283). `u8::is_ascii_whitespace` includes `\x0C` and would
-/// accept `[1,\x0C2]` where the Zig backends reject it.
+/// JSON whitespace is exactly space, `\t`, `\r`, and `\n`; form feed is not
+/// included.
 #[inline]
 pub fn is_json_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
@@ -104,10 +103,8 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_set_is_zig_std_json_exactly() {
-        // Scanner.zig:1283 — ' ', '\t', '\r', '\n' and nothing else.
-        // In particular \x0C (form feed, in u8::is_ascii_whitespace) is NOT
-        // whitespace to the Zig backends.
+    fn whitespace_set_matches_json_grammar() {
+        // In particular, \x0C (form feed) is not JSON whitespace.
         for b in 0u8..=255 {
             let input = [b, b'x'];
             let expected = usize::from(matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
