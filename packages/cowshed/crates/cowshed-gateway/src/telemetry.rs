@@ -273,12 +273,8 @@ impl AuditWriter {
                 self.pending.push(PendingRecord { event, reply });
                 self.flush_deadline
                     .get_or_insert_with(|| Instant::now() + self.flush_interval);
-                if (decision_boundary || self.pending.len() >= self.batch_capacity)
-                    && self.flush_pending().await.is_err()
-                {
-                    return false;
-                }
-                true
+                let must_flush = decision_boundary || self.pending.len() >= self.batch_capacity;
+                !(must_flush && self.flush_pending().await.is_err())
             }
             WriterCommand::Flush { reply } => {
                 let result = self
