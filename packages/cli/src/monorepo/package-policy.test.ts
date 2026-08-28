@@ -1103,6 +1103,53 @@ describe('workspace package script policy', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('accepts a Cargo workspace that carries the Linux cross-lint target', async () => {
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [{ dir: 'ferris', name: '@fixture/ferris', nx: { name: 'ferris', targets: {} } }],
+    });
+    try {
+      const resolvedTargetsByProject = new Map([['ferris', new Set(['cargo-lint', 'cargo-lint-cross', 'test'])]]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a Cargo workspace whose Linux arm is never compiled', async () => {
+    // The gate is only a gate while every Rust project actually carries it. A
+    // project that loses the target keeps passing `nx lint` on macOS and stops
+    // being checked against the platform CI validates on — silently, which is the
+    // defect class the target exists to end.
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [{ dir: 'ferris', name: '@fixture/ferris', nx: { name: 'ferris', targets: {} } }],
+    });
+    const errors = captureConsoleErrors();
+    try {
+      const resolvedTargetsByProject = new Map([['ferris', new Set(['cargo-lint', 'test'])]]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(1);
+      expect(errors.some((error) => error.includes('its Linux arm is never compiled'))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves projects without Cargo alone', async () => {
+    // Keyed off cargo-lint, so a TypeScript-only project must not be asked for a
+    // cross-compile target it has no Rust for.
+    const root = await createWorkspace({
+      rootName: '@fixture/root',
+      packages: [{ dir: 'web', name: '@fixture/web', nx: { name: 'web', targets: {} } }],
+    });
+    try {
+      const resolvedTargetsByProject = new Map([['web', new Set(['build', 'lint', 'test'])]]);
+      expect(validateWorkspaceDependencies(root, { resolvedTargetsByProject })).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 async function createWorkspace(input: {
