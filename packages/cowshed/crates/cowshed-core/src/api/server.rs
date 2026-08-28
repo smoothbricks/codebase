@@ -1,10 +1,11 @@
+use super::peer_credentials::{self, PeerCredentialsError};
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
 use bytes::Bytes;
 use serde_json::Value;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -1084,64 +1085,27 @@ async fn write_rpc_error(
 }
 
 fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
-    let fd = descriptor.as_raw_fd();
-    let mut socket_type: libc::c_int = 0;
-    let mut socket_type_len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
-        .map_err(|_| connection_error("socket type size does not fit socklen_t"))?;
-    let result = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            std::ptr::from_mut(&mut socket_type).cast(),
-            &mut socket_type_len,
-        )
-    };
-    if result != 0 || socket_type != libc::SOCK_STREAM {
+    let peer_uid = peer_credentials::peer_uid(descriptor).map_err(|error| match error {
+        PeerCredentialsError::SocketTypeSizeOverflow => {
+            connection_error("socket type size does not fit socklen_t")
+        }
+        PeerCredentialsError::SocketTypeQueryFailed | PeerCredentialsError::NotStream => {
+            connection_error("controller descriptor is not a stream socket")
+        }
+        PeerCredentialsError::PeerCredentialSizeOverflow => {
+            connection_error("peer credential size does not fit socklen_t")
+        }
+        PeerCredentialsError::PeerCredentialQueryFailed
+        | PeerCredentialsError::UnsupportedPlatform => {
+            connection_error("controller descriptor peer does not match the current uid")
+        }
+    })?;
+    let current_uid = unsafe { libc::geteuid() };
+    if peer_uid != current_uid {
         return Err(connection_error(
-            "controller descriptor is not a stream socket",
+            "controller descriptor peer does not match the current uid",
         ));
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut peer_uid: libc::uid_t = 0;
-        let mut peer_gid: libc::gid_t = 0;
-        let result = unsafe { libc::getpeereid(fd, &mut peer_uid, &mut peer_gid) };
-        let current_uid = unsafe { libc::geteuid() };
-        if result != 0 || peer_uid != current_uid {
-            return Err(connection_error(
-                "controller descriptor peer does not match the current uid",
-            ));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut credentials_len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
-            .map_err(|_| connection_error("peer credential size does not fit socklen_t"))?;
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                std::ptr::from_mut(&mut credentials).cast(),
-                &mut credentials_len,
-            )
-        };
-        let current_uid = unsafe { libc::geteuid() };
-        if result != 0 || credentials.uid != current_uid {
-            return Err(connection_error(
-                "controller descriptor peer does not match the current uid",
-            ));
-        }
-    }
-
     Ok(())
 }
 

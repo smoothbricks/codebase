@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod dto;
+pub(crate) mod peer_credentials;
 pub mod server;
 
 pub use capability::{
