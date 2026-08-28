@@ -472,15 +472,18 @@ fn render_block(store: &SharedStore) -> String {
          #\n\
          # size matches the daemon's cap deliberately: a client that finds no daemon starts a\n\
          # server of its own over this same directory, and sccache's 10 GiB default would evict\n\
-         # the shared cache down to it.\n\
+         # the shared cache down to it. It is written as a byte count because sccache accepts\n\
+         # only an integer or a bare k/m/g/t suffix and rejects anything else — `\"200 GiB\"`\n\
+         # fails its TOML load with exit 2 — so a byte count cannot drift with how cowshed\n\
+         # chooses to render a capacity for humans elsewhere.\n\
          #\n\
          # Delete this block to opt out. `cowshed setup` never rewrites a [cache.disk] it did not\n\
          # write, and reports what it found instead.\n\
          [cache.disk]\n\
          dir = {}\n\
-         size = \"{}\"\n",
+         size = {}\n",
         basic_string(store.directory()),
-        store.capacity(),
+        store.capacity().bytes(),
     )
 }
 
@@ -539,7 +542,7 @@ mod tests {
         assert_eq!(change, ConfigChange::Created);
         assert!(contents.starts_with(OWNERSHIP_MARKER));
         assert!(contents.contains("[cache.disk]\ndir = \"/private/cowshed/caches/sccache\"\n"));
-        assert!(contents.contains("size = \"200g\""));
+        assert!(contents.contains("size = 214748364800"));
         assert!(directs_to(&contents, &store()));
     }
 
@@ -674,7 +677,7 @@ mod tests {
         ));
         let (change, contents) = written(Some(&stale));
         assert_eq!(change, ConfigChange::Refreshed);
-        assert!(contents.contains("size = \"200g\""));
+        assert!(contents.contains("size = 214748364800"));
         assert!(!contents.contains("40g"));
     }
 
@@ -690,8 +693,8 @@ mod tests {
         );
 
         let extra_key = mine.replace(
-            "size = \"200g\"\n",
-            "size = \"200g\"\nrw_mode = \"READ_ONLY\"\n",
+            "size = 214748364800\n",
+            "size = 214748364800\nrw_mode = \"READ_ONLY\"\n",
         );
         assert_eq!(
             plan(Some(&extra_key), &store()),
@@ -714,8 +717,49 @@ mod tests {
         let (change, contents) = written(Some(&stale));
         assert_eq!(change, ConfigChange::Refreshed);
         assert!(contents.starts_with(existing));
-        assert!(contents.contains("size = \"200g\""));
+        assert!(contents.contains("size = 214748364800"));
         assert!(directs_to(&contents, &store()));
+    }
+
+    /// `apply` writes what `plan` decided, and does it to a real file.
+    ///
+    /// Every other test here exercises `plan`, which is pure and hands back a `String`. That
+    /// leaves the whole write path — the temp-and-rename, the mode, and the read-modify-write
+    /// round trip — asserted by inspection rather than demonstrated, which is exactly where a
+    /// config that is correct in memory and wrong on disk would hide. This drives the real
+    /// filesystem and reads the bytes back.
+    #[test]
+    fn apply_appends_to_a_users_config_on_disk_and_leaves_their_lines_intact() {
+        let directory =
+            std::env::temp_dir().join(format!("cowshed-sccache-apply-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp directory");
+        let path = directory.join("config");
+        let authored = "[dist]\ntoolchain_cache_size = 1073741824\n";
+        std::fs::write(&path, authored).expect("author a config");
+
+        let report = apply(&path, &store()).expect("apply");
+        assert_eq!(
+            report.outcome,
+            ConfigOutcome::Written(ConfigChange::Appended)
+        );
+
+        let written_back = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            written_back.starts_with(authored),
+            "the user's own lines must survive verbatim, got {written_back:?}"
+        );
+        assert!(directs_to(&written_back, &store()));
+
+        // A second run must change nothing: idempotence is the property that makes `setup` safe
+        // to run repeatedly, and only a real file can prove the bytes are identical.
+        let again = apply(&path, &store()).expect("apply twice");
+        assert_eq!(again.outcome, ConfigOutcome::AlreadyCurrent);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back twice"),
+            written_back
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     /// The marker only claims a block it introduces at a line start; one quoted inside a value
