@@ -51,11 +51,11 @@
       "rust-src"
     ];
     # CI validates on Linux, so a macOS shell carries Linux's std and can
-    # type-check the arm CI compiles. This reaches every crate whose dependency
-    # graph is pure Rust; a dependency that compiles C for the target — ring,
-    # openssl-sys, libgit2-sys, libz-sys — additionally needs a cross C compiler,
-    # which this shell does not provide, so those crates check on the host target
-    # only.
+    # type-check the arm CI compiles. rust-std alone reaches every crate whose
+    # dependency graph is pure Rust; a dependency that compiles C for the target
+    # — ring, openssl-sys, libgit2-sys, libz-sys — additionally needs a cross C
+    # compiler, which is 0.4 GiB and so lives in the opt-in `linux-cross` profile
+    # below rather than here, keeping it off every macOS shell and macOS runner.
     #
     # The reverse direction is not available at any price: type-checking an Apple
     # target from Linux needs an Apple SDK for those same C-building
@@ -63,6 +63,48 @@
     targets = [
       "x86_64-unknown-linux-gnu"
     ];
+  };
+
+  # Opt-in Linux cross toolchain, activated by `devenv -P linux-cross` and driven
+  # by the root `check:linux` script. devenv 2.2.3 has first-class profiles, so
+  # this is one gated module in the shared file rather than a second config
+  # directory that would have to re-import and re-pin everything here.
+  #
+  # It is a profile and NOT a default package because pkgsCross.gnu64's cc
+  # closure is 0.4 GiB against a default shell closure of ~5.4 GiB — a 7% tax on
+  # every shell entry and every CI cache restore, to serve one command that a
+  # macOS laptop runs deliberately. Nothing on Darwin links a Linux object.
+  #
+  # Why a C compiler is needed at all, when rust-std above is already installed:
+  # ring, openssl-sys, libgit2-sys and libz-sys compile C for the target from
+  # their build scripts, and build scripts are compiled and run even under
+  # `cargo check`, so std alone stops at `ToolNotFound: failed to find tool
+  # "x86_64-linux-gnu-gcc"`. The `cc` crate probes triple-prefixed tool names,
+  # which is precisely what this wrapper's bin/ exports.
+  #
+  # Each tool path is derived from the wrapper's own `targetPrefix` instead of
+  # being written out, so a nixpkgs bump that renames the prefix carries these
+  # with it rather than leaving four stale strings that fail at build-script time.
+  #
+  # This profile supplies the toolchain and nothing else. CARGO_BUILD_TARGET is
+  # deliberately NOT set: the triple belongs to the Nx target that asks for it
+  # (`cargo-lint-x64-linux` passes `--target` explicitly), not to the ambient
+  # environment. An ambient triple would make the check silently host-local
+  # whenever the profile was forgotten — reporting green having compiled macOS —
+  # and that false green is the precise failure this whole profile exists to end.
+  # With the flag on the target instead, running it outside this profile fails
+  # loudly at `ToolNotFound` and a host lint can never be mistaken for a cross one.
+  profiles.linux-cross.module = let
+    crossCC = pkgs.pkgsCross.gnu64.stdenv.cc;
+    tool = name: "${crossCC}/bin/${crossCC.targetPrefix}${name}";
+  in {
+    packages = [crossCC];
+    env = {
+      CC_x86_64_unknown_linux_gnu = tool "cc";
+      CXX_x86_64_unknown_linux_gnu = tool "c++";
+      AR_x86_64_unknown_linux_gnu = tool "ar";
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = tool "cc";
+    };
   };
 
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
