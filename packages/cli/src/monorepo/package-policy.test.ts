@@ -53,7 +53,7 @@ describe('root smoo monorepo policy', () => {
       );
       await writeJson(join(root, 'nx.json'), validNxJson());
 
-      expect(validateRootPackagePolicy(root)).toBe(7);
+      expect(validateRootPackagePolicy(root)).toBe(8);
       expect(validateNxReleaseConfig(root)).toBe(8);
 
       applyFixableMonorepoDefaults(root);
@@ -61,6 +61,7 @@ describe('root smoo monorepo policy', () => {
       const rootPackage = await readJson(join(root, 'package.json'));
       const nxJson = await readJson(join(root, 'nx.json'));
       expect(rootPackage.scripts).toEqual({
+        'check:linux': 'tooling/devenv --quiet -P linux-cross shell -- nx run-many -t cargo-lint-cross',
         clean: 'nx run-many -t clean; nx reset',
         'clean:node_modules':
           'rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf',
