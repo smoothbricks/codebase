@@ -118,7 +118,7 @@ export function loadNativeModule(): NativeModule {
     }
   }
 
-  throw new Error(`Could not load ${fileName}. Run \`nx run cowshed:cargo-napi\` for this platform.`, {
+  throw new Error(`Could not load ${fileName}. Run \`nx build cowshed\` for this platform.`, {
     cause: lastError,
   });
 }
