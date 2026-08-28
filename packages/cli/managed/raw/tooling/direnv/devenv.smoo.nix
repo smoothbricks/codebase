@@ -13,6 +13,7 @@
 # Every explanation lives out here in Nix comments. Hook bodies are exported as
 # shell text, so a comment inside one becomes part of an environment variable.
 {
+  inputs,
   lib,
   pkgs,
   ...
@@ -52,31 +53,32 @@
   };
 
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
-  # is part of a cache key, so two of them mean two caches. devenv pins it through
-  # the lock.
+  # is part of a cache key, so two of them mean two caches.
   #
-  # The rule, stated plainly, because it is an ownership boundary and not a
-  # workaround: OUR code is built with the Go devenv provides. A dependency MAY
-  # vendor its own SDK — ttsc does, inside its native package, with no override
-  # for it — and that vendored SDK is an implementation detail of the dependency
-  # in the same way a library bundling its own zlib is. Neither side may leak
-  # GOROOT into the other. Whose Go is whose is therefore decided by which
-  # binary is invoked, never by an ambient variable.
+  # Pinned to the patch release ttsc vendors inside its native package, because
+  # that SDK is not overridable — ttsc exposes only TTSC_CACHE_DIR and
+  # TTSC_TSGO_BINARY — so matching it is the only way to have ONE Go rather than
+  # ours plus a dependency's. `smoo monorepo check` enforces the match and fails
+  # with both versions when they diverge, which is what makes this pin a
+  # maintained invariant instead of a comment that rots.
   #
-  # This is why Go arrives via `packages` and NOT `languages.go.enable`: that
-  # option exports GOROOT, and an exported GOROOT naming one patch release makes
-  # the other side's build fail with `compile: version does not match go tool
-  # version`. On PATH only, each toolchain resolves its own GOROOT from its own
-  # binary and the two coexist by construction. Note the failure is a
-  # tool-resolution fault, not a cache fault: Go keys build-cache entries by
-  # toolchain, so two versions sharing one GOCACHE produce distinct keys rather
-  # than corruption — sharing costs cache size, never correctness, which is what
-  # keeps ttsc's plugin builds from costing a rebuild per checkout.
+  # It needs its own input because the fleet's nixpkgs does not carry that patch:
+  # devenv-nixpkgs rolling ships go 1.26.5 and its `go_1_27` is a release
+  # candidate, while ttsc 0.28.3 vendors go1.26.7. Same idiom, and same reason,
+  # as the dedicated sccache input — one leaf package from a nixpkgs that has it,
+  # lock-pinned, prebuilt, rather than a fleet-wide bump that would move rustc,
+  # bun and node too. Not every pairing is reachable: ttsc 0.28.1/0.28.2 vendor
+  # go1.26.6, which NO channel packages, so when no revision offers the vendored
+  # patch the ttsc pin is what moves.
   #
-  # Deliberately NOT pinned to whatever Go ttsc vendors. That coupling would make
-  # our toolchain hostage to an npm package and is not even always satisfiable:
-  # ttsc 0.28.1/0.28.2 vendor go1.26.6, which no nixpkgs channel packages at all.
-  packages = [pkgs.go];
+  # The ownership boundary this pin sits inside, unchanged by it: our code is
+  # built with the Go devenv provides, a dependency may vendor its own SDK, and
+  # neither may leak GOROOT into the other. Go therefore arrives via `packages`
+  # and NOT `languages.go.enable`, which would export GOROOT; on PATH only, each
+  # toolchain resolves its own GOROOT from its own binary. With the versions
+  # matched that crossing cannot misfire at all, so the unset in enterShell is
+  # belt-and-braces rather than the fix.
+  packages = [(import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go];
 
   enterShell = lib.mkMerge [
     # Prologue, in order:
@@ -132,15 +134,18 @@
     #    non-incrementally still goes through the cache. Under cowshed the choice
     #    is not this module's to make: the supervisor sets CARGO_INCREMENTAL=0 for
     #    every sandboxed process, so incremental is off wherever cowshed runs.
-    # 7. GOROOT is unset rather than set, and this is the isolation boundary that
-    #    makes the arrangement above correct rather than a workaround for it. Our
-    #    Go comes from devenv; a dependency may vendor its own SDK; neither may
+    # 7. GOROOT is unset rather than set. With devenv's Go pinned to the patch
+    #    release ttsc vendors, a GOROOT crossing cannot misfire on version at all,
+    #    so this is belt-and-braces rather than the fix — it keeps the isolation
+    #    boundary intact even while the two are momentarily out of step, e.g. after
+    #    a ttsc bump and before the Go pin follows it. The boundary itself: our Go
+    #    comes from devenv, a dependency may vendor its own SDK, and neither may
     #    leak GOROOT into the other. An inherited GOROOT names exactly one
-    #    toolchain and is therefore wrong for at least one side, which surfaces as
-    #    `compile: version does not match go tool version`. Absent the variable,
-    #    every Go resolves its own GOROOT from its own binary, so which toolchain
-    #    builds what is decided by which binary is invoked — the only thing that
-    #    can actually be reasoned about.
+    #    toolchain and so is wrong for at least one side, surfacing as `compile:
+    #    version does not match go tool version`. Absent the variable, every Go
+    #    resolves its own GOROOT from its own binary, which makes "whose Go is
+    #    whose" a property of which binary is invoked — the only thing that can
+    #    actually be reasoned about.
     # 8. On Darwin, drop nix CC/CXX so xcodebuild finds Xcode's clang (it supports
     #    -index-store-path); bun/node native addons find compilers through
     #    node-gyp.

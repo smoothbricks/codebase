@@ -60,8 +60,8 @@
     "typia": "14.0.2"
   },
   "devDependencies": {
-    "@ttsc/unplugin": "0.25.0",
-    "ttsc": "0.25.0",
+    "@ttsc/unplugin": "0.28.3",
+    "ttsc": "0.28.3",
     "typescript": "^6.0.3"
   },
   "license": "MIT",
