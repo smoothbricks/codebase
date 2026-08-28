@@ -1010,7 +1010,6 @@ where
             let workspace = resolve_workspace(service, args.workspace, "rebase").await?;
             let options = RebaseOptions {
                 onto: args.onto.map(os_revision).transpose()?,
-                fresh: args.fresh,
                 expected_workspace_incarnation: args
                     .expected_workspace_incarnation
                     .map(os_incarnation)
