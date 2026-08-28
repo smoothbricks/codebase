@@ -3188,8 +3188,8 @@ fn is_directory_only_tree(path: &Path) -> Result<bool, HostError> {
     for entry in fs::read_dir(path)
         .map_err(|source| host_io_error("read scaffold directory", path, source))?
     {
-        let entry = entry
-            .map_err(|source| host_io_error("read scaffold directory entry", path, source))?;
+        let entry =
+            entry.map_err(|source| host_io_error("read scaffold directory entry", path, source))?;
         let file_type = entry
             .file_type()
             .map_err(|source| host_io_error("inspect scaffold entry", &entry.path(), source))?;
@@ -3328,7 +3328,6 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Stdio;
