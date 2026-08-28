@@ -301,7 +301,7 @@ async fn a_partially_landed_workspace_reports_only_the_landed_commits_as_landed(
 #[tokio::test]
 async fn a_workspace_whose_work_is_nowhere_upstream_is_wholly_unlanded() {
     let fixture = Fixture::new("unlanded");
-    let mount = fixture.clone_workspace("clean-fix");
+    let mount = fixture.clone_workspace("local-only");
     workspace_commit(&mount, "one.txt", "one\n", "one");
     workspace_commit(&mount, "two.txt", "two\n", "two");
 
