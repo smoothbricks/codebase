@@ -13,16 +13,29 @@ import { type PackageJson, readPackageJsonObject } from '../lib/workspace.js';
 
 interface RequiredDependency {
   name: string;
+  /**
+   * Seed used only when the repository has no bun.lock entry yet (a fresh
+   * bootstrap). For `pinnedFromLockfile` dependencies the lock, not this value,
+   * decides what package.json must say.
+   */
   fallbackVersion: string;
   minimumVersion?: string;
   prefix?: string;
   useWorkspaceRangeInCodebase?: boolean;
+  /**
+   * Exact pin whose value the repository owns. bun.lock is the source of truth:
+   * this CLI must not carry a second copy of a version the repo has already
+   * resolved, or `smoo monorepo update` silently reverts a deliberate bump.
+   */
+  pinnedFromLockfile?: boolean;
 }
 
 export interface ToolPolicy {
   isSmoothBricksCodebase: boolean;
   toolingPackageName: string;
   cliDependencyRange: string;
+  /** Exact versions bun.lock resolved, for `pinnedFromLockfile` dependencies. */
+  lockedToolVersions: Record<string, string>;
 }
 
 export interface ToolContext {
@@ -56,7 +69,10 @@ const rootDevDependencies: RequiredDependency[] = [
   },
   { name: 'nx', fallbackVersion: '23.1.0', minimumVersion: '23.1.0' },
   { name: 'prettier', fallbackVersion: '^3.6.1', minimumVersion: '3.6.0', prefix: '^' },
-  { name: 'ttsc', fallbackVersion: '0.25.0' },
+  // ttsc participates in cache keys and vendors the Go SDK that
+  // `smoo monorepo check` matches against devenv's pinned Go, so it is an exact
+  // pin the repository owns, read back from bun.lock rather than restated here.
+  { name: 'ttsc', fallbackVersion: '0.28.3', pinnedFromLockfile: true },
   // Nx and typescript-eslint still load the TypeScript JS API (6.x).
   // Compilation is exclusively delegated to ttsc by the Nx plugin targets.
   { name: 'typescript', fallbackVersion: '^6.0.3', minimumVersion: '6.0.0', prefix: '^' },
@@ -67,12 +83,19 @@ const rootDevDependencies: RequiredDependency[] = [
 
 const cliPackageName = '@smoothbricks/cli';
 
-const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar', 'go'];
-// Any explicit nodejs provider is fine — the pinned major is the repo's choice
-// (Lambda parity, org convergence, …). Whether the pins in package.json agree
-// with the runtime is validated against the live PATH (validateRootRuntimeVersions),
-// never against a version template here.
-const nodePackagePattern = /(^|\s)nodejs(_\d+|_latest)?(\s|#|$)/m;
+// Go and Node are deliberately absent: ./devenv.smoo.nix supplies both, and
+// every repository is required to import it (validateDevenvModuleImport). Go
+// comes from the dedicated `nixpkgs-go` input pinned to the patch release ttsc
+// vendors, and Node as an explicit major. Requiring them again here made
+// `smoo monorepo update` append a bare `go` — which resolves from the default
+// channel and reintroduces the `compile: version does not match go tool
+// version` skew the pinned input exists to prevent — and a `nodejs_latest`,
+// which is the opposite of a pinned fleet-wide runtime.
+const requiredDevenvPackages = ['bun', 'git', 'git-format-staged', 'jq', 'alejandra', 'coreutils', 'gnutar'];
+// A repo-owned bare `go` shadows the pinned one on PATH, so it is rejected
+// rather than merely not required. Anchored to a package-list entry, never a
+// comment that only mentions Go.
+const unpinnedGoPackagePattern = /^\s*go\s*(#.*)?$/m;
 const requiredRustDevenvPackages = ['sccache'];
 const linuxCompilerPackage = 'pkgs.stdenv.cc';
 const ignoredNativeManifestDirectories = new Set([
@@ -120,7 +143,11 @@ export async function applyRootDevDependencyDefaults(root: string, context: Tool
       changed = setStringProperty(devDependencies, dependency.name, version) || changed;
     }
   }
-  if (delete devDependencies['@smoothbricks/cli']) {
+  // `delete` returns true for an absent key, so an unguarded delete reported
+  // "updated" and rewrote package.json on every run — which is why nothing this
+  // command wrote was ever scrutinised.
+  if (cliPackageName in devDependencies) {
+    delete devDependencies[cliPackageName];
     changed = true;
   }
   changed = removeObsoleteTtscPatch(pkg) || changed;
@@ -147,7 +174,8 @@ async function applyRootPackageToolDefaults(root: string, context: ToolContext):
       dependencyChanged = setStringProperty(devDependencies, dependency.name, version) || dependencyChanged;
     }
   }
-  if (delete devDependencies[cliPackageName]) {
+  if (cliPackageName in devDependencies) {
+    delete devDependencies[cliPackageName];
     dependencyChanged = true;
   }
   workspaceChanged = addWorkspacePattern(pkg, 'tooling');
@@ -208,11 +236,6 @@ export function applyDevenvPackageDefaults(root: string): void {
   }
   let content = readFileSync(path, 'utf8');
   let changed = false;
-  if (!nodePackagePattern.test(content)) {
-    const next = addNixPackage(content, 'nodejs_latest', '# Node.js for workspace tooling');
-    changed = next !== content || changed;
-    content = next;
-  }
   const compilesRust = workspaceCompilesRust(root);
   const requiredPackages = [...requiredDevenvPackages, ...(compilesRust ? requiredRustDevenvPackages : [])];
   for (const name of requiredPackages) {
@@ -281,7 +304,7 @@ function validateObsoleteTtscPatchRemoved(rootPackage: PackageJson | null): numb
     return 0;
   }
   console.error(
-    `package.json patchedDependencies.${obsoleteTtscPatchedDependencyKey} must be removed; ttsc 0.25.0 emits typia declarations without the obsolete patch`,
+    `package.json patchedDependencies.${obsoleteTtscPatchedDependencyKey} must be removed; every supported ttsc emits typia declarations without the obsolete patch`,
   );
   return 1;
 }
@@ -329,9 +352,11 @@ export function validateDevenvPackages(root: string): number {
   }
   const content = readFileSync(path, 'utf8');
   let failures = 0;
-  if (!nodePackagePattern.test(content)) {
+  if (unpinnedGoPackagePattern.test(content)) {
     console.error(
-      'tooling/direnv/devenv.nix packages must include a nodejs provider (nodejs_<major> or nodejs_latest)',
+      'tooling/direnv/devenv.nix packages must not include a bare `go`: ./devenv.smoo.nix supplies Go from the ' +
+        'pinned nixpkgs-go input, matched to the SDK ttsc vendors. An unqualified `go` resolves from the default ' +
+        'channel and shadows it on PATH, which fails as `compile: version does not match go tool version`.',
     );
     failures++;
   }
@@ -435,9 +460,6 @@ function nixPackageComment(name: string): string {
   if (name === 'git') {
     return '# Git hooks and repository inspection';
   }
-  if (name === 'go') {
-    return '# Builds ttsc source plugins';
-  }
   if (name === 'sccache') {
     return '# Rust compiler cache; client of the host-owned daemon (cowshed sccache start)';
   }
@@ -455,6 +477,9 @@ function satisfiesDependencyPolicy(policy: ToolPolicy, version: string, dependen
   // Dual-package native compiler: must stay an npm:typescript@7 alias, never unscoped "typescript".
   if (dependency.name === '@typescript/native') {
     return isTypeScriptNativeAlias(version);
+  }
+  if (dependency.pinnedFromLockfile === true) {
+    return version === expectedPinnedVersion(policy, dependency);
   }
   if (dependency.minimumVersion === undefined) {
     return version === dependency.fallbackVersion;
@@ -479,6 +504,13 @@ function formatExpectedDependency(policy: ToolPolicy, dependency: RequiredDepend
   if (dependency.name === '@typescript/native') {
     return 'npm:typescript@^7 (TypeScript 7 native compiler alias for ttsc)';
   }
+  if (dependency.pinnedFromLockfile === true) {
+    const expected = expectedPinnedVersion(policy, dependency);
+    const locked = policy.lockedToolVersions[dependency.name];
+    return locked === undefined
+      ? `${expected} (no bun.lock entry yet; bootstrap seed)`
+      : `${expected}, the version bun.lock resolved — change the pin by installing it, not by editing package.json alone`;
+  }
   return dependency.minimumVersion ? `>= ${dependency.minimumVersion}` : dependency.fallbackVersion;
 }
 
@@ -488,11 +520,19 @@ export async function readToolContext(root: string): Promise<ToolContext> {
   const configuredCliRange = toolingPackage?.dependencies?.[cliPackageName];
   return {
     rootPackage,
-    policy: await toolPolicy(rootPackage, typeof configuredCliRange === 'string' ? configuredCliRange : null),
+    policy: await toolPolicy(
+      rootPackage,
+      typeof configuredCliRange === 'string' ? configuredCliRange : null,
+      readLockedToolVersions(root),
+    ),
   };
 }
 
-async function toolPolicy(rootPackage: PackageJson | null, configuredCliRange: string | null): Promise<ToolPolicy> {
+async function toolPolicy(
+  rootPackage: PackageJson | null,
+  configuredCliRange: string | null,
+  lockedToolVersions: Record<string, string>,
+): Promise<ToolPolicy> {
   const name = rootPackage?.name ?? null;
   const isCodebase = isSmoothBricksCodebasePackageName(name ?? undefined);
   const toolingName = toolingPackageName(name);
@@ -502,7 +542,40 @@ async function toolPolicy(rootPackage: PackageJson | null, configuredCliRange: s
     // Consumers pin the latest *published* CLI. Running a linked prerelease must not
     // freeze tooling/package.json on an older range or rewrite it to an unpublished -next.
     cliDependencyRange: isCodebase ? 'workspace:*' : await resolvePublishedCliDependencyRange(configuredCliRange),
+    lockedToolVersions,
   };
+}
+
+/**
+ * Exact versions bun.lock resolved for the dependencies the repository pins.
+ *
+ * A resolved package entry is `"<name>": ["<name>@<version>", …]`, which the
+ * dependency maps elsewhere in the lock (`"<name>": "<range>"`) cannot match.
+ * Read rather than parsed: bun's text lockfile is JSONC, and lockfile.ts
+ * already works over it the same way.
+ */
+function readLockedToolVersions(root: string): Record<string, string> {
+  const lockfilePath = join(root, 'bun.lock');
+  if (!existsSync(lockfilePath)) {
+    return {};
+  }
+  const lockfile = readFileSync(lockfilePath, 'utf8');
+  const locked: Record<string, string> = {};
+  for (const dependency of rootDevDependencies) {
+    if (dependency.pinnedFromLockfile !== true) {
+      continue;
+    }
+    const escaped = escapeRegex(dependency.name);
+    const resolved = new RegExp(`"${escaped}":\\s*\\[\\s*"${escaped}@([^"]+)"`).exec(lockfile)?.[1];
+    if (resolved !== undefined) {
+      locked[dependency.name] = resolved;
+    }
+  }
+  return locked;
+}
+
+function expectedPinnedVersion(policy: ToolPolicy, dependency: RequiredDependency): string {
+  return policy.lockedToolVersions[dependency.name] ?? dependency.fallbackVersion;
 }
 
 function toolingPackageName(rootName: string | null): string {
@@ -518,6 +591,9 @@ function workspaceDependencyExpected(policy: ToolPolicy, dependency: RequiredDep
 async function resolveDependencyVersion(policy: ToolPolicy, dependency: RequiredDependency): Promise<string> {
   if (workspaceDependencyExpected(policy, dependency)) {
     return 'workspace:*';
+  }
+  if (dependency.pinnedFromLockfile === true) {
+    return expectedPinnedVersion(policy, dependency);
   }
   if (!dependency.minimumVersion) {
     return dependency.fallbackVersion;
