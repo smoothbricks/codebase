@@ -1,5 +1,7 @@
 /// <reference types="node" />
 
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AsyncSQLiteDatabase,
@@ -31,8 +33,12 @@ function toSyncStatement(statement: {
  *
  * Use this in Node Vitest setup when you want trace output persisted
  * to a deterministic file path.
+ *
+ * The trace sink lives one directory down from the root it belongs to (see
+ * `./trace-db-path.js`), and SQLite will not create that directory itself.
  */
 export function createNodeSQLiteDatabase(dbPath: string): SyncSQLiteDatabase {
+  mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   return {
     exec(sql: string): void {

@@ -5,7 +5,7 @@
  * resolution semantics — nearest package.json above cwd — identically in every
  * layout: a monorepo checkout, a consumer of the Bun isolated store, or plain
  * node_modules. The regression this guards: resolution anchored on the
- * library's own file location left consumer repos' .trace-results.db silently
+ * library's own file location left consumer repos' trace sinks silently
  * stale.
  */
 

@@ -44,7 +44,7 @@
     "build:watch": "nx run-many -t build --watch",
     "clean": "nx run-many -t clean; nx reset",
     "clean:node_modules": "rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf",
-    "clean:trace-db": "find * -name .trace-results.db -delete -print",
+    "clean:trace-db": "rm -fv .cache/trace-results.db* packages/*/.cache/trace-results.db* targets/*/.cache/trace-results.db* tooling/.cache/trace-results.db*",
     "format:changed": "git-format-staged --config tooling/git-hooks/git-format-staged.yml --also-unstaged",
     "format:staged": "git-format-staged --config tooling/git-hooks/git-format-staged.yml",
     "link:all": "bun run build:all && for pkg in packages/*; do (cd $pkg && bun link); done",

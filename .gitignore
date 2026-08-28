@@ -63,9 +63,6 @@ Thumbs.db
 # Jest
 test-output
 
-# Trace test results (SQLite)
-.trace-results.db
-
 # TypeScript build info
 *.tsbuildinfo
 dist-test/
@@ -73,7 +70,8 @@ dist-test/
 # Rust build output (packages/columine, lmao-rs)
 target/
 
-# local tool caches (ttsc plugins, etc.)
+# Local tool caches (ttsc plugins) and the SQLite trace sink, which lives here
+# because project walkers and file watchers skip this directory name.
 .cache/
 
 # Zig build cache (17.9 MB of build.exe/.pdb/.obj was committed by mistake)

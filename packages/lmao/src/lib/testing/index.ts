@@ -120,12 +120,20 @@ export { replayTraceToStdio } from './stdio-replay.js';
 
 export { type QueryableSpan, querySpan } from './queryable-span.js';
 export { extractFactsFor, findAllSpans, findSpan, spanNames } from './span-query.js';
+export { TraceQuery, type TraceQueryResult } from './trace-query.js';
 
 // =============================================================================
 // SQLITE PERSISTENCE
 // =============================================================================
 
-export { SQLiteAsyncTraceWriter, SQLiteTraceWriter, type SQLiteWriterConfig } from '../sqlite/index.js';
+export {
+  DEFAULT_TRACE_DB_PATH,
+  SQLiteAsyncTraceWriter,
+  SQLiteTraceWriter,
+  type SQLiteWriterConfig,
+  TRACE_DB_DIRECTORY,
+  TRACE_DB_FILENAME,
+} from '../sqlite/index.js';
 export { createD1SQLiteDatabase, type D1LikeDatabase, type D1LikePreparedStatement } from '../sqlite/sqlite-d1.js';
 export type {
   AsyncSQLiteDatabase,

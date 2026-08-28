@@ -16,8 +16,8 @@
  * });
  *
  * // test-setup.ts
- * import { initTraceTestRun } from '@smoothbricks/lmao/testing/vitest';
- * initTraceTestRun(myOpContext, { sqlite: { dbPath: '.trace-results.db' } });
+ * import { DEFAULT_TRACE_DB_PATH, initTraceTestRun } from '@smoothbricks/lmao/testing/vitest';
+ * initTraceTestRun(myOpContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } });
  *
  * // my-test.test.ts
  * import { describe, it, expect, useTestSpan } from '@smoothbricks/lmao/testing/vitest';
@@ -42,6 +42,7 @@ import { S } from '../schema/builder.js';
 import { isSpanContext } from '../spanContext.js';
 import type { AsyncSQLiteDatabase, SyncSQLiteDatabase } from '../sqlite/sqlite-db.js';
 import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
+import { DEFAULT_TRACE_DB_PATH } from '../sqlite/trace-db-path.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { Tracer } from '../tracer.js';
 import { CompositeTracer } from '../tracers/CompositeTracer.js';
@@ -286,13 +287,13 @@ function createRootTracer<B extends OpContextBinding>({
 
   let sqliteTracer: Tracer<B> | null = null;
   if (sqlite?.createAsyncDatabase) {
-    const dbPath = sqlite.dbPath ?? '.trace-results.db';
+    const dbPath = sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
     sqliteTracer = new SQLiteAsyncTracer(binding, {
       ...tracerOptions,
       db: sqlite.createAsyncDatabase(dbPath),
     });
   } else if (sqlite?.createDatabase) {
-    const db = sqlite.createDatabase(sqlite.dbPath ?? '.trace-results.db');
+    const db = sqlite.createDatabase(sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH);
     sqliteTracer = new SQLiteTracer(binding, {
       ...tracerOptions,
       db,
@@ -473,7 +474,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
           await tracer.flush();
           if (options?.sqlite) {
             const traceId = rootCtx.buffer.trace_id;
-            const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
+            const dbPath = options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
             console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
           }
         } catch (error) {
@@ -681,6 +682,9 @@ export const it: VitestIt = Object.assign(itBase, {
   skipIf: (condition: boolean) => (condition ? _it.skip : it),
 });
 
+// Setup files wire `sqlite.dbPath` from here rather than spelling the sink path, which is only safe under a directory
+// project walkers and watchers ignore.
+export { DEFAULT_TRACE_DB_PATH, TRACE_DB_DIRECTORY, TRACE_DB_FILENAME } from '../sqlite/trace-db-path.js';
 // Re-export everything else unchanged
 export {
   _afterAll as afterAll,

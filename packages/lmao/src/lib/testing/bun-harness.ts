@@ -22,10 +22,10 @@
  * // test-setup.ts (preload)
  * import { mock } from 'bun:test';
  * import * as bunTest from 'bun:test';
- * import { initTraceTestRun, createBunTestMock } from '@smoothbricks/lmao/testing/bun';
+ * import { DEFAULT_TRACE_DB_PATH, initTraceTestRun, createBunTestMock } from '@smoothbricks/lmao/testing/bun';
  * import { myOpContext } from './src/opContext.js';
  *
- * initTraceTestRun(myOpContext, { sqlite: { dbPath: '.trace-results.db' } });
+ * initTraceTestRun(myOpContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } });
  * mock.module('bun:test', () => createBunTestMock(bunTest));
  *
  * // my-test.test.ts — uses bun:test directly, no import changes needed
@@ -54,6 +54,8 @@ import {
   mock,
 } from 'bun:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { existsSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { cleanupDebug, cleanupDebugActiveHandles } from '../cleanupDiagnostics.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
@@ -64,12 +66,17 @@ import { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { isSpanContext } from '../spanContext.js';
 import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
+import { DEFAULT_TRACE_DB_PATH, TRACE_DB_DIRECTORY, TRACE_DB_FILENAME } from '../sqlite/trace-db-path.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import type { Tracer } from '../tracer.js';
 import { CompositeTracer } from '../tracers/CompositeTracer.js';
 import { SQLiteTracer } from '../tracers/SQLiteTracer.js';
 import { StdioTracer } from '../tracers/StdioTracer.js';
 import { TestTracer as InMemoryTestTracer } from '../tracers/TestTracer.js';
+
+// Preloads wire `sqlite.dbPath` from here rather than spelling the sink path, which is only safe under a directory
+// project walkers and watchers ignore.
+export { DEFAULT_TRACE_DB_PATH, TRACE_DB_DIRECTORY, TRACE_DB_FILENAME } from '../sqlite/trace-db-path.js';
 
 /** bun:test expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
@@ -278,7 +285,10 @@ function createRootTracer<B extends OpContextBinding>({
   } as const;
 
   if (sqlite) {
-    const db = new Database(sqlite.dbPath ?? '.trace-results.db');
+    const dbPath = sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
+    // The sink lives under a directory project walkers ignore, which SQLite will not create on its own.
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = new Database(dbPath);
     const sqliteTracer = new SQLiteTracer(binding, {
       ...tracerOptions,
       db,
@@ -599,7 +609,7 @@ function createTestTracerInstance<
             cleanupDebug('instance.tracer.flush:end', { tracer: tracer.constructor.name });
             if (options?.sqlite && rootCtx) {
               const traceId = rootCtx.buffer.trace_id;
-              const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
+              const dbPath = options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
               console.log(`\n[trace] trace_id: ${traceId} -> ${dbPath}`);
             }
           } catch (e) {
@@ -713,7 +723,7 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
         cleanupDebug('global.tracer.flush:end', { tracer: _tracer.constructor.name });
         if (options?.sqlite && isSpanContext(_rootCtx)) {
           const traceId = _rootCtx.buffer.trace_id;
-          const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
+          const dbPath = options.sqlite.dbPath ?? DEFAULT_TRACE_DB_PATH;
           console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
         }
       } catch (e) {
@@ -988,10 +998,9 @@ export type AutoSetupTarget =
  * target (see `resolveConsumerTarget` in `./consumer-package.js`).
  *
  * A package target imports that package's own `src/test-suite-tracer.ts` (if
- * present) and writes `.trace-results.db` at the package root. A
- * workspace-root target scans the member packages' tracer modules so
- * cross-package runs keep the merged-schema behavior, writing the DB at the
- * workspace root.
+ * present) and writes the sink under the package root. A workspace-root target
+ * scans the member packages' tracer modules so cross-package runs keep the
+ * merged-schema behavior, writing the sink under the workspace root.
  *
  * Per-package `useTestSpan()` delegates to the global `useTestSpan()` from this
  * module which checks `_activeSuiteTracer` — set by the root preload via
@@ -1005,13 +1014,10 @@ export type AutoSetupTarget =
  * ```
  */
 export async function autoSetupBunTestTracing(target: AutoSetupTarget): Promise<boolean> {
-  const { join } = await import('node:path');
-  const { existsSync } = await import('node:fs');
-
   const installSuite = (opContext: OpContextBinding, mergedSchema: Record<string, unknown>, dbDir: string): boolean => {
     const hasCustomSchema = Object.keys(mergedSchema).length > 0;
     const suite = makeBunTestSuiteTracer(opContext, {
-      sqlite: { dbPath: join(dbDir, '.trace-results.db') },
+      sqlite: { dbPath: join(dbDir, TRACE_DB_DIRECTORY, TRACE_DB_FILENAME) },
       extraTestColumns: hasCustomSchema && isSchemaFieldsRecord(mergedSchema) ? mergedSchema : undefined,
     });
 
