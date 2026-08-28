@@ -4,7 +4,7 @@
  * Stages: Parse | Reduce | Compact | Undo
  *
  * Each stage is independently usable — you can use Reduce without Parse,
- * or Compact without Reduce. axe-runtime composes columine's pipeline
+ * or Compact without Reduce. A consumer runtime composes columine's pipeline
  * with RETE as an additional stage.
  *
  *   const stages = createPipeline({ backend, parseBackend });
@@ -216,7 +216,7 @@ function createCompactStage(parseBackend: ParseCompactBackend): CompactStage {
   };
 }
 
-//#region axe!n/reducer-speculation-undo-log #undo-log #speculation
+//#region reducer-speculation-undo-log #undo-log #speculation
 /** Create the mandatory native undo stage. */
 function createUndoStage(backend: ColumineBackend): UndoStage {
   return {
@@ -246,13 +246,13 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     },
   };
 }
-//#endregion axe!n/reducer-speculation-undo-log
+//#endregion reducer-speculation-undo-log
 
 // =============================================================================
 // Pipeline Factory
 // =============================================================================
 
-//#region axe!n/columine-package.pipeline #create-pipeline #four-stages #composable
+//#region columine-package.pipeline #create-pipeline #four-stages #composable
 export interface PipelineOptions {
   /** Concrete reducer backend owned by this pipeline instance */
   backend: ColumineBackend;
@@ -280,4 +280,4 @@ export function createPipeline(options: PipelineOptions): ColumineStages {
     undo: createUndoStage(backend),
   };
 }
-//#endregion axe!n/columine-package.pipeline
+//#endregion columine-package.pipeline

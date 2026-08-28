@@ -2,16 +2,16 @@
 //!
 //! Replaces columine's Zig `columine.wasm` build: 56 `vm_*` function exports
 //! plus EXPORTED memory, enumerated from the Zig artifact's export section
-//! and pinned by `tests/export_checklist.rs`. The surface is the axe
-//! superset artifact minus the RETE/ax_eval/condition-tree families — the
+//! and pinned by `tests/export_checklist.rs`. The surface is the superset
+//! artifact minus the RETE/ax_eval/condition-tree families — the
 //! published @smoothbricks/columine npm package ships this artifact as
 //! `dist/columine.wasm` (`"./wasm"` export).
 //!
-//! The wrapper layer is an adapted copy of axe-superset-wasm's (that crate
-//! additionally wires RETE/eval into its Runtime); both surfaces are pinned
-//! by their own export checklists and smoke tests, which is what catches
-//! wrapper drift. Unify via a shared extern-core macro when this surface
-//! next changes.
+//! The wrapper layer is an adapted copy of the superset wasm wrapper (that
+//! crate additionally wires RETE/eval into its Runtime); both surfaces are
+//! pinned by their own export checklists and smoke tests, which is what
+//! catches wrapper drift. Unify via a shared extern-core macro when this
+//! surface next changes.
 //!
 //! Statics policy: single-threaded wasm assumed (one caller per instance).
 //! Pointer policy: wasm32 pointers bounded by linear memory; native tests

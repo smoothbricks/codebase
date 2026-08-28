@@ -1,6 +1,6 @@
 //! Integration tests: real `lmao-core::SpanBuffer` input, archive primitives, and
 //! cross-implementation validation of the emitted Arrow IPC via pyarrow (adapted
-//! from `AxE/packages/axe-runtime/scripts/pyarrow-verify.py`).
+//! from an independent pyarrow verifier).
 
 use std::sync::Arc;
 

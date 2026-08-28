@@ -9,14 +9,14 @@
 //!
 //! Global uniqueness: `(trace_id, thread_id, span_id)`.
 //!
-//! AxE determinism (`AxE/specs/sim/01-deterministic-scheduler.md`): the thread id
+//! Deterministic simulation (`01-deterministic-scheduler.md`): the thread id
 //! must come through the injectable [`Entropy`] seam, never `rand::thread_rng`,
 //! so a simulated run gets a seeded, reproducible identity stream.
 
 use std::cell::Cell;
 use std::sync::Arc;
 
-/// Entropy seam. Production uses OS randomness; AxE sim injects a seeded PCG stream.
+/// Entropy seam. Production uses OS randomness; deterministic simulations inject a seeded PCG stream.
 pub trait Entropy {
     fn next_u64(&mut self) -> u64;
 }
@@ -117,7 +117,7 @@ mod tests {
     fn generated_trace_id_is_w3c_shaped_and_deterministic() {
         let t1 = TraceId::generate(&mut FixedEntropy(42));
         let t2 = TraceId::generate(&mut FixedEntropy(42));
-        assert_eq!(t1, t2, "same entropy seed must yield same trace id (AxE)");
+        assert_eq!(t1, t2, "same entropy seed must yield same trace id");
         assert_eq!(t1.as_str().len(), 32);
         assert!(t1.as_str().chars().all(|c| c.is_ascii_hexdigit()));
     }

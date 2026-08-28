@@ -2,7 +2,7 @@
  * @smoothbricks/columine - Types
  *
  * Generic columnar processing pipeline types.
- * Self-contained — no dependency on axe-runtime.
+ * Self-contained — no dependency on a consumer runtime.
  *
  * Four backend implementations, one interface:
  * - WASM (universal fallback, input columns copied)
@@ -245,7 +245,7 @@ export enum Opcode {
   BATCH_MAP_UPSERT_MIN_IF = 0x2d,
 
   // Keyed slot-probe join (body opcode, runs per FLAT_MAP element).
-  //#region axe!n/reduce-typed-state.probe-op
+  //#region reduce-typed-state.probe-op
   // flatMap-list × keyed-struct-map-probe → resolved-row stream (.lookup DSL).
   // Probes probe_slot[key_col] open-addressing; on hit copies probe-row fields
   // into out_slot keyed by out_key_col; on miss + miss_mode=0 (skip) drops the element.
@@ -253,9 +253,9 @@ export enum Opcode {
   //   probe_slot:u8, key_col:u8, miss_mode:u8(0=skip,1=null), out_slot:u8, num_fields:u8,
   //   [probe_field_idx:u8, out_field_idx:u8] × num_fields, out_key_col:u8
   BATCH_STRUCT_MAP_PROBE = 0x2e,
-  //#endregion axe!n/reduce-typed-state.probe-op
+  //#endregion reduce-typed-state.probe-op
 
-  //#region axe!n/reduce-typed-state.scatter-op
+  //#region reduce-typed-state.scatter-op
   // Fused probe+dispatch (body opcode, runs per FLAT_MAP element). Probes a slot
   // and scatters the resolved datom DIRECTLY into a destination typed slot routed
   // by a compiler-emitted route-ordinal column — one copy, no intermediate.
@@ -267,7 +267,7 @@ export enum Opcode {
   //   num_routes:u8,
   //   [kind:u8, dest_slot:u8, dest_field_idx:u8, out_key_col:u8, v_src_field_idx:u8] × num_routes
   BATCH_STRUCT_MAP_PROBE_SCATTER = 0x2f,
-  //#endregion axe!n/reduce-typed-state.scatter-op
+  //#endregion reduce-typed-state.scatter-op
 
   // Batch HashSet ops
   BATCH_SET_INSERT = 0x30,
@@ -324,7 +324,7 @@ export enum Opcode {
   FOR_EACH = 0xe0, // col, match_count, match_ids (u32 LE × match_count), body_len (u16 LE)
   FLAT_MAP = 0xe1, // offsets_col, parent_ts_col, inner_body_len (u16 LE: 2 bytes)
 
-  // Note: 0x50+ range reserved for RETE (axe-runtime superset binary)
+  // Note: 0x50+ range reserved for RETE (superset binary)
   // Columine's reducer opcodes end at 0x4F (except struct map at 0x80+, blocks at 0xE0+)
 }
 
@@ -332,12 +332,12 @@ export enum Opcode {
 // ColumineBackend Interface - implemented by all backends
 // =============================================================================
 
-//#region axe!n/columine-package.ts-api #columine-backend #subset-of-axevm
+//#region columine-package.ts-api #columine-backend #subset-of-superset-vm
 /**
  * Backend interface for columine's columnar processing.
  *
- * This is a subset of AxeVM — everything except RETE rule execution.
- * axe-runtime injects a superset backend (AxeVM) that also implements
+ * This is a subset of the superset VM — everything except RETE rule execution.
+ * A consumer runtime can inject a superset backend that also implements
  * executeBatchWithRete, but columine only uses the methods below.
  */
 export interface ColumineBackend {
@@ -458,7 +458,7 @@ export interface ColumineBackend {
   /** Apply an exported rollforward segment. */
   deltaApplyRollforwardSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void;
 }
-//#endregion axe!n/columine-package.ts-api
+//#endregion columine-package.ts-api
 
 export interface DeltaSegmentExport {
   undoBytes: Uint8Array;

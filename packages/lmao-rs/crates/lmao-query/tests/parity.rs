@@ -1,7 +1,7 @@
 //! Backend parity: the SAME selector must produce the SAME answer against the
 //! in-process Arrow scan, SQLite (`SQLiteTracer` shape), and DataFusion — the
-//! "query layer must not care which tracer produced the table" rule from
-//! `AxE/specs/sim/08-trace-testing.md`.
+//! "query layer must not care which tracer produced the table" rule from the
+//! trace-testing specification.
 
 use std::sync::Arc;
 

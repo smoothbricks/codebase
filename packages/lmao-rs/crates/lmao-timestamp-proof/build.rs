@@ -6,7 +6,7 @@ fn main() {
         napi_build::setup();
     }
 
-    // The AxE proof artifact deliberately keeps the original shared,
+    // The timestamp proof artifact deliberately keeps the original shared,
     // host-owned memory ABI. Ordinary workspace WASM builds stay unshared.
     println!("cargo::rerun-if-env-changed=LMAO_TIMESTAMP_PROOF_SHARED_MEMORY");
     let builds_shared_proof = std::env::var_os("LMAO_TIMESTAMP_PROOF_SHARED_MEMORY").is_some();

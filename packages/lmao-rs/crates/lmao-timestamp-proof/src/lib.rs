@@ -1,9 +1,9 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 //! `span_start.{wasm,node}` — timestamp-accuracy proof instrumentation.
 //!
-//! Ports AxE's `timestamp_proof_{layout,wasm,napi}.zig` (228 LOC) into
+//! Ports the shared `timestamp_proof_{layout,wasm,napi}.zig` artifacts (228 LOC) into
 //! lmao-rs: this is LMAO proof machinery (measures span-timestamp accuracy
-//! for the proof harness `proofs/timestamp-accuracy.proof.ts` in AxE), not
+//! for the proof harness `proofs/timestamp-accuracy.proof.ts`), not
 //! runtime code. Export names are byte-compatible with the Zig artifacts.
 
 #[cfg(target_arch = "wasm32")]

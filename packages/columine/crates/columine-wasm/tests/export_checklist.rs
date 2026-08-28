@@ -1,7 +1,7 @@
 //! Pins the wasm export surface against the Zig `columine.wasm` ground
 //! truth: 56 vm_* function exports plus the EXPORTED memory (frozen from the
 //! Zig artifact's export section at cutover — the Zig build is deleted; this
-//! list is its tombstone). The surface is the axe superset minus the
+//! list is its tombstone). The surface is the superset minus the
 //! RETE/ax_eval/condition-tree families.
 
 /// Every function export of the Zig columine.wasm.

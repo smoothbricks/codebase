@@ -1,6 +1,6 @@
 //! # lmao-query
 //!
-//! Trace assertion/query layer per `AxE/specs/sim/08-trace-testing.md`:
+//! Trace assertion/query layer per the trace-testing specification:
 //!
 //! - "The query layer must not care which tracer produced the table" — the same
 //!   [`Selector`] runs against in-process Arrow RecordBatches ([`ArrowTraceQuery`],

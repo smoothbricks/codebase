@@ -1,17 +1,15 @@
 //! Unified event processor: parse → columns → (dedup) → Arrow IPC.
 //!
 //! Ports BOTH drifted `event_processor.zig` variants as one core
-//! parameterized the way axe-runtime's `addEpModules` parameterizes modules
-//! (`EpWiring`):
+//! parameterized by artifact wiring (`EpWiring`):
 //!
-//! - **AxE artifact** (`axe-runtime/src/event_processor.zig`, VERSION 2):
+//! - **Consumer artifact** (`event_processor.zig`, VERSION 2):
 //!   dynamic-only extraction, dedup (bloom + checkpoint), diagnostic bytes
 //!   in the result header, JSON fallback-workspace growth, NO msgpack
 //!   workspace growth.
-//! - **Columine npm artifact** (`columine/src/event_processor.zig`,
-//!   VERSION 1): no dedup, base 4-column path for `field_count == 4`
-//!   schemas (scanners + `EventColumns`), workspace growth on BOTH json and
-//!   msgpack extraction.
+//! - **Columine npm artifact** (`event_processor.zig`, VERSION 1): no dedup,
+//!   base 4-column path for `field_count == 4` schemas (scanners +
+//!   `EventColumns`), workspace growth on BOTH json and msgpack extraction.
 //!
 //! The wasm `ep_*` export surface (handle table, host buffers, ep_alloc)
 //! is the bindings slice; this crate is the library core those thin
@@ -38,8 +36,8 @@ use columine_parsing::{
     msgpack_scanner,
 };
 
-/// Module version: 2 is the AxE artifact, 1 the columine npm artifact.
-pub const AXE_VERSION: u32 = 2;
+/// Module version: 2 is the consumer artifact, 1 this crate's npm artifact.
+pub const CONSUMER_VERSION: u32 = 2;
 pub const COLUMINE_VERSION: u32 = 1;
 
 /// Input format for `create_log_entry` (u8 values are ABI).
@@ -76,7 +74,7 @@ pub const RESULT_HEADER_SIZE: usize = 32;
 pub const DIAGNOSTIC_ABI_VERSION: u8 = 1;
 
 /// Extraction diagnostic packed into the header's reserved bytes
-/// (AxE variant; `ResultDiagnostic`, 12 bytes: version u8 | stage u8 |
+/// (consumer variant; `ResultDiagnostic`, 12 bytes: version u8 | stage u8 |
 /// detail u8 | expected_type u8 | actual_type u8 | reserved0 u8 |
 /// field_index u16 | row_index u16 | reserved1 u16).
 ///
@@ -98,24 +96,24 @@ pub struct ResultDiagnostic {
 /// once drifted two detail values AND two stage values from the Zig enums).
 pub use columine_parsing::json_extractor::{NO_FIELD, diagnostic_detail, diagnostic_stage};
 
-/// Parse-path wiring: the axis on which the two Zig artifacts differ
+/// Parse-path wiring: the dimension on which the two Zig artifacts differ
 /// (`addEpModules` equivalent).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EpWiring {
-    /// Dedup by event id (AxE artifact wires it; columine does not).
+    /// Dedup by event id (the consumer artifact wires it; columine does not).
     pub dedup: bool,
     /// Base 4-column scanner path for `field_count == 4` schemas
-    /// (columine keeps it; the AxE artifact deleted it).
+    /// (columine keeps it; the consumer artifact omits it).
     pub base_path: bool,
     /// Grow the msgpack workspace and retry on overflow (columine yes,
-    /// AxE no — its msgpack path errors without retry).
+    /// consumer artifact no — its msgpack path errors without retry).
     pub msgpack_growth: bool,
-    /// Write diagnostic bytes into the result header (AxE yes).
+    /// Write diagnostic bytes into the result header (consumer artifact yes).
     pub diagnostics: bool,
 }
 
 impl EpWiring {
-    pub fn axe() -> Self {
+    pub fn consumer_variant() -> Self {
         Self {
             dedup: true,
             base_path: false,
@@ -474,7 +472,7 @@ impl EventProcessor {
             return code;
         }
 
-        // Dedup: read event ids from column 0 (AxE artifact).
+        // Dedup: read event ids from column 0 when consumer wiring is enabled.
         let mut processed = 0u32;
         let mut duplicates = 0u32;
         if let Some(dedup) = self.dedup_state.as_mut() {
@@ -659,7 +657,7 @@ fn compact_encode_diagnostic() -> ResultDiagnostic {
 }
 
 /// Write the header with the diagnostic packed into the reserved bytes
-/// (`writeResultHeaderWithDiagnostic`, AxE artifact).
+/// (`writeResultHeaderWithDiagnostic`, consumer artifact).
 pub fn write_result_header_with_diagnostic(
     output: &mut [u8],
     code: ResultCode,
@@ -758,12 +756,17 @@ mod tests {
         assert!(reader.next().is_none());
     }
 
-    // test "ep_create_log_entry with schema" (axe-runtime variant)
+    // test "ep_create_log_entry with schema" (consumer variant)
     #[test]
-    fn create_log_entry_axe_json() {
+    fn create_log_entry_consumer_variant_json() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep =
-            EventProcessor::new(EpWiring::axe(), 100, CollisionPolicy::Latest, schema).unwrap();
+        let mut ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            100,
+            CollisionPolicy::Latest,
+            schema,
+        )
+        .unwrap();
         let input = br#"[{"id":"test","type":"click","timestamp":1705315800000000}]"#;
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
@@ -831,7 +834,7 @@ mod tests {
         );
 
         let mut dyn_ep = EventProcessor::new(
-            EpWiring::axe(),
+            EpWiring::consumer_variant(),
             10,
             CollisionPolicy::Latest,
             schema_with_names(&base_fields(), names),
@@ -856,8 +859,13 @@ mod tests {
     #[test]
     fn error_result_codes() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep =
-            EventProcessor::new(EpWiring::axe(), 10, CollisionPolicy::Latest, schema).unwrap();
+        let mut ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            10,
+            CollisionPolicy::Latest,
+            schema,
+        )
+        .unwrap();
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
             ep.create_log_entry(b"not json", InputFormat::Json, &mut output),
@@ -865,7 +873,7 @@ mod tests {
         );
         let (code, ..) = read_result_header(&output);
         assert_eq!(code, ResultCode::ParseError as u32);
-        // Diagnostic bytes rode the reserved region (AxE wiring).
+        // Diagnostic bytes occupy the reserved region for consumer wiring.
         assert_eq!(output[20], DIAGNOSTIC_ABI_VERSION);
         assert_eq!(output[21], diagnostic_stage::JSON);
 
@@ -875,13 +883,18 @@ mod tests {
         );
     }
 
-    /// AxE dedup counts duplicates in the header and survives a
+    /// The consumer wiring counts duplicates in the header and survives a
     /// checkpoint/restore round trip.
     #[test]
     fn dedup_and_checkpoint_through_ep() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut ep =
-            EventProcessor::new(EpWiring::axe(), 100, CollisionPolicy::Discard, schema).unwrap();
+        let mut ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            100,
+            CollisionPolicy::Discard,
+            schema,
+        )
+        .unwrap();
         let input = br#"[{"id":"dup","type":"a","timestamp":1},{"id":"dup","type":"a","timestamp":2},{"id":"uniq","type":"a","timestamp":3}]"#;
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
@@ -898,8 +911,13 @@ mod tests {
         assert!(size > 0);
 
         let schema2 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut restored =
-            EventProcessor::new(EpWiring::axe(), 100, CollisionPolicy::Discard, schema2).unwrap();
+        let mut restored = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            100,
+            CollisionPolicy::Discard,
+            schema2,
+        )
+        .unwrap();
         assert_eq!(restored.restore(&checkpoint_buf[..size]), ResultCode::Ok);
         // The restored filter still knows both ids.
         let state = restored.dedup_state.as_ref().unwrap();
@@ -939,7 +957,7 @@ mod tests {
     }
 
     /// msgpack workspace growth: columine wiring retries and succeeds where
-    /// AxE wiring surfaces the overflow — the drift axis pinned.
+    /// consumer wiring surfaces the overflow — the drift axis pinned.
     #[test]
     fn msgpack_growth_is_wiring_dependent() {
         // A value.$extra schema forces the msgpack workspace into use with
@@ -953,10 +971,14 @@ mod tests {
         let schema = schema_with_names(&fields, b"id\0value.$extra\0");
         assert!(schema.has_extraction_fields);
 
-        let mut axe_ep =
-            EventProcessor::new(EpWiring::axe(), 10, CollisionPolicy::Latest, schema.clone())
-                .unwrap();
-        axe_ep.work_buffer = vec![0; 8];
+        let mut consumer_ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            10,
+            CollisionPolicy::Latest,
+            schema.clone(),
+        )
+        .unwrap();
+        consumer_ep.work_buffer = vec![0; 8];
         let mut col_ep =
             EventProcessor::new(EpWiring::columine(), 10, CollisionPolicy::Latest, schema).unwrap();
         col_ep.work_buffer = vec![0; 8];
@@ -975,9 +997,9 @@ mod tests {
 
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
-            axe_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
+            consumer_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
             ResultCode::ParseError,
-            "AxE wiring: no msgpack growth, overflow surfaces"
+            "consumer wiring: no msgpack growth, overflow surfaces"
         );
         assert_eq!(
             col_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),

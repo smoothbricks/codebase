@@ -1,6 +1,6 @@
 [package]
 name = "lmao-query"
-description = "Tracer-agnostic trace query layer: one selector surface over SQLite or in-process Arrow backends (AxE 08-trace-testing.md)"
+description = "Tracer-agnostic selectors over in-process Arrow, SQLite, and DataFusion trace backends"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
