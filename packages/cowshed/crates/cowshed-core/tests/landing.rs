@@ -237,7 +237,7 @@ async fn a_workspace_whose_head_the_target_contains_is_landed_by_ancestry() {
 async fn content_that_reached_the_target_by_squash_or_rewrite_is_landed_without_being_an_ancestor()
 {
     let fixture = Fixture::new("patch-id-only");
-    let mount = fixture.clone_workspace("dollarbash");
+    let mount = fixture.clone_workspace("squashed-feature");
     workspace_commit(&mount, "feature.txt", "feature\n", "the feature");
     let head = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
 
@@ -286,7 +286,7 @@ async fn content_that_reached_the_target_by_squash_or_rewrite_is_landed_without_
 #[tokio::test]
 async fn a_partially_landed_workspace_reports_only_the_landed_commits_as_landed() {
     let fixture = Fixture::new("partial");
-    let mount = fixture.clone_workspace("axe-llm-live");
+    let mount = fixture.clone_workspace("partly-shipped");
     workspace_commit(&mount, "shipped.txt", "shipped\n", "shipped work");
     workspace_commit(&mount, "pending.txt", "pending\n", "pending work");
     workspace_commit(&mount, "later.txt", "later\n", "later work");
@@ -317,13 +317,13 @@ async fn a_workspace_whose_work_is_nowhere_upstream_is_wholly_unlanded() {
 #[tokio::test]
 async fn an_evil_merge_counts_as_unlanded_because_its_resolution_exists_in_no_parent() {
     let fixture = Fixture::new("evil-merge");
-    let mount = fixture.clone_workspace("greenfield-formats");
+    let mount = fixture.clone_workspace("merge-heavy");
     workspace_commit(&mount, "guard.txt", "guard\n", "guard work");
     let guard = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
     git(&mount, ["checkout", "-q", "-b", "side", "HEAD~1"]);
     workspace_commit(&mount, "side.txt", "side\n", "side work");
     let side = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
-    git(&mount, ["checkout", "-q", "greenfield-formats"]);
+    git(&mount, ["checkout", "-q", "merge-heavy"]);
 
     // The parents touch disjoint files, so the merge itself resolves cleanly — and then authors a
     // file neither parent has. That is an evil merge in its purest form: the only copy of
@@ -341,7 +341,7 @@ async fn an_evil_merge_counts_as_unlanded_because_its_resolution_exists_in_no_pa
             OsStr::new("fetch"),
             OsStr::new("-q"),
             mount.as_os_str(),
-            OsStr::new("greenfield-formats"),
+            OsStr::new("merge-heavy"),
             OsStr::new("side"),
         ],
     );
@@ -368,11 +368,11 @@ async fn an_evil_merge_counts_as_unlanded_because_its_resolution_exists_in_no_pa
 #[tokio::test]
 async fn a_clean_merge_does_not_block_a_workspace_whose_commits_are_all_held() {
     let fixture = Fixture::new("clean-merge");
-    let mount = fixture.clone_workspace("land-wave");
+    let mount = fixture.clone_workspace("topic-branch");
     workspace_commit(&mount, "guard.txt", "guard\n", "guard work");
     git(&mount, ["checkout", "-q", "-b", "side"]);
     workspace_commit(&mount, "side.txt", "side\n", "side work");
-    git(&mount, ["checkout", "-q", "land-wave"]);
+    git(&mount, ["checkout", "-q", "topic-branch"]);
     // Disjoint files, so the merge resolves itself and contributes nothing.
     git(
         &mount,
@@ -441,7 +441,7 @@ async fn an_empty_commit_in_the_range_counts_as_unlanded() {
 #[tokio::test]
 async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_files() {
     let fixture = Fixture::new("conflict");
-    let mount = fixture.clone_workspace("three-way-walk-tuning");
+    let mount = fixture.clone_workspace("conflict-resolver");
     workspace_commit(&mount, "base.txt", "workspace\n", "workspace edit");
     fixture.land_content_separately("base.txt", "upstream\n", "upstream edit");
 
@@ -501,7 +501,7 @@ async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_fi
 #[tokio::test]
 async fn a_dirty_tree_is_counted_by_change_and_does_not_disturb_the_landing_verdict() {
     let fixture = Fixture::new("dirty");
-    let mount = fixture.clone_workspace("four-probe");
+    let mount = fixture.clone_workspace("dirty-tree");
     workspace_commit(&mount, "kept.txt", "kept\n", "kept work");
     fixture.land_content_separately("kept.txt", "kept\n", "kept work upstream");
 
@@ -529,7 +529,7 @@ async fn a_dirty_tree_is_counted_by_change_and_does_not_disturb_the_landing_verd
 #[tokio::test]
 async fn a_target_branch_that_does_not_exist_is_indeterminate_rather_than_landed() {
     let fixture = Fixture::new("no-branch");
-    let mount = fixture.clone_workspace("land-wave");
+    let mount = fixture.clone_workspace("topic-branch");
     workspace_commit(&mount, "wave.txt", "wave\n", "wave work");
 
     let target = resolve_target(&fixture.parent(), "release").await;
@@ -558,7 +558,7 @@ async fn a_target_branch_that_does_not_exist_is_indeterminate_rather_than_landed
 #[tokio::test]
 async fn a_main_mount_that_is_not_a_repository_is_indeterminate_and_says_so() {
     let fixture = Fixture::new("dead-mount");
-    let mount = fixture.clone_workspace("g809-publishing-wall");
+    let mount = fixture.clone_workspace("orphaned-mount");
     workspace_commit(&mount, "wall.txt", "wall\n", "wall work");
 
     let stub = fixture.0.join("unmounted-stub");
@@ -580,7 +580,7 @@ async fn a_main_mount_that_is_not_a_repository_is_indeterminate_and_says_so() {
 #[tokio::test]
 async fn alternate_object_store_is_what_makes_the_comparison_possible() {
     let fixture = Fixture::new("alternates");
-    let mount = fixture.clone_workspace("napi-parity");
+    let mount = fixture.clone_workspace("needs-alternates");
     workspace_commit(&mount, "parity.txt", "parity\n", "parity work");
     fixture.land_content_separately("parity.txt", "parity\n", "parity work upstream");
     let tip = git(fixture.parent(), ["rev-parse", "refs/heads/main"])
@@ -611,7 +611,7 @@ async fn alternate_object_store_is_what_makes_the_comparison_possible() {
 #[tokio::test]
 async fn classification_follows_head_and_not_a_registered_branch_that_has_drifted_from_it() {
     let fixture = Fixture::new("label-drift");
-    let mount = fixture.clone_workspace("rollout-verify");
+    let mount = fixture.clone_workspace("drifted-label");
 
     // The registered label: one commit, landed upstream by content, left behind on that branch.
     workspace_commit(&mount, "verify.txt", "verify\n", "verify work");
@@ -660,7 +660,7 @@ async fn classification_follows_head_and_not_a_registered_branch_that_has_drifte
 #[tokio::test]
 async fn a_stale_cached_remote_ref_has_no_influence_on_the_verdict() {
     let fixture = Fixture::new("stale-remote-cache");
-    let mount = fixture.clone_workspace("greenfield-formats");
+    let mount = fixture.clone_workspace("stale-cache");
     let clone_time_tip = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
 
     // Half one: work that is nowhere upstream, against a main that has moved on. Freeze the cache

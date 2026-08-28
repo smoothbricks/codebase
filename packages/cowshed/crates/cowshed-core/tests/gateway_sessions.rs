@@ -280,7 +280,7 @@ async fn stale_foreign_session_holding_a_claimed_endpoint_is_evicted_before_inst
 #[tokio::test]
 async fn live_foreign_session_on_a_claimed_endpoint_is_an_inventory_fault_not_an_eviction() {
     let repo = RepoId::parse("example-org/example-app").expect("repo");
-    let other = RepoId::parse("example-org/minigraf").expect("other repo");
+    let other = RepoId::parse("example-org/example-app").expect("other repo");
     let claimant = workspace_id(&repo, "lock-contracts", 1);
     let live_owner = workspace_id(&other, "board-wave", 1);
     let control = FakeControl::default();

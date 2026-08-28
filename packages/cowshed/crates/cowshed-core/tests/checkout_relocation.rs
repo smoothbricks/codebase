@@ -55,10 +55,10 @@ impl Relocated {
             "cowshed-relocation-{label}-{}-{nonce}",
             std::process::id()
         ));
-        let live_root = root.join("Dev/_fork/minigraf");
-        let session = root.join("mnt/axe-scale/minigraf/greenfield-formats");
-        let store = root.join("store/axe-scale/minigraf");
-        let image = store.join("sessions/greenfield-formats.sparseimage");
+        let live_root = root.join("dev/projects/example-app");
+        let session = root.join("mnt/example-org/example-app/relocated-session");
+        let store = root.join("store/example-org/example-app");
+        let image = store.join("sessions/relocated-session.sparseimage");
         for path in [&live_root, &session] {
             fs::create_dir_all(path).expect("fixture tree");
         }
@@ -89,11 +89,11 @@ impl Relocated {
         );
         git(
             &session,
-            ["checkout", "-q", "-b", "cowshed/greenfield-formats"],
+            ["checkout", "-q", "-b", "cowshed/relocated-session"],
         );
 
         let fixture = Self {
-            dead_root: root.join(".cowshed/mnt/axe-scale/minigraf/main"),
+            dead_root: root.join(".cowshed/mnt/example-org/example-app/main"),
             root,
             live_root,
             session,
@@ -186,7 +186,7 @@ impl Relocated {
                 project_root: project_root.to_owned(),
                 role: WorkspaceRole::Workspace,
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
-                branch: Some("cowshed/greenfield-formats".to_owned()),
+                branch: Some("cowshed/relocated-session".to_owned()),
                 created_at: "2026-08-01T00:00:00Z".to_owned(),
                 forked_from: None,
                 captured_at: "2026-08-01T00:00:00Z".to_owned(),
@@ -262,11 +262,11 @@ impl Drop for Relocated {
 }
 
 fn repo() -> RepoId {
-    RepoId::parse("axe-scale/minigraf").expect("repo id")
+    RepoId::parse("example-org/example-app").expect("repo id")
 }
 
 fn workspace() -> WorkspaceName {
-    WorkspaceName::new("greenfield-formats").expect("workspace name")
+    WorkspaceName::new("relocated-session").expect("workspace name")
 }
 
 fn incarnation() -> WorkspaceIncarnation {
