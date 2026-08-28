@@ -2051,7 +2051,7 @@ fn emit_doctor<W: Write, E: Write>(output: &mut Output<W, E>, report: &DoctorRep
                 finding.code, finding.message
             ))
             .map_err(output_error)?;
-        if !finding.hint.is_empty() && !hints.iter().any(|hint| *hint == finding.hint.as_str()) {
+        if !finding.hint.is_empty() && !hints.contains(&finding.hint.as_str()) {
             hints.push(finding.hint.as_str());
         }
     }
