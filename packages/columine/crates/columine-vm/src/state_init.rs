@@ -34,9 +34,10 @@
 //! returns `InvalidProgram`/0 — strictly-defined behavior, noted per site.
 
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
+pub use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
-    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, PROGRAM_MAGIC, SLOT_META_SIZE, STATE_FORMAT_VERSION,
+    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, SLOT_META_SIZE, STATE_FORMAT_VERSION,
     STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags,
     StateHeaderOffset, StructFieldType, TOMBSTONE, align8, next_power_of_2,
 };
@@ -166,9 +167,21 @@ struct ProgramView<'a> {
     init_code: &'a [u8],
 }
 
+/// Return whether a program header magic is admitted by the embedder.
+///
+/// Keeping membership in this helper makes every bytecode walker use the same
+/// acceptance rule while retaining a borrowed, allocation-free cold-path set.
+#[inline]
+pub(crate) fn accepts_program_magic(magic: u32, accepted_program_magics: &[u32]) -> bool {
+    accepted_program_magics.contains(&magic)
+}
+
 /// The magic/length prologue every Zig entry point repeats. Returns None on
 /// the conditions where Zig returns 0 / INVALID_PROGRAM.
-fn parse_program(program: &[u8]) -> Option<ProgramView<'_>> {
+fn parse_program<'a>(
+    program: &'a [u8],
+    accepted_program_magics: &[u32],
+) -> Option<ProgramView<'a>> {
     if (program.len() as u32) < PROGRAM_HEADER_SIZE {
         return None;
     }
@@ -177,7 +190,7 @@ fn parse_program(program: &[u8]) -> Option<ProgramView<'_>> {
         | (u32::from(content[1]) << 8)
         | (u32::from(content[2]) << 16)
         | (u32::from(content[3]) << 24);
-    if magic != PROGRAM_MAGIC {
+    if !accepts_program_magic(magic, accepted_program_magics) {
         return None;
     }
     let num_slots = content[6];
@@ -390,19 +403,21 @@ fn validate_init_code(view: &ProgramView<'_>) -> bool {
     false
 }
 
-fn validated_program(program: &[u8]) -> Option<ProgramView<'_>> {
-    let view = parse_program(program)?;
+fn validated_program<'a>(
+    program: &'a [u8],
+    accepted_program_magics: &[u32],
+) -> Option<ProgramView<'a>> {
+    let view = parse_program(program, accepted_program_magics)?;
     validate_init_code(&view).then_some(view)
 }
-
 // =============================================================================
 // State Size Calculation — vm_calculate_state_size
 // =============================================================================
 
 /// state_init.zig:145-381 `vm_calculate_state_size`.
 /// Returns the required buffer size in bytes, or 0 if the program is invalid.
-pub fn calculate_state_size(program: &[u8]) -> u32 {
-    let Some(view) = validated_program(program) else {
+pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> u32 {
+    let Some(view) = validated_program(program, accepted_program_magics) else {
         return 0;
     };
     let init_code = view.init_code;
@@ -654,8 +669,12 @@ fn write_slot_meta(
 /// state_init.zig:442-914 `vm_init_state`.
 /// `state` must be at least `calculate_state_size(program)` bytes and zeroed
 /// (Zig relies on zeroed values regions; both TS backends allocate zeroed).
-pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
-    let Some(view) = validated_program(program) else {
+pub fn init_state(
+    state: &mut [u8],
+    program: &[u8],
+    accepted_program_magics: &[u32],
+) -> Result<(), ErrorCode> {
+    let Some(view) = validated_program(program, accepted_program_magics) else {
         return Err(ErrorCode::InvalidProgram);
     };
     let content = &program[PROGRAM_HASH_PREFIX as usize..];
@@ -1096,14 +1115,17 @@ pub fn init_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
 /// contract: init never writes a HASHMAP's values side-array (it relies on
 /// zeroed memory), and the deleted Zig's reset left stale value bytes behind
 /// on a dirty buffer — unobservable through lookups, but a byte-level lie.
-pub fn reset_state(state: &mut [u8], program: &[u8]) -> Result<(), ErrorCode> {
-    if validated_program(program).is_none() {
+pub fn reset_state(
+    state: &mut [u8],
+    program: &[u8],
+    accepted_program_magics: &[u32],
+) -> Result<(), ErrorCode> {
+    if validated_program(program, accepted_program_magics).is_none() {
         return Err(ErrorCode::InvalidProgram);
     }
     state.fill(0);
-    init_state(state, program)
+    init_state(state, program, accepted_program_magics)
 }
-
 // =============================================================================
 // Slot Growth — vm_calculate_grown_state_size / vm_grow_state
 // =============================================================================

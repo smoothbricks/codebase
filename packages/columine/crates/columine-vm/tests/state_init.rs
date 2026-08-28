@@ -4,6 +4,7 @@
 //! example-based tests only sample. Comments name the Zig test each block
 //! mirrors.
 
+use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
     Opcode, PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotType,
@@ -23,11 +24,8 @@ const HASH_PREFIX: usize = PROGRAM_HASH_PREFIX as usize;
 fn build_single_slot_program(type_flags_byte: u8, cap_lo: u8, cap_hi: u8) -> [u8; 64] {
     let mut prog = [0u8; 64];
     let content = &mut prog[HASH_PREFIX..];
-    // Magic "AXE1" little-endian.
-    content[0] = 0x41;
-    content[1] = 0x58;
-    content[2] = 0x45;
-    content[3] = 0x31;
+    // Magic "CLM1" little-endian.
+    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
     content[4] = 1; // version lo
     content[5] = 0; // version hi
     content[6] = 1; // num_slots
@@ -56,10 +54,7 @@ fn build_single_slot_ttl_program(
     let mut prog = [0u8; 64];
     let flags = type_flags_byte | 0x10 | if has_evict_trigger { 0x20 } else { 0 };
     let content = &mut prog[HASH_PREFIX..];
-    content[0] = 0x41;
-    content[1] = 0x58;
-    content[2] = 0x45;
-    content[3] = 0x31;
+    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
     content[4] = 1;
     content[6] = 1;
     let init_len: u16 = 16; // SLOT_DEF(1) + base(4) + ttl params(10) + HALT(1)
@@ -84,10 +79,7 @@ fn build_struct_map_program(cap_lo: u8, cap_hi: u8, field_types: &[u8]) -> Vec<u
     let nf = field_types.len() as u8;
     let init_len = (1 + 5 + field_types.len() + 1) as u16;
     let content = &mut prog[HASH_PREFIX..];
-    content[0] = 0x41;
-    content[1] = 0x58;
-    content[2] = 0x45;
-    content[3] = 0x31;
+    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
     content[4] = 1;
     content[6] = 1;
     content[10] = init_len as u8;
@@ -108,7 +100,7 @@ fn build_struct_map_program(cap_lo: u8, cap_hi: u8, field_types: &[u8]) -> Vec<u
 fn build_hashmap_and_condition_tree_program(derived_capacity: u16) -> [u8; 64] {
     let mut prog = [0u8; 64];
     let content = &mut prog[HASH_PREFIX..];
-    content[0..4].copy_from_slice(&0x3145_5841u32.to_le_bytes());
+    content[0..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
     content[4] = 1;
     content[6] = 2;
     content[10..12].copy_from_slice(&11u16.to_le_bytes());
@@ -128,7 +120,7 @@ fn build_init_program(num_slots: u8, init: &[u8]) -> Vec<u8> {
     let mut prog = vec![0u8; HASH_PREFIX + 14];
     {
         let content = &mut prog[HASH_PREFIX..];
-        content[0..4].copy_from_slice(&0x3145_5841u32.to_le_bytes());
+        content[0..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
         content[4] = 1;
         content[6] = num_slots;
         content[10..12].copy_from_slice(&(init.len() as u16).to_le_bytes());
@@ -139,20 +131,58 @@ fn build_init_program(num_slots: u8, init: &[u8]) -> Vec<u8> {
 
 fn assert_invalid_init_without_mutation(num_slots: u8, init: &[u8]) {
     let prog = build_init_program(num_slots, init);
-    assert_eq!(calculate_state_size(&prog), 0);
+    assert_eq!(
+        calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
+        0
+    );
 
     let mut state = vec![0xa5; 256];
     let before = state.clone();
     assert_eq!(
-        init_state(&mut state, &prog),
+        init_state(
+            &mut state,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        ),
         Err(ErrorCode::InvalidProgram)
     );
     assert_eq!(state, before);
     assert_eq!(
-        reset_state(&mut state, &prog),
+        reset_state(
+            &mut state,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        ),
         Err(ErrorCode::InvalidProgram)
     );
     assert_eq!(state, before);
+}
+
+#[test]
+fn program_magic_acceptance_uses_embedder_set() {
+    let base = build_single_slot_program(0x00, 8, 0);
+    let foreign_magic = 0x7A6B_5C4Du32;
+    let mut foreign = base;
+    foreign[HASH_PREFIX..HASH_PREFIX + 4].copy_from_slice(&foreign_magic.to_le_bytes());
+
+    assert!(
+        calculate_state_size(
+            &base,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ) > 0
+    );
+    assert_eq!(
+        calculate_state_size(
+            &foreign,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
+        0
+    );
+    let accepted = [PROGRAM_MAGIC, foreign_magic];
+    assert!(calculate_state_size(&foreign, &accepted) > 0);
 }
 /// Probe-read a u32 hashmap value the way vm_map_get does.
 fn map_get(state: &[u8], offset: u32, cap: u32, key: u32) -> Option<u32> {
@@ -297,7 +327,10 @@ fn ttl_side_buffer_size_ttl_plus_evict_trigger() {
 fn calculate_state_size_hashmap() {
     // HASHMAP flags 0x00, requested cap 8 → effective nextPowerOf2(8*2) = 16.
     let prog = build_single_slot_program(0x00, 8, 0);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
 
     let cap = 16u32;
@@ -311,7 +344,10 @@ fn calculate_state_size_hashmap() {
 fn calculate_state_size_aggregate_count() {
     // AGGREGATE flags 0x02, cap_lo = AggType COUNT (2).
     let prog = build_single_slot_program(0x02, 2, 0);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
 
     let mut expected = align8(STATE_HEADER_SIZE + SLOT_META_SIZE);
@@ -325,10 +361,21 @@ fn condition_tree_derived_facts_use_sixteen_bytes_per_cell() {
     let capacity = 4u32;
     let prog = build_single_slot_program(0x04, capacity as u8, 0);
     let expected = align8(STATE_HEADER_SIZE + SLOT_META_SIZE + 8) + capacity * 16;
-    assert_eq!(calculate_state_size(&prog), expected);
+    assert_eq!(
+        calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
+        expected
+    );
 
     let mut state = vec![0u8; expected as usize];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let derived_offset = bytes::read_u32(&state, StateHeaderOffset::DERIVED_FACTS_OFFSET);
     assert_eq!(derived_offset % 8, 0);
@@ -363,11 +410,19 @@ fn condition_tree_derived_facts_use_sixteen_bytes_per_cell() {
 #[test]
 fn init_state_hashmap_keys_empty_size_zero_timestamps_neg_inf() {
     let prog = build_single_slot_program(0x00, 8, 0);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
 
     let mut state = vec![0u8; 16384];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     assert_eq!(bytes::read_u32(&state, 0), STATE_MAGIC);
 
@@ -393,11 +448,19 @@ fn init_state_hashmap_keys_empty_size_zero_timestamps_neg_inf() {
 #[test]
 fn init_state_aggregate_sum_value_zero_count_zero() {
     let prog = build_single_slot_program(0x02, 1, 0); // SUM
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
 
     let mut state = vec![0u8; 16384];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let offset = bytes::read_u32(&state, STATE_HEADER_SIZE);
     assert!((aggregates::agg_value_f64(&state, offset) - 0.0).abs() < 0.001);
@@ -408,7 +471,12 @@ fn init_state_aggregate_sum_value_zero_count_zero() {
 fn init_state_aggregate_min_value_pos_inf() {
     let prog = build_single_slot_program(0x02, 3, 0); // MIN
     let mut state = vec![0u8; 16384];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let offset = bytes::read_u32(&state, STATE_HEADER_SIZE);
     assert_eq!(aggregates::agg_value_f64(&state, offset), f64::INFINITY);
@@ -418,11 +486,19 @@ fn init_state_aggregate_min_value_pos_inf() {
 #[test]
 fn init_state_hashset_keys_empty() {
     let prog = build_single_slot_program(0x01, 8, 0); // HASHSET
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
 
     let mut state = vec![0u8; 16384];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let meta = STATE_HEADER_SIZE;
     let offset = bytes::read_u32(&state, meta);
@@ -440,9 +516,17 @@ fn init_state_hashset_keys_empty() {
 #[test]
 fn calculate_grown_state_size_hashmap_cap_doubles() {
     let prog = build_single_slot_program(0x00, 8, 0);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     let mut state = vec![0u8; 16384];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let grown_size = calculate_grown_state_size(&state, 0);
     assert!(grown_size > size);
@@ -464,8 +548,14 @@ fn hashmap_no_timestamp_slot_reduces_state_size() {
     let with_ts = build_single_slot_program(0x00, 4, 0);
     let no_ts = build_single_slot_program(0x40, 4, 0); // no_hashmap_timestamps
 
-    let with_ts_size = calculate_state_size(&with_ts);
-    let no_ts_size = calculate_state_size(&no_ts);
+    let with_ts_size = calculate_state_size(
+        &with_ts,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
+    let no_ts_size = calculate_state_size(
+        &no_ts,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     // Effective capacity nextPowerOf2(4*2) = 16, saving one f64 per entry.
     assert_eq!(with_ts_size - no_ts_size, 16 * 8);
 }
@@ -474,11 +564,21 @@ fn hashmap_no_timestamp_slot_reduces_state_size() {
 #[test]
 fn hashmap_no_timestamp_plus_ttl_combination_rejected() {
     let prog = build_single_slot_ttl_program(0x40, 4, 0, 10.0, 0.0, false);
-    assert_eq!(calculate_state_size(&prog), 0);
+    assert_eq!(
+        calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
+        0
+    );
 
     let mut state = vec![0u8; 256];
     assert_eq!(
-        init_state(&mut state, &prog),
+        init_state(
+            &mut state,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        ),
         Err(ErrorCode::InvalidProgram)
     );
 }
@@ -487,8 +587,20 @@ fn hashmap_no_timestamp_plus_ttl_combination_rejected() {
 fn calculate_state_size_rejects_bad_magic_and_short_programs() {
     let mut prog = build_single_slot_program(0x00, 8, 0);
     prog[HASH_PREFIX] = 0xde; // corrupt magic
-    assert_eq!(calculate_state_size(&prog), 0);
-    assert_eq!(calculate_state_size(&[0u8; 8]), 0);
+    assert_eq!(
+        calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
+        0
+    );
+    assert_eq!(
+        calculate_state_size(
+            &[0u8; 8],
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
+        0
+    );
 }
 
 #[test]
@@ -505,10 +617,18 @@ fn scalar_slot_metadata_accepts_only_explicit_u32_f64_and_i64_subtypes() {
                 Opcode::Halt as u8,
             ],
         );
-        let size = calculate_state_size(&prog);
+        let size = calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        );
         assert!(size > 0);
         let mut state = vec![0u8; size as usize];
-        init_state(&mut state, &prog).expect("valid scalar metadata");
+        init_state(
+            &mut state,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .expect("valid scalar metadata");
         assert_eq!(
             state[(STATE_HEADER_SIZE + 12) as usize] & 0x0f,
             SlotType::Scalar as u8
@@ -593,13 +713,22 @@ fn calculate_state_size_ttl_hashset_adds_eviction_buffers() {
     let ttl_evict = build_single_slot_ttl_program(0x01, 8, 0, 10.0, 0.0, true);
 
     let cap = 16u32;
-    let base_size = calculate_state_size(&base);
+    let base_size = calculate_state_size(
+        &base,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert_eq!(
-        calculate_state_size(&ttl),
+        calculate_state_size(
+            &ttl,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
         base_size + align8(cap * EVICTION_ENTRY_SIZE)
     );
     assert_eq!(
-        calculate_state_size(&ttl_evict),
+        calculate_state_size(
+            &ttl_evict,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+        ),
         base_size + align8(cap * EVICTION_ENTRY_SIZE) + align8(1024 * EVICTION_ENTRY_SIZE)
     );
 }
@@ -608,11 +737,19 @@ fn calculate_state_size_ttl_hashset_adds_eviction_buffers() {
 #[test]
 fn init_state_ttl_hashset_writes_eviction_metadata() {
     let prog = build_single_slot_ttl_program(0x01, 8, 0, 10.0, 2.5, true);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
 
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let meta = STATE_HEADER_SIZE;
     let cap = bytes::read_u32(&state, meta + 4);
@@ -647,9 +784,17 @@ fn insert_into_hashmap(state: &mut [u8], offset: u32, cap: u32, key: u32, value:
 #[test]
 fn grow_state_hashmap_preserves_entries_and_doubles_cap() {
     let prog = build_single_slot_program(0x00, 8, 0);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let meta = STATE_HEADER_SIZE;
     let offset = bytes::read_u32(&state, meta);
@@ -676,9 +821,17 @@ fn grow_state_hashmap_preserves_entries_and_doubles_cap() {
 fn grow_state_relocates_full_derived_fact_cells_without_lane_drift() {
     let capacity = 4u32;
     let prog = build_hashmap_and_condition_tree_program(capacity as u16);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let old_derived = bytes::read_u32(&state, StateHeaderOffset::DERIVED_FACTS_OFFSET);
     let identity_a = (3u64 << 32) | 7;
@@ -721,9 +874,17 @@ fn grow_state_relocates_full_derived_fact_cells_without_lane_drift() {
 fn grow_state_struct_map_rehashes_rows() {
     let fields = [StructFieldType::UInt32 as u8, StructFieldType::Int64 as u8];
     let prog = build_struct_map_program(8, 0, &fields);
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog).expect("init must succeed");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init must succeed");
 
     let meta = STATE_HEADER_SIZE;
     let offset = bytes::read_u32(&state, meta);
@@ -789,8 +950,14 @@ proptest! {
         let (lo, hi) = (cap_a.min(cap_b), cap_a.max(cap_b));
         let prog_lo = build_single_slot_program(flags, lo as u8, (lo >> 8) as u8);
         let prog_hi = build_single_slot_program(flags, hi as u8, (hi >> 8) as u8);
-        let size_lo = calculate_state_size(&prog_lo);
-        let size_hi = calculate_state_size(&prog_hi);
+        let size_lo = calculate_state_size(
+            &prog_lo,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        );
+        let size_hi = calculate_state_size(
+            &prog_hi,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        );
         prop_assert!(size_lo > 0 && size_hi > 0);
         prop_assert_eq!(size_lo % 8, 0);
         prop_assert!(size_lo <= size_hi);
@@ -805,8 +972,14 @@ proptest! {
         let prog_zero = build_single_slot_program(flags, 0, 0);
         let prog_default = build_single_slot_program(flags, 0, 4); // 1024 = 0x0400
         prop_assert_eq!(
-            calculate_state_size(&prog_zero),
-            calculate_state_size(&prog_default)
+            calculate_state_size(
+                &prog_zero,
+                columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+            ),
+            calculate_state_size(
+                &prog_default,
+                columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+            )
         );
     }
 
@@ -829,11 +1002,19 @@ proptest! {
             _ => cap,
         };
         let prog = build_single_slot_program(flags, cap_lo, 0);
-        let size = calculate_state_size(&prog) as usize;
+        let size = calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        ) as usize;
         prop_assert!(size > 0);
 
         let mut fresh = vec![0u8; size];
-        init_state(&mut fresh, &prog).expect("init");
+        init_state(
+            &mut fresh,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .expect("init");
 
         let meta = STATE_HEADER_SIZE;
         let offset = bytes::read_u32(&fresh, meta) as usize;
@@ -851,7 +1032,12 @@ proptest! {
             let idx = data_start + (i * 7) % (size - data_start);
             scribbled[idx] = *b;
         }
-        reset_state(&mut scribbled, &prog).expect("reset");
+        reset_state(
+            &mut scribbled,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .expect("reset");
         for i in 0..size {
             if !unrestored.contains(&i) {
                 prop_assert_eq!(scribbled[i], fresh[i], "byte {} not restored", i);
@@ -865,9 +1051,17 @@ proptest! {
         keys in proptest::collection::btree_set(0u32..1_000_000, 1..11),
     ) {
         let prog = build_single_slot_program(0x00, 8, 0);
-        let size = calculate_state_size(&prog) as usize;
+        let size = calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        ) as usize;
         let mut state = vec![0u8; size];
-        init_state(&mut state, &prog).expect("init");
+        init_state(
+            &mut state,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .expect("init");
 
         let meta = STATE_HEADER_SIZE;
         let offset = bytes::read_u32(&state, meta);
@@ -893,9 +1087,17 @@ proptest! {
     #[test]
     fn repeated_growth_is_metadata_driven(cap in 0u8..32) {
         let prog = build_single_slot_program(0x01, cap, 0); // HASHSET
-        let size = calculate_state_size(&prog) as usize;
+        let size = calculate_state_size(
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        ) as usize;
         let mut state = vec![0u8; size];
-        init_state(&mut state, &prog).expect("init");
+        init_state(
+            &mut state,
+            &prog,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .expect("init");
 
         let meta = STATE_HEADER_SIZE;
         let cap1 = bytes::read_u32(&state, meta + 4);

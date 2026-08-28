@@ -1,3 +1,4 @@
+use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
     EMPTY_KEY, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
     TOMBSTONE, hash_key_pair,
@@ -15,7 +16,8 @@ const OK: u32 = ErrorCode::Ok as u32;
 
 fn program(init: &[u8], num_inputs: u8, reduce: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
-    out.extend([0x41, 0x58, 0x45, 0x31, 1, 0, 1, num_inputs, 0, 0]);
+    out.extend(PROGRAM_MAGIC.to_le_bytes());
+    out.extend([1, 0, 1, num_inputs, 0, 0]);
     out.extend(u16::try_from(init.len()).unwrap().to_le_bytes());
     out.extend(u16::try_from(reduce.len()).unwrap().to_le_bytes());
     out.extend_from_slice(init);
@@ -45,10 +47,18 @@ fn map2_program(requested_capacity: u16, fields: &[u8], num_inputs: u8, reduce: 
 }
 
 fn init(program: &[u8]) -> Vec<u8> {
-    let size = calculate_state_size(program);
+    let size = calculate_state_size(
+        program,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, program).unwrap();
+    init_state(
+        &mut state,
+        program,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .unwrap();
     state
 }
 

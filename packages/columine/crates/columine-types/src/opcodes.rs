@@ -190,8 +190,10 @@ pub enum DurationUnit {
     Year = 8,
 }
 
-/// Program-format magic in little-endian wire order.
-pub const PROGRAM_MAGIC: u32 = 0x3145_5841;
+/// Program-format magic in little-endian wire order: ASCII bytes `C L M 1`.
+pub const PROGRAM_MAGIC: u32 = 0x314D_4C43;
+/// The default program-magic acceptance set for public embedders.
+pub const DEFAULT_ACCEPTED_PROGRAM_MAGICS: &[u32] = &[PROGRAM_MAGIC];
 /// Reserved bytes at program start for SHA-256 hash.
 pub const PROGRAM_HASH_PREFIX: u32 = 32;
 /// Total header size: hash prefix (32) + content header (14).

@@ -5,7 +5,6 @@
 use core::mem::size_of;
 
 pub const STATE_MAGIC: u32 = 0x5354_4154;
-pub const PROGRAM_MAGIC: u32 = 0x3145_5841;
 pub const RETE_MAGIC: u32 = 0x4554_4552;
 pub const STATE_HEADER_SIZE: u32 = 32;
 pub const PROGRAM_HASH_PREFIX: u32 = 32;

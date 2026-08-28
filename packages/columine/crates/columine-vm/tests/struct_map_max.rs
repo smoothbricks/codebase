@@ -1,3 +1,4 @@
+use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_vm::bytes;
 use columine_vm::state_init::{calculate_state_size, init_state};
@@ -21,7 +22,8 @@ fn program(num_inputs: u8, field_types: &[u8], reduce: &[u8]) -> Vec<u8> {
     init.push(0);
 
     let mut program = vec![0u8; 32];
-    program.extend([0x41, 0x58, 0x45, 0x31, 1, 0, 1, num_inputs, 0, 0]);
+    program.extend(PROGRAM_MAGIC.to_le_bytes());
+    program.extend([1, 0, 1, num_inputs, 0, 0]);
     program.extend(
         u16::try_from(init.len())
             .expect("init length fits u16")
@@ -91,10 +93,18 @@ fn flat_map(body: &[u8]) -> Vec<u8> {
 }
 
 fn init(program: &[u8]) -> Vec<u8> {
-    let size = calculate_state_size(program);
+    let size = calculate_state_size(
+        program,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0);
     let mut state = vec![0u8; usize::try_from(size).expect("state size fits usize")];
-    init_state(&mut state, program).expect("init state");
+    init_state(
+        &mut state,
+        program,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init state");
     state
 }
 
