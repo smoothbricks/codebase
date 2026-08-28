@@ -383,17 +383,34 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(targets['cargo-wasm']).toBeUndefined();
       expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts']);
-      expect(targets['cargo-napi']).toMatchObject({
-        executor: 'nx:run-commands',
-        cache: true,
-        dependsOn: ['^build'],
-        outputs: ['{projectRoot}/dist/native/host'],
-        options: {
-          cwd: 'packages/cowshed',
-          command:
-            'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
-        },
-      });
+      // Match the production host suffix so both native-platform and dedicated
+      // cargo-napi host-provider regimes are covered on every runner.
+      const hostOs = process.platform === 'darwin' ? 'macos' : process.platform === 'linux' ? 'linux' : null;
+      const hostArch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : null;
+      const hostSuffix = hostOs !== null && hostArch !== null ? `-${hostArch}-${hostOs}` : null;
+      const hostPlatformNapiTarget = hostSuffix === null ? null : `napi${hostSuffix}`;
+      const nativeHostProvider = hostPlatformNapiTarget?.endsWith('-macos') ? hostPlatformNapiTarget : null;
+      const hostProvider = nativeHostProvider ?? 'cargo-napi';
+      const hostProviders = ['cargo-napi', nativeHostProvider].filter(
+        (name): name is string => name !== null && targets[name] !== undefined,
+      );
+      expect(hostProviders).toHaveLength(1);
+      expect(hostProviders[0]).toBe(hostProvider);
+      if (hostProvider === 'cargo-napi') {
+        expect(targets['cargo-napi']).toMatchObject({
+          executor: 'nx:run-commands',
+          cache: true,
+          dependsOn: ['^build'],
+          outputs: ['{projectRoot}/dist/native/host'],
+          options: {
+            cwd: 'packages/cowshed',
+            command:
+              'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
+          },
+        });
+      } else {
+        expect(targets['cargo-napi']).toBeUndefined();
+      }
       expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64']);
       expect(targets['napi-arm64-macos']?.options).toMatchObject({
         command:
@@ -421,11 +438,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         env: { TARGET_CC: 'clang', TARGET_CXX: 'clang++' },
       });
       // The aggregate build pulls in exactly the HOST's platform-suffixed
-      // targets (publish still owns foreign platforms). This suite runs on
-      // macOS and Linux hosts, so derive the expectation from the process.
-      const hostSuffix = `-${process.arch === 'arm64' ? 'arm64' : 'x64'}-${
-        process.platform === 'darwin' ? 'macos' : 'linux'
-      }`;
+      // targets (publish still owns foreign platforms).
       const hostNapiTargets = [
         'cli-arm64-macos',
         'cli-x64-linux',
@@ -434,21 +447,25 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'napi-arm64-linux',
         'napi-x64-linux',
       ]
-        .filter((name) => name.endsWith(hostSuffix))
+        .filter((name) => hostSuffix !== null && name.endsWith(hostSuffix))
         .sort();
       expect(targets.build?.dependsOn).toEqual([...buildOutputDependencies, ...hostNapiTargets]);
       const platformBuildDependencies = (targets.build?.dependsOn ?? []).filter(
         (dependency): dependency is string =>
           typeof dependency === 'string' && /-(?:arm64|x64)-(?:macos|linux)$/.test(dependency),
       );
-      for (const name of platformBuildDependencies) {
-        expect(name.endsWith(hostSuffix)).toBe(true);
+      if (hostSuffix !== null) {
+        for (const name of platformBuildDependencies) {
+          expect(name.endsWith(hostSuffix)).toBe(true);
+        }
+      } else {
+        expect(platformBuildDependencies).toEqual([]);
       }
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
         cache: true,
-        dependsOn: ['cargo-test', 'cargo-napi', 'tsc-js', '^build', 'build'],
+        dependsOn: ['cargo-test', hostProvider, 'tsc-js', '^build', 'build'],
         options: {
           command: 'bun test --config=../bunfig.toml --timeout=30000 native.test.ts',
           cwd: 'packages/cowshed/src',

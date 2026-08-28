@@ -37,8 +37,7 @@
     "targets": {
       "build": {
         "outputs": [
-          "{projectRoot}/dist/ts",
-          "{projectRoot}/dist/native/host"
+          "{projectRoot}/dist/ts"
         ]
       },
       "refresh-harnesses": {
