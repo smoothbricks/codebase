@@ -30,36 +30,9 @@ in {
       nodejs_latest
       # Bun.sh for javascript dependencies
       bun
-      # Rust toolchain for packages/cowshed and packages/lmao-rs: cargo, rustc,
-      # clippy, rustfmt via rust-overlay stable, plus rust-src/rust-analyzer for
-      # IDE and LSP use. Keep the WASM target on every system; add only the
-      # native release targets that the current runner can build.
-      (rust-bin.stable.latest.default.override {
-        extensions = ["rust-src" "rust-analyzer"];
-        targets =
-          ["wasm32-unknown-unknown"]
-          ++ lib.optionals pkgs.stdenv.isDarwin [
-            "aarch64-apple-darwin"
-            "x86_64-apple-darwin"
-          ]
-          ++ lib.optionals pkgs.stdenv.isLinux [
-            "aarch64-unknown-linux-gnu"
-          ];
-      })
-      # Nightly rides alongside stable as an explicit `cargo-nightly` shim, so
-      # stable stays the default for every existing target. Only the wasm
-      # artifact build uses it: -Zbuild-std + panic=immediate-abort strips the
-      # fmt/panic machinery stable cannot remove (packages/columine justfile
-      # `wasm`; same shim as AxE's devenv). rust-src is required by -Zbuild-std.
-      (let
-        nightly = rust-bin.nightly.latest.minimal.override {
-          extensions = ["rust-src"];
-        };
-      in
-        pkgs.writeShellScriptBin "cargo-nightly" ''
-          export RUSTC="${nightly}/bin/rustc"
-          exec "${nightly}/bin/cargo" "$@"
-        '')
+      # The toolchain itself comes from ./devenv.smoo.nix (one nightly for every
+      # repository, pinned by devenv.lock). Only this repository's extra targets
+      # are declared here, below, via languages.rust.targets.
       just # Task runner for packages/columine (mirrors lmao-rs/axe justfiles)
       cargo-nextest # Rust test runner
       cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
@@ -91,6 +64,19 @@ in {
   # https://devenv.sh/recipes/macos/
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
+
+  # Targets merge with the managed module's channel/components. Keep WASM on
+  # every system; add only the native release targets the current runner can
+  # actually build, so a laptop does not fetch Linux std it never links.
+  languages.rust.targets =
+    ["wasm32-unknown-unknown"]
+    ++ lib.optionals pkgs.stdenv.isDarwin [
+      "aarch64-apple-darwin"
+      "x86_64-apple-darwin"
+    ]
+    ++ lib.optionals pkgs.stdenv.isLinux [
+      "aarch64-unknown-linux-gnu"
+    ];
 
   # NX_PARALLEL, the PATH/toolchain exports, and the sccache policy come from
   # ./devenv.smoo.nix.

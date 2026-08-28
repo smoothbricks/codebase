@@ -21,6 +21,36 @@
   # developer shell or CI runner; explicit --parallel flags still take precedence.
   env.NX_PARALLEL = "100%";
 
+  # One toolchain for every repository and every workspace, pinned by devenv.lock
+  # rather than by a rust-toolchain file. devenv resolves the channel through
+  # rust-overlay, so a lock bump is the only thing that moves the compiler, and a
+  # CI runner building this same shell gets the same rustc a laptop has.
+  #
+  # Nightly because the fleet needs `-Z` features (`-Zbuild-std`,
+  # `panic=immediate-abort` for wasm artifacts) and there is no reason to keep a
+  # second toolchain alongside for them. `version = "latest"` reads "newest
+  # nightly the locked rust-overlay offers", not "whatever nightly exists today".
+  #
+  # `components` and `targets` are list options, so a repository adds its own
+  # targets in devenv.nix and they merge with these; `channel` and `version` are
+  # single-valued and belong to this module. A `rust-toolchain.toml` is NOT the
+  # mechanism here: nix cargo ignores it unless devenv is pointed at it with
+  # `languages.rust.toolchainFile`, so such a file is decoration that silently
+  # disagrees with the shell.
+  languages.rust = {
+    enable = true;
+    channel = "nightly";
+    version = "latest";
+    components = [
+      "rustc"
+      "cargo"
+      "clippy"
+      "rustfmt"
+      "rust-analyzer"
+      "rust-src"
+    ];
+  };
+
   enterShell = lib.mkMerge [
     # Prologue, in order:
     #
