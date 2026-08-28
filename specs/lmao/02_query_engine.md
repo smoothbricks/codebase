@@ -5,9 +5,9 @@
 > no Lambda deployment, no `read_ipc`/`httpfs` S3 wiring, and no DuckDB C extension. The repo's only DuckDB usage is the
 > **browser** DuckDB-WASM engine in `packages/lmao-inspector` (spec 03), which has no `msgpack_extract` either (it
 > queries Arrow primitive/standard columns only). The server-side path here is staged as `smoo/lmao` action nodes — it
-> is intended infrastructure, not shipped. The Zig `msgpack_extractor.zig` in `packages/columine` is a columnar-runtime
-> msgpack scanner (payload extraction in a VM), a different artifact from the DuckDB scalar function this spec
-> specifies.
+> is intended infrastructure, not shipped. The Rust `columine` msgpack scanner in
+> `packages/columine/crates/columine-parsing` is a columnar-runtime payload extractor in a VM, a different artifact from
+> the DuckDB scalar function this spec specifies.
 
 ## Overview <a id="smoo/lmao!n/query-engine.overview"></a>
 
@@ -45,7 +45,7 @@ Rejected because:
 - **Precision loss**: BigInt → number (loses precision above 2^53), Date → string (loses type), undefined vs null
   conflation, NaN/Infinity → null
 - **Size**: JSON is ~2-4x larger than msgpack for typical payloads
-- **Encoding cost**: JSON.stringify is slower than msgpack encoding on the Zig hot path
+- **Encoding cost**: JSON.stringify is slower than msgpack encoding on lmao's hot path
 - **DuckDB extension is small**: The custom function is a bounded, well-scoped piece of work
 
 ### Why DuckDB Specifically <a id="smoo/lmao!n/query-engine.why-duckdb-specifically"></a>
@@ -164,7 +164,7 @@ The extension needs:
 
 ### Scope <a id="smoo/lmao!n/query-engine-msgpack-extract.scope"></a>
 
-The extension only needs to handle the msgpack subset that lmao's Zig encoder produces:
+The extension only needs to handle the msgpack subset that lmao's encoder produces:
 
 - nil, boolean, integer (positive/negative fixint, uint8-64, int8-64), float32, float64
 - string (fixstr, str8-32), binary (bin8-32)
