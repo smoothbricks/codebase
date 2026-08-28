@@ -183,8 +183,9 @@ function buildProgram(): Command {
     });
   release
     .command('version')
+    .description('Bump release package versions and create the release commit; writes no tags')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
-    .option('--dry-run [dryRun]', 'run without writing versions or tags')
+    .option('--dry-run [dryRun]', 'preview the bump without writing versions or a release commit')
     .option('--github-output <path>', 'append mode=<mode> and projects=<nx-projects> to a GitHub Actions output file')
     .action(async (options: { bump: string; dryRun?: string | boolean; githubOutput?: string }) => {
       const { releaseVersion } = await import('./release/index.js');
@@ -193,6 +194,14 @@ function buildProgram(): Command {
         dryRun: booleanOption(options.dryRun),
         githubOutput: options.githubOutput,
       });
+    });
+  release
+    .command('tag')
+    .description('Create the release tags for the release commit at HEAD')
+    .option('--dry-run [dryRun]', 'report the tags without creating them')
+    .action(async (options: { dryRun?: string | boolean }) => {
+      const { releaseCreateTags } = await import('./release/index.js');
+      await releaseCreateTags(await findRepoRoot(), { dryRun: booleanOption(options.dryRun) });
     });
   release
     .command('publish')

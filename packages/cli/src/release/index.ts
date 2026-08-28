@@ -58,6 +58,7 @@ import {
   type ReleaseSummary,
   type ReleaseVersionMode,
   repairPendingTargets,
+  runReleaseTag,
   runReleaseVersion,
 } from './orchestration.js';
 import { type RetagUnpublishedTagUpdate, retagUnpublished } from './retag-unpublished.js';
@@ -66,6 +67,10 @@ export interface ReleaseVersionOptions {
   bump: string;
   dryRun?: boolean;
   githubOutput?: string;
+}
+
+export interface ReleaseTagOptions {
+  dryRun?: boolean;
 }
 
 export interface ReleasePublishOptions {
@@ -120,7 +125,6 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
     {
       releasePackagesAtHead: () => releasePackagesAtHead(root, packages),
       releaseVersionPackages: (releaseBump) => releaseVersionPackages(root, packages, releaseBump),
-      ensureLocalReleaseTags: (releasePackages) => ensureLocalReleaseTags(root, releasePackages),
       gitHead: () => gitHead(root),
       runNxReleaseVersion: (releasePackages, releaseBump, dryRun) =>
         runNxReleaseVersion(root, releasePackageProjects(releasePackages), releaseBump, dryRun),
@@ -137,6 +141,30 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
     await writeReleasePreviewSummary(root, packages, result.packages);
   }
   await writeReleaseGithubOutput(options.githubOutput, result.packages, result.mode);
+}
+
+/**
+ * Create the release tags for the release commit at HEAD. Separate from
+ * `smoo release version` on purpose: versioning runs in every release-candidate
+ * job (Linux plus one macOS leg per architecture) before the tree has been
+ * built, linted, and tested, so it must not write refs that outlive a red
+ * candidate. Only the publishing job tags, and only just before it publishes.
+ */
+export async function releaseCreateTags(root: string, options: ReleaseTagOptions): Promise<void> {
+  const packages = releasePackages(root);
+  const result = await runReleaseTag(
+    {
+      releasePackagesAtHead: () => releasePackagesAtHead(root, packages),
+      ensureLocalReleaseTags: (releasePackages) => ensureLocalReleaseTags(root, releasePackages),
+    },
+    { dryRun: options.dryRun === true },
+  );
+  if (result.status === 'no-release') {
+    console.log('No release commit at HEAD; no release tags to create.');
+    return;
+  }
+  const tags = result.packages.map((pkg) => releaseTag(pkg)).join(', ');
+  console.log(result.status === 'dry-run' ? `Would create release tags ${tags}.` : `Created release tags ${tags}.`);
 }
 
 export async function releasePublish(root: string, options: ReleasePublishOptions): Promise<void> {
@@ -708,14 +736,16 @@ async function runNxReleaseVersion(
     return runNxReleaseVersionPreview(root, projects, bump);
   }
 
-  // Nx owns local release mutation: package versions, bun.lock updates, the
-  // release commit, and annotated tags. smoo owns remote publication after the
-  // workflow validates the exact release commit Nx produced.
+  // Nx owns local release mutation: package versions, bun.lock updates, and the
+  // release commit. Tagging is deliberately withheld (`--git-tag=false`): this
+  // runs in every release-candidate job before Build, Lint, and Unit Tests, so a
+  // tag written here would survive a red candidate and collide on the next run.
+  // `smoo release tag` creates the tags once, in the publishing job.
   const nxArgs = ['release', 'version'];
   if (bump !== 'auto') {
     nxArgs.push(bump);
   }
-  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=true', '--git-push=false');
+  nxArgs.push(`--projects=${projects}`, '--git-commit=true', '--git-tag=false', '--git-push=false');
   await run('nx', nxArgs, root);
   return [];
 }
@@ -732,7 +762,9 @@ async function runNxReleaseVersionPreview(root: string, projects: string, bump: 
       specifier: bump === 'auto' ? undefined : bump,
       projects: projectNames,
       gitCommit: true,
-      gitTag: true,
+      // Mirror the real invocation exactly, so the preview never reports a tag
+      // that `smoo release version` would not have written.
+      gitTag: false,
       gitPush: false,
       dryRun: true,
     });
@@ -806,9 +838,27 @@ async function writeReleaseGithubOutput(
   await appendFile(outputPath, `mode=${mode}\nprojects=${releasePackageProjects(packages)}\n`);
 }
 
-async function releasePackagesAtRef(root: string, packages: ReleasePackage[], ref: string): Promise<ReleasePackage[]> {
-  const packagesAtRef = await Promise.all(packages.map(async (pkg) => releasePackageAtRef(root, pkg, ref)));
-  const presentPackages = packagesAtRef.filter((pkg): pkg is ReleasePackage => pkg !== null);
+/**
+ * Which owned release packages the commit at `ref` releases.
+ *
+ * Tags are the direct evidence, but they are no longer written by versioning:
+ * `smoo release version` produces the release commit and `smoo release tag`
+ * creates the tags later, in the publishing job. Between those two points a
+ * validated release commit is legitimately untagged, so the fallback — Nx's
+ * release commit subject plus a version that differs from the parent — is the
+ * only evidence available, and it is what `smoo release tag` itself runs on.
+ */
+export async function releasePackagesAtRef<Package extends ReleasePackageInfo>(
+  root: string,
+  packages: Package[],
+  ref: string,
+): Promise<Package[]> {
+  // Promise.all widens the element type to `Awaited<Package> | null`, which no
+  // longer relates to `Package`; annotate so the null filter narrows.
+  const packagesAtRef: Array<Package | null> = await Promise.all(
+    packages.map((pkg) => releasePackageAtRef(root, pkg, ref)),
+  );
+  const presentPackages = packagesAtRef.filter((pkg): pkg is Package => pkg !== null);
   const tags = new Set(await gitTagsAtRef(root, ref));
   const taggedPackages = presentPackages.filter((pkg) => tags.has(releaseTag(pkg)));
   if (taggedPackages.length > 0) {
@@ -820,7 +870,11 @@ async function releasePackagesAtRef(root: string, packages: ReleasePackage[], re
   return releasePackagesChangedAtRef(root, presentPackages, ref);
 }
 
-async function releasePackageAtRef(root: string, pkg: ReleasePackage, ref: string): Promise<ReleasePackage | null> {
+async function releasePackageAtRef<Package extends ReleasePackageInfo>(
+  root: string,
+  pkg: Package,
+  ref: string,
+): Promise<Package | null> {
   const version = await packageVersionAtRef(root, pkg.path, ref);
   return version ? { ...pkg, version } : null;
 }
@@ -842,15 +896,15 @@ async function isNxReleaseCommit(root: string, ref: string): Promise<boolean> {
   return result.exitCode === 0 && decode(result.stdout).trim() === 'chore(release): publish';
 }
 
-async function releasePackagesChangedAtRef(
+async function releasePackagesChangedAtRef<Package extends ReleasePackageInfo>(
   root: string,
-  packages: ReleasePackage[],
+  packages: Package[],
   ref: string,
-): Promise<ReleasePackage[]> {
+): Promise<Package[]> {
   if (!(await gitRefExists(root, `${ref}^`))) {
     return packages;
   }
-  const changed: ReleasePackage[] = [];
+  const changed: Package[] = [];
   for (const pkg of packages) {
     const previousVersion = await packageVersionAtRef(root, pkg.path, `${ref}^`);
     if (previousVersion !== pkg.version) {
