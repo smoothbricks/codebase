@@ -102,29 +102,88 @@ describe('publish workflow definition', () => {
     );
     const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
 
-    expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
-    expect(singleJob).toContain('# Step 14\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
-    expect(singleJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+    expect(singleJob).toContain('# Step 14\n      - name: 🏷️ Tag release');
+    expect(singleJob).toContain('# Step 15\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
+    expect(singleJob).toContain('# Step 16\n      - name: 🧹 Cleanup and cache Nix/devenv');
     expect(linuxCandidate).toContain('# Step 7\n      - name: 🔒 Capture candidate release SHA');
     expect(linuxCandidate).toContain(
       '# Step 8\n      - name: ✅ Check managed monorepo files (${{ steps.version.outputs.mode }})',
     );
     expect(linuxCandidate).toContain('# Step 19\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(macosPlatform).toContain('# Step 6\n      - name: 🏷️ Version release');
+    expect(macosPlatform).toContain('# Step 6\n      - name: 🔢 Version release');
     expect(macosPlatform).toContain('# Step 7\n      - name: 🍎 Build selected macOS and iOS release outputs');
     expect(macosPlatform).toContain('# Step 10\n      - name: 🧹 Cleanup and cache Nix/devenv');
     expect(finalJob).toContain('# Step 7\n      - name: 🧯 Repair pending releases');
     expect(finalJob).toContain('# Step 8\n      - name: ♻️ Restore validated release state');
     expect(finalJob).toContain('# Step 9\n      - name: 📦 Apply verified Linux outputs');
     expect(finalJob).toContain('# Step 10\n      - name: 🍎 Apply verified macOS outputs');
+    expect(finalJob).toContain('# Step 12\n      - name: 🏷️ Tag release');
     expect(finalJob).toContain(
-      '# Step 12\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
+      '# Step 13\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
     );
-    expect(finalJob).toContain('# Step 13\n      - name: 🚀 Deploy production');
-    expect(finalJob).toContain('# Step 14\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 14\n      - name: 🚀 Deploy production');
+    expect(finalJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
+  });
+
+  it('tags only in the publishing job, after repair and before the npm publish', () => {
+    const platform = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      macosPlatformArchitectures: ['arm64', 'x64'],
+    });
+    const linuxCandidate = platform.slice(
+      platform.indexOf('  linux-release-candidate:'),
+      platform.indexOf('  macos-platform:'),
+    );
+    const macosPlatform = platform.slice(
+      platform.indexOf('  macos-platform:'),
+      platform.indexOf('  publish-on-linux:'),
+    );
+    const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
+
+    // Candidates build the versioned tree, so versioning stays ahead of Build,
+    // but a candidate that fails Build, Lint, or Unit Tests must leave no ref.
+    for (const candidate of [linuxCandidate, macosPlatform]) {
+      expect(candidate).toContain('smoo release version');
+      expect(candidate).not.toContain('smoo release tag');
+      expect(candidate).not.toContain('- name: 🏷️ Tag release');
+    }
+    expect(linuxCandidate.indexOf('- name: 🔢 Version release')).toBeLessThan(
+      linuxCandidate.indexOf('- name: 🔨 Build'),
+    );
+
+    // Exactly one tag-creating step exists in the whole workflow.
+    expect(platform.match(/- name: 🏷️ Tag release/g)).toHaveLength(1);
+    expect(platform.match(/smoo release tag /g)).toHaveLength(1);
+    expect(finalJob).toContain('        run: smoo release tag --dry-run "${{ inputs.dry_run }}"');
+    expect(finalJob.indexOf('- name: 🧯 Repair pending releases')).toBeLessThan(
+      finalJob.indexOf('- name: 🏷️ Tag release'),
+    );
+    expect(finalJob.indexOf('- name: ✅ Validate restored release')).toBeLessThan(
+      finalJob.indexOf('- name: 🏷️ Tag release'),
+    );
+    expect(finalJob.indexOf('- name: 🏷️ Tag release')).toBeLessThan(finalJob.indexOf('- name: 📦 Publish release'));
+  });
+
+  it('keeps the same version-then-tag-then-publish order in the single-job workflow', () => {
+    const singleJob = renderPublishWorkflowYaml({ repoName: '@smoothbricks/codebase' });
+
+    expect(singleJob.match(/- name: 🏷️ Tag release/g)).toHaveLength(1);
+    expect(singleJob).toContain('        run: smoo release tag --dry-run "${{ inputs.dry_run }}"');
+    expect(singleJob.indexOf('- name: 🧯 Repair pending releases')).toBeLessThan(
+      singleJob.indexOf('- name: 🔢 Version release'),
+    );
+    expect(singleJob.indexOf('- name: 🔢 Version release')).toBeLessThan(singleJob.indexOf('- name: 🔨 Build'));
+    expect(singleJob.indexOf('- name: 🧪 Unit Tests')).toBeLessThan(singleJob.indexOf('- name: 🏷️ Tag release'));
+    expect(singleJob.indexOf('- name: 🏷️ Tag release')).toBeLessThan(singleJob.indexOf('- name: 📦 Publish release'));
+    // The Release section starts at tagging now, not at publishing.
+    expect(singleJob).toContain(
+      '# --- Release ------------------------------------------------------------\n\n      # Step 14\n      - name: 🏷️ Tag release',
+    );
   });
 
   it('renders parallel native producers and a dependent publish-only final job', () => {
@@ -163,7 +222,7 @@ describe('publish workflow definition', () => {
       `smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects`,
     );
     expect(macosPlatform).toContain('smoo release version');
-    expect(macosPlatform.indexOf('- name: 🏷️ Version release')).toBeLessThan(
+    expect(macosPlatform.indexOf('- name: 🔢 Version release')).toBeLessThan(
       macosPlatform.indexOf('- name: 🍎 Build selected macOS and iOS release outputs'),
     );
     expect(foldedRunCommand(macosPlatform, '🍎 Build selected macOS and iOS release outputs')).toBe(
@@ -405,6 +464,8 @@ describe('publish workflow definition', () => {
     expect(outcome.validation).toEqual({ checks: 0, builds: [], lints: [], tests: [], validates: 0 });
     expect(outcome.publishRan).toBe(true);
     expect(outcome.publishCompletedTags).toEqual(['@scope/a@1.2.0']);
+    expect(outcome.createdTags).toEqual(['@scope/a@1.2.0']);
+    expect(outcome.publishSawCreatedTags).toBe(true);
     expect(outcome.remainingDurableGaps).toEqual([]);
   });
 
@@ -431,6 +492,8 @@ describe('publish workflow definition', () => {
     });
     expect(outcome.publishSawValidatedRelease).toBe(true);
     expect(outcome.publishCompletedTags).toEqual(['@scope/a@1.2.0', '@scope/b@2.0.0']);
+    expect(outcome.createdTags).toEqual(['@scope/a@1.2.0', '@scope/b@2.0.0']);
+    expect(outcome.publishSawCreatedTags).toBe(true);
     expect(outcome.remainingDurableGaps).toEqual([]);
   });
 
@@ -457,6 +520,7 @@ describe('publish workflow definition', () => {
     });
     expect(outcome.publishRan).toBe(true);
     expect(outcome.publishCompletedTags).toEqual([]);
+    expect(outcome.createdTags).toEqual([]);
     expect(outcome.remainingDurableGaps).toEqual([
       '@scope/a@1.1.0:github',
       '@scope/a@1.1.0:npm',
@@ -496,6 +560,8 @@ interface WorkflowOutcome {
   productionDeployed: boolean;
   publishSawValidatedRelease: boolean;
   publishCompletedTags: string[];
+  createdTags: string[];
+  publishSawCreatedTags: boolean;
   remainingDurableGaps: string[];
 }
 
@@ -521,6 +587,8 @@ class WorkflowScenarioState {
   private publishReleaseRan = false;
   private productionDeployRan = false;
   private publishSawValidation = false;
+  private publishSawTags = false;
+  private readonly createdTags = new Set<string>();
   private readonly repaired = new Set<string>();
   private readonly repairBuilds = new Set<string>();
   private readonly publishedCurrent = new Set<string>();
@@ -595,11 +663,22 @@ class WorkflowScenarioState {
       validateMonorepoConfig: async () => {
         this.validationState.validates += 1;
       },
+      tagRelease: async ({ dryRun }) => {
+        expect(dryRun).toBe(this.config.dryRun);
+        if (dryRun) {
+          return;
+        }
+        for (const gap of this.config.current) {
+          this.createdTags.add(gap.tag);
+        }
+      },
       publishRelease: async ({ bump, dryRun }) => {
         expect(bump).toBe(this.config.bump);
         expect(dryRun).toBe(this.config.dryRun);
         this.publishReleaseRan = true;
         this.publishSawValidation = this.config.version.mode === 'none' || this.validationState.validates > 0;
+        // Publishing must never be the first writer of a release tag.
+        this.publishSawTags = this.config.current.every((gap) => this.createdTags.has(gap.tag));
         if (dryRun) {
           return;
         }
@@ -642,6 +721,8 @@ class WorkflowScenarioState {
       productionDeployed: this.productionDeployRan,
       publishSawValidatedRelease: this.publishSawValidation,
       publishCompletedTags: [...this.publishedCurrent].sort(),
+      createdTags: [...this.createdTags].sort(),
+      publishSawCreatedTags: this.publishSawTags,
       remainingDurableGaps: [...this.durableGaps].sort(),
     };
   }

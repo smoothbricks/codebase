@@ -44,6 +44,7 @@ export enum PublishWorkflowStepKind {
   UnitTests = 'unit-tests',
   UploadTraceDbs = 'upload-trace-dbs',
   ValidateMonorepoConfig = 'validate-monorepo-config',
+  TagRelease = 'tag-release',
   PublishRelease = 'publish-release',
   DeployProduction = 'deploy-production',
   SaveNixDevenv = 'save-nix-devenv',
@@ -103,6 +104,7 @@ export interface PublishWorkflowCallbacks {
   nxRunMany(input: { target: PublishWorkflowNxTarget; projects: string[] }): Promise<void>;
   uploadTraceDbs(): Promise<void>;
   validateMonorepoConfig(): Promise<void>;
+  tagRelease(input: { dryRun: boolean }): Promise<void>;
   publishRelease(input: { bump: PublishWorkflowBump; dryRun: boolean }): Promise<void>;
   deployProduction(): Promise<void>;
   saveNixDevenv(input: PublishWorkflowSetupOutputs): Promise<void>;
@@ -131,6 +133,7 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
     setupSteps.push({ kind: PublishWorkflowStepKind.BuildSelfHostedCli, name: '🏗️ Build self-hosted smoo' });
   }
   const releaseSteps: PublishWorkflowStepInput[] = [
+    { kind: PublishWorkflowStepKind.TagRelease, name: '🏷️ Tag release' },
     {
       kind: PublishWorkflowStepKind.PublishRelease,
       name: `📦 Publish release (${versionMode})`,
@@ -150,7 +153,7 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
         kind: PublishWorkflowStepKind.RepairPendingReleases,
         name: '🧯 Repair pending releases',
       },
-      { kind: PublishWorkflowStepKind.VersionRelease, name: '🏷️ Version release', id: 'version' },
+      { kind: PublishWorkflowStepKind.VersionRelease, name: '🔢 Version release', id: 'version' },
       {
         kind: PublishWorkflowStepKind.CheckManagedMonorepoFiles,
         name: `✅ Check managed monorepo files (${versionMode})`,
@@ -244,6 +247,9 @@ export async function runPublishWorkflow(
           break;
         case PublishWorkflowStepKind.ValidateMonorepoConfig:
           await context.callbacks.validateMonorepoConfig();
+          break;
+        case PublishWorkflowStepKind.TagRelease:
+          await context.callbacks.tagRelease({ dryRun: context.inputs.dryRun });
           break;
         case PublishWorkflowStepKind.PublishRelease:
           await context.callbacks.publishRelease({
@@ -378,7 +384,7 @@ function sectionLinesBefore(step: PublishWorkflowStep): string[] {
       '',
     ];
   }
-  if (step.kind === PublishWorkflowStepKind.PublishRelease) {
+  if (step.kind === PublishWorkflowStepKind.TagRelease) {
     return ['      # --- Release ------------------------------------------------------------', ''];
   }
   if (step.kind === PublishWorkflowStepKind.SaveNixDevenv) {
@@ -472,6 +478,8 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
       ];
     case PublishWorkflowStepKind.ValidateMonorepoConfig:
       return conditionalRunStep(step, 'smoo monorepo validate');
+    case PublishWorkflowStepKind.TagRelease:
+      return tagReleaseStepLines(step.name);
     case PublishWorkflowStepKind.PublishRelease:
       return [
         `      - name: ${step.name}`,
@@ -493,6 +501,23 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
       ];
   }
+}
+
+/**
+ * The one place release tags come into existence. Release candidates version
+ * without tagging, so a candidate that fails Build, Lint, or Unit Tests leaves
+ * no ref behind and the next run recomputes the same version cleanly. Tagging
+ * here — after validation, immediately before the npm publish — preserves the
+ * "tagged but not published" state that `smoo release repair-pending`
+ * reconciles, because git and npm cannot be written atomically.
+ */
+function tagReleaseStepLines(name: string): string[] {
+  return [
+    `      - name: ${name}`,
+    '        # Ordered before the publish below so an interrupted release stays',
+    '        # detectable by the repair step at the top of this job on a later run.',
+    `        run: smoo release tag --dry-run "${githubExpression('inputs.dry_run')}"`,
+  ];
 }
 
 function deployProductionStep(step: PublishWorkflowStep, options: PublishWorkflowDefinitionOptions): string[] {
@@ -634,6 +659,7 @@ function renderLinuxReleaseCandidateSteps(
   for (const step of steps) {
     if (
       step.kind === PublishWorkflowStepKind.RepairPendingReleases ||
+      step.kind === PublishWorkflowStepKind.TagRelease ||
       step.kind === PublishWorkflowStepKind.PublishRelease ||
       step.kind === PublishWorkflowStepKind.DeployProduction ||
       step.kind === PublishWorkflowStepKind.SaveNixDevenv
@@ -799,7 +825,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '          "41898282+github-actions[bot]@users.noreply.github.com"',
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 🏷️ Version release',
+    '      - name: 🔢 Version release',
     '        id: version',
     '        run:',
     `          smoo release version --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
@@ -973,6 +999,9 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '        run: smoo monorepo validate',
     '',
     '      # --- Release ------------------------------------------------------------',
+    '',
+    `      # Step ${stepNumber++}`,
+    ...tagReleaseStepLines('🏷️ Tag release'),
     '',
     `      # Step ${stepNumber++}`,
     `      - name: 📦 Publish release (${githubExpression(mode)})`,

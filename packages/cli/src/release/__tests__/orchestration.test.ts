@@ -6,8 +6,10 @@ import {
   completeReleaseAtHead,
   type ReleaseRepairOutputsShell,
   type ReleaseRepairShell,
+  type ReleaseTagShell,
   type ReleaseVersionShell,
   repairPendingTargets,
+  runReleaseTag,
   runReleaseVersion,
 } from '../orchestration.js';
 
@@ -146,7 +148,6 @@ describe('release orchestration', () => {
 
     expect(result).toEqual({ mode: 'none', packages: [stable], status: 'already-release-target' });
     expect(shell.nxRuns).toEqual([]);
-    expect(shell.ensureCalls).toEqual([['@scope/stable']]);
   });
 
   it('runs forced Nx versioning for an untagged HEAD and reports a new release commit', async () => {
@@ -161,7 +162,6 @@ describe('release orchestration', () => {
     expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable', '@scope/prerelease'], bump: 'patch', dryRun: false }]);
     expect(shell.cleanChecks).toBe(1);
-    expect(shell.ensureCalls).toEqual([['@scope/stable']]);
   });
 
   it('skips auto Nx versioning when no package-local candidates exist', async () => {
@@ -172,7 +172,6 @@ describe('release orchestration', () => {
     expect(result).toEqual({ mode: 'none', packages: [], status: 'no-release-needed' });
     expect(shell.nxRuns).toEqual([]);
     expect(shell.cleanChecks).toBe(0);
-    expect(shell.ensureCalls).toEqual([]);
   });
 
   it('runs auto Nx versioning only for selected package-local candidates', async () => {
@@ -196,6 +195,33 @@ describe('release orchestration', () => {
 
     expect(result).toEqual({ mode: 'dry-run', packages: [preview], status: 'dry-run' });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: true }]);
+  });
+
+  it('tags every release package at HEAD without touching versioning', async () => {
+    const shell = new RecordingTagShell([stable, prerelease]);
+
+    const result = await runReleaseTag(shell, { dryRun: false });
+
+    expect(result).toEqual({ packages: [stable, prerelease], status: 'tagged' });
+    expect(shell.ensureCalls).toEqual([['@scope/stable', '@scope/prerelease']]);
+  });
+
+  it('reports the tags a dry run would create and writes none', async () => {
+    const shell = new RecordingTagShell([stable]);
+
+    const result = await runReleaseTag(shell, { dryRun: true });
+
+    expect(result).toEqual({ packages: [stable], status: 'dry-run' });
+    expect(shell.ensureCalls).toEqual([]);
+  });
+
+  it('writes no tags when HEAD carries no release', async () => {
+    const shell = new RecordingTagShell([]);
+
+    const result = await runReleaseTag(shell, { dryRun: false });
+
+    expect(result).toEqual({ packages: [], status: 'no-release' });
+    expect(shell.ensureCalls).toEqual([]);
   });
 
   it('bumps stable release packages to next after publish completion', async () => {
@@ -324,7 +350,6 @@ class RecordingRepairOutputsShell implements ReleaseRepairOutputsShell<ReleasePa
 }
 
 class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
-  readonly ensureCalls: string[][] = [];
   readonly nxRuns: Array<{ packages: string[]; bump: string; dryRun: boolean }> = [];
   cleanChecks = 0;
   private readonly releaseBatches: ReleasePackageInfo[][];
@@ -352,10 +377,6 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
     return this.versionPackages;
   }
 
-  async ensureLocalReleaseTags(packages: ReleasePackageInfo[]): Promise<void> {
-    this.ensureCalls.push(packageNames(packages));
-  }
-
   async gitHead(): Promise<string> {
     return this.heads.shift() ?? 'head';
   }
@@ -371,6 +392,20 @@ class RecordingVersionShell implements ReleaseVersionShell<ReleasePackageInfo> {
 
   async assertCleanGitTree(): Promise<void> {
     this.cleanChecks += 1;
+  }
+}
+
+class RecordingTagShell implements ReleaseTagShell<ReleasePackageInfo> {
+  readonly ensureCalls: string[][] = [];
+
+  constructor(private readonly packagesAtHead: ReleasePackageInfo[]) {}
+
+  async releasePackagesAtHead(): Promise<ReleasePackageInfo[]> {
+    return this.packagesAtHead;
+  }
+
+  async ensureLocalReleaseTags(packages: ReleasePackageInfo[]): Promise<void> {
+    this.ensureCalls.push(packageNames(packages));
   }
 }
 
