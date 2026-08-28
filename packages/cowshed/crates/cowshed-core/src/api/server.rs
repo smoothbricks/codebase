@@ -1092,11 +1092,7 @@ fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
         PeerCredentialsError::SocketTypeQueryFailed | PeerCredentialsError::NotStream => {
             connection_error("controller descriptor is not a stream socket")
         }
-        PeerCredentialsError::PeerCredentialSizeOverflow => {
-            connection_error("peer credential size does not fit socklen_t")
-        }
-        PeerCredentialsError::PeerCredentialQueryFailed
-        | PeerCredentialsError::UnsupportedPlatform => {
+        PeerCredentialsError::PeerCredentialQueryFailed => {
             connection_error("controller descriptor peer does not match the current uid")
         }
     })?;
