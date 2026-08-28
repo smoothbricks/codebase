@@ -67,6 +67,11 @@ export interface PublishWorkflowDefinitionOptions {
   deployProvider?: 'cloudflare';
   repoName?: string;
   platformTargetGlobs?: readonly string[];
+  /**
+   * Architectures the macOS platform job fans out over, one job per entry.
+   * Empty falls back to a single job selecting every macOS platform family.
+   */
+  macosPlatformArchitectures?: readonly string[];
   /** Linux jobs only. Default ubuntu-latest. Same smoo.github.runsOn as CI. */
   runsOn?: WorkflowRunsOn;
 }
@@ -596,7 +601,7 @@ ${renderRunsOnLine(options.runsOn)}
 ${renderLinuxReleaseCandidateSteps(steps, options)}
 
   macos-platform:
-    runs-on: macos-latest
+${renderMacosJobHeaderLines(options)}
     permissions:
       contents: read
       id-token: none
@@ -800,29 +805,49 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `          smoo release version --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}" --github-output`,
     '          "$GITHUB_OUTPUT"',
   );
+  const architectures = macosPlatformArchitectures(options);
+  const isMatrix = architectures.length >= 2;
+  const testArchitecture = macosTestArchitecture(architectures);
+  const legLabel = isMatrix ? ` (${githubExpression('matrix.arch')})` : '';
+  const testCondition =
+    isMatrix && testArchitecture !== undefined
+      ? `matrix.arch == '${testArchitecture}' && steps.platform-outputs.outputs.projects != ''`
+      : `steps.platform-outputs.outputs.projects != ''`;
   lines.push(
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 🍎 Build selected macOS and iOS release outputs',
+    `      - name: 🍎 Build selected macOS and iOS release outputs${legLabel}`,
     '        id: platform-outputs',
     '        run:',
     `          smoo release build-platform-outputs --bump "${githubExpression(
       'inputs.bump',
-    )}" --ref "${githubExpression('github.sha')}" --targets "${MACOS_PLATFORM_TARGET_GLOBS.join(',')}" --output`,
+    )}" --ref "${githubExpression('github.sha')}" --targets "${macosPlatformTargetSelector(options)}" --output`,
     `          "${githubExpression('runner.temp')}/macos-platform-outputs" --github-output "$GITHUB_OUTPUT"`,
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🧪 Unit test selected macOS and iOS packages',
-    `        if: steps.platform-outputs.outputs.projects != ''`,
+  );
+  if (isMatrix) {
+    lines.push(
+      '        # Only the runner-native leg can execute what it built; the foreign',
+      '        # architecture ships as an artifact without running here.',
+    );
+  }
+  lines.push(
+    `        if: ${testCondition}`,
     '        run:',
     '          smoo github-ci nx-run-many --targets test --projects',
     `          "${githubExpression('steps.platform-outputs.outputs.projects')}"`,
     '',
     `      # Step ${stepNumber++}`,
-    '      - name: 📤 Upload macOS platform outputs',
+    `      - name: 📤 Upload macOS platform outputs${legLabel}`,
     '        uses: actions/upload-artifact@v7.0.1',
     '        with:',
-    `          name: publish-macos-outputs-${githubExpression('github.run_id')}`,
+    `          name: ${
+      isMatrix
+        ? `publish-macos-${githubExpression('matrix.arch')}-outputs-${githubExpression('github.run_id')}`
+        : `publish-macos-outputs-${githubExpression('github.run_id')}`
+    }`,
     `          path: ${githubExpression('runner.temp')}/macos-platform-outputs`,
     '          if-no-files-found: error',
     '          retention-days: 1',
@@ -894,12 +919,10 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     `      # Step ${stepNumber++}`,
     '      - name: 🧯 Repair pending releases',
     '        run:',
-    `          smoo release repair-pending --ref "${githubExpression(
-      'github.sha',
-    )}" --platform-outputs "${githubExpression(
-      'runner.temp',
-    )}/publish-artifacts/publish-macos-outputs-${githubExpression('github.run_id')}/repairs" --dry-run`,
-    `          "${githubExpression('inputs.dry_run')}"`,
+    `          smoo release repair-pending --ref "${githubExpression('github.sha')}" --platform-outputs`,
+    `          "${macosPlatformArtifactNames(options)
+      .map((name) => `${githubExpression('runner.temp')}/publish-artifacts/${name}/repairs`)
+      .join(',')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
     '',
     `      # Step ${stepNumber++}`,
     '      - name: ♻️ Restore validated release state',
@@ -940,9 +963,9 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     `        if: ${mode} != 'none'`,
     '        run:',
     `          smoo github-ci apply-outputs --source-sha "${githubExpression('github.sha')}"`,
-    `          "${githubExpression('runner.temp')}/publish-artifacts/publish-macos-outputs-${githubExpression(
-      'github.run_id',
-    )}/current"`,
+    ...macosPlatformArtifactNames(options).map(
+      (name) => `          "${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`,
+    ),
     '',
     `      # Step ${stepNumber++}`,
     `      - name: ✅ Validate restored release (${githubExpression(mode)})`,
@@ -990,6 +1013,68 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
 
 function hasMacosPlatformTargets(options: PublishWorkflowDefinitionOptions): boolean {
   return MACOS_PLATFORM_TARGET_GLOBS.some((glob) => options.platformTargetGlobs?.includes(glob) === true);
+}
+
+/**
+ * The architecture `macos-latest` runs natively. Only that leg can execute the
+ * binaries it just built, so it owns the unit-test step; keep this beside the
+ * `runs-on` label it describes.
+ */
+const MACOS_RUNNER_ARCHITECTURE = 'arm64';
+
+function macosPlatformFamilies(options: PublishWorkflowDefinitionOptions): string[] {
+  return MACOS_PLATFORM_TARGET_GLOBS.filter((glob) => options.platformTargetGlobs?.includes(glob) === true);
+}
+
+/**
+ * One matrix leg per architecture. A single runner cannot overlap two platform
+ * builds of one package: cargo holds an exclusive lock on the package's whole
+ * `target/` directory, so extra Nx workers only queue behind it. Separate
+ * runners have separate target directories, so the architectures compile in
+ * parallel for real.
+ */
+function macosPlatformArchitectures(options: PublishWorkflowDefinitionOptions): string[] {
+  return hasMacosPlatformTargets(options) ? [...(options.macosPlatformArchitectures ?? [])] : [];
+}
+
+function macosTestArchitecture(architectures: readonly string[]): string | undefined {
+  return architectures.includes(MACOS_RUNNER_ARCHITECTURE) ? MACOS_RUNNER_ARCHITECTURE : architectures[0];
+}
+
+function renderMacosJobHeaderLines(options: PublishWorkflowDefinitionOptions): string {
+  const architectures = macosPlatformArchitectures(options);
+  const lines = ['    runs-on: macos-latest'];
+  if (architectures.length >= 2) {
+    lines.push(
+      '    strategy:',
+      '      # One architecture per runner: a leg that fails still leaves the other',
+      '      # architecture uploaded for inspection.',
+      '      fail-fast: false',
+      '      matrix:',
+      `        arch: [${architectures.join(', ')}]`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/** Per-leg target selector, or every macOS family when there is no matrix. */
+function macosPlatformTargetSelector(options: PublishWorkflowDefinitionOptions): string {
+  const families = macosPlatformFamilies(options);
+  const selectors = families.length > 0 ? families : [...MACOS_PLATFORM_TARGET_GLOBS];
+  if (macosPlatformArchitectures(options).length < 2) {
+    return selectors.join(',');
+  }
+  return selectors.map((glob) => `*-${githubExpression('matrix.arch')}-${glob.slice(2)}`).join(',');
+}
+
+/** Artifact names the final job downloads, one per rendered macOS leg. */
+function macosPlatformArtifactNames(options: PublishWorkflowDefinitionOptions): string[] {
+  const architectures = macosPlatformArchitectures(options);
+  const runId = githubExpression('github.run_id');
+  if (architectures.length < 2) {
+    return [`publish-macos-outputs-${runId}`];
+  }
+  return architectures.map((architecture) => `publish-macos-${architecture}-outputs-${runId}`);
 }
 
 function hasLinuxPlatformTargets(options: PublishWorkflowDefinitionOptions): boolean {

@@ -75,6 +75,7 @@ export interface ReleasePublishOptions {
 
 export interface ReleaseRepairPendingOptions {
   dryRun?: boolean;
+  /** Comma-separated collected-output roots, one per platform matrix leg. */
   platformOutputs?: string;
   ref?: string;
 }
@@ -189,13 +190,25 @@ export async function releasePublish(root: string, options: ReleasePublishOption
   }
 }
 
+/**
+ * One root per platform matrix leg. Legs upload separate artifacts, so the
+ * repair inputs arrive as a list rather than a single directory.
+ */
+export function platformOutputRoots(root: string, platformOutputs: string | undefined): string[] {
+  return (platformOutputs ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => resolve(root, entry));
+}
+
 export async function releaseRepairPending(root: string, options: ReleaseRepairPendingOptions): Promise<void> {
   const repairRef = await fetchReleaseRepairRef(root, options.ref);
   const restoreRef = options.ref ? await gitHead(root) : repairRef;
   console.log(`Repair pending releases: planning from ${repairRef}.`);
   const targets = await listPendingReleaseTargets(root, repairRef);
   logPendingReleaseTargets(targets);
-  const platformOutputs = options.platformOutputs ? resolve(root, options.platformOutputs) : undefined;
+  const platformOutputs = platformOutputRoots(root, options.platformOutputs);
   const summaries = await repairPendingTargets(
     releaseRepairShell(root, platformOutputs),
     targets,
@@ -958,17 +971,27 @@ function releaseTargetCheckoutShell(root: string) {
   };
 }
 
-function releaseRepairShell(root: string, platformOutputs?: string): ReleaseRepairShell<ReleasePackage> {
+/**
+ * Repairs read every platform root the matrix produced. One leg per
+ * architecture means a pending release's binaries arrive as several collected
+ * trees; each owns the targets its selector named, so the paths are disjoint
+ * and `apply-outputs` can verify them together. A leg that built nothing for a
+ * given pending sha contributes no directory, which is not an error.
+ */
+function releaseRepairShell(root: string, platformOutputs: readonly string[]): ReleaseRepairShell<ReleasePackage> {
   return {
     ...releaseCompletionShell(root),
     ...releaseTargetCheckoutShell(root),
     prepareRepairTarget: async (target) => {
-      if (!platformOutputs || target.npmPackages.length === 0) {
+      if (target.npmPackages.length === 0) {
         return;
       }
-      const output = join(platformOutputs, target.sha);
-      console.log(`Repair pending releases: applying cross-platform outputs from ${output}.`);
-      await githubCiApplyOutputs(root, [output], target.sha);
+      const outputs = platformOutputs.map((base) => join(base, target.sha)).filter((output) => existsSync(output));
+      if (outputs.length === 0) {
+        return;
+      }
+      console.log(`Repair pending releases: applying cross-platform outputs from ${outputs.join(', ')}.`);
+      await githubCiApplyOutputs(root, outputs, target.sha);
     },
   };
 }

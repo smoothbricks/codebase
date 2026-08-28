@@ -13,6 +13,7 @@ import {
   INLINE_LOCAL_BEGIN,
   INLINE_LOCAL_END,
   LOCAL_SECTION_MARKER,
+  macosPlatformArchitecturesForTest,
   managedFileTargetsForTest,
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
@@ -180,6 +181,21 @@ describe('managed publish platform discovery', () => {
 
   it('returns no platform families for ordinary Nx targets', () => {
     expect(platformTargetGlobsForTest(['build', 'lint', 'test', 'typecheck'])).toEqual([]);
+  });
+
+  it('derives macOS matrix architectures from the target names that exist', () => {
+    expect(
+      macosPlatformArchitecturesForTest([
+        'build',
+        'cli-arm64-macos',
+        'cli-x64-macos',
+        'napi-arm64-macos',
+        'cli-x64-linux',
+        'test',
+      ]),
+    ).toEqual(['arm64', 'x64']);
+    expect(macosPlatformArchitecturesForTest(['simulator-arm64-ios', 'cli-arm64-macos'])).toEqual(['arm64']);
+    expect(macosPlatformArchitecturesForTest(['build', 'cli-x64-linux', 'test'])).toEqual([]);
   });
 });
 
