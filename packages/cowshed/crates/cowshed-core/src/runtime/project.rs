@@ -4534,12 +4534,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         .map_err(native_integrity_error)?;
         self.enforce_checkpoint_quota(&current).await?;
         let handle = self.ensure_supervisor(&workspace).await?;
-        let barrier_id = u64::try_from(current.derived.checkpoints.len())
-            .map_err(|_| CowshedError::internal("checkpoint count overflow"))?
-            + 1;
-        let barrier = handle
-            .checkpoint_barrier(label.to_string(), barrier_id)
-            .await?;
+        let barrier = handle.checkpoint_barrier(label.to_string()).await?;
         let plan = self
             .substrate
             .plan_checkpoint(

@@ -295,7 +295,7 @@ pub trait ArtifactSink: Send {
         stdout_copy: Option<OutputPublication>,
         stderr_copy: Option<OutputPublication>,
     ) -> Result<ArtifactSeal>;
-    fn checkpoint(&mut self, barrier_id: u64) -> Result<CheckpointBarrier>;
+    fn checkpoint(&mut self) -> Result<CheckpointBarrier>;
 }
 
 pub use crate::storage::audit::CommitmentDraft;
@@ -420,14 +420,11 @@ impl ArtifactSink for ArtifactStoreSink {
         })
     }
 
-    fn checkpoint(&mut self, barrier_id: u64) -> Result<CheckpointBarrier> {
+    fn checkpoint(&mut self) -> Result<CheckpointBarrier> {
         let SealedCheckpointManifest {
             record,
             manifest_batch_sha256,
-        } = self
-            .store
-            .checkpoint(barrier_id)
-            .map_err(map_artifact_error)?;
+        } = self.store.checkpoint().map_err(map_artifact_error)?;
         Ok(CheckpointBarrier {
             checkpoint_id: String::new(),
             barrier_id: record.barrier_id,
@@ -1722,15 +1719,10 @@ impl WorkspaceSupervisorHandle {
         self.log_read(job_id, stream, offset, true).await
     }
 
-    pub async fn checkpoint_barrier(
-        &self,
-        checkpoint_id: String,
-        barrier_id: u64,
-    ) -> Result<CheckpointBarrier> {
+    pub async fn checkpoint_barrier(&self, checkpoint_id: String) -> Result<CheckpointBarrier> {
         self.call(|reply| Command::Checkpoint {
             authority: self.authority.clone(),
             checkpoint_id,
-            barrier_id,
             reply,
         })
         .await
@@ -1814,7 +1806,6 @@ impl WorkspaceSupervisor {
             term_grace: config.term_grace,
             next_job_id,
             next_session_id: 1,
-            next_barrier_id: 1,
             lifecycle: ActorLifecycle::Running,
             commands: receiver,
             events,
@@ -1904,7 +1895,6 @@ enum Command {
     Checkpoint {
         authority: WorkspaceAuthoritySnapshot,
         checkpoint_id: String,
-        barrier_id: u64,
         reply: oneshot::Sender<Result<CheckpointBarrier>>,
     },
     Quiesce {
@@ -2001,7 +1991,6 @@ struct SupervisorActor {
     term_grace: Duration,
     next_job_id: JobId,
     next_session_id: u64,
-    next_barrier_id: u64,
     lifecycle: ActorLifecycle,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<ProcessEvent>,
@@ -2138,10 +2127,9 @@ impl SupervisorActor {
             Command::Checkpoint {
                 authority,
                 checkpoint_id,
-                barrier_id,
                 reply,
             } => {
-                let result = self.checkpoint(&authority, checkpoint_id, barrier_id).await;
+                let result = self.checkpoint(&authority, checkpoint_id).await;
                 let _ = reply.send(result);
             }
             Command::Quiesce { authority, reply } => {
@@ -2752,31 +2740,20 @@ impl SupervisorActor {
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         checkpoint_id: String,
-        barrier_id: u64,
     ) -> Result<CheckpointBarrier> {
         self.validate_authority(authority)?;
-        if barrier_id != self.next_barrier_id {
-            return Err(CowshedError::conflict(
-                "checkpoint barrier id is stale or out of order",
-                "retry with the next supervisor barrier id",
-            ));
-        }
         validate_checkpoint_id(&checkpoint_id)?;
-        let mut barrier = self.artifacts.checkpoint(barrier_id)?;
+        let mut barrier = self.artifacts.checkpoint()?;
         barrier.checkpoint_id = checkpoint_id.clone();
         self.commitments
             .record(CommitmentDraft::Checkpoint {
                 repo_id: self.authority.repo_id.clone(),
                 origin_incarnation: self.authority.workspace_incarnation.clone(),
                 checkpoint_id,
-                barrier_id,
+                barrier_id: barrier.barrier_id,
                 manifest_batch_sha256: barrier.manifest_batch_sha256,
             })
             .await?;
-        self.next_barrier_id = self
-            .next_barrier_id
-            .checked_add(1)
-            .ok_or_else(|| CowshedError::internal("checkpoint barrier allocation exhausted"))?;
         Ok(barrier)
     }
 
@@ -3885,7 +3862,7 @@ mod lifecycle_commitment_tests {
             .unwrap();
         let first = artifacts.finish(first, JobState::Exited).unwrap();
         publish_sealed_job(&mut publisher, &repo_id, &source, &first).await;
-        let checkpoint = artifacts.checkpoint(1).unwrap();
+        let checkpoint = artifacts.checkpoint().unwrap();
         publisher
             .record(CommitmentDraft::Checkpoint {
                 repo_id: repo_id.clone(),

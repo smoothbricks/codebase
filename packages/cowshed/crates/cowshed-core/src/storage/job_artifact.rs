@@ -738,19 +738,18 @@ impl ArtifactStore {
         Ok((record, digest))
     }
 
-    pub fn checkpoint(
-        &mut self,
-        barrier_id: u64,
-    ) -> Result<SealedCheckpointManifest, ArtifactError> {
-        if barrier_id == 0 {
-            return Err(integrity(0, "checkpoint barrier id must be positive"));
-        }
-        if barrier_id <= self.last_checkpoint_barrier {
-            return Err(integrity(
-                0,
-                "checkpoint barrier id must increase monotonically",
-            ));
-        }
+    /// Take the checkpoint artifact barrier: force every visible stream prefix durable and append
+    /// the manifest. The store allocates the barrier id by continuing the durable sequence
+    /// replayed from this incarnation's manifests — the same ownership as job ids — so a
+    /// checkpoint that fails after its barrier merely skips an id instead of leaving a consumed
+    /// id that every later checkpoint trips over.
+    pub fn checkpoint(&mut self) -> Result<SealedCheckpointManifest, ArtifactError> {
+        let barrier_id =
+            self.last_checkpoint_barrier
+                .checked_add(1)
+                .ok_or(ArtifactError::InvalidConfig(
+                    "checkpoint barrier allocation exhausted",
+                ))?;
         let mut visible = self
             .committed_jobs
             .values()
@@ -3981,7 +3980,7 @@ mod tests {
                 assert_eq!(fs::metadata(&path).unwrap().len(), 0);
             }
 
-            let checkpoint = store.checkpoint(1).unwrap();
+            let checkpoint = store.checkpoint().unwrap();
             assert_eq!(
                 checkpoint.record.records_sha256,
                 Sha256Digest::compute(RECORD_MAGIC),
@@ -4002,7 +4001,7 @@ mod tests {
         let job_root = ensure_private_job_root(&root).unwrap();
         fs::set_permissions(&job_root, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let error = store.checkpoint(1).unwrap_err();
+        let error = store.checkpoint().unwrap_err();
         assert!(
             matches!(error, ArtifactError::Io { path, .. } if path == records_path(&root)),
             "checkpoint must return the records metadata error without attempting publication"
@@ -4046,20 +4045,17 @@ mod tests {
             },
         )
         .unwrap();
-        historical_store.checkpoint(1).unwrap();
+        assert_eq!(historical_store.checkpoint().unwrap().record.barrier_id, 1);
         drop(historical_store);
         fs::remove_dir_all(historical_root).unwrap();
 
         let current_root = temp_root("current-manifest");
         let mut current_store = store_at(&current_root, ArtifactConfig::default());
-        current_store.checkpoint(7).unwrap();
+        assert_eq!(current_store.checkpoint().unwrap().record.barrier_id, 1);
         drop(current_store);
+        // Reopening replays the durable manifest sequence: allocation continues, never repeats.
         let mut reopened = store_at(&current_root, ArtifactConfig::default());
-        assert!(matches!(
-            reopened.checkpoint(7),
-            Err(ArtifactError::Integrity { .. })
-        ));
-        reopened.checkpoint(8).unwrap();
+        assert_eq!(reopened.checkpoint().unwrap().record.barrier_id, 2);
         drop(reopened);
         fs::remove_dir_all(current_root).unwrap();
     }
@@ -4481,7 +4477,7 @@ mod tests {
         store
             .append(&token, StreamKind::Stdout, b"before-checkpoint")
             .unwrap();
-        let first = store.checkpoint(1).unwrap();
+        let first = store.checkpoint().unwrap();
         let first_visible = &first.record.visible_jobs[0].stdout;
         assert_eq!(first_visible.bytes, b"before-checkpoint".len() as u64);
         assert_eq!(
@@ -4490,7 +4486,7 @@ mod tests {
         );
 
         store.append(&token, StreamKind::Stdout, b"-after").unwrap();
-        let second = store.checkpoint(2).unwrap();
+        let second = store.checkpoint().unwrap();
         let second_visible = &second.record.visible_jobs[0].stdout;
         assert_eq!(
             second_visible.bytes,
