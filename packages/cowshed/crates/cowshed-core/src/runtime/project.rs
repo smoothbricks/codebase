@@ -12,6 +12,8 @@ use url::Url;
 
 #[cfg(target_os = "macos")]
 use crate::api::dto::AbandonedWork;
+#[cfg(target_os = "macos")]
+use crate::api::dto::LandingCommits;
 use crate::api::dto::{
     AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota, CheckpointResult, CommandArg,
     CreateOptions, DoctorReport, EmptyResult, ExecRequest, GcOptions, GcReport, GitOid, GrantDelta,
@@ -2332,6 +2334,7 @@ impl NativeProjectRuntimeHost {
                     })
                     .collect(),
                 snapshot_stale: info_snapshot.is_some_and(|info| info.stale),
+                landing: None,
             },
             grants: workspace.metadata.grants.clone(),
             lifecycle_revision: workspace.derived.workspace.revision().get(),
@@ -2521,28 +2524,27 @@ impl NativeProjectRuntimeHost {
 
     /// Where a session's commits stand relative to the branch that has to hold them.
     ///
-    /// Read out of *main's* repository, because that is the object store that survives this
-    /// workspace: it holds the branch tip, and it holds the session's commits only if they were
-    /// ever landed or pushed there. A head main has never seen is therefore conclusively unlanded
-    /// without a single network call.
-    async fn landed_state(&self, head: &GitOid) -> Result<NativeLandedState> {
+    /// The target tip is read out of *main's own repository* — the object store that survives this
+    /// workspace — and never out of a `refs/remotes/*` cache inside the workspace, which is a
+    /// clone-time snapshot that has been observed hundreds of commits stale. The comparison then
+    /// runs inside the workspace with main's object store attached read-only, so main's commits are
+    /// visible without fetching and without writing anything anywhere.
+    ///
+    /// Containment is by patch identity, not only by ancestry. That is the correction this gate
+    /// needed: a workspace whose work reached main by squash-merge or a history rewrite is not an
+    /// ancestor of anything, and demanding `--abandon` to retire it taught callers to pass a
+    /// commit-destroying flag for a safe operation.
+    async fn landed_state(
+        &self,
+        workspace: &WorkspaceName,
+        head: &GitOid,
+    ) -> Result<NativeLandedState> {
         let main_mount = self.workspace_mount_path(&main_name())?;
-        let main = crate::git::GitRepository::from_root(&main_mount);
-        let tip = main
-            .branch_tip(DEFAULT_LANDING_BRANCH)
-            .await?
-            .map(GitOid::new)
-            .transpose()
-            .map_err(native_integrity_error)?;
-        let landed = match tip.as_ref() {
-            Some(tip) => main.commit_is_ancestor(head.as_str(), tip.as_str()).await?,
-            // No such branch: there is nothing anywhere that could be holding these commits.
-            None => false,
-        };
+        let target = crate::landing::resolve_target(&main_mount, DEFAULT_LANDING_BRANCH).await;
+        let mount = self.workspace_mount_path(workspace)?;
         Ok(NativeLandedState {
             branch: DEFAULT_LANDING_BRANCH.to_owned(),
-            tip,
-            landed,
+            commits: crate::landing::measure_commits(&target, &mount, head.as_str()).await,
         })
     }
 
@@ -2558,14 +2560,8 @@ impl NativeProjectRuntimeHost {
         fence: &NativeRemovalGitFence,
         abandon: bool,
     ) -> Result<Option<NativeLandedState>> {
-        let landed = self.landed_state(&fence.head).await?;
-        if landed.landed {
-            return Ok(None);
-        }
-        if abandon {
-            return Ok(Some(landed));
-        }
-        Err(removal_unlanded_refusal(workspace, &fence.head, &landed))
+        let landed = self.landed_state(workspace, &fence.head).await?;
+        removal_landed_decision(workspace, &fence.head, landed, abandon)
     }
 
     /// Write the unlanded commits beside the image that is about to be trashed.
@@ -2582,13 +2578,18 @@ impl NativeProjectRuntimeHost {
     ) -> Result<AbandonedWork> {
         let mount = current_snapshot_mount(self, workspace)?;
         let git = crate::git::GitRepository::from_root(&mount);
-        // `HEAD`, not the fence oid, and the difference is load-bearing: `git bundle create` names
-        // the bundle's contents after the *refs* in its rev range, so a range whose tip is a raw
-        // oid produces a bundle with no refs — which git rejects as empty. The fence has already
-        // proved HEAD is exactly `fence.head`, so the ref spelling is the same commit.
-        let unlanded_commits = git
-            .commits_ahead(Some(landed.branch.as_str()), "HEAD")
-            .await?;
+        // What was destroyed is the authoritative count, not the workspace's own view of
+        // `main..HEAD`: its local `main` is a clone-time snapshot, so against a rewritten upstream
+        // it reports hundreds of commits where four were actually lost. Without a measurement there
+        // is nothing better than that local view, and over-counting is the safe direction to err in
+        // a report about loss.
+        let unlanded_commits = match &landed.commits {
+            LandingCommits::Measured { unlanded, .. } => *unlanded,
+            LandingCommits::Indeterminate { .. } => {
+                git.commits_ahead(Some(landed.branch.as_str()), "HEAD")
+                    .await?
+            }
+        };
         let trash = self
             .layout
             .project()
@@ -2615,12 +2616,22 @@ impl NativeProjectRuntimeHost {
         .map_err(|error| {
             CowshedError::internal(format!("trash directory task failed: {error}"))
         })??;
+        // The bundle range stays the workspace's own `main..HEAD`, deliberately: its local `main`
+        // is an ancestor of main's own, so main's repository holds the prerequisite this thin
+        // bundle names, and a stale local `main` only makes the bundle carry more than it must.
+        // Naming the authoritative tip instead would need main's object store attached, which is
+        // one more thing that can fail on the path that exists to lose nothing.
+        //
+        // `HEAD`, not the fence oid, and the difference is load-bearing: `git bundle create` names
+        // the bundle's contents after the *refs* in its rev range, so a range whose tip is a raw
+        // oid produces a bundle with no refs — which git rejects as empty. The fence has already
+        // proved HEAD is exactly `fence.head`, so the ref spelling is the same commit.
         git.bundle_commits(&bundle, Some(landed.branch.as_str()), "HEAD")
             .await?;
         Ok(AbandonedWork {
             head: fence.head.clone(),
             target_branch: landed.branch,
-            target_head: landed.tip,
+            target_head: landed.commits.target_head().cloned(),
             unlanded_commits,
             bundle,
         })
@@ -3381,15 +3392,14 @@ struct NativeRemovalGitFence {
     in_progress: Option<String>,
 }
 
-/// Whether the branch that outlives a workspace already contains the workspace's head.
+/// Whether the branch that outlives a workspace already holds the workspace's work.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeLandedState {
     branch: String,
-    /// `None` when the project has no such branch: nothing can be landed in a branch that is not
-    /// there, so this is a conclusive negative rather than missing information.
-    tip: Option<GitOid>,
-    landed: bool,
+    /// The measurement, or the reason there is none. A missing measurement is never landed: there
+    /// is no shape here in which the absence of an answer can be read as a permissive one.
+    commits: LandingCommits,
 }
 
 #[cfg(target_os = "macos")]
@@ -6254,12 +6264,27 @@ mod removal_refusal_tests {
         }
     }
 
-    fn unlanded(tip: Option<GitOid>) -> NativeLandedState {
+    fn state(commits: LandingCommits) -> NativeLandedState {
         NativeLandedState {
             branch: DEFAULT_LANDING_BRANCH.to_owned(),
-            tip,
-            landed: false,
+            commits,
         }
+    }
+
+    fn measured(unlanded: u64, landed: u64) -> NativeLandedState {
+        state(LandingCommits::Measured {
+            target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+            target_head: oid('1'),
+            unlanded,
+            landed,
+            behind: 0,
+        })
+    }
+
+    fn indeterminate() -> NativeLandedState {
+        state(LandingCommits::Indeterminate {
+            reason: String::from("main's repository has no main branch"),
+        })
     }
 
     /// Every refusal a removal can answer with, so the sweep below cannot miss one.
@@ -6267,8 +6292,8 @@ mod removal_refusal_tests {
         vec![
             removal_in_progress_refusal(&workspace(), "rebase-merge"),
             removal_dirty_refusal(&workspace()),
-            removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(Some(oid('1')))),
-            removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(None)),
+            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1)),
+            removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate()),
             removal_head_moved_refusal(&workspace(), &oid('1'), &oid('4')),
             main_removal_mode_refusal(),
             NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &fence(true, None))
@@ -6300,29 +6325,85 @@ mod removal_refusal_tests {
         }
     }
 
-    /// The refusal has to be actionable on its own: it names the head that is at risk, the branch
-    /// that does not hold it, and where that branch stands.
+    /// The refusal has to be actionable on its own: it names the head that is at risk, how much of
+    /// it is unheld, the branch that does not hold it, and where that branch stands.
     #[test]
-    fn the_unlanded_refusal_names_the_head_the_branch_and_the_tip() {
-        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(Some(oid('1'))));
+    fn the_unlanded_refusal_names_the_head_the_count_the_branch_and_the_tip() {
+        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1));
         assert_eq!(
             refusal.message,
             format!(
-                "workspace raven head {} is not contained by main (main is at {})",
+                "workspace raven head {} carries 3 commits that main does not hold, by ancestry or \
+                 by patch equivalence (main is at {})",
                 oid('4'),
                 oid('1')
             )
         );
         assert_eq!(refusal.hint, "land the workspace: cowshed land raven");
 
-        // No branch at all is a conclusive negative, and says so rather than printing an absence.
-        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &unlanded(None));
+        // One commit reads as one commit. A gate that says "1 commits" is a gate nobody trusts.
+        assert!(
+            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(1, 0))
+                .message
+                .contains("carries 1 commit that main"),
+        );
+
+        // No measurement names the unanswered question rather than printing an absence, because the
+        // caller is being refused for a missing proof and not for work they can see.
+        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate());
         assert_eq!(
             refusal.message,
             format!(
-                "workspace raven head {} is not contained by main: this project has no main branch",
+                "workspace raven head {} cannot be proven to be in main: main's repository has no \
+                 main branch",
                 oid('4')
             )
+        );
+    }
+
+    /// The half of the gate this change exists to fix. Patch equivalence satisfies "landed", so a
+    /// workspace whose work reached main by squash-merge or a history rewrite retires with no flag
+    /// at all — while genuinely unheld work still requires the one flag that authorizes losing it.
+    #[test]
+    fn the_landed_gate_accepts_patch_equivalence_and_still_refuses_unheld_work() {
+        // Landed by patch identity alone: nothing ahead is unheld, though one commit is not an
+        // ancestor of main. No flag, and nothing to bundle.
+        assert_eq!(
+            removal_landed_decision(&workspace(), &oid('4'), measured(0, 1), false)
+                .expect("patch-equivalent work needs no authorization"),
+            None
+        );
+
+        // Nothing ahead at all — landed by ancestry — is the same answer by the same rule.
+        assert_eq!(
+            removal_landed_decision(&workspace(), &oid('4'), measured(0, 0), false)
+                .expect("a workspace with nothing ahead needs no authorization"),
+            None
+        );
+
+        // Partly landed is not landed, and the refusal stands without `--abandon`.
+        let refused = removal_landed_decision(&workspace(), &oid('4'), measured(2, 1), false)
+            .expect_err("unheld commits must be refused");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+
+        // `--abandon` is what turns that refusal into an authorized loss, and it answers with the
+        // state to bundle rather than with a bare go-ahead.
+        assert_eq!(
+            removal_landed_decision(&workspace(), &oid('4'), measured(2, 1), true)
+                .expect("--abandon authorizes the loss"),
+            Some(measured(2, 1))
+        );
+
+        // An unanswered question is refused exactly as unheld work is, and `--abandon` is still the
+        // only way past it — so a stale or unreadable target can never authorize a deletion.
+        assert!(
+            removal_landed_decision(&workspace(), &oid('4'), indeterminate(), false).is_err(),
+            "an indeterminate verdict must never read as landed"
+        );
+        assert_eq!(
+            removal_landed_decision(&workspace(), &oid('4'), indeterminate(), true)
+                .expect("--abandon authorizes a loss it cannot measure"),
+            Some(indeterminate())
         );
     }
 
@@ -7058,6 +7139,28 @@ fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
     )
 }
 
+/// The one place that decides whether a removal may destroy a session's object store.
+///
+/// Pure, and separated from the measurement on purpose: this is the decision an incident turned
+/// into a gate, and a decision worth testing directly is worth being able to test without a
+/// substrate. `Some` means the caller authorized an abandonment and there is genuinely something to
+/// bundle before deleting.
+#[cfg(target_os = "macos")]
+fn removal_landed_decision(
+    workspace: &WorkspaceName,
+    head: &GitOid,
+    landed: NativeLandedState,
+    abandon: bool,
+) -> Result<Option<NativeLandedState>> {
+    if landed.commits.fully_landed() {
+        return Ok(None);
+    }
+    if abandon {
+        return Ok(Some(landed));
+    }
+    Err(removal_unlanded_refusal(workspace, head, &landed))
+}
+
 /// The gate the incident turned on: these commits exist nowhere but the image about to be deleted.
 #[cfg(target_os = "macos")]
 fn removal_unlanded_refusal(
@@ -7065,15 +7168,22 @@ fn removal_unlanded_refusal(
     head: &GitOid,
     landed: &NativeLandedState,
 ) -> CowshedError {
+    let branch = &landed.branch;
     CowshedError::conflict(
-        match landed.tip.as_ref() {
-            Some(tip) => format!(
-                "workspace {workspace} head {head} is not contained by {} ({} is at {tip})",
-                landed.branch, landed.branch
+        match &landed.commits {
+            LandingCommits::Measured {
+                target_head,
+                unlanded,
+                ..
+            } => format!(
+                "workspace {workspace} head {head} carries {unlanded} commit{} that {branch} does \
+                 not hold, by ancestry or by patch equivalence ({branch} is at {target_head})",
+                if *unlanded == 1 { "" } else { "s" }
             ),
-            None => format!(
-                "workspace {workspace} head {head} is not contained by {}: this project has no {} branch",
-                landed.branch, landed.branch
+            // Saying which question went unanswered is the whole value of this branch: the caller
+            // is being refused for a missing proof, not for work they can see.
+            LandingCommits::Indeterminate { reason } => format!(
+                "workspace {workspace} head {head} cannot be proven to be in {branch}: {reason}"
             ),
         },
         format!("land the workspace: cowshed land {workspace}"),

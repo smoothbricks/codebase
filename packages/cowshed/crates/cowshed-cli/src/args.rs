@@ -236,9 +236,15 @@ pub struct RestoreArgs {
     pub label: OsString,
 }
 
+/// `landing` selects the view; `landed` selects the rows and implies the measurement. They are
+/// separate because their consumers are: a human triaging a project wants every row with its
+/// counts, and a script retiring landed workspaces wants nothing but the names it may safely pass
+/// to `rm`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ListArgs {
     pub all: bool,
+    pub landing: bool,
+    pub landed: bool,
 }
 
 /// `cowshed path` resolves either a workspace by name or a build slot by number. A slot is a
@@ -577,7 +583,7 @@ fn cli_command() -> ClapCommand {
                 .arg(positional("workspace", 0..=1))
                 .arg(positional("label", 0..=1)),
         )
-        .subcommand(leaf("ls").arg(flag("all")))
+        .subcommand(leaf("ls").args([flag("all"), flag("landing"), flag("landed")]))
         .subcommand(
             leaf("path")
                 .arg(positional("workspace", 0..=1))
@@ -1446,16 +1452,30 @@ const LIST: CommandSpec = CommandSpec {
     summary: "list workspaces",
     about: &[
         "One line per workspace of the project selected by the cwd or `--project`: name, state, branch, and mountpoint (empty when detached).",
+        "`--landing` and `--landed` answer a different question: is this workspace's work already in main? Both compare each workspace's HEAD — not its recorded branch, which is a label that can drift — against main's branch tip as it stands right now in main's own repository. A commit counts as landed when main holds its patch, so work that reached main by squash-merge, cherry-pick, or a history rewrite counts even though it is not an ancestor. A commit whose equivalence cannot be computed — a merge, or a commit with an empty diff — counts as unlanded, because the only safe error is to refuse. A workspace whose target cannot be resolved reports `indeterminate` with the reason on stderr and is never treated as landed.",
+        "Neither flag is on by default because the measurement costs git processes per workspace, and `ls` is used interactively and in scripts.",
     ],
-    options: &[Opt {
-        spelling: "--all",
-        meaning: "every adopted project on the host, with its repository id as the first column",
-    }],
+    options: &[
+        Opt {
+            spelling: "--all",
+            meaning: "every adopted project on the host, with its repository id as the first column",
+        },
+        Opt {
+            spelling: "--landing",
+            meaning: "add a header row and four columns — unlanded, landed, behind, dirty — measured against main; `?` where the measurement could not be made",
+        },
+        Opt {
+            spelling: "--landed",
+            meaning: "list only workspaces with nothing unlanded, as bare names for `cowshed ls --landed | xargs -n1 cowshed rm`; main is never listed, and an indeterminate workspace is never listed; add --landing for the table form instead of names",
+        },
+    ],
 };
 
 fn parse_list(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::List(ListArgs {
         all: flagged(matches, "all"),
+        landing: flagged(matches, "landing"),
+        landed: flagged(matches, "landed"),
     }))
 }
 
@@ -1625,13 +1645,14 @@ const REMOVE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "remove a workspace",
     about: &[
-        "Retires one workspace, deleting the image its commits live in. The gate is therefore ancestry, not preservation: `rm` refuses unless the project's main branch already contains the workspace's HEAD, read out of main's own repository. The workspace is marked deleted immediately; detach and image deletion finish in the background.",
+        "Retires one workspace, deleting the image its commits live in. The gate is containment, not preservation: `rm` refuses unless every commit the workspace's HEAD carries is already in the project's main branch. The workspace is marked deleted immediately; detach and image deletion finish in the background.",
+        "Containment means ancestry *or* patch equivalence. Work that reached main by squash-merge, cherry-pick, or a history rewrite is not an ancestor of main and is still landed, so retiring it needs no flag — passing a commit-destroying flag to remove work main already has is exactly the habit this gate exists to prevent. A commit whose equivalence cannot be computed — a merge, or one with an empty diff — is treated as not contained. The target tip is read live from main's own repository, never from the workspace's `main` remote, which is a clone-time snapshot; when it cannot be read the answer is `cannot determine`, which is refused exactly as unlanded work is.",
         "The two overrides authorize different losses and neither substitutes for the other, so a script carrying one has not acquired the other.",
     ],
     options: &[
         Opt {
             spelling: "--force",
-            meaning: "waive transient state only — a dirty tree, an in-progress merge, a busy mount; it does not reach the landed-ancestry gate",
+            meaning: "waive transient state only — a dirty tree, an in-progress merge, a busy mount. It does not waive the containment gate, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it or `cowshed checkpoint` first if it is the only copy",
         },
         Opt {
             spelling: "--restore",
@@ -1639,7 +1660,7 @@ const REMOVE: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--abandon",
-            meaning: "the sole authorization for destroying commits main does not contain; before deleting, main..HEAD is bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported, so it stays recoverable by fetching that bundle",
+            meaning: "the sole authorization for destroying commits main does not contain, and needed only for those: a workspace whose work is upstream by patch equivalence passes without it. Before deleting, main..HEAD is bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported, so the commits stay recoverable by fetching that bundle — the uncommitted tree is not bundled and does not survive",
         },
     ],
 };
@@ -1786,11 +1807,15 @@ const GC: CommandSpec = CommandSpec {
     trailing: "",
     summary: "free storage",
     about: &[
-        "Deletes orphaned images and stale mountpoint directories, prunes expired checkpoints, compacts detached images, and reports what it freed. Safe at any time; `rm`, `land`, and `restore` run it opportunistically.",
+        "Reclaims five kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned` and `freedBytes`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
+        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main or were deliberately abandoned. Safe. Note what is *not* in this category: the `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are never reclaimed, so abandoned commits stay fetchable and their disk use accumulates until you delete them yourself.",
+        "`orphanStagingImage` and `orphanStagingMetadata` — an image with no metadata sidecar, or a sidecar with no image, under `sessions/.staging/`. Each is half of a lifecycle transaction — create, fork, `rebase --fresh`, restore — that died between writing the image and publishing it. Neither half was ever published under a workspace name, so nothing ever used it. Safe.",
+        "`expiredCheckpoint` — an automatic checkpoint that is neither one of the five most recent for its workspace nor younger than fourteen days. This is the category that can delete something you still want: an automatic checkpoint is a real crash-consistent copy of that workspace, and past those two thresholds it goes. Pinned checkpoints are never candidates, and `cowshed checkpoint --keep` or any explicitly labelled checkpoint is pinned; `retainedPinned` in the report counts what was spared for that reason.",
+        "`detachedImageCompaction` — punches holes in an unmounted sparse image so the filesystem stops charging for blocks the image no longer uses. This deletes no data: the image's contents are unchanged and it stays fully usable. Only unmounted sparse images qualify.",
     ],
     options: &[Opt {
         spelling: "--dry-run",
-        meaning: "report what would be deleted without deleting anything",
+        meaning: "report every candidate with its path, byte count, and reason, and delete nothing",
     }],
 };
 

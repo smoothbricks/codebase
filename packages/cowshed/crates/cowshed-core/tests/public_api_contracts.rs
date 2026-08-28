@@ -217,6 +217,9 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
             pinned: true,
         }],
         snapshot_stale: false,
+        // A landing measurement is opt-in, so the frozen shape is the one without it. The
+        // populated shape is pinned separately below.
+        landing: None,
     };
     assert_eq!(
         serde_json::to_value(&attached).expect("attached JSON"),
@@ -251,9 +254,81 @@ fn workspace_info_attached_and_detached_shapes_are_frozen() {
     let detached_json = serde_json::to_value(detached).expect("detached JSON");
     assert_eq!(detached_json["state"], "detached");
     assert_eq!(detached_json["snapshotStale"], true);
-    for absent in ["branch", "baseCommit", "createdAt"] {
+    for absent in ["branch", "baseCommit", "createdAt", "landing"] {
         assert!(detached_json.get(absent).is_none(), "unexpected {absent}");
     }
+}
+
+/// Scripts are the main consumer of the landing fields, so the shape they read is frozen here.
+///
+/// The discriminated `state` is the load-bearing part: a script must be able to tell "measured, and
+/// nothing is unlanded" from "nobody could tell", and a shape where the counts were merely absent
+/// would let a `// unlanded == 0` test pass on an unanswered question.
+#[test]
+fn workspace_landing_shapes_are_frozen_and_discriminated() {
+    let measured = WorkspaceLanding {
+        dirty_files: Some(2),
+        commits: LandingCommits::Measured {
+            target_branch: "main".into(),
+            target_head: oid('b'),
+            unlanded: 4,
+            landed: 541,
+            behind: 673,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&measured).expect("measured JSON"),
+        json!({
+            "dirtyFiles": 2,
+            "commits": {
+                "state": "measured",
+                "targetBranch": "main",
+                "targetHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "unlanded": 4,
+                "landed": 541,
+                "behind": 673
+            }
+        })
+    );
+    assert!(measured.commits.target_head().is_some());
+    assert!(!measured.commits.fully_landed());
+
+    let indeterminate = WorkspaceLanding {
+        dirty_files: None,
+        commits: LandingCommits::Indeterminate {
+            reason: "main's repository has no main branch".into(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&indeterminate).expect("indeterminate JSON"),
+        json!({
+            "commits": {
+                "state": "indeterminate",
+                "reason": "main's repository has no main branch"
+            }
+        })
+    );
+    assert!(
+        !indeterminate.commits.fully_landed(),
+        "an unanswered question must never satisfy the landed predicate"
+    );
+    assert!(indeterminate.commits.target_head().is_none());
+
+    // Nothing unlanded is the one shape that authorizes a no-flag removal.
+    assert!(
+        WorkspaceLanding {
+            dirty_files: Some(0),
+            commits: LandingCommits::Measured {
+                target_branch: "main".into(),
+                target_head: oid('b'),
+                unlanded: 0,
+                landed: 1,
+                behind: 1,
+            },
+        }
+        .commits
+        .fully_landed()
+    );
 }
 
 #[test]
