@@ -21,3 +21,8 @@ sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# sccache's own config file is TOML, and `setup` has to read one it did not write without
+# reordering or dropping a key its author set. Parsing is what makes the never-clobber decision
+# honest; preservation comes from never rewriting those bytes at all — cowshed's block is appended
+# below them, and only that block is ever rewritten.
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }

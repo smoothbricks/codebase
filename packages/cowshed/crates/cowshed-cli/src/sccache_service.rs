@@ -182,7 +182,11 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
 ///
 /// Allocated rather than logical bytes: these images are sparse and provisioned far beyond their
 /// contents (100 GiB by default), so `len()` would derive a cap from the provisioning, not the data.
-async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<ImageCapacity> {
+///
+/// Shared with `setup`, which writes the same number into sccache's own config file: a client that
+/// finds no daemon starts a server of its own over the same directory, and two servers deriving
+/// two different caps would make the shared store's eviction bound depend on which one started.
+pub(crate) async fn derived_capacity(storage: &ValidatedHostStorage) -> Result<ImageCapacity> {
     use cowshed_core::metadata::ImageFormat;
     use cowshed_core::storage::StorageLayout;
     use std::os::unix::fs::MetadataExt as _;
