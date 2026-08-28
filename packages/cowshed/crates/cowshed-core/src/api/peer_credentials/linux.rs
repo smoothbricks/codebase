@@ -7,7 +7,7 @@ pub(super) fn peer_uid(fd: libc::c_int) -> Result<libc::uid_t, PeerCredentialsEr
         gid: 0,
     };
     let mut credentials_len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
-        .map_err(|_| PeerCredentialsError::PeerCredentialSizeOverflow)?;
+        .map_err(|_| PeerCredentialsError::PeerCredentialQueryFailed)?;
     let result = unsafe {
         libc::getsockopt(
             fd,

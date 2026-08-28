@@ -891,9 +891,7 @@ fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
         | PeerCredentialsError::NotStream => {
             handshake_error("coordinator descriptor is not a stream socket")
         }
-        PeerCredentialsError::PeerCredentialSizeOverflow
-        | PeerCredentialsError::PeerCredentialQueryFailed
-        | PeerCredentialsError::UnsupportedPlatform => {
+        PeerCredentialsError::PeerCredentialQueryFailed => {
             handshake_error("coordinator descriptor peer does not match the current uid")
         }
     })?;
