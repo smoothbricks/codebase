@@ -19,10 +19,10 @@ subsequent timestamps.
 > realized API is the class method `getTimestampNanos()`. Behaviour is pinned by
 > `packages/lmao/src/lib/__tests__/timestamp.test.ts`.
 >
-> **Native acceleration is WASM, not NAPI.** A Zig NAPI span-write backend was built and benchmarked against JS and WASM
-> (span timestamp writes, M1 Max: WASM ~48 ns, NAPI ~70–86 ns, JS ~85–98 ns); NAPI beat JS but lost to WASM, so the
-> node-gyp/NAPI path was removed in favor of the pure-Zig WASM memory architecture (01q). Node's `TraceRoot` writes are
-> plain JS today; the WASM allocator is the native fast path. There is no NAPI addon in the package.
+> **Native acceleration is WASM, not NAPI.** Earlier benchmarks compared a N-API span-write backend with JS and WASM
+> (span timestamp writes, M1 Max: WASM ~48 ns, NAPI ~70–86 ns, JS ~85–98 ns); NAPI beat JS but lost to WASM. The current
+> package keeps `TraceRoot` writes in plain JS and uses the WASM allocator as the native fast path. There is no NAPI
+> addon in the package.
 
 ### Core Design Principles
 

@@ -495,7 +495,7 @@ Offset  Size  Field
 
 On **pushToFreelist(offset, is_merge)**:
 
-```zig
+```text
 block.next = old_head
 if (old_head != 0) {
     block.freelist_len = old_head.freelist_len + 1
@@ -513,7 +513,7 @@ HEAD = block
 
 On **allocAtTier() from freelist**:
 
-```zig
+```text
 block = HEAD
 HEAD = block.next
 // Cascade stats to new head and increment reuse count
@@ -776,15 +776,16 @@ oldest lease age, pinned/reusable/orphaned bytes, committed pages, fragmentation
 
 ## Implementation Map <a id="smoo/lmao!n/wasm-mem.implementation-map"></a>
 
-The architecture spans Zig (the allocator + per-span lifecycle) and a TypeScript surface (buffer strategy, span buffer,
-codegen). It integrates with `TestTracer` / `StdioTracer` / `ArrayQueueTracer` via `WasmBufferStrategy`, with
-`defineOpContext()` and the logging API (tag, log, ok, err, span), with Arrow conversion via
+The architecture spans a Rust WASM allocator (`packages/lmao-rs/crates/lmao-wasm`) and a TypeScript surface (buffer
+strategy, span buffer, codegen). It integrates with `TestTracer` / `StdioTracer` / `ArrayQueueTracer` via
+`WasmBufferStrategy`, with `defineOpContext()` and the logging API (tag, log, ok, err, span), with Arrow conversion via
 `convertSpanTreeToArrowTable()`, and with schema generation (`S.enum`, `S.category`, `S.text`, `S.number`, `S.boolean`).
 The pieces below are the commitments — what lives where, the file:symbol map.
 
 ### WASM Allocator Module <a id="smoo/lmao!n/wasm-mem.allocator"></a>
 
-Lives in Zig (`packages/lmao/src/lib/wasm/allocator.zig`):
+Lives in Rust (`packages/lmao-rs/crates/lmao-wasm/src/lib.rs`), with the allocation core in
+`packages/lmao-rs/crates/lmao-arena/src/raw.rs`:
 
 - Header initialization: `init()`, `reset()`
 - Tiered allocation: `alloc_span_system(capacity)`, `alloc_col_1b(capacity)`, `alloc_col_4b(capacity)`,
