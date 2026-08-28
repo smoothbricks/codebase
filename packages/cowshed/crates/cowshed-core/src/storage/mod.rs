@@ -168,6 +168,16 @@ impl StorageLayout {
     pub fn project(&self) -> &ProjectPaths {
         &self.project
     }
+    /// Establishes the per-project storage boundary before any project-local metadata is written.
+    ///
+    /// Path derivation remains side-effect free; only the adopt provisioning path calls this.
+    pub(crate) fn provision_project(&self) -> Result<(), StorageLayoutError> {
+        verify_no_symlinks(&self.project.store_root, &self.project.project_root)?;
+        fs::create_dir_all(&self.project.project_root).map_err(|source| StorageLayoutError::Io {
+            path: self.project.project_root.clone(),
+            source,
+        })
+    }
 
     pub fn main_image(&self, format: ImageFormat) -> Result<ImagePaths, StorageLayoutError> {
         self.image_below(&self.project.project_root, "main", format)
@@ -520,6 +530,48 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn adopt_provisioning_creates_project_root_before_the_first_journal_write() {
+        use crate::api::dto::AdoptOptions;
+        use crate::storage::recovery::{
+            LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
+        };
+
+        let root = temp_store("adopt-provisioning");
+        let layout = layout_under(&root);
+        let project_root = layout.project().project_root.clone();
+        assert!(!project_root.exists());
+
+        layout.provision_project().expect("provision project root");
+        let mut journal = LifecycleIntentJournal::default();
+        journal.begin(LifecycleIntent::Adopt {
+            options: AdoptOptions::default(),
+        });
+        journal
+            .persist(&project_root.join(LIFECYCLE_INTENTS_FILE))
+            .expect("first project-local write");
+
+        assert!(project_root.is_dir());
+        assert!(project_root.join(LIFECYCLE_INTENTS_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_provisioning_refuses_a_symlinked_repository_boundary() {
+        let root = temp_store("provisioning-symlink");
+        let outside = temp_store("provisioning-symlink-target");
+        std::os::unix::fs::symlink(&outside, root.join("acme")).unwrap();
+        let layout = layout_under(&root);
+
+        let error = layout.provision_project().unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageLayoutError::SymlinkComponent(path) if path == root.join("acme")
+        ));
+        assert!(!outside.join("widget").exists());
     }
 
     #[test]

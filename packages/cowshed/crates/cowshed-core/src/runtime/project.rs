@@ -1644,6 +1644,26 @@ impl NativeProjectRuntimeHost {
             let binding = load_or_validate_binding(&layout, candidate, &git).await?;
             (repo_id, layout, binding)
         };
+        if !existing_only {
+            let provision_layout = layout.clone();
+            let project_root = layout.project().project_root.clone();
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                provision_layout.provision_project()
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("project storage provisioning task failed: {error}"))
+            })?
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot provision project storage {}: {error}",
+                        project_root.display()
+                    ),
+                    "repair cowshed storage and retry adoption",
+                )
+            })?;
+        }
         // Every resolver that answers "where does main mount" reads this one value, so it is
         // resolved once here, from durable project state, and never inferred per call site.
         let checkout_layout = layout.checkout_layout().map_err(native_integrity_error)?;
