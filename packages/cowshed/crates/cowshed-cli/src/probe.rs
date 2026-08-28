@@ -22,7 +22,7 @@ const GIT: &str = "/usr/bin/git";
 #[cfg(not(target_os = "macos"))]
 const GIT: &str = "git";
 
-const HINT: &str = "cowshed setup --mount-root <dir>";
+const HINT: &str = "add an includeIf gitdir: pattern covering the workspace mount root; cowshed setup --mount-root does not rewrite git identity";
 
 /// One config file Git included in the checkout and not at the candidate workspace path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,13 +35,13 @@ impl GitIdentityGap {
     pub fn message(&self, mount_root: &Path) -> String {
         match &self.include_if_condition {
             Some(condition) => format!(
-                "config file {} is included only in the checkout via includeIf {}; add pattern covering {} or rerun setup --mount-root",
+                "config file {} is included only in the checkout via includeIf {}; add an includeIf gitdir: pattern covering {}",
                 self.config_file.display(),
                 condition,
                 mount_root.display()
             ),
             None => format!(
-                "config file {} is included only in the checkout; add pattern covering {} or rerun setup --mount-root",
+                "config file {} is included only in the checkout; add an includeIf gitdir: pattern covering {}",
                 self.config_file.display(),
                 mount_root.display()
             ),
@@ -345,10 +345,16 @@ mod tests {
         assert!(finding.message.contains(extra.to_str().unwrap()));
         assert!(finding.message.contains("includeIf gitdir:"));
         assert!(
-            finding.message.contains(
-                "add pattern covering /Users/dev/.cowshed/mnt or rerun setup --mount-root"
-            )
+            finding
+                .message
+                .contains("add an includeIf gitdir: pattern covering /Users/dev/.cowshed/mnt")
         );
+        assert!(
+            !finding.hint.starts_with("cowshed setup"),
+            "the next step must not be a setup command that cannot add includeIf patterns; hint was {}",
+            finding.hint
+        );
+        assert!(finding.hint.contains("does not rewrite git identity"));
         assert_eq!(finding.hint, HINT);
 
         let _ = fs::remove_dir_all(root);

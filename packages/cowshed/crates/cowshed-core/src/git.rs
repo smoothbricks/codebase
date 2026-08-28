@@ -85,6 +85,17 @@ pub enum MergeDriverState {
     Unresolvable { program: String },
 }
 
+/// Cowshed's upstream in this workspace, read without writing.
+///
+/// Displacement is accounted for: a user-owned `main` is never treated as cowshed's, even when
+/// that URL is not a local path. Doctor reports `repository == false`; it never retargets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CowshedUpstream {
+    pub remote_name: String,
+    pub url: Option<PathBuf>,
+    pub repository: bool,
+}
+
 /// Where a linked-worktree registration is taken out before its pointer is moved to the mount
 /// root. Inside the image, so it is on the workspace's own volume and gone before the mount is
 /// published; under `.cowshed/` because that subtree is already cowshed's and not the repository's.
@@ -1003,6 +1014,38 @@ impl GitRepository {
         self.classified_merge_drivers().await
     }
 
+    /// Which remote cowshed uses as this workspace's upstream, and whether that URL is a repository.
+    ///
+    /// Doctor reads this; it never writes. Ownership uses the same rules as
+    /// [`Self::configure_main_remote`]: a recorded `remote.<name>.cowshed` value, else a URL that
+    /// already names `main_mount`, else a dead local path. A live foreign `main` is not cowshed's.
+    pub async fn inspect_cowshed_upstream(&self, main_mount: &Path) -> Result<CowshedUpstream> {
+        let main_url = self.remote_url(MAIN_REMOTE).await?;
+        let cowshed_owns_main = match &main_url {
+            Some(url) => self.owns_remote(MAIN_REMOTE, url, main_mount).await?,
+            None => false,
+        };
+        let remote_name = if cowshed_owns_main {
+            MAIN_REMOTE
+        } else {
+            FALLBACK_MAIN_REMOTE
+        };
+        let url = if cowshed_owns_main {
+            main_url
+        } else {
+            self.remote_url(remote_name).await?
+        };
+        let repository = match &url {
+            Some(path) if path.is_absolute() => is_git_repository(path).await?,
+            _ => false,
+        };
+        Ok(CowshedUpstream {
+            remote_name: remote_name.to_owned(),
+            url,
+            repository,
+        })
+    }
+
     /// Rewrite every `merge.*.driver` whose program is an absolute path into the
     /// repository-relative spelling, and report the state of all of them afterwards.
     ///
@@ -1539,8 +1582,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        FALLBACK_MAIN_REMOTE, GIT, GitRepository, MAIN_REMOTE, MainRemote, ensure_git_success,
-        git_message, workspace_remote_name,
+        CowshedUpstream, FALLBACK_MAIN_REMOTE, GIT, GitRepository, MAIN_REMOTE, MainRemote,
+        ensure_git_success, git_message, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2562,5 +2605,89 @@ mod tests {
         fs::remove_dir_all(empty_recovery).expect("remove empty recovery");
         fs::remove_dir_all(recovery).expect("remove recovery fixture");
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn inspect_cowshed_upstream_does_not_write_and_skips_a_foreign_main() {
+        let workspace = repository();
+        let main_mount = repository();
+        let repo = GitRepository::from_root(&workspace);
+
+        git(
+            &workspace,
+            &[
+                "remote",
+                "add",
+                "main",
+                "https://example.invalid/acme/widget.git",
+            ],
+        );
+        let inspected = repo
+            .inspect_cowshed_upstream(&main_mount)
+            .await
+            .expect("inspect");
+        assert_eq!(
+            inspected,
+            CowshedUpstream {
+                remote_name: FALLBACK_MAIN_REMOTE.to_owned(),
+                url: None,
+                repository: false,
+            }
+        );
+        let remotes = repo.remotes().await.expect("list remotes");
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "main");
+
+        fs::remove_dir_all(workspace).expect("remove workspace");
+        fs::remove_dir_all(main_mount).expect("remove main");
+    }
+
+    #[tokio::test]
+    async fn inspect_cowshed_upstream_reports_a_dead_owned_remote_and_configure_clears_it() {
+        let workspace = repository();
+        let main_mount = repository();
+        let dead = workspace.join("gone-checkout");
+        let repo = GitRepository::from_root(&workspace);
+
+        git(
+            &workspace,
+            &["remote", "add", "main", dead.to_str().expect("utf-8")],
+        );
+        git(
+            &workspace,
+            &[
+                "config",
+                "remote.main.cowshed",
+                dead.to_str().expect("utf-8"),
+            ],
+        );
+
+        let before = repo
+            .inspect_cowshed_upstream(&main_mount)
+            .await
+            .expect("inspect");
+        assert_eq!(before.remote_name, MAIN_REMOTE);
+        assert_eq!(before.url.as_deref(), Some(dead.as_path()));
+        assert!(
+            !before.repository,
+            "a recorded cowshed remote pointing at a missing path is not a repository"
+        );
+
+        repo.configure_main_remote(&main_mount)
+            .await
+            .expect("repair");
+        let after = repo
+            .inspect_cowshed_upstream(&main_mount)
+            .await
+            .expect("inspect after repair");
+        assert_eq!(after.remote_name, MAIN_REMOTE);
+        assert_eq!(after.url.as_deref(), Some(main_mount.as_path()));
+        assert!(
+            after.repository,
+            "configure_main_remote must retarget cowshed's remote"
+        );
+
+        fs::remove_dir_all(workspace).expect("remove workspace");
+        fs::remove_dir_all(main_mount).expect("remove main");
     }
 }
