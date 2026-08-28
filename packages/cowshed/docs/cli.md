@@ -663,12 +663,10 @@ cowshed: mirror /private/cowshed/caches/repo-mirrors/github.com/tinylibs/tinyben
 tinybench
 ```
 
-### `cowshed rebase <name> [--fresh]`
+### `cowshed rebase <name>`
 
 Brings the workspace branch up to current main (`git fetch host && git rebase host/main`, run inside the sandbox).
-Conflicts abort cleanly and exit 4 naming the conflicted paths. `--fresh` sheds accumulated image divergence: replay the
-branch onto a brand-new clone of current main and transplant the workspace's identity onto it — refused (exit 4) if the
-tree is dirty.
+Conflicts abort cleanly and exit 4 naming the conflicted paths.
 
 ### `cowshed land <name> [--check <cmd>]`
 
@@ -812,8 +810,7 @@ the resolved configuration without starting a server, so it is safe to run again
 ### `cowshed du`
 
 Copy-on-write-aware usage: written vs referenced bytes per workspace and per checkpoint — "written" is the true cost,
-"referenced" is shared with main. `--json` for dashboards; this is also how a coordinator spots long-lived workspaces
-worth `cowshed rebase --fresh`.
+"referenced" is shared with main. `--json` for dashboards and automation.
 
 ### `cowshed logs` / `cowshed audit` / `cowshed trace`
 
