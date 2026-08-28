@@ -50,6 +50,19 @@
       "rust-analyzer"
       "rust-src"
     ];
+    # CI validates on Linux, so a macOS shell carries Linux's std and can
+    # type-check the arm CI compiles. This reaches every crate whose dependency
+    # graph is pure Rust; a dependency that compiles C for the target — ring,
+    # openssl-sys, libgit2-sys, libz-sys — additionally needs a cross C compiler,
+    # which this shell does not provide, so those crates check on the host target
+    # only.
+    #
+    # The reverse direction is not available at any price: type-checking an Apple
+    # target from Linux needs an Apple SDK for those same C-building
+    # dependencies, which is a licensing boundary rather than a missing package.
+    targets = [
+      "x86_64-unknown-linux-gnu"
+    ];
   };
 
   # One Go for every repository, same reasoning as the Rust toolchain: a compiler
