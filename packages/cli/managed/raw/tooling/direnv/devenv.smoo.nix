@@ -106,24 +106,32 @@
     #    a failed bootstrap aborts shell entry instead of yielding a half-working
     #    shell.
     # 6. The wrapper follows the store, so a cowshed host wraps every checkout,
-    #    including main. CARGO_INCREMENTAL is deliberately never set, which is what
-    #    lets incremental and the cache coexist. With it unset, cargo keeps
-    #    incremental for local dev units (sccache reports them non-cacheable and
-    #    forwards them, which costs nothing because an agent's own edit is novel
-    #    input that could never hit) while every unit cargo compiles
-    #    non-incrementally — registry dependencies, `incremental = false` profiles,
-    #    release and platform builds — goes through the cache and can hit work
-    #    another workspace already did. Setting CARGO_INCREMENTAL=0 bought nothing
-    #    and surrendered the inner loop.
+    #    including main. The store and the socket are cowshed's own, not this
+    #    module's invention: cowshed-core/src/sandbox.rs defines them as
+    #    /private/cowshed/caches/sccache and /private/cowshed/store/sccache.sock,
+    #    its Seatbelt profile admits exactly that socket and denies binding it, and
+    #    its supervisor exports the same pair into every sandboxed process. Naming
+    #    any other path here does not create a second opinion, it creates a second
+    #    cache — and a $HOME path is the worst of them, because $HOME is private
+    #    per workspace inside the sandbox, so every client is sent to a store the
+    #    daemon does not serve while the daemon's own store goes unread.
     #
-    #    The socket path is a fixed convention because a client that finds no daemon
-    #    compiles uncached. A CI runner that exports SCCACHE_DIR opts in the same
-    #    way. A machine with no store stays unwrapped, so nothing grows a cache
-    #    nobody reclaims. SCCACHE_BASEDIR_CWD=1 activates the patched sccache from
-    #    the repository's nixpkgs overlay, which keys path-bearing hash inputs
-    #    relative to the request cwd so workspaces share one cache at any mount
-    #    path; crates that compile env!("CARGO_MANIFEST_DIR") into their output fail
-    #    closed.
+    #    A client that finds no daemon compiles uncached, so the socket path is a
+    #    fixed convention rather than a discovery. A CI runner that exports
+    #    SCCACHE_DIR opts in the same way. A machine with no cowshed store stays
+    #    unwrapped, so nothing grows a cache nobody reclaims. SCCACHE_BASEDIR_CWD=1
+    #    activates the patched sccache from the repository's nixpkgs overlay, which
+    #    keys path-bearing hash inputs relative to the request cwd so workspaces
+    #    share one cache at any mount path; crates that compile
+    #    env!("CARGO_MANIFEST_DIR") into their output fail closed.
+    #
+    #    CARGO_INCREMENTAL is not set here, so a shell outside cowshed keeps
+    #    incremental for local dev units — sccache reports them non-cacheable and
+    #    forwards them, which costs nothing because an agent's own edit is novel
+    #    input that could never hit — while everything cargo compiles
+    #    non-incrementally still goes through the cache. Under cowshed the choice
+    #    is not this module's to make: the supervisor sets CARGO_INCREMENTAL=0 for
+    #    every sandboxed process, so incremental is off wherever cowshed runs.
     # 7. GOROOT is unset rather than set, and this is the isolation boundary that
     #    makes the arrangement above correct rather than a workaround for it. Our
     #    Go comes from devenv; a dependency may vendor its own SDK; neither may
@@ -153,9 +161,9 @@
       unset GOROOT
       bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
 
-      if [ -n "''${SCCACHE_DIR:-}" ] || [ -d "$HOME/.cowshed/caches/sccache" ]; then
-        export SCCACHE_DIR="''${SCCACHE_DIR:-$HOME/.cowshed/caches/sccache}"
-        export SCCACHE_SERVER_UDS="''${SCCACHE_SERVER_UDS:-$HOME/.cowshed/sccache.sock}"
+      if [ -n "''${SCCACHE_DIR:-}" ] || [ -d /private/cowshed/caches/sccache ]; then
+        export SCCACHE_DIR="''${SCCACHE_DIR:-/private/cowshed/caches/sccache}"
+        export SCCACHE_SERVER_UDS="''${SCCACHE_SERVER_UDS:-/private/cowshed/store/sccache.sock}"
         export RUSTC_WRAPPER=sccache
         export SCCACHE_BASEDIR_CWD=1
       fi
