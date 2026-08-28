@@ -107,7 +107,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: trace-results-${{ github.run_id }}
-          path: packages/*/.trace-results.db
+          path: packages/*/.cache/trace-results.db*
           if-no-files-found: ignore
           retention-days: 14
           include-hidden-files: true
