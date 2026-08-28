@@ -24,10 +24,22 @@ release, and Git hook files. Update generated copies with `smoo monorepo update`
 **Error handling policy:** Known operational failures must return `Err`/`Result`; reserve `throw` for invariants or
 impossible programmer/configuration bugs. For full policy and examples, follow `AGENTS.md`.
 
+**What traced tests are for:** a test's spans are its observable output — the surface tests **assert over**, and the
+record you **read after** instead of re-running the suite. Assertions select by span name/TEMPLATE and typed columns,
+never rendered text; negative assertions ("this event never appears") and parentage-based ordering are first-class.
+`span-err` is an expected operational failure (`ctx.err(...)` / `Err`); `span-exception` is a bug. The sink is an
+assertion oracle, not a log file.
+
 **Test tracing policy:** Every package test suite (except `packages/lmao`) must be LMAO-traced and flush to a SQLite
-sink (local `.trace-results.db` or worker D1 binding like `TRACE_RESULTS`). Keep preload/setup files wiring-only and
-move runner-specific behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`,
-`@smoothbricks/lmao/testing/vitest`) plus package-local typed tracer modules.
+sink (worker suites: a D1 binding like `TRACE_RESULTS`). Keep preload/setup files wiring-only and move runner-specific
+behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`, `@smoothbricks/lmao/testing/vitest`) plus
+package-local typed tracer modules.
+
+**The sink's location and durability are load-bearing.** One exported harness constant owns the path — never hardcode it
+in a package, a workflow glob, or a doc. It must sit under a directory name project walkers and watchers ignore, because
+a database inside a compiled package's root makes its own journal churn look like the project tree changing mid-compile.
+Parallel test workers share one database, so never trade on-disk rollback for quiet: a journal mode without it lets one
+killed worker corrupt the traces the other workers assert over.
 
 **Tracing policy — No default `NoOpTracer`:** `NoOpTracer` may exist in `@smoothbricks/lmao` for API proof, comparison,
 and overhead benchmarking, but it is not the normal repo pattern. Require tracing context from callers, use child spans,
@@ -145,17 +157,20 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Typecheck / build:** `nx tsc-js <project>` for source, `nx typecheck-tests <project>` for tests,
   `nx build <project>` for the aggregate
 - **After tsconfig or dependency changes:** `nx sync` and `nx sync:check`
-- **Query test results:** Use `.trace-results.db` SQLite databases:
+- **Query test results:** read failures out of the trace sink instead of re-running a large suite. The harness constant
+  owns the path; the queries are path-independent:
   ```bash
-  bun -e \"
+  bun -e "
     const { Database } = require('bun:sqlite');
-    const db = new Database('packages/<project>/.trace-results.db');
-    const latest = db.query(\\\"SELECT trace_id FROM spans WHERE parent_span_id = 0 AND row_index = 0 ORDER BY timestamp_ns DESC LIMIT 1\\\").get();
-    const failures = db.query(\\\"SELECT s0.message AS name, s1.message AS err FROM spans s0 JOIN spans s1 ON s1.trace_id=s0.trace_id AND s1.span_id=s0.span_id AND s1.row_index=1 WHERE s0.trace_id=? AND s0.row_index=0 AND s1.entry_type IN (3,4)\\\").all(latest.trace_id);
+    const db = new Database(process.argv[1]);
+    const latest = db.query(\"SELECT trace_id FROM spans WHERE parent_span_id = 0 AND row_index = 0 ORDER BY timestamp_ns DESC LIMIT 1\").get();
+    const failures = db.query(\"SELECT s0.message AS name, s1.message AS err FROM spans s0 JOIN spans s1 ON s1.trace_id=s0.trace_id AND s1.span_id=s0.span_id AND s1.row_index=1 WHERE s0.trace_id=? AND s0.row_index=0 AND s1.entry_type IN (3,4)\").all(latest.trace_id);
     if (!failures.length) { console.log('All passed'); process.exit(0); }
-    for (const f of failures) console.log('[FAIL]', f.name);
-  \"
+    for (const f of failures) console.log('[FAIL]', f.name, '—', f.err);
+  " <sink-path>
   ```
+  `entry_type IN (3,4)` is `span-err` and `span-exception`; prefer `TraceQuery`/`lmao-query` selectors over raw SQL when
+  asserting rather than eyeballing.
 - **ALWAYS run tests through Nx:** `nx test <project>` — this builds dependencies first, keeps declarations fresh, and
   loads the package's real test config/preloads. Pass extra runner args through Nx instead of switching to `bun test`.
 - **Package-local extra preloads still matter.** If a package adds its own extra preload beyond the shared root ones,
