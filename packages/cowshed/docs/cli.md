@@ -176,6 +176,7 @@ $ cowshed setup
 cowshed: cowshed.store (store): present but not mounted -> mounted
 cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remounted
 cowshed: /etc/fstab already pins the boot mounts
+cowshed: wrote ~/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in /private/cowshed/caches/sccache
 cowshed: host storage is set up
 next: cowshed doctor
 
@@ -183,6 +184,7 @@ $ cowshed setup
 cowshed: cowshed.store (store): mounted at its canonical path -> already-current
 cowshed: cowshed.caches (caches): mounted at its canonical path -> already-current
 cowshed: /etc/fstab already pins the boot mounts
+cowshed: ~/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache
 cowshed: everything already set up
 next: cowshed doctor
 ```
@@ -196,6 +198,32 @@ cowshed: cowshed.store (store): found outside this host's container (container d
 cowshed: data is safe on disk4s7; cowshed left it untouched
 cowshed: host storage is partially set up: 1 volume lives outside this host's container and left untouched
 ```
+
+`setup` also writes **sccache's own config file** — the one host-level thing that decides where a compile cache lands
+for a client that has no cowshed environment at all. Every workspace gets `SCCACHE_DIR` from its supervisor, so a build
+inside a workspace already reaches the daemon; a `cargo` invoked anywhere else is still wrapped (`RUSTC_WRAPPER=sccache`
+survives in any shell that once loaded a project environment) and would otherwise fall back to sccache's private
+per-user directory, where nothing is shared and the hit rate reads as zero. The file names
+`/private/cowshed/caches/sccache` and the same cap the daemon uses, because a client that finds no daemon starts a
+server of its own over that directory and sccache's 10 GiB default would evict the shared store down to it.
+
+The destination is whichever config path sccache itself would load — `~/Library/Application Support/Mozilla.sccache/` on
+macOS, `$XDG_CONFIG_HOME/sccache/` elsewhere, and the legacy `~/Library/Preferences/Mozilla.sccache/` when a config
+already lives there, since writing the modern path over an existing old one would shadow rather than replace it. cowshed
+owns exactly the `[cache.disk]` table and says so in a comment at the top of the block (a comment, because sccache
+rejects unknown _keys_ and would refuse to start over one). Nothing else in that file is ever rewritten: the block is
+appended below whatever is already there, and a `cache.disk.dir` cowshed did not write is left alone and reported rather
+than overwritten —
+
+```
+cowshed: left ~/Library/Application Support/Mozilla.sccache/config alone: it already sets cache.disk.dir to ~/Library/Caches/Mozilla.sccache; a store-less sccache client will not share /private/cowshed/caches/sccache until cache.disk.dir names it
+```
+
+which is a report, not a failure: the host's storage is set up either way. A block cowshed _did_ write is refreshed on
+every run, so a cap that has drifted upward as projects were adopted is repaired by running `setup` again; a foreign
+`dir` never is, and has to be resolved by hand. Nothing is written at all when the caches volume is not mounted, since a
+config naming a directory beneath an empty mountpoint would resolve onto the boot disk and become one more orphaned
+cache.
 
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
 the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `cowshed.store` and
@@ -774,6 +802,12 @@ aggregate hit rate routinely hides a Rust hit rate of zero — which is the numb
 Workspaces reach the daemon through `SCCACHE_SERVER_UDS` (supervisor-injected, `.cowshed/env`-exported, and carried by
 the cargo `[env]` guidance); the Seatbelt profile admits exactly that socket and keeps the sccache store
 daemon-write-only. `sccache --show-stats` works from any shell with the export set — it speaks to the same server.
+
+A client with no export set at all is `cowshed setup`'s business rather than this verb's: it reads sccache's own config
+file, which `setup` writes and owns (see [`cowshed setup`](#cowshed-setup---uninstall---force---mount-root-dir) above).
+`sccache --show-stats` run from such a shell — no `SCCACHE_DIR`, no `SCCACHE_CONF`, outside every workspace — is the
+check that the file took effect: `Cache location` must read `Local disk: "/private/cowshed/caches/sccache"`. It reports
+the resolved configuration without starting a server, so it is safe to run against a live host.
 
 ### `cowshed du`
 
