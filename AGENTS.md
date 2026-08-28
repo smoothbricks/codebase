@@ -579,6 +579,27 @@ explicitly!
 **Lint**: `nx lint <project>` **Fix linting issues**: `bun run lint:fix` at the repository root. There is no Nx
 `lint:fix` target. **⚠️ CRITICAL**: Agents MUST run `nx lint <project>` before running tests to catch type errors early
 
+#### Linux cross-compile check (macOS hosts)
+
+CI validates on Linux. Rust behind a `cfg(target_os)` arm that only Linux compiles is invisible to `nx lint` on macOS,
+so a fully green local lint can still turn CI red on unused imports, unresolved names and dead code inside the
+`not(target_os = "macos")` branch. Before pushing Rust that has any platform `cfg`, run at the repository root:
+
+```bash
+bun run check:linux
+```
+
+That runs `nx run-many -t cargo-lint-cross` inside the opt-in `linux-cross` devenv profile, which is the only place the
+0.4 GiB cross C toolchain lives — the default `devenv shell` never carries it, so macOS shells and macOS CI stay lean.
+Each Rust project gets `cargo-lint-cross` inferred automatically from its workspace `Cargo.toml`; nobody adds it by
+hand, and `smoo monorepo check` fails if a Cargo workspace has lost it.
+
+**It type-checks, it does not run.** `--all-targets` compiles bins, tests, benches and examples for
+`x86_64-unknown-linux-gnu`, so test _code_ is verified for Linux — but nothing is executed, because an x86_64 Linux
+binary cannot run on Apple Silicon. There is deliberately no cross `test` or `build` target: Linux release artifacts are
+built by CI's platform matrix, and a cross test target could only produce a harness it must refuse to launch. Passing
+`check:linux` therefore means "Linux compiles this", never "Linux tests pass".
+
 ### Testing
 
 - **Test**: `nx test <project>`
