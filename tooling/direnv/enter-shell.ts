@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, stat, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import { $ } from 'bun';
 
@@ -24,15 +24,36 @@ async function rebuildNxPluginIfStale(): Promise<void> {
     // no prior graph cache, so `nx run nx-plugin:tsc-js` deadlocks on the plugin
     // it is trying to build. `ttsc` only needs the package tsconfig.
     await runQuietly('ttsc', ['-p', 'tsconfig.lib.json', '--emit'], path.join(projectRoot, 'packages/nx-plugin'));
+    // The marker records when dist was last VERIFIED current, not when tsc last
+    // chose to write bytes. ttsc is content-incremental, so an mtime-only change —
+    // a checkout, a revert, a formatter rewriting a file identically — makes it
+    // exit 0 emitting nothing and leaves the marker behind the sources forever.
+    // Without this touch the condition above never clears again, so every later
+    // shell entry and every direnv reload rebuilds and calls clearNxDaemonState,
+    // permanently destroying Nx's task cache for the whole repository.
+    await utimes(buildMarker, new Date(), new Date()).catch(() => {});
     await clearNxDaemonState();
   }
 }
 
 async function clearNxDaemonState(): Promise<void> {
-  // Equivalent to `nx reset` without constructing the project graph.
-  await $`rm -rf ${path.join(projectRoot, '.nx/cache')} ${path.join(projectRoot, '.nx/workspace-data')}`
-    .quiet(true)
-    .nothrow();
+  // Only `.nx/workspace-data` — the daemon socket and project-graph DB, which is
+  // the state a rebuilt plugin actually invalidates. NOT `.nx/cache`.
+  //
+  // `.nx/cache` holds task results and the `terminalOutputs/<hash>` files the task
+  // orchestrator writes when a task exits. Deleting it here raced every concurrent
+  // Nx invocation: a shell entry or direnv reload (both run this file, and direnv
+  // watches the devenv config) removed the directory while another terminal's Nx
+  // was mid-run, and that run then died writing its own terminal output —
+  // `ENOENT: open '.nx/cache/terminalOutputs/<hash>'` strictly after its tasks had
+  // succeeded. `--skip-nx-cache` does not avoid it, because the orchestrator writes
+  // that file regardless of whether results are cached.
+  //
+  // Keeping the task cache is safe, not merely cheaper: a target's hash covers its
+  // resolved configuration, so entries produced by the previous plugin build are
+  // unreachable rather than wrong once inference changes. Clearing the graph DB is
+  // what makes the new plugin take effect; clearing results was only collateral.
+  await $`rm -rf ${path.join(projectRoot, '.nx/workspace-data')}`.quiet(true).nothrow();
 }
 
 async function runQuietly(command: string, args: readonly string[], cwd: string): Promise<void> {
@@ -63,6 +84,10 @@ async function hasFileNewerThanMarker(markerMtimeMs: number): Promise<boolean> {
   return false;
 }
 
+// `tsconfig.lib.json` excludes `src/**/*.test.ts` and `src/**/__tests__/**`, so those
+// files cannot change dist. Counting them made editing any plugin test mark the
+// plugin stale, which rebuilt it and cleared Nx's daemon state on every shell entry.
+
 async function pathHasFileNewerThanMarker(sourcePath: string, markerMtimeMs: number): Promise<boolean> {
   const sourceStat = await stat(sourcePath);
   if (sourceStat.isFile()) {
@@ -75,9 +100,15 @@ async function pathHasFileNewerThanMarker(sourcePath: string, markerMtimeMs: num
   for (const entry of await readdir(sourcePath, { withFileTypes: true })) {
     const childPath = path.join(sourcePath, entry.name);
     if (entry.isDirectory()) {
+      if (entry.name === '__tests__') {
+        continue;
+      }
       if (await pathHasFileNewerThanMarker(childPath, markerMtimeMs)) {
         return true;
       }
+      continue;
+    }
+    if (entry.name.endsWith('.test.ts')) {
       continue;
     }
     if (entry.isFile() && (await stat(childPath)).mtimeMs > markerMtimeMs) {
