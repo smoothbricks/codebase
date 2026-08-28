@@ -15,7 +15,6 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{Finding, FindingSeverity};
-use cowshed_core::git::GIT;
 use cowshed_core::{CowshedError, Result};
 
 const HINT: &str = "add an includeIf gitdir: pattern covering the workspace mount root; cowshed setup --mount-root does not rewrite git identity";
@@ -204,7 +203,7 @@ fn git_at<const N: usize>(
     extra_env: &[(&str, &OsStr)],
     args: [&str; N],
 ) -> Result<String> {
-    let mut command = Command::new(GIT);
+    let mut command = Command::new("git");
     command.arg("-C").arg(root).args(args);
     command.env("GIT_TERMINAL_PROMPT", "0");
     for (key, value) in extra_env {
