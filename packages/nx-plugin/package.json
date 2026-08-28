@@ -48,6 +48,12 @@
       "development": "./src/typecheck-test-policy.ts",
       "import": "./dist/typecheck-test-policy.js",
       "default": "./dist/typecheck-test-policy.js"
+    },
+    "./cross-check-policy": {
+      "types": "./dist/cross-check-policy.d.ts",
+      "development": "./src/cross-check-policy.ts",
+      "import": "./dist/cross-check-policy.js",
+      "default": "./dist/cross-check-policy.js"
     }
   },
   "generators": "./generators.json",

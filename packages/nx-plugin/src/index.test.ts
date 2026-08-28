@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { CARGO_CROSS_LINT_TARGET } from './cross-check-policy.js';
 import { createNodesV2 } from './index.js';
 import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
 
@@ -249,7 +250,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // Even a cdylib crate named *-wasm infers no cargo-wasm: rust output
       // targets are declared package-locally, never derived from crate metadata.
-      expect(Object.keys(targets).sort()).toEqual(['bench', 'cargo-lint', 'cargo-test', 'lint', 'mutation', 'test']);
+      expect(Object.keys(targets).sort()).toEqual([
+        'bench',
+        'cargo-lint',
+        'cargo-lint-cross',
+        'cargo-test',
+        'lint',
+        'mutation',
+        'test',
+      ]);
       expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(targets['cargo-test']?.options).toMatchObject({
         command: 'cargo test --workspace',
@@ -268,6 +277,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         commands: ['cargo fmt --all --check', 'cargo clippy --workspace --all-targets -- -D warnings'],
       });
       expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
+      expect(targets[CARGO_CROSS_LINT_TARGET]?.options).toMatchObject({
+        command: 'cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings',
+        cwd: 'packages/ferris',
+      });
+      expect(targets[CARGO_CROSS_LINT_TARGET]?.cache).toBe(true);
+      // The cross gate must never join the lint aggregate: `bun run lint`, and
+      // CI's own already-native Linux lint, would then require the opt-in 0.4 GiB
+      // cross toolchain to run at all.
+      expect(targets.lint?.dependsOn).not.toContain(CARGO_CROSS_LINT_TARGET);
       expect(targets.test?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(targets.test?.options).toMatchObject({
         command: 'cargo test --workspace',

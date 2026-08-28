@@ -11,6 +11,7 @@ import {
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 
+import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
@@ -330,6 +331,41 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       };
     }
     validationTargets.push('cargo-lint');
+    // The Linux arm of `cargo-lint`, as its own target. Rationale for the name,
+    // the command and the absent cross test leg lives in ./cross-check-policy.ts.
+    //
+    // Inferred rather than declared package-locally: the rule reserving
+    // package-local declaration for output families (`cargo-wasm`, `cargo-napi`)
+    // governs targets that PRODUCE artifacts, where "does this package ship this
+    // artifact" is a packaging decision no crate manifest can answer. This target
+    // emits nothing — clippy type-checks and discards — so it belongs with
+    // cargo-lint and cargo-test on the inferred validation side.
+    //
+    // The discriminator for "has cross-platform Rust" is deliberately the same
+    // `[workspace]` Cargo.toml that already grants cargo-lint, NOT a scan of
+    // sources for `cfg` arms and NOT an opt-in flag. A source scan looks more
+    // precise and is strictly worse: target-specific code arrives through
+    // DEPENDENCIES as well as own source, which no scan of this repo's files can
+    // see, so it would silently skip projects — today's bug in a new costume. An
+    // opt-in flag has the same failure mode by construction. Every Rust project is
+    // in scope because CI compiles every Rust project on Linux; a project that
+    // genuinely cannot cross-compile overrides the target by declaring it, which is
+    // a visible edit to its package.json rather than a silent absence.
+    //
+    // Deliberately NOT pushed to validationTargets: joining the lint aggregate
+    // would make `bun run lint` — and CI's own Linux lint, already native — demand
+    // the 0.4 GiB cross toolchain that the devenv profile exists to keep opt-in.
+    if (!(CARGO_CROSS_LINT_TARGET in declared)) {
+      targets[CARGO_CROSS_LINT_TARGET] = {
+        executor: 'nx:run-commands',
+        cache: true,
+        inputs: CARGO_INPUTS,
+        options: {
+          command: CARGO_CROSS_LINT_COMMAND,
+          cwd: projectRoot,
+        },
+      };
+    }
     if (!targets.test && !('test' in declared) && typeof packageJson.scripts?.test !== 'string') {
       // Execute Cargo directly: workspace targetDefaults may replace test.dependsOn.
       targets.test = createCargoTestTarget(projectRoot);
