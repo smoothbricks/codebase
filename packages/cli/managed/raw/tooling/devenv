@@ -6,11 +6,23 @@
 ORIGINAL_PWD="$(pwd)"
 SELF_PATH="$(realpath "$0")"
 
-# Find the root of the git repository
-TOOLING_DIR="$(dirname "$SELF_PATH")"
+# Locate this repository's tooling/ from the INVOCATION path, not from
+# realpath($0). WHY: tooling/devenv is a symlink into
+# packages/cli/managed/raw/tooling/, so realpath lands inside the managed
+# template, whose tooling/direnv holds no devenv.yaml — `devenv update` then ran
+# against a directory with nothing to update, printed nothing, and exited 0. A
+# lock-updating command that silently succeeds without updating anything is the
+# worst possible failure, so resolve the directory lexically (only the leaf is a
+# symlink; tooling/ itself is real) and refuse to run if the config is absent.
+TOOLING_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEVENV_DIR="$TOOLING_DIR/direnv"
 if [ ! -d "$DEVENV_DIR" ]; then
     echo "Error: Could not find devenv directory at $DEVENV_DIR" >&2
+    exit 1
+fi
+if [ ! -f "$DEVENV_DIR/devenv.yaml" ] && [ ! -f "$DEVENV_DIR/devenv.nix" ]; then
+    echo "Error: $DEVENV_DIR holds no devenv.yaml or devenv.nix." >&2
+    echo "       Refusing to run: devenv would report success having done nothing." >&2
     exit 1
 fi
 
