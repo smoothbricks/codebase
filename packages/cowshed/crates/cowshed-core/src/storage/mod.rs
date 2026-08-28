@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -51,6 +52,32 @@ impl CheckpointLabel {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The default label for an unlabeled checkpoint: the UTC second of the request, rendered in
+    /// the label alphabet (`2026-07-11t120309z`). Workspace revision is the wrong key — it does
+    /// not advance between checkpoints, so a revision-derived default collides deterministically
+    /// on the second unlabeled checkpoint. A checkpoint image may be the only crash-consistent
+    /// copy, so an existing label is never reused or overwritten: a same-second collision takes
+    /// `-2`, `-3`, … instead.
+    pub fn utc_default(now: SystemTime, mut is_taken: impl FnMut(&str) -> bool) -> Self {
+        let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let (year, month, day) = civil_from_days(seconds / 86_400);
+        let clock = seconds % 86_400;
+        let base = format!(
+            "{year:04}-{month:02}-{day:02}t{:02}{:02}{:02}z",
+            clock / 3_600,
+            clock % 3_600 / 60,
+            clock % 60,
+        );
+        if !is_taken(&base) {
+            return Self(base);
+        }
+        (2_u64..)
+            .map(|ordinal| format!("{base}-{ordinal}"))
+            .find(|candidate| !is_taken(candidate))
+            .map(Self)
+            .expect("existing checkpoint labels are finite")
     }
 }
 
@@ -328,6 +355,27 @@ fn image_name(file_name: &str) -> Option<(&str, ImageFormat)> {
         }
     }
     None
+}
+
+/// Days since 1970-01-01 to a proleptic-Gregorian civil date (Howard Hinnant's algorithm,
+/// restricted to the non-negative domain). Total over every `u64` second count, unlike
+/// `libc::gmtime_r`, which rejects out-of-range `time_t` — a label generator must not fail.
+const fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + (month <= 2) as u64;
+    (year, month, day)
 }
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -735,6 +783,53 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn the_default_label_is_the_documented_utc_second() {
+        for (seconds, expected) in [
+            (0, "1970-01-01t000000z"),
+            (1_783_771_200, "2026-07-11t120000z"),
+            // Leap day and both neighbours: a leap-year error shifts one of the three.
+            (1_835_395_199, "2028-02-28t235959z"),
+            (1_835_395_200, "2028-02-29t000000z"),
+            (1_835_481_600, "2028-03-01t000000z"),
+            // Year boundary at exactly midnight UTC.
+            (1_893_455_999, "2029-12-31t235959z"),
+            (1_893_456_000, "2030-01-01t000000z"),
+            // 2100 is the century rule's first bite: divisible by 4 but not a leap year.
+            (4_107_542_399, "2100-02-28t235959z"),
+            (4_107_542_400, "2100-03-01t000000z"),
+            // 2400 restores the 400-year exception, so its February 29th exists.
+            (13_574_585_228, "2400-02-29t060708z"),
+        ] {
+            let label = CheckpointLabel::utc_default(at(seconds), |_| false);
+            assert_eq!(label.as_str(), expected, "at {seconds}s");
+            // Every generated default must survive the validator it bypasses.
+            assert_eq!(CheckpointLabel::new(expected).unwrap(), label);
+        }
+    }
+
+    #[test]
+    fn a_same_second_collision_takes_the_next_ordinal_and_never_reuses_a_label() {
+        let now = at(1_783_771_200);
+        let base = CheckpointLabel::utc_default(now, |_| false);
+        assert_eq!(base.as_str(), "2026-07-11t120000z");
+
+        let taken = [base.as_str().to_owned()];
+        let second =
+            CheckpointLabel::utc_default(now, |candidate| taken.iter().any(|l| l == candidate));
+        assert_eq!(second.as_str(), "2026-07-11t120000z-2");
+
+        let taken = [taken[0].clone(), second.as_str().to_owned()];
+        let third =
+            CheckpointLabel::utc_default(now, |candidate| taken.iter().any(|l| l == candidate));
+        assert_eq!(third.as_str(), "2026-07-11t120000z-3");
+        assert_eq!(CheckpointLabel::new(third.as_str()).unwrap(), third);
     }
 
     #[test]
