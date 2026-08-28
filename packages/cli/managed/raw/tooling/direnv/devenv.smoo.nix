@@ -78,7 +78,34 @@
   # toolchain resolves its own GOROOT from its own binary. With the versions
   # matched that crossing cannot misfire at all, so the unset in enterShell is
   # belt-and-braces rather than the fix.
-  packages = [(import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go];
+  # Node tracks the newest AWS Lambda managed runtime, currently nodejs26.x. It
+  # lives here rather than in each repository's devenv.nix because it is a
+  # fleet-wide fact: declared in three places, the next bump has to find all
+  # three, and the one it misses re-splits the fleet.
+  #
+  # An explicit major, NOT `nodejs_latest`. A tool that participates in cache keys
+  # and native-addon ABI must not be spelled "whatever is newest" in one
+  # repository and a fixed major in the others — and the two spellings agreeing
+  # today is precisely what makes the drift invisible, because the fleet looks
+  # unified right up to the lock bump that splits it. A floating attribute is a
+  # version that changes without a commit, so it cannot be reviewed or bisected.
+  #
+  # 26 also closes a split this axis caused once: 24.0.x declares URLPattern in a
+  # way that TS2403-conflicts with lib.dom in consumers emitting declarations,
+  # which forced a ~24.13.0 floor on one side; 26 is DOM-compatible.
+  #
+  # `@types/node`, `engines.node` and `packageManager` are derived from this pin
+  # rather than maintained beside it — smoo's syncRootRuntimeVersions reads the
+  # shell's Node major, so this line moves them.
+  #
+  # Reading which version this resolves to: devenv.lock has TWO nixpkgs nodes and
+  # the obvious one is a decoy. `.nodes.nixpkgs` is not what `pkgs` is; the
+  # authoritative path is `.nodes.root.inputs.nixpkgs`, which indirects to
+  # `nixpkgs_2`.
+  packages = [
+    (import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go
+    pkgs.nodejs_26
+  ];
 
   enterShell = lib.mkMerge [
     # Prologue, in order:
