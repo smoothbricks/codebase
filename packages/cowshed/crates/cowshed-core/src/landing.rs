@@ -66,7 +66,8 @@ pub async fn resolve_target(
         .await
         .map_err(|error| format!("main's {branch} could not be read: {}", error.message))?
         .ok_or_else(|| format!("main's repository has no {branch} branch"))?;
-    let tip = GitOid::new(tip).map_err(|error| format!("main's {branch} tip is unusable: {error}"))?;
+    let tip =
+        GitOid::new(tip).map_err(|error| format!("main's {branch} tip is unusable: {error}"))?;
     Ok(LandingTarget {
         branch: branch.to_owned(),
         tip,

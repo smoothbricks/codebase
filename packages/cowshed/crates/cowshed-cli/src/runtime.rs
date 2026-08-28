@@ -2210,9 +2210,7 @@ fn landing_cells(workspace: &WorkspaceInfo) -> [String; 4] {
             behind.to_string(),
             dirty,
         ],
-        LandingCommits::Indeterminate { .. } => {
-            [unknown(), unknown(), unknown(), dirty]
-        }
+        LandingCommits::Indeterminate { .. } => [unknown(), unknown(), unknown(), dirty],
     }
 }
 
