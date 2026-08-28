@@ -3,6 +3,7 @@ import { $ } from 'bun';
 import { decode, run } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
 import { readProjectTargets } from '../nx/index.js';
+import { validateCargoCachePolicy } from './cargo-policy.js';
 import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
@@ -131,7 +132,8 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validatePublicPackageMetadata(root) +
     validateTestFileLocations(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +
-    validateDevenvModuleImport(root);
+    validateDevenvModuleImport(root) +
+    validateCargoCachePolicy(root);
   if (results.some((result) => result.action === 'drifted') || packageFailures > 0) {
     throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
   }
