@@ -15,6 +15,7 @@
  * @module sqlite-writer
  */
 
+import { hasOwnString, isRecord } from '@smoothbricks/validation';
 import { cleanupDebug } from '../cleanupDiagnostics.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
@@ -35,8 +36,14 @@ import {
 } from './sqlite-common.js';
 import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
 
+const JOURNAL_MODE_WAL_SQL = 'PRAGMA journal_mode = WAL';
+const DATABASE_LIST_SQL = 'PRAGMA database_list';
+
+/** Journal modes that keep no rollback record, so a killed writer leaves partially applied pages behind. */
+const UNRECOVERABLE_JOURNAL_MODES: Record<string, true> = { memory: true, off: true };
+
 export interface SQLiteWriterConfig {
-  /** Path to SQLite file. Default: '.trace-results.db' */
+  /** Path to SQLite file. Defaults to `DEFAULT_TRACE_DB_PATH` from `./trace-db-path.js`. */
   dbPath?: string;
 }
 
@@ -51,14 +58,55 @@ export class SQLiteTraceWriter {
   private init(): void {
     // Parallel Bun test workers share one trace DB, so wait for short SQLite writer locks instead of failing setup.
     this.db.exec('PRAGMA busy_timeout = 10000');
-    // The trace DB lives in a package root that ttsc walks, and ttsc rejects a transform generation when a walked
-    // directory's membership moves mid-compile. A rollback journal on disk creates and unlinks `<db>-journal` per
-    // transaction, which is exactly that. Hold the journal in memory instead: the trade is crash durability, and a
-    // trace DB is diagnostic output — a run that dies has nothing worth recovering, because the run is the record.
-    this.db.exec('PRAGMA journal_mode = MEMORY');
+    this.requireRecoverableJournal();
     this.db.exec(SPANS_TABLE_INIT_SQL);
 
     this.refreshKnownColumns();
+  }
+
+  /**
+   * Put a file-backed sink in WAL, and refuse to write one that has no rollback record.
+   *
+   * Several test-worker processes write this database at once and tests assert over what lands in it, so it is an
+   * oracle rather than a log. WAL keeps those readers off the writer's lock — measured at ~20ms worst-case writer
+   * stall against 200-1900ms under the rollback journal with twelve concurrent writers. Its `-wal` and `-shm`
+   * sidecars are also created once and then stay, where a rollback journal creates and unlinks one per transaction.
+   *
+   * `PRAGMA journal_mode` reports the mode it settled on instead of failing, so a refused conversion is silent.
+   * `memory` and `off` keep no rollback record at all: a worker killed mid-transaction then leaves partially applied
+   * rows that `PRAGMA integrity_check` still calls "ok", turning a crashed run into wrong assertion input rather than
+   * a missing one. An in-memory database has no file to protect and legitimately settles on `memory`.
+   */
+  private requireRecoverableJournal(): void {
+    const modeRow = this.db.prepare(JOURNAL_MODE_WAL_SQL).get();
+    if (!isRecord(modeRow) || !hasOwnString(modeRow, 'journal_mode')) {
+      throw new Error(`${JOURNAL_MODE_WAL_SQL} returned no journal_mode`);
+    }
+
+    const mode = modeRow.journal_mode.toLowerCase();
+    if (!UNRECOVERABLE_JOURNAL_MODES[mode]) {
+      return;
+    }
+
+    const file = this.readMainDatabaseFile();
+    if (file === '') {
+      return;
+    }
+
+    throw new Error(
+      `Trace database at ${file} settled on journal_mode=${mode}, which cannot roll back a killed writer`,
+    );
+  }
+
+  /** Backing file of the `main` schema, or '' for an in-memory database. */
+  private readMainDatabaseFile(): string {
+    for (const row of this.db.prepare(DATABASE_LIST_SQL).all()) {
+      if (isRecord(row) && hasOwnString(row, 'name') && row.name === 'main' && hasOwnString(row, 'file')) {
+        return row.file;
+      }
+    }
+
+    throw new Error(`${DATABASE_LIST_SQL} returned no main schema`);
   }
 
   private refreshKnownColumns(): void {

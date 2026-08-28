@@ -11,9 +11,9 @@
  * @example
  * ```typescript
  * import { Database } from 'bun:sqlite';
- * import { TraceQuery } from '@smoothbricks/lmao/testing';
+ * import { DEFAULT_TRACE_DB_PATH, TraceQuery } from '@smoothbricks/lmao/testing';
  *
- * const query = new TraceQuery(new Database('.trace-results.db'));
+ * const query = new TraceQuery(new Database(DEFAULT_TRACE_DB_PATH));
  * console.log(query.failures());
  * console.log(query.slowest(undefined, 10));
  * query.close();

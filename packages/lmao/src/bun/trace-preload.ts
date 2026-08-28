@@ -17,7 +17,7 @@ if (target.kind === 'package') {
 } else {
   // WHY loud: this preload is only ever loaded on purpose (bunfig `preload`),
   // so failing to install tracing must never be a silent no-op — that is how
-  // stale .trace-results.db databases go unnoticed for months.
+  // stale trace databases go unnoticed for months.
   console.error(
     `[lmao] trace-preload: no package.json found above ${process.cwd()} ` +
       `(searched: ${target.searched.join(', ')}). Test tracing is DISABLED for this run — ` +

@@ -25,3 +25,4 @@ export type {
   SyncSQLiteStatement,
 } from './sqlite-db.js';
 export { SQLiteTraceWriter, type SQLiteWriterConfig } from './sqlite-writer.js';
+export { DEFAULT_TRACE_DB_PATH, TRACE_DB_DIRECTORY, TRACE_DB_FILENAME } from './trace-db-path.js';
