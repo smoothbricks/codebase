@@ -5,6 +5,7 @@ use super::dto::{
     PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RevisionResult,
     RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
 };
+use super::peer_credentials::{self, PeerCredentialsError};
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
 use super::server::{
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
@@ -884,62 +885,24 @@ fn handshake_error(message: impl Into<String>) -> CowshedError {
 
 #[cfg(unix)]
 fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
-    let fd = descriptor.as_raw_fd();
-    let mut socket_type: libc::c_int = 0;
-    let mut socket_type_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&mut socket_type as *mut libc::c_int).cast(),
-            &mut socket_type_len,
-        )
-    };
-    if result != 0 || socket_type != libc::SOCK_STREAM {
+    let peer_uid = peer_credentials::peer_uid(descriptor).map_err(|error| match error {
+        PeerCredentialsError::SocketTypeSizeOverflow
+        | PeerCredentialsError::SocketTypeQueryFailed
+        | PeerCredentialsError::NotStream => {
+            handshake_error("coordinator descriptor is not a stream socket")
+        }
+        PeerCredentialsError::PeerCredentialSizeOverflow
+        | PeerCredentialsError::PeerCredentialQueryFailed
+        | PeerCredentialsError::UnsupportedPlatform => {
+            handshake_error("coordinator descriptor peer does not match the current uid")
+        }
+    })?;
+    let current_uid = unsafe { libc::geteuid() };
+    if peer_uid != current_uid {
         return Err(handshake_error(
-            "coordinator descriptor is not a stream socket",
+            "coordinator descriptor peer does not match the current uid",
         ));
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut peer_uid: libc::uid_t = 0;
-        let mut peer_gid: libc::gid_t = 0;
-        let result = unsafe { libc::getpeereid(fd, &mut peer_uid, &mut peer_gid) };
-        let current_uid = unsafe { libc::geteuid() };
-        if result != 0 || peer_uid != current_uid {
-            return Err(handshake_error(
-                "coordinator descriptor peer does not match the current uid",
-            ));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut credentials_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credentials as *mut libc::ucred).cast(),
-                &mut credentials_len,
-            )
-        };
-        let current_uid = unsafe { libc::geteuid() };
-        if result != 0 || credentials.uid != current_uid {
-            return Err(handshake_error(
-                "coordinator descriptor peer does not match the current uid",
-            ));
-        }
-    }
-
     Ok(())
 }
 
