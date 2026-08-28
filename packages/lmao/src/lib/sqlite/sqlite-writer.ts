@@ -51,6 +51,11 @@ export class SQLiteTraceWriter {
   private init(): void {
     // Parallel Bun test workers share one trace DB, so wait for short SQLite writer locks instead of failing setup.
     this.db.exec('PRAGMA busy_timeout = 10000');
+    // The trace DB lives in a package root that ttsc walks, and ttsc rejects a transform generation when a walked
+    // directory's membership moves mid-compile. A rollback journal on disk creates and unlinks `<db>-journal` per
+    // transaction, which is exactly that. Hold the journal in memory instead: the trade is crash durability, and a
+    // trace DB is diagnostic output — a run that dies has nothing worth recovering, because the run is the record.
+    this.db.exec('PRAGMA journal_mode = MEMORY');
     this.db.exec(SPANS_TABLE_INIT_SQL);
 
     this.refreshKnownColumns();
