@@ -4182,7 +4182,7 @@ mod rebase_recovery_tests {
     use super::*;
 
     fn git(root: &Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new("/usr/bin/git")
+        std::process::Command::new("git")
             .args(args)
             .current_dir(root)
             .output()
@@ -6113,7 +6113,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             tokio::fs::create_dir_all(&parent).await.map_err(|error| {
                 CowshedError::environment_missing(error.to_string(), "check cache permissions")
             })?;
-            let output = tokio::process::Command::new("/usr/bin/git")
+            let output = tokio::process::Command::new("git")
                 .arg("clone")
                 .arg("--mirror")
                 .arg(url.as_str())
@@ -7751,7 +7751,7 @@ fn current_snapshot_mount(
 
 #[cfg(target_os = "macos")]
 async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
-    let output = tokio::process::Command::new("/usr/bin/git")
+    let output = tokio::process::Command::new("git")
         .args(args)
         .current_dir(root)
         .output()
@@ -7764,7 +7764,7 @@ async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
 #[cfg(target_os = "macos")]
 async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid) -> Result<()> {
     async fn invoke(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-        tokio::process::Command::new("/usr/bin/git")
+        tokio::process::Command::new("git")
             .args(args)
             .current_dir(root)
             .output()
@@ -7868,7 +7868,7 @@ async fn git_oid(root: &Path) -> Result<GitOid> {
 
 #[cfg(target_os = "macos")]
 async fn git_revision_oid(root: &Path, revision: &str) -> Result<GitOid> {
-    let output = tokio::process::Command::new("/usr/bin/git")
+    let output = tokio::process::Command::new("git")
         .args(["rev-parse", "--verify", revision])
         .current_dir(root)
         .output()
@@ -7889,7 +7889,7 @@ async fn git_revision_oid(root: &Path, revision: &str) -> Result<GitOid> {
 /// exist yet" into an internal error instead of the `None` every caller here is written for.
 #[cfg(target_os = "macos")]
 async fn git_optional_ref_oid(root: &Path, reference: &str) -> Result<Option<GitOid>> {
-    let output = tokio::process::Command::new("/usr/bin/git")
+    let output = tokio::process::Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
         .current_dir(root)
         .output()
@@ -7910,7 +7910,7 @@ async fn git_optional_ref_oid(root: &Path, reference: &str) -> Result<Option<Git
 
 #[cfg(target_os = "macos")]
 async fn git_remote_ref_oid(root: &Path, remote: &str, reference: &str) -> Result<Option<GitOid>> {
-    let output = tokio::process::Command::new("/usr/bin/git")
+    let output = tokio::process::Command::new("git")
         .args(["ls-remote", "--refs", remote, reference])
         .current_dir(root)
         .output()

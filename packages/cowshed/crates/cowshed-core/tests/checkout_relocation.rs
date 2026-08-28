@@ -28,7 +28,6 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 
-const GIT: &str = "/usr/bin/git";
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 
 /// A relocated project: main at its new path, one session workspace, and a dead old checkout path
@@ -225,7 +224,7 @@ impl Relocated {
     }
 
     fn remote_url(&self, name: &str) -> Option<String> {
-        let output = Command::new(GIT)
+        let output = Command::new("git")
             .arg("-C")
             .arg(&self.session)
             .args(["config", "--get", &format!("remote.{name}.url")])
@@ -284,7 +283,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(GIT)
+    let output = Command::new("git")
         .arg("-C")
         .arg(root.as_ref())
         .args(args)
@@ -302,7 +301,7 @@ where
 }
 
 fn commit(root: &Path, message: &str) {
-    let output = Command::new(GIT)
+    let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["commit", "-q", "-m", message])
@@ -336,7 +335,7 @@ async fn a_relocated_project_has_every_recorded_path_repaired() {
         Some(fixture.dead_root.display().to_string().as_str())
     );
     assert!(
-        Command::new(GIT)
+        Command::new("git")
             .arg("-C")
             .arg(&fixture.session)
             .args(["ls-remote", "--exit-code", "main", "refs/heads/main"])
