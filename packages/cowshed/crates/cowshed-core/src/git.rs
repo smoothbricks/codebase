@@ -105,7 +105,7 @@ const WORKSPACE_ENVIRONMENT_MARKER: &[u8] = b"# cowshed: workspace environment";
 const WORKSPACE_ENVIRONMENT_SOURCE: &[u8] = b"source_env_if_present .cowshed/env";
 const LOCAL_ENVIRONMENT_LOADER: &[u8] = b"source_env_if_exists \"$local_override\"";
 const LOCAL_WORKSPACE_ENVIRONMENT_SOURCE: &[u8] =
-    b"source_env_if_present \"${local_override%/*}/.cowshed/env\"";
+    b"source_env_if_exists \"${local_override%/*}/.cowshed/env\"";
 
 /// The name of the remote main registers for a workspace under `--register`.
 pub fn workspace_remote_name(workspace: &str) -> String {
@@ -2111,7 +2111,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(root.join(".envrc-local")).expect("read local envrc"),
-            b"# cowshed: workspace environment\nsource_env_if_present \"${local_override%/*}/.cowshed/env\"\n"
+            b"# cowshed: workspace environment\nsource_env_if_exists \"${local_override%/*}/.cowshed/env\"\n"
         );
         assert_eq!(
             git_stdout(&root, &["status", "--porcelain"]),
