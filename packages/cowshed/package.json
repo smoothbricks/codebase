@@ -106,6 +106,9 @@
       "cli-arm64-linux": {
         "executor": "nx:run-commands",
         "cache": true,
+        "dependsOn": [
+          "napi-toolchain-arm64-linux"
+        ],
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
@@ -129,6 +132,9 @@
       "cli-x64-linux": {
         "executor": "nx:run-commands",
         "cache": true,
+        "dependsOn": [
+          "napi-toolchain-x64-linux"
+        ],
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
