@@ -24,10 +24,10 @@ This is the procedural checklist for wiring trace-testing into a package. For th
    ```ts
    import * as bunTest from 'bun:test';
    import { mock } from 'bun:test';
-   import { createBunTestMock, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
+   import { createBunTestMock, DEFAULT_TRACE_DB_PATH, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
    import { opContext } from './src/op-context.js';
 
-   initTraceTestRun(opContext, { sqlite: { dbPath: '.trace-results.db' } });
+   initTraceTestRun(opContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } });
    mock.module('bun:test', () => createBunTestMock(bunTest));
    ```
 
@@ -38,11 +38,15 @@ This is the procedural checklist for wiring trace-testing into a package. For th
    preload = ["./test-trace-setup.ts"]
    ```
 
-4. **Ignore the results database.** Add the configured path to `.gitignore`:
+4. **Ignore the results database.** `DEFAULT_TRACE_DB_PATH` is `.cache/trace-results.db`, so ignore the directory:
 
    ```text
-   .trace-results.db
+   .cache/
    ```
+
+   The sink must live under a directory name project walkers and file watchers skip. A SQLite database keeps journal
+   sidecars beside itself, so a compiler that snapshots and watches that directory would see its own inputs move
+   mid-build and refuse to reuse the result.
 
 5. **Write tests as usual.** Import `describe`/`it`/`expect` from `bun:test`; use `useTestSpan()` and the query helpers
    to assert on the span tree.

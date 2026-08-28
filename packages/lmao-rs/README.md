@@ -34,7 +34,7 @@ These constraints are defined by the deterministic scheduler and trace-testing s
    (`benches/overhead.rs` harness; gate comparison TBD).
 4. **Deterministic encoding:** sorted dictionaries, no HashMap-iteration-order or float-formatting leakage into emitted
    bytes.
-5. **Tracer-agnostic queries:** the same selector must run against SQLite (`.trace-results.db` parity) and in-process
+5. **Tracer-agnostic queries:** the same selector must run against SQLite (`.cache/trace-results.db` parity) and in-process
    Arrow batches.
 
 ## TDD workflow

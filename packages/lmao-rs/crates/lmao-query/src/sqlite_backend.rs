@@ -1,5 +1,5 @@
 //! SQLite backend matching the TS `SQLiteTracer` table shape
-//! (`packages/lmao/src/lib/sqlite/sqlite-common.ts`, `.trace-results.db`):
+//! (`packages/lmao/src/lib/sqlite/sqlite-common.ts`, `.cache/trace-results.db`):
 //!
 //! ```sql
 //! CREATE TABLE spans (

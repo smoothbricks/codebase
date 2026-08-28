@@ -226,11 +226,15 @@ describe('order processing', () => {
 });
 ```
 
-Setup is wiring-only: a preload/setup file calls `initTraceTestRun(opContext, { sqlite: { dbPath: '.trace-results.db' } })`
-and installs a transparent mock so tests import `describe`/`it`/`expect` from their native runner as usual. Bun and
-Vitest are both supported (`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). Traces flush to a
-SQLite sink you can query with the `TraceQuery` API or the `sqlite3` CLI. See the docs for the full harness setup, the
-SQLite schema, and query recipes.
+Setup is wiring-only: a preload/setup file calls
+`initTraceTestRun(opContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } })` and installs a transparent mock so tests
+import `describe`/`it`/`expect` from their native runner as usual. Bun and Vitest are both supported
+(`@smoothbricks/lmao/testing/bun` · `@smoothbricks/lmao/testing/vitest`). `DEFAULT_TRACE_DB_PATH` resolves to
+`.cache/trace-results.db` under the package or workspace root: the sink must sit in a directory that project walkers
+and file watchers skip, because a SQLite database churns its directory's membership through journal sidecars and a
+compiler watching that directory would call its own transform generation incoherent. Traces flush to a SQLite sink you
+can query with the `TraceQuery` API or the `sqlite3` CLI. See the docs for the full harness setup, the SQLite schema,
+and query recipes.
 
 ## Package exports
 

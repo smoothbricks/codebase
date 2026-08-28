@@ -20,8 +20,8 @@ Registers a trace test run. Options include `sqlite` (write results to a databas
 
 ```ts
 // bun
-import { createBunTestMock, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
-initTraceTestRun(opContext, { sqlite: { dbPath: '.trace-results.db' } });
+import { createBunTestMock, DEFAULT_TRACE_DB_PATH, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
+initTraceTestRun(opContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } });
 ```
 
 On vitest, import from `@smoothbricks/lmao/testing/vitest` and provide

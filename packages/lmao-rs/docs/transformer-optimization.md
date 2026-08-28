@@ -429,7 +429,7 @@ analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that 
 - **Compile-time schema-composition checking.** With project references the plugin sees library schemas AND the app's
   `prefix()`/`mapColumns()` wiring — column-name collisions across composed libraries become build-time diagnostics
   instead of runtime startup errors.
-- **Profile-guided emission (novel loop).** Test suites already run under `SQLiteTracer` (`.trace-results.db`). The
+- **Profile-guided emission (novel loop).** Test suites already run under `SQLiteTracer` (`.cache/trace-results.db`). The
   plugin can read that database as build input: measured column-usage frequencies and span row-count distributions drive
   the eager sets (B) and capacity seeds (C) with real data instead of static bounds — PGO where the profile is lmao's
   own trace output. Deterministic given a checked-in profile snapshot.
