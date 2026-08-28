@@ -4535,13 +4535,21 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         }
         require_checkpointable(&workspace, &current.metadata, "checkpoint")?;
         let explicitly_labeled = options.label.is_some();
-        let label = crate::storage::CheckpointLabel::new(options.label.unwrap_or_else(|| {
-            format!(
-                "checkpoint-{}",
-                current.derived.workspace.revision().get() + 1
-            )
-        }))
-        .map_err(native_integrity_error)?;
+        let label = match options.label {
+            Some(value) => {
+                crate::storage::CheckpointLabel::new(value).map_err(native_integrity_error)?
+            }
+            None => crate::storage::CheckpointLabel::utc_default(
+                std::time::SystemTime::now(),
+                |candidate| {
+                    current
+                        .derived
+                        .checkpoints
+                        .iter()
+                        .any(|fact| fact.label.as_str() == candidate)
+                },
+            ),
+        };
         self.enforce_checkpoint_quota(&current).await?;
         let handle = self.ensure_supervisor(&workspace).await?;
         let barrier = handle.checkpoint_barrier(label.to_string()).await?;
