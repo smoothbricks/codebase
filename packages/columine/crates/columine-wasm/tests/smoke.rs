@@ -6,6 +6,7 @@
 //! `unsafe` throughout is the point: this exercises the exact C ABI calls
 //! the TS backends make.
 
+use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_wasm::{
     __register_region, vm_calculate_state_size, vm_delta_export_entry_size,
@@ -33,7 +34,8 @@ fn meta_u32(state: &[u8], slot: u8, field_off: u32) -> u32 {
 /// vm_test.zig:82 `buildTestProgram` — HASHMAP(LAST) cap 16 + AGG COUNT.
 fn test_program() -> Vec<u8> {
     let mut prog = vec![0u8; 32];
-    prog.extend([0x41, 0x58, 0x45, 0x31, 1, 0, 2, 2, 0, 0]);
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, 2, 2, 0, 0]);
     let mut init: Vec<u8> = [[0x10, 0, 0x00, 16, 0], [0x10, 1, 0x02, 2, 0]].concat();
     init.push(0);
     let reduce = [0x22u8, 0, 0, 1, 0x41, 1];

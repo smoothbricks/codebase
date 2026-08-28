@@ -3,6 +3,7 @@
 //! growth signaling. Each test cites the vm_test.zig block it translates;
 //! scenarios and expected values are identical.
 
+use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
     ChangeFlag, EMPTY_KEY, ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
 };
@@ -32,7 +33,8 @@ fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8>
     let mut reduce = reduce.to_vec();
     reduce.push(0);
     let mut prog = vec![0u8; 32];
-    prog.extend([0x41, 0x58, 0x45, 0x31, 1, 0, num_slots, num_inputs, 0, 0]);
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, num_slots, num_inputs, 0, 0]);
     prog.extend((init.len() as u16).to_le_bytes());
     prog.extend((reduce.len() as u16).to_le_bytes());
     prog.extend(init);
@@ -183,10 +185,18 @@ fn build_probe_scatter_program(type_id: u32) -> Vec<u8> {
 // =============================================================================
 
 fn init(prog: &[u8]) -> Vec<u8> {
-    let size = calculate_state_size(prog);
+    let size = calculate_state_size(
+        prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0, "state size must be > 0");
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, prog).expect("init_state");
+    init_state(
+        &mut state,
+        prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init_state");
     state
 }
 
@@ -1436,20 +1446,28 @@ fn undo_overflow_inside_container_op_snapshots_and_rolls_back() {
 /// pointer and never dereferences it (batch_len == 0); checked `cols[idx]`
 /// indexing panicked instead. `col_at` resolves out-of-range to the empty
 /// column. Program bytes are the exact TS-compiled `count()` reducer capture
-/// (exact capture incl. 32-byte hash prefix; header "AXE1" + SLOT_DEF AGGREGATE/COUNT +
+/// (exact capture incl. 32-byte hash prefix; header "CLM1" + SLOT_DEF AGGREGATE/COUNT +
 /// top-level 0xE0 FOR_EACH wrapping AGG_COUNT).
 #[test]
 fn empty_batch_with_no_column_pointers_is_ok() {
-    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000006000c00100002020000e00101010000000200410000";
+    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d3101000100000006000c00100002020000e00101010000000200410000";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect();
     let mut vm = Vm::default();
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0, "state size must be > 0");
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog).expect("init_state");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init_state");
 
     // Plain and delta paths, zero columns: both must no-op cleanly.
     let cols: Vec<&[u8]> = Vec::new();
@@ -1471,15 +1489,23 @@ fn empty_batch_with_no_column_pointers_is_ok() {
 /// difference between "clean no-op" and "named refusal".
 #[test]
 fn nonempty_batch_with_missing_columns_is_column_underrun() {
-    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000006000c00100002020000e00101010000000200410000";
+    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d3101000100000006000c00100002020000e00101010000000200410000";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect();
     let mut vm = Vm::default();
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog).expect("init_state");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init_state");
 
     let underrun = ErrorCode::ColumnUnderrun as u32;
 
@@ -1509,16 +1535,24 @@ fn nonempty_batch_with_missing_columns_is_column_underrun() {
 /// id=1) around `48 00 03 02` (slot 0, val_col 3, cmp_col 2).
 #[test]
 fn ts_scalar_latest_program_writes_value_and_cmp() {
-    let hex = "00000000000000000000000000000000000000000000000000000000000000004158453101000100000006000e00100005090000e001010100000004004800030200";
+    let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d3101000100000006000e00100005090000e001010100000004004800030200";
     let prog: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect();
     let mut vm = Vm::default();
-    let size = calculate_state_size(&prog);
+    let size = calculate_state_size(
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    );
     assert!(size > 0, "state size must be > 0");
     let mut state = vec![0u8; size as usize];
-    init_state(&mut state, &prog).expect("init_state");
+    init_state(
+        &mut state,
+        &prog,
+        columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+    )
+    .expect("init_state");
 
     let keys = [0u32];
     let type_ids = [1u32];
