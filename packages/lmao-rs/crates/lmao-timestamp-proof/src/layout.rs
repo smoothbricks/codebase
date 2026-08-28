@@ -1,10 +1,10 @@
-//! The proof-buffer layout (ports `timestamp_proof_layout.zig` 1:1).
+//! The proof-buffer layout is a fixed three-region binary format.
 //!
 //! One buffer, three regions, all unaligned little-endian:
 //! `[timestamps: i64 × capacity][entry_types: u8 × capacity][write_index: u32]`.
 //! Rows 0 and 1 are the span slots (start + end); `write_log_entry` appends
-//! from the persisted write index. The Zig wrote through unaligned pointers;
-//! Rust writes explicit LE bytes, so no alignment contract exists at all.
+//! from the persisted write index. Rust writes explicit LE bytes, so no
+//! alignment contract exists at all.
 
 pub const ENTRY_TYPE_SPAN_START: u8 = 1;
 pub const ENTRY_TYPE_SPAN_OK: u8 = 2;

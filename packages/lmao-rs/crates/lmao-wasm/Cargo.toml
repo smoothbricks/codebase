@@ -1,6 +1,6 @@
 [package]
 name = "lmao-wasm"
-description = "wasm32 cdylib exposing the allocator.zig-compatible ABI so the TS host (wasmAllocator.ts) loads it unchanged"
+description = "wasm32 cdylib exposing the SpanBuffer allocator ABI for the TypeScript host with imported memory and host-clock hooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

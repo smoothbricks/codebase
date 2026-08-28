@@ -53,9 +53,9 @@ impl Clock for SystemClock {
     }
 }
 
-/// The 16-byte per-trace anchor (mirrors `TraceRoot` in `allocator.zig`, which stores
-/// wall nanos + monotonic millis; here both sides are nanos and the WASM ABI crate
-/// converts at the boundary).
+/// The 16-byte per-trace anchor stores wall-clock and monotonic nanoseconds.
+/// The WASM ABI crate converts at the boundary where its trace-root layout uses
+/// a monotonic millisecond field.
 #[derive(Debug, Clone, Copy)]
 pub struct TraceAnchor {
     pub wall_nanos: i64,
