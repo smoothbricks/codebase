@@ -1,6 +1,7 @@
-//! Replaces `packages/columine/src/vm/types.zig`.
+//! Shared VM type tables and raw-state layout constants.
 //!
-//! This module owns the shared VM type tables and raw-state layout constants.
+//! These definitions are consumed by the bytecode encoder and VM and keep
+//! their wire-level representations explicit.
 
 use core::mem::size_of;
 
@@ -67,10 +68,10 @@ impl SlotMetaOffset {
     pub const START_OF: u32 = 44;
 }
 
-/// Bytecode encoding for duration units from the Ax expression language
-/// (the expression-language specification). The Zig variants use the short
-/// forms the JS compiler normalizes to: s, m, h, d, w, M (month), Q (quarter),
-/// y — Rust spells them out; the discriminants are the contract.
+/// Bytecode encoding for duration units from the Ax expression language. The
+/// JavaScript compiler normalizes units to `s, m, h, d, w, M, Q, y`; the Rust
+/// enum uses descriptive variant names, while the discriminants are the
+/// contract.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurationUnit {
@@ -151,7 +152,7 @@ impl SlotType {
     }
 }
 
-/// Deliberate equivalent of Zig's `packed struct(u8) SlotTypeFlags`.
+/// Bitfield encoding for slot flags.
 ///
 /// Logical fields are extracted from the backing byte with masks and shifts;
 /// no bitfield crate is used so the bytecode ABI is explicit.
@@ -282,16 +283,12 @@ impl StructFieldType {
     }
 }
 
-/// Zig's `packed struct` EvictionEntry is backed by u128: size 16, align 16 on
-/// BOTH native and wasm32-freestanding (verified with a zig 0.16.0 probe:
-/// `@sizeOf`/`@alignOf` native run + wasm32 comptime assert). `repr(C, align(16))`
-/// matches size, alignment, and the little-endian byte image (timestamp@0,
-/// key_or_idx@8, value@12).
+/// Eviction entries use a 16-byte, 16-aligned representation on native and
+/// wasm32 targets. `repr(C, align(16))` preserves that layout and its
+/// little-endian byte image (`timestamp@0`, `key_or_idx@8`, `value@12`).
 ///
-/// Latent Zig fragility to confront in the VM-core stage: state_init.zig places
-/// TTL buffers with `align8`, while `[*]EvictionEntry` casts in vm.zig demand
-/// align 16 — offsets are 16-aligned in practice today, but Rust accessors
-/// should either guarantee that or use unaligned reads.
+/// The 16-byte alignment is required by the typed accessors; offsets must
+/// remain aligned when TTL buffers are laid out.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EvictionEntry {
@@ -321,15 +318,11 @@ pub const CT_NODE_NOT: u8 = 10;
 pub const CT_NODE_DESTINATION: u8 = 11;
 pub const CONDITION_TREE_STATE_BYTES: u32 = size_of::<ConditionTreeState>() as u32;
 
-/// Bytecode opcodes as documented in types.zig (the module vm.zig imports).
+/// Bytecode opcode registry. Operand encodings are part of the wire ABI.
 ///
-/// Drift RESOLVED against vm.zig's dispatch (the ground truth): the decode
-/// arms read a trailing `cmp_type:u8` (0=u32, 1=f64, 2=i64) on the LATEST and
-/// MAX/MIN map upserts — 0x20/0x24 at operand 5 (vm.zig:1429/decode), 0x26/0x27
-/// after cmp_col (vm.zig:1480/1492), and the `_IF` forms 0x28/0x2C/0x2D before
-/// pred_col (vm.zig:2220-2591 body arms). opcodes.zig's registry was correct;
-/// types.zig's comments omitted the operand. The docs below carry the
-/// vm.zig-confirmed encodings.
+/// Map upserts that compare values carry a trailing `cmp_type:u8`
+/// (0=u32, 1=f64, 2=i64): at operand 5 for LATEST forms, after `cmp_col` for
+/// MAX/MIN forms, and before `pred_col` for the conditional forms.
 #[repr(u8)]
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,8 +425,7 @@ pub enum Opcode {
     SlotStructMap = 0x18,
     /// slot:u8, key_col:u8, num_vals:u8, \[val_col:u8, field_idx:u8\] × num_vals
     BatchStructMapUpsertLast = 0x80,
-    /// Same encoding as 0x80; first-wins — writes only when the key is absent
-    /// (opcodes.zig:236, dispatch vm.zig:1774/2775).
+    /// Same encoding as 0x80; first-wins — writes only when the key is absent.
     BatchStructMapUpsertFirst = 0x81,
     /// Same row operands as 0x80 followed by comparison_field_idx:u8; replaces
     /// only when the incoming scalar comparison is strictly greater.
@@ -472,11 +464,9 @@ pub enum Opcode {
 }
 
 impl Opcode {
-    /// Decode one opcode byte. `None` is an UNKNOWN byte — vm.zig's dispatch
-    /// is an open `enum(u8)` whose top-level `else` arm returns
-    /// INVALID_PROGRAM for anything it does not handle, so the Rust dispatch
-    /// maps `None` (and known-but-non-executable registry entries) to the
-    /// same INVALID_PROGRAM result rather than panicking on wild bytes.
+    /// Decode one opcode byte. `None` is an unknown byte. The VM dispatch
+    /// treats unknown bytes and known-but-non-executable registry entries as
+    /// `INVALID_PROGRAM` rather than panicking on wild input.
     pub const fn from_u8(byte: u8) -> Option<Self> {
         Some(match byte {
             0x00 => Self::Halt,
@@ -559,7 +549,8 @@ pub enum ErrorCode {
     /// Reserved StructMap2 lane-1 sentinel supplied as reducer data.
     InvalidKey = 7,
     /// A batch-driven op referenced a column that cannot cover `batch_len`
-    /// cells. Named refusal instead of the Zig-era read-garbage/panic split.
+    /// cells. Named refusal makes this boundary explicit instead of reading
+    /// beyond the available column data.
     ColumnUnderrun = 8,
 }
 
@@ -587,34 +578,32 @@ pub const fn hash_key_pair(first: u32, second: u32, cap: u32) -> u32 {
     (h as u32) & (cap - 1)
 }
 
-/// Portable layout equivalent of Zig's `@Vector(4, f64)`.
+/// Portable four-lane `f64` vector layout.
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct V4f64 {
     pub lanes: [f64; 4],
 }
 
-/// Portable layout equivalent of Zig's `@Vector(4, u32)`.
+/// Portable four-lane `u32` vector layout.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V4u32 {
     pub lanes: [u32; 4],
 }
 
-/// Portable layout equivalent of Zig's `@Vector(2, i64)`.
+/// Portable two-lane `i64` vector layout.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V2i64 {
     pub lanes: [i64; 2],
 }
 
-/// Transient view over a slot's raw metadata bytes (types.zig:437-455).
+/// Transient view over a slot's raw metadata bytes.
 ///
-/// The Zig original is a plain (non-`extern`) struct, so its in-memory layout
-/// is UNSPECIFIED and never crosses the ABI — `getSlotMeta` constructs it from
-/// state bytes and it lives only inside a call. This Rust struct therefore has
-/// deliberately NO layout contract and no layout test; `SlotMetaOffset` is the
-/// byte contract for the underlying 48-byte metadata record.
+/// The struct has no layout contract and never crosses the ABI; `get_slot_meta`
+/// constructs it from state bytes and it lives only inside a call. The
+/// `SlotMetaOffset` constants define the 48-byte metadata record.
 #[derive(Clone, Copy, Debug)]
 pub struct SlotMeta {
     pub size_ptr: *mut u32,
@@ -890,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn duration_unit_discriminants_match_zig() {
+    fn duration_unit_discriminants_are_stable() {
         assert_discriminants!(DurationUnit, u8;
             None = 0, Second = 1, Minute = 2, Hour = 3, Day = 4, Week = 5, Month = 6,
             Quarter = 7, Year = 8
@@ -898,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_type_discriminants_match_zig() {
+    fn slot_type_discriminants_are_stable() {
         assert_discriminants!(SlotType, u8;
             HashMap = 0, HashSet = 1, Aggregate = 2, Array = 3, ConditionTree = 4,
             Scalar = 5, StructMap = 6, OrderedList = 7, Bitmap = 8, Nested = 9
@@ -906,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn agg_type_discriminants_match_zig() {
+    fn agg_type_discriminants_are_stable() {
         assert_discriminants!(AggType, u8;
             Sum = 1, Count = 2, Min = 3, Max = 4, Avg = 5, ScalarU32 = 8,
             ScalarF64 = 9, ScalarI64 = 10, SumI64 = 11, MinI64 = 12, MaxI64 = 13
@@ -914,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_field_type_discriminants_match_zig() {
+    fn struct_field_type_discriminants_are_stable() {
         assert_discriminants!(StructFieldType, u8;
             UInt32 = 0, Int64 = 1, Float64 = 2, Bool = 3, String = 4, ArrayU32 = 5,
             ArrayI64 = 6, ArrayF64 = 7, ArrayString = 8, ArrayBool = 9
@@ -922,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn opcode_discriminants_match_zig() {
+    fn opcode_discriminants_are_stable() {
         assert_discriminants!(Opcode, u8;
             Halt = 0x00, SlotDef = 0x10, SlotArray = 0x14, SlotStructMap = 0x18,
             SlotOrderedList = 0x19, SlotNested = 0x1a, BatchMapUpsertLatest = 0x20,
@@ -948,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn error_code_discriminants_match_zig() {
+    fn error_code_discriminants_are_stable() {
         assert_discriminants!(ErrorCode, u32;
             Ok = 0, CapacityExceeded = 1, InvalidProgram = 2, InvalidSlot = 3,
             InvalidState = 4, NeedsGrowth = 5, ArenaOverflow = 6, InvalidKey = 7,
@@ -957,8 +946,8 @@ mod tests {
     }
 
     #[test]
-    fn slot_type_flags_layout_and_bitfield_round_trip_match_zig() {
-        // Source: types.zig:176-190 (`packed struct(u8)`).
+    fn slot_type_flags_layout_and_bitfield_round_trip() {
+        // The flag byte uses four slot-type bits followed by four boolean flags.
         assert_eq!(size_of::<SlotTypeFlags>(), 1);
         assert_eq!(align_of::<SlotTypeFlags>(), 1);
         assert_eq!(offset_of!(SlotTypeFlags, bits), 0);
@@ -975,7 +964,7 @@ mod tests {
 
     #[test]
     fn constant_namespace_types_are_zero_sized() {
-        // These model Zig compile-time-only `struct { pub const ... }` namespaces.
+        // These are zero-sized namespaces for compile-time constants.
         assert_eq!(size_of::<StateHeaderOffset>(), 0);
         assert_eq!(align_of::<StateHeaderOffset>(), 1);
         assert_eq!(size_of::<StateFlags>(), 0);
@@ -987,8 +976,8 @@ mod tests {
     }
 
     #[test]
-    fn eviction_entry_layout_matches_zig() {
-        // Source: types.zig:235-240; Zig compile-time layout probe: size=16, align=16.
+    fn eviction_entry_layout_is_stable() {
+        // The representation is C-compatible, 16 bytes, and 16-byte aligned.
         assert_eq!(size_of::<EvictionEntry>(), 16);
         assert_eq!(align_of::<EvictionEntry>(), 16);
         assert_eq!(offset_of!(EvictionEntry, timestamp), 0);
@@ -997,8 +986,8 @@ mod tests {
     }
 
     #[test]
-    fn condition_tree_state_layout_matches_zig() {
-        // Source: types.zig:242-245; `extern struct` means C layout.
+    fn condition_tree_state_layout_is_stable() {
+        // The representation is C-compatible: two consecutive u32 fields.
         assert_eq!(size_of::<ConditionTreeState>(), 8);
         assert_eq!(align_of::<ConditionTreeState>(), 4);
         assert_eq!(offset_of!(ConditionTreeState, lifecycle_generation), 0);
@@ -1006,8 +995,8 @@ mod tests {
     }
 
     #[test]
-    fn vector_layouts_match_zig() {
-        // Source: types.zig:429-431; Zig layout probe records these vector ABI values.
+    fn vector_layouts_are_stable() {
+        // Lane arrays have explicit C layout and alignment for SIMD access.
         assert_eq!(size_of::<V4f64>(), 32);
         assert_eq!(align_of::<V4f64>(), 32);
         assert_eq!(offset_of!(V4f64, lanes), 0);
@@ -1019,12 +1008,11 @@ mod tests {
         assert_eq!(offset_of!(V2i64, lanes), 0);
     }
 
-    // SlotMeta deliberately has NO layout test: the Zig original is a plain
-    // struct with unspecified layout that never crosses the ABI (and pointer
-    // fields make any size assertion break on wasm32). See the type's doc.
+    // SlotMeta deliberately has NO layout test: its pointer fields and
+    // transient, call-local role give it no cross-target layout contract.
 
     #[test]
-    fn eviction_entry_byte_image_matches_zig_packed_le_layout() {
+    fn eviction_entry_byte_image_matches_packed_le_layout() {
         // Independently computed: struct.pack('<dII', 1234.5, 42, 7).
         let entry = EvictionEntry {
             timestamp: 1234.5,
@@ -1055,9 +1043,9 @@ mod tests {
     }
 
     #[test]
-    fn hash_key_matches_zig_reference_vectors() {
-        // Vectors computed independently with the same avalanche steps
-        // (Python, 64-bit wrapping): see types.zig:415-423.
+    fn hash_key_matches_reference_vectors() {
+        // Vectors were computed independently with the same avalanche steps
+        // using 64-bit wrapping arithmetic.
         assert_eq!(hash_key(0, 16), 0);
         assert_eq!(hash_key(42, 16), 4);
         assert_eq!(hash_key(1, 1024), 183);
@@ -1087,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn align8_and_next_power_of_2_edges_match_zig() {
+    fn align8_and_next_power_of_2_edges_are_stable() {
         assert_eq!(align8(0), 0);
         assert_eq!(align8(1), 8);
         assert_eq!(align8(8), 8);
@@ -1100,9 +1088,8 @@ mod tests {
     }
 
     #[test]
-    fn struct_row_layout_layout_matches_its_named_zig_return_value() {
-        // Source: types.zig:615-624 anonymous return struct; Rust names it so it
-        // can appear in the public function signature.
+    fn struct_row_layout_matches_named_return_value() {
+        // The public struct names the three fields returned by the layout helper.
         assert_eq!(size_of::<StructRowLayout>(), 12);
         assert_eq!(align_of::<StructRowLayout>(), 4);
         assert_eq!(offset_of!(StructRowLayout, row_size), 0);
@@ -1111,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn utility_functions_match_types_zig() {
+    fn utility_functions_have_expected_values() {
         assert_eq!(hash_key(42, 16), 4);
         assert_eq!(align8(9), 16);
         assert_eq!(next_power_of_2(0), 16);

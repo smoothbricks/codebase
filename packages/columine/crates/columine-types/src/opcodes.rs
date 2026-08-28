@@ -1,22 +1,13 @@
-//! Replaces `packages/columine/src/vm/opcodes.zig`.
+//! Canonical opcode, slot, and wire-format registries.
 //!
-//! This remains a separate canonical opcode registry, even where its tables
-//! overlap `types`, because the Zig port inventory keeps the source modules
-//! distinct. Like the Zig original, this is a registry/specification file:
-//! vm.zig's dispatch (inline hex values) is the executable truth.
-//!
-//! Drift RESOLVED against vm.zig's dispatch: this registry's trailing
-//! `cmp_type:u8` operand (0=u32, 1=f64, 2=i64) on the LATEST/MAX/MIN map
-//! upserts (0x20, 0x24, 0x26-0x28, 0x2C, 0x2D) matches the decode arms
-//! (vm.zig:1424-1508 top-level, :2213-2613 body ops) — this file was correct;
-//! types.zig's operand comments omitted the operand and are now fixed on the
-//! Rust side (types.rs carries the vm.zig-confirmed encodings).
-//!
-//! Ranges the Zig registry reserves for PLANNED opcodes (kept for tooling):
-//! nested-container slot defs 0x15-0x17; time filters 0x50-0x53 (0x50+ range
-//! also reserved for RETE in the VM superset binary); expressions
-//! 0x60-0x69; JS callbacks 0x70-0x71; nested map ops 0x90-0x96 (partially
-//! implemented per types.zig: 0x90, 0x92, 0x95).
+//! This remains a separate registry from `types`, even where their tables
+//! overlap, because each table documents a distinct public contract. The
+//! dispatch implementation is the executable consumer of these definitions.
+//! Operand encodings and reserved ranges below are part of the bytecode ABI.
+//! Reserved ranges include nested-container slot defs 0x15-0x17, time filters
+//! 0x50-0x53 (0x50+ also RETE in the VM superset), expressions 0x60-0x69,
+//! JS callbacks 0x70-0x71, and nested map ops 0x90-0x96; implemented nested
+//! ops are 0x90, 0x92, and 0x95.
 
 #[repr(u8)]
 #[non_exhaustive]
@@ -103,7 +94,7 @@ pub enum Opcode {
     /// Upsert into struct map — last-write-wins per key.
     BatchStructMapUpsertLast = 0x80,
     /// Insert into struct map only when the key is absent from persisted/current
-    /// state. Encoding is identical to BATCH_STRUCT_MAP_UPSERT_LAST (opcodes.zig:236).
+    /// state. Encoding is identical to BATCH_STRUCT_MAP_UPSERT_LAST.
     BatchStructMapUpsertFirst = 0x81,
     /// Upsert the whole row only when its mapped scalar comparison field is
     /// strictly greater. Encoding is 0x80 plus comparison_field_idx:u8.
@@ -173,9 +164,9 @@ pub enum StructFieldType {
     ArrayBool = 9,
 }
 
-/// Duration unit encoding for TTL `startOf` truncation. Zig spells the
-/// variants as the compiler-normalized short forms (s, m, h, d, w, M, Q, y);
-/// the discriminants are the contract.
+/// Duration unit encoding for TTL `startOf` truncation. The JavaScript
+/// compiler normalizes units to `s, m, h, d, w, M, Q, y`; the discriminants
+/// are the contract.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurationUnit {
@@ -201,10 +192,8 @@ pub const PROGRAM_HEADER_SIZE: u32 = 46;
 
 /// The byte-content header immediately after the 32-byte hash prefix.
 ///
-/// Zig's `packed struct` (backed by u112) rounds this record to a 16-byte,
-/// 16-aligned value — verified with a zig 0.16.0 layout probe (`@sizeOf`,
-/// `@alignOf`, `@offsetOf`) — while only the first 14 bytes
-/// ([`Self::WIRE_SIZE`]) are program wire content.
+/// The in-memory representation is 16 bytes and 16-byte aligned, while only
+/// the first 14 bytes ([`Self::WIRE_SIZE`]) are program wire content.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramHeader {
@@ -288,7 +277,8 @@ pub enum ErrorCode {
     ArenaOverflow = 6,
     InvalidKey = 7,
     /// A batch-driven op referenced a column that cannot cover `batch_len`
-    /// cells. Named refusal instead of the Zig-era read-garbage/panic split.
+    /// cells. Named refusal makes this boundary explicit instead of reading
+    /// beyond the available column data.
     ColumnUnderrun = 8,
 }
 
@@ -304,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn opcode_discriminants_match_zig() {
+    fn opcode_discriminants_are_stable() {
         assert_discriminants!(Opcode, u8;
             Halt = 0x00, SlotDef = 0x10, SlotArray = 0x14, SlotStructMap = 0x18,
             SlotOrderedList = 0x19, BatchMapUpsertLatest = 0x20, BatchMapUpsertFirst = 0x21,
@@ -329,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_slot_field_duration_and_error_discriminants_match_zig() {
+    fn aggregate_slot_field_duration_and_error_discriminants_are_stable() {
         assert_discriminants!(AggType, u8;
             Sum = 1, Count = 2, Min = 3, Max = 4, Avg = 5, ScalarU32 = 8,
             ScalarF64 = 9, ScalarI64 = 10, SumI64 = 11, MinI64 = 12, MaxI64 = 13
@@ -354,8 +344,8 @@ mod tests {
     }
 
     #[test]
-    fn program_header_layout_matches_zig() {
-        // Source: opcodes.zig:434-446. Zig compile-time layout probe: size=16, align=16.
+    fn program_header_layout_is_stable() {
+        // The in-memory representation is C-compatible, 16 bytes, and 16-byte aligned.
         assert_eq!(size_of::<ProgramHeader>(), 16);
         assert_eq!(align_of::<ProgramHeader>(), 16);
         assert_eq!(offset_of!(ProgramHeader, magic), 0);
@@ -369,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn program_header_wire_round_trip_matches_zig_packed_content() {
+    fn program_header_wire_round_trip_matches_packed_content() {
         let header = ProgramHeader {
             magic: PROGRAM_MAGIC,
             version: 7,
@@ -387,7 +377,7 @@ mod tests {
 
     #[test]
     fn change_flag_namespace_is_zero_sized() {
-        // Zig's `struct { pub const ... }` exists only as a constant namespace.
+        // ChangeFlag is a zero-sized constant namespace.
         assert_eq!(size_of::<ChangeFlag>(), 0);
         assert_eq!(align_of::<ChangeFlag>(), 1);
     }

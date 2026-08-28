@@ -1,16 +1,16 @@
-//! Registry-declaration audit against the frozen Zig ABI (tripwire; see the
-//! WHY on `columine_types::zig_audit` and the 0x81 incident it answers).
+//! Registry-declaration audit against frozen ABI snapshots (tripwire; see the
+//! WHY on `columine_types::audit_parser` and the 0x81 incident it answers).
 //!
-//! The Zig sources are deleted (cutover); `zig_abi_fixture` is their
-//! tombstone. Each Rust registry is audited against the fixture of the Zig
-//! file it replaced — SEPARATELY on purpose: types.zig and opcodes.zig were
-//! drifted registries (types has the Nested family, opcodes does not), and
-//! that drift is pinned truth the port reproduces. A deliberate ABI change
-//! edits fixture and registry in the same commit.
+//! The snapshots were captured at the port cutover; `abi_registry_fixture`
+//! preserves their ground truth. Each Rust registry is audited against its
+//! corresponding frozen declaration set — separately on purpose: the types
+//! and opcodes registries intentionally differ (types has the Nested family,
+//! opcodes does not), and that distinction is pinned truth. A deliberate ABI
+//! change edits the fixture and registry in the same commit.
 
+use columine_types::abi_registry_fixture::{OPCODES_OPCODE_REGISTRY, TYPES_OPCODE_REGISTRY};
+use columine_types::audit_parser::{enum_decls, norm, read_source};
 use columine_types::types::Opcode as TypesOpcode;
-use columine_types::zig_abi_fixture::{OPCODES_ZIG_OPCODES, TYPES_ZIG_OPCODES};
-use columine_types::zig_audit::{enum_decls, norm, read_source};
 use std::collections::BTreeMap;
 
 const MANIFEST: &str = env!("CARGO_MANIFEST_DIR");
@@ -33,26 +33,26 @@ fn fixture(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {
 }
 
 #[test]
-fn types_rs_registry_matches_zig_fixture() {
+fn types_rs_registry_matches_fixture() {
     let rust = read_source(MANIFEST, "src/types.rs");
     let rust_decls = decls(&rust, "pub enum Opcode", 55, "types.rs Opcode");
     assert_eq!(
-        fixture(TYPES_ZIG_OPCODES),
+        fixture(TYPES_OPCODE_REGISTRY),
         rust_decls,
-        "types.rs Opcode registry diverged from the frozen types.zig ABI — \
-         if this change is deliberate, update zig_abi_fixture in this commit"
+        "types.rs Opcode registry diverged from the frozen ABI snapshot — \
+         if this change is deliberate, update abi_registry_fixture in this commit"
     );
 }
 
 #[test]
-fn opcodes_rs_registry_matches_zig_fixture() {
+fn opcodes_rs_registry_matches_fixture() {
     let rust = read_source(MANIFEST, "src/opcodes.rs");
     let rust_decls = decls(&rust, "pub enum Opcode", 50, "opcodes.rs Opcode");
     assert_eq!(
-        fixture(OPCODES_ZIG_OPCODES),
+        fixture(OPCODES_OPCODE_REGISTRY),
         rust_decls,
-        "opcodes.rs Opcode registry diverged from the frozen opcodes.zig ABI — \
-         if this change is deliberate, update zig_abi_fixture in this commit"
+        "opcodes.rs Opcode registry diverged from the frozen ABI snapshot — \
+         if this change is deliberate, update abi_registry_fixture in this commit"
     );
 }
 

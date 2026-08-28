@@ -1,24 +1,25 @@
-//! Test-support parsers for the Zig↔Rust opcode-registry audit tripwire.
+//! Test-support parsers for registry audit tripwires.
 //!
 //! WHY this lives in the library (doc-hidden) instead of a test module: the
 //! audit runs in three crates (columine-types, columine-vm, and a RETE
-//! consumer crate) against the in-repo Zig sources; integration tests cannot
-//! share code across crates any other way without duplicating the parser. The module is
-//! `#[doc(hidden)]`, compiled only when referenced, and has zero runtime
-//! callers.
+//! consumer crate) against their Rust registry and dispatch sources;
+//! integration tests cannot share code across crates any other way without
+//! duplicating the parser. The module is `#[doc(hidden)]`, compiled only when
+//! referenced, and has zero runtime callers.
 //!
-//! These are TRIPWIRES, not compilers: line-oriented scans over the Zig and
-//! Rust sources. Every consumer must pair a harvest with a sanity FLOOR
-//! (assert the harvested count >= the count known today) so that silent
-//! parser rot — a formatting change that makes a scan return nothing — fails
-//! a test instead of quietly weakening the audit (the 0x81 incident was
-//! exactly a silent-skip class; the audit must not reproduce it).
+//! These are TRIPWIRES, not compilers: line-oriented scans over Rust sources.
+//! Every consumer must pair a harvest with a sanity FLOOR (assert the
+//! harvested count >= the count known today) so that silent parser rot — a
+//! formatting change that makes a scan return nothing — fails a test instead
+//! of quietly weakening the audit (the 0x81 incident was exactly a silent-skip
+//! class; the audit must not reproduce it).
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Read a source file relative to a crate's `CARGO_MANIFEST_DIR`, panicking
-/// with the resolved path on failure so a moved Zig file fails loud.
+/// Read a Rust source file relative to a crate's `CARGO_MANIFEST_DIR`,
+/// panicking with the resolved path on failure so a moved audit input fails
+/// loudly.
 pub fn read_source(manifest_dir: &str, rel: &str) -> String {
     let path = Path::new(manifest_dir).join(rel);
     std::fs::read_to_string(&path)
@@ -37,9 +38,8 @@ fn parse_value(tok: &str) -> Option<u8> {
 
 /// Harvest `NAME = <byte>,` declarations from the enum block that starts at
 /// the first line containing `header`. The block ends at the first following
-/// line whose trimmed form starts with `}`. Commented-out declarations
-/// (`// NAME = ...`, e.g. Zig "planned" opcodes) are skipped — they are
-/// intentionally NOT part of the declared set.
+/// line whose trimmed form starts with `}`. Commented-out declarations are
+/// skipped because they are not part of the declared set.
 pub fn enum_decls(src: &str, header: &str) -> Vec<(String, u8)> {
     let mut out = Vec::new();
     let mut in_block = false;
@@ -83,11 +83,11 @@ pub fn enum_decls(src: &str, header: &str) -> Vec<(String, u8)> {
 }
 
 /// Harvest the bytes of raw-hex match-arm labels: lines shaped like
-/// `0xNN => …`, `0xNN | 0xMM => …`, `0xNN..=0xMM => …` (Rust) or
-/// `0xNN...0xMM => …`, `0xNN, 0xMM => …` (Zig). Ranges expand inclusively.
-/// Decimal-only labels are deliberately ignored (they belong to non-opcode
-/// matches like undo-op decode); a label containing any character outside
-/// the hex-literal/label-punctuation set is rejected wholesale.
+/// `0xNN => …`, `0xNN | 0xMM => …`, or `0xNN..=0xMM => …`. Ranges expand
+/// inclusively. Decimal-only labels are deliberately ignored because they
+/// belong to non-opcode matches like undo-op decode; a label containing any
+/// character outside the hex-literal/label-punctuation set is rejected
+/// wholesale.
 pub fn arm_bytes(src: &str) -> BTreeSet<u8> {
     let mut out = BTreeSet::new();
     for line in src.lines() {
@@ -121,8 +121,9 @@ pub fn arm_bytes(src: &str) -> BTreeSet<u8> {
 }
 
 /// Harvest `<prefix>NAME` tokens from lines that contain a match arrow.
-/// For Zig pass `prefix = "."` (only SCREAMING_CASE names are taken, so
-/// `.slot_ref` field inits don't pollute); for Rust pass e.g. `"Opcode::"`.
+/// A dot-prefixed harvest keeps only uppercase names so lowercase field
+/// access does not pollute the result; Rust callers pass prefixes such as
+/// `"Opcode::"`.
 pub fn arm_names(src: &str, prefix: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in src.lines() {
@@ -134,8 +135,8 @@ pub fn arm_names(src: &str, prefix: &str) -> BTreeSet<String> {
     out
 }
 
-/// Harvest `<prefix>NAME` tokens from EVERY line (no arrow requirement) —
-/// for handler-table registrations like `h[@intFromEnum(ReteOpcode.NAME)]`.
+/// Harvest `<prefix>NAME` tokens from every line (no arrow requirement), for
+/// example handler-table registrations.
 pub fn all_prefixed_names(src: &str, prefix: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in src.lines() {
@@ -152,7 +153,7 @@ fn collect_prefixed(line: &str, prefix: &str, out: &mut BTreeSet<String>) {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
-        // A Zig `.name` harvest must not pick up lowercase field access.
+        // A dot-prefixed harvest must not pick up lowercase field access.
         let uppercase_ok =
             prefix != "." || name.chars().next().is_some_and(|c| c.is_ascii_uppercase());
         if !name.is_empty() && uppercase_ok {
@@ -162,8 +163,8 @@ fn collect_prefixed(line: &str, prefix: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Case/underscore-insensitive name normalization so Zig `BATCH_BITMAP_ANDNOT`
-/// equals Rust `BatchBitmapAndNot`: lowercase alphanumerics only.
+/// Case/underscore-insensitive name normalization: lowercase alphanumerics
+/// only.
 pub fn norm(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_alphanumeric())
