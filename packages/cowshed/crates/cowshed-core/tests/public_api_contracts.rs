@@ -7,7 +7,6 @@ use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::SystemTime;
 
 fn repo() -> cowshed_core::repository::RepoId {
     cowshed_core::repository::RepoId::parse("acme/widget").expect("repo id")
@@ -781,14 +780,35 @@ fn json_envelope_has_exact_discriminated_success_and_failure_shapes() {
 
 #[test]
 fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
-    // rustc the deny snippet against the rlib this test already linked. A path-dep
-    // `cargo check` would compile cowshed-core again (~7 min cold on CI) and test
-    // the build graph, not the API surface.
+    // Compiled by cargo, not by a hand-assembled rustc command line.
+    //
+    // This test used to run rustc itself against the newest `libcowshed_core-*.rlib` in
+    // `<target>/debug/deps`, to avoid a path-dependency `cargo check` rebuilding cowshed-core. Two
+    // toolchain changes made that technique impossible rather than merely fragile:
+    //
+    // * cargo no longer writes package rlibs into `<target>/<profile>/deps`. They live in
+    //   `<target>/<profile>/build/<pkg>/<hash>/out/`, and dependencies are found through one
+    //   `-L dependency=` per package rather than a single shared directory.
+    // * rustc now emits rlibs carrying only a metadata *stub*, with the full metadata in a sibling
+    //   `.rmeta`. `--extern name=<rlib>` fails with "only metadata stub found", and reproducing
+    //   cargo's rlib/rmeta pairing by hand does not resolve either.
+    //
+    // Reconstructing cargo's dependency search path here would have to be redone at every layout
+    // change, and while it was broken this gate passed nothing and proved nothing. Asking cargo
+    // cannot go stale. The cost is one cold dependency check in a probe-private target directory,
+    // warm on every subsequent run; the probe directory is deliberately *not* the shared target
+    // directory, because this runs while the outer cargo owns that one.
+    //
+    // If a stale-artifact failure ever reappears here, this is what it looks like: a poisoned rlib
+    // left in the legacy `deps` directory, written by sccache with 0640 permissions on a cache hit,
+    // compiled by a rustc that is no longer the one on PATH.
+    let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("cargo target directory")
+        .join("capability-probe");
     let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-deny");
     fs::create_dir_all(&work).expect("deny snippet directory");
-    let deps = cargo_debug_deps();
-    let cowshed_core = newest_rlib(&deps, "cowshed_core");
-    let serde = newest_rlib(&deps, "serde");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let cases: [(&str, &str, &[&str]); 6] = [
         (
             "project_authority",
@@ -838,28 +858,35 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             &["success", "Sealed"],
         ),
     ];
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     for (name, source, expected) in cases {
-        let src = work.join(format!("{name}.rs"));
-        fs::write(&src, source).expect("deny snippet");
-        let output = Command::new(&rustc)
-            .arg("--edition=2024")
-            .arg("--crate-name")
-            .arg(name)
-            .arg("--crate-type=lib")
-            .arg("--emit=metadata")
-            .arg("--error-format=short")
-            .arg("--extern")
-            .arg(format!("cowshed_core={}", cowshed_core.display()))
-            .arg("--extern")
-            .arg(format!("serde={}", serde.display()))
-            .arg("-L")
-            .arg(format!("dependency={}", deps.display()))
-            .arg("-o")
-            .arg(work.join(name))
-            .arg(&src)
+        let probe = work.join(name);
+        fs::create_dir_all(probe.join("src")).expect("probe crate directory");
+        // `[workspace]` detaches the probe from the outer workspace, whose members it must not join
+        // and whose lints and profiles it must not inherit — the snippet is meant to fail on
+        // visibility, and nothing else. `serde` is here because one snippet names a serde trait to
+        // prove a sealed token does not implement it; without it that snippet would fail on an
+        // unresolved crate and prove nothing.
+        fs::write(
+            probe.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+                 publish = false\n\n[lib]\npath = \"src/lib.rs\"\n\n\
+                 [dependencies]\ncowshed-core = {{ path = {:?} }}\n\
+                 serde = {{ version = \"1\", features = [\"derive\"] }}\n\n[workspace]\n",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+        )
+        .expect("probe manifest");
+        fs::write(probe.join("src/lib.rs"), source).expect("deny snippet");
+        let output = Command::new(&cargo)
+            .arg("check")
+            .arg("--offline")
+            .arg("--message-format=short")
+            .arg("--target-dir")
+            .arg(&target)
+            .current_dir(&probe)
             .output()
-            .unwrap_or_else(|error| panic!("rustc {name}: {error}"));
+            .unwrap_or_else(|error| panic!("cargo check {name}: {error}"));
         assert!(
             !output.status.success(),
             "{name} unexpectedly compiled:\n{}",
@@ -873,48 +900,4 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             );
         }
     }
-}
-
-fn cargo_debug_deps() -> PathBuf {
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    for ancestor in tmp.ancestors() {
-        let nested = ancestor.join("debug/deps");
-        if nested.is_dir() {
-            return nested;
-        }
-        if ancestor.file_name().is_some_and(|name| name == "debug") {
-            let deps = ancestor.join("deps");
-            if deps.is_dir() {
-                return deps;
-            }
-        }
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/deps")
-}
-
-fn newest_rlib(deps: &std::path::Path, crate_name: &str) -> PathBuf {
-    let prefix = format!("lib{crate_name}-");
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
-    for entry in
-        fs::read_dir(deps).unwrap_or_else(|error| panic!("read {}: {error}", deps.display()))
-    {
-        let entry = entry.expect("deps entry");
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !(name.starts_with(&prefix) && name.ends_with(".rlib")) {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if newest.as_ref().is_none_or(|(stamp, _)| modified >= *stamp) {
-            newest = Some((modified, entry.path()));
-        }
-    }
-    newest
-        .map(|(_, path)| path)
-        .unwrap_or_else(|| panic!("no {prefix}*.rlib in {}", deps.display()))
 }
