@@ -2098,6 +2098,7 @@ mod tests {
                 created_at: None,
                 checkpoints: Vec::new(),
                 snapshot_stale: false,
+                landing: None,
             },
             grants: GrantSet::default(),
             runtime,

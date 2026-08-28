@@ -875,6 +875,7 @@ impl NativeGatewayInventory {
                     })
                     .collect(),
                 snapshot_stale: info.is_some_and(|snapshot| snapshot.stale),
+                landing: None,
             });
         }
         workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
