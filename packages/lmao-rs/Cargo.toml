@@ -38,3 +38,13 @@ codegen-units = 1
 inherits = "release"
 opt-level = "z"
 panic = "abort"
+
+# The shared lane. `incremental = false` is what makes these units cacheable at
+# all — cargo marks incremental compilations non-cacheable, and the `test`
+# profile inherits `dev`, which is incremental — and `debug = 0` is what keeps a
+# cached artifact correct in a workspace that did not build it: a cacheable
+# profile carrying debuginfo hands the hitting checkout the producing checkout's
+# absolute source paths. Matches packages/cowshed.
+[profile.test]
+incremental = false
+debug = 0
