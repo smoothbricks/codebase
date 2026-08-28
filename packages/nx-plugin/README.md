@@ -36,6 +36,13 @@ Concrete targets come from concrete files:
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
   the workspace's sccache wrapper.
+- Each `--use-napi-cross` triple also gets a `napi-toolchain-<arch>-linux` prerequisite that extracts the pinned
+  `@napi-rs/cross-toolchain-<host>-target-<arch>` archive into `~/.napi-rs`, where the NAPI CLI probes for it. Every
+  cross build of that triple — the inferred `napi-<arch>-linux` and any package-local `cli-<arch>-linux` — depends on
+  it, so the CLI's own downloader never runs. That downloader `npm pack`s into its own package directory, which under
+  Bun's isolated global store is a shared (in CI host-wide) cache: two concurrent cross builds of one triple would
+  otherwise pack the same file into the same directory and one would die on the other's cleanup. The prerequisite
+  produces no artifact, so it stays out of the aggregate `build` and out of collected platform outputs.
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.
