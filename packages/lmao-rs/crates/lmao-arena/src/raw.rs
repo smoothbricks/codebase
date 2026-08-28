@@ -1,13 +1,12 @@
-//! Function-by-function port of allocator.zig's allocator core, generic over a
-//! [`Mem`] linear-memory backend so the identical logic runs natively (over
-//! `Vec<u8>`, see [`crate::Arena`]) and on wasm32 (over WASM linear memory, see
-//! the `lmao-wasm` crate).
+//! Allocation core over a [`Mem`] linear-memory backend. The same logic runs
+//! natively (over `Vec<u8>`, see [`crate::Arena`]) and on wasm32 (over WASM
+//! linear memory, see the `lmao-wasm` crate).
 //!
-//! Offsets, sentinel conventions, stat cascading, and merge order are ABI /
-//! behavior-identical to the Zig (`packages/lmao/src/lib/wasm/allocator.zig`);
-//! each `pub fn` names its Zig counterpart. Time is passed IN (`current_ms`,
-//! `wall_ms`) instead of imported, keeping this module deterministic — the
-//! wasm exports fetch host clocks, native callers use `Clock` from lmao-core.
+//! Offsets, sentinel conventions, stat cascading, and merge order define the
+//! shared linear-memory ABI consumed by the TypeScript host. Time is passed IN
+//! (`current_ms`, `wall_ms`) instead of imported, keeping this module
+//! deterministic — the wasm exports fetch host clocks, native callers use
+//! `Clock` from lmao-core.
 
 use crate::{
     FREE_BLOCK_SIZE, HEADER_SIZE, IDENTITY_SIZE, NUM_TIERS, SizeClass, block_size,
@@ -15,7 +14,7 @@ use crate::{
 };
 
 /// Linear memory backend. Offsets are absolute byte offsets; offset 0 holds the
-/// header, so 0 doubles as the null sentinel exactly as in the Zig.
+/// header, so 0 doubles as the null sentinel.
 ///
 /// Growth is behind this trait: the native backend grows a `Vec`, the wasm
 /// backend calls `memory.grow`. `grow_to` returns false on OOM (alloc then
@@ -44,7 +43,7 @@ pub trait Mem {
     }
 }
 
-// --- Header field offsets (Header extern struct in allocator.zig) ---
+// --- Header field offsets in the linear-memory ABI ---
 const H_BUMP_PTR: u32 = 0;
 const H_SPAN_ID_COUNTER: u32 = 4;
 const H_ALLOC_COUNT: u32 = 8;
@@ -76,7 +75,7 @@ const EXACT_FREE_BLOCK_SIZE: u32 = 16;
 const ID_WRITE_INDEX: u32 = 0;
 const ID_SPAN_ID: u32 = 4;
 const ID_TRACE_ID_LEN: u32 = 8;
-pub const ID_TRACE_ID: u32 = 9; // @offsetOf(Identity, "trace_id")
+pub const ID_TRACE_ID: u32 = 9; // offset of trace_id in Identity
 const ID_TRACE_ID_MAX: u32 = 119;
 
 // --- TraceRoot field offsets ---
@@ -325,14 +324,11 @@ fn capacity_block_is_free<M: Mem>(m: &M, offset: u32, sc: SizeClass) -> bool {
 
 /// Effective allocation tier for a request.
 ///
-/// DELIBERATE DEVIATION from allocator.zig: a freed block is overlaid with a
-/// 20-byte `FreeBlock`, but `col_1b` blocks at capacity 8/16 are only 9/18
-/// bytes — in the Zig, freeing/splitting those silently corrupts the adjacent
-/// split-sibling's FreeBlock (latent memory-corruption bug, caught here by
-/// Rust's checked arithmetic). We clamp such requests up to the first tier
-/// whose block size fits a FreeBlock; buddy doubling stays intact, callers
-/// still get a block valid for the requested capacity (just over-provisioned).
-/// Affects only col_1b cap 8 → tier 2 (36B) and cap 16 → tier 2.
+/// A freed block is overlaid with a 20-byte `FreeBlock`, but `col_1b` blocks at
+/// capacity 8/16 are only 9/18 bytes. Clamp those requests up to the first tier
+/// whose block size fits the metadata; buddy doubling stays intact, and callers
+/// still receive a block valid for the requested capacity (just over-provisioned).
+/// This affects only `col_1b` capacity 8 → tier 2 (36B) and capacity 16 → tier 2.
 #[inline]
 fn effective_tier(sc: SizeClass, tier: usize) -> usize {
     let mut t = tier;
@@ -464,10 +460,9 @@ pub fn free_exact<M: Mem>(m: &mut M, offset: u32, byte_len: u32, alignment: u32)
 
 // --- Identity blocks (fixed 128B, separate freelist, no buddy) ---
 
-/// `allocIdentity` — pop identity freelist or aligned bump. NOTE: faithfully
-/// ports the Zig, including its quirk that the identity bump path does NOT grow
-/// memory (native Vec backends should over-provision or rely on `grow_to` in
-/// `alloc_at_tier` having grown enough; the wasm host sizes memory up front).
+/// Identity allocation pops the freelist or uses an aligned bump. The bump path
+/// grows the backend when needed, keeping native `Vec` and WASM memory
+/// implementations safe when the initial region is too small.
 fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
     let head_offset = m.read_u32(H_FREELIST_IDENTITY);
     if head_offset != 0 {
@@ -482,8 +477,6 @@ fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
     }
     let aligned = (m.read_u32(H_BUMP_PTR) + 7) & !7u32;
     let new_bump = aligned + IDENTITY_SIZE as u32;
-    // Deviation from Zig (which cannot fail here and would trap): grow if the
-    // backend supports it, so native Vec arenas stay safe.
     if new_bump > m.size() && !m.grow_to(new_bump) {
         return 0;
     }

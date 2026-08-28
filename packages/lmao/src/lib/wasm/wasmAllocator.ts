@@ -128,7 +128,7 @@ export interface WasmAllocator {
 }
 
 /**
- * Size class enum matching Zig's SizeClass
+ * Size class discriminants shared with the allocator ABI.
  */
 export enum SizeClass {
   SpanSystem = 0,
@@ -148,7 +148,7 @@ export interface WasmAllocatorOptions {
 }
 
 // =============================================================================
-// WASM Exports Interface (matches Zig export names)
+// WASM export names consumed by the TypeScript wrapper
 // =============================================================================
 
 interface WasmExports {

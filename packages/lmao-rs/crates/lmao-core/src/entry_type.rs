@@ -2,9 +2,8 @@
 //!
 //! Everything — user logs AND internal metrics — flows through the same table and
 //! flush path as one dense entry-type lane in the packed row header. Discriminants
-//! 1..=4 MUST match the Zig allocator constants in
-//! `packages/lmao/src/lib/wasm/allocator.zig`.
-
+//! 1..=4 MUST remain stable for span lifecycle entries consumed by the WASM and
+//! TypeScript ABI.
 /// Dense entry-type discriminant stored in the low byte of the packed row header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -73,8 +72,8 @@ mod tests {
     }
 
     #[test]
-    fn zig_abi_constants_match() {
-        // Must match ENTRY_TYPE_* in packages/lmao/src/lib/wasm/allocator.zig.
+    fn span_entry_discriminants_are_stable() {
+        // These values are part of the WASM/TypeScript ABI.
         assert_eq!(EntryType::SpanStart.as_u8(), 1);
         assert_eq!(EntryType::SpanOk.as_u8(), 2);
         assert_eq!(EntryType::SpanErr.as_u8(), 3);
