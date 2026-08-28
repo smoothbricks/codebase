@@ -68,8 +68,8 @@ sense. `cowshed exec main -- ...` uses the same closed sandbox and explicit gran
 
 A host may adopt many repositories. Each repository binding owns one `main` and an independent namespace of workspace
 names and checkpoints. cwd or `--project` selects the repository before a command interprets its workspace argument;
-`main` is therefore repository-scoped, not host-global. `--repo-id` is used only while adopting a repository whose
-identity cannot be derived unambiguously from its remotes.
+`main` is therefore repository-scoped, not host-global. `--repo-id` selects an explicit identity while adopting and
+repairs an adopted identity with `cowshed mv main --repo-id`.
 
 ## Lifecycle
 
@@ -290,6 +290,33 @@ next: cowshed new <name>
 Workspace environment lives in the image at `.cowshed/env` and is rewritten on token rotation. The repository `.envrc`
 is a two-liner that sources that file. Cowshed does not authorize direnv or devenv trust databases. Reattach a detached
 session workspace with `cowshed attach`.
+
+### `cowshed mv main --repo-id <owner/repo>`
+
+Change the adopted project's repository identity without changing its Git remotes or copying the
+checkout. Cowshed moves the store namespace and the session mount namespace, rewrites the
+repository binding, and moves every workspace's store-side detached sidecar onto the new identity.
+The target identity is validated with the same `owner/repo` grammar as adoption.
+
+The binding records the identity it leaves as a former one, and every later identity check asks
+whether the project owns the identity it is shown rather than whether that identity is the current
+one. That is what keeps the stamps this operation cannot reach valid: a detached session's in-image
+marker, a workspace's CA certificate subject, and artifact records already appended. A detached
+workspace's marker is brought onto the current identity the next time it is attached.
+
+The operation refuses if any live adopted project already owns the target identity — as its current
+identity or as one it recorded holding — if a session workspace is attached, or if main is
+detached. Uniqueness is scoped to live projects: retirement deletes the binding, so a retired
+project's former identities are free again.
+
+The identity transaction writes a store-root intent before its first mutation and marks it
+`mutating` only once the project's volumes are unmounted. Reopening any project completes a started
+transaction from what is on disk rather than from how far the record says it got, so a crash leaves
+a project that finishes renaming, never one that is half-renamed. Two namespaces both present, or a
+malformed intent, are refused by name instead of guessed at.
+
+`--repo-id` is an identity override, not a remote check. `origin` may already point at the renamed
+repository, may still use the old path, or may be absent; cowshed does not inspect or rewrite it.
 
 ### `cowshed new <name> [--ref <rev> | --from <workspace>] [--browse] [--slot <n>]`
 

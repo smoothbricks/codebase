@@ -19,7 +19,7 @@ use cowshed_core::metadata::{
     PortBlock, PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,
     WorkspaceRole, sidecar_path,
 };
-use cowshed_core::repository::RepoId;
+use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::apfs::native::{
     KernelMountSnapshot, KernelMountSource, MacOsApfsExecutionHost, RecoveryMarkerSource,
     RestoreFailpoint, SystemKernelMountSource,
@@ -826,7 +826,7 @@ fn marker_validation_checks_every_detached_identity_dimension() {
     let private_key = fixture.root.join("marker.ca.key");
     mint_credentials(&workspace, &mount, &private_key).expect("workspace credentials");
     let expected = MarkerExpectation {
-        repo: workspace.repo().clone(),
+        repos: OwnedRepoIds::sole(workspace.repo().clone()),
         workspace: workspace.name().clone(),
         incarnation: workspace.incarnation().clone(),
         format: workspace.format(),
@@ -836,7 +836,7 @@ fn marker_validation_checks_every_detached_identity_dimension() {
 
     let mismatches = [
         MarkerExpectation {
-            repo: RepoId::parse("other/widget").expect("repo"),
+            repos: OwnedRepoIds::sole(RepoId::parse("other/widget").expect("repo")),
             ..expected.clone()
         },
         MarkerExpectation {

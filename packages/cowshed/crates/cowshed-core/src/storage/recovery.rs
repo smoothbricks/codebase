@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::api::dto::{AdoptOptions, CreateOptions, RemoveOptions, RemoveReport};
 use crate::error::{CowshedError, Result as CowshedResult};
 use crate::metadata::{MetadataError, WorkspaceIncarnation, WorkspaceName, read_json, write_json};
-
+use crate::repository::RepoId;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const CHECKPOINT_NAMESPACE: &str = ".checkpoints";
 pub const STAGING_NAMESPACE: &str = ".staging";
@@ -258,6 +258,138 @@ impl LifecycleIntentJournal {
         }
         Ok(())
     }
+}
+
+/// Store-root intent for the one operation whose project directory changes name.
+///
+/// It lives at the store root rather than in `lifecycle-intents.json` because that journal moves
+/// with the project directory this operation renames, and because the disagreement it describes —
+/// a project directory and the identity in its binding naming different things — is store-wide
+/// evidence that any reader of the store may need.
+///
+/// There is at most one at a time: an identity change holds the project actor exclusively, and a
+/// second one cannot start while a first is unfinished because the first thing every open does is
+/// finish it.
+pub const REPO_IDENTITY_INTENT_FILE: &str = ".cowshed-repo-id-intent.json";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryIdentityIntent {
+    pub old_repo_id: RepoId,
+    pub new_repo_id: RepoId,
+    /// The project's checkout, needed only to repoint its symlink under `CheckoutLayout::Symlink`.
+    /// Recovery never gates on it: an unfinished identity change is store-wide damage, so it is
+    /// completed by whichever open notices it first, not only by the renamed project's own.
+    pub checkout_path: PathBuf,
+    pub old_project_root: PathBuf,
+    pub new_project_root: PathBuf,
+    pub old_mount_root: PathBuf,
+    pub new_mount_root: PathBuf,
+    /// `Prepared` means nothing durable has been touched and the record may be discarded.
+    /// `Mutating` is the mutation fence: it is written only once every volume is unmounted and the
+    /// next act is a directory rename, so recovery from it is always forward.
+    #[serde(default)]
+    pub phase: LifecycleIntentPhase,
+}
+
+impl RepositoryIdentityIntent {
+    /// Refuse anything that is not a well-formed identity change of this store.
+    ///
+    /// A malformed or truncated record is refused rather than skipped: it is evidence that a
+    /// transaction was interrupted, and silently ignoring it would leave the store half-renamed
+    /// with nothing left to say so. The four store paths must be inside the store, so a record
+    /// naming somewhere else can never make recovery rename a directory outside cowshed.
+    pub fn validate(&self, store_root: &Path) -> CowshedResult<()> {
+        let paths = [
+            ("checkout", &self.checkout_path, false),
+            ("old project", &self.old_project_root, true),
+            ("new project", &self.new_project_root, true),
+            ("old mount", &self.old_mount_root, true),
+            ("new mount", &self.new_mount_root, true),
+        ];
+        for (name, path, inside_store) in paths {
+            if !path.is_absolute() {
+                return Err(malformed_identity_intent(format!(
+                    "repository identity intent has a relative {name} path {}",
+                    path.display()
+                )));
+            }
+            if inside_store && !path.starts_with(store_root) {
+                return Err(malformed_identity_intent(format!(
+                    "repository identity intent {name} path {} escapes store {}",
+                    path.display(),
+                    store_root.display()
+                )));
+            }
+        }
+        if self.old_repo_id == self.new_repo_id
+            || self.old_project_root == self.new_project_root
+            || self.old_mount_root == self.new_mount_root
+        {
+            return Err(malformed_identity_intent(
+                "repository identity intent does not describe a change".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn path(store_root: &Path) -> PathBuf {
+        store_root.join(REPO_IDENTITY_INTENT_FILE)
+    }
+
+    pub fn persist(&self, store_root: &Path) -> CowshedResult<()> {
+        self.validate(store_root)?;
+        let path = Self::path(store_root);
+        write_json(&path, self).map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot persist repository identity intent {}: {error}",
+                    path.display()
+                ),
+                "repair cowshed storage and retry `cowshed mv main --repo-id`",
+            )
+        })
+    }
+
+    pub fn load(store_root: &Path) -> CowshedResult<Option<Self>> {
+        let path = Self::path(store_root);
+        match read_json::<Self>(&path) {
+            Ok(intent) => {
+                intent.validate(store_root)?;
+                Ok(Some(intent))
+            }
+            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(malformed_identity_intent(format!(
+                "cannot read repository identity intent {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    pub fn clear(store_root: &Path) -> CowshedResult<()> {
+        let path = Self::path(store_root);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CowshedError::environment_missing(
+                format!(
+                    "cannot clear repository identity intent {}: {error}",
+                    path.display()
+                ),
+                "repair cowshed storage and retry `cowshed mv main --repo-id`",
+            )),
+        }
+    }
+}
+
+fn malformed_identity_intent(message: String) -> CowshedError {
+    CowshedError::integrity(
+        message,
+        "inspect the identity intent with `cowshed doctor` before removing it — a project may be \
+         half-renamed",
+    )
 }
 
 /// The refusal a retained `Prepared` retirement produces when its target state cannot be read.

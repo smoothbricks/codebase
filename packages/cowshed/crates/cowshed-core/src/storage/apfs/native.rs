@@ -2734,13 +2734,13 @@ where
         let marker_path = mount_point.join(WORKSPACE_MARKER_PATH);
         let marker = WorkspaceMarker::read_from(&marker_path)
             .map_err(|error| ApfsStorageError::MarkerMismatch(error.to_string()))?;
-        if marker.repo_id == expected.repo
+        if expected.repos.accepts(&marker.repo_id)
             && marker.workspace == expected.workspace
             && marker.workspace_incarnation == expected.incarnation
             && marker.image_format == expected.format
         {
             validate_public_workspace_assets(
-                &marker.repo_id,
+                &expected.repos,
                 &marker.workspace,
                 &marker.workspace_incarnation,
                 mount_point,
@@ -2750,7 +2750,7 @@ where
             Err(ApfsStorageError::MarkerMismatch(format!(
                 "{} does not match {}/{}/{:?}",
                 marker_path.display(),
-                expected.repo,
+                expected.repos,
                 expected.workspace,
                 expected.format
             )))
@@ -2970,7 +2970,10 @@ where
             .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
             .map_err(ApfsStorageError::from)
             .and_then(|()| {
-                self.validate_marker(mount_point, &MarkerExpectation::from_workspace(workspace))
+                self.validate_marker(
+                    mount_point,
+                    &MarkerExpectation::owned(&self.config, workspace),
+                )
             })
         {
             return Err(self.abandon_resized_attachment(attachment, primary));

@@ -1,5 +1,6 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
+use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
@@ -212,6 +213,7 @@ pub struct MoveArgs {
 pub enum MoveDestination {
     Workspace(String),
     Checkout(PathBuf),
+    RepoId(RepoId),
 }
 
 impl std::fmt::Display for MoveDestination {
@@ -219,6 +221,7 @@ impl std::fmt::Display for MoveDestination {
         match self {
             Self::Workspace(name) => formatter.write_str(name),
             Self::Checkout(path) => write!(formatter, "{}", path.display()),
+            Self::RepoId(repo_id) => write!(formatter, "{repo_id}"),
         }
     }
 }
@@ -569,7 +572,8 @@ fn cli_command() -> ClapCommand {
         .subcommand(
             leaf("mv")
                 .arg(positional("src", 0..=1))
-                .arg(positional("dst", 0..=1)),
+                .arg(positional("dst", 0..=1))
+                .arg(value("repo-id")),
         )
         .subcommand(
             leaf("checkpoint")
@@ -1344,24 +1348,53 @@ fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const MOVE: CommandSpec = CommandSpec {
     name: "mv",
-    args: "<ws> <new-name> | main <new-checkout-path>",
+    args: "<ws> <new-name> | main <path>",
     trailing: "",
-    summary: "rename a workspace or move the checkout",
+    summary: "rename a workspace, move/re-identify main",
     about: &[
-        "The source decides what the destination means. `mv main <path>` moves the adopted checkout to an absolute path and keeps every record of where it lives in step; every other source renames a workspace, whose new name is subject to the ordinary name grammar and cannot be `main`.",
+        "The source decides what the destination means. `mv main <path>` moves the adopted checkout to an absolute path and keeps every record of where it lives in step; `mv main --repo-id <owner/repo>` changes the adopted identity without consulting or changing Git remotes. Every other source renames a workspace, whose new name is subject to the ordinary name grammar and cannot be `main`.",
     ],
-    options: &[],
+    options: &[Opt {
+        spelling: "--repo-id <owner/repo>",
+        meaning: "`main` only: replace the adopted repository identity in all cowshed records",
+    }],
 };
 
 fn parse_move(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &MOVE;
     let source = require_workspace(matches, "src", false, USAGE, "mv requires a workspace")?;
-    let destination =
-        os(matches, "dst").ok_or_else(|| UsageError::new("mv requires a destination", USAGE))?;
-    let destination = if source == "main" {
-        MoveDestination::Checkout(checkout_destination(&destination, USAGE)?)
-    } else {
-        MoveDestination::Workspace(workspace_name(&destination, true, USAGE)?)
+    let repo_id = os(matches, "repo-id");
+    let destination = os(matches, "dst");
+    let destination = match (source.as_str(), repo_id, destination) {
+        ("main", Some(repo_id), None) => {
+            let value = repo_id
+                .to_str()
+                .ok_or_else(|| UsageError::new("--repo-id requires a UTF-8 owner/repo", USAGE))?;
+            MoveDestination::RepoId(RepoId::parse(value).map_err(|error| {
+                UsageError::new(format!("invalid --repo-id `{value}`: {error}"), USAGE)
+            })?)
+        }
+        ("main", Some(_), Some(_)) => {
+            return Err(UsageError::new(
+                "`main --repo-id` cannot also name a checkout destination",
+                USAGE,
+            ));
+        }
+        (_, Some(_), _) => {
+            return Err(UsageError::new(
+                "--repo-id is only valid when the source workspace is `main`",
+                USAGE,
+            ));
+        }
+        ("main", None, Some(destination)) => {
+            MoveDestination::Checkout(checkout_destination(&destination, USAGE)?)
+        }
+        (_, None, Some(destination)) => {
+            MoveDestination::Workspace(workspace_name(&destination, true, USAGE)?)
+        }
+        (_, None, None) => {
+            return Err(UsageError::new("mv requires a destination", USAGE));
+        }
     };
     Ok(Command::Move(MoveArgs {
         source,
@@ -2592,6 +2625,29 @@ mod tests {
         assert_eq!(
             args.destination,
             MoveDestination::Checkout(PathBuf::from("/Users/dev/moved"))
+        );
+        let Command::Move(args) = parse_args(["mv", "main", "--repo-id", "acme/renamed"])
+            .expect("identity move")
+            .command
+        else {
+            panic!("mv main --repo-id parses as an identity move");
+        };
+        assert_eq!(args.source, "main");
+        assert_eq!(
+            args.destination,
+            MoveDestination::RepoId(RepoId::parse("acme/renamed").expect("repo identity"))
+        );
+        assert!(parse_args(["mv", "main", "--repo-id", "not-valid"]).is_err());
+        assert!(parse_args(["mv", "raven", "--repo-id", "acme/renamed"]).is_err());
+        assert!(
+            parse_args([
+                "mv",
+                "main",
+                "/Users/dev/moved",
+                "--repo-id",
+                "acme/renamed"
+            ])
+            .is_err()
         );
 
         // A path where a workspace name belongs, and a workspace name where a path belongs, are
