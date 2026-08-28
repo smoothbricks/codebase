@@ -7,6 +7,19 @@ permittedInsecurePackages:
 inputs:
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
+  # Go for devenv.smoo.nix, pinned to the patch release ttsc vendors inside its
+  # native package (0.28.3 -> go1.26.7); `smoo monorepo check` fails when the two
+  # disagree. Our curated channel above cannot supply it — rolling is at 1.26.5
+  # and its go_1_27 is a release candidate — so this is one leaf package from a
+  # nixpkgs that has it, the same idiom as the dedicated sccache source.
+  #
+  # An exact revision rather than the nixpkgs-unstable branch, deliberately: the
+  # whole point of this input is to name ONE Go version, so a `devenv update` must
+  # not be able to slide it out from under the vendored SDK it is matched to. It
+  # moves when someone bumps ttsc and the check says it has to.
+  nixpkgs-go:
+    url: github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410
+    flake: true
   nixpkgs-overlay:
     url: path:../../tooling/direnv/nixpkgs-overlay
     flake: true
