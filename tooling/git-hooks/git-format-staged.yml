@@ -53,12 +53,10 @@ formatters:
       - '!*.rs'
       # Exclude files handled by gofmt
       - '!*.go'
-      # Prettier has no TOML parser; --ignore-unknown otherwise emits an empty file.
       - '!*.toml'
       # Bun lockfiles are generated and should not be rewritten by Prettier
       - '!bun.lock'
-      # Binary artifacts: Prettier reads them as UTF-8 and can corrupt them
-      # by replacing invalid byte sequences.
+      # Binary artifacts: not text, nothing for Prettier to do.
       - '!*.wasm'
       - '!*.wasm.sha256'
 
