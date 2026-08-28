@@ -56,8 +56,11 @@ whose `flushReason` is one of `capacity`, `time`, `memory`, `idle`, or `manual`.
 
 `initTraceTestRun(opContext, options)` accepts:
 
-- `sqlite` — write results to a database. On Node/bun, `{ dbPath: '.trace-results.db' }`; on vitest, also pass
-  `createDatabase: createNodeSQLiteDatabase`.
+- `sqlite` — write results to a database. On Node/bun, `{ dbPath: DEFAULT_TRACE_DB_PATH }`; on vitest, also pass
+  `createDatabase: createNodeSQLiteDatabase`. `DEFAULT_TRACE_DB_PATH` is exported by every testing entry point and
+  resolves to `.cache/trace-results.db`, a directory project walkers and file watchers skip. Point `dbPath` somewhere
+  else only if that location is skipped too — a SQLite database keeps journal sidecars beside itself, and a watched
+  directory whose membership moves mid-build invalidates the build.
 - `verbose` — extra logging.
 
 See [Set up trace-testing](/guides/set-up-trace-testing/).

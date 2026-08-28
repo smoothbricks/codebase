@@ -42,10 +42,10 @@ This tutorial uses `bun:test`. A `vitest` setup is nearly identical; see the not
    // test-trace-setup.ts
    import * as bunTest from 'bun:test';
    import { mock } from 'bun:test';
-   import { createBunTestMock, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
+   import { createBunTestMock, DEFAULT_TRACE_DB_PATH, initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
    import { opContext } from './src/op-context.js';
 
-   initTraceTestRun(opContext, { sqlite: { dbPath: '.trace-results.db' } });
+   initTraceTestRun(opContext, { sqlite: { dbPath: DEFAULT_TRACE_DB_PATH } });
    mock.module('bun:test', () => createBunTestMock(bunTest));
    ```
 
