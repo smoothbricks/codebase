@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { appendFile, mkdtemp, realpath, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { $ } from 'bun';
 import typia from 'typia';
 import { parseStringArrayText } from '../lib/json.js';
@@ -267,6 +268,16 @@ export function expandNxTargetRuns(projects: ProjectTargets[], options: NxRunMan
   return { runs, unmatchedGlobs };
 }
 
+/**
+ * Outputs a collection tree owns: the selected targets plus their dependency
+ * closure, minus platform-suffixed dependencies.
+ *
+ * A platform artifact belongs to the step that selects its platform target, so
+ * the same file never lands in two collected trees (`apply-outputs` rejects
+ * that, and would have to trust two producers of one path). The aggregate
+ * `build` reaches host-platform targets because the runner happens to be that
+ * platform - an accident of scheduling, not release-artifact ownership.
+ */
 export function expandNxTargetDependencyRuns(runs: NxTargetRun[]): NxTargetRun[] {
   const expanded: NxTargetRun[] = [];
   const added = new Set<string>();
@@ -290,7 +301,9 @@ export function expandNxTargetDependencyRuns(runs: NxTargetRun[]): NxTargetRun[]
         : project.targets.includes(dependency)
           ? [dependency]
           : [];
-      for (const dependencyTarget of dependencyTargets.sort((left, right) => left.localeCompare(right))) {
+      for (const dependencyTarget of dependencyTargets
+        .filter((candidate) => !isPlatformTargetName(candidate))
+        .sort((left, right) => left.localeCompare(right))) {
         visit(project, dependencyTarget);
       }
     }
@@ -374,6 +387,10 @@ async function loadOutputBoundary() {
 
 function isGlobPattern(value: string): boolean {
   return /[*?{[]/.test(value);
+}
+
+function isPlatformTargetName(target: string): boolean {
+  return PLATFORM_TARGET_GLOBS.some((glob) => target.endsWith(glob.slice(1)));
 }
 
 function selectProjects(projects: ProjectTargets[], selectors: string | undefined): ProjectTargets[] {
