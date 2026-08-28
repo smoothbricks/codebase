@@ -137,16 +137,16 @@ async fn counted(
         .await
         .map_err(|error| error.message)?;
     let landed = workspace
-        .patch_equivalent_count(tip, head)
+        .commits_already_held(tip, head)
         .await
         .map_err(|error| error.message)?;
     // `landed` counts a subset of the same range `ahead` counts, so this cannot underflow unless
-    // git's own two answers disagree. If they ever do, say so rather than wrap into a huge
-    // `unlanded` or a zero one — the second would authorize a deletion.
+    // git's own answers disagree with each other. If they ever do, say so rather than wrap into a
+    // huge `unlanded` or a zero one — the second would authorize a deletion.
     let unlanded = ahead.checked_sub(landed).ok_or_else(|| {
         format!(
-            "git reported {landed} patch-equivalent commits in a range of {ahead}: refusing to \
-             guess which is right"
+            "git reported {landed} already-held commits in a range of {ahead}: refusing to guess \
+             which is right"
         )
     })?;
     Ok(LandingCommits::Measured {
