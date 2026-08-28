@@ -103,6 +103,9 @@ const WORKTREE_STAGING: &str = ".cowshed/worktree-staging";
 
 const WORKSPACE_ENVIRONMENT_MARKER: &[u8] = b"# cowshed: workspace environment";
 const WORKSPACE_ENVIRONMENT_SOURCE: &[u8] = b"source_env_if_present .cowshed/env";
+const LOCAL_ENVIRONMENT_LOADER: &[u8] = b"source_env_if_exists \"$local_override\"";
+const LOCAL_WORKSPACE_ENVIRONMENT_SOURCE: &[u8] =
+    b"source_env_if_present \"${local_override%/*}/.cowshed/env\"";
 
 /// The name of the remote main registers for a workspace under `--register`.
 pub fn workspace_remote_name(workspace: &str) -> String {
@@ -123,6 +126,196 @@ pub struct GitRepository {
     /// A fetch is also no use as a fallback: if main's object store cannot be read then its objects
     /// cannot be obtained by any route, so the honest answer is still "cannot determine".
     alternate_objects: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct WorkspaceEnvironmentHook {
+    path: PathBuf,
+    relative: PathBuf,
+    exists: bool,
+}
+
+/// Resolve a repository-owned hook without replacing a relocatable link or writing outside its tree.
+fn workspace_environment_hook(root: &Path) -> Result<WorkspaceEnvironmentHook> {
+    let hook = root.join(".envrc");
+    let metadata = match fs::symlink_metadata(&hook) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceEnvironmentHook {
+                path: hook,
+                relative: PathBuf::from(".envrc"),
+                exists: false,
+            });
+        }
+        Err(error) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "cannot inspect workspace environment hook {}: {error}",
+                    hook.display()
+                ),
+                "repair the repository .envrc and retry",
+            ));
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(WorkspaceEnvironmentHook {
+            path: hook,
+            relative: PathBuf::from(".envrc"),
+            exists: true,
+        });
+    }
+
+    let link_target = fs::read_link(&hook).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot read workspace environment hook {}: {error}",
+                hook.display()
+            ),
+            "repair the repository .envrc and retry",
+        )
+    })?;
+    if link_target.is_absolute() {
+        return Err(CowshedError::integrity(
+            format!(
+                "workspace environment hook {} has a non-relocatable absolute target {}",
+                hook.display(),
+                link_target.display()
+            ),
+            "replace .envrc with a relative symlink to a file inside the repository",
+        ));
+    }
+
+    let staged_root = fs::canonicalize(root).map_err(|error| {
+        CowshedError::integrity(
+            format!("cannot resolve workspace root {}: {error}", root.display()),
+            "repair the repository directory and retry",
+        )
+    })?;
+    let resolved = fs::canonicalize(&hook).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot resolve workspace environment hook {}: {error}",
+                hook.display()
+            ),
+            "repair the repository .envrc and retry",
+        )
+    })?;
+    let Ok(relative) = resolved.strip_prefix(&staged_root) else {
+        return Err(CowshedError::integrity(
+            format!(
+                "workspace environment hook {} resolves outside workspace {} to {}",
+                hook.display(),
+                root.display(),
+                resolved.display()
+            ),
+            "replace .envrc with a regular file or a symlink to a file inside the repository",
+        ));
+    };
+    let relative = relative.to_owned();
+    Ok(WorkspaceEnvironmentHook {
+        path: resolved,
+        relative,
+        exists: true,
+    })
+}
+
+fn environment_hook_contains(bytes: &[u8], line: &[u8]) -> bool {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .any(|candidate| candidate == line)
+}
+
+fn read_environment_hook(path: &Path) -> Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "cannot open workspace environment hook {}: {error}",
+                    path.display()
+                ),
+                "repair the repository environment hook and retry",
+            )
+        })?;
+    let mut existing = Vec::new();
+    file.read_to_end(&mut existing).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot read workspace environment hook {}: {error}",
+                path.display()
+            ),
+            "repair the repository environment hook and retry",
+        )
+    })?;
+    Ok(existing)
+}
+
+fn append_environment_hook(root: &Path, path: &Path, source: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "cannot open workspace environment hook {}: {error}",
+                    path.display()
+                ),
+                "repair the repository environment hook and retry",
+            )
+        })?;
+    let mut existing = Vec::new();
+    file.read_to_end(&mut existing).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot read workspace environment hook {}: {error}",
+                path.display()
+            ),
+            "repair the repository environment hook and retry",
+        )
+    })?;
+    if environment_hook_contains(&existing, source) {
+        return Ok(());
+    }
+
+    let mut addition = Vec::with_capacity(WORKSPACE_ENVIRONMENT_MARKER.len() + source.len() + 3);
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        addition.push(b'\n');
+    }
+    addition.extend_from_slice(WORKSPACE_ENVIRONMENT_MARKER);
+    addition.push(b'\n');
+    addition.extend_from_slice(source);
+    addition.push(b'\n');
+    file.write_all(&addition).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot update workspace environment hook {}: {error}",
+                path.display()
+            ),
+            "repair the repository environment hook and retry",
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "cannot sync workspace environment hook {}: {error}",
+                path.display()
+            ),
+            "repair the repository environment hook and retry",
+        )
+    })?;
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot sync workspace root {}: {error}", root.display()),
+                "repair the repository directory and retry",
+            )
+        })
 }
 
 impl GitRepository {
@@ -381,88 +574,117 @@ impl GitRepository {
         .map_err(|error| CowshedError::internal(format!("Git exclude task failed: {error}")))?
     }
 
+    async fn path_is_tracked(&self, path: &Path) -> Result<bool> {
+        let args = [
+            OsStr::new("ls-files"),
+            OsStr::new("--error-unmatch"),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ];
+        let output = self.run(args).await?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(git_internal("inspect tracked environment hook", &output)),
+        }
+    }
+
+    async fn path_is_ignored(&self, path: &Path) -> Result<bool> {
+        let args = [
+            OsStr::new("check-ignore"),
+            OsStr::new("--quiet"),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ];
+        let output = self.run(args).await?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(git_internal("inspect ignored environment hook", &output)),
+        }
+    }
+
     /// Add the one repository-visible hook that loads cowshed's in-image environment.
     ///
-    /// Existing bytes are never rewritten: an owned marker and source line are appended only
-    /// when the exact source line is absent, so tracked and untracked project configuration are
-    /// treated identically and repeated publication is a no-op.
+    /// A tracked hook is immutable workspace input. When it exposes the repository's ignored local
+    /// override, cowshed writes there instead; otherwise publication fails rather than making every
+    /// new workspace dirty. Untracked hooks retain the direct append behavior.
     pub async fn ensure_workspace_environment_wiring(&self) -> Result<()> {
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || {
-            let envrc = root.join(".envrc");
-            let mut file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .create(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&envrc)
-                .map_err(|error| {
-                    CowshedError::integrity(
-                        format!(
-                            "cannot open workspace environment hook {}: {error}",
-                            envrc.display()
-                        ),
-                        "restore the repository .envrc as a regular file and retry",
-                    )
-                })?;
-            let mut existing = Vec::new();
-            file.read_to_end(&mut existing).map_err(|error| {
-                CowshedError::integrity(
-                    format!(
-                        "cannot read workspace environment hook {}: {error}",
-                        envrc.display()
-                    ),
-                    "repair the repository .envrc and retry",
-                )
-            })?;
-            if existing
-                .split(|byte| *byte == b'\n')
-                .any(|line| line == WORKSPACE_ENVIRONMENT_SOURCE)
-            {
-                return Ok(());
-            }
-
-            let mut addition = Vec::with_capacity(
-                WORKSPACE_ENVIRONMENT_MARKER.len() + WORKSPACE_ENVIRONMENT_SOURCE.len() + 3,
-            );
-            if !existing.is_empty() && !existing.ends_with(b"\n") {
-                addition.push(b'\n');
-            }
-            addition.extend_from_slice(WORKSPACE_ENVIRONMENT_MARKER);
-            addition.push(b'\n');
-            addition.extend_from_slice(WORKSPACE_ENVIRONMENT_SOURCE);
-            addition.push(b'\n');
-            file.write_all(&addition).map_err(|error| {
-                CowshedError::integrity(
-                    format!(
-                        "cannot update workspace environment hook {}: {error}",
-                        envrc.display()
-                    ),
-                    "repair the repository .envrc and retry",
-                )
-            })?;
-            file.sync_all().map_err(|error| {
-                CowshedError::integrity(
-                    format!(
-                        "cannot sync workspace environment hook {}: {error}",
-                        envrc.display()
-                    ),
-                    "repair the repository .envrc and retry",
-                )
-            })?;
-            File::open(&root)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| {
-                    CowshedError::integrity(
-                        format!("cannot sync workspace root {}: {error}", root.display()),
-                        "repair the repository directory and retry",
-                    )
-                })
+        let (hook, existing) = tokio::task::spawn_blocking(move || {
+            let hook = workspace_environment_hook(&root)?;
+            let existing = if hook.exists {
+                read_environment_hook(&hook.path)?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, CowshedError>((hook, existing))
         })
         .await
         .map_err(|error| {
-            CowshedError::internal(format!("workspace environment wiring task failed: {error}"))
-        })?
+            CowshedError::internal(format!(
+                "workspace environment inspection task failed: {error}"
+            ))
+        })??;
+        if environment_hook_contains(&existing, WORKSPACE_ENVIRONMENT_SOURCE) {
+            return Ok(());
+        }
+
+        let tracked = self.path_is_tracked(&hook.relative).await?;
+        let (path, source) = if tracked {
+            if !environment_hook_contains(&existing, LOCAL_ENVIRONMENT_LOADER) {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "tracked workspace environment hook {} has no local override loader",
+                        hook.relative.display()
+                    ),
+                    "add an ignored local environment hook before creating a workspace",
+                ));
+            }
+            let local_relative = Path::new(".envrc-local");
+            let local_path = self.root.join(local_relative);
+            if self.path_is_tracked(local_relative).await? {
+                let local_path_for_read = local_path.clone();
+                let local_existing = tokio::task::spawn_blocking(move || {
+                    read_environment_hook(&local_path_for_read)
+                })
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!(
+                        "workspace local environment inspection task failed: {error}"
+                    ))
+                })??;
+                if environment_hook_contains(&local_existing, LOCAL_WORKSPACE_ENVIRONMENT_SOURCE) {
+                    return Ok(());
+                }
+                return Err(CowshedError::integrity(
+                    "tracked .envrc-local does not load the cowshed workspace environment",
+                    "make .envrc-local untracked and ignored before creating a workspace",
+                ));
+            }
+            if !self.path_is_ignored(local_relative).await? {
+                return Err(CowshedError::integrity(
+                    "repository .envrc-local is not ignored",
+                    "add .envrc-local to the repository ignore rules before creating a workspace",
+                ));
+            }
+            (local_path, LOCAL_WORKSPACE_ENVIRONMENT_SOURCE)
+        } else {
+            if !hook.exists && !self.path_is_ignored(&hook.relative).await? {
+                return Err(CowshedError::integrity(
+                    "creating .envrc would make the new workspace dirty",
+                    "track a workspace environment hook or ignore .envrc before creating a workspace",
+                ));
+            }
+            (hook.path, WORKSPACE_ENVIRONMENT_SOURCE)
+        };
+
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || append_environment_hook(&root, &path, source))
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("workspace environment wiring task failed: {error}"))
+            })?
     }
 
     /// Resolve `revision` to the commit object this repository actually holds for it.
@@ -1796,6 +2018,7 @@ mod tests {
     async fn workspace_environment_wiring_creates_an_absent_envrc() {
         let root = repository();
         let envrc = root.join(".envrc");
+        fs::write(root.join(".git/info/exclude"), ".envrc\n").expect("ignore owned envrc");
 
         GitRepository::from_root(&root)
             .ensure_workspace_environment_wiring()
@@ -1829,6 +2052,98 @@ mod tests {
             fs::read(&envrc).expect("read envrc"),
             b"use flake\n# project-owned tail\n# cowshed: workspace environment\nsource_env_if_present .cowshed/env\n"
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn workspace_environment_wiring_preserves_an_in_tree_relative_symlink() {
+        let root = repository();
+        fs::write(root.join(".gitignore"), ".envrc-local\n").expect("ignore local envrc");
+        let managed = root.join("managed");
+        fs::create_dir(&managed).expect("create managed directory");
+        let target = managed.join("envrc");
+        let managed_contents = concat!(
+            "local_override=\"$PWD/.envrc-local\"\n",
+            "source_env_if_exists \"$local_override\"\n",
+        );
+        fs::write(&target, managed_contents).expect("seed managed envrc");
+        let envrc = root.join(".envrc");
+        std::os::unix::fs::symlink("managed/envrc", &envrc).expect("link envrc");
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "managed environment hook",
+            ],
+        );
+        let resolved_before = fs::canonicalize(&envrc).expect("resolve envrc before wiring");
+        let repository = GitRepository::from_root(&root);
+
+        repository
+            .ensure_workspace_environment_wiring()
+            .await
+            .expect("wire environment through relative symlink");
+        repository
+            .ensure_workspace_environment_wiring()
+            .await
+            .expect("wiring is idempotent");
+
+        assert_eq!(
+            fs::read_link(&envrc).expect("read envrc link"),
+            Path::new("managed/envrc"),
+            "the repository-relative link is preserved verbatim"
+        );
+        assert_eq!(
+            fs::canonicalize(&envrc).expect("resolve envrc after wiring"),
+            resolved_before,
+            "the staged link still names the same in-tree file"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read managed envrc"),
+            managed_contents.as_bytes(),
+            "tracked hook content remains unchanged"
+        );
+        assert_eq!(
+            fs::read(root.join(".envrc-local")).expect("read local envrc"),
+            b"# cowshed: workspace environment\nsource_env_if_present \"${local_override%/*}/.cowshed/env\"\n"
+        );
+        assert_eq!(
+            git_stdout(&root, &["status", "--porcelain"]),
+            "",
+            "wiring leaves the new workspace clean"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn workspace_environment_wiring_rejects_a_symlink_outside_the_tree() {
+        let root = repository();
+        let outside = root.with_extension("outside-envrc");
+        fs::write(&outside, b"outside\n").expect("seed outside envrc");
+        let target = Path::new("..").join(outside.file_name().expect("outside file name"));
+        std::os::unix::fs::symlink(target, root.join(".envrc")).expect("link outside envrc");
+
+        let error = GitRepository::from_root(&root)
+            .ensure_workspace_environment_wiring()
+            .await
+            .expect_err("outside symlink must be rejected");
+
+        assert!(
+            error.message.contains("resolves outside workspace"),
+            "{error:?}"
+        );
+        assert_eq!(
+            fs::read(&outside).expect("read outside envrc"),
+            b"outside\n",
+            "the external target is never modified"
+        );
+        fs::remove_file(outside).expect("remove outside envrc");
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
