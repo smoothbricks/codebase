@@ -15,6 +15,20 @@ use crate::api::dto::{
     OutputPublication, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
 };
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod unsupported;
+
+#[cfg(target_os = "linux")]
+use linux::{rename_noreplace, try_fast_clone};
+#[cfg(target_os = "macos")]
+use macos::{rename_noreplace, try_fast_clone};
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use unsupported::{rename_noreplace, try_fast_clone};
+
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const PROTECTED_DIRECTORY: &[u8] = b".cowshed";
 static NONCE: AtomicU64 = AtomicU64::new(1);
@@ -233,89 +247,8 @@ impl Parent {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    #[cfg(target_os = "macos")]
     fn try_fast_clone(&mut self, source: &File) -> Result<Option<File>, ArtifactError> {
-        let result = unsafe {
-            libc::fclonefileat(
-                source.as_raw_fd(),
-                self.directory.as_raw_fd(),
-                self.temporary_leaf.as_ptr(),
-                0,
-            )
-        };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error().is_some_and(|code| {
-                code == libc::EXDEV
-                    || code == libc::ENOTSUP
-                    || code == libc::EACCES
-                    || code == libc::EPERM
-            }) {
-                return Ok(None);
-            }
-            return Err(publication_error(
-                &self.temporary_path(),
-                PublicationStage::Clone,
-                error,
-            ));
-        }
-        self.temporary_exists = true;
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                self.temporary_leaf.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(publication_error(
-                &self.temporary_path(),
-                PublicationStage::Clone,
-                io::Error::last_os_error(),
-            ));
-        }
-        if unsafe { libc::fchmod(fd, 0o600) } != 0 {
-            let error = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(publication_error(
-                &self.temporary_path(),
-                PublicationStage::Clone,
-                error,
-            ));
-        }
-        Ok(Some(unsafe { File::from_raw_fd(fd) }))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn try_fast_clone(&mut self, source: &File) -> Result<Option<File>, ArtifactError> {
-        const FICLONE: libc::c_ulong = 0x4004_9409;
-        let file = self.create_temporary()?;
-        if unsafe { libc::ioctl(file.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
-            return Ok(Some(file));
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error().is_some_and(|code| {
-            code == libc::EXDEV
-                || code == libc::EOPNOTSUPP
-                || code == libc::ENOTTY
-                || code == libc::EINVAL
-        }) {
-            drop(file);
-            self.cleanup_temporary().map_err(|cleanup| {
-                publication_error(&self.temporary_path(), PublicationStage::Cleanup, cleanup)
-            })?;
-            return Ok(None);
-        }
-        Err(publication_error(
-            &self.temporary_path(),
-            PublicationStage::Clone,
-            error,
-        ))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    fn try_fast_clone(&mut self, _source: &File) -> Result<Option<File>, ArtifactError> {
-        Ok(None)
+        try_fast_clone(self, source)
     }
 
     fn cleanup_temporary(&mut self) -> io::Result<()> {
@@ -550,55 +483,6 @@ fn publish_relative(
         ));
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn rename_noreplace(
-    directory_fd: libc::c_int,
-    temporary: &CStr,
-    destination: &CStr,
-) -> Result<libc::c_int, ArtifactError> {
-    Ok(unsafe {
-        libc::renameatx_np(
-            directory_fd,
-            temporary.as_ptr(),
-            directory_fd,
-            destination.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn rename_noreplace(
-    directory_fd: libc::c_int,
-    temporary: &CStr,
-    destination: &CStr,
-) -> Result<libc::c_int, ArtifactError> {
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-    Ok(unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            directory_fd,
-            temporary.as_ptr(),
-            directory_fd,
-            destination.as_ptr(),
-            RENAME_NOREPLACE,
-        ) as libc::c_int
-    })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn rename_noreplace(
-    _directory_fd: libc::c_int,
-    _temporary: &CStr,
-    destination: &CStr,
-) -> Result<libc::c_int, ArtifactError> {
-    Err(publication_error(
-        Path::new(destination.to_string_lossy().as_ref()),
-        PublicationStage::Publish,
-        "atomic create-new publication is unsupported on this platform",
-    ))
 }
 
 #[cfg(test)]

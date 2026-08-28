@@ -37,6 +37,20 @@ use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 use crate::storage::job_artifact::controller_commitments_to_batch;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod unsupported;
+
+#[cfg(target_os = "linux")]
+use linux::rename_noreplace;
+#[cfg(target_os = "macos")]
+use macos::rename_noreplace;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use unsupported::rename_noreplace;
+
 const SEGMENT_PREFIX: &str = "commitment-";
 
 /// One controller act, before the sink assigns it a writer-local order.
@@ -581,52 +595,6 @@ fn create_new_file_at(directory: &File, name: &CStr) -> Result<File, AuditSinkEr
     } else {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
-}
-
-#[cfg(target_os = "macos")]
-fn rename_noreplace(directory: RawFd, temporary: &CStr, sealed: &CStr) -> io::Result<()> {
-    let result = unsafe {
-        libc::renameatx_np(
-            directory,
-            temporary.as_ptr(),
-            directory,
-            sealed.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn rename_noreplace(directory: RawFd, temporary: &CStr, sealed: &CStr) -> io::Result<()> {
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            directory,
-            temporary.as_ptr(),
-            directory,
-            sealed.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn rename_noreplace(_directory: RawFd, _temporary: &CStr, _sealed: &CStr) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic create-new rename is unsupported",
-    ))
 }
 
 struct TemporaryCleanup {
