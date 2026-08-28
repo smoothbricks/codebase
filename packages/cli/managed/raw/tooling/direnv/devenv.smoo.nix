@@ -105,6 +105,7 @@
   packages = [
     (import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go
     pkgs.nodejs_26
+    pkgs.binaryen
   ];
 
   enterShell = lib.mkMerge [

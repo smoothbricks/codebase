@@ -22,7 +22,6 @@
     "dist/**/*.wasm"
   ],
   "scripts": {
-    "build:ts": "nx run columine:tsc-js",
     "test": "nx run columine:test --outputStyle=stream",
     "build:wasm": "nx run columine:cargo-wasm"
   },
