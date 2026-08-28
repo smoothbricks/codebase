@@ -576,38 +576,178 @@ impl GitRepository {
         self.count_range(&range).await
     }
 
-    /// Write a Git bundle of the commits `head` has and `exclude` does not.
+    /// Write and verify a self-contained bundle of `head` and the live target it was measured
+    /// against, returning the number of commits in that exact range.
     ///
-    /// The range form produces a *thin* bundle whose one prerequisite is `exclude`. That is the
-    /// right trade here: the bundle is written beside a workspace's retired image, and the
-    /// repository it would ever be restored into is main's, which contains `exclude` by
-    /// construction — a workspace image is a copy of main's, so its local `main` is an ancestor of
-    /// main's own. When there is no usable range (no such branch, or nothing ahead of it) the
-    /// bundle carries every ref instead, because a bundle that cannot stand alone is not a belt.
+    /// A target is included as a positive revision, never an exclusion. This deliberately makes
+    /// the bundle larger than a thin `target..head` bundle: both histories travel in the artifact,
+    /// so a rewritten target cannot leave recovery dependent on an orphaned clone-time snapshot.
+    /// Including both endpoints also lets recovery reconstruct and audit the same `target..head`
+    /// range that the removal report counted.
     ///
     /// `head` MUST be a ref spelling — `HEAD` or a branch — never a raw oid. `git bundle create`
-    /// names a bundle's contents after the refs in its rev range, so an oid tip yields a bundle
-    /// with no refs, which git rejects outright as empty.
+    /// names a bundle's fetchable tip after refs in its revision arguments, so a raw oid alone
+    /// produces a bundle with no advertised ref and git rejects it as empty.
     pub async fn bundle_commits(
         &self,
         destination: &Path,
-        exclude: Option<&str>,
+        target: Option<&str>,
         head: &str,
-    ) -> Result<()> {
-        let range = match self.usable_exclude(exclude).await? {
-            Some(exclude) if self.commits_ahead(Some(&exclude), head).await? > 0 => {
-                Some(format!("{exclude}..{head}"))
-            }
-            _ => None,
+    ) -> Result<u64> {
+        let head_commit = format!("{head}^{{commit}}");
+        let expected_head = self
+            .read_one(["rev-parse", head_commit.as_str()], "read bundle tip")
+            .await?;
+        let commit_count = match target {
+            Some(target) => self.commits_ahead_of(target, head).await?,
+            None => self.commits_ahead(None, head).await?,
         };
         let mut args = vec![
             OsString::from("bundle"),
             OsString::from("create"),
             destination.as_os_str().to_owned(),
+            OsString::from(head),
         ];
-        args.push(OsString::from(range.unwrap_or_else(|| "--all".to_owned())));
+        if let Some(target) = target {
+            args.push(OsString::from(target));
+        }
         let output = self.run(args).await?;
-        ensure_git_success("write commit bundle", output)
+        ensure_git_success("write commit bundle", output)?;
+        self.verify_bundle(destination, &expected_head, target, commit_count)
+            .await?;
+        Ok(commit_count)
+    }
+
+    /// Prove the artifact works in the environment its promise names: a repository with no
+    /// prerequisite objects. Verification alone is insufficient when run in the source repository,
+    /// because that repository can satisfy a thin bundle's prerequisites immediately before it is
+    /// destroyed. Fetching into a fresh bare repository proves both self-containment and that the
+    /// advertised tip resolves to the fenced commit.
+    async fn verify_bundle(
+        &self,
+        bundle: &Path,
+        expected_head: &str,
+        target: Option<&str>,
+        expected_count: u64,
+    ) -> Result<()> {
+        let parent = bundle.parent().ok_or_else(|| {
+            CowshedError::integrity(
+                format!(
+                    "abandonment bundle has no parent directory: {}",
+                    bundle.display()
+                ),
+                "repair the cowshed store and retry removal",
+            )
+        })?;
+        let scratch = parent.join(format!(".bundle-verify-{}", uuid::Uuid::new_v4().simple()));
+        tokio::fs::create_dir(&scratch).await.map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot create abandonment bundle verification repository {}: {error}",
+                    scratch.display()
+                ),
+                "repair the cowshed store and retry removal",
+            )
+        })?;
+
+        let verification = async {
+            let output = run_git_at(&scratch, ["init", "--bare", "."]).await?;
+            if !output.status.success() {
+                return Err(bundle_artifact_error(
+                    "initialize abandonment bundle verification repository",
+                    &output,
+                ));
+            }
+            let recovery = Self::from_root(&scratch);
+            let output = recovery
+                .run([
+                    OsStr::new("bundle"),
+                    OsStr::new("verify"),
+                    bundle.as_os_str(),
+                ])
+                .await?;
+            if !output.status.success() {
+                return Err(bundle_artifact_error(
+                    "verify abandonment bundle",
+                    &output,
+                ));
+            }
+            let output = recovery
+                .run([
+                    OsStr::new("fetch"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("--no-tags"),
+                    bundle.as_os_str(),
+                    OsStr::new("HEAD"),
+                ])
+                .await?;
+            if !output.status.success() {
+                return Err(bundle_artifact_error(
+                    "fetch abandonment bundle into an empty repository",
+                    &output,
+                ));
+            }
+            let recovered_head = recovery
+                .read_one(["rev-parse", "FETCH_HEAD^{commit}"], "read recovered bundle tip")
+                .await
+                .map_err(|error| {
+                    CowshedError::integrity(
+                        format!("abandonment bundle tip is not retrievable: {}", error.message),
+                        "inspect the bundle and cowshed store, then retry removal",
+                    )
+                })?;
+            if recovered_head != expected_head {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "abandonment bundle recovered tip {recovered_head}, expected {expected_head}"
+                    ),
+                    "inspect the bundle and cowshed store, then retry removal",
+                ));
+            }
+            let recovered_count = match target {
+                Some(target) => recovery.commits_ahead_of(target, "FETCH_HEAD").await,
+                None => recovery.commits_ahead(None, "FETCH_HEAD").await,
+            }
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!(
+                        "abandonment bundle cannot reconstruct its reported commit range: {}",
+                        error.message
+                    ),
+                    "inspect the bundle and cowshed store, then retry removal",
+                )
+            })?;
+            if recovered_count != expected_count {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "abandonment bundle recovered {recovered_count} commits, expected \
+                         {expected_count}"
+                    ),
+                    "inspect the bundle and cowshed store, then retry removal",
+                ));
+            }
+            Ok(())
+        }
+        .await;
+
+        let cleanup = tokio::fs::remove_dir_all(&scratch).await.map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot remove abandonment bundle verification repository {}: {error}",
+                    scratch.display()
+                ),
+                "repair the cowshed store and retry removal",
+            )
+        });
+        match (verification, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(primary), Err(cleanup)) => Err(CowshedError::integrity(
+                format!("{primary}; verification cleanup also failed: {cleanup}"),
+                "inspect the bundle and cowshed store, then retry removal",
+            )),
+        }
     }
 
     /// The `exclude` endpoint of a range, reduced to an oid this repository holds.
@@ -1522,6 +1662,13 @@ fn git_internal(operation: &str, output: &Output) -> CowshedError {
     CowshedError::internal(git_message(operation, output))
 }
 
+fn bundle_artifact_error(operation: &str, output: &Output) -> CowshedError {
+    CowshedError::integrity(
+        git_message(operation, output),
+        "inspect the bundle and cowshed store, then retry removal",
+    )
+}
+
 fn git_message(operation: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail = stderr.trim();
@@ -1583,7 +1730,7 @@ mod tests {
 
     use super::{
         CowshedUpstream, FALLBACK_MAIN_REMOTE, GIT, GitRepository, MAIN_REMOTE, MainRemote,
-        ensure_git_success, git_message, workspace_remote_name,
+        ensure_git_success, git_message, parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2511,45 +2658,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_unlanded_commits_restore_into_a_repository_holding_the_prerequisite() {
-        let root = repository();
-        let repo = GitRepository::from_root(&root);
-        let base = repo.head_oid().await.expect("read base");
-        git(&root, &["switch", "-qc", "cowshed/raven"]);
-        commit_on(&root, "one");
-        let tip = commit_on(&root, "two");
+    async fn rewritten_main_bundle_matches_the_live_range_and_fetches_into_an_empty_repository() {
+        let main = repository();
+        let main_repo = GitRepository::from_root(&main);
+        commit_on(&main, "old-one");
+        let clone_time_main = commit_on(&main, "old-two");
 
-        let bundle = root.join("raven.bundle");
-        repo.bundle_commits(&bundle, Some("main"), "HEAD")
+        let workspace = std::env::temp_dir().join(format!(
+            "cowshed-git-test-history-diverged-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let status = Command::new(GIT)
+            .args(["clone", "-q"])
+            .arg(&main)
+            .arg(&workspace)
+            .status()
+            .expect("clone workspace");
+        assert!(status.success());
+        git(&workspace, &["config", "user.name", "Cowshed Test"]);
+        git(
+            &workspace,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(&workspace, &["switch", "-qc", "cowshed/history-diverged"]);
+        commit_on(&workspace, "workspace-one");
+        let tip = commit_on(&workspace, "workspace-two");
+
+        // Deliberately make the clone-time `main` snapshot unreachable from every surviving ref.
+        // This is the condition the old thin bundle silently depended on never happening.
+        git(&main, &["switch", "-q", "--orphan", "rewritten-main"]);
+        commit_on(&main, "replacement");
+        git(&main, &["branch", "-M", "main"]);
+        let live_main = main_repo.head_oid().await.expect("read rewritten main");
+        assert!(
+            !main_repo
+                .commit_is_preserved(&clone_time_main)
+                .await
+                .expect("check clone-time tip reachability"),
+            "the test must orphan the clone-time main snapshot deliberately"
+        );
+
+        let main_objects = main_repo
+            .object_directory()
             .await
-            .expect("bundle the unlanded range");
-        assert!(bundle.is_file());
+            .expect("locate main object store");
+        let workspace_repo = GitRepository::from_root(&workspace)
+            .with_alternate_objects(main_objects)
+            .expect("attach live main objects");
+        let bundle = workspace.join("history-diverged.bundle");
+        let reported_count = workspace_repo
+            .bundle_commits(&bundle, Some(&live_main), "HEAD")
+            .await
+            .expect("write and verify self-contained abandonment bundle");
+        let claimed = workspace_repo
+            .run(["rev-list", "--reverse", &format!("{live_main}..HEAD")])
+            .await
+            .expect("list the live-target range");
+        assert!(claimed.status.success());
+        assert_eq!(
+            parse_lines(&claimed.stdout, "claimed abandoned oid")
+                .expect("parse claimed oids")
+                .len() as u64,
+            reported_count,
+            "the reported abandoned count must come from the bundle's live-target range"
+        );
 
-        // A raw-oid tip names no ref, so git refuses the bundle as empty. This is the shape a live
-        // abandonment hit: the caller had the fenced oid in hand and the range looked right.
-        let refless = repo
-            .bundle_commits(&root.join("refless.bundle"), Some("main"), &tip)
+        // A raw-oid tip advertises no fetchable ref, even though it names the right object.
+        let refless = workspace_repo
+            .bundle_commits(&workspace.join("refless.bundle"), Some(&live_main), &tip)
             .await
             .expect_err("an oid tip produces a ref-less bundle git will not write");
         assert!(refless.message.contains("empty bundle"), "{refless:?}");
 
-        // The recovery repository is main's: it holds the prerequisite and nothing of the session.
-        let recovery = repository();
-        git(
-            &recovery,
-            &[
-                "fetch",
-                "-q",
-                root.to_str().expect("utf-8 root"),
-                "+refs/heads/main:refs/heads/mint",
-            ],
-        );
-        let recovery_repo = GitRepository::from_root(&recovery);
+        let recovery = std::env::temp_dir().join(format!(
+            "cowshed-git-test-empty-recovery-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&recovery).expect("create empty recovery");
+        git(&recovery, &["init", "-q", "--bare", "."]);
+        let verify = Command::new(GIT)
+            .arg("-C")
+            .arg(&recovery)
+            .args(["bundle", "verify"])
+            .arg(&bundle)
+            .output()
+            .expect("verify bundle in empty repository");
         assert!(
-            !recovery_repo
-                .has_commit(&tip)
-                .await
-                .expect("recovery repository has no session object yet")
+            verify.status.success(),
+            "self-contained bundle must verify without the orphaned prerequisite: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&verify.stderr).contains("requires this ref"),
+            "git must report no prerequisites: {}",
+            String::from_utf8_lossy(&verify.stderr)
         );
         git(
             &recovery,
@@ -2560,51 +2764,78 @@ mod tests {
                 "HEAD:refs/heads/recovered",
             ],
         );
+        let recovery_repo = GitRepository::from_root(&recovery);
         assert!(
             recovery_repo
-                .has_commit(&tip)
+                .has_commit(&live_main)
                 .await
-                .expect("bundle restores the abandoned tip")
+                .expect("bundle carries the live target"),
+            "the live target must travel in the self-contained artifact"
         );
+        let restored = recovery_repo
+            .run([
+                "rev-list",
+                "--reverse",
+                &format!("{live_main}..refs/heads/recovered"),
+            ])
+            .await
+            .expect("list restored abandoned oids");
+        assert!(restored.status.success());
         assert_eq!(
-            recovery_repo
-                .commits_ahead(Some(&base), "refs/heads/recovered")
-                .await
-                .expect("count restored commits"),
-            2
+            restored.stdout, claimed.stdout,
+            "bundle must yield exactly the oids claimed against live main after history rewrite"
         );
 
-        // No usable range: the bundle has to stand alone, so it carries every ref.
-        let standalone = root.join("standalone.bundle");
-        repo.bundle_commits(&standalone, Some("no-such-branch"), "HEAD")
-            .await
-            .expect("bundle every ref");
-        let empty_recovery = std::env::temp_dir().join(format!(
-            "cowshed-git-test-empty-{}-{}",
-            std::process::id(),
-            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&empty_recovery).expect("create empty recovery");
-        git(&empty_recovery, &["init", "-q", "-b", "main"]);
+        fs::remove_dir_all(recovery).expect("remove recovery fixture");
+        fs::remove_dir_all(workspace).expect("remove workspace fixture");
+        fs::remove_dir_all(main).expect("remove main fixture");
+    }
+
+    #[tokio::test]
+    async fn failed_empty_repository_verification_leaves_the_workspace_intact() {
+        let workspace = repository();
+        let repo = GitRepository::from_root(&workspace);
+        let base = repo.head_oid().await.expect("read base");
+        git(&workspace, &["switch", "-qc", "cowshed/history-diverged"]);
+        commit_on(&workspace, "one");
+        let tip = commit_on(&workspace, "two");
+        let thin = workspace.join("thin.bundle");
         git(
-            &empty_recovery,
+            &workspace,
             &[
-                "fetch",
-                "-q",
-                standalone.to_str().expect("utf-8 bundle"),
-                "+refs/heads/cowshed/raven:refs/heads/recovered",
+                "bundle",
+                "create",
+                thin.to_str().expect("utf-8 bundle"),
+                "main..HEAD",
             ],
         );
+
+        let error = repo
+            .verify_bundle(&thin, &tip, Some(&base), 2)
+            .await
+            .expect_err("a prerequisite-dependent artifact must abort abandonment");
         assert!(
-            GitRepository::from_root(&empty_recovery)
-                .has_commit(&tip)
+            error.message.contains("verify abandonment bundle"),
+            "{error:?}"
+        );
+        assert!(
+            workspace.is_dir(),
+            "verification must not destroy the workspace"
+        );
+        assert_eq!(
+            repo.head_oid().await.expect("workspace remains readable"),
+            tip,
+            "verification failure must leave the workspace tip untouched"
+        );
+        assert_eq!(
+            repo.current_branch()
                 .await
-                .expect("all-refs bundle stands alone")
+                .expect("workspace branch remains"),
+            Some("cowshed/history-diverged".to_owned()),
+            "verification failure must leave workspace refs untouched"
         );
 
-        fs::remove_dir_all(empty_recovery).expect("remove empty recovery");
-        fs::remove_dir_all(recovery).expect("remove recovery fixture");
-        fs::remove_dir_all(root).expect("remove fixture");
+        fs::remove_dir_all(workspace).expect("remove fixture");
     }
 
     #[tokio::test]
