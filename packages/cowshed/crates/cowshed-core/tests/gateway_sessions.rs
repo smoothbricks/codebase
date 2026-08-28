@@ -238,7 +238,7 @@ async fn stale_foreign_session_holding_a_claimed_endpoint_is_evicted_before_inst
     // `local/diag` was deleted out of band; its gateway session kept port block 41536, which the
     // host-global allocator then handed to this project's `lock-contracts`. Every reconcile hit
     // EndpointConflict on that install and abandoned the rest of the project.
-    let repo = RepoId::parse("hyperide/axe").expect("repo");
+    let repo = RepoId::parse("example-org/example-app").expect("repo");
     let deleted = RepoId::parse("local/diag").expect("deleted repo");
     let prefix = project_session_prefix(&repo);
     let claimant = workspace_id(&repo, "lock-contracts", 1);
@@ -279,8 +279,8 @@ async fn stale_foreign_session_holding_a_claimed_endpoint_is_evicted_before_inst
 
 #[tokio::test]
 async fn live_foreign_session_on_a_claimed_endpoint_is_an_inventory_fault_not_an_eviction() {
-    let repo = RepoId::parse("hyperide/axe").expect("repo");
-    let other = RepoId::parse("axe-scale/minigraf").expect("other repo");
+    let repo = RepoId::parse("example-org/example-app").expect("repo");
+    let other = RepoId::parse("example-org/minigraf").expect("other repo");
     let claimant = workspace_id(&repo, "lock-contracts", 1);
     let live_owner = workspace_id(&other, "board-wave", 1);
     let control = FakeControl::default();
@@ -311,7 +311,7 @@ async fn live_foreign_session_on_a_claimed_endpoint_is_an_inventory_fault_not_an
 
 #[tokio::test]
 async fn one_refused_install_does_not_abandon_the_other_workspaces() {
-    let repo = RepoId::parse("hyperide/axe").expect("repo");
+    let repo = RepoId::parse("example-org/example-app").expect("repo");
     let refused = workspace_id(&repo, "lock-contracts", 1);
     let first = workspace_id(&repo, "abi-reconcile", 1);
     let last = workspace_id(&repo, "ttsc-gate", 1);

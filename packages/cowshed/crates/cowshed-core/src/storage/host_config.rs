@@ -521,7 +521,7 @@ mod tests {
             &store,
             &mount_root,
             [AttachedWorkspace::new(
-                RepoId::parse("hyperide/axe").unwrap(),
+                RepoId::parse("example-org/example-app").unwrap(),
                 WorkspaceName::new("main").unwrap(),
             )],
         )
@@ -545,7 +545,7 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
         let attached = [
             AttachedWorkspace::new(
-                RepoId::parse("hyperide/axe").unwrap(),
+                RepoId::parse("example-org/example-app").unwrap(),
                 WorkspaceName::new("main").unwrap(),
             ),
             AttachedWorkspace::new(

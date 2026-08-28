@@ -7682,7 +7682,7 @@ mod workspace_origin_tests {
         let source = temp.join("missing-retired-checkout");
         let destination = temp.join("explicit-destination");
         let store = temp.join("store");
-        let repo_id = RepoId::parse("axe-scale/minigraf").expect("live repository identity");
+        let repo_id = RepoId::parse("example-org/minigraf").expect("live repository identity");
         let layout = crate::storage::StorageLayout::with_mount_root(
             &store,
             temp.join("current-mnt"),
@@ -7693,7 +7693,7 @@ mod workspace_origin_tests {
         let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
             repo_id,
             remote_name: Some("origin".to_owned()),
-            remote_url: Some("https://example.test/axe-scale/minigraf.git".to_owned()),
+            remote_url: Some("https://example.test/example-org/minigraf.git".to_owned()),
             primary: true,
         }])
         .expect("validated live binding");
@@ -7701,15 +7701,14 @@ mod workspace_origin_tests {
             .workspace_mount(&WorkspaceName::new("main").expect("main"))
             .expect("current main mount");
         let invoking_home = Path::new("/Users/alice");
-        let historical_main_mount = Path::new("/Users/alice/.cowshed/mnt/axe-scale/minigraf/main");
+        let historical_main_mount =
+            Path::new("/Users/alice/.cowshed/mnt/example-org/minigraf/main");
         let targets = known_retired_main_targets(&current_main_mount, invoking_home, &binding)
             .expect("same-repository retired roots");
         assert!(targets.contains(&historical_main_mount.to_owned()));
-        assert!(
-            targets.contains(
-                &Path::new("/private/cowshed/store/mnt/axe-scale/minigraf/main").to_owned()
-            )
-        );
+        assert!(targets.contains(
+            &Path::new("/private/cowshed/store/mnt/example-org/minigraf/main").to_owned()
+        ));
         assert_eq!(
             targets.len(),
             3,
@@ -7720,7 +7719,7 @@ mod workspace_origin_tests {
                 .expect("duplicate home and current root"),
             vec![
                 historical_main_mount.to_owned(),
-                Path::new("/private/cowshed/store/mnt/axe-scale/minigraf/main").to_owned(),
+                Path::new("/private/cowshed/store/mnt/example-org/minigraf/main").to_owned(),
             ],
             "an unchanged current home root is listed only once"
         );
@@ -8067,7 +8066,7 @@ mod binding_tests {
     #[test]
     fn a_remote_without_a_derivable_identity_is_skipped_not_fatal() {
         let remotes = [
-            remote("axe", "https://github.com/axe-scale/minigraf.git"),
+            remote("origin", "https://example.com/example-org/minigraf.git"),
             remote("backup", "/Volumes/Backup/Dev/_fork/minigraf.git"),
         ];
 
@@ -8075,8 +8074,8 @@ mod binding_tests {
             binding_from_remotes(&remotes, None).expect("the usable remote identifies it");
 
         let primary = binding.primary().expect("primary");
-        assert_eq!(primary.repo_id, repo_id("axe-scale/minigraf"));
-        assert_eq!(primary.remote_name.as_deref(), Some("axe"));
+        assert_eq!(primary.repo_id, repo_id("example-org/minigraf"));
+        assert_eq!(primary.remote_name.as_deref(), Some("origin"));
     }
 
     #[test]
@@ -8089,7 +8088,7 @@ mod binding_tests {
         assert!(error.message.contains("backup"), "{}", error.message);
 
         // An explicit identity is still enough to proceed.
-        let requested = repo_id("axe-scale/minigraf");
+        let requested = repo_id("example-org/minigraf");
         let binding =
             binding_from_remotes(&remotes, Some(&requested)).expect("explicit identity suffices");
         assert_eq!(binding.primary().expect("primary").repo_id, requested);
