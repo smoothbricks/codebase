@@ -23,10 +23,12 @@ use crate::gateway_service::{
 };
 use crate::launchd::RemovalOutcome;
 use crate::output::Output;
-use crate::sccache_service::{remove_stale_socket, sccache_launch_agent};
+use crate::sccache_client_config::{self, ConfigChange, ConfigOutcome, ConfigReport, SharedStore};
+use crate::sccache_service::{derived_capacity, remove_stale_socket, sccache_launch_agent};
 use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
 use cowshed_core::metadata::ImageFormat;
+use cowshed_core::sandbox::sccache_cache_directory;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
@@ -154,6 +156,8 @@ pub trait HostSetup: Send {
     async fn unmounted_mains(&mut self) -> Result<MainMounts>;
     /// Deactivate and delete the host services and the binaries they ran.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>>;
+    /// Point an sccache client that inherited no cowshed environment at the shared cache.
+    async fn configure_sccache_client(&mut self) -> Result<ConfigReport>;
     /// Record the host session mount root. Refused while any session workspace is attached.
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf>;
 }
@@ -293,6 +297,36 @@ impl HostSetup for NativeHostSetup {
         ];
         remove_stale_socket(&sccache_socket)?;
         Ok(removals)
+    }
+
+    /// Write sccache's own config file, so a build outside every workspace still shares the cache.
+    ///
+    /// Gated on validated host storage rather than on the plan: a config naming a directory under
+    /// an unmounted caches volume would resolve onto the boot disk beneath the empty mountpoint —
+    /// a fourth orphaned cache, created by the command whose whole job is to prevent them. The
+    /// destination is the daemon's own [`sccache_cache_directory`] and the cap is the daemon's own
+    /// derivation, so the config file and the plist can never name two different stores or two
+    /// different eviction bounds.
+    async fn configure_sccache_client(&mut self) -> Result<ConfigReport> {
+        let path = sccache_client_config::client_config_path(&self.home);
+        let directory = sccache_cache_directory();
+        let storage = match validate_existing_host_storage(&self.home).await {
+            Ok(storage) => storage,
+            Err(error) => {
+                return Ok(ConfigReport {
+                    path,
+                    store: directory,
+                    outcome: ConfigOutcome::NoSharedStore {
+                        reason: error.message,
+                    },
+                });
+            }
+        };
+        fs::create_dir_all(&directory).map_err(|error| {
+            CowshedError::internal(format!("could not create {}: {error}", directory.display()))
+        })?;
+        let capacity = derived_capacity(&storage).await?;
+        sccache_client_config::apply(&path, &SharedStore::new(directory, capacity))
     }
 
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf> {
@@ -452,16 +486,27 @@ where
         Some(_) => None,
         None => Some(setup.unmounted_mains().await?),
     };
+    // Same reason, one step further: a run that never mounted the caches volume has no shared
+    // cache to point a client at, and writing a config naming one would be the false claim.
+    let sccache = match &failure {
+        Some(_) => None,
+        None => Some(setup.configure_sccache_client().await?),
+    };
     if json {
         // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
         // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
         // answering `ok:true` over a failure is the one thing this must not do.
         match &failure {
-            None => output.success(report).map_err(output_error)?,
-            Some(_) => render_repair(&plan, &report, mains.as_ref(), output)?,
+            None => {
+                output.success(report).map_err(output_error)?;
+                // On stderr, so the frozen stdout envelope stays frozen and a conflict a person
+                // has to resolve still reaches them in a scripted run.
+                emit_sccache_client(sccache.as_ref(), output)?;
+            }
+            Some(_) => render_repair(&plan, &report, mains.as_ref(), sccache.as_ref(), output)?,
         }
     } else {
-        render_repair(&plan, &report, mains.as_ref(), output)?;
+        render_repair(&plan, &report, mains.as_ref(), sccache.as_ref(), output)?;
     }
     if let Some(failure) = failure {
         return Err(partial_setup_failure(failure));
@@ -742,6 +787,7 @@ fn render_repair<W: Write, E: Write>(
     plan: &HostSetupPlan,
     report: &HostSetupReport,
     mains: Option<&MainMounts>,
+    sccache: Option<&ConfigReport>,
     output: &mut Output<W, E>,
 ) -> Result<()> {
     // The per-action outcomes come first and only when there is something to say: they are the
@@ -763,10 +809,59 @@ fn render_repair<W: Write, E: Write>(
     output
         .guidance(&fstab_phrase(&report.fstab))
         .map_err(output_error)?;
+    // Before the status line, which is the last thing a reader sees and is a claim about the whole
+    // host rather than about one file.
+    emit_sccache_client(sccache, output)?;
     output
         .guidance(&repair_status(plan, report, mains))
         .map_err(output_error)?;
     Ok(())
+}
+
+fn emit_sccache_client<W: Write, E: Write>(
+    sccache: Option<&ConfigReport>,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    if let Some(report) = sccache {
+        output
+            .guidance(&sccache_client_phrase(report))
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+/// What the run did about sccache's own config file, in one line.
+///
+/// Every arm names the file, because the whole point of writing it is that a future reader can
+/// find out who did. No default branch: an outcome the module adds stops compiling here rather
+/// than being reported as something it is not.
+fn sccache_client_phrase(report: &ConfigReport) -> String {
+    let path = report.path.display();
+    let store = report.store.display();
+    match &report.outcome {
+        ConfigOutcome::AlreadyCurrent => {
+            format!("{path} already sends a store-less sccache client to {store}")
+        }
+        ConfigOutcome::Written(ConfigChange::Created) => format!(
+            "wrote {path}: an sccache client that inherited no cowshed environment now caches in {store}"
+        ),
+        // Named separately from `Created` because the reassurance is the point: a person who has
+        // settings in that file needs to know cowshed did not rewrite them.
+        ConfigOutcome::Written(ConfigChange::Appended) => format!(
+            "added cowshed's [cache.disk] block to {path}, naming {store}; every other setting in that file was left exactly as it was"
+        ),
+        ConfigOutcome::Written(ConfigChange::Refreshed) => {
+            format!("refreshed cowshed's [cache.disk] block in {path}, naming {store}")
+        }
+        // A file cowshed did not write is not cowshed's to overwrite, so this is a report and not
+        // a failure — but it is a report of a cache that will not be shared, so it says so.
+        ConfigOutcome::Refused(conflict) => format!(
+            "left {path} alone: {conflict}; a store-less sccache client will not share {store} until cache.disk.dir names it"
+        ),
+        ConfigOutcome::NoSharedStore { reason } => format!(
+            "{path} not written: {store} is not available ({reason}), and a config naming a cache that is not there would create a fourth one"
+        ),
+    }
 }
 
 /// `cowshed.store exists (…) and will be mounted at …: failed — <why>`.
