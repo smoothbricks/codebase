@@ -1,36 +1,32 @@
-//! Rust port of `packages/columine/src/vm/hash_table.zig` — generic flat
-//! hash table (open addressing, linear probe) over a byte region.
+//! Generic flat hash table (open addressing, linear probe) over a byte region.
 //!
-//! Memory layout at `offset` (hash_table.zig:15):
-//!   `[cap: u32] [size: u32] [keys: u32 × cap] [entries: Entry × cap]`
-//! with entries omitted for sets, and the header omitted for top-level VM
-//! slots whose cap/size live in slot metadata (`bind_external`).
+//! Memory layout at `offset`:
+//! `[cap: u32] [size: u32] [keys: u32 × cap] [entries: Entry × cap]`.
+//! Entries are omitted for sets, and the header is omitted for top-level VM
+//! slots whose capacity and size live in slot metadata (`bind_external`).
 //!
-//! Zig parameterizes by a comptime `Entry` type; here the table carries its
-//! `entry_size` at runtime (0 = set, 4 = u32 map, 16 = timestamped map) and
-//! entry access goes through typed helpers. Following this crate's
-//! convention, no pointer/reference is ever formed into the state buffer —
-//! `FlatTable` stores OFFSETS and every access is an explicit LE byte copy —
-//! so the Zig `align(1) size_ptr` / `@alignCast` hazards do not exist here.
+//! `entry_size` selects set (0), u32 map (4), or timestamped map (16)
+//! semantics at runtime. No pointer/reference is formed into the state buffer:
+//! `FlatTable` stores offsets and every access is an explicit LE byte copy.
 //!
-//! Probe sequence, sentinel handling, load factor, and rehash placement are
-//! byte-for-byte the Zig algorithm: this is observable ABI (the scan order of
-//! the keys array is what `vm_map_iter_*` exposes to TS backends).
+//! Probe sequence, sentinel handling, load factor, and rehash placement define
+//! the observable ABI; the ascending key-cell scan order is exposed to
+//! TypeScript backends.
 
 use crate::bytes;
 use columine_types::types::{EMPTY_KEY, TOMBSTONE, hash_key};
 
-/// hash_table.zig:27-29 — inline table header field offsets.
+/// Inline table header field offsets.
 const HDR_CAP: u32 = 0;
 const HDR_SIZE: u32 = 4;
 pub const HDR_BYTES: u32 = 8;
 
-/// Entry sizes for the concrete Zig instantiations (hash_table.zig:217-228).
-pub const ENTRY_NONE: u32 = 0; // HashSet = FlatHashTable(void)
-pub const ENTRY_U32: u32 = 4; // HashMap / PtrMap = FlatHashTable(u32)
-pub const ENTRY_TIMESTAMPED: u32 = 16; // TimestampedMap = FlatHashTable(TimestampedEntry)
+/// Entry sizes for the concrete table forms.
+pub const ENTRY_NONE: u32 = 0; // HashSet
+pub const ENTRY_U32: u32 = 4; // HashMap / PtrMap
+pub const ENTRY_TIMESTAMPED: u32 = 16; // TimestampedMap
 
-/// `FlatHashTable(u32).byteSize(capacity)` — header + keys + u32 entries.
+/// HashMap byte size: inline header, keys, and u32 entries.
 pub const fn hashmap_byte_size(capacity: u32) -> u32 {
     byte_size(capacity, ENTRY_U32)
 }
@@ -45,33 +41,31 @@ pub const fn timestamped_map_byte_size(capacity: u32) -> u32 {
     byte_size(capacity, ENTRY_TIMESTAMPED)
 }
 
-/// hash_table.zig:48 `byteSize` for any entry size.
+/// Byte size of a table with the given capacity and entry size.
 pub const fn byte_size(capacity: u32, entry_size: u32) -> u32 {
     HDR_BYTES + capacity * 4 + capacity * entry_size
 }
 
-/// hash_table.zig:53 `dataSizeNoHeader`.
+/// Data size without the inline header.
 pub const fn data_size_no_header(capacity: u32, entry_size: u32) -> u32 {
     capacity * 4 + capacity * entry_size
 }
 
-/// The key-initialization effect of `initExternal` on a headerless
-/// (metadata-managed) table: every key cell becomes EMPTY_KEY. Values are
-/// deliberately left untouched (Zig relies on the zeroed buffer).
+/// Initialize key cells in a metadata-managed table. Values are deliberately
+/// left untouched; their initialization belongs to the caller.
 #[inline(always)]
 pub fn init_external_keys(state: &mut [u8], data_offset: u32, capacity: u32) {
     bytes::fill_u32(state, data_offset, capacity, EMPTY_KEY);
 }
 
-/// Result of `find_insert` (hash_table.zig:139 anonymous struct).
+/// Result of a `find_insert` probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Probe {
     pub pos: u32,
     pub found: bool,
 }
 
-/// hash_table.zig:35 `FlatHashTable` — a bound table view. Carries offsets
-/// into the state buffer, never pointers.
+/// Bound table view. Carries offsets into the state buffer, never pointers.
 #[derive(Clone, Copy, Debug)]
 pub struct FlatTable {
     pub cap: u32,
@@ -86,7 +80,7 @@ pub struct FlatTable {
 }
 
 impl FlatTable {
-    /// hash_table.zig:58 `bind` — bind to a table with an inline header.
+    /// Bind to a table with an inline header.
     #[inline(always)]
     pub fn bind(state: &[u8], offset: u32, entry_size: u32) -> Self {
         let cap = bytes::read_u32(state, offset + HDR_CAP);
@@ -99,8 +93,8 @@ impl FlatTable {
         }
     }
 
-    /// hash_table.zig:71 `bindExternal` — headerless table; cap/size live
-    /// externally (`size_off` typically points into slot metadata).
+    /// Bind to a headerless table; capacity and size live externally
+    /// (`size_off` typically points into slot metadata).
     pub fn bind_external(data_off: u32, cap: u32, size_off: u32, entry_size: u32) -> Self {
         Self {
             cap,
@@ -111,7 +105,7 @@ impl FlatTable {
         }
     }
 
-    /// hash_table.zig:100 `init` — write header, fill keys with EMPTY_KEY.
+    /// Initialize an inline-header table and fill keys with `EMPTY_KEY`.
     pub fn init(state: &mut [u8], offset: u32, capacity: u32, entry_size: u32) -> Self {
         bytes::write_u32(state, offset + HDR_CAP, capacity);
         bytes::write_u32(state, offset + HDR_SIZE, 0);
@@ -125,7 +119,7 @@ impl FlatTable {
         }
     }
 
-    /// hash_table.zig:87 `initExternal` — headerless init.
+    /// Initialize a headerless table.
     pub fn init_external(
         state: &mut [u8],
         data_off: u32,
@@ -161,8 +155,8 @@ impl FlatTable {
         bytes::write_u32(state, self.entries_off + pos * 4, value);
     }
 
-    /// TimestampedEntry accessors (hash_table.zig:223 — extern struct
-    /// `{ value: u32, _pad: u32, timestamp: f64 }`, 16 bytes).
+    /// Timestamped entry accessors use `{ value: u32, _pad: u32, timestamp:
+    /// f64 }`, 16 bytes.
     pub fn ts_entry_at(&self, state: &[u8], pos: u32) -> (u32, f64) {
         debug_assert_eq!(self.entry_size, ENTRY_TIMESTAMPED);
         let base = self.entries_off + pos * 16;
@@ -187,7 +181,7 @@ impl FlatTable {
         state.copy_within(src..src + len, dst);
     }
 
-    /// hash_table.zig:114 `size`.
+    /// Current table size.
     #[inline(always)]
     pub fn size(&self, state: &[u8]) -> u32 {
         bytes::read_u32(state, self.size_off)
@@ -198,13 +192,13 @@ impl FlatTable {
         bytes::write_u32(state, self.size_off, value);
     }
 
-    /// hash_table.zig:118 `maxLoad` — 70% load factor, integer math.
+    /// Maximum size before growth, using a 70% integer load factor.
     pub const fn max_load(&self) -> u32 {
         self.cap * 7 / 10
     }
 
-    /// hash_table.zig:123 `find` — linear probe. The probe sequence
-    /// (`hash_key` start, +1 steps, `& (cap - 1)` wrap) is observable ABI.
+    /// Find a key by linear probing. The sequence starts at `hash_key`, steps
+    /// by one, and wraps with `& (cap - 1)`.
     pub fn find(&self, state: &[u8], key: u32) -> Option<u32> {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
@@ -224,10 +218,9 @@ impl FlatTable {
         None
     }
 
-    /// hash_table.zig:139 `findInsert` — probes past tombstones to find the
-    /// key deeper in the chain, reusing the FIRST tombstone for insertion
-    /// when the key is truly absent. Returns None for sentinel keys or a
-    /// full, tombstone-free table.
+    /// Insert-or-update probe: scan past tombstones to find a deeper matching
+    /// key, then reuse the first tombstone when the key is absent. Returns
+    /// `None` for sentinel keys or a full tombstone-free table.
     pub fn find_insert(&self, state: &[u8], key: u32) -> Option<Probe> {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
@@ -251,27 +244,26 @@ impl FlatTable {
             }
             pos = (pos + 1) & (self.cap - 1);
         }
-        // Table full — use first tombstone if available (hash_table.zig:151).
+        // A full table reuses the first tombstone when one exists.
         first_tombstone.map(|ft| Probe {
             pos: ft,
             found: false,
         })
     }
 
-    /// hash_table.zig:157 `contains`.
+    /// Test whether a key is present.
     pub fn contains(&self, state: &[u8], key: u32) -> bool {
         self.find(state, key).is_some()
     }
 
-    /// hash_table.zig:162 `get` for u32-entry tables.
+    /// Read a value from a u32-entry table.
     pub fn get_u32(&self, state: &[u8], key: u32) -> Option<u32> {
         let pos = self.find(state, key)?;
         Some(self.entry_u32_at(state, pos))
     }
 
-    /// hash_table.zig:170 `insertKey` — set semantics. Some(true) = newly
-    /// inserted, Some(false) = already present, None = sentinel key, full
-    /// table, or load factor exceeded (needs growth).
+    /// Set semantics: `Some(true)` inserted, `Some(false)` already present,
+    /// and `None` means sentinel, full table, or load factor exceeded.
     pub fn insert_key(&self, state: &mut [u8], key: u32) -> Option<bool> {
         let probe = self.find_insert(state, key)?;
         if probe.found {
@@ -286,10 +278,10 @@ impl FlatTable {
         Some(true)
     }
 
-    /// hash_table.zig:181 `upsert` for u32-entry tables. Some(true) = newly
-    /// inserted, Some(false) = overwrote existing, None = sentinel/full/load.
-    /// (Zig makes set-typed `upsert` a compile error; here the entry-size
-    /// debug_assert in the accessor plays that role.)
+    /// Upsert in a u32-entry table: `Some(true)` inserted,
+    /// `Some(false)` overwrote an existing value, and `None` means sentinel,
+    /// full table, or load factor exceeded. The entry-size assertion enforces
+    /// that this accessor is not used for set tables.
     pub fn upsert_u32(&self, state: &mut [u8], key: u32, value: u32) -> Option<bool> {
         let probe = self.find_insert(state, key)?;
         if probe.found {
@@ -306,11 +298,9 @@ impl FlatTable {
         Some(true)
     }
 
-    /// hash_table.zig:197 `rehashInto` — move all live entries into a fresh
-    /// inline-header table at `dst_offset`. Insertion placement is the plain
-    /// probe WITHOUT tombstone logic (the destination has none); iteration
-    /// over the source is ascending slot order, which fixes the destination
-    /// layout byte-for-byte.
+    /// Move live entries into a fresh inline-header table. The destination has
+    /// no tombstones, so insertion uses plain probing; ascending source-slot
+    /// iteration fixes destination placement.
     pub fn rehash_into(&self, state: &mut [u8], dst_offset: u32, new_cap: u32) -> Self {
         let dst = Self::init(state, dst_offset, new_cap, self.entry_size);
         let mut moved = 0u32;

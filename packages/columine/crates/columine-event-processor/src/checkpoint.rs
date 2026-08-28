@@ -1,10 +1,9 @@
-//! Checkpoint serialization for dedup state (`dedup/checkpoint.zig`).
+//! Checkpoint serialization for deduplication state.
 //!
-//! Byte layout is the cross-session contract (TS persists these blobs):
-//! `[header 36B][bloom bits][pad8][meta 8B][pad8][stats 24B][pad8]`.
-//! Note the header is NOT padded before the bloom bits (bloom_offset = 36);
-//! `requiredSize`'s comment in the Zig narrates a different layout but
-//! computes the same total — serialize() is the truth ported here.
+//! Byte layout is the cross-session contract (TypeScript persists these
+//! blobs): `[header 36B][bloom bits][pad8][meta 8B][pad8][stats 24B][pad8]`.
+//! The header is not padded before bloom bits (`bloom_offset = 36`), and the
+//! serializer's explicit offsets define the required size.
 
 use crate::bloom::{CollisionPolicy, DedupState};
 
@@ -19,8 +18,8 @@ fn align_to_8(offset: usize) -> usize {
     (offset + 7) & !7usize
 }
 
-/// Serialize dedup state; returns bytes written or None when the output is
-/// too small (`checkpoint.zig serialize`).
+/// Serialize dedup state; returns bytes written or `None` when the output is
+/// too small.
 pub fn serialize(state: &DedupState, output: &mut [u8]) -> Option<usize> {
     let mut offset = HEADER_SIZE;
 
@@ -88,9 +87,9 @@ fn read_u64(input: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(input.get(at..at + 8)?.try_into().ok()?))
 }
 
-/// Deserialize checkpoint bytes (`checkpoint.zig deserialize`). The restored
-/// bloom geometry must match a fresh filter of the checkpointed capacity —
-/// a bit-length mismatch is `SizeMismatch`, not a resize.
+/// Deserialize checkpoint bytes. Restored bloom geometry must match a fresh
+/// filter of the checkpointed capacity; a bit-length mismatch is
+/// `SizeMismatch`, not a resize.
 pub fn deserialize(input: &[u8]) -> Result<DedupState, DeserializeError> {
     if input.len() < HEADER_SIZE {
         return Err(DeserializeError::InvalidCheckpoint);
@@ -135,8 +134,7 @@ pub fn deserialize(input: &[u8]) -> Result<DedupState, DeserializeError> {
     Ok(state)
 }
 
-/// Required checkpoint size for a bloom filter of `bloom_bytes`
-/// (`checkpoint.zig requiredSize`).
+/// Required checkpoint size for a bloom filter of `bloom_bytes`.
 pub fn required_size(bloom_bytes: usize) -> usize {
     let mut size = HEADER_SIZE + bloom_bytes;
     size = align_to_8(size);
@@ -170,9 +168,7 @@ mod tests {
         assert!(restored.bloom.maybe_contains(b"event-002"));
     }
 
-    // test "checkpoint header size" / "meta size" / "stats size" — the Zig
-    // pins @sizeOf of extern structs; the Rust writer uses explicit offsets,
-    // so the layout is pinned by a serialized byte-image instead.
+    // Explicit offsets and the serialized byte image pin all layout sizes.
     #[test]
     fn serialized_layout_pinned() {
         let state = DedupState::new(10, CollisionPolicy::Discard); // 64-byte bloom

@@ -1,6 +1,6 @@
 [package]
 name = "columine-event-processor"
-description = "Unified event processor: parse -> columns -> (dedup) -> Arrow IPC (ports event_processor.zig both variants + dedup/{bloom,checkpoint}.zig)"
+description = "Unified event processor: parse, columns, deduplication, and Arrow IPC"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

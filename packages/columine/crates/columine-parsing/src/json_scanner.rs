@@ -1,4 +1,4 @@
-//! Replaces `packages/columine/src/parsing/json_scanner.zig`.
+//! Streaming JSON scanner and UTC timestamp conversion.
 
 use crate::{
     EventColumns, ParseError,
@@ -118,33 +118,33 @@ pub enum TimestampError {
     InvalidFormat,
 }
 
-/// Scalar ISO-8601 conversion matching Zig's UTC, millisecond-only contract.
+/// Parse a UTC ISO-8601 timestamp with millisecond precision into microseconds.
 pub fn parse_iso8601_to_micros(value: &str) -> Result<i64, TimestampError> {
     let bytes = value.as_bytes();
     if bytes.len() < 20 || bytes.last() != Some(&b'Z') {
         return Err(TimestampError::InvalidFormat);
     }
-    let year = zig_int(&bytes[0..4])? as i32;
+    let year = parse_digits(&bytes[0..4])? as i32;
     if bytes.get(4) != Some(&b'-') {
         return Err(TimestampError::InvalidFormat);
     }
-    let month = zig_int(&bytes[5..7])? as u32;
+    let month = parse_digits(&bytes[5..7])? as u32;
     if bytes.get(7) != Some(&b'-') {
         return Err(TimestampError::InvalidFormat);
     }
-    let day = zig_int(&bytes[8..10])? as u32;
+    let day = parse_digits(&bytes[8..10])? as u32;
     if bytes.get(10) != Some(&b'T') {
         return Err(TimestampError::InvalidFormat);
     }
-    let hour = zig_int(&bytes[11..13])? as u32;
+    let hour = parse_digits(&bytes[11..13])? as u32;
     if bytes.get(13) != Some(&b':') {
         return Err(TimestampError::InvalidFormat);
     }
-    let minute = zig_int(&bytes[14..16])? as u32;
+    let minute = parse_digits(&bytes[14..16])? as u32;
     if bytes.get(16) != Some(&b':') {
         return Err(TimestampError::InvalidFormat);
     }
-    let second = zig_int(&bytes[17..19])? as u32;
+    let second = parse_digits(&bytes[17..19])? as u32;
     if !(1970..=2099).contains(&year)
         || !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
@@ -154,11 +154,9 @@ pub fn parse_iso8601_to_micros(value: &str) -> Result<i64, TimestampError> {
     {
         return Err(TimestampError::InvalidFormat);
     }
-    // Deliberate unified fraction semantics (post-parity; the deleted Zig
-    // had two drifted parsers — `catch 0` garbage-acceptance in one, reject
-    // + longer-than-3-yields-0 in the other): every fraction char must be a
-    // digit (garbage REJECTS), the first three digits are the milliseconds
-    // (ISO truncation), and an empty fraction after '.' rejects.
+    // Fraction semantics are deliberately uniform: every character must be a
+    // digit, the first three digits are milliseconds (ISO truncation), and an
+    // empty fraction after `.` is invalid.
     let millis = if bytes.len() > 20 && bytes[19] == b'.' {
         let fraction = &bytes[20..bytes.len() - 1];
         if fraction.is_empty() || !fraction.iter().all(u8::is_ascii_digit) {
@@ -167,7 +165,7 @@ pub fn parse_iso8601_to_micros(value: &str) -> Result<i64, TimestampError> {
         let mut padded = [b'0'; 3];
         let take = fraction.len().min(3);
         padded[..take].copy_from_slice(&fraction[..take]);
-        zig_int(&padded)?
+        parse_digits(&padded)?
     } else {
         0
     };
@@ -177,9 +175,8 @@ pub fn parse_iso8601_to_micros(value: &str) -> Result<i64, TimestampError> {
         + i64::from(second);
     Ok(seconds * 1_000_000 + millis * 1_000)
 }
-/// Strict digits (unified post-parity: the deleted Zig's parseInt accepted
-/// a leading '+', e.g. "2024-+1-15T…" parsed month 1).
-fn zig_int(bytes: &[u8]) -> Result<i64, TimestampError> {
+/// Parse decimal digits with overflow checking.
+fn parse_digits(bytes: &[u8]) -> Result<i64, TimestampError> {
     let digits = bytes;
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return Err(TimestampError::InvalidFormat);
@@ -258,8 +255,7 @@ mod tests {
     }
     #[test]
     fn parse_iso8601_to_micros_garbage_fraction_rejects() {
-        // Post-parity unified semantics: a non-digit fraction REJECTS (the
-        // deleted Zig's `parseInt catch 0` silently read it as 0 ms).
+        // A non-digit fraction is rejected rather than interpreted as zero.
         let base = parse_iso8601_to_micros("2024-01-15T10:30:00Z").unwrap();
         assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.abcZ").is_err());
         assert!(parse_iso8601_to_micros("2024-01-15T10:30:00.1x3Z").is_err());

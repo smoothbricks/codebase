@@ -1,29 +1,21 @@
-//! Rust port of `packages/columine/src/vm/intern.zig` — string interning to
-//! u32 indices (fast u32 key comparisons, Arrow dictionary-encoding
-//! compatibility, cross-batch dedup).
+//! String interning to u32 indices for fast key comparisons, Arrow
+//! dictionary-encoding compatibility, and cross-batch deduplication.
 //!
-//! Layout mirrors the Zig exactly (intern.zig:10): concatenated UTF-8 `data`
-//! with `offsets[i]..offsets[i+1]` string boundaries (`offsets[count]` always
-//! equals `data_len`), plus an open-addressing hash table (FNV-1a u32 hash,
-//! linear probing, no tombstones — interning never removes).
+//! Layout: concatenated UTF-8 `data` with `offsets[i]..offsets[i+1]` string
+//! boundaries (`offsets[count]` always equals `data_len`), plus an
+//! open-addressing FNV-1a hash table with linear probing and no tombstones.
+//! Buffers grow on demand; handles stay stable because growth only appends.
 //!
-// Initial sizing: `data` = cap×32 ("assume ~32 bytes per string"),
-// `offsets` = cap+1, hash = nextPowerOf2(cap×2) — and every buffer GROWS on
-// demand (the deleted Zig bump-heap model had no overflow checks and
-// overran/probed forever past capacity; interned u32 handles stay stable
-// across growth because growth only appends).
-//!
-//! The `intern_*` exports (intern.zig:182-220) are the wasm ABI over a
-//! global singleton + 4 MB bump heap — that surface belongs to the bindings
-//! stage (stage 5); this module ports the `StringIntern` mechanism.
+//! The `intern_*` wasm exports are provided by the bindings layer; this module
+//! owns the `StringIntern` mechanism.
 
 use columine_types::types::next_power_of_2;
 
-/// intern.zig:36 — empty hash-table sentinel.
+/// Empty hash-table sentinel.
 const EMPTY: u32 = 0xFFFF_FFFF;
 
-/// intern.zig:81 `hashBytes` — FNV-1a, 32-bit (offset basis 2166136261,
-/// prime 16777619, wrapping multiply).
+/// FNV-1a, 32-bit (offset basis 2166136261, prime 16777619, wrapping
+/// multiply).
 pub fn hash_bytes(bytes: &[u8]) -> u32 {
     let mut h: u32 = 2_166_136_261;
     for &b in bytes {
@@ -33,8 +25,8 @@ pub fn hash_bytes(bytes: &[u8]) -> u32 {
     h
 }
 
-/// intern.zig:19 `StringIntern`. Buffers start at the Zig sizing model and
-/// grow on demand; u32 handles are stable (growth only appends).
+/// String interning state. Buffers start at the requested sizing model and
+/// grow on demand; u32 handles are stable because growth only appends.
 #[derive(Debug)]
 pub struct StringIntern {
     data: Vec<u8>,
@@ -47,17 +39,15 @@ pub struct StringIntern {
 }
 
 impl StringIntern {
-    /// intern.zig:38 `init` — capacities derived from `initial_cap`:
-    /// data = cap×32 ("assume ~32 bytes per string"), offsets = cap+1,
-    /// hash = nextPowerOf2(cap×2) (50% load factor). intern.zig's private
-    /// `nextPowerOf2` (intern.zig:69) is identical to types.zig's ported
-    /// `next_power_of_2` incl. the clamp-to-16 floor.
+    /// Allocate buffers from `initial_cap`: data = cap×32 (roughly 32 bytes
+    /// per string), offsets = cap+1, and hash = next power of two at cap×2
+    /// (50% load factor, clamped to a minimum of 16).
     pub fn new(initial_cap: u32) -> Self {
         let data_cap = initial_cap * 32;
         let offsets_cap = initial_cap + 1;
         let hash_cap = next_power_of_2(initial_cap * 2);
         let mut offsets = vec![0u32; offsets_cap as usize];
-        offsets[0] = 0; // intern.zig:54 — first offset is 0
+        offsets[0] = 0;
         Self {
             data: vec![0u8; data_cap as usize],
             data_len: 0,
@@ -69,10 +59,9 @@ impl StringIntern {
         }
     }
 
-    /// intern.zig:94 `intern` — return the index of `s`, inserting if new.
-    /// Probe: `h & (cap-1)`, +1 linear, wrapping; a matching hash verifies
-    /// content before returning (FNV-1a collisions are real, e.g.
-    /// "costarring"/"liquid").
+    /// Return the index of `s`, inserting it if new. Probe with `h & (cap-1)`
+    /// and linear wraparound; a matching hash verifies content because FNV-1a
+    /// collisions are possible.
     pub fn intern(&mut self, s: &[u8]) -> u32 {
         // Keep load factor <= 1/2 so probes terminate; rehash doubles the
         // table and re-seats every live hash (handles unchanged).
@@ -121,7 +110,7 @@ impl StringIntern {
         self.hash_cap = new_cap;
     }
 
-    /// intern.zig:120 `insertNew` — buffers grow on demand.
+    /// Insert a new string, growing buffers on demand.
     fn insert_new(&mut self, s: &[u8], h: u32, slot: u32) -> u32 {
         let idx = self.count;
         if (idx as usize) >= self.offsets.len() - 1 {
@@ -149,8 +138,8 @@ impl StringIntern {
         idx
     }
 
-    /// intern.zig:141 `get` — bytes of string `idx`. Out-of-range `idx` is a
-    /// programmer bug (Zig reads garbage offsets).
+    /// Return the bytes of string `idx`. Out-of-range indices are programmer
+    /// errors.
     pub fn get(&self, idx: u32) -> &[u8] {
         assert!(
             idx < self.count,
@@ -162,24 +151,23 @@ impl StringIntern {
         &self.data[start..end]
     }
 
-    /// intern.zig:148 `getDataPtr` / :158 `getDataLen` — the concatenated
-    /// UTF-8 buffer for Arrow export (live prefix only).
+    /// Concatenated UTF-8 buffer for Arrow export (live prefix only).
     pub fn data_bytes(&self) -> &[u8] {
         &self.data[..self.data_len as usize]
     }
 
-    /// intern.zig:153 `getOffsetsPtr` — the offsets array for Arrow export;
-    /// `count()+1` live entries, `offsets[count] == data_len`.
+    /// Offsets array for Arrow export: `count()+1` live entries with
+    /// `offsets[count] == data_len`.
     pub fn offsets(&self) -> &[u32] {
         &self.offsets[..=self.count as usize]
     }
 
-    /// intern.zig:163 `getCount`.
+    /// Number of interned strings.
     pub fn count(&self) -> u32 {
         self.count
     }
 
-    /// intern.zig:158 `getDataLen`.
+    /// Number of live bytes in the concatenated data buffer.
     pub fn data_len(&self) -> u32 {
         self.data_len
     }
@@ -215,9 +203,8 @@ mod tests {
         assert_eq!(si.get(2), b"");
     }
 
-    /// The Arrow-export layout: `data` is the concatenation in first-seen
-    /// order; `offsets` has count+1 entries with offsets[count] == data_len
-    /// (intern.zig:10-15).
+    /// Arrow export layout: `data` is the concatenation in first-seen order;
+    /// `offsets` has count+1 entries and `offsets[count] == data_len`.
     #[test]
     fn arrow_export_layout_is_pinned() {
         let mut si = StringIntern::new(16);
@@ -230,8 +217,8 @@ mod tests {
         assert_eq!(si.data_len(), 6);
     }
 
-    /// Colliding hashes still intern to distinct indices via the
-    /// content-verify branch (intern.zig:106-115).
+    /// Colliding hashes still intern to distinct indices via content
+    /// verification.
     #[test]
     fn fnv_collision_pair_gets_distinct_indices() {
         let mut si = StringIntern::new(16);
@@ -244,10 +231,9 @@ mod tests {
         assert_eq!(si.get(b), b"liquid");
     }
 
-    /// Post-parity fix pin: capacity is a starting size, not a ceiling —
-    /// buffers and the hash table grow on demand (the deleted Zig overran
-    /// its bump heap / probed forever past capacity). Handles stay stable
-    /// and dedup keeps working across every growth boundary.
+    /// Capacity is a starting size, not a ceiling: buffers and the hash table
+    /// grow on demand. Handles stay stable and deduplication remains correct
+    /// across every growth boundary.
     #[test]
     fn growth_past_initial_capacity_keeps_handles_and_dedup() {
         let mut si = StringIntern::new(16);

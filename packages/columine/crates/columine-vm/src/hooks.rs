@@ -1,33 +1,24 @@
-//! STAGE-2C BOUNDARY: the vm.zig services the container ops call back into.
+//! Service boundary between container operations and VM-owned state.
 //!
-//! On the Zig side, `hashmap_ops.zig` and `hashset_ops.zig` reach into
-//! `vm.zig` module globals: the undo-log switch (`g_undo_enabled` +
-//! `appendMutation`), TTL insertion (`insertWithTTL`, eviction-index lookup
-//! for remove-undo), and the BITMAP delegation pair (`batchBitmapAdd` /
-//! `batchBitmapRemove`). Those live in later slices (vm dispatch, undo_log,
-//! bitmap_ops). This trait pins the exact call surface the container family
-//! uses; the vm slice provides the real implementation and this comment then
-//! shrinks to a doc pointer.
-//!
-//! `NoVm` is the "undo disabled, no TTL/BITMAP slots in play" environment —
-//! byte-for-byte the behavior of a fresh Zig VM before `vm_enable_undo`, and
-//! what every hash-container test in the Zig tree runs under.
+//! HashMap and HashSet operations use this trait for undo logging, TTL
+//! eviction-index maintenance, and BITMAP delegation. The VM supplies the
+//! implementation; [`NoVm`] is the deliberately minimal environment used when
+//! those services are not wired.
 
 use crate::meta::SlotMetaView;
 use columine_types::types::ErrorCode;
 
-/// One side of an undo/redo pair (vm.zig `appendMutation` argument shape).
-/// Field names follow the Zig anonymous-struct literals; `_pad1`/`_pad2` are
-/// omitted — they are layout padding in the Zig log entry, not data. The
-/// undo_log slice owns the serialized entry layout.
+/// One side of an undo/redo pair.
+///
+/// `_pad1`/`_pad2` are layout padding in serialized entries and are not part
+/// of this in-memory record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationRecord {
     pub op: MutationOp,
     pub slot: u8,
     pub key: u32,
     pub prev_value: u32,
-    /// 8-byte auxiliary lane: comparison/timestamp bits (`@bitCast` of the
-    /// stored u64 cmp value or f64 timestamp on the Zig side).
+    /// 8-byte auxiliary lane: comparison or timestamp bits.
     pub aux: u64,
 }
 
@@ -42,19 +33,14 @@ pub enum MutationOp {
     MapUpdate,
 }
 
-/// Services vm.zig provides to the container ops.
+/// Services container operations may request from the VM.
 pub trait VmHooks {
-    /// vm.zig `g_undo_enabled`.
+    /// Whether undo logging is enabled.
     fn undo_enabled(&self) -> bool;
 
-    /// vm.zig `appendMutation(delta_mode, undo, redo)`. Called only when
-    /// `undo_enabled()`; the state buffer's slot `size` field has already
-    /// been flushed when this is called (the Zig code writes `size_ptr.*`
-    /// immediately before appending so the log sees consistent state).
-    /// `state` is the full state buffer at the append moment: Zig's
-    /// `undoAppend`/`undoAppendPair` snapshot it into the shadow buffer on
-    /// FIRST overflow (vm.zig:246/275, via the aliasing `g_undo_state_base`
-    /// global), so the append boundary must see the live bytes.
+    /// Append an undo/redo pair. The state buffer has already had its slot
+    /// size flushed, so the log observes consistent bytes. On first overflow,
+    /// the VM snapshots the live state; callers must pass the full buffer.
     fn append_mutation(
         &mut self,
         delta_mode: bool,
@@ -63,8 +49,7 @@ pub trait VmHooks {
         redo: MutationRecord,
     );
 
-    /// vm.zig `insertWithTTL` — record `key`@`ts` in the slot's eviction
-    /// index. Returns an `ErrorCode` exactly like the Zig call.
+    /// Record `key` at `ts` in the slot's eviction index and return its result.
     fn insert_with_ttl(
         &mut self,
         state: &mut [u8],
@@ -73,25 +58,20 @@ pub trait VmHooks {
         ts: f64,
     ) -> ErrorCode;
 
-    /// vm.zig `findLatestEvictionTimestampForKey` over the slot's eviction
-    /// index — the remove-undo path captures the key's last TTL timestamp.
+    /// Return the key's latest TTL timestamp for remove-undo.
     fn latest_eviction_ts(&self, state: &[u8], meta: &SlotMetaView, key: u32) -> Option<f64>;
 
-    /// vm.zig `removeTTLEntriesForKey` — bitmap remove clears the removed
-    /// key's eviction-index entries.
+    /// Remove all eviction-index entries for a key.
     fn remove_ttl_entries_for_key(&mut self, state: &mut [u8], meta: &SlotMetaView, key: u32);
 
-    /// vm.zig `g_undo_overflow` — true once a snapshot already covers the
-    /// state (further per-element tracking is pointless).
+    /// Whether a snapshot already covers the state.
     fn undo_overflow(&self) -> bool;
 
-    /// bitmap_ops.zig:511 `forceUndoSnapshot` — snapshot-based rollback for
-    /// bulk bitmap algebra (per-element tracking impractical). Called only
-    /// when `undo_enabled() && !undo_overflow()`; the undo slice owns the
-    /// shadow buffers.
+    /// Snapshot state for bulk BITMAP algebra. Called only when undo is enabled
+    /// and no prior overflow snapshot exists; the undo service owns the shadow.
     fn force_undo_snapshot(&mut self, state: &[u8]);
 
-    /// vm.zig `batchBitmapAdd` — HASHSET ops delegate BITMAP-typed slots.
+    /// Delegate a HASHSET operation on a BITMAP-typed slot.
     fn batch_bitmap_add(
         &mut self,
         delta_mode: bool,
@@ -102,7 +82,7 @@ pub trait VmHooks {
         ts_col: Option<&[f64]>,
     ) -> ErrorCode;
 
-    /// vm.zig `batchBitmapRemove`.
+    /// Delegate a batch removal on a BITMAP-typed slot.
     fn batch_bitmap_remove(
         &mut self,
         delta_mode: bool,
@@ -113,10 +93,9 @@ pub trait VmHooks {
     );
 }
 
-/// Undo disabled, no TTL, no BITMAP slots — the environment the Zig container
-/// tests run under. Reaching an unimplemented service is a programmer bug
-/// (the caller passed a TTL/BITMAP slot without wiring the vm slice), so it
-/// panics rather than silently no-oping.
+/// Minimal environment with undo, TTL, and BITMAP services disabled. Calling an
+/// unimplemented service is a programmer error, so it panics rather than
+/// silently doing nothing.
 #[derive(Debug, Default)]
 pub struct NoVm;
 

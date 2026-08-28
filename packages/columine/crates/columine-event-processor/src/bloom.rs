@@ -1,9 +1,8 @@
-//! Bloom filter for duplicate event detection (`dedup/bloom.zig`).
+//! Bloom filter for duplicate event detection.
 //!
-//! Probabilistic duplicate detection with a 0.1% target false-positive rate,
-//! double hashing (FNV-1a + a Murmur3-finalizer-mixed second hash). The
-//! sizing/hash-count formulas are ported to the constant so checkpointed
-//! filters restore onto identically sized bit arrays.
+//! The filter targets a 0.1% false-positive rate using double hashing (FNV-1a
+//! plus a Murmur3-finalizer-mixed second hash). The sizing and hash-count
+//! formulas are fixed so checkpointed filters restore onto identical bit arrays.
 
 /// Collision policy when a duplicate is detected (u8 values are FFI
 /// contract: 0=LATEST, 1=DISCARD).
@@ -39,21 +38,19 @@ pub struct BloomFilter {
 impl BloomFilter {
     /// Size for the 0.1% false-positive target:
     /// `m = ceil(n * 6.907755 / 0.480453)` bits (≈14.4 bits/element),
-    /// minimum 64 bytes; `k = ceil(m/n * ln 2)` clamped to [3, 16]
-    /// (bloom.zig:26-56, formulas kept bit-for-bit so restored checkpoints
-    /// match).
+    /// minimum 64 bytes; `k = ceil(m/n * ln 2)` clamped to [3, 16].
     pub fn new(expected_elements: u32) -> Self {
         let n = f64::from(expected_elements);
         let m_bits = (n * 6.907755 / 0.480453).ceil() as u64;
         let m_bytes = m_bits.div_ceil(8);
         let actual_bytes = m_bytes.max(64) as u32;
 
-        // Zig uses the truncated literal 0.693147, not LN_2 — the exact
-        // constant flips ceil() for some capacities and would desync
-        // checkpoint geometry across runtimes.
+        // Use the truncated literal 0.693147, not LN_2: the exact constant
+        // changes ceil() for some capacities and would change checkpoint
+        // geometry.
         #[allow(clippy::approx_constant)]
-        let ln2_zig = 0.693147_f64;
-        let k = ((f64::from(actual_bytes) * 8.0) / n * ln2_zig).ceil() as u8;
+        let ln2 = 0.693147_f64;
+        let k = ((f64::from(actual_bytes) * 8.0) / n * ln2).ceil() as u8;
         let hash_count = k.clamp(3, 16);
 
         Self {
@@ -198,7 +195,8 @@ mod tests {
                 false_positives += 1;
             }
         }
-        // Target 0.1%; assert < 1% like the Zig test.
+        // The measured false-positive rate remains below the one-percent
+        // acceptance bound for the 0.1% target.
         assert!((f64::from(false_positives) / 10_000.0) < 0.01);
     }
 

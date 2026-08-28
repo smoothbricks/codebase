@@ -1,17 +1,13 @@
-//! Rust port of `packages/columine/src/vm/hashmap_ops.zig` — HashMap batch
-//! operations, generic over upsert strategy.
+//! HashMap batch operations, generic over upsert strategy.
 //!
-//! Top-level HASHMAP slot layout (SoA, hashmap_ops.zig:61):
-//!   `[keys: u32 × cap][values: u32 × cap][cmp/timestamps: u64 × cap]`
+//! Top-level HASHMAP slots use a structure-of-arrays layout:
+//! `[keys: u32 × cap][values: u32 × cap][cmp/timestamps: u64 × cap]`.
 //! The keys+values portion binds as a `FlatTable` with u32 entries; the
-//! comparison lane is 8 bytes per entry, physically u64, interpreted per
+//! comparison lane is 8 bytes per entry, physically u64 and interpreted by
 //! `CmpType`.
 //!
-//! Zig comptime-specializes on `(strategy, delta_mode)`; here both are
-//! runtime parameters — observable behavior is identical, only codegen
-//! differs (the vm dispatch slice may re-specialize if the perf gate needs
-//! it). Calls into vm.zig globals (`g_undo_enabled`, `appendMutation`,
-//! `insertWithTTL`) go through the `hooks::VmHooks` boundary.
+//! Strategy and delta mode are runtime parameters. Calls that need VM-owned
+//! undo or TTL state go through the `hooks::VmHooks` boundary.
 
 use crate::bytes;
 use crate::hash_table::{ENTRY_U32, FlatTable};
@@ -19,7 +15,7 @@ use crate::hooks::{MutationOp, MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
 use columine_types::types::{ChangeFlag, ErrorCode};
 
-/// hashmap_ops.zig:37 `Strategy`.
+/// HashMap upsert strategy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Strategy {
     /// Update if ts > existing ts.
@@ -35,15 +31,14 @@ pub enum Strategy {
 }
 
 impl Strategy {
-    /// hashmap_ops.zig:138 — latest/max/min require the comparison lane.
+    /// Latest, max, and min strategies require the comparison lane.
     pub const fn needs_timestamps(self) -> bool {
         matches!(self, Self::Latest | Self::Max | Self::Min)
     }
 }
 
-/// hashmap_ops.zig:48 `CmpType` — how the 8-byte comparison lane and the
-/// input comparison column are interpreted. Discriminants are the opcode
-/// `cmp_type` operand byte.
+/// `CmpType` describes the comparison lane and input comparison column.
+/// Discriminants are the opcode `cmp_type` operand byte.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CmpType {
@@ -57,8 +52,8 @@ pub enum CmpType {
 }
 
 impl CmpType {
-    /// Decode the opcode's `cmp_type` operand byte. `None` = a byte the Zig
-    /// `@enumFromInt` would make UB; the dispatch maps it to INVALID_PROGRAM.
+    /// Decode the opcode's `cmp_type` operand byte. Unknown values return
+    /// `None`, allowing dispatch to reject the program explicitly.
     pub const fn from_u8(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::U32),
@@ -77,8 +72,8 @@ impl CmpType {
     }
 }
 
-/// hashmap_ops.zig:83 `readCmpValue` — read the i-th comparison value from a
-/// raw input column. u32 columns have 4-byte stride; f64/i64 8-byte.
+/// Read the i-th comparison value from a raw input column. u32 columns have a
+/// four-byte stride; f64/i64 columns have an eight-byte stride.
 #[inline(always)]
 pub fn read_cmp_value(cmp_col: &[u8], i: u32, cmp_type: CmpType) -> u64 {
     match cmp_type {
@@ -88,7 +83,7 @@ pub fn read_cmp_value(cmp_col: &[u8], i: u32, cmp_type: CmpType) -> u64 {
     }
 }
 
-/// hashmap_ops.zig:93 `cmpGt` — `a > b` under the cmp_type's semantics.
+/// Compare `a > b` under the `cmp_type` semantics.
 pub(crate) fn cmp_gt(a: u64, b: u64, cmp_type: CmpType) -> bool {
     match cmp_type {
         CmpType::U32 => (a as u32) > (b as u32),
@@ -97,7 +92,7 @@ pub(crate) fn cmp_gt(a: u64, b: u64, cmp_type: CmpType) -> bool {
     }
 }
 
-/// hashmap_ops.zig:102 `cmpLt`.
+/// Compare `a < b` under the `cmp_type` semantics.
 fn cmp_lt(a: u64, b: u64, cmp_type: CmpType) -> bool {
     match cmp_type {
         CmpType::U32 => (a as u32) < (b as u32),
@@ -106,7 +101,7 @@ fn cmp_lt(a: u64, b: u64, cmp_type: CmpType) -> bool {
     }
 }
 
-/// hashmap_ops.zig:112 `cmpToF64` — TTL always operates on f64 timestamps.
+/// Convert a comparison value to f64 for TTL operations.
 fn cmp_to_f64(val: u64, cmp_type: CmpType) -> f64 {
     match cmp_type {
         CmpType::U32 => (val as u32) as f64,
@@ -115,7 +110,7 @@ fn cmp_to_f64(val: u64, cmp_type: CmpType) -> f64 {
     }
 }
 
-/// hashmap_ops.zig:63 `bindSlotMap` — keys+values portion of the slot.
+/// Bind the keys+values portion of a HASHMAP slot.
 pub fn bind_slot_map(meta: &SlotMetaView) -> FlatTable {
     FlatTable::bind_external(
         meta.offset,
@@ -125,8 +120,7 @@ pub fn bind_slot_map(meta: &SlotMetaView) -> FlatTable {
     )
 }
 
-/// hashmap_ops.zig:69 `getCmpSlots` / `getTimestamps` — the 8-byte lane
-/// after keys+values (`offset + cap * 8`).
+/// Offset of the 8-byte comparison/timestamp lane after keys+values.
 pub const fn cmp_lane_off(meta: &SlotMetaView) -> u32 {
     meta.offset + meta.capacity * 8
 }
@@ -141,7 +135,7 @@ fn write_cmp_slot(state: &mut [u8], meta: &SlotMetaView, pos: u32, value: u64) {
     bytes::write_u64(state, cmp_lane_off(meta) + pos * 8, value);
 }
 
-/// hashmap_ops.zig:199 — strategy decision for an existing key.
+/// Decide whether a strategy updates an existing key.
 fn should_update(strategy: Strategy, new_cmp: u64, existing: u64, cmp_type: CmpType) -> bool {
     match strategy {
         Strategy::First => false,
@@ -151,8 +145,7 @@ fn should_update(strategy: Strategy, new_cmp: u64, existing: u64, cmp_type: CmpT
     }
 }
 
-/// Flush size + change flags before an early return
-/// (hashmap_ops.zig:161-165 pattern, repeated on every exit path).
+/// Flush size and change flags before an early return.
 #[inline(always)]
 fn flush(
     state: &mut [u8],
@@ -171,10 +164,10 @@ fn flush(
     }
 }
 
-/// hashmap_ops.zig:125 `batchMapUpsert`. `cmp_col` is the raw comparison
-/// column (stride per `cmp_type`); pass `None` for strategies that don't
-/// need comparison. Column lengths bound the batch: `keys.len()` is
-/// `batch_len` and `vals` must match.
+/// Upsert a batch of keys and values. `cmp_col` is the raw comparison column
+/// (stride per `cmp_type`); pass `None` for strategies that do not need it.
+/// Column lengths bound the batch: `keys.len()` is `batch_len` and `vals` must
+/// match.
 #[allow(clippy::too_many_arguments)]
 pub fn batch_map_upsert(
     strategy: Strategy,
@@ -205,7 +198,7 @@ pub fn batch_map_upsert(
 
     for (i, (&key, &val)) in keys.iter().zip(vals).enumerate() {
         let i = i as u32;
-        // Skip EMPTY_KEY/TOMBSTONE keys (hashmap_ops.zig:154).
+        // Skip EMPTY_KEY and TOMBSTONE sentinels.
         let Some(probe) = tbl.find_insert(state, key) else {
             continue;
         };
@@ -221,15 +214,15 @@ pub fn batch_map_upsert(
         };
 
         if !probe.found {
-            // New key — capacity check (hashmap_ops.zig:161).
+            // New key — check capacity before insertion.
             if local_size >= max_load {
                 flush(state, meta, &tbl, local_size, had_insert, had_update);
                 return ErrorCode::CapacityExceeded;
             }
 
             if hooks.undo_enabled() {
-                // Zig flushes size before appending so the log sees
-                // consistent state (hashmap_ops.zig:170).
+                // Flush size before appending so the undo log sees consistent
+                // state.
                 tbl.set_size(state, local_size);
                 hooks.append_mutation(
                     delta_mode,
@@ -274,7 +267,7 @@ pub fn batch_map_upsert(
             continue;
         }
 
-        // Existing key — apply strategy (hashmap_ops.zig:197).
+        // Existing key — apply the selected strategy.
         let pos = probe.pos;
         if should_update(
             strategy,
@@ -337,7 +330,7 @@ pub fn batch_map_upsert(
     ErrorCode::Ok
 }
 
-/// hashmap_ops.zig:240 `batchMapRemove` — tombstone keys.
+/// Remove a batch of keys by writing tombstones.
 pub fn batch_map_remove(
     delta_mode: bool,
     state: &mut [u8],
@@ -391,8 +384,8 @@ pub fn batch_map_remove(
     }
 }
 
-/// hashmap_ops.zig:280 `singleMapUpsert` — FOR_EACH body dispatch. `cmp` is
-/// the raw 8-byte comparison value (typed by `cmp_type`).
+/// Upsert one key/value pair for the per-element dispatch. `cmp` is the raw
+/// eight-byte comparison value interpreted by `cmp_type`.
 #[allow(clippy::too_many_arguments)]
 pub fn single_map_upsert(
     strategy: Strategy,
@@ -412,7 +405,7 @@ pub fn single_map_upsert(
     }
 
     let tbl = bind_slot_map(meta);
-    // Skip invalid keys (hashmap_ops.zig:297).
+    // Skip invalid keys.
     let Some(probe) = tbl.find_insert(state, key) else {
         return ErrorCode::Ok;
     };
@@ -490,7 +483,7 @@ pub fn single_map_upsert(
     ErrorCode::Ok
 }
 
-/// hashmap_ops.zig:343 `singleMapRemove`.
+/// Remove one key for the per-element dispatch.
 pub fn single_map_remove(
     delta_mode: bool,
     state: &mut [u8],

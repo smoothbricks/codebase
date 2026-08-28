@@ -1,4 +1,4 @@
-//! Replaces `packages/columine/src/parsing/json_extractor.zig`.
+//! JSON extraction and typed-column diagnostics.
 
 use crate::{
     ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, ParseError,
@@ -18,7 +18,7 @@ pub enum ExtractionError {
     OutOfMemory,
 }
 
-/// `json_extractor.zig NO_FIELD`.
+/// Sentinel for an unset diagnostic field index.
 pub const NO_FIELD: u16 = 0xFFFF;
 
 /// Diagnostic stage bytes (`ExtractionDiagnostic.Stage` — order is ABI,
@@ -57,9 +57,8 @@ pub mod json_value_type {
     pub const ARRAY: u8 = 6;
 }
 
-/// Per-field extraction diagnostic (`json_extractor.zig ExtractionDiagnostic`)
-/// — populated at the failure site so the EP header can report the exact
-/// stage/field/type/row instead of a coarse derivation.
+/// Per-field extraction diagnostic, populated at the failure site so the EP
+/// header can report the exact stage, field, type, and row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtractionDiagnostic {
     pub stage: u8,
@@ -96,8 +95,7 @@ impl ExtractionDiagnostic {
         };
     }
 
-    /// Zig `completeDiagnostic`: derive stage/detail from the error only if
-    /// no failure site filled them in.
+    /// Complete a diagnostic from the error when no failure site filled it in.
     pub fn complete(&mut self, failure: &ExtractionError) {
         if self.stage != diagnostic_stage::NONE {
             return;
@@ -121,7 +119,7 @@ impl ExtractionDiagnostic {
     }
 }
 
-/// Zig `jsonValueType`.
+/// Map a parser token to its ABI value-kind byte.
 fn json_value_type_of(token: &Token) -> u8 {
     match token {
         Token::Null => json_value_type::NULL,
@@ -134,8 +132,7 @@ fn json_value_type_of(token: &Token) -> u8 {
     }
 }
 
-/// Zig `columnFailure`: column-stage diagnostic with detail from the
-/// storage error.
+/// Create a column-stage diagnostic from a storage failure.
 fn column_failure(
     diagnostic: &mut ExtractionDiagnostic,
     col_idx: u32,
@@ -169,8 +166,8 @@ fn column_failure(
     error
 }
 
-/// Zig `variableValueFailure` (reservation/commit errors on a declared
-/// column).
+/// Translate a variable-value reservation or commit failure for a declared
+/// column into a column-stage diagnostic.
 fn variable_value_failure(
     diagnostic: &mut ExtractionDiagnostic,
     col_idx: u32,
@@ -187,8 +184,7 @@ fn variable_value_failure(
     column_failure(diagnostic, col_idx, arrow_type, actual, row, parse_error)
 }
 
-/// Zig `msgpackFailure` ($extra workspace writer errors — msgpack stage, so
-/// the EP growth loop can key on exactly this).
+/// Create a message-pack-stage diagnostic for fallback workspace failures.
 fn msgpack_failure(
     diagnostic: &mut ExtractionDiagnostic,
     col_idx: u32,
@@ -225,9 +221,8 @@ fn msgpack_failure(
     error
 }
 
-/// Zig `directMsgpackFailure` (declared-Binary writer errors: capacity
-/// failures are COLUMN failures — the sink is column storage — while
-/// malformed input stays msgpack/json).
+/// Classify a failure writing a declared binary value: capacity failures
+/// belong to the column stage, while malformed input stays msgpack/json.
 fn direct_msgpack_failure(
     diagnostic: &mut ExtractionDiagnostic,
     col_idx: u32,
@@ -285,9 +280,8 @@ pub fn extract_json_events(
             return Err(err);
         }
         count += 1;
-        // Refuse only when MORE events follow a full batch — an
-        // exactly-capacity batch is legal. (The deleted Zig checked
-        // `count >= capacity` after every event, rejecting full batches.)
+        // An exactly-capacity batch is legal; reject only when more events
+        // follow a full batch.
         if count >= columns.capacity as usize && !parser.is_array_end() {
             return Err(ExtractionError::TooManyEvents);
         }
@@ -318,8 +312,8 @@ pub fn extract_json_event(
     }
     let result = extract_json_event_open(parser, config, columns, work_buffer, diagnostic);
     if result.is_err() {
-        // Zig abandons the half-built row on error (endRow is never reached);
-        // committing a partial row here would corrupt the batch.
+        // Abandon the half-built row on error; committing it would corrupt the
+        // batch.
         columns.abandon_row();
     }
     result
@@ -342,14 +336,11 @@ fn extract_json_event_open(
         );
         return Err(ExtractionError::InvalidJson);
     }
-    // Schema-sized presence tracking retained by DynamicColumns
-    // (json_extractor.zig `columns_seen` — a fixed 64-column array here once
-    // failed every schema wider than 64 fields, found by the TS
-    // buffer-lifecycle suite).
+    // Track presence across the declared schema. A schema-sized tracker avoids
+    // rejecting schemas wider than a fixed implementation limit.
     columns.columns_seen.fill(false);
-    // The writer wraps the buffer up front, but a too-small buffer only
-    // becomes an error on the first undeclared field, exactly like Zig's
-    // lazy `MsgpackValueWriter.init(...) orelse return error.BufferOverflow`.
+    // A too-small workspace reports an error when the first undeclared field
+    // needs to be encoded.
     let mut extra = MsgpackValueWriter::new(work_buffer);
     let mut extra_count = 0;
     while !parser.is_object_end() {
@@ -364,8 +355,8 @@ fn extract_json_event_open(
                 lookup.column,
                 diagnostic,
             ) {
-                // Zig backfills field/expected/row on any typed-value error
-                // whose site did not set them.
+                // Fill in diagnostic context that the typed-value failure did
+                // not set at its source.
                 if diagnostic.field_index == NO_FIELD {
                     diagnostic.field_index = lookup.column as u16;
                 }
@@ -450,9 +441,8 @@ fn extract_json_event_open(
             Some(writer) if extra_count > 0 => {
                 let row = columns.count;
                 let bytes = writer.finish_map32(extra_count)?;
-                // Zig appends straight from the workspace slice
-                // (`appendBinary(fallback_idx, msgpack_bytes)`) — no
-                // intermediate materialization.
+                // Append directly from the workspace slice; no intermediate
+                // materialization is needed.
                 if let Err(err) = columns.append_binary(column as u32, bytes) {
                     return Err(column_failure(
                         diagnostic,
@@ -497,11 +487,9 @@ pub(crate) fn extract_typed_value(
                 ));
             }
         },
-        // json_extractor.zig (typed event schemas): Int32 is STRICT — integer
-        // JSON numbers only (no float truncation, no strings); Int64 keeps
-        // bigint-as-string + ISO timestamps because JSON cannot represent the
-        // full range losslessly, but a decimal NUMBER is invalid_number for
-        // both (the old float-truncation lane is gone).
+        // Typed event schemas keep Int32 strict (integer JSON numbers only).
+        // Int64 accepts bigint-as-string and ISO timestamps because JSON cannot
+        // represent the full range losslessly; decimal numbers remain invalid.
         ArrowType::Int32 => match token {
             Token::Number(value) => Some(ColumnValue::Int64(i64::from(
                 value.parse::<i32>().map_err(|_| {
@@ -581,12 +569,9 @@ pub(crate) fn extract_typed_value(
             | Token::False
             | Token::ObjectBegin
             | Token::ArrayBegin) => {
-                // json_extractor.zig `.Binary`: msgpack-encode DIRECTLY into
-                // the column's data buffer via a reservation (grows in place
-                // up to the column byte limit; a 4 KiB scratch here once made
-                // every larger declared-Binary value fail — found by the TS
-                // buffer-lifecycle suite). Commit publishes offset/validity,
-                // so a parse failure leaves the column logically unchanged.
+                // Encode directly into the column's reserved data buffer.
+                // Growth is retained up to the column byte limit, and commit
+                // publishes offset/validity only after encoding succeeds.
                 let res = columns.reserve_binary_value(column as u32).map_err(|err| {
                     variable_value_failure(diagnostic, column as u32, arrow_type, actual, row, err)
                 })?;
@@ -613,12 +598,9 @@ pub(crate) fn extract_typed_value(
             }
         },
         ArrowType::Null => {
-            // DELIBERATE DIVERGENCE from json_extractor.zig: the Zig code
-            // appends null WITHOUT consuming a container value, leaving the
-            // token stream desynchronized mid-object (a latent bug — its own
-            // msgpack extractor DOES skip here). We skip the container so the
-            // stream stays coherent; flagged in the README for the stage-4B
-            // unification audit.
+            // Null columns still consume a container value so the token stream
+            // stays coherent; this is especially important for nested objects
+            // and arrays.
             if matches!(token, Token::ObjectBegin | Token::ArrayBegin) {
                 parser
                     .skip_open_container(token)
@@ -628,8 +610,8 @@ pub(crate) fn extract_typed_value(
         }
     };
     append(columns, column, value).map_err(|err| {
-        // Zig columnFailure on the append result — but only when a failure
-        // site has not already claimed the diagnostic.
+        // Map append failures to column-stage diagnostics unless a failure site
+        // has already populated the diagnostic.
         if diagnostic.stage == diagnostic_stage::NONE {
             let parse_error = match err {
                 ExtractionError::BufferOverflow => ParseError::BufferOverflow,
@@ -649,7 +631,7 @@ pub(crate) fn extract_typed_value(
     })
 }
 
-/// Zig `invalidFieldType`.
+/// Record an invalid field-type diagnostic.
 fn invalid_field_type(
     diagnostic: &mut ExtractionDiagnostic,
     col_idx: u32,
@@ -668,7 +650,7 @@ fn invalid_field_type(
     ExtractionError::InvalidFieldType
 }
 
-/// Zig `invalidNumber`.
+/// Record an invalid-number diagnostic.
 fn invalid_number(
     diagnostic: &mut ExtractionDiagnostic,
     col_idx: u32,
@@ -686,8 +668,8 @@ fn invalid_number(
     );
     ExtractionError::InvalidFieldType
 }
-/// Zig `initColumn`'s error mapping: reservation failures keep BufferOverflow
-/// and OutOfMemory distinct; InvalidFieldType surfaces as InvalidJson.
+/// Map variable-value errors to extraction errors while preserving
+/// BufferOverflow and OutOfMemory.
 fn variable_write_error(error: columine_arrow::VariableValueError) -> ExtractionError {
     match error {
         columine_arrow::VariableValueError::BufferOverflow => ExtractionError::BufferOverflow,
@@ -707,11 +689,8 @@ fn append(
     })
 }
 
-/// Where the msgpack bytes land: the reusable `$extra` workspace (a plain
-/// slice, EP-grown between retries) or a column-data reservation that grows
-/// in place up to the column's byte limit (json_extractor.zig `initColumn` —
-/// declared Binary values encode DIRECTLY into column storage, never through
-/// a bounded scratch).
+/// Destination for encoded MessagePack bytes: the reusable `$extra` workspace
+/// or a variable-width column reservation that grows in place to its limit.
 pub(crate) enum MsgpackSink<'a> {
     Slice(&'a mut [u8]),
     Column {
@@ -731,7 +710,7 @@ impl<'a> MsgpackValueWriter<'a> {
             offset: 0,
         })
     }
-    /// Zig `MsgpackValueWriter.initColumn`: pre-grow 5 bytes, preserve none.
+    /// Reserve the initial five bytes required for a MessagePack value.
     pub(crate) fn new_column(
         cols: &'a mut DynamicColumns,
         res: VariableValueReservation,
@@ -758,8 +737,8 @@ impl<'a> MsgpackValueWriter<'a> {
                 }
             }
             MsgpackSink::Column { cols, res } => {
-                // Zig `ensureBytes`: grow to offset+n, preserving the bytes
-                // written so far (growth reallocates; the tail is scratch).
+                // Grow to offset+n while preserving bytes already written;
+                // the reallocated tail is scratch space.
                 res.ensure_capacity_preserving(cols, end, self.offset)
                     .map_err(variable_write_error)?;
             }
@@ -927,15 +906,11 @@ impl<'a> MsgpackValueWriter<'a> {
     }
 }
 
-/// Scalar ISO timestamp parser used for string-to-i64 extraction.
+/// Parse an ISO-8601 timestamp string for string-to-i64 extraction.
 ///
-/// json_extractor.zig carries its OWN `parseTimestampToMicros`, which drifts
-/// from json_scanner.zig's `parseIso8601ToMicros` in three observable ways,
-/// all mirrored here:
-/// Delegates to the ONE canonical parser (`json_scanner::parse_iso8601_to_micros`)
-/// — the deleted Zig carried two drifted variants; unified post-parity on
-/// deliberate semantics: strict digits, digit-only fractions (garbage
-/// rejects), first three fraction digits are the milliseconds, 1970..=2099.
+/// This delegates to the canonical parser so JSON and MessagePack paths share
+/// strict digits, digit-only fractions, three-digit millisecond truncation,
+/// and the 1970..=2099 year range.
 pub fn parse_timestamp_to_micros(value: &str) -> Option<i64> {
     crate::json_scanner::parse_iso8601_to_micros(value).ok()
 }
@@ -1204,10 +1179,8 @@ mod tests {
     }
     #[test]
     fn extract_json_events_supports_schemas_wider_than_64_fields() {
-        // json_extractor.zig tracks presence in the schema-sized
-        // `columns_seen` workspace — no 64-column ceiling (a fixed array +
-        // rejection here once failed every wide schema; the TS
-        // dynamic-schema-extraction suite pins >64-field processing).
+        // Presence tracking is schema-sized, so schemas wider than 64 fields
+        // are processed without a fixed-column ceiling.
         let fields = vec![field(ArrowType::Utf8); 65];
         let names: Vec<String> = (0..65).map(|i| format!("f{i:02}")).collect();
         let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -1248,10 +1221,9 @@ mod tests {
         assert_eq!(parse_timestamp_to_micros("not a date"), None);
         assert_eq!(parse_timestamp_to_micros(""), None);
     }
-    /// Post-parity fix pin: ONE canonical timestamp parser (the deleted Zig
-    /// carried two drifted variants) with deliberate semantics — 1970..=2099
-    /// years, digit-only fractions (garbage rejects), first three fraction
-    /// digits are the milliseconds, strict digits everywhere.
+    /// Assert that timestamp extraction uses one canonical parser with
+    /// deliberate semantics: years 1970..=2099, digit-only fractions, the
+    /// first three fraction digits as milliseconds, and strict digits.
     #[test]
     fn parse_timestamp_unified_semantics() {
         use crate::json_scanner::parse_iso8601_to_micros;
@@ -1274,8 +1246,7 @@ mod tests {
         // Leading '+' in a field rejects (strict digits).
         assert!(parse_iso8601_to_micros("2024-+1-15T10:30:00Z").is_err());
     }
-    /// Post-parity fix pin: an exactly-capacity batch is ACCEPTED; only a
-    /// larger one refuses. (The deleted Zig rejected full batches.)
+    /// An exactly-capacity batch is accepted; only a larger batch is refused.
     #[test]
     fn extract_json_events_accepts_exactly_capacity_batch() {
         let fields = [field(ArrowType::Utf8)];
