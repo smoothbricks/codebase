@@ -2855,12 +2855,13 @@ impl NativeProjectRuntimeHost {
         removal_landed_decision(workspace, &fence.head, landed, abandon)
     }
 
-    /// Write the unlanded commits beside the image that is about to be trashed.
+    /// Write and verify the commits that are about to lose their only workspace ref.
     ///
-    /// Belt for a deliberate abandonment: the refs die with the image, so a bundle in the same
-    /// trash directory as the retired sidecars is the only thing that keeps the commits fetchable
-    /// afterwards. Written from the workspace's own repository, whose local `main` is main's tip at
-    /// mint time and therefore a prerequisite main's repository still holds.
+    /// The live main tip is both the report's baseline and a positive revision in the bundle.
+    /// Carrying both histories makes the bundle self-contained even after main was rewritten, and
+    /// lets an empty recovery repository reconstruct the exact `main_tip..HEAD` range the report
+    /// counted. The landing gate keeps its patch-identity policy; this artifact count is the
+    /// conservative oid range whose objects are actually being retired.
     async fn bundle_abandoned_work(
         &self,
         workspace: &NativeWorkspace,
@@ -2868,18 +2869,17 @@ impl NativeProjectRuntimeHost {
         landed: NativeLandedState,
     ) -> Result<AbandonedWork> {
         let mount = current_snapshot_mount(self, workspace)?;
+        let target_head = landed.commits.target_head().cloned();
         let git = crate::git::GitRepository::from_root(&mount);
-        // What was destroyed is the authoritative count, not the workspace's own view of
-        // `main..HEAD`: its local `main` is a clone-time snapshot, so against a rewritten upstream
-        // it reports hundreds of commits where four were actually lost. Without a measurement there
-        // is nothing better than that local view, and over-counting is the safe direction to err in
-        // a report about loss.
-        let unlanded_commits = match &landed.commits {
-            LandingCommits::Measured { unlanded, .. } => *unlanded,
-            LandingCommits::Indeterminate { .. } => {
-                git.commits_ahead(Some(landed.branch.as_str()), "HEAD")
-                    .await?
+        let git = match target_head.as_ref() {
+            Some(_) => {
+                let main_mount = self.workspace_mount_path(&main_name())?;
+                let main_objects = crate::git::GitRepository::from_root(main_mount)
+                    .object_directory()
+                    .await?;
+                git.with_alternate_objects(main_objects)?
             }
+            None => git,
         };
         let trash = self
             .layout
@@ -2907,22 +2907,16 @@ impl NativeProjectRuntimeHost {
         .map_err(|error| {
             CowshedError::internal(format!("trash directory task failed: {error}"))
         })??;
-        // The bundle range stays the workspace's own `main..HEAD`, deliberately: its local `main`
-        // is an ancestor of main's own, so main's repository holds the prerequisite this thin
-        // bundle names, and a stale local `main` only makes the bundle carry more than it must.
-        // Naming the authoritative tip instead would need main's object store attached, which is
-        // one more thing that can fail on the path that exists to lose nothing.
-        //
-        // `HEAD`, not the fence oid, and the difference is load-bearing: `git bundle create` names
-        // the bundle's contents after the *refs* in its rev range, so a range whose tip is a raw
-        // oid produces a bundle with no refs — which git rejects as empty. The fence has already
-        // proved HEAD is exactly `fence.head`, so the ref spelling is the same commit.
-        git.bundle_commits(&bundle, Some(landed.branch.as_str()), "HEAD")
+        // `HEAD`, not the fence oid, is load-bearing: a raw oid does not advertise a fetchable ref
+        // in a bundle. The fence already proved HEAD is exactly `fence.head`, and bundle creation
+        // verifies that exact tip and commit range by fetching it into an empty repository.
+        let unlanded_commits = git
+            .bundle_commits(&bundle, target_head.as_ref().map(GitOid::as_str), "HEAD")
             .await?;
         Ok(AbandonedWork {
             head: fence.head.clone(),
             target_branch: landed.branch,
-            target_head: landed.commits.target_head().cloned(),
+            target_head,
             unlanded_commits,
             bundle,
         })
@@ -4929,8 +4923,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 self.begin_lifecycle_intent(intent).await?;
             }
             self.mark_lifecycle_intent_mutating(&workspace).await?;
-            // The bundle goes in before anything is destroyed: a belt written after the image is
-            // gone would have nothing left to read.
+            // Creation and an empty-repository fetch both finish before anything is destroyed: a
+            // preservation artifact that has not proved its own recoverability authorizes nothing.
             let abandoned = match abandoning {
                 Some(landed) => Some(
                     self.bundle_abandoned_work(&current, &final_fence, landed)
