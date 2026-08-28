@@ -297,15 +297,20 @@ impl RepositoryIdentityIntent {
     ///
     /// A malformed or truncated record is refused rather than skipped: it is evidence that a
     /// transaction was interrupted, and silently ignoring it would leave the store half-renamed
-    /// with nothing left to say so. The four store paths must be inside the store, so a record
-    /// naming somewhere else can never make recovery rename a directory outside cowshed.
+    /// with nothing left to say so.
+    ///
+    /// Both project roots must be inside the store, and the two mount roots must be siblings under
+    /// one mount root — the workspace mount root is configurable and deliberately lives outside the
+    /// store, so containment there is expressed as "the same place, a different name" rather than a
+    /// prefix. Either way a record naming somewhere else can never make recovery rename a directory
+    /// cowshed does not own.
     pub fn validate(&self, store_root: &Path) -> CowshedResult<()> {
         let paths = [
             ("checkout", &self.checkout_path, false),
             ("old project", &self.old_project_root, true),
             ("new project", &self.new_project_root, true),
-            ("old mount", &self.old_mount_root, true),
-            ("new mount", &self.new_mount_root, true),
+            ("old mount", &self.old_mount_root, false),
+            ("new mount", &self.new_mount_root, false),
         ];
         for (name, path, inside_store) in paths {
             if !path.is_absolute() {
@@ -321,6 +326,17 @@ impl RepositoryIdentityIntent {
                     store_root.display()
                 )));
             }
+        }
+        // `<mount-root>/<owner>/<repo>` on both sides, so the shared grandparent is the configured
+        // mount root itself.
+        if self.old_mount_root.parent().and_then(Path::parent)
+            != self.new_mount_root.parent().and_then(Path::parent)
+        {
+            return Err(malformed_identity_intent(format!(
+                "repository identity intent mount paths {} and {} are not under one mount root",
+                self.old_mount_root.display(),
+                self.new_mount_root.display()
+            )));
         }
         if self.old_repo_id == self.new_repo_id
             || self.old_project_root == self.new_project_root
