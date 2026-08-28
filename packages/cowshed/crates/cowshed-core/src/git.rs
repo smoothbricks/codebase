@@ -36,6 +36,17 @@ pub const FALLBACK_MAIN_REMOTE: &str = "cowshed-main";
 /// removes it: it is not a user remote, and it names the recorded checkout rather than the mount.
 const LEGACY_MAIN_REMOTE: &str = "host";
 
+/// The config key that records "cowshed created this remote and may retarget it".
+///
+/// Ownership has to be a written-down fact rather than one inferred from the URL. Inferring it
+/// failed in exactly one direction and it was the expensive one: after a checkout moved, the `main`
+/// remote still held the *old* mount path, so a URL comparison read it as somebody else's remote,
+/// cowshed stood beside it under `cowshed-main`, and every workspace kept a `main` remote pointing
+/// at a directory that had stopped being a repository. `git fetch main` then failed forever and
+/// `mv`/`attach` both reported success. A remote git namespaces under `remote.<name>.*` is the
+/// natural home for the fact, so the answer travels with the thing it describes.
+const REMOTE_OWNER_KEY: &str = "cowshed";
+
 /// The name a workspace's `main` remote is actually registered under, once configuration has run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainRemote {
@@ -53,6 +64,25 @@ impl MainRemote {
             Self::Displaced => FALLBACK_MAIN_REMOTE,
         }
     }
+}
+
+/// One `merge.<name>.driver` entry and whether its program survives a moved checkout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeDriver {
+    pub name: String,
+    pub state: MergeDriverState,
+}
+
+/// How a merge driver's program is spelt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeDriverState {
+    /// Already a repository-relative path, which is the only relocation-proof spelling.
+    Relative,
+    /// An absolute path that named a file inside this repository, rewritten to `to`.
+    Relativized { to: String },
+    /// An absolute path with no counterpart inside this repository. Cowshed will not invent one:
+    /// the driver is the project's, and a wrong guess would silently merge with the wrong program.
+    Unresolvable { program: String },
 }
 
 /// Where a linked-worktree registration is taken out before its pointer is moved to the mount
@@ -619,7 +649,12 @@ impl GitRepository {
     /// where a relative path resolves against the wrong directory.
     pub async fn object_directory(&self) -> Result<PathBuf> {
         let output = self
-            .run(["rev-parse", "--path-format=absolute", "--git-path", "objects"])
+            .run([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ])
             .await?;
         if !output.status.success() {
             return Err(git_internal("locate the git object store", &output));
@@ -864,6 +899,11 @@ impl GitRepository {
     /// just stripped, and again on any later reconciliation against one an agent has been working
     /// in — where `cowshed repo` mirrors and hand-added remotes are the user's, and a remote named
     /// `main` may well be one of them.
+    ///
+    /// Ownership decides, and ownership is read from [`REMOTE_OWNER_KEY`] rather than guessed from
+    /// the URL. A remote cowshed owns is retargeted whatever it currently says — that is the whole
+    /// repair after a checkout moves. A remote cowshed does not own is never touched, and cowshed
+    /// stands beside it under [`FALLBACK_MAIN_REMOTE`].
     pub async fn configure_main_remote(&self, main_mount: &Path) -> Result<MainRemote> {
         if !main_mount.is_absolute() {
             return Err(CowshedError::usage(
@@ -880,18 +920,213 @@ impl GitRepository {
             ensure_git_success("remove superseded host remote", output)?;
         }
         match self.remote_url(MAIN_REMOTE).await? {
-            // Already ours and already correct: the idempotent re-run.
-            Some(url) if Path::new(&url) == main_mount => Ok(MainRemote::Canonical),
-            // Someone else holds the name. Leave it exactly as it is and stand beside it.
-            Some(_) => {
-                self.set_remote(FALLBACK_MAIN_REMOTE, main_mount).await?;
-                Ok(MainRemote::Displaced)
-            }
             None => {
-                self.set_remote(MAIN_REMOTE, main_mount).await?;
+                self.set_owned_remote(MAIN_REMOTE, main_mount).await?;
                 Ok(MainRemote::Canonical)
             }
+            Some(url) if self.owns_remote(MAIN_REMOTE, &url, main_mount).await? => {
+                self.set_owned_remote(MAIN_REMOTE, main_mount).await?;
+                Ok(MainRemote::Canonical)
+            }
+            Some(_) => {
+                self.set_owned_remote(FALLBACK_MAIN_REMOTE, main_mount)
+                    .await?;
+                Ok(MainRemote::Displaced)
+            }
         }
+    }
+
+    /// Is the remote named `name`, currently pointing at `url`, cowshed's to retarget?
+    ///
+    /// The recorded fact is *the URL cowshed last wrote*, not a boolean "cowshed made this". A
+    /// boolean cannot survive the one thing users actually do — `git remote set-url main <their
+    /// upstream>` inside a workspace — because the flag would still say "cowshed's" over a URL the
+    /// user chose, and the next reconciliation would clobber it. A recorded value answers both
+    /// questions at once: equal means untouched since cowshed wrote it, so retargeting is cowshed
+    /// correcting itself; different means somebody edited it, so hands off.
+    ///
+    /// With no record at all — every workspace minted before this was written down — two things
+    /// still establish ownership without guessing:
+    ///
+    /// * the URL already names `main_mount`, so claiming it changes nothing and the record is
+    ///   adopted on this first reconciliation;
+    /// * the URL is an absolute local path holding no repository. Nothing can be fetched from a
+    ///   directory with no object store, so this is not a working remote being displaced, it is a
+    ///   record whose subject has gone. A *live* foreign repository is left alone, and a URL that
+    ///   is not a local path is never a candidate.
+    async fn owns_remote(&self, name: &str, url: &Path, main_mount: &Path) -> Result<bool> {
+        if let Some(recorded) = self.recorded_remote_owner(name).await? {
+            return Ok(recorded == url);
+        }
+        if url == main_mount {
+            return Ok(true);
+        }
+        Ok(url.is_absolute() && !is_git_repository(url).await?)
+    }
+
+    /// The URL cowshed recorded for `name`, or `None` if cowshed never wrote one.
+    async fn recorded_remote_owner(&self, name: &str) -> Result<Option<PathBuf>> {
+        let output = self
+            .run([
+                "config",
+                "--get",
+                &format!("remote.{name}.{REMOTE_OWNER_KEY}"),
+            ])
+            .await?;
+        if output.status.success() {
+            return parse_one_path(&output.stdout, "recorded remote owner").map(Some);
+        }
+        // git-config exits 1 for an absent key; anything else is a real failure.
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        Err(git_internal("read remote ownership", &output))
+    }
+
+    /// Point `name` at `url` and record the URL just written, so the next reconciliation can tell
+    /// its own record from an edit somebody made after it.
+    async fn set_owned_remote(&self, name: &str, url: &Path) -> Result<()> {
+        self.set_remote(name, url).await?;
+        let output = self
+            .run([
+                OsStr::new("config"),
+                OsStr::new(&format!("remote.{name}.{REMOTE_OWNER_KEY}")),
+                url.as_os_str(),
+            ])
+            .await?;
+        ensure_git_success("record remote ownership", output)
+    }
+
+    /// What every `merge.*.driver` in this repository's local config looks like, without changing
+    /// any of them. `doctor` reads this; it never writes.
+    pub async fn inspect_merge_drivers(&self) -> Result<Vec<MergeDriver>> {
+        self.classified_merge_drivers().await
+    }
+
+    /// Rewrite every `merge.*.driver` whose program is an absolute path into the
+    /// repository-relative spelling, and report the state of all of them afterwards.
+    ///
+    /// Relative is not a preference here, it is the only correct form. Git runs a merge driver with
+    /// its working directory at the top of the work tree (gitattributes(5), "Defining a custom merge
+    /// driver"), so `scripts/merge-ledger.py %O %A %B` resolves for every checkout of the
+    /// repository forever, while an absolute path buys nothing and dies the first time the checkout
+    /// moves — which is how every rebase in a relocated project came to fail with
+    /// `merge-ledger.py: No such file or directory`.
+    ///
+    /// Idempotent: a driver that is already relative is left byte-for-byte alone, and one whose
+    /// program has no counterpart in this repository is reported rather than guessed at.
+    pub async fn repair_merge_drivers(&self) -> Result<Vec<MergeDriver>> {
+        let drivers = self.classified_merge_drivers().await?;
+        for driver in &drivers {
+            let MergeDriverState::Relativized { to } = &driver.state else {
+                continue;
+            };
+            let output = self
+                .run(["config", &format!("merge.{}.driver", driver.name), to])
+                .await?;
+            ensure_git_success("rewrite merge driver", output)?;
+        }
+        Ok(drivers)
+    }
+
+    async fn classified_merge_drivers(&self) -> Result<Vec<MergeDriver>> {
+        // `-z` because a driver command is free-form text: records are NUL-separated and the key is
+        // separated from its value by the first newline, so a value containing spaces — every real
+        // driver does, it carries `%O %A %B` — survives intact.
+        let output = self
+            .run([
+                "config",
+                "--local",
+                "-z",
+                "--get-regexp",
+                r"^merge\..*\.driver$",
+            ])
+            .await?;
+        // Exit 1 is git's answer for "no key matched", which is most repositories.
+        if output.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+        if !output.status.success() {
+            return Err(git_internal("list merge drivers", &output));
+        }
+        let text = String::from_utf8(output.stdout).map_err(|error| {
+            CowshedError::integrity(error.to_string(), "repair the git configuration")
+        })?;
+        let mut drivers = Vec::new();
+        for record in text.split('\0').filter(|record| !record.is_empty()) {
+            let Some((key, command)) = record.split_once('\n') else {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "git reported a merge driver with no value: {key}",
+                        key = record
+                    ),
+                    "repair the git configuration",
+                ));
+            };
+            let name = key
+                .strip_prefix("merge.")
+                .and_then(|rest| rest.strip_suffix(".driver"))
+                .ok_or_else(|| {
+                    CowshedError::integrity(
+                        format!("git reported an unexpected merge driver key: {key}"),
+                        "repair the git configuration",
+                    )
+                })?;
+            drivers.push(MergeDriver {
+                name: name.to_owned(),
+                state: self.classify_driver_command(command),
+            });
+        }
+        Ok(drivers)
+    }
+
+    fn classify_driver_command(&self, command: &str) -> MergeDriverState {
+        // Only the program is a path; everything after it is git's placeholder arguments and is
+        // carried through untouched.
+        let (program, arguments) = match command.split_once(char::is_whitespace) {
+            Some((program, arguments)) => (program, Some(arguments)),
+            None => (command, None),
+        };
+        let program_path = Path::new(program);
+        if !program_path.is_absolute() {
+            return MergeDriverState::Relative;
+        }
+        let Some(relative) = self.repository_relative_program(program_path) else {
+            return MergeDriverState::Unresolvable {
+                program: program.to_owned(),
+            };
+        };
+        let mut to = relative.to_string_lossy().into_owned();
+        if let Some(arguments) = arguments {
+            to.push(' ');
+            to.push_str(arguments);
+        }
+        MergeDriverState::Relativized { to }
+    }
+
+    /// The same program, named relative to this repository's root — or `None` if it is not in it.
+    ///
+    /// Two rules, exact first. A program already under this root is simply stripped. Otherwise the
+    /// longest tail of the absolute path that names an existing file under the root is the answer:
+    /// that is what recovers a driver still spelt against a checkout path that no longer exists,
+    /// where no prefix arithmetic is possible because the old prefix was never recorded anywhere.
+    /// Longest rather than shortest because it agrees with more of what the operator wrote.
+    fn repository_relative_program(&self, program: &Path) -> Option<PathBuf> {
+        if let Ok(stripped) = program.strip_prefix(&self.root)
+            && self.root.join(stripped).is_file()
+        {
+            return Some(stripped.to_owned());
+        }
+        let components: Vec<_> = program
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        (0..components.len())
+            .map(|skip| components[skip..].iter().collect::<PathBuf>())
+            .find(|candidate| self.root.join(candidate).is_file())
     }
 
     /// Register `workspace`'s mount as a remote in *this* repository, which is main's.
@@ -1185,6 +1420,22 @@ where
     S: AsRef<OsStr>,
 {
     run_git_at_with_objects(root, None, args).await
+}
+
+/// Does `path` currently hold a git repository?
+///
+/// Asked of a remote URL, this separates "somebody else's working remote" from "a record whose
+/// subject has gone". `rev-parse --git-dir` is git's own answer and covers every shape — worktree,
+/// bare, submodule pointer file — where a `.git` existence check covers one. A path that is not a
+/// directory at all fails the same way, which is the answer we want.
+async fn is_git_repository(path: &Path) -> Result<bool> {
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(run_git_at(path, ["rev-parse", "--git-dir"])
+        .await?
+        .status
+        .success())
 }
 
 async fn run_git_at_with_objects<I, S>(
@@ -1778,8 +2029,10 @@ mod tests {
         );
 
         // Foreign: the user's remote keeps both its name and its URL, byte for byte, and cowshed's
-        // upstream stands beside it under the fallback name.
-        let foreign = PathBuf::from("/tmp/somewhere-the-user-chose");
+        // upstream stands beside it under the fallback name. A network URL is the unambiguous case
+        // — it can never be a path cowshed recorded — and it is what a fork workflow actually puts
+        // there.
+        let foreign = PathBuf::from("https://github.com/example/upstream.git");
         repo.set_remote(MAIN_REMOTE, &foreign)
             .await
             .expect("user retargets main");
@@ -1798,9 +2051,65 @@ mod tests {
             repo.remote_url(FALLBACK_MAIN_REMOTE)
                 .await
                 .expect("read fallback"),
-            Some(mount)
+            Some(mount.clone())
         );
         assert_eq!(MainRemote::Displaced.remote_name(), FALLBACK_MAIN_REMOTE);
+
+        // Ownership is the URL cowshed wrote, so an edit invalidates it and keeps invalidating it:
+        // once the user holds the name, cowshed stays beside them however that URL later changes.
+        let edited_again = root.join("wherever-the-user-went-next");
+        repo.set_remote(MAIN_REMOTE, &edited_again)
+            .await
+            .expect("user retargets main again");
+        assert_eq!(
+            repo.configure_main_remote(&mount)
+                .await
+                .expect("still displaced"),
+            MainRemote::Displaced
+        );
+        assert_eq!(
+            repo.remote_url(MAIN_REMOTE).await.expect("read url"),
+            Some(edited_again),
+            "a remote the user has edited is never reclaimed, dead path or not"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// The state a moved checkout leaves in every workspace minted before ownership was recorded:
+    /// `main` naming a directory that has stopped being a repository. Nothing can be fetched from
+    /// it, so it is cowshed's own record with its subject gone rather than a working remote being
+    /// displaced — and leaving it is what made `git fetch main` fail forever across a whole project
+    /// while `mv` and `attach` both reported success.
+    #[tokio::test]
+    async fn a_legacy_main_remote_naming_a_dead_path_is_reclaimed_rather_than_stood_beside() {
+        let root = repository();
+        let mount = root.join("main-mount");
+        fs::create_dir_all(&mount).expect("main mount");
+        let dead = root.join("checkout-that-moved-away");
+        assert!(!dead.exists(), "the fixture path must genuinely be absent");
+        let repo = GitRepository::from_root(&root);
+        // `set_remote` and not `set_owned_remote`: this workspace predates the ownership record.
+        repo.set_remote(MAIN_REMOTE, &dead)
+            .await
+            .expect("plant a stale record");
+
+        assert_eq!(
+            repo.configure_main_remote(&mount)
+                .await
+                .expect("reclaim a dead record"),
+            MainRemote::Canonical
+        );
+        assert_eq!(
+            repo.remote_url(MAIN_REMOTE).await.expect("read url"),
+            Some(mount)
+        );
+        assert_eq!(
+            repo.remote_url(FALLBACK_MAIN_REMOTE)
+                .await
+                .expect("read fallback"),
+            None,
+            "no second remote is left behind"
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
