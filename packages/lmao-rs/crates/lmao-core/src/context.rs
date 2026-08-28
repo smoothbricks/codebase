@@ -37,7 +37,7 @@ pub struct TraceContext {
 
 impl TraceContext {
     /// `thread_id` comes from the host's entropy seam once per process/worker
-    /// (`01b4`); pass it in rather than generating here so the AxE sim can seed it.
+    /// (`01b4`); pass it in rather than generating here so a simulation can seed it.
     pub fn new(trace_id: TraceId, thread_id: u64, clock: Arc<dyn Clock>) -> Self {
         let anchor = TraceAnchor::capture(&*clock);
         Self {
@@ -91,7 +91,7 @@ impl TraceContext {
     /// value ([`Transient`]); each retry gets a FRESH span buffer (attempts are
     /// separate spans sharing the parent) and `sleep` receives the policy delay —
     /// inject `std::thread::sleep`, `tokio::time::sleep` via a bridge, or a no-op
-    /// in the AxE sim.
+    /// in a deterministic simulation.
     pub fn span_with_retry<T, E>(
         &self,
         name: &str,

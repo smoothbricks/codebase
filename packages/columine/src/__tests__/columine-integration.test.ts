@@ -82,12 +82,12 @@ function createMockColumineBackend(overrides: Partial<ColumineBackend> = {}): Co
 }
 
 // =============================================================================
-// BytecodeBuilder (minimal, local to avoid circular dep on axe-runtime)
+// BytecodeBuilder (minimal, local to avoid circular dep on the superset runtime)
 // =============================================================================
 
 /**
  * Minimal bytecode builder for test programs.
- * We avoid importing from axe-runtime to prove columine works standalone.
+ * We avoid importing from the superset runtime to prove columine works standalone.
  */
 function buildProgram(opts: {
   slots: Array<

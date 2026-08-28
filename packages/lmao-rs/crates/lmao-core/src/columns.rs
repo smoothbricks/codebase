@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 /// A shared string slot value: `'static` borrows (log templates, compile-time
 /// names) cost ZERO allocations; dynamic values ride an `Arc` refcount bump.
-/// This is what keeps the AxE zero-alloc gate honest for `log(template)`.
+/// This is what keeps the zero-alloc gate honest for `log(template)`.
 #[derive(Debug, Clone)]
 pub enum SharedStr {
     Static(&'static str),
@@ -147,7 +147,7 @@ pub type EnumColumn = NumColumn<u16>;
 /// `None` = null (no separate bitmap needed, matching the JS `undefined`=null
 /// convention). Slots hold [`SharedStr`]: `'static` templates are free, dynamic
 /// values are a refcount bump — either way the post-warmup path satisfies the
-/// AxE zero-alloc gate.
+/// zero-alloc gate.
 #[derive(Debug, Default)]
 pub struct StrColumn {
     buf: Option<Box<[Option<SharedStr>]>>,

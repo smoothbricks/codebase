@@ -1,5 +1,5 @@
-//! Placeholder bench harness for the AxE overhead gates
-//! (`AxE/specs/sim/01-deterministic-scheduler.md` §5):
+//! Placeholder bench harness for the overhead gates
+//! (deterministic scheduler specification §5):
 //! - enabling tracing must not cut median throughput by >20% at a 10^6-event run
 //! - peak RSS increase ≤25%
 //!

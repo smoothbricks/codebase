@@ -5,14 +5,14 @@
 //! Avoids repeated wall-clock syscalls and long-run drift; each trace is a fresh
 //! self-contained time reference.
 //!
-//! The [`Clock`] trait is the AxE determinism seam
-//! (`AxE/specs/sim/01-deterministic-scheduler.md`): kernel/sim code must never call
+//! The [`Clock`] trait is the determinism seam
+//! (deterministic scheduler specification): kernel/sim code must never call
 //! `SystemTime::now()`/`Instant::now()` directly — a simulated run injects a
 //! `SimClock` here and gets bit-identical trace bytes for a given seed.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Injectable time source. Production: [`SystemClock`]. AxE sim: a deterministic clock.
+/// Injectable time source. A deterministic simulation injects a deterministic clock.
 pub trait Clock: Send + Sync {
     /// Wall-clock nanoseconds since the Unix epoch (captured once per trace).
     fn wall_nanos(&self) -> i64;
@@ -85,8 +85,8 @@ impl TraceAnchor {
 ///
 /// Trade-off: entries stamped from the cache share a timestamp (ordering within
 /// a span is still exact — row order is authoritative, `08-trace-testing.md`
-/// orders by parentage + row, not by distinct timestamps). Under the AxE sim the
-/// inner clock is already virtual and this wrapper is harmless.
+/// orders by parentage + row, not by distinct timestamps). Under deterministic
+/// simulation the inner clock is already virtual and this wrapper is harmless.
 #[derive(Debug)]
 pub struct CoarseClock<C> {
     inner: C,
@@ -141,7 +141,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Deterministic clock: fixed wall time, monotonic ticks on every read.
-    /// This is the shape an AxE `SimClock` adapter will take.
+    /// This is the shape a deterministic simulation clock adapter will take.
     pub struct TickClock {
         ticks: AtomicU64,
     }

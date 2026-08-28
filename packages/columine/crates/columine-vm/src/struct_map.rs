@@ -226,14 +226,14 @@ impl StructMapSlot {
         state[(row_off + u32::from(field_idx) / 8) as usize] |= 1u8 << (field_idx % 8);
     }
 
-    //#region axe!n/reduce-typed-state.scatter-clear
+    //#region reduce-typed-state.scatter-clear
     /// Clear a single field's bit in the bitset (inverse of `set_field_bit`).
     /// Used by BATCH_STRUCT_MAP_PROBE_SCATTER card-one retract to drop one
     /// routed attribute field without disturbing the row's other field bits.
     pub fn clear_scalar_field(state: &mut [u8], row_off: u32, field_idx: u8) {
         state[(row_off + u32::from(field_idx) / 8) as usize] &= !(1u8 << (field_idx % 8));
     }
-    //#endregion axe!n/reduce-typed-state.scatter-clear
+    //#endregion reduce-typed-state.scatter-clear
 
     /// struct_map.zig:140 `clearBitset`.
     pub fn clear_bitset(&self, state: &mut [u8], row_off: u32) {

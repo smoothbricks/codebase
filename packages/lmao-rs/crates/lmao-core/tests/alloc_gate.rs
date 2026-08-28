@@ -1,5 +1,5 @@
-//! AxE overhead gate: ZERO heap allocations per event after warmup
-//! (`AxE/specs/sim/01-deterministic-scheduler.md` §5 — the scheduler's steady state
+//! Overhead gate: ZERO heap allocations per event after warmup
+//! (deterministic scheduler specification §5 — the scheduler's steady state
 //! must be zero bytes / zero allocations per event; the tracer hot path must not
 //! break that).
 //!

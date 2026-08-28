@@ -59,9 +59,9 @@ into hot-path writes; offsets/constants it folds are per-library-schema, not per
 
 ### 5. Native lmao-rs hosts don't need the transformer
 
-In-process Rust (jcode, AxE sim) gets the same effect from `define_log_schema!` proc-macro expansion at Rust compile
-time (1.9 ns append, 2.5 ns tag write, per the main investigation). The native ttsc transformer is the _TypeScript-host_
-analog of that macro — same role and schema-static philosophy, in one compiler implementation.
+In-process Rust (jcode, deterministic simulation) gets the same effect from `define_log_schema!` proc-macro expansion at
+Rust compile time (1.9 ns append, 2.5 ns tag write, per the main investigation). The native ttsc transformer is the
+_TypeScript-host_ analog of that macro — same role and schema-static philosophy, in one compiler implementation.
 
 ## Current shipped span optimization
 
@@ -423,7 +423,7 @@ analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that 
   one-`defineModule`-per-file invariant could likewise become diagnostics rather than runtime/build failures.
 - **Compile-time log-level stripping.** Production config → `log.debug`/ `log.trace` statements deleted at emit (not
   branched over). Zero-cost disabled levels; composes with feature flags (01p) for flag-gated spans. The "stripped, not
-  stubbed" law from AxE's sim toolchain, applied to TS.
+  stubbed" law from the deterministic simulation toolchain, applied to TS.
 - **Checker-powered §4 at native speed — implemented.** The ttsc plugin uses checker proof for the tag-chain inliner and
   preserves conservative runtime fallback when a receiver/schema cannot be proven.
 - **Compile-time schema-composition checking.** With project references the plugin sees library schemas AND the app's

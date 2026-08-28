@@ -1,8 +1,8 @@
 //! Dynamic RecordBatch encoder (`arrow/dynamic_record_batch.zig`).
 //!
-//! Drift audit: byte-identical between columine and axe-runtime today — the
+//! Drift audit: the two artifact variants are byte-identical today — the
 //! `recordBatchMetadataSize` + in-place-body optimization was forward-ported
-//! to columine before this port. The RecordBatch FlatBuffer is hand-emitted
+//! to this crate before this port. The RecordBatch FlatBuffer is hand-emitted
 //! in place, field by field; no FlatBuffer library, no intermediate model.
 //! The emitted bytes ARE the contract (Flechette/arrow-js parses them), so
 //! every offset below mirrors the Zig source line-for-line.

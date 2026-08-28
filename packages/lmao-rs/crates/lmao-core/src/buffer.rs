@@ -13,7 +13,7 @@
 //! on the hot path (`01a`): category/text columns hold owned refs, dictionary building
 //! is deferred to the Arrow flush pass in `lmao-arrow`.
 //!
-//! HARD CONSTRAINT (AxE `01-deterministic-scheduler.md` §5): zero heap allocations per
+//! HARD CONSTRAINT (deterministic scheduler specification §5): zero heap allocations per
 //! event after warmup. All growth happens via overflow chaining (allocate a NEW buffer,
 //! never realloc in place) so writes are wait-free with respect to readers.
 

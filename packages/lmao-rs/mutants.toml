@@ -1,7 +1,7 @@
 # cargo-mutants configuration (https://mutants.rs)
 #
-# AxE convention (AxE/specs/sim/07-mutation-testing.md): lmao INSTRUMENTATION CALL
-# SITES in application code are "arid" (excluded from mutation) — but the tracer's
+# Deterministic simulation convention (mutation-testing specification §7): lmao
+# INSTRUMENTATION CALL SITES in application code are "arid" (excluded from mutation) — but the tracer's
 # OWN logic (this workspace) is fully mutated. Kernel-rule residue policy applies:
 # survivors must be classified equivalent / invalid / budget-timeout / unreached /
 # oracle-gap; only demonstrated equivalence is acceptable.

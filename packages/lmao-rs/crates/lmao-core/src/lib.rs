@@ -5,10 +5,9 @@
 //! `01a_trace_schema_system.md`, `01b_columnar_buffer_architecture.md` (+ `01b1`..`01b5`),
 //! `01f_arrow_table_structure.md`, `01h_entry_types_and_logging_primitives.md`.
 //!
-//! Determinism constraints come from `AxE/specs/sim/` (esp. `01-deterministic-scheduler.md`
-//! and `08-trace-testing.md`): time and entropy only via the [`clock::Clock`] and
-//! [`identity::Entropy`] traits; same `(build, seed, config)` must produce bit-identical
-//! trace bytes; zero heap allocations per event after warmup.
+//! Determinism constraints come from the deterministic scheduler and trace-testing specs:
+//! time and entropy only via the [`clock::Clock`] and [`identity::Entropy`] traits; same
+//! `(build, seed, config)` must produce bit-identical trace bytes; zero heap allocations per event after warmup.
 
 pub mod buffer;
 pub mod clock;

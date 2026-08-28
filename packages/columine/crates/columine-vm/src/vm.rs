@@ -428,8 +428,8 @@ fn remove_entry_by_key(
 }
 
 /// vm.zig:785 `evictExpired` — evict everything older than the cutoff.
-/// `#region axe!n/vm-architecture-ttl.evict` carries over from the Zig.
-//#region axe!n/vm-architecture-ttl.evict #eviction-index #o-expired
+/// `#region vm-architecture-ttl.evict` carries over from the Zig.
+//#region vm-architecture-ttl.evict #eviction-index #o-expired
 pub fn evict_expired(
     undo: &mut UndoState,
     env: &mut BitmapEnv,
@@ -532,7 +532,7 @@ pub fn evict_expired(
 
     removed_count
 }
-//#endregion axe!n/vm-architecture-ttl.evict
+//#endregion vm-architecture-ttl.evict
 
 // =============================================================================
 // Derived-facts header access (vm.zig:3294-3348)
@@ -673,7 +673,7 @@ impl UndoState {
     /// rete.zig derived-fact journaling (FACT_INSERT_NEW / FACT_INSERT_UPDATE /
     /// FACT_RETRACT) appends through the same undo-only lane as evict — Zig's
     /// rete.zig:445/463/540 call `vm.undoAppend` directly. Public API extension
-    /// for the axe-rete crate; caller checks `enabled` like the Zig call sites.
+    /// for the consumer RETE crate; caller checks `enabled` like the Zig call sites.
     pub fn append_undo_only(&mut self, state: &[u8], entry: FlatUndoEntry) {
         self.append_undo_only_snapshot(state, entry);
     }
@@ -681,7 +681,7 @@ impl UndoState {
     /// Append a paired before/after mutation through the same bounded journal
     /// and first-overflow snapshot path as VM-owned delta mutations.
     ///
-    /// AxE's derived-fact VM uses this public seam because its RETE execution
+    /// The derived-fact VM uses this public seam because its RETE execution
     /// lives in a sibling crate while the journal remains owned here.
     pub fn append_pair(
         &mut self,
@@ -2071,7 +2071,7 @@ fn single_struct_map2_remove(
     ErrorCode::Ok
 }
 
-//#region axe!n/reduce-typed-state.probe-upsert
+//#region reduce-typed-state.probe-upsert
 /// vm.zig:1139 `singleStructMapUpsertFromProbe` — copy remapped fields from a
 /// probed source row into the out slot (the `.lookup` join).
 #[allow(clippy::too_many_arguments)]
@@ -2149,7 +2149,7 @@ fn single_struct_map_upsert_from_probe(
         pos: result.pos,
     }
 }
-//#endregion axe!n/reduce-typed-state.probe-upsert
+//#endregion reduce-typed-state.probe-upsert
 
 /// vm.zig:1200 `writeStructMapArrayFields` — CSR array fields into the arena.
 #[allow(clippy::too_many_arguments)]
@@ -2507,20 +2507,20 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => 5,
         Opcode::BatchMapRemoveIf => 4,
         Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => 7,
-        //#region axe!n/reduce-typed-state.probe-len
+        //#region reduce-typed-state.probe-len
         Opcode::BatchStructMapProbe => {
             let num_fields = usize::from(*code.get(pc.checked_add(5)?)?);
             6usize
                 .checked_add(num_fields.checked_mul(2)?)?
                 .checked_add(1)?
         }
-        //#endregion axe!n/reduce-typed-state.probe-len
-        //#region axe!n/reduce-typed-state.scatter-len
+        //#endregion reduce-typed-state.probe-len
+        //#region reduce-typed-state.scatter-len
         Opcode::BatchStructMapProbeScatter => {
             let num_routes = usize::from(*code.get(pc.checked_add(6)?)?);
             7usize.checked_add(num_routes.checked_mul(5)?)?
         }
-        //#endregion axe!n/reduce-typed-state.scatter-len
+        //#endregion reduce-typed-state.scatter-len
         Opcode::BatchSetInsert
         | Opcode::BatchSetRemove
         | Opcode::BatchBitmapAdd
@@ -4193,7 +4193,7 @@ impl Vm {
                     }
                 }
 
-                //#region axe!n/reduce-typed-state.probe-exec
+                //#region reduce-typed-state.probe-exec
                 // STRUCT_MAP_PROBE (0x2e)
                 0x2e => {
                     let (probe_slot, key_col, _miss_mode, out_slot, num_fields) = (
@@ -4241,9 +4241,9 @@ impl Vm {
                         return NEEDS_GROWTH;
                     }
                 }
-                //#endregion axe!n/reduce-typed-state.probe-exec
+                //#endregion reduce-typed-state.probe-exec
 
-                //#region axe!n/reduce-typed-state.scatter-exec
+                //#region reduce-typed-state.scatter-exec
                 // STRUCT_MAP_PROBE_SCATTER (0x2f)
                 0x2f => {
                     let (
@@ -4446,7 +4446,7 @@ impl Vm {
                         _ => return INVALID_PROGRAM,
                     }
                 }
-                //#endregion axe!n/reduce-typed-state.scatter-exec
+                //#endregion reduce-typed-state.scatter-exec
 
                 // LIST_APPEND (0x84)
                 0x84 => {

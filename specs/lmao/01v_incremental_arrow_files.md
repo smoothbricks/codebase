@@ -9,16 +9,16 @@ consumers with one artifact:
 1. **Live tail readers** (the Console log stream, `session.grep`-class searches) follow committed record batches by
    offset over mmap, with bounded staleness.
 2. **Search** runs over the mmap-able columns of live and sealed files alike — no load step, no conversion.
-3. **The by-ref signal lane**: a sealed file is absorbed into the CAS and referenced by a single datom in the AxE event
-   log (`{:e sig :a :lmao/traceBatch :v #cas "b3:…"}` — AxE spec `specs/axe/02i-datom-log.md`), so monitoring agents
-   reduce trace columns without the trace pipeline ever copying its own data.
+3. **The by-ref signal lane**: a sealed file is absorbed into the CAS and referenced by a single datom in the event log
+   (`{:e sig :a :lmao/traceBatch :v #cas "b3:…"}` — the datom-log specification), so monitoring agents reduce trace
+   columns without the trace pipeline ever copying its own data.
 
 ## Ownership Boundary <a id="smoo/lmao!n/incremental-arrow.ownership"></a>
 
 **LMAO owns**: the file format contract below, the incremental writer, the tail/search reader primitives, batch-size
 self-tuning, sealing (finalize + hash). **The consuming system owns**: rotation policy (window boundaries), CAS
-absorption wiring, signal emission, retention, and indexing of sealed objects (the PTMCART Arrow window-index plane is
-the AxE-side consumer decision).
+absorption wiring, signal emission, retention, and indexing of sealed objects (the window-index plane is a consumer-side
+decision).
 
 ## File Contract <a id="smoo/lmao!n/incremental-arrow.contract"></a>
 
@@ -65,9 +65,8 @@ At a window boundary (the consumer's rotation policy — size, time, or module l
 1. Final flush; write the definitive footer. The file is now immutable.
 2. **Absorb into CAS**: BLAKE3 the file (incremental hashing may run alongside appends so sealing is metadata-only),
    link into the content-addressed store.
-3. Hand the consumer the ref. In AxE that becomes the by-ref trace signal, the sealed object is adopted in place by
-   archive window indexes (RowRef terminals point directly into it — zero rewrite), and GC roots it through the
-   referencing log.
+3. Hand the consumer the ref. The sealed object is adopted in place by archive window indexes (RowRef terminals point
+   directly into it — zero rewrite), and GC roots it through the referencing log.
 4. Open the next window's file.
 
 A sealed file and a live file answer the same reads through the same reader — sealing changes lifecycle, never format.
@@ -78,5 +77,5 @@ A sealed file and a live file answer the same reads through the same reader — 
 - [01f Arrow Table Structure](./01f_arrow_table_structure.md) — column schema and the ownership/copy contract
 - [01t Trace Archive Primitives](./01t_trace_archive_pipeline.md) — chunk identity and archive-side compaction over
   sealed objects
-- AxE repo: `specs/axe/02i-datom-log.md` (the by-ref signal lane), `specs/console/00-console.md` (the log-stream screen
-  consuming live tails)
+- The consuming system's datom-log and console specifications define the by-ref signal lane and the log-stream screen
+  consuming live tails.

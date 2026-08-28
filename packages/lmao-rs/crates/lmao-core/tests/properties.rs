@@ -217,7 +217,7 @@ fn run(capacity_exp: usize, ops: &[(u8, u16)]) -> lmao_core::SpanBuffer {
 }
 
 proptest! {
-    /// AxE H-SIM-4 shape: identical input sequences under a fixed Clock produce
+    /// Deterministic scheduler shape: identical input sequences under a fixed Clock produce
     /// BIT-IDENTICAL buffer contents (same bytes, both runs).
     #[test]
     fn identical_inputs_produce_bit_identical_buffers(
