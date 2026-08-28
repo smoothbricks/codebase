@@ -26,14 +26,9 @@ wasm:
     cargo build -p columine-wasm --target wasm32-unknown-unknown --profile wasm-release \
         -Zbuild-std=std,panic_abort
     cargo test -p columine-wasm --test export_checklist -- --include-ignored
-    @if command -v wasm-opt >/dev/null; then \
-        wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
-            target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm \
-            -o target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm; \
-    else \
-        cp target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm \
-            target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm; \
-    fi
+    wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
+        target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm \
+        -o target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm
     @mkdir -p dist
     @cp target/wasm32-unknown-unknown/wasm-release/columine_wasm.opt.wasm dist/columine.wasm
     @ls -la dist/columine.wasm
@@ -46,14 +41,9 @@ wasm-ep:
     cargo build -p columine-ep-wasm --target wasm32-unknown-unknown --profile wasm-release \
         -Zbuild-std=std,panic_abort
     cargo test -p columine-ep-wasm --test export_checklist -- --include-ignored
-    @if command -v wasm-opt >/dev/null; then \
-        wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
-            target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm \
-            -o target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm; \
-    else \
-        cp target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm \
-            target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm; \
-    fi
+    wasm-opt -Oz --converge --strip-producers --strip-target-features --zero-filled-memory \
+        target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm \
+        -o target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm
     @mkdir -p dist
     @cp target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.opt.wasm dist/event_processor.wasm
     @ls -la dist/event_processor.wasm
