@@ -2,9 +2,9 @@ import type { ReducerProgram, SlotDef, SlotTtlMetadata, StructFieldType } from '
 import {
   AggType,
   HEADER_SIZE,
-  MAGIC,
   Opcode,
   PROGRAM_HASH_PREFIX,
+  PROGRAM_MAGIC,
   SlotType,
   SlotTypeFlag,
   type TtlStartOf,
@@ -14,6 +14,8 @@ const SLOT_TYPE_MASK = 0x0f;
 const HAS_TTL_FLAG = SlotTypeFlag.HAS_TTL;
 const HAS_EVICT_TRIGGER_FLAG = SlotTypeFlag.HAS_EVICT_TRIGGER;
 const NO_HASHMAP_TIMESTAMPS_FLAG = SlotTypeFlag.NO_HASHMAP_TIMESTAMPS;
+/** Base acceptance stays centralized so embedders can add magics without changing parsing. */
+const DEFAULT_ACCEPTED_PROGRAM_MAGICS = [PROGRAM_MAGIC] as const;
 
 interface ParsedTtl {
   ttl: SlotTtlMetadata;
@@ -101,15 +103,19 @@ function parseTtlStartOf(value: number): TtlStartOf {
   }
 }
 
-export function parseReducerProgram(bytecode: Uint8Array, defaultCapacity = 1024): ReducerProgram {
+export function parseReducerProgram(
+  bytecode: Uint8Array,
+  defaultCapacity = 1024,
+  acceptedMagics: readonly number[] = DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+): ReducerProgram {
   const minLen = PROGRAM_HASH_PREFIX + HEADER_SIZE;
   if (bytecode.length < minLen) {
     throw new Error('Invalid program: too short');
   }
 
   const content = bytecode.subarray(PROGRAM_HASH_PREFIX);
-  const magic = content[0] | (content[1] << 8) | (content[2] << 16) | (content[3] << 24);
-  if (magic !== MAGIC) {
+  const magic = (content[0] | (content[1] << 8) | (content[2] << 16) | (content[3] << 24)) >>> 0;
+  if (!acceptedMagics.includes(magic)) {
     throw new Error('Invalid program: bad magic');
   }
 

@@ -4,9 +4,9 @@ import {
   type ColumnInput,
   ErrorCode,
   HEADER_SIZE,
-  MAGIC,
   Opcode,
   PROGRAM_HASH_PREFIX,
+  PROGRAM_MAGIC,
   SlotType,
   StructFieldType,
   ValueType,
@@ -25,10 +25,10 @@ function reducer(
   const code = [...reduce, Opcode.HALT];
   const bytecode = new Uint8Array(PROGRAM_HASH_PREFIX + HEADER_SIZE + init.length + code.length);
   const base = PROGRAM_HASH_PREFIX;
-  bytecode[base] = MAGIC & 0xff;
-  bytecode[base + 1] = (MAGIC >>> 8) & 0xff;
-  bytecode[base + 2] = (MAGIC >>> 16) & 0xff;
-  bytecode[base + 3] = (MAGIC >>> 24) & 0xff;
+  bytecode[base] = PROGRAM_MAGIC & 0xff;
+  bytecode[base + 1] = (PROGRAM_MAGIC >>> 8) & 0xff;
+  bytecode[base + 2] = (PROGRAM_MAGIC >>> 16) & 0xff;
+  bytecode[base + 3] = (PROGRAM_MAGIC >>> 24) & 0xff;
   bytecode[base + 4] = 1;
   bytecode[base + 6] = 1;
   bytecode[base + 7] = numInputs;

@@ -218,7 +218,7 @@ export enum ErrorCode {
 // Bytecode Constants
 // =============================================================================
 
-export const MAGIC = 0x31455841; // "AXE1"
+export const PROGRAM_MAGIC = 0x314d_4c43;
 export const HEADER_SIZE = 14;
 /** Reserved bytes at program start for SHA-256 hash (content starts at offset 32) */
 export const PROGRAM_HASH_PREFIX = 32;
@@ -350,8 +350,10 @@ export interface ColumineBackend {
   /**
    * Parse and validate a program. Fills embedded hash if needed; caches by hash when available.
    * Call once per agent type.
+   *
+   * @param acceptedMagics - Program magics accepted by this embedder. Defaults to [PROGRAM_MAGIC].
    */
-  loadProgram(bytecode: Uint8Array): Promise<ReducerProgram>;
+  loadProgram(bytecode: Uint8Array, acceptedMagics?: readonly number[]): Promise<ReducerProgram>;
 
   // ===========================================================================
   // State Management

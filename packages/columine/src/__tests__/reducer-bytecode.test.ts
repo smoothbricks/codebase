@@ -3,26 +3,26 @@ import { describe, expect, it } from 'bun:test';
 import { parseReducerProgram } from '../reducer-bytecode.js';
 import {
   AggType,
-  MAGIC,
   Opcode,
   PROGRAM_HASH_PREFIX,
+  PROGRAM_MAGIC,
   SlotType,
   SlotTypeFlag,
   StructFieldType,
   TtlStartOf,
 } from '../types.js';
 
-function buildProgram(initCode: number[], numSlots: number): Uint8Array {
+function buildProgram(initCode: number[], numSlots: number, magic = PROGRAM_MAGIC): Uint8Array {
   const headerSize = 14;
   const reduceCode = [0x00];
   const totalLen = PROGRAM_HASH_PREFIX + headerSize + initCode.length + reduceCode.length;
   const out = new Uint8Array(totalLen);
   const base = PROGRAM_HASH_PREFIX;
 
-  out[base + 0] = MAGIC & 0xff;
-  out[base + 1] = (MAGIC >> 8) & 0xff;
-  out[base + 2] = (MAGIC >> 16) & 0xff;
-  out[base + 3] = (MAGIC >> 24) & 0xff;
+  out[base + 0] = magic & 0xff;
+  out[base + 1] = (magic >> 8) & 0xff;
+  out[base + 2] = (magic >> 16) & 0xff;
+  out[base + 3] = (magic >> 24) & 0xff;
   out[base + 4] = 1;
   out[base + 5] = 0;
   out[base + 6] = numSlots;
@@ -48,6 +48,13 @@ function ttlBytes(ttlSeconds: number, graceSeconds: number, tsField: number, sta
 }
 
 describe('parseReducerProgram', () => {
+  it('rejects foreign magics by default and admits them when explicitly accepted', () => {
+    const foreignMagic = 0xdead_beef;
+    const bytecode = buildProgram([Opcode.SLOT_DEF, 0, SlotType.HASHSET, 4, 0, Opcode.HALT], 1, foreignMagic);
+
+    expect(() => parseReducerProgram(bytecode)).toThrow('Invalid program: bad magic');
+    expect(parseReducerProgram(bytecode, 1024, [PROGRAM_MAGIC, foreignMagic]).slotDefs).toHaveLength(1);
+  });
   it('decodes SLOT_DEF type nibble while preserving TTL metadata', () => {
     const typeFlags = SlotType.HASHMAP | SlotTypeFlag.HAS_TTL | SlotTypeFlag.HAS_EVICT_TRIGGER;
     const initCode = [0x10, 0x00, typeFlags, 0x20, 0x00, ...ttlBytes(90, 5, 3, TtlStartOf.MINUTE), 0x00];

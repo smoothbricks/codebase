@@ -489,8 +489,8 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
   const backend: ColumineBackend = {
     backend: 'wasm',
 
-    async loadProgram(bytecode: Uint8Array): Promise<ReducerProgram> {
-      return parseReducerProgram(bytecode);
+    async loadProgram(bytecode: Uint8Array, acceptedMagics?: readonly number[]): Promise<ReducerProgram> {
+      return parseReducerProgram(bytecode, undefined, acceptedMagics);
     },
 
     createState(program: ReducerProgram): StateHandle {
