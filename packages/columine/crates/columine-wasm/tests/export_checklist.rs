@@ -1,11 +1,9 @@
-//! Pins the wasm export surface against the Zig `columine.wasm` ground
-//! truth: 56 vm_* function exports plus the EXPORTED memory (frozen from the
-//! Zig artifact's export section at cutover — the Zig build is deleted; this
-//! list is its tombstone). The surface is the superset minus the
-//! RETE/ax_eval/condition-tree families.
+//! Pins the wasm export surface: 62 expected `vm_*` function exports plus
+//! exported memory. The list is the frozen Columine ABI baseline and excludes
+//! the RETE/ax_eval/condition-tree families.
 
-/// Every function export of the Zig columine.wasm.
-pub const ZIG_COLUMINE_EXPORTS: [&str; 62] = [
+/// Expected function exports of the Columine wasm artifact.
+pub const EXPECTED_COLUMINE_EXPORTS: [&str; 62] = [
     "vm_calculate_grown_state_size",
     "vm_calculate_state_size",
     "vm_delta_apply_rollback_segment",
@@ -112,12 +110,12 @@ fn wasm_exports(bytes: &[u8]) -> Vec<(String, u8)> {
 
 #[test]
 fn export_list_is_complete_and_deduped() {
-    let mut names: Vec<&str> = ZIG_COLUMINE_EXPORTS.to_vec();
+    let mut names: Vec<&str> = EXPECTED_COLUMINE_EXPORTS.to_vec();
     names.sort_unstable();
     names.dedup();
     assert_eq!(
         names.len(),
-        ZIG_COLUMINE_EXPORTS.len(),
+        EXPECTED_COLUMINE_EXPORTS.len(),
         "duplicate names in the checklist"
     );
 }
@@ -125,7 +123,7 @@ fn export_list_is_complete_and_deduped() {
 /// `just wasm` (columine justfile) runs this against the built artifact.
 #[test]
 #[ignore = "needs target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm (run `just wasm`)"]
-fn built_wasm_exports_every_zig_symbol_and_memory() {
+fn built_wasm_exports_expected_symbols_and_memory() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm"
@@ -138,7 +136,7 @@ fn built_wasm_exports_every_zig_symbol_and_memory() {
         .filter(|(_, k)| *k == 0)
         .map(|(n, _)| n.as_str())
         .collect();
-    let missing: Vec<&&str> = ZIG_COLUMINE_EXPORTS
+    let missing: Vec<&&str> = EXPECTED_COLUMINE_EXPORTS
         .iter()
         .filter(|n| !fn_names.contains(**n))
         .collect();
@@ -148,7 +146,7 @@ fn built_wasm_exports_every_zig_symbol_and_memory() {
     );
     let extra: Vec<&str> = fn_names
         .iter()
-        .filter(|n| !ZIG_COLUMINE_EXPORTS.contains(*n) && !n.starts_with("__"))
+        .filter(|n| !EXPECTED_COLUMINE_EXPORTS.contains(*n) && !n.starts_with("__"))
         .copied()
         .collect();
     assert!(

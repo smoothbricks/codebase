@@ -1,4 +1,4 @@
-//! Replaces `packages/columine/src/parsing/msgpack_scanner.zig`.
+//! MessagePack scanner for event extraction.
 
 use crate::{EventColumns, ParseError};
 
@@ -152,8 +152,7 @@ impl<'a> Reader<'a> {
         self.pos += 1;
         Some(byte)
     }
-    /// msgpack_extractor.zig `readBinary`: consume a standard bin value
-    /// (0xc4/0xc5/0xc6) and return its payload slice.
+    /// Consume a standard bin value (0xc4/0xc5/0xc6) and return its payload.
     pub(crate) fn read_bin(&mut self) -> Option<&'a [u8]> {
         let marker = self.take()?;
         let len = match marker {
@@ -248,11 +247,9 @@ impl<'a> Reader<'a> {
             _ => None,
         }
     }
-    /// Timestamp: integer ms, float ms (some encoders), or ISO-8601 string →
-    /// microseconds, dispatched on the marker byte exactly like Zig's
-    /// readTimestamp. Zig's `ms * 1000` / `@intFromFloat` overflow paths are
-    /// UB in ReleaseSmall; the checked/saturating versions here are the safe
-    /// superset of an unreachable-in-practice domain.
+    /// Decode integer or floating-point milliseconds, or an ISO-8601 string,
+    /// into microseconds. Checked and saturating arithmetic keeps overflow
+    /// defined for malformed input.
     pub(crate) fn read_timestamp(&mut self) -> Option<i64> {
         let byte = *self.input.get(self.pos)?;
         if byte & 0x80 == 0 || byte & 0xe0 == 0xe0 || (0xcc..=0xd3).contains(&byte) {
@@ -443,8 +440,8 @@ mod tests {
     }
     #[test]
     fn parse_msgpack_stream_float_timestamp() {
-        // Zig readTimestamp accepts float32/float64 milliseconds (some
-        // encoders emit floats); 1500.7 ms truncates to 1500 ms.
+        // Float32 and float64 timestamps are truncated to integer milliseconds;
+        // 1500.7 ms becomes 1500 ms.
         let mut input = vec![0x83];
         str_(&mut input, "id");
         str_(&mut input, "a");

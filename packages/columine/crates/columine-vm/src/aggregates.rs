@@ -1,35 +1,27 @@
-//! Port of `packages/columine/src/vm/aggregates.zig` — slot init/accessors
-//! plus the pure batch-reduction kernels.
+//! Slot initialization/accessors plus pure batch-reduction kernels.
 //!
-//! Layout (aggregates.zig:296-309): compact COUNT is 8 bytes (u64 count at
-//! offset 0); every other aggregate is 16 bytes (value at 0 — f64, or i64 for
-//! the `_I64` family — and u64 count at 8).
+//! Layout: compact COUNT is 8 bytes (u64 count at offset 0); every other
+//! aggregate is 16 bytes (value at 0 — f64, or i64 for the `_I64` family —
+//! and u64 count at 8).
 //!
 //! # FP determinism (specs/vo/01-canonical-encoding.md profile)
 //!
-//! The Zig kernels accumulate through 4-wide `@Vector(4, f64)` lanes and
-//! finish with `@reduce`, which Zig lowers as a SEQUENTIAL left-to-right
-//! lane fold (probed on zig 0.16.0, Debug == ReleaseSmall:
-//! `@reduce(.Add, .{1e16, 1.0, -1e16, 1.0}) == 1.0`, bit 0x3ff0000000000000 —
-//! pairwise would give 0.0). `@min`/`@max` are minNum-flavoured — a NaN
-//! operand yields the OTHER operand — and a TIE yields the SECOND operand:
-//! probed `@min(-0.0, 0.0) == +0.0` and `@min(0.0, -0.0) == -0.0` (bits 0x0 /
-//! 0x8000000000000000). Rust's `f64::min`/`f64::max` intrinsics do NOT pin
-//! that tie order (aarch64 `fminnm` returns -0.0 for either order), so this
-//! module hand-rolls `min_zig`/`max_zig` and replicates the exact lane
-//! structure with scalar arithmetic: fixed evaluation order, no FMA, no
-//! reassociation, no autovectorization dependence. The kernels deliberately
-//! do NOT canonicalize NaN / -0 — the Zig kernels don't either; the VO
-//! digest profile applies where digests are formed, and bug-for-bug parity
-//! with the current runtime is this stage's oracle.
+//! The kernels accumulate through 4-wide f64 lanes and finish with a
+//! sequential left-to-right lane fold. The fixed evaluation order matters:
+//! pairwise reduction would produce a different result for cancellation-prone
+//! inputs. Min/max use minNum semantics — NaN yields the other operand and a
+//! tie yields the second operand — so this module hand-rolls those operations
+//! and preserves the exact lane structure with scalar arithmetic. The kernels
+//! deliberately do not canonicalize NaN or negative zero; the VO digest
+//! profile applies where digests are formed.
 
 use crate::bytes;
 
-/// AggType discriminants this module switches on. `initAggSlot` operates on
-/// the RAW metadata byte, not the enum: state_init.zig routes `cap_lo`
-/// straight through, and bytes outside the enum (or the SCALAR subtypes)
-/// take the zero-fill default branch. Porting via `AggType::from_u8` would
-/// silently rewrite invalid bytes; the raw byte IS the contract.
+/// AggType discriminants switched on by this module. Initialization operates
+/// on the raw metadata byte, not the enum: the capacity byte passes through,
+/// and bytes outside the enum (or scalar subtypes) take the zero-fill default.
+/// Converting through `AggType::from_u8` would silently rewrite invalid bytes;
+/// the raw byte is the contract.
 const AGG_SUM: u8 = 1;
 const AGG_COUNT: u8 = 2;
 const AGG_MIN: u8 = 3;
@@ -44,7 +36,7 @@ pub const fn agg_slot_byte_size(agg_type_byte: u8) -> u32 {
     if agg_type_byte == AGG_COUNT { 8 } else { 16 }
 }
 
-/// aggregates.zig:238-293 `initAggSlot`. Returns the slot's byte size.
+/// Initialize an aggregate slot and return its byte size.
 pub fn init_agg_slot(state: &mut [u8], offset: u32, agg_type_byte: u8) -> u32 {
     match agg_type_byte {
         AGG_COUNT => {
@@ -128,10 +120,9 @@ pub fn agg_set_count(state: &mut [u8], offset: u32, agg_type_byte: u8, c: u64) {
 }
 
 // =============================================================================
-// Pure batch-reduction kernels (aggregates.zig:20-226)
-// =============================================================================
+// Pure batch-reduction kernels
 
-/// aggregates.zig:20 `AggKind`.
+/// Aggregate kind used by the reduction kernels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggKind {
     Sum,
@@ -139,19 +130,17 @@ pub enum AggKind {
     Max,
 }
 
-/// aggregates.zig:22 `TypeMask` — FOR_EACH filtering: include row `i` only
-/// when `data[i] == id`.
+/// Type mask for `FOR_EACH`: include row `i` only when `data[i] == id`.
 #[derive(Clone, Copy, Debug)]
 pub struct TypeMask<'a> {
     pub data: &'a [u32],
     pub id: u32,
 }
 
-// WHY tie-returns-SECOND-operand is the profile (deliberate, digest-bearing):
-// probed Zig @min/@max semantics, adopted as the FP-determinism profile per
-// specs/vo/01-canonical-encoding.md — ±0 selection order is observable in
-// digests, and changing it would silently re-digest every archived state
-// for zero functional gain. NaN yields the other operand (min/max skip NaN).
+// WHY tie-returns-second-operand is the profile (deliberate, digest-bearing):
+// ±0 selection order is observable in digests, and changing it would silently
+// re-digest archived state for no functional gain. NaN yields the other
+// operand (min/max skip NaN).
 //
 // Maintenance-algebra note: min/max are the SUPPORT-SCAN class —
 // NOT group-invertible; a retraction that removes the
@@ -160,10 +149,9 @@ pub struct TypeMask<'a> {
 // group class (exactly maintainable under ±weights). Any future TREAT/delta
 // maintenance layer builds on exactly this split; these kernels are the
 // batch-fold form of the same per-aggregate algebra.
-/// Zig `@min` as probed (module docs): NaN yields the other operand, a tie
-/// yields the SECOND operand. `f64::min` does not pin the tie order.
+/// Min profile: NaN yields the other operand and ties yield the second.
 #[inline]
-fn min_zig(a: f64, b: f64) -> f64 {
+fn min_profile(a: f64, b: f64) -> f64 {
     if a.is_nan() {
         return b;
     }
@@ -173,9 +161,9 @@ fn min_zig(a: f64, b: f64) -> f64 {
     if a < b { a } else { b }
 }
 
-/// Zig `@max` as probed: NaN yields the other operand, tie yields the second.
+/// Max profile: NaN yields the other operand and ties yield the second.
 #[inline]
-fn max_zig(a: f64, b: f64) -> f64 {
+fn max_profile(a: f64, b: f64) -> f64 {
     if a.is_nan() {
         return b;
     }
@@ -185,26 +173,26 @@ fn max_zig(a: f64, b: f64) -> f64 {
     if a > b { a } else { b }
 }
 
-/// Zig `@reduce(.Add, V4f64)` — sequential left-to-right lane fold (probed).
+/// Sequential left-to-right fold of four f64 lanes.
 #[inline]
 fn reduce_add_4(l: [f64; 4]) -> f64 {
     ((l[0] + l[1]) + l[2]) + l[3]
 }
 
-/// Zig `@reduce(.Min, V4f64)` with `@min` semantics, sequential (probed).
+/// Sequential four-lane minimum using the module's min profile.
 #[inline]
 fn reduce_min_4(l: [f64; 4]) -> f64 {
-    min_zig(min_zig(min_zig(l[0], l[1]), l[2]), l[3])
+    min_profile(min_profile(min_profile(l[0], l[1]), l[2]), l[3])
 }
 
-/// Zig `@reduce(.Max, V4f64)`, sequential.
+/// Sequential four-lane maximum using the module's max profile.
 #[inline]
 fn reduce_max_4(l: [f64; 4]) -> f64 {
-    max_zig(max_zig(max_zig(l[0], l[1]), l[2]), l[3])
+    max_profile(max_profile(max_profile(l[0], l[1]), l[2]), l[3])
 }
 
-/// aggregates.zig:28 `batchAggSum`. Lane `k` accumulates elements
-/// `k, k+4, k+8, …` in chunk order; the lane fold and the scalar tail follow.
+/// Sum lanes in chunk order (`k`, `k+4`, `k+8`, …), then process the scalar
+/// tail.
 pub fn batch_agg_sum(vals: &[f64]) -> f64 {
     let batch_len = vals.len();
     let mut lanes = [0.0f64; 4];
@@ -224,7 +212,7 @@ pub fn batch_agg_sum(vals: &[f64]) -> f64 {
     result
 }
 
-/// aggregates.zig:40 `batchAggMin`.
+/// Batch minimum, preserving the supplied current minimum.
 pub fn batch_agg_min(vals: &[f64], current_min: f64) -> f64 {
     let batch_len = vals.len();
     if batch_len == 0 {
@@ -234,19 +222,19 @@ pub fn batch_agg_min(vals: &[f64], current_min: f64) -> f64 {
     let mut i = 0;
     while i + 4 <= batch_len {
         for (k, lane) in lanes.iter_mut().enumerate() {
-            *lane = min_zig(*lane, vals[i + k]);
+            *lane = min_profile(*lane, vals[i + k]);
         }
         i += 4;
     }
     let mut result = reduce_min_4(lanes);
     while i < batch_len {
-        result = min_zig(result, vals[i]);
+        result = min_profile(result, vals[i]);
         i += 1;
     }
     result
 }
 
-/// aggregates.zig:53 `batchAggMax`.
+/// Batch maximum, preserving the supplied current maximum.
 pub fn batch_agg_max(vals: &[f64], current_max: f64) -> f64 {
     let batch_len = vals.len();
     if batch_len == 0 {
@@ -256,20 +244,19 @@ pub fn batch_agg_max(vals: &[f64], current_max: f64) -> f64 {
     let mut i = 0;
     while i + 4 <= batch_len {
         for (k, lane) in lanes.iter_mut().enumerate() {
-            *lane = max_zig(*lane, vals[i + k]);
+            *lane = max_profile(*lane, vals[i + k]);
         }
         i += 4;
     }
     let mut result = reduce_max_4(lanes);
     while i < batch_len {
-        result = max_zig(result, vals[i]);
+        result = max_profile(result, vals[i]);
         i += 1;
     }
     result
 }
 
-/// aggregates.zig:70 `maskedAggSum` — masked-out lanes contribute `+0.0`
-/// (the Zig `@select` zero identity).
+/// Masked sum; masked-out lanes contribute `+0.0`, the additive identity.
 pub fn masked_agg_sum(vals: &[f64], type_data: &[u32], type_id: u32) -> f64 {
     let batch_len = vals.len();
     if batch_len == 0 {
@@ -297,9 +284,8 @@ pub fn masked_agg_sum(vals: &[f64], type_data: &[u32], type_id: u32) -> f64 {
     result
 }
 
-/// aggregates.zig:89 `maskedAggCount`. The slice's length IS the batch
-/// extent: callers hand a batch-covering view (`col_u32_exact`), so a
-/// separate `batch_len` parameter was only an invitation to disagree with it.
+/// Masked count. The slice length is the batch extent, so no separate length
+/// parameter can disagree with it.
 pub fn masked_agg_count(type_data: &[u32], type_id: u32) -> u32 {
     let batch_len = type_data.len();
     let mut count: u32 = 0;
@@ -317,7 +303,7 @@ pub fn masked_agg_count(type_data: &[u32], type_id: u32) -> u32 {
     count
 }
 
-/// aggregates.zig:105 `maskedAggMin` — masked-out lanes see `+inf`.
+/// Masked minimum; masked-out lanes see `+inf`.
 pub fn masked_agg_min(vals: &[f64], type_data: &[u32], type_id: u32, current_min: f64) -> f64 {
     let batch_len = vals.len();
     let mut lanes = [current_min; 4];
@@ -329,21 +315,21 @@ pub fn masked_agg_min(vals: &[f64], type_data: &[u32], type_id: u32, current_min
             } else {
                 f64::INFINITY
             };
-            *lane = min_zig(*lane, v);
+            *lane = min_profile(*lane, v);
         }
         i += 4;
     }
     let mut result = reduce_min_4(lanes);
     while i < batch_len {
         if type_data[i] == type_id {
-            result = min_zig(result, vals[i]);
+            result = min_profile(result, vals[i]);
         }
         i += 1;
     }
     result
 }
 
-/// aggregates.zig:123 `maskedAggMax` — masked-out lanes see `-inf`.
+/// Masked maximum; masked-out lanes see `-inf`.
 pub fn masked_agg_max(vals: &[f64], type_data: &[u32], type_id: u32, current_max: f64) -> f64 {
     let batch_len = vals.len();
     let mut lanes = [current_max; 4];
@@ -355,23 +341,22 @@ pub fn masked_agg_max(vals: &[f64], type_data: &[u32], type_id: u32, current_max
             } else {
                 f64::NEG_INFINITY
             };
-            *lane = max_zig(*lane, v);
+            *lane = max_profile(*lane, v);
         }
         i += 4;
     }
     let mut result = reduce_max_4(lanes);
     while i < batch_len {
         if type_data[i] == type_id {
-            result = max_zig(result, vals[i]);
+            result = max_profile(result, vals[i]);
         }
         i += 1;
     }
     result
 }
 
-/// aggregates.zig:148 `reduceCol` for `T == f64`. Dispatch mirrors the Zig
-/// comptime branches: no predicate → lane kernels (sum ADDS the kernel result
-/// to `current`); any predicate → the scalar path.
+/// Reduce an f64 column. Without a predicate, use the lane kernels and add
+/// the sum to `current`; with a predicate, use the scalar path.
 pub fn reduce_col_f64(
     kind: AggKind,
     vals: &[f64],
@@ -394,10 +379,9 @@ pub fn reduce_col_f64(
         };
     }
 
-    // Scalar path (aggregates.zig:206-225), unified post-parity on the
-    // vector path's NaN policy: min/max via min_zig/max_zig (NaN yields the
-    // other operand), so ONE NaN convention holds everywhere — that
-    // uniformity is load-bearing for any future delta-maintenance layer,
+    // Scalar path uses the same NaN policy as the lane path: min/max return
+    // the other operand for NaN. Keeping one convention makes a fold
+    // reproducible by a support re-scan.
     // where a fold must be reproducible by a support re-scan
     let mut acc = current;
     for (i, &v) in vals.iter().enumerate() {
@@ -414,20 +398,18 @@ pub fn reduce_col_f64(
         match kind {
             AggKind::Sum => acc += v,
             AggKind::Min => {
-                acc = min_zig(acc, v);
+                acc = min_profile(acc, v);
             }
             AggKind::Max => {
-                acc = max_zig(acc, v);
+                acc = max_profile(acc, v);
             }
         }
     }
     acc
 }
 
-/// aggregates.zig:148 `reduceCol` for `T == i64`. Sum uses wrapping adds
-/// (`+%`, V2i64 two-lane structure — associative, so the lane split is not
-/// observable); min/max take the scalar path exactly like the Zig comptime
-/// dispatch (no i64 SIMD min/max in the Zig).
+/// Reduce an i64 column. Sum uses wrapping adds; min/max use the scalar path
+/// because their operation is not lane-vectorized here.
 pub fn reduce_col_i64(
     kind: AggKind,
     vals: &[i64],

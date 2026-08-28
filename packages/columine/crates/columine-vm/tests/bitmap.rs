@@ -1,11 +1,5 @@
-//! Translated `test "…"` blocks from `packages/columine/src/vm/bitmap_ops.zig`
-//! (15/15), RoaringFormatSpec read-compat fixtures, and the slice-4
-//! boundary-capacity proptests.
-//!
-//! The Zig algebra tests (blocks 12-15) call rawr's `RoaringBitmap` directly
-//! because the wasm exports take linear-memory pointers; the ports go through
-//! `set_algebra`, which exercises the same operations through the public
-//! serialized surface — strictly more of the ported code.
+//! Coverage for bitmap storage, Portable Roaring serialization, mutation,
+//! algebra, boundary-capacity, and property tests.
 
 use columine_vm::bitmap_ops::{
     BitmapAlgebraOp, BitmapEnv, BitmapStorage, batch_bitmap_add, batch_bitmap_algebra,
@@ -24,7 +18,7 @@ use columine_types::types::{
     StateHeaderOffset,
 };
 
-/// bitmap_ops.zig:905 `makeStorage` — a storage view over a local buffer:
+///  `makeStorage` — a storage view over a local buffer:
 /// `[serialized_len u32][payload…]` at offset 0.
 fn make_storage(buf_len: u32) -> BitmapStorage {
     BitmapStorage {
@@ -33,7 +27,7 @@ fn make_storage(buf_len: u32) -> BitmapStorage {
     }
 }
 
-/// bitmap_ops.zig:915 `initBitmapSlotState` — minimal state with one BITMAP
+///  `initBitmapSlotState` — minimal state with one BITMAP
 /// slot: `[STATE_HEADER (32)][SLOT_META (48)][bitmap data …]`.
 fn init_bitmap_slot_state(state: &mut [u8], capacity: u32) -> SlotMetaView {
     state.fill(0);
@@ -57,7 +51,7 @@ fn init_bitmap_slot_state(state: &mut [u8], capacity: u32) -> SlotMetaView {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Empty bitmap load (bitmap_ops.zig:939)
+// 1. Empty bitmap load ()
 // ---------------------------------------------------------------------------
 #[test]
 fn bitmap_load_empty_returns_cardinality_0() {
@@ -69,7 +63,7 @@ fn bitmap_load_empty_returns_cardinality_0() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Serialize round-trip, 10 elements (bitmap_ops.zig:953)
+// 2. Serialize round-trip, 10 elements ()
 // ---------------------------------------------------------------------------
 #[test]
 fn store_load_round_trip_preserves_10_elements() {
@@ -96,7 +90,7 @@ fn store_load_round_trip_preserves_10_elements() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Large bitmap, 500 elements (bitmap_ops.zig:981)
+// 3. Large bitmap, 500 elements ()
 // ---------------------------------------------------------------------------
 #[test]
 fn store_load_500_elements_round_trip() {
@@ -123,9 +117,8 @@ fn store_load_500_elements_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// 4-5. serialized_data on empty / iterates stored elements
-// (bitmap_ops.zig:1007 bitmapFrozen tests — the roaring crate has no frozen
-// view; `serialized_data` + deserialize is the ported query path)
+// 4-5. serialized_data on empty payloads and iteration over stored elements;
+// `serialized_data` plus deserialization is the query path under test.
 // ---------------------------------------------------------------------------
 #[test]
 fn serialized_data_none_when_empty() {
@@ -156,7 +149,7 @@ fn serialized_data_iterates_stored_elements() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. bitmap_select (bitmap_ops.zig:1045)
+// 6. bitmap_select ()
 // ---------------------------------------------------------------------------
 #[test]
 fn bitmap_select_returns_element_at_rank() {
@@ -180,7 +173,7 @@ fn bitmap_select_returns_element_at_rank() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. payload-capacity formula (bitmap_ops.zig:1067)
+// 7. payload-capacity formula ()
 // ---------------------------------------------------------------------------
 #[test]
 fn bitmap_payload_capacity_formula() {
@@ -200,7 +193,7 @@ fn bitmap_payload_capacity_formula() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. get_bitmap_storage layout (bitmap_ops.zig:1081)
+// 8. get_bitmap_storage layout ()
 // ---------------------------------------------------------------------------
 #[test]
 fn get_bitmap_storage_returns_correct_offsets_and_capacity() {
@@ -219,7 +212,7 @@ fn get_bitmap_storage_returns_correct_offsets_and_capacity() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. batch add — 5 elements (bitmap_ops.zig:1104)
+// 9. batch add — 5 elements ()
 // ---------------------------------------------------------------------------
 #[test]
 fn batch_bitmap_add_inserts_5_elements() {
@@ -244,7 +237,7 @@ fn batch_bitmap_add_inserts_5_elements() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. batch add — dedup (bitmap_ops.zig:1126)
+// 10. batch add — dedup ()
 // ---------------------------------------------------------------------------
 #[test]
 fn batch_bitmap_add_dedups_same_element() {
@@ -261,7 +254,7 @@ fn batch_bitmap_add_dedups_same_element() {
 }
 
 // ---------------------------------------------------------------------------
-// 11. batch remove (bitmap_ops.zig:1140)
+// 11. batch remove ()
 // ---------------------------------------------------------------------------
 #[test]
 fn batch_bitmap_remove_removes_elements_correctly() {
@@ -288,8 +281,8 @@ fn batch_bitmap_remove_removes_elements_correctly() {
 }
 
 // ---------------------------------------------------------------------------
-// 12-15. Set algebra AND/OR/ANDNOT/XOR (bitmap_ops.zig:1197-1285) — ported
-// through `set_algebra` over serialized inputs.
+// 12-15. Set algebra AND/OR/ANDNOT/XOR, exercised through `set_algebra` over
+// serialized inputs.
 // ---------------------------------------------------------------------------
 
 fn serialize(elems: &[u32]) -> Vec<u8> {
@@ -343,14 +336,13 @@ fn set_algebra_xor_symmetric_difference() {
 }
 
 // ---------------------------------------------------------------------------
-// Beyond the Zig blocks: batch-add capacity refusal, slot-level algebra,
-// serialized queries, spec fixtures, proptests.
+// Additional coverage: batch-add capacity refusal, slot-level algebra,
+// serialized queries, format fixtures, and property tests.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn batch_bitmap_add_capacity_exceeded_flushes_partial_batch() {
-    // bitmap_ops.zig:315-329 — the capacity branch: earlier inserts in the
-    // same batch are flushed and size reflects them before CAPACITY_EXCEEDED.
+    // Earlier inserts are flushed before the capacity refusal.
     let mut env = BitmapEnv::default();
     let mut state = vec![0u8; 65536];
     let meta = init_bitmap_slot_state(&mut state, 2); // capacity 2
@@ -367,7 +359,7 @@ fn batch_bitmap_add_capacity_exceeded_flushes_partial_batch() {
 
 #[test]
 fn batch_bitmap_add_skips_sentinel_keys() {
-    // EMPTY_KEY / TOMBSTONE elements are skipped (bitmap_ops.zig:311).
+    // EMPTY_KEY / TOMBSTONE elements are skipped ().
     let mut env = BitmapEnv::default();
     let mut state = vec![0u8; 65536];
     let meta = init_bitmap_slot_state(&mut state, 128);
@@ -381,7 +373,7 @@ fn batch_bitmap_add_skips_sentinel_keys() {
 
 #[test]
 fn slot_algebra_and_with_empty_clears_target() {
-    // bitmap_ops.zig:541-554 empty-source identities.
+    //  empty-source identities.
     let mut env = BitmapEnv::default();
     let mut state = vec![0u8; 65536];
     let meta = init_bitmap_slot_state(&mut state, 128);
@@ -492,12 +484,10 @@ fn set_algebra_empty_identities_copy_survivor() {
     assert!(env.algebra_result().is_empty());
 }
 
-/// RoaringFormatSpec read-compat fixture, hand-derived from the public spec
-/// (the same spec rawr's format.zig implements): cookie 12346
-/// (SERIAL_COOKIE_NO_RUNCONTAINER), one array container, key 0,
-/// cardinality-1 = 2, offset header, then values {7, 42, 100} as u16 LE.
-/// Pins that the roaring crate parses spec-formatted bytes byte-for-byte —
-/// the read-compat direction of the rawr interop story.
+/// Portable Roaring read-compat fixture, hand-derived from the public spec:
+/// cookie 12346, one array container, key 0, cardinality 3, offset header,
+/// then values {7, 42, 100} as u16 little-endian.
+/// This pins parsing of spec-formatted bytes.
 #[test]
 fn roaring_format_spec_fixture_parses() {
     let mut fixture = Vec::new();

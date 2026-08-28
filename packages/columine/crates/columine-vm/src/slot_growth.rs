@@ -1,12 +1,13 @@
-//! Replaces `packages/columine/src/vm/slot_growth.zig` (sizing + typed
-//! rehash/copy used by `vm_grow_state`). The `FlatHashTable`-based stress
-//! test rides with the container-family slice (it needs `upsert`/`rehashInto`).
+//! Slot sizing and typed rehash/copy used by `vm_grow_state`.
+//!
+//! The stress tests exercise `FlatTable` rehashing alongside the container
+//! family.
 
 use crate::bytes;
 use columine_types::types::{CONDITION_TREE_STATE_BYTES, EMPTY_KEY, SlotType, TOMBSTONE, hash_key};
 
-/// slot_growth.zig:30-42 `slotDataSize` — primary data size per slot type.
-/// STRUCT_MAP/ORDERED_LIST/NESTED return 0 (metadata-driven sizing instead).
+/// Primary data size per slot type. STRUCT_MAP, ORDERED_LIST, and NESTED return
+/// zero because their sizing is metadata-driven.
 pub fn slot_data_size(
     slot_type: SlotType,
     capacity: u32,
@@ -31,14 +32,9 @@ pub fn slot_data_size(
             CONDITION_TREE_STATE_BYTES + if capacity > 0 { capacity * 16 } else { 0 }
         }
         SlotType::Scalar => 16,
-        // FIXED semantics (telos idea i-87c94893): slot_growth.zig carried a
-        // module-private `max(256, cap*8)` here, strictly smaller than the
-        // canonical `cap*8 + 256` that init sizing, the grow copy path, and
-        // every reader (`getBitmapStorage`) use — so the Zig grow path
-        // overran its allocation. The Zig fix (unstaged in the main checkout)
-        // deletes the private formula and unifies on the canonical one; this
-        // port matches the FIXED Zig. Invariant `alloc == copy == reader
-        // capacity` is pinned in this module's tests.
+        // Canonical bitmap sizing is shared by allocation, grow copy, and
+        // readers. Keeping `alloc == copy == reader capacity` prevents a
+        // growth copy from overrunning its allocation.
         SlotType::Bitmap => {
             columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
                 + crate::bitmap_ops::bitmap_payload_capacity(capacity)
@@ -48,8 +44,8 @@ pub fn slot_data_size(
     }
 }
 
-/// slot_growth.zig:53-92 `growHashMap` — rehash keys+values (linear probe),
-/// carrying the timestamps side-array when present. Returns entries rehashed.
+/// Rehash HASHMAP keys and values, carrying the timestamps side-array when
+/// present. Return the number of entries rehashed.
 pub fn grow_hash_map(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -87,7 +83,7 @@ pub fn grow_hash_map(
     rehashed
 }
 
-/// slot_growth.zig:95-120 `growHashSet` — rehash keys only.
+/// Rehash HASHSET keys and return the number of entries rehashed.
 pub fn grow_hash_set(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -113,8 +109,8 @@ pub fn grow_hash_set(
     rehashed
 }
 
-/// slot_growth.zig:123-166 `growStructMap` — copy descriptor, rehash keys,
-/// move each live row to its new probe position. Returns entries rehashed.
+/// Copy a STRUCT_MAP descriptor, rehash keys, and move live rows to their new
+/// probe positions. Return the number of entries rehashed.
 #[allow(clippy::too_many_arguments)]
 pub fn grow_struct_map(
     old_state: &[u8],
@@ -213,7 +209,7 @@ pub fn grow_struct_map2(
 mod tests {
     use super::*;
 
-    // slot_growth.zig test "growHashMap — rehashes into larger table preserving values"
+    // Rehashing into a larger HASHMAP preserves values.
     #[test]
     fn grow_hash_map_rehashes_into_larger_table_preserving_values() {
         let mut old_buf = vec![0u8; 4096];
@@ -248,7 +244,7 @@ mod tests {
         assert_eq!(get(1), None);
     }
 
-    // slot_growth.zig test "growHashSet — rehashes keys only"
+    // Rehashing a HASHSET preserves keys.
     #[test]
     fn grow_hash_set_rehashes_keys_only() {
         let mut old_buf = vec![0u8; 512];
@@ -270,7 +266,7 @@ mod tests {
         assert_eq!(found, 3);
     }
 
-    // slot_growth.zig test "growHashMap — preserves timestamps side-array"
+    // Rehashing a HASHMAP preserves its timestamps side-array.
     #[test]
     fn grow_hash_map_preserves_timestamps_side_array() {
         let mut old_buf = vec![0u8; 4096];
@@ -292,11 +288,9 @@ mod tests {
         assert!((ts - 999.5).abs() < 0.001);
     }
 
-    /// The i-87c94893 invariant: the grown-state ALLOCATION for a BITMAP
-    /// slot (`slot_data_size`), the grow COPY sizing, and the READER
-    /// capacity (`getBitmapStorage`) all derive from ONE formula. The Zig
-    /// bug was a drifted private allocation formula; the fixed Zig and this
-    /// port share `bitmap_ops::bitmap_payload_capacity`.
+    /// The grown-state bitmap allocation, grow-copy, and reader capacity all
+    /// derive from one canonical formula:
+    /// `bitmap_ops::bitmap_payload_capacity`.
     #[test]
     fn bitmap_alloc_copy_reader_capacity_are_one_formula() {
         use columine_types::types::BITMAP_SERIALIZED_LEN_BYTES;

@@ -1,4 +1,4 @@
-//! Replaces `packages/columine/src/parsing/json_parser.zig`.
+//! Scalar streaming JSON lexer with strict structural validation.
 //!
 //! This is deliberately a scalar streaming lexer: a hand-rolled simd128
 //! variant of the `scan` kernels measured ~23% slower than this shape at
@@ -45,10 +45,10 @@ pub fn target_is_wasm() -> bool {
     cfg!(target_arch = "wasm32") || cfg!(target_arch = "wasm64")
 }
 
-/// Structural context, mirroring the validation `std.json.Scanner` performs.
-/// The Zig port's first cut accepted `[1 2]`, `{"a" 1}`, `[,]`, `[01]`, and
-/// trailing commas that the Zig backends reject; this state machine restores
-/// the JSON grammar the Zig scanner enforces.
+/// Structural context used to enforce the JSON grammar.
+///
+/// The state machine rejects missing separators, trailing commas, leading
+/// zeroes, and trailing non-whitespace after the top-level value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Frame {
     /// Inside `[...]`; the payload tracks what may come next.
@@ -103,7 +103,7 @@ impl<'a> JsonParser<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        // Zig std.json's whitespace set exactly (space/\t/\r/\n, no \x0C).
+        // JSON whitespace is exactly space, tab, carriage return, and newline.
         self.cursor = crate::scan::skip_whitespace(self.input, self.cursor);
     }
 
@@ -196,9 +196,8 @@ impl<'a> JsonParser<'a> {
         match self.stack.last().copied() {
             None => match self.top {
                 Top::NotStarted => self.read_value_token(),
-                // After the top-level value: only trailing whitespace is
-                // acceptable (std.json: end_of_document, mapped to
-                // EndOfInput by the Zig wrapper; anything else is an error).
+                // After the top-level value, only trailing whitespace is
+                // acceptable; any other byte is invalid JSON.
                 Top::Done => {
                     if self.cursor >= self.input.len() {
                         Err(ParserError::EndOfInput)
@@ -606,8 +605,8 @@ mod tests {
         }
     }
 
-    /// The Zig backends reject structurally invalid JSON (std.json grammar);
-    /// each of these was accepted by the first cut of the scalar lexer.
+    /// Reject structurally invalid JSON, including missing separators,
+    /// trailing commas, leading zeroes, and trailing non-whitespace.
     #[test]
     fn json_parser_rejects_structurally_invalid_documents() {
         for bad in [
@@ -641,9 +640,8 @@ mod tests {
         assert!(drain(b"\t[\r\n1 ]").is_ok());
     }
 
-    /// Form feed is whitespace to `u8::is_ascii_whitespace` but NOT to Zig
-    /// std.json (Scanner.zig:1283: space/\t/\r/\n only) — the Zig backends
-    /// reject it between tokens.
+    /// Form feed is accepted by `u8::is_ascii_whitespace` but not by the JSON
+    /// grammar, so it must be rejected between tokens.
     #[test]
     fn json_parser_rejects_form_feed_between_tokens() {
         for bad in [

@@ -1,29 +1,17 @@
-//! Port of `packages/columine/src/vm/bitmap_ops.zig` — roaring-bitmap slot
-//! storage, load/store, batch add/remove, and set algebra.
+//! Roaring-bitmap slot storage, load/store, batch mutation, and set algebra.
 //!
 //! # Roaring backend
 //!
-//! The Zig side uses `rawr` (smoothbricks' roaring library), which implements
-//! the standard portable RoaringFormatSpec (cookies 12346/12347 — verified in
-//! rawr `src/format.zig`). This port uses the pure-Rust `roaring` crate,
-//! which implements the SAME spec, so serialized payloads are mutually
-//! readable in both directions. Freshly-SERIALIZED byte images may differ
-//! within the spec (rawr's `runOptimize` and roaring-rs's `optimize` may pick
-//! different container encodings for the same logical set); the cutover
-//! consequence is recorded in the crate README's ledger.
+//! The implementation follows the standard portable RoaringFormatSpec
+//! (cookies 12346/12347), so serialized payloads are mutually readable.
+//! Freshly serialized byte images may differ within the spec because
+//! container optimization choices are implementation-dependent.
+//! # Allocation behavior
 //!
-//! # Globals become `BitmapEnv`
-//!
-//! bitmap_ops.zig keeps module globals (`g_bitmap_last_error`, the reusable
-//! store/algebra buffers, and the wasm scratch FixedBufferAllocator wired by
-//! `vm_set_rbmp_scratch`). Rust models the observable ones as [`BitmapEnv`],
-//! which the wasm bindings stage will instantiate once per instance. The
-//! scratch-FBA machinery exists to bound allocation inside a wasm call and
-//! surface OOM as `CAPACITY_EXCEEDED` (error codes 100/101, plus the
-//! non-scratch OOM fallbacks); Rust's global allocator has no observable
-//! failure path here, so those code paths are unreachable and documented at
-//! their sites rather than emulated.
-
+//! Rust backing storage does not expose allocator-failure branches; invalid
+//! serialization and capacity failures are the observable error paths.
+//! Scratch-related failure codes are therefore unreachable and are not
+//! emulated.
 use crate::bytes;
 use crate::hooks::{MutationOp, MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
@@ -33,15 +21,14 @@ use columine_types::types::{
     EMPTY_KEY, ErrorCode, TOMBSTONE,
 };
 
-/// bitmap_ops.zig:144-146. THE canonical payload-capacity formula —
-/// allocation, grow copy, and readers all derive from it (fixed semantics of
-/// telos idea i-87c94893; the drifted private growth formula is deleted).
+/// Canonical payload-capacity formula used by allocation, grow-copy, and
+/// readers. Keeping one formula prevents those paths from disagreeing.
 pub const fn bitmap_payload_capacity(slot_capacity: u32) -> u32 {
     slot_capacity * BITMAP_BYTES_PER_CAPACITY + BITMAP_BASE_BYTES
 }
 
-/// bitmap_ops.zig:125 `BitmapStorage` — offsets instead of pointers (crate
-/// convention: no references into the state buffer).
+/// Bitmap storage view carrying offsets into the state buffer rather than
+/// references into it.
 #[derive(Clone, Copy, Debug)]
 pub struct BitmapStorage {
     /// Offset of the `serialized_len: u32` field (== the slot data offset).
@@ -62,7 +49,7 @@ impl BitmapStorage {
         bytes::write_u32(state, self.data_offset, len);
     }
 
-    /// bitmap_ops.zig:686 `slotSerializedData` — `None` if empty or invalid.
+    /// `None` when empty or invalid.
     pub fn serialized_data<'a>(&self, state: &'a [u8]) -> Option<&'a [u8]> {
         let len = self.serialized_len(state);
         if len == 0 || len > self.payload_capacity {
@@ -73,7 +60,7 @@ impl BitmapStorage {
     }
 }
 
-/// bitmap_ops.zig:148 `getBitmapStorage`.
+/// Build a bitmap storage view from slot metadata.
 pub fn get_bitmap_storage(meta: &SlotMetaView) -> BitmapStorage {
     BitmapStorage {
         data_offset: meta.offset,
@@ -81,9 +68,8 @@ pub fn get_bitmap_storage(meta: &SlotMetaView) -> BitmapStorage {
     }
 }
 
-/// The observable module state of bitmap_ops.zig (minus the wasm scratch
-/// machinery — module docs). Reusable buffers exist for the same reason the
-/// Zig globals do: no per-call allocation churn on the store path.
+/// Observable bitmap operation state. Reusable buffers avoid allocation churn
+/// on store and algebra paths.
 #[derive(Debug, Default)]
 pub struct BitmapEnv {
     /// `g_bitmap_last_error` — diagnostic code readable after a failure.
@@ -100,10 +86,9 @@ impl BitmapEnv {
     }
 }
 
-/// bitmap_ops.zig:172 `bitmapLoad`. `None` ⇒ caller maps to an error path;
-/// `env.last_error` carries the diagnostic exactly like the Zig global.
-/// (The Zig OOM fallbacks — codes 100/101/103 and the scratch-retry — are
-/// unreachable here; deserialize failure is the surviving failure mode.)
+/// Load a serialized bitmap. `None` maps to an error path and
+/// `env.last_error` carries the diagnostic; deserialization failure is the
+/// surviving failure mode.
 pub fn bitmap_load(
     env: &mut BitmapEnv,
     state: &[u8],
@@ -127,9 +112,9 @@ pub fn bitmap_load(
     }
 }
 
-/// bitmap_ops.zig:219 `bitmapStore` — run-optimize, size check, two-phase
-/// commit through a reusable temp buffer (a failed serialize must leave the
-/// slot bytes unmodified), then copy + zero the payload tail.
+/// Store a bitmap with run optimization, size checking, and a two-phase commit
+/// through a reusable temporary buffer. Failed serialization leaves slot bytes
+/// unmodified; the payload tail is zeroed after a successful copy.
 pub fn bitmap_store(
     env: &mut BitmapEnv,
     state: &mut [u8],
@@ -147,7 +132,8 @@ pub fn bitmap_store(
     env.store_temp.clear();
     env.store_temp.reserve(serialized_size_needed);
     if bitmap.serialize_into(&mut env.store_temp).is_err() {
-        // A Vec sink cannot fail in practice; preserved as the Zig `else` lane.
+        // A Vec sink is infallible in practice; retain the error code for a
+        // uniform failure path.
         env.last_error = 61;
         return ErrorCode::InvalidState;
     }
@@ -170,16 +156,15 @@ pub fn bitmap_store(
     ErrorCode::Ok
 }
 
-/// bitmap_ops.zig:271 `bitmapSelect` — element at `rank` in ascending order.
+/// Select the element at `rank` in ascending order.
 pub fn bitmap_select(state: &[u8], storage: BitmapStorage, rank: u32) -> Option<u32> {
     let data = storage.serialized_data(state)?;
     let bm = RoaringBitmap::deserialize_from(data).ok()?;
     bm.iter().nth(rank as usize)
 }
 
-/// bitmap_ops.zig:282 `batchBitmapAdd`. Control flow ported branch-for-branch;
-/// the `bitmap.add() catch` scratch-OOM branch (error codes 3/4) is
-/// unreachable in Rust and therefore absent.
+/// Add a batch of elements. Rust's backing storage has no scratch-allocation
+/// failure path.
 #[allow(clippy::too_many_arguments)]
 pub fn batch_bitmap_add(
     env: &mut BitmapEnv,
@@ -315,8 +300,7 @@ pub fn batch_bitmap_add(
     ErrorCode::Ok
 }
 
-/// bitmap_ops.zig:425 `batchBitmapRemove` — void return like the Zig
-/// (failures leave the slot bytes unchanged).
+/// Remove a batch of elements; failures leave slot bytes unchanged.
 pub fn batch_bitmap_remove(
     env: &mut BitmapEnv,
     hooks: &mut impl VmHooks,
@@ -391,7 +375,7 @@ pub fn batch_bitmap_remove(
     meta.set_change_flag(state, ChangeFlag::REMOVED);
 }
 
-/// bitmap_ops.zig:507 `BitmapAlgebraOp`.
+/// Set-algebra operation applied to a target bitmap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BitmapAlgebraOp {
     And,
@@ -400,9 +384,8 @@ pub enum BitmapAlgebraOp {
     Xor,
 }
 
-/// bitmap_ops.zig:531 `batchBitmapAlgebra` — in-place set algebra on a
-/// target slot. Bulk mutations are covered by an undo SNAPSHOT (per-element
-/// tracking is impractical), requested through the hooks boundary.
+/// Apply in-place set algebra to a target slot. Bulk mutations use one undo
+/// snapshot because per-element tracking is impractical.
 pub fn batch_bitmap_algebra(
     env: &mut BitmapEnv,
     hooks: &mut impl VmHooks,
@@ -454,8 +437,8 @@ pub fn batch_bitmap_algebra(
         return ErrorCode::InvalidState;
     };
 
-    // In-place operation (assign operators; the Zig per-op error lanes 81-84
-    // are alloc failures, unreachable here).
+    // In-place operation; backing storage allocation failures are not exposed
+    // by this implementation.
     match op {
         BitmapAlgebraOp::And => target &= &source,
         BitmapAlgebraOp::Or => target |= &source,
@@ -481,10 +464,8 @@ pub fn batch_bitmap_algebra(
 // Serialized-level queries and set algebra (decision-function side)
 // =============================================================================
 
-/// bitmap_ops.zig:861 `vm_rbmp_contains_serialized` (logic only; the export
-/// shell is the bindings stage). rawr answers through a zero-copy
-/// FrozenBitmap; the roaring crate has no frozen view, so this deserializes —
-/// logically identical, allocation noted for the bindings-stage perf review.
+/// Test whether a serialized bitmap contains `value`. Invalid or empty
+/// payloads return false.
 pub fn contains_serialized(data: &[u8], value: u32) -> bool {
     if data.is_empty() {
         return false;
@@ -494,7 +475,7 @@ pub fn contains_serialized(data: &[u8], value: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// bitmap_ops.zig:868 `vm_rbmp_cardinality_serialized` (saturates at u32::MAX).
+/// Return serialized bitmap cardinality, saturating at `u32::MAX`.
 pub fn cardinality_serialized(data: &[u8]) -> u32 {
     if data.is_empty() {
         return 0;
@@ -504,17 +485,15 @@ pub fn cardinality_serialized(data: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
-/// `vm_rbmp_import_copy` (bitmap_ops.zig FrozenBitmap.init + cardinality)
-/// needs validity and cardinality from ONE probe — `cardinality_serialized`'s
-/// 0-on-invalid is ambiguous with an empty bitmap. `None` ⇒ malformed bytes.
+/// Validate a serialized bitmap and return its cardinality. A `None` result
+/// distinguishes malformed bytes from an empty bitmap.
 pub fn cardinality_validated(data: &[u8]) -> Option<u32> {
     RoaringBitmap::deserialize_from(data)
         .ok()
         .map(|bm| u32::try_from(bm.len()).unwrap_or(u32::MAX))
 }
 
-/// bitmap_ops.zig:877 `vm_rbmp_extract_serialized` — ascending values,
-/// capped at the output buffer; returns the number written.
+/// Extract ascending values into `out`, capped at its length; return the count.
 pub fn extract_serialized(data: &[u8], out: &mut [u32]) -> u32 {
     if data.is_empty() {
         return 0;
@@ -533,7 +512,7 @@ pub fn extract_serialized(data: &[u8], out: &mut [u32]) -> u32 {
     count as u32
 }
 
-/// bitmap_ops.zig:679 `deserializedIntersects`.
+/// Test whether two serialized bitmaps intersect.
 pub fn intersects_serialized(left: &[u8], right: &[u8]) -> bool {
     if left.is_empty() || right.is_empty() {
         return false;
@@ -547,7 +526,7 @@ pub fn intersects_serialized(left: &[u8], right: &[u8]) -> bool {
     }
 }
 
-/// bitmap_ops.zig:671 `deserializedIntersectCount` (saturates at u32::MAX).
+/// Count the intersection of two serialized bitmaps, saturating at `u32::MAX`.
 pub fn intersect_count_serialized(left: &[u8], right: &[u8]) -> u32 {
     if left.is_empty() || right.is_empty() {
         return 0;
@@ -561,8 +540,8 @@ pub fn intersect_count_serialized(left: &[u8], right: &[u8]) -> u32 {
     }
 }
 
-/// bitmap_ops.zig:779 `rbmpSetAlgebra` — the result lands in
-/// `env.algebra_result` (the VM-owned buffer the wasm exports point at).
+/// Apply set algebra and store the result in `env.algebra_result`, the
+/// VM-owned buffer exported by the wasm layer.
 pub fn set_algebra(
     env: &mut BitmapEnv,
     op: BitmapAlgebraOp,

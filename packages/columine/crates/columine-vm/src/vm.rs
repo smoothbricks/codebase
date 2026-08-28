@@ -1,23 +1,15 @@
-//! Rust port of `packages/columine/src/vm/vm.zig` (3,799 LOC) — the dispatch
-//! loop, the runtime undo/delta machinery, TTL eviction, and the read/iterate
-//! export surface. Zig line citations point at the file at the port baseline.
+//! Reducer VM dispatch loop, runtime undo/delta machinery, TTL eviction, and
+//! read/iteration operations.
 //!
-//! The Zig module keeps its runtime state in module globals (single-threaded
-//! wasm). Rust models them as [`Vm`] (owning [`UndoState`] +
-//! [`bitmap_ops::BitmapEnv`]); the wasm/NAPI bindings stage owns making one
+//! [`Vm`] owns [`UndoState`] and [`bitmap_ops::BitmapEnv`]. Bindings keep one
 //! long-lived instance per module instance.
 //!
-//! Shadow-buffer note: Zig splits overflow snapshots between a wasm-static
-//! 1 MB buffer (skipping the snapshot entirely when the state is larger —
-//! leaving post-overflow mutations unrecoverable) and an exact-size native
-//! page allocation. Rust unifies on the exact-size allocation (the native
-//! semantics, strictly more correct); the bindings stage decides whether the
-//! wasm build needs the static-buffer/size-cap variant back.
+//! Overflow snapshots use exact-size allocations for every state size, so
+//! mutations remain recoverable after overflow without a wasm-specific size
+//! cap.
 //!
-//! `defer clearBitmapScratch()` in the Zig entrypoints resets the wasm
-//! scratch FixedBufferAllocator; Rust's allocator model has no observable
-//! counterpart (see `bitmap_ops` module docs), so the entrypoints have no
-//! equivalent step.
+//! The allocator handles temporary bitmap storage; no separate scratch reset
+//! step is observable at entrypoint boundaries.
 
 use crate::aggregates::{self, AggKind, TypeMask};
 use crate::bitmap_ops::{
@@ -45,29 +37,21 @@ use columine_types::types::{
 use core::sync::atomic::Ordering;
 
 // =============================================================================
-// Input columns — vm.zig `col_ptrs` reinterpret casts
+// Input columns — bounded typed views
 // =============================================================================
 
-/// The VM's byte contract (state, program, columns) is little-endian; the
-/// column views below reinterpret in place exactly like the Zig
-/// `@ptrCast(@alignCast(...))` and are only equivalent to `from_le_bytes`
-/// reads on a little-endian target.
+/// The VM's state, program, and column bytes are little-endian. Typed views
+/// therefore require aligned input and are only available on little-endian
+/// targets.
 #[cfg(target_endian = "big")]
 compile_error!("columine-vm input-column views require a little-endian target");
 
-/// vm.zig `getColU32` — a batch column as u32 cells.
+/// View a batch column as u32 cells.
 ///
-/// The Zig contract is pointer + op-determined extent: section columns
-/// (FOR_EACH / scatter sources) are legitimately SHORTER than `batch_len` —
-/// each op reads the count its own semantics dictate (ingest-backends-parity
-/// passes a 40-cell txn column with batch 50). The view therefore clamps to
-/// `min(batch extent, available cells)`: batch-driven kernels iterate the
-/// slice and must never see more than `batch_len` cells (on wasm the
-/// "column" spans to the end of linear memory), while a section column
-/// exposes its own shorter extent and an op that genuinely over-indexes
-/// panics at the access (Zig reads garbage there — UB; checked-stricter
-/// divergence, same class as the other checked-vs-UB sites). Alignment is
-/// still a hard invariant.
+/// Section columns (FOR_EACH/scatter sources) may be shorter than `batch_len`;
+/// each operation reads the extent its semantics require. The view clamps to
+/// complete cells and exposes the shorter extent. An operation that
+/// over-indexes then panics at the access, making the boundary error visible.
 pub fn col_u32(col: &[u8], batch_len: u32) -> &[u32] {
     let usable = (col.len() & !3).min(batch_len as usize * 4);
     // SAFETY: length within `col`; alignment checked via the `prefix`
@@ -78,8 +62,7 @@ pub fn col_u32(col: &[u8], batch_len: u32) -> &[u32] {
     cells
 }
 
-/// vm.zig `getColF64` — a batch column as f64 cells (see `col_u32` for the
-/// pointer + op-determined-extent contract).
+/// View a batch column as f64 cells; see [`col_u32`] for extent rules.
 pub fn col_f64(col: &[u8], batch_len: u32) -> &[f64] {
     let usable = (col.len() & !7).min(batch_len as usize * 8);
     // SAFETY: as in `col_u32`; every bit pattern is a valid f64.
@@ -106,8 +89,7 @@ pub fn i64s_as_bytes(v: &[i64]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 8) }
 }
 
-/// vm.zig `getColI64` — a batch column as i64 cells (see `col_u32` for the
-/// pointer + op-determined-extent contract).
+/// View a batch column as i64 cells; see [`col_u32`] for extent rules.
 pub fn col_i64(col: &[u8], batch_len: u32) -> &[i64] {
     let usable = (col.len() & !7).min(batch_len as usize * 8);
     // SAFETY: as in `col_u32`.
@@ -154,22 +136,18 @@ fn cmp_col_exact(col: &[u8], batch_len: u32, cmp_type: CmpType) -> Option<&[u8]>
     (col.len() >= batch_len as usize * cmp_type.stride()).then_some(col)
 }
 
-/// vm.zig `getCol*` never bounds-checks the column-pointer table: with
-/// `batch_len == 0` the TS side legitimately passes FEWER column pointers than
-/// the program references (empty batches ship an empty column array), and the
-/// Zig arms fetch the garbage pointer but never dereference it. Checked
-/// indexing here would panic where Zig is well-behaved, so out-of-range
-/// resolves to the empty column; any actual dereference attempt then fails
-/// the `col_*` length assert (batch_len > 0 with a missing column is a real
-/// JS/FFI-boundary bug, same contract as the alignment asserts).
+/// Return bounded column views. Empty batches may provide fewer pointers than
+/// the program references because no column is dereferenced; out-of-range
+/// entries therefore resolve to an empty column. With a non-empty batch, a
+/// missing pointer is an FFI-boundary bug and the typed-view length assertion
+/// reports it.
 #[inline(always)]
 pub fn col_at<'a>(cols: &[&'a [u8]], idx: usize) -> &'a [u8] {
     cols.get(idx).copied().unwrap_or(&[])
 }
 
 // =============================================================================
-// Eviction entries — 16-byte LE records (types.zig `EvictionEntry`)
-// =============================================================================
+// Eviction entries — 16-byte little-endian records
 
 /// `EvictionEntry` layout: `timestamp:f64 @0, key_or_idx:u32 @8, value:u32 @12`
 /// (16 bytes; layout pinned in columine-types). Accessors below address entry
@@ -205,10 +183,10 @@ fn evict_copy(state: &mut [u8], base: u32, dst: u32, src: u32) {
 }
 
 // =============================================================================
-// TTL eviction operations (vm.zig:665-1023)
+// TTL eviction operations
 // =============================================================================
 
-/// vm.zig:680 `binarySearchEvictionPos` — insertion position by timestamp.
+/// Find the sorted insertion position for an eviction timestamp.
 fn binary_search_eviction_pos(state: &[u8], base: u32, size: u32, timestamp: f64) -> u32 {
     let (mut left, mut right) = (0u32, size);
     while left < right {
@@ -222,7 +200,7 @@ fn binary_search_eviction_pos(state: &[u8], base: u32, size: u32, timestamp: f64
     left
 }
 
-/// vm.zig:696 `shiftEvictionLeft`.
+/// Shift eviction entries left after removing an item.
 fn shift_eviction_left(state: &mut [u8], base: u32, count: u32, size: u32) {
     if count >= size {
         return;
@@ -232,7 +210,7 @@ fn shift_eviction_left(state: &mut [u8], base: u32, count: u32, size: u32) {
     }
 }
 
-/// vm.zig:706 `shiftEvictionRight`.
+/// Shift eviction entries right to make room at `pos`.
 fn shift_eviction_right(state: &mut [u8], base: u32, pos: u32, size: u32) {
     if size == 0 {
         return;
@@ -244,8 +222,7 @@ fn shift_eviction_right(state: &mut [u8], base: u32, pos: u32, size: u32) {
     }
 }
 
-/// vm.zig:717 `removeEvictionEntriesForKey` — compacting removal; returns the
-/// removed count.
+/// Remove all eviction entries for a key and return the removed count.
 fn remove_eviction_entries_for_key(state: &mut [u8], base: u32, size: u32, key: u32) -> u32 {
     let mut write_idx = 0u32;
     let mut removed = 0u32;
@@ -262,7 +239,7 @@ fn remove_eviction_entries_for_key(state: &mut [u8], base: u32, size: u32, key: 
     removed
 }
 
-/// vm.zig:737 `findLatestEvictionTimestampForKey`.
+/// Find the latest eviction timestamp for a key, if present.
 pub fn find_latest_eviction_timestamp_for_key(
     state: &[u8],
     meta: &SlotMetaView,
@@ -276,7 +253,7 @@ pub fn find_latest_eviction_timestamp_for_key(
         .map(|i| evict_ts(state, base, i))
 }
 
-/// vm.zig:750 `removeTTLEntriesForKey`.
+/// Remove all TTL eviction entries for a key.
 pub fn remove_ttl_entries_for_key(state: &mut [u8], meta: &SlotMetaView, key: u32) {
     if !meta.has_ttl() {
         return;
@@ -289,8 +266,8 @@ pub fn remove_ttl_entries_for_key(state: &mut [u8], meta: &SlotMetaView, key: u3
     }
 }
 
-/// vm.zig:761 `restoreTTLEntry` — rollback re-inserts a TTL entry; failure is
-/// a programmer bug (the entry fit before the rollback).
+/// Restore a TTL entry during rollback. Failure means the entry no longer fits
+/// the capacity that was valid when it was captured.
 fn restore_ttl_entry(state: &mut [u8], meta: &SlotMetaView, key: u32, timestamp: f64) {
     if !meta.has_ttl() {
         return;
@@ -299,15 +276,13 @@ fn restore_ttl_entry(state: &mut [u8], meta: &SlotMetaView, key: u32, timestamp:
     debug_assert_eq!(result, ErrorCode::Ok);
 }
 
-/// vm.zig:769 `isEvictionEntryCurrent` — no newer entry for the key later in
-/// the sorted index.
+/// Return whether an eviction entry is current (no newer entry for its key).
 fn is_eviction_entry_current(state: &[u8], base: u32, size: u32, entry_idx: u32, key: u32) -> bool {
     ((entry_idx + 1)..size).all(|i| evict_key(state, base, i) != key)
 }
 
-/// vm.zig:961 `insertWithTTL` — sorted eviction-index insert (removes stale
-/// entries for the key first). CAPACITY_EXCEEDED signals index growth through
-/// the same path as primary storage.
+/// Insert a key/timestamp into the sorted eviction index, removing stale
+/// entries first. `CAPACITY_EXCEEDED` signals index growth.
 pub fn insert_with_ttl(
     state: &mut [u8],
     meta: &SlotMetaView,
@@ -330,7 +305,7 @@ pub fn insert_with_ttl(
 
     let pos = binary_search_eviction_pos(state, base, size, timestamp);
 
-    // vm.zig:980 — the entry snapshots the key's current mapped value.
+    // Snapshot the key's current mapped value in the eviction entry.
     let entry_value = match meta.slot_type() {
         SlotType::HashMap => {
             let tbl = hashmap_ops::bind_slot_map(meta);
@@ -346,12 +321,12 @@ pub fn insert_with_ttl(
     ErrorCode::Ok
 }
 
-/// vm.zig:997 `clearEvictedBuffer`.
+/// Clear the count of evicted entries.
 pub fn clear_evicted_buffer(state: &mut [u8], meta: &SlotMetaView) {
     meta.set_evicted_count(state, 0);
 }
 
-/// vm.zig:883 `removeEntryByKey` — primary-storage removal per slot type.
+/// Remove a key from its primary storage according to slot type.
 fn remove_entry_by_key(
     env: &mut BitmapEnv,
     state: &mut [u8],
@@ -395,7 +370,7 @@ fn remove_entry_by_key(
             true
         }
         SlotType::Array => {
-            // vm.zig:909 — key_or_idx is the array index; tombstone approach.
+            // Array slots use key_or_idx as the array index.
             let data = meta.offset;
             if key < meta.capacity {
                 let k = bytes::read_u32(state, data + key * 4);
@@ -408,16 +383,15 @@ fn remove_entry_by_key(
             false
         }
         SlotType::ConditionTree => {
-            // vm.zig:954 `removeConditionTreeEntry` — bump lifecycle
-            // generation (+%= wrap) and record the removed key.
-            // ConditionTreeState: lifecycle_generation:u32 @0, last_removed_key:u32 @4.
+            // Bump condition-tree lifecycle generation and record the removed
+            // key.
             let off = meta.offset;
             let generation = bytes::read_u32(state, off).wrapping_add(1);
             bytes::write_u32(state, off, generation);
             bytes::write_u32(state, off + 4, key);
             true
         }
-        // vm.zig:922-946 — no per-entry TTL removal for these slot types.
+        // These slot types have no per-entry TTL removal.
         SlotType::Aggregate
         | SlotType::StructMap
         | SlotType::StructMap2
@@ -427,9 +401,8 @@ fn remove_entry_by_key(
     }
 }
 
-/// vm.zig:785 `evictExpired` — evict everything older than the cutoff.
-/// `#region vm-architecture-ttl.evict` carries over from the Zig.
-//#region vm-architecture-ttl.evict #eviction-index #o-expired
+/// Evict every entry older than the slot's cutoff.
+//#region eviction-index-expired
 pub fn evict_expired(
     undo: &mut UndoState,
     env: &mut BitmapEnv,
@@ -462,10 +435,8 @@ pub fn evict_expired(
             continue;
         }
 
-        // vm.zig:809 — journal the eviction. Evictions are undo-only BY
-        // DESIGN: an eviction has no meaningful forward replay (rollforward
-        // re-derives expiry from TTL state), so its redo lane is the zeroed
-        // no-op marker that delta_apply_rollforward_segment skips.
+        // Journal evictions in the undo-only lane: they have no meaningful
+        // forward replay, so the redo lane is an explicit zeroed no-op marker.
         if undo.enabled {
             match meta.slot_type() {
                 SlotType::HashMap => {
@@ -535,8 +506,7 @@ pub fn evict_expired(
 //#endregion vm-architecture-ttl.evict
 
 // =============================================================================
-// Derived-facts header access (vm.zig:3294-3348)
-// =============================================================================
+// Derived-facts header access
 
 pub fn get_derived_facts_offset(state: &[u8]) -> u32 {
     bytes::read_u32(state, StateHeaderOffset::DERIVED_FACTS_OFFSET)
@@ -562,8 +532,7 @@ pub fn clear_derived_facts_change_flag(state: &mut [u8]) {
     state[StateHeaderOffset::DERIVED_FACTS_CHANGE_FLAG as usize] = 0;
 }
 
-/// vm.zig:3327 `writeDerivedFactsHeader` (RETE program loading — stage 3
-/// consumes it; the header fields themselves are columine's).
+/// Write the derived-facts header used when loading a RETE program.
 pub fn write_derived_facts_header(
     state: &mut [u8],
     derived_offset: u32,
@@ -581,21 +550,19 @@ pub fn write_derived_facts_header(
 }
 
 // =============================================================================
-// Undo/delta runtime state (vm.zig:208-333, 3630-3792)
+// Undo/delta runtime state
 // =============================================================================
 
-/// vm.zig:208 `UNDO_CAPACITY`.
+/// Maximum number of undo entries retained in memory.
 pub const UNDO_CAPACITY: u32 = 16384;
 
-/// The vm.zig undo/delta module globals as one owned value.
+/// Owned undo/delta state for one VM instance.
 #[derive(Debug)]
 pub struct UndoState {
     /// `g_undo_entries[0..g_undo_count]`.
     entries: Vec<FlatUndoEntry>,
-    /// `g_redo_entries` — parallel lane. Undo-only appends store the zeroed
-    /// entry as an explicit no-op marker (op byte 0), which rollforward
-    /// skips — deterministic exports, garbage-free replay. (The deleted Zig
-    /// exported undefined bytes for these lanes.)
+    /// Parallel redo lane. Undo-only appends store explicit zeroed no-op
+    /// markers, which rollforward skips to keep exported segments deterministic.
     redo: Vec<FlatUndoEntry>,
     /// `g_delta_count` — pairs are valid up to here.
     delta_count: u32,
@@ -670,10 +637,8 @@ impl UndoState {
         self.shadow_active = true;
     }
 
-    /// rete.zig derived-fact journaling (FACT_INSERT_NEW / FACT_INSERT_UPDATE /
-    /// FACT_RETRACT) appends through the same undo-only lane as evict — Zig's
-    /// rete.zig:445/463/540 call `vm.undoAppend` directly. Public API extension
-    /// for the consumer RETE crate; caller checks `enabled` like the Zig call sites.
+    /// Append a derived-fact journal entry through the undo-only lane. The
+    /// consumer RETE crate checks `enabled` before calling this extension.
     pub fn append_undo_only(&mut self, state: &[u8], entry: FlatUndoEntry) {
         self.append_undo_only_snapshot(state, entry);
     }
@@ -692,7 +657,7 @@ impl UndoState {
         self.append_pair_snapshot(state, undo_entry, redo_entry);
     }
 
-    /// vm.zig:240 `undoAppend` — undo-only lane (non-delta batches, evict).
+    /// Append an undo-only entry for non-delta batches and evictions.
     fn append_undo_only_snapshot(&mut self, state: &[u8], entry: FlatUndoEntry) {
         if self.count() < UNDO_CAPACITY {
             self.entries.push(entry);
@@ -705,7 +670,7 @@ impl UndoState {
         // Already overflowed: silently drop — the shadow covers it.
     }
 
-    /// vm.zig:269 `undoAppendPair`.
+    /// Append an undo/redo pair for a delta batch.
     fn append_pair_snapshot(&mut self, state: &[u8], undo_e: FlatUndoEntry, redo_e: FlatUndoEntry) {
         if self.count() < UNDO_CAPACITY {
             self.entries.push(undo_e);
@@ -784,7 +749,7 @@ impl UndoState {
         self.capture_scratch.clear();
     }
 
-    /// vm.zig:311 `saveChangeFlags`.
+    /// Save change flags for restoration after rollback.
     fn save_change_flags(&mut self, state: &[u8]) {
         let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize] as u32;
         for i in 0..num_slots {
@@ -797,7 +762,7 @@ impl UndoState {
         self.saved_change_flags_count = num_slots + 1;
     }
 
-    /// vm.zig:324 `restoreChangeFlags`.
+    /// Restore change flags saved before rollback.
     fn restore_change_flags(&self, state: &mut [u8]) {
         if self.saved_change_flags_count == 0 {
             return;
@@ -829,7 +794,7 @@ fn state_bytes_entry(offset: u32, len: u8, value: &[u8]) -> FlatUndoEntry {
     }
 }
 
-/// The Zig module globals as one long-lived VM instance.
+/// One long-lived reducer VM instance.
 #[derive(Debug)]
 pub struct Vm {
     pub undo: UndoState,
@@ -857,9 +822,8 @@ impl Default for Vm {
     }
 }
 
-/// Split-borrow view implementing the container-ops hooks boundary: the undo
-/// lane and the bitmap environment are independent Zig global groups, and the
-/// bitmap ops need both (`hooks` + `env`) at once.
+/// Split-borrow view implementing the container-ops hook boundary. Undo state
+/// and bitmap state are independent, and bitmap operations need both at once.
 pub struct VmCtx<'a> {
     pub undo: &'a mut UndoState,
     pub env: &'a mut BitmapEnv,
@@ -908,11 +872,9 @@ impl VmHooks for VmCtx<'_> {
         undo_r: MutationRecord,
         redo_r: MutationRecord,
     ) {
-        // Zig's undoAppend/undoAppendPair snapshot the state on FIRST
-        // overflow through the aliasing `g_undo_state_base` global — for
-        // every append path, container ops included. The ops reborrow the
-        // buffer shared for the call, so the snapshot happens at the true
-        // overflow moment here too.
+        // Snapshot the state on first undo overflow. Container operations
+        // reborrow the same buffer, so this captures the true pre-overflow
+        // state for every append path.
         let (u, r) = (record_to_entry(undo_r), record_to_entry(redo_r));
         if delta_mode {
             self.undo.append_pair_snapshot(state, u, r);
@@ -944,7 +906,7 @@ impl VmHooks for VmCtx<'_> {
     }
 
     fn force_undo_snapshot(&mut self, state: &[u8]) {
-        // bitmap_ops.zig:511 — bulk algebra rollback is snapshot-based.
+        // Bulk bitmap algebra uses snapshot-based rollback.
         self.undo.snapshot(state);
         self.undo.overflow = true;
     }
@@ -990,10 +952,10 @@ impl VmHooks for VmCtx<'_> {
 }
 
 // =============================================================================
-// Rollback (vm.zig:343-543)
+// Rollback
 // =============================================================================
 
-/// vm.zig:343 `rollbackEntry` — reverse one mutation on the state buffer.
+/// Reverse-apply one mutation to the state buffer.
 pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEntry) {
     match entry.op {
         FlatUndoOp::MapInsert => {
@@ -1121,8 +1083,8 @@ pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEnt
                 .copy_from_slice(&cell[..len as usize]);
         }
         FlatUndoOp::ListAppendUndo => {
-            // vm.zig:464 — restore the ORDERED_LIST count (raw SIZE field;
-            // getSlotMeta cannot bind ORDERED_LIST's repurposed metadata).
+            // Restore the ORDERED_LIST count from its repurposed metadata
+            // field; the general metadata view cannot bind this slot type.
             let meta_off = slot_meta_base(entry.slot);
             bytes::write_u32(state, meta_off + SlotMetaOffset::SIZE, entry.prev_value);
         }
@@ -1256,17 +1218,17 @@ fn rollback_struct_map2_row(state: &mut [u8], entry: &FlatUndoEntry) {
 }
 
 // =============================================================================
-// Struct-map journaling (vm.zig:545-663)
+// Struct-map journaling
 // =============================================================================
 
-/// vm.zig:553 `packFieldBytes` — ≤8 field-cell bytes as a LE u64.
+/// Pack up to eight field-cell bytes into a little-endian u64.
 fn pack_field_bytes(bytes_in: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     buf[..bytes_in.len()].copy_from_slice(bytes_in);
     u64::from_le_bytes(buf)
 }
 
-/// vm.zig:658 `packBitsetBytes`.
+/// Pack up to eight row-presence bytes into a little-endian u64.
 fn pack_bitset_bytes(state: &[u8], off: u32, bitset_bytes: u32) -> u64 {
     let n = bitset_bytes.min(8) as usize;
     let mut buf = [0u8; 8];
@@ -1274,8 +1236,7 @@ fn pack_bitset_bytes(state: &[u8], off: u32, bitset_bytes: u32) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// vm.zig:559-566 `g_smr_prior_*` — the pre-overwrite row snapshot. Rust
-/// passes it explicitly instead of using module globals.
+/// Pre-overwrite row snapshot passed explicitly instead of stored in globals.
 struct RowPrior {
     bitset: [u8; 8],
     cells: [u64; 64],
@@ -1294,7 +1255,7 @@ impl RowPrior {
     }
 }
 
-/// vm.zig:573 `captureStructMapRowPrior`.
+/// Capture the prior row state before an upsert rewrites it.
 fn capture_struct_map_row_prior(
     state: &[u8],
     smap: &StructMapSlot,
@@ -1316,8 +1277,8 @@ fn capture_struct_map_row_prior(
     }
 }
 
-/// vm.zig:604 `emitStructMapRowJournal` — STRUCT_MAP_ROW first (authoritative
-/// prior bitset runs LAST in reverse rollback), then per-field entries.
+/// Emit a STRUCT_MAP_ROW entry first, then per-field entries; reverse rollback
+/// restores the authoritative row bitset before field-level state.
 #[allow(clippy::too_many_arguments)]
 fn emit_struct_map_row_journal(
     undo: &mut UndoState,
@@ -1552,9 +1513,8 @@ fn emit_struct_map2_remove_journal(
     }
 }
 
-/// vm.zig:301 `appendMutation` where the caller owns the state buffer (so
-/// first-overflow snapshots can happen, exactly like the Zig global-pointer
-/// path).
+/// Append a mutation while the caller owns the state buffer, allowing the
+/// first-overflow snapshot to capture the live bytes.
 fn append_mutation_state(
     undo: &mut UndoState,
     delta_mode: bool,
@@ -1580,8 +1540,7 @@ fn nested_journal_ranges(state: &[u8], meta: &SlotMetaView) -> [(u32, u32); 2] {
 }
 
 // =============================================================================
-// Single-element struct-map operations (vm.zig:1072-1273)
-// =============================================================================
+// Single-element struct-map operations
 
 struct StructUpsertResult {
     err: ErrorCode,
@@ -1857,7 +1816,7 @@ fn should_upsert_struct_map_max(
     hashmap_ops::cmp_gt(incoming, existing, comparison.cmp_type)
 }
 
-/// vm.zig:1080 `singleStructMapUpsertLast`.
+/// Upsert one struct-map row using the latest-value strategy.
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map_upsert_last(
     undo: &mut UndoState,
@@ -1892,8 +1851,8 @@ fn single_struct_map_upsert_last(
 
     let row = smap.row_off(result.pos);
 
-    // vm.zig:1106 — capture the prior row BEFORE clearBitset wipes it; small
-    // (non-overflow) batches have no shadow snapshot to fall back on.
+    // Capture the prior row before clear_bitset wipes it; small batches have no
+    // overflow shadow snapshot to fall back on.
     let mut prior = RowPrior::new();
     if undo.enabled && !result.is_new {
         capture_struct_map_row_prior(state, &smap, row, &mut prior);
@@ -2093,8 +2052,7 @@ fn single_struct_map2_remove(
 }
 
 //#region reduce-typed-state.probe-upsert
-/// vm.zig:1139 `singleStructMapUpsertFromProbe` — copy remapped fields from a
-/// probed source row into the out slot (the `.lookup` join).
+/// Copy remapped fields from a probed source row into the output slot.
 #[allow(clippy::too_many_arguments)]
 fn single_struct_map_upsert_from_probe(
     undo: &mut UndoState,
@@ -2172,7 +2130,7 @@ fn single_struct_map_upsert_from_probe(
 }
 //#endregion reduce-typed-state.probe-upsert
 
-/// vm.zig:1200 `writeStructMapArrayFields` — CSR array fields into the arena.
+/// Write CSR array fields into the nested arena.
 #[allow(clippy::too_many_arguments)]
 fn write_struct_map_array_fields(
     state: &mut [u8],
@@ -2199,7 +2157,7 @@ fn write_struct_map_array_fields(
     let arena_header_off = bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS);
 
     if arena_header_off == 0 {
-        return ErrorCode::Ok; // vm.zig:1220 — no arena.
+        return ErrorCode::Ok; // no arena
     }
 
     let descriptor_size = align8(u32::from(num_fields));
@@ -2252,11 +2210,11 @@ fn write_struct_map_array_fields(
 }
 
 // =============================================================================
-// Aggregate execution (vm.zig:1297-1329)
+// Aggregate execution
 // =============================================================================
 
-/// vm.zig:1297 `execAgg` for f64 slots (16-byte value+count layout). The
-/// full u64 count rides prev_value (low) + key (high) journal lanes.
+/// Execute an aggregate on f64 slots (`[value: u64][count: u64]`). The full
+/// u64 count uses the journal's `prev_value` low lane and `key` high lane.
 #[allow(clippy::too_many_arguments)]
 fn exec_agg_f64(
     undo: &mut UndoState,
@@ -2274,7 +2232,7 @@ fn exec_agg_f64(
 
     let new_val = aggregates::reduce_col_f64(kind, vals, old_val, type_mask, pred_col);
 
-    // Float compare exactly like Zig `!=` (a NaN old/new always "changes").
+    // A NaN old or new value compares unequal, so every NaN transition changes.
     #[allow(clippy::float_cmp)]
     if new_val != old_val {
         if undo.enabled {
@@ -2284,8 +2242,8 @@ fn exec_agg_f64(
                 pad1: 0,
                 pad2: 0,
                 // Full u64 count: low half in prev_value, high half in the
-                // otherwise-unused key lane (the deleted Zig truncated to
-                // u32, so counts past 4.29e9 rolled back wrong).
+                // Store the full u64 count across the journal's low/high lanes
+                // so counts above u32::MAX remain lossless during rollback.
                 key: (count >> 32) as u32,
                 prev_value: count as u32,
                 aux,
@@ -2303,7 +2261,7 @@ fn exec_agg_f64(
     }
 }
 
-/// vm.zig:1297 `execAgg` for i64 slots.
+/// Execute an aggregate on i64 slots.
 #[allow(clippy::too_many_arguments)]
 fn exec_agg_i64(
     undo: &mut UndoState,
@@ -2329,8 +2287,8 @@ fn exec_agg_i64(
                 pad1: 0,
                 pad2: 0,
                 // Full u64 count: low half in prev_value, high half in the
-                // otherwise-unused key lane (the deleted Zig truncated to
-                // u32, so counts past 4.29e9 rolled back wrong).
+                // Store the full u64 count across the journal's low/high lanes
+                // so counts above u32::MAX remain lossless during rollback.
                 key: (count >> 32) as u32,
                 prev_value: count as u32,
                 aux,
@@ -2348,7 +2306,7 @@ fn exec_agg_i64(
     }
 }
 
-/// Shared COUNT-slot bump (vm.zig BATCH_AGG_COUNT / 0x41 / 0x45 bodies).
+/// Bump a COUNT slot.
 fn exec_agg_count(
     undo: &mut UndoState,
     delta_mode: bool,
@@ -2379,13 +2337,8 @@ fn exec_agg_count(
     meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
 }
 
-/// vm.zig BATCH_SCALAR_LATEST core (top-level and 0x48 body share it via the
-/// optional type mask). Unknown scalar subtypes are always INVALID_PROGRAM.
-///
-/// Scalar writes ARE undo-journaled (ScalarUpdate, one undo/redo pair per
-/// call when the slot changed) — the deleted Zig journaled nothing here, so
-/// a speculative BATCH_SCALAR_LATEST mutation survived rollback unless the
-/// overflow shadow snapshot happened to cover it.
+/// Execute the shared BATCH_SCALAR_LATEST core. Unknown scalar subtypes return
+/// INVALID_PROGRAM. Scalar writes are undo-journaled with one pair per change.
 #[allow(clippy::too_many_arguments)]
 fn exec_scalar_latest(
     undo: &mut UndoState,
@@ -2417,10 +2370,8 @@ fn exec_scalar_latest(
     let prev_value = bytes::read_u64(state, data);
     let prev_ts = bytes::read_f64(state, data + 8);
 
-    // AggType: SCALAR_U32 = 8, SCALAR_F64 = 9, SCALAR_I64 = 10 (types.zig:214-216;
-    // 6-7 are the reserved gap — a prior misread as 5/6/7 made every scalar op a
-    // silent no-op, self-confirmed by tests built from the same wrong constants
-    // and caught only by the TS parity suite).
+    // Scalar discriminants are SCALAR_U32 = 8, SCALAR_F64 = 9, and
+    // SCALAR_I64 = 10; 6–7 are reserved.
     let matches = |i: usize| type_mask.is_none_or(|(td, id)| td[i] == id);
     match scalar_type {
         8 => {
@@ -2493,15 +2444,15 @@ fn exec_scalar_latest(
 }
 
 // =============================================================================
-// Block-based execution tables (vm.zig:1869-1984)
+// Block-based execution tables
 // =============================================================================
 
-/// vm.zig:1870 `isAggregateOp` — 0x40-0x4F.
+/// Test whether an opcode belongs to the aggregate block (0x40–0x4F).
 const fn is_aggregate_op(op_byte: u8) -> bool {
     op_byte & 0xF0 == 0x40
 }
 
-/// vm.zig:1875 `aggOpLen`.
+/// Return the length of an aggregate opcode.
 const fn agg_op_len(op_byte: u8) -> u32 {
     match op_byte {
         0x40 => 3,
@@ -2511,11 +2462,11 @@ const fn agg_op_len(op_byte: u8) -> u32 {
         0x45 => 3,
         0x46..=0x48 => 4,
         0x49..=0x4b => 3,
-        _ => 2, // conservative fallback (vm.zig:1889)
+        _ => 2, // conservative fallback for unknown aggregate opcodes
     }
 }
 
-/// vm.zig:1895 `bodyOpLen` — length (incl. opcode) of a non-agg body op.
+/// Return the length (including opcode) of a non-aggregate body operation.
 fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
     let op = Opcode::from_u8(*code.get(pc)?)?;
     let len = match op {
@@ -2535,13 +2486,12 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
                 .checked_add(num_fields.checked_mul(2)?)?
                 .checked_add(1)?
         }
-        //#endregion reduce-typed-state.probe-len
         //#region reduce-typed-state.scatter-len
         Opcode::BatchStructMapProbeScatter => {
             let num_routes = usize::from(*code.get(pc.checked_add(6)?)?);
             7usize.checked_add(num_routes.checked_mul(5)?)?
         }
-        //#endregion reduce-typed-state.scatter-len
+        //#endregion struct-map scatter length
         Opcode::BatchSetInsert
         | Opcode::BatchSetRemove
         | Opcode::BatchBitmapAdd
@@ -2637,7 +2587,7 @@ fn validate_body(state: &[u8], body: &[u8]) -> bool {
 }
 
 // =============================================================================
-// Dispatch (vm.zig:1346-3288)
+// VM dispatch
 // =============================================================================
 
 const OK: u32 = ErrorCode::Ok as u32;
@@ -2645,7 +2595,7 @@ const INVALID_STATE: u32 = ErrorCode::InvalidState as u32;
 const INVALID_PROGRAM: u32 = ErrorCode::InvalidProgram as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 
-/// vm.zig:1406 `signalGrowth` — CAPACITY_EXCEEDED → NEEDS_GROWTH + slot.
+/// Map a capacity failure to NEEDS_GROWTH and record its slot.
 fn signal_growth(slot_idx: u8, result: ErrorCode) -> u32 {
     if result == ErrorCode::CapacityExceeded {
         NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
@@ -2655,7 +2605,7 @@ fn signal_growth(slot_idx: u8, result: ErrorCode) -> u32 {
 }
 
 impl Vm {
-    /// vm.zig:3266 `vm_execute_batch`.
+    /// Execute one batch using the VM's normal mutation lane.
     pub fn execute_batch(
         &mut self,
         state: &mut [u8],
@@ -2666,7 +2616,7 @@ impl Vm {
         self.execute_impl(false, state, program, cols, batch_len)
     }
 
-    /// vm.zig:3278 `vm_execute_batch_delta`.
+    /// Execute one batch using the VM's delta mutation lane.
     pub fn execute_batch_delta(
         &mut self,
         state: &mut [u8],
@@ -2694,7 +2644,7 @@ impl Vm {
         Ok(total)
     }
 
-    /// vm.zig:1346 `executeBatchImpl`.
+    /// Execute the core batch implementation for normal or delta mode.
     fn execute_impl(
         &mut self,
         delta_mode: bool,
@@ -2729,8 +2679,7 @@ impl Vm {
         while pc < code.len() {
             let op_byte = code[pc];
             pc += 1;
-            // Unknown byte or a registry-only opcode both take the Zig
-            // dispatch's `else` arm: INVALID_PROGRAM.
+            // Unknown or registry-only opcodes are invalid in the reduce dispatch.
             let Some(op) = Opcode::from_u8(op_byte) else {
                 return INVALID_PROGRAM;
             };
@@ -3177,9 +3126,9 @@ impl Vm {
                         field_idxs[vi] = pair[1];
                     }
 
-                    // The top-level batch path intentionally parses but does
-                    // not materialize array operands, matching the Zig VM.
                     let smap = StructMapSlot::bind(state, operands.slot);
+                    // The top-level batch path parses but does not materialize
+                    // array operands.
                     let comparison = match operands.comparison_field_idx {
                         Some(field_idx) => {
                             let Some(comparison) = resolve_struct_map_max_comparison(
@@ -3386,7 +3335,7 @@ impl Vm {
                     // to batch_len; a short column is a malformed batch.
                     let type_data = batch_col!(col_u32_exact(type_col, batch_len));
 
-                    // Pass 1: batch aggregates, once per match id (vm.zig:1806).
+                    // Pass 1: batch aggregates, once per match id.
                     for mi in 0..match_count {
                         let id_off = match_ids_start + mi * 4;
                         let match_id = bytes::read_u32(code, id_off as u32);
@@ -3398,7 +3347,7 @@ impl Vm {
                         }
                     }
 
-                    // Pass 2: per-element scalar ops (vm.zig:1827).
+                    // Pass 2: per-element scalar operations.
                     for ei in 0..batch_len {
                         let val = type_data[ei as usize];
                         let mut matched = false;
@@ -3420,8 +3369,7 @@ impl Vm {
                     }
                 }
 
-                // Registry-only / init-section opcodes reaching the reduce
-                // dispatch take the Zig `else` arm.
+                // Registry-only and init-section opcodes are invalid here.
                 _ => return INVALID_PROGRAM,
             }
         }
@@ -3429,7 +3377,7 @@ impl Vm {
         OK
     }
 
-    /// vm.zig:1988 `executeBatchAggregates` — pass 1 of FOR_EACH.
+    /// Execute pass one of FOR_EACH: batch aggregates once per match id.
     #[allow(clippy::too_many_arguments)]
     fn execute_batch_aggregates(
         &mut self,
@@ -3568,8 +3516,7 @@ impl Vm {
         OK
     }
 
-    /// vm.zig:2178 `executeElementOpcodes` — pass 2, one element at a time;
-    /// recursive through FLAT_MAP.
+    /// Execute element opcodes one at a time, recursing through FLAT_MAP.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn execute_element_opcodes(
         &mut self,
@@ -3906,8 +3853,7 @@ impl Vm {
                     }
                 }
 
-                // SET_INSERT (0x30) / BITMAP_ADD (0x34) — vm.zig routes both
-                // through singleSetInsert (BITMAP delegation via hooks).
+                // SET_INSERT and BITMAP_ADD share the single-element set path.
                 0x30 | 0x34 => {
                     let (slot, elem_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
@@ -4458,8 +4404,7 @@ impl Vm {
                                     0.0,
                                     &mut self.ctx(),
                                 );
-                                // Faithful: ANY failure becomes NEEDS_GROWTH
-                                // (vm.zig:3025 checks != .OK, not CAPACITY_EXCEEDED).
+                                // Any failure requests growth so the caller can retry.
                                 if set_result != ErrorCode::Ok {
                                     NEEDS_GROWTH_SLOT.store(dest_slot, Ordering::Relaxed);
                                     return NEEDS_GROWTH;
@@ -4477,8 +4422,7 @@ impl Vm {
                     let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
 
-                    // Raw metadata reads — getSlotMeta cannot bind
-                    // ORDERED_LIST's repurposed fields (vm.zig:3045).
+                    // Read the repurposed ORDERED_LIST metadata fields directly.
                     let meta_base = slot_meta_base(slot);
                     let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
                     let capacity = bytes::read_u32(state, meta_base + SlotMetaOffset::CAPACITY);
@@ -4635,7 +4579,7 @@ impl Vm {
                                 let v = cell_u32(cols, vc[vi], child_idx);
                                 state[f_offset as usize] = u8::from(v != 0);
                             }
-                            // Array fields in ordered-list rows — not supported (vm.zig:3156).
+                            // Array fields in ordered-list rows are unsupported.
                             StructFieldType::ArrayU32
                             | StructFieldType::ArrayI64
                             | StructFieldType::ArrayF64
@@ -4764,10 +4708,9 @@ impl Vm {
     }
 
     // =========================================================================
-    // Undo-log surface (vm.zig:3630-3731)
-    // =========================================================================
+    // Undo-log surface
 
-    /// vm.zig:3630 `vm_undo_enable`.
+    /// Enable undo and capture the state size.
     pub fn undo_enable(&mut self, state: &[u8]) {
         let u = &mut self.undo;
         u.enabled = true;
@@ -4782,12 +4725,12 @@ impl Vm {
         u.save_change_flags(state);
     }
 
-    /// vm.zig:3651 `vm_undo_checkpoint`.
+    /// Return the current undo checkpoint position.
     pub fn undo_checkpoint(&self) -> u32 {
         self.undo.count()
     }
 
-    /// vm.zig:3660 `vm_undo_rollback`.
+    /// Roll back to a checkpoint, restoring the state and change flags.
     pub fn undo_rollback(&mut self, state: &mut [u8], checkpoint_pos: u32) {
         let u = &mut self.undo;
         if u.overflow && u.shadow_active {
@@ -4816,7 +4759,7 @@ impl Vm {
         u.restore_change_flags(state);
     }
 
-    /// vm.zig:3704 `vm_undo_commit`.
+    /// Commit undo state and discard its shadow snapshot.
     pub fn undo_commit(&mut self) {
         let u = &mut self.undo;
         u.shadow = None;
@@ -4829,17 +4772,16 @@ impl Vm {
         u.enabled = false;
     }
 
-    /// vm.zig:3729 `vm_undo_has_overflow`.
+    /// Return whether delta export overflowed.
     pub fn undo_has_overflow(&self) -> bool {
         self.undo.overflow
     }
 
     // =========================================================================
-    // Delta export/apply (vm.zig:3733-3792)
+    // Delta export and apply
     // =========================================================================
 
-    /// vm.zig:3733 `vm_delta_export_segment` — clamp `[from, to)` to the
-    /// valid pair range; returns the exported count.
+    /// Export the selected `[from, to)` delta pair range and return its count.
     pub fn delta_export_segment(&mut self, from_pos: u32, to_pos: u32) -> u32 {
         let u = &mut self.undo;
         let end = to_pos.min(u.delta_count);
@@ -4869,20 +4811,18 @@ impl Vm {
         )
     }
 
-    /// vm.zig:3751 `vm_delta_export_len_bytes`.
+    /// Return the byte length of the exported delta segment.
     pub fn delta_export_len_bytes(&self) -> u32 {
         self.undo.export_count * FLAT_UNDO_ENTRY_SIZE
     }
 
-    /// vm.zig:3759 `vm_delta_export_overflow`.
+    /// Return whether delta export overflowed.
     pub fn delta_export_overflow(&self) -> bool {
         self.undo.export_overflow
     }
 
-    /// vm.zig:3763 `vm_delta_apply_rollback_segment` — reverse-apply an undo
-    /// segment. Zig trusts the bytes (UB on a corrupt op); Rust panics on one
-    /// — segments are produced by `delta_export_*` and a corrupt op byte is a
-    /// programmer bug at the boundary.
+    /// Reverse-apply an undo segment. Segments are produced by
+    /// `delta_export_*`; a corrupt op byte is a programmer error and panics.
     pub fn delta_apply_rollback_segment(
         &mut self,
         state: &mut [u8],
@@ -4901,8 +4841,7 @@ impl Vm {
         }
     }
 
-    /// vm.zig:3779 `vm_delta_apply_rollforward_segment` — forward-apply a
-    /// redo segment (the entries are "rollbacks" toward the target state).
+    /// Forward-apply a redo segment; entries move the state toward the target.
     pub fn delta_apply_rollforward_segment(
         &mut self,
         state: &mut [u8],
@@ -4916,11 +4855,8 @@ impl Vm {
         }
         let count = redo_segment.len() / FLAT_UNDO_ENTRY_SIZE as usize;
         for i in 0..count {
-            // Undo-only journal items (evictions, derived-fact appends) have
-            // no forward effect: their redo lane is the explicit zeroed
-            // no-op marker (op byte 0). Skip them — the deleted Zig exported
-            // undefined bytes here, and treating the marker as corruption
-            // would panic mid-rollforward.
+            // Entries without a forward effect use an explicit zeroed no-op
+            // marker (op byte 0); skip them during rollforward.
             if redo_segment[i * FLAT_UNDO_ENTRY_SIZE as usize] == 0 {
                 continue;
             }
@@ -4929,7 +4865,7 @@ impl Vm {
         }
     }
 
-    /// vm.zig:3755 `vm_delta_export_entry_size`.
+    /// Return the serialized size of one delta entry.
     pub const fn delta_export_entry_size() -> u32 {
         FLAT_UNDO_ENTRY_SIZE
     }
@@ -4956,10 +4892,10 @@ fn parse_entry(segment: &[u8], i: usize) -> FlatUndoEntry {
 }
 
 // =============================================================================
-// Read / iteration exports (vm.zig:3358-3621)
+// Read and iteration exports
 // =============================================================================
 
-/// vm.zig:3359 `vm_map_get`.
+/// Look up a value in a HASHMAP slot, returning `EMPTY_KEY` when absent.
 pub fn vm_map_get(state: &[u8], slot_offset: u32, capacity: u32, key: u32) -> u32 {
     let keys = slot_offset;
     let values = slot_offset + capacity * 4;
@@ -4977,7 +4913,7 @@ pub fn vm_map_get(state: &[u8], slot_offset: u32, capacity: u32, key: u32) -> u3
     EMPTY_KEY
 }
 
-/// vm.zig:3382 `vm_set_contains`.
+/// Test whether a set contains a key.
 pub fn vm_set_contains(
     env: &mut BitmapEnv,
     state: &[u8],
@@ -5009,7 +4945,7 @@ pub fn vm_set_contains(
     false
 }
 
-/// vm.zig:3414 `vm_map_iter_start` — ascending-slot scan, end = capacity.
+/// Start a map iterator by scanning live key cells in ascending order.
 pub fn vm_map_iter_start(state: &[u8], slot_offset: u32, capacity: u32) -> u32 {
     (0..capacity)
         .find(|&i| {
@@ -5019,7 +4955,7 @@ pub fn vm_map_iter_start(state: &[u8], slot_offset: u32, capacity: u32) -> u32 {
         .unwrap_or(capacity)
 }
 
-/// vm.zig:3435 `vm_map_iter_next`.
+/// Advance a map iterator.
 pub fn vm_map_iter_next(state: &[u8], slot_offset: u32, capacity: u32, current: u32) -> u32 {
     ((current + 1)..capacity)
         .find(|&i| {
@@ -5029,14 +4965,14 @@ pub fn vm_map_iter_next(state: &[u8], slot_offset: u32, capacity: u32, current: 
         .unwrap_or(capacity)
 }
 
-/// vm.zig:3456 `vm_map_iter_get` — value in the high 32 bits, key low.
+/// Return the key and value at a map iterator position, packed as u64.
 pub fn vm_map_iter_get(state: &[u8], slot_offset: u32, capacity: u32, pos: u32) -> u64 {
     let key = bytes::read_u32(state, slot_offset + pos * 4);
     let val = bytes::read_u32(state, slot_offset + capacity * 4 + pos * 4);
     (u64::from(val) << 32) | u64::from(key)
 }
 
-/// vm.zig:3472 `vm_set_iter_start` — BITMAP slots iterate by rank.
+/// Start a BITMAP/set iterator; BITMAP slots iterate by rank.
 pub fn vm_set_iter_start(state: &[u8], slot_offset: u32, capacity: u32) -> u32 {
     if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
         && meta.slot_type() == SlotType::Bitmap
@@ -5046,7 +4982,7 @@ pub fn vm_set_iter_start(state: &[u8], slot_offset: u32, capacity: u32) -> u32 {
     vm_map_iter_start(state, slot_offset, capacity)
 }
 
-/// vm.zig:3489 `vm_set_iter_next`.
+/// Advance a BITMAP/set iterator.
 pub fn vm_set_iter_next(state: &[u8], slot_offset: u32, capacity: u32, current: u32) -> u32 {
     if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
         && meta.slot_type() == SlotType::Bitmap
@@ -5061,7 +4997,7 @@ pub fn vm_set_iter_next(state: &[u8], slot_offset: u32, capacity: u32, current: 
     vm_map_iter_next(state, slot_offset, capacity, current)
 }
 
-/// vm.zig:3506 `vm_set_iter_get`.
+/// Return the element at a BITMAP/set iterator position.
 pub fn vm_set_iter_get(state: &[u8], slot_offset: u32, pos: u32) -> u32 {
     if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
         && meta.slot_type() == SlotType::Bitmap
@@ -5072,7 +5008,7 @@ pub fn vm_set_iter_get(state: &[u8], slot_offset: u32, pos: u32) -> u32 {
     bytes::read_u32(state, slot_offset + pos * 4)
 }
 
-/// vm.zig:3526 `findSlotMetaByOffset`.
+/// Find slot metadata by its data offset.
 pub fn find_slot_meta_by_offset(state: &[u8], slot_offset: u32) -> Option<SlotMetaView> {
     let num_slots = state[StateHeaderOffset::NUM_SLOTS as usize];
     (0..num_slots)
@@ -5080,7 +5016,7 @@ pub fn find_slot_meta_by_offset(state: &[u8], slot_offset: u32) -> Option<SlotMe
         .find(|meta| meta.offset == slot_offset)
 }
 
-/// vm.zig:3566 `vm_struct_map_get_row_ptr` — row byte offset or 0xFFFFFFFF.
+/// Return a struct-map row offset, or `0xFFFF_FFFF` when absent.
 pub fn vm_struct_map_get_row_ptr(
     state: &[u8],
     slot_offset: u32,
@@ -5106,7 +5042,7 @@ pub fn vm_struct_map_get_row_ptr(
     0xFFFF_FFFF
 }
 
-/// vm.zig:3581 `vm_struct_map_iter_start`.
+/// Start a struct-map iterator by scanning live key cells.
 pub fn vm_struct_map_iter_start(
     state: &[u8],
     slot_offset: u32,
@@ -5122,7 +5058,7 @@ pub fn vm_struct_map_iter_start(
         .unwrap_or(capacity)
 }
 
-/// vm.zig:3597 `vm_struct_map_iter_next`.
+/// Advance a struct-map iterator.
 pub fn vm_struct_map_iter_next(
     state: &[u8],
     slot_offset: u32,
@@ -5139,7 +5075,7 @@ pub fn vm_struct_map_iter_next(
         .unwrap_or(capacity)
 }
 
-/// vm.zig:3613 `vm_struct_map_iter_key`.
+/// Return the key at a struct-map iterator position.
 pub fn vm_struct_map_iter_key(state: &[u8], slot_offset: u32, num_fields: u32, pos: u32) -> u32 {
     bytes::read_u32(state, slot_offset + align8(num_fields) + pos * 4)
 }

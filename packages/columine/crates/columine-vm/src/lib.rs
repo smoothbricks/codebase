@@ -1,12 +1,9 @@
-//! Rust port of the columine VM core — stage 2 of the Zig-to-Rust port specification.
+//! Byte-addressed reducer VM core for state lifecycle, hash containers,
+//! nested containers, aggregates, undo/delta, and reads/iteration.
 //!
-//! Slice 1 ports `packages/columine/src/vm/state_init.zig` plus the minimal
-//! surface of its sibling modules that state initialization and slot growth
-//! call into. Slice 2 ports the hash-container family (`hash_table.zig`,
-//! `hashmap_ops.zig`, `hashset_ops.zig`); its calls into vm.zig globals go
-//! through the `hooks` boundary until the vm dispatch/undo/bitmap slices
-//! land. Each module here names the Zig file it replaces; modules that exist
-//! only as a boundary for a later slice say so in their header.
+//! Modules share explicit little-endian byte layouts and typed offset views.
+//! Container operations use hooks to reach VM-owned undo, TTL, and bitmap
+//! services without retaining references into the state buffer.
 //!
 //! Byte-order note: the VM state and program bytecode are little-endian byte
 //! contracts (wasm32 + the LE native targets). All multi-byte accesses go

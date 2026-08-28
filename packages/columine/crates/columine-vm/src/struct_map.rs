@@ -1,27 +1,13 @@
-//! Rust port of `packages/columine/src/vm/struct_map.zig` — typed accessor
-//! for multi-field hash map rows.
+//! Typed accessor for multi-field hash-map rows.
 //!
-//! Slot data layout (struct_map.zig:5-11):
-//!   `[field_type_descriptor: u8 × num_fields (padded to 8)]`
-//!   `[keys: u32 × capacity]`
-//!   `[rows: row_size × capacity]`
+//! Slot data layout:
+//! `[field_type_descriptor: u8 × num_fields (padded to 8)]`
+//! `[keys: u32 × capacity]` `[rows: row_size × capacity]`
+//! `[timestamps: f64 × capacity]?`.
 //!
-//! Each row: `[bitset: ceil(num_fields/8) bytes][field0][field1]…` with NO
-//! padding between fields (`fieldOffset` is a plain cumulative sum). The
-//! 4-byte ROW padding lives only in `row_size` itself, which state_init
-//! computes via `compute_struct_row_layout_padded` and stores in slot
-//! metadata — this module only reads it back.
-//!
-//! Field sizes: UINT32/STRING 4, INT64/FLOAT64 8, BOOL 1, ARRAY_* 8 in-row
-//! (`columine_types::types::struct_field_size`).
-//!
-//! Probe-semantics note (deliberate, matches Zig): unlike `hash_table.zig`'s
-//! `findInsert`, struct_map's probe (struct_map.zig:92-103) does NOT scan
-//! past tombstones for the key — a TOMBSTONE cell terminates the probe as an
-//! insertion point exactly like EMPTY_KEY. Struct maps have no remove
-//! operation, so tombstones cannot occur in well-formed state; the simpler
-//! probe is still ported verbatim because the probe sequence is observable
-//! ABI the moment a row is placed.
+//! Struct-map probing scans past tombstones and reuses the first tombstone
+//! only when the key is absent. Struct maps have no remove operation, so
+//! tombstones are not expected in a well-formed state.
 
 use crate::bytes;
 use crate::meta::slot_meta_base;
@@ -30,44 +16,44 @@ use columine_types::types::{
     struct_field_size,
 };
 
-/// struct_map.zig:92 `findInsert` result.
+/// Result of a `find_insert` probe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Probe {
     pub pos: u32,
     pub found: bool,
 }
 
-/// struct_map.zig:145 `upsert` result.
+/// Result of an `upsert` operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Upsert {
     pub pos: u32,
     pub is_new: bool,
 }
 
-/// struct_map.zig:29 `StructMapSlot` — a bound view carrying offsets into the
-/// state buffer (this crate never forms pointers into state; see `bytes`).
+/// Bound struct-map view carrying offsets into the state buffer.
+/// No pointers into state are formed.
 #[derive(Clone, Copy, Debug)]
 pub struct StructMapSlot {
     pub slot_offset: u32,
     pub capacity: u32,
-    /// Offset of the u32 size field in slot metadata (Zig `size_ptr`).
+    /// Offset of the u32 size field in slot metadata.
     pub size_off: u32,
     pub num_fields: u8,
     pub bitset_bytes: u32,
     pub row_size: u32,
-    /// `align8(num_fields)` (struct_map.zig:51).
+    /// `align8(num_fields)`, the descriptor size.
     pub descriptor_size: u32,
     /// Offset of the field-type descriptor bytes (== `slot_offset`).
     pub field_types_off: u32,
     pub keys_off: u32,
-    /// Absolute offset of row 0 (struct_map.zig `rows_base`).
+    /// Absolute offset of row zero.
     pub rows_base: u32,
 }
 
 impl StructMapSlot {
-    /// struct_map.zig:43-67 `bind` — bind to an existing struct map slot via
-    /// its metadata record. Metadata byte reuse (pinned by state_init tests):
-    /// byte 13 = num_fields, byte 15 = bitset_bytes, bytes 16-17 = row_size.
+    /// Bind to an existing struct-map slot via its metadata record. Metadata
+    /// byte reuse: byte 13 = num_fields, byte 15 = bitset_bytes, bytes 16–17
+    /// = row_size.
     pub fn bind(state: &[u8], slot_idx: u8) -> Self {
         let meta_base = slot_meta_base(slot_idx);
         let slot_offset = bytes::read_u32(state, meta_base + SlotMetaOffset::OFFSET);
@@ -97,7 +83,7 @@ impl StructMapSlot {
         }
     }
 
-    /// struct_map.zig:69 `size`.
+    /// Current element count.
     #[inline(always)]
     pub fn size(&self, state: &[u8]) -> u32 {
         bytes::read_u32(state, self.size_off)
@@ -108,7 +94,7 @@ impl StructMapSlot {
         bytes::write_u32(state, self.size_off, value);
     }
 
-    /// struct_map.zig:73 `maxLoad` — 70% integer load factor.
+    /// Maximum size before growth, using a 70% integer load factor.
     const fn max_load(&self) -> u32 {
         self.capacity * 7 / 10
     }
@@ -118,7 +104,7 @@ impl StructMapSlot {
         bytes::read_u32(state, self.keys_off + pos * 4)
     }
 
-    /// Raw key-cell write (vm.zig rollback arms stamp TOMBSTONE directly).
+    /// Raw key-cell write used by rollback to stamp a TOMBSTONE.
     #[inline(always)]
     pub(crate) fn set_key_at(&self, state: &mut [u8], pos: u32, key: u32) {
         bytes::write_u32(state, self.keys_off + pos * 4, key);
@@ -137,8 +123,7 @@ impl StructMapSlot {
         })
     }
 
-    /// struct_map.zig:78 `find` — key lookup, or None. Sentinel keys are
-    /// never present.
+    /// Find a key, or return `None`. Sentinel keys are never present.
     pub fn find(&self, state: &[u8], key: u32) -> Option<u32> {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
@@ -161,11 +146,9 @@ impl StructMapSlot {
         None
     }
 
-    /// struct_map.zig:92 `findInsert` — insert-or-update probe, unified on
-    /// the hash_table policy post-parity: probe for an existing key first,
-    /// reusing the first tombstone seen. (The deleted Zig claimed a
-    /// tombstone immediately, so an insert could shadow a live copy of the
-    /// same key sitting past it.)
+    /// Insert-or-update probe: find an existing key before reusing the first
+    /// tombstone, then return `None` for sentinel keys, probe exhaustion, or
+    /// exceeded load factor.
     pub fn find_insert(&self, state: &[u8], key: u32) -> Option<Probe> {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
@@ -196,14 +179,13 @@ impl StructMapSlot {
         first_tombstone.map(|pos| Probe { pos, found: false })
     }
 
-    /// struct_map.zig:106 `rowPtr` — absolute byte offset of the row at hash
-    /// position `pos` (the Zig version returns a pointer).
+    /// Absolute byte offset of row `pos`.
     pub const fn row_off(&self, pos: u32) -> u32 {
         self.rows_base + pos * self.row_size
     }
 
-    /// struct_map.zig:111 `fieldOffset` — byte offset of a field within a
-    /// row (bitset first, then a plain cumulative sum — no padding).
+    /// Byte offset of a field within a row (bitset first, then cumulative
+    /// field sizes without padding).
     pub fn field_offset(&self, state: &[u8], field_idx: u8) -> u32 {
         let mut off = self.bitset_bytes;
         for i in 0..field_idx {
@@ -212,15 +194,14 @@ impl StructMapSlot {
         off
     }
 
-    /// struct_map.zig:121 `isFieldSet` — `row_off` is the absolute offset of
-    /// the row (bitset lives at its start).
+    /// Test whether a row field is present in its leading bitset.
     #[inline(always)]
     pub fn is_field_set(state: &[u8], row_off: u32, field_idx: u8) -> bool {
         let byte = state[(row_off + u32::from(field_idx) / 8) as usize];
         byte & (1u8 << (field_idx % 8)) != 0
     }
 
-    /// struct_map.zig:126 `setFieldBit`.
+    /// Set a row field's presence bit.
     #[inline(always)]
     pub fn set_field_bit(state: &mut [u8], row_off: u32, field_idx: u8) {
         state[(row_off + u32::from(field_idx) / 8) as usize] |= 1u8 << (field_idx % 8);
@@ -235,13 +216,13 @@ impl StructMapSlot {
     }
     //#endregion reduce-typed-state.scatter-clear
 
-    /// struct_map.zig:140 `clearBitset`.
+    /// Clear the row's presence bitset.
     pub fn clear_bitset(&self, state: &mut [u8], row_off: u32) {
         bytes::zero(state, row_off, self.bitset_bytes);
     }
 
-    /// struct_map.zig:145 `upsert` — insert or find `key`, tracking size.
-    /// None = sentinel key, probe exhaustion, or load factor exceeded.
+    /// Insert or find `key`, tracking size. `None` means sentinel key, probe
+    /// exhaustion, or load factor exceeded.
     pub fn upsert(&self, state: &mut [u8], key: u32) -> Option<Upsert> {
         let probe = self.find_insert(state, key)?;
         if !probe.found {
@@ -258,11 +239,8 @@ impl StructMapSlot {
         })
     }
 
-    /// struct_map.zig:157 `writeScalarField` — write one scalar field from a
-    /// column into the row at `pos`, setting its bitset bit. Columns are raw
-    /// LE cell arrays exactly like the Zig `col_ptrs` (u32 cells for
-    /// UINT32/STRING/BOOL, u64/f64 cells for INT64/FLOAT64). ARRAY_* fields
-    /// are handled separately by the arena path, matching the Zig no-op.
+    /// Write one scalar field from a raw little-endian column into the row,
+    /// setting its bitset bit. Array fields are handled by the arena path.
     pub fn write_scalar_field(
         &self,
         state: &mut [u8],
@@ -289,8 +267,7 @@ impl StructMapSlot {
                 bytes::write_u64(state, f_off, v);
             }
             StructFieldType::Float64 => {
-                // Zig `@bitCast`s the f64 to u64 before the LE write; reading
-                // and writing the raw 8 bytes is the same operation.
+                // Preserve the f64 bit pattern as its raw little-endian bytes.
                 let v = bytes::read_u64(col, element_idx * 8);
                 bytes::write_u64(state, f_off, v);
             }
@@ -298,7 +275,7 @@ impl StructMapSlot {
                 let v = bytes::read_u32(col, element_idx * 4);
                 state[f_off as usize] = u8::from(v != 0);
             }
-            // Array fields handled separately (struct_map.zig:190).
+            // Array fields are handled separately.
             StructFieldType::ArrayU32
             | StructFieldType::ArrayI64
             | StructFieldType::ArrayF64
@@ -307,8 +284,8 @@ impl StructMapSlot {
         }
     }
 
-    /// struct_map.zig:195 `getRowPtrByKey` — absolute byte offset of the
-    /// key's row, or `0xFFFF_FFFF` when absent (the TS-visible sentinel).
+    /// Return the absolute byte offset of a key's row, or `0xFFFF_FFFF` when
+    /// absent.
     pub fn get_row_ptr_by_key(&self, state: &[u8], key: u32) -> u32 {
         match self.find(state, key) {
             Some(pos) => self.rows_base + pos * self.row_size,
@@ -316,9 +293,7 @@ impl StructMapSlot {
         }
     }
 
-    /// struct_map.zig:201 `readU32` — reads the first 4 row bytes. Ported
-    /// verbatim: the Zig version ignores `field_idx` (callers pass a row
-    /// pointer already advanced to the field; see its own comment).
+    /// Read the first four bytes of a row as a u32.
     pub fn read_u32(state: &[u8], row_off: u32) -> u32 {
         bytes::read_u32(state, row_off)
     }

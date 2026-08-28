@@ -1,7 +1,5 @@
-//! vm_test.zig blocks that exercise the DISPATCH loop (`vm_execute_batch`),
-//! the undo/rollback surface, TTL eviction through the live reducer path, and
-//! growth signaling. Each test cites the vm_test.zig block it translates;
-//! scenarios and expected values are identical.
+//! Dispatch tests cover batch execution, undo/rollback, TTL eviction, and
+//! growth signaling. Scenarios and expected values are pinned as ABI behavior.
 
 use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
@@ -21,7 +19,7 @@ const OK: u32 = ErrorCode::Ok as u32;
 const NEEDS_GROWTH: u32 = ErrorCode::NeedsGrowth as u32;
 
 // =============================================================================
-// Program builders (vm_test.zig:78-260, 1200-1293, 1530-1600, 1957-2036,
+// Program builders (, 1200-1293, 1530-1600, 1957-2036,
 // 2450-2530 equivalents)
 // =============================================================================
 
@@ -72,7 +70,7 @@ fn slot_struct_map(slot: u8, type_flags: u8, cap_lo: u8, field_types: &[u8]) -> 
     def
 }
 
-/// vm_test.zig:82 `buildTestProgram` — HASHMAP(LAST) + AGG COUNT.
+///  `buildTestProgram` — HASHMAP(LAST) + AGG COUNT.
 fn build_test_program(cap_lo: u8, cap_hi: u8) -> Vec<u8> {
     let mut init = Vec::new();
     init.extend(slot_def(0, 0x00, cap_lo, cap_hi));
@@ -81,7 +79,7 @@ fn build_test_program(cap_lo: u8, cap_hi: u8) -> Vec<u8> {
     program(2, 2, &init, &reduce)
 }
 
-/// vm_test.zig:185 `buildTTLMapProgram` — TTL HASHMAP + BATCH_MAP_UPSERT_LATEST.
+///  `buildTTLMapProgram` — TTL HASHMAP + BATCH_MAP_UPSERT_LATEST.
 fn build_ttl_map_program(cap_lo: u8, cap_hi: u8, has_evict_trigger: bool) -> Vec<u8> {
     let evict_flag = if has_evict_trigger { 0x20 } else { 0 };
     let init = slot_def_ttl(0, 0x10 | evict_flag, cap_lo, cap_hi, 10.0, 0.0, 2);
@@ -89,14 +87,14 @@ fn build_ttl_map_program(cap_lo: u8, cap_hi: u8, has_evict_trigger: bool) -> Vec
     program(1, 3, &init, &reduce)
 }
 
-/// vm_test.zig:236 `buildTTLSetProgram` — TTL HASHSET + BATCH_SET_INSERT.
+///  `buildTTLSetProgram` — TTL HASHSET + BATCH_SET_INSERT.
 fn build_ttl_set_program(cap_lo: u8, cap_hi: u8) -> Vec<u8> {
     let init = slot_def_ttl(0, 0x01 | 0x10, cap_lo, cap_hi, 10.0, 0.0, 1);
     let reduce = [0x30, 0, 0];
     program(1, 2, &init, &reduce)
 }
 
-/// vm_test.zig:1211 `buildForEachTestProgramMulti` — FOR_EACH { MAP_UPSERT_LAST + AGG_COUNT }.
+///  `buildForEachTestProgramMulti` — FOR_EACH { MAP_UPSERT_LAST + AGG_COUNT }.
 fn build_for_each_program(type_ids: &[u32]) -> Vec<u8> {
     let mut init = Vec::new();
     init.extend(slot_def(0, 0x00, 4, 0));
@@ -112,7 +110,7 @@ fn build_for_each_program(type_ids: &[u32]) -> Vec<u8> {
     program(2, 3, &init, &reduce)
 }
 
-/// vm_test.zig:1530 `buildBlockStructMapTestProgram` — FOR_EACH { 0x80 }.
+///  `buildBlockStructMapTestProgram` — FOR_EACH { 0x80 }.
 fn build_block_struct_map_program(type_id: u32) -> Vec<u8> {
     let init = slot_struct_map(0, 6, 4, &[0, 4]); // STRUCT_MAP=6; UINT32 + STRING
     let body = [0x80u8, 0, 1, 2, 2, 0, 3, 1, 0];
@@ -123,10 +121,8 @@ fn build_block_struct_map_program(type_id: u32) -> Vec<u8> {
     program(1, 4, &init, &reduce)
 }
 
-/// vm_test.zig:1957 `buildFlatMapTestProgram` — FOR_EACH { FLAT_MAP { 0x80 } }.
-/// Faithful byte quirk: the Zig builder writes type_flags 0x05 here (vs the
-/// enum value 6 in its sibling builders) — SLOT_STRUCT_MAP's init path keys
-/// on the opcode, not the flag byte's type bits.
+/// Build a FOR_EACH/FLAT_MAP program with the documented type-flag quirk:
+/// initialization keys on the opcode, not the flag byte's type bits.
 fn build_flat_map_program(type_id: u32) -> Vec<u8> {
     let init = slot_struct_map(0, 0x05, 4, &[0, 4]);
     let inner_body = [0x80u8, 0, 2, 2, 3, 0, 4, 1, 0];
@@ -140,7 +136,7 @@ fn build_flat_map_program(type_id: u32) -> Vec<u8> {
     program(1, 5, &init, &reduce)
 }
 
-/// vm_test.zig:2480 `buildStructMapTestProgram` — top-level 0x80.
+///  `buildStructMapTestProgram` — top-level 0x80.
 fn build_struct_map_program(cap_lo: u8, cap_hi: u8) -> Vec<u8> {
     let init = slot_struct_map(0, 6, cap_lo, &[0, 4]);
     let mut init2 = init.clone();
@@ -149,7 +145,7 @@ fn build_struct_map_program(cap_lo: u8, cap_hi: u8) -> Vec<u8> {
     program(1, 3, &init2, &reduce)
 }
 
-/// vm_test.zig:2036 `buildProbeScatterTestProgram` — FOR_EACH { FLAT_MAP { 0x2f } }.
+///  `buildProbeScatterTestProgram` — FOR_EACH { FLAT_MAP { 0x2f } }.
 fn build_probe_scatter_program(type_id: u32) -> Vec<u8> {
     let mut init = Vec::new();
     // Slot 0: stagedSuggestions [route:U32, op:U32, e:U32, v_str:STR, v_num:F64, v_set:STR]
@@ -250,7 +246,7 @@ fn bit_set(state: &[u8], row: u32, fi: u8) -> bool {
     StructMapSlot::is_field_set(state, row, fi)
 }
 
-/// vm_test.zig:2150 `seedProbeRow`.
+///  `seedProbeRow`.
 #[allow(clippy::too_many_arguments)]
 fn seed_probe_row(
     state: &mut [u8],
@@ -280,7 +276,7 @@ fn seed_probe_row(
 }
 
 // =============================================================================
-// TTL through the live reducer path (vm_test.zig:406-531)
+// TTL through the live reducer path ()
 // =============================================================================
 
 #[test]
@@ -404,7 +400,7 @@ fn ttl_eviction_index_overflow_returns_needs_growth_instead_of_dropping() {
 }
 
 // =============================================================================
-// Slot growth through dispatch (vm_test.zig:533-871)
+// Slot growth through dispatch ()
 // =============================================================================
 
 #[test]
@@ -472,7 +468,7 @@ fn slot_growth_grow_preserves_hashmap_entries_and_aggregate() {
 
 #[test]
 fn slot_growth_hashset_growth_preserves_elements() {
-    // vm_test.zig:693 — one HASHSET slot, BATCH_SET_INSERT, grow after fill.
+    //  — one HASHSET slot, BATCH_SET_INSERT, grow after fill.
     let init_sec = slot_def(0, 0x01, 4, 0);
     let reduce = [0x30u8, 0, 0];
     let prog = program(1, 1, &init_sec, &reduce);
@@ -518,7 +514,7 @@ fn slot_growth_hashset_growth_preserves_elements() {
 }
 
 // =============================================================================
-// FOR_EACH (vm_test.zig:1295-1596)
+// FOR_EACH ()
 // =============================================================================
 
 const TYPE_A: u32 = 1001;
@@ -664,7 +660,7 @@ fn for_each_struct_map_upsert_with_type_filtering() {
 }
 
 // =============================================================================
-// FLAT_MAP (vm_test.zig:1752-1993)
+// FLAT_MAP ()
 // =============================================================================
 
 #[test]
@@ -794,7 +790,7 @@ fn flat_map_growth_small_capacity_triggers_needs_growth() {
 }
 
 // =============================================================================
-// STRUCT_MAP_PROBE_SCATTER 0x2f (vm_test.zig:2194-2451)
+// STRUCT_MAP_PROBE_SCATTER 0x2f ()
 // =============================================================================
 
 fn run_scatter_one(vm: &mut Vm, state: &mut [u8], prog: &[u8], type_id: u32, key: u32) -> u32 {
@@ -1063,7 +1059,7 @@ fn probe_scatter_kind0_retract_clear_then_rollback_restores_value_and_bit() {
 }
 
 // =============================================================================
-// STRUCT_MAP_UPSERT_LAST 0x80 rollback (vm_test.zig:2453-2662)
+// STRUCT_MAP_UPSERT_LAST 0x80 rollback ()
 // =============================================================================
 
 fn exec_struct_upsert(
@@ -1201,7 +1197,7 @@ fn struct_map_upsert_multi_row_speculative_batch_fully_rolled_back() {
 }
 
 // =============================================================================
-// Struct map through top-level dispatch (vm_test.zig:871-1091)
+// Struct map through top-level dispatch ()
 // =============================================================================
 
 #[test]
@@ -1309,7 +1305,7 @@ proptest! {
         let cols: Vec<&[u8]> = vec![u32s_as_bytes(&keys), u32s_as_bytes(&vals)];
         prop_assert_eq!(OK, vm.execute_batch_delta(&mut state, &prog, &cols, keys.len() as u32));
 
-        // A second delta batch REMOVES a subset of the keys, so the exported
+        // A second delta batch REMOVES a subset of the keys, so the excovered
         // segment carries MapDelete pairs too (rollforward must re-delete,
         // rollback must re-insert with the pre-remove value).
         let rkeys: Vec<u32> = keys
@@ -1334,7 +1330,7 @@ proptest! {
         let redo_seg = vm.delta_export_redo_bytes();
         let entry_size = Vm::delta_export_entry_size();
 
-        // Roll the LIVE state back via the exported undo segment → logical
+        // Roll the LIVE state back via the excovered undo segment → logical
         // pre-batch content.
         let mut rolled = state.clone();
         vm.delta_apply_rollback_segment(&mut rolled, &undo_seg, entry_size);
@@ -1388,10 +1384,8 @@ proptest! {
 }
 
 // =============================================================================
-// Undo overflow through the container-op hooks path (vm.zig:240-299: EVERY
-// append snapshots on first overflow via the aliasing g_undo_state_base —
-// including appends from inside hashmap/hashset/bitmap ops)
-// =============================================================================
+// Undo overflow through the container-operation hooks path: every append
+// snapshots on first overflow, including hashmap/hashset/bitmap operations.
 
 #[test]
 fn undo_overflow_inside_container_op_snapshots_and_rolls_back() {
@@ -1440,14 +1434,11 @@ fn undo_overflow_inside_container_op_snapshots_and_rolls_back() {
     vm.undo_commit();
 }
 
-/// Parity regression (found by reducer-vm-integration.test.ts "handles empty
-/// batch"): the TS side ships an EMPTY column-pointer array for an empty
-/// batch while the program still references columns — Zig fetches the garbage
-/// pointer and never dereferences it (batch_len == 0); checked `cols[idx]`
-/// indexing panicked instead. `col_at` resolves out-of-range to the empty
-/// column. Program bytes are the exact TS-compiled `count()` reducer capture
-/// (exact capture incl. 32-byte hash prefix; header "CLM1" + SLOT_DEF AGGREGATE/COUNT +
-/// top-level 0xE0 FOR_EACH wrapping AGG_COUNT).
+/// Empty batches may provide no column pointers even when the program references
+/// columns: no column is dereferenced when `batch_len == 0`, and `col_at`
+/// resolves out-of-range to the empty column. Non-empty missing columns remain
+/// a malformed FFI input. The bytes below are the exact TypeScript-compiled
+/// `count()` reducer capture.
 #[test]
 fn empty_batch_with_no_column_pointers_is_ok() {
     let hex = "0000000000000000000000000000000000000000000000000000000000000000434c4d3101000100000006000c00100002020000e00101010000000200410000";
@@ -1526,11 +1517,9 @@ fn nonempty_batch_with_missing_columns_is_column_underrun() {
     assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 1));
 }
 
-/// Parity regression (reducer-vm-integration.test.ts "Scalar Slot — latest()"):
-/// exec_scalar_latest matched AggType 5/6/7, but the registry says SCALAR_U32=8,
-/// SCALAR_F64=9, SCALAR_I64=10 (types.zig:214-216; 6-7 reserved) — every scalar
-/// op was a silent no-op and NO Rust test covered 0x48 at all. Program bytes are
-/// the exact TS-compiled `latest('score')` capture (hash prefix included):
+/// Scalar latest() uses SCALAR_U32=8, SCALAR_F64=9, and SCALAR_I64=10;
+/// 6–7 are reserved. The bytes below are the exact TypeScript-compiled
+/// `latest('score')` capture.
 /// init `05 09 00` = scalar slot AggType SCALAR_F64, reduce = FOR_EACH(type_col=1,
 /// id=1) around `48 00 03 02` (slot 0, val_col 3, cmp_col 2).
 #[test]

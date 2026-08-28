@@ -1,11 +1,9 @@
 //! Little-endian raw-state access helpers shared by the VM-core modules.
 //!
-//! The Zig side reads and writes state bytes through pointer casts that are
-//! valid because every multi-byte field in the state layout happens to be
-//! naturally aligned. Rust references to underaligned data are UB, so this
-//! crate never forms a reference into the state buffer at all: every access
-//! is an explicit LE byte copy. That is byte-for-byte identical on the LE
-//! targets the VM ships on, and also correct on BE hosts.
+//! State fields may be underaligned in the byte buffer, so forming typed Rust
+//! references into it would be undefined behavior. Every access is an
+//! explicit little-endian byte copy: this matches the VM's LE targets and
+//! remains correct on big-endian hosts.
 //!
 //! The accessors are `#[inline(always)]` (they compile to a bounds check plus
 //! one load/store, and the interpreter hot loops call them per event), so the
@@ -91,9 +89,8 @@ pub fn copy(dst: &mut [u8], dst_off: u32, src: &[u8], src_off: u32, len: u32) {
     dst.copy_from_slice(src);
 }
 
-/// Same-buffer copy (vm.zig `@memcpy` between two regions of the state; the
-/// Zig call requires non-overlap and callers guarantee it — `copy_within`
-/// handles overlap safely anyway).
+/// Copy a range within one buffer. `copy_within` also handles overlapping
+/// source and destination ranges safely.
 #[inline(always)]
 pub fn copy_within(buf: &mut [u8], src_off: u32, dst_off: u32, len: u32) {
     buf.copy_within(src_off as usize..(src_off + len) as usize, dst_off as usize);

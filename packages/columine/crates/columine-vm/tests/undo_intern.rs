@@ -1,12 +1,7 @@
-//! Translated test blocks from `packages/columine/src/vm/undo_log.zig` (all
-//! 6 have counterparts here, same scenarios and expected values) plus
-//! rollback round-trip proptests, and behavior tests for `intern.rs`
-//! (intern.zig has NO test blocks of its own — the tests in
-//! `src/intern.rs` and here are new coverage).
+//! Coverage for undo-log rollback, delta round trips, and string interning.
 //!
-//! The vm_test.zig undo blocks (STRUCT_MAP_* rollback, "ORDERED_LIST - undo
-//! restores count") all execute batches through the dispatch loop — they are
-//! the dispatch slice's to translate.
+//! Rollback scenarios execute through the dispatch loop where applicable; the
+//! tests pin logical state, serialized layouts, and handle stability.
 
 use columine_types::types::{
     AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY,
@@ -26,11 +21,11 @@ use columine_vm::vm::{Vm, rollback_entry, write_derived_facts_header};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
-// Scaffolding — mirrors undo_log.zig's test-state construction (undo_log.zig
+// Scaffolding — mirrors 's test-state construction (
 // :115-127): header, one 48-byte slot-meta record, slot data right after.
 // ---------------------------------------------------------------------------
 
-const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48; // types.zig SLOT_META_SIZE
+const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48; // SLOT_META_SIZE
 
 fn mk_slot_state(cap: u32, type_flags_byte: u8) -> Vec<u8> {
     let mut state = vec![0u8; 4096];
@@ -67,14 +62,14 @@ fn set_table(meta: &SlotMetaView) -> FlatTable {
     )
 }
 
-/// undo_log.zig test flags byte: HASHMAP (0) + no_timestamps (0x40).
+///  test flags byte: HASHMAP (0) + no_timestamps (0x40).
 const HASHMAP_NO_TS: u8 = 0x40;
 
 // ---------------------------------------------------------------------------
-// undo_log.zig test blocks
+//  test blocks
 // ---------------------------------------------------------------------------
 
-/// undo_log.zig:114 "rollbackMapInsert — tombstones key and decrements size"
+///  "rollbackMapInsert — tombstones key and decrements size"
 #[test]
 fn rollback_map_insert_tombstones_key_and_decrements_size() {
     let mut state = mk_slot_state(16, HASHMAP_NO_TS);
@@ -89,7 +84,7 @@ fn rollback_map_insert_tombstones_key_and_decrements_size() {
     assert!(!tbl.contains(&state, 42));
 }
 
-/// undo_log.zig:139 "rollbackMapUpdate — restores previous value"
+///  "rollbackMapUpdate — restores previous value"
 #[test]
 fn rollback_map_update_restores_previous_value() {
     let mut state = mk_slot_state(16, HASHMAP_NO_TS);
@@ -104,7 +99,7 @@ fn rollback_map_update_restores_previous_value() {
     assert_eq!(tbl.get_u32(&state, 42), Some(100));
 }
 
-/// undo_log.zig:164 "rollbackMapDelete — restores key+value and increments size"
+///  "rollbackMapDelete — restores key+value and increments size"
 #[test]
 fn rollback_map_delete_restores_key_value_and_increments_size() {
     let mut state = mk_slot_state(16, HASHMAP_NO_TS);
@@ -125,7 +120,7 @@ fn rollback_map_delete_restores_key_value_and_increments_size() {
     assert_eq!(tbl.size(&state), 1);
 }
 
-/// undo_log.zig:195 "rollbackSetInsert — tombstones element"
+///  "rollbackSetInsert — tombstones element"
 #[test]
 fn rollback_set_insert_tombstones_element() {
     let mut state = mk_slot_state(16, SlotType::HashSet as u8);
@@ -140,7 +135,7 @@ fn rollback_set_insert_tombstones_element() {
     assert_eq!(tbl.size(&state), 0);
 }
 
-/// undo_log.zig:220 "rollback — AGG_UPDATE restores previous f64 value and count"
+///  "rollback — AGG_UPDATE restores previous f64 value and count"
 #[test]
 fn rollback_agg_update_restores_previous_f64_value_and_count() {
     let mut state = mk_slot_state(0, SlotType::Aggregate as u8);
@@ -173,7 +168,7 @@ fn rollback_agg_update_restores_previous_f64_value_and_count() {
     );
 }
 
-/// undo_log.zig:263 "rollback — COUNT_UPDATE restores previous u64 count"
+///  "rollback — COUNT_UPDATE restores previous u64 count"
 #[test]
 fn rollback_count_update_restores_previous_u64_count() {
     let mut state = mk_slot_state(0, SlotType::Aggregate as u8);
@@ -198,9 +193,7 @@ fn rollback_count_update_restores_previous_u64_count() {
     );
 }
 
-/// Zig-parity extra (no Zig counterpart): rollbackSetDelete restores the
-/// element — undo_log.zig:98 has no test block for it; same shape as the
-/// map-delete test.
+/// Additional coverage: rollback of a deleted set element restores the key.
 #[test]
 fn rollback_set_delete_restores_element() {
     let mut state = mk_slot_state(16, SlotType::HashSet as u8);
@@ -218,8 +211,8 @@ fn rollback_set_delete_restores_element() {
     assert_eq!(tbl.size(&state), 1);
 }
 
-/// Zig-parity extras: the false paths (key not found / key already present)
-/// that rollbackEntry relies on to skip stale entries.
+/// False paths (key not found or already present) must return `false` without
+/// changing state.
 #[test]
 fn rollback_helpers_return_false_on_mismatched_state() {
     let mut state = mk_slot_state(16, HASHMAP_NO_TS);
@@ -240,12 +233,9 @@ fn rollback_helpers_return_false_on_mismatched_state() {
 }
 
 // ---------------------------------------------------------------------------
-// Rollback round-trip proptests — the composition vm.zig's rollbackEntry
-// performs: journal a mutation sequence, roll it back in reverse, and the
-// LOGICAL state is restored. Rollback is not byte-exact at this layer:
-// rollbackMapInsert/rollbackSetInsert write TOMBSTONE where the insert found
-// EMPTY (undo_log.zig:32/92), and dead cells keep stale value/timestamp
-// bytes — only live content is the contract (pinned explicitly below).
+// Rollback round trips restore logical state, not byte-exact state: insert
+// rollback writes TOMBSTONE where the insert found EMPTY, and dead cells keep
+// stale value/timestamp bytes outside the live table.
 // ---------------------------------------------------------------------------
 
 /// Live logical content of a map slot: (key → (value, ts_bits)) + size.
@@ -271,7 +261,7 @@ fn set_content(state: &[u8], meta: &SlotMetaView) -> (Vec<u32>, u32) {
 }
 
 /// Pins the residue that makes rollback logical-not-byte-exact: rolling back
-/// a fresh insert leaves TOMBSTONE (undo_log.zig:32), not EMPTY_KEY.
+/// a fresh insert leaves TOMBSTONE (), not EMPTY_KEY.
 #[test]
 fn rollback_of_insert_leaves_tombstone_not_empty() {
     let mut state = mk_slot_state(16, HASHMAP_NO_TS);
@@ -283,7 +273,7 @@ fn rollback_of_insert_leaves_tombstone_not_empty() {
     assert_eq!(tbl.key_at(&state, pos), TOMBSTONE);
 }
 
-/// A journaled map mutation, as vm.zig's map paths would record it.
+/// A journaled map mutation, as 's map paths would record it.
 #[derive(Clone, Debug)]
 enum MapOp {
     Upsert { key: u32, value: u32, ts: f64 },
@@ -374,7 +364,7 @@ proptest! {
             }
         }
 
-        // Reverse rollback, dispatching exactly like vm.zig rollbackEntry.
+        // Reverse rollback, dispatching exactly like  rollbackEntry.
         for entry in journal.iter().rev() {
             let applied = match entry.op {
                 FlatUndoOp::MapInsert => rollback_map_insert(&mut state, &meta, entry.key),
@@ -487,8 +477,8 @@ proptest! {
     }
 }
 
-/// Post-parity fix pin: counts past u32::MAX round-trip through the widened
-/// journal lanes (prev_value low + key high) — the deleted Zig truncated.
+/// Counts above u32::MAX round-trip through the widened journal lanes
+/// (`prev_value` low and `key` high).
 #[test]
 fn rollback_count_update_preserves_counts_past_u32_max() {
     let mut state = mk_slot_state(0, SlotType::Aggregate as u8);

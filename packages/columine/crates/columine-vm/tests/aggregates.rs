@@ -1,9 +1,8 @@
-//! Translated `test "…"` blocks from `packages/columine/src/vm/aggregates.zig`
-//! (16/16), the zig-0.16.0 FP-probe bit pins, and the slice-4 proptests.
+//! Coverage for aggregate kernels, slot layout, deterministic FP probes, and
+//! property tests.
 //!
-//! The Zig tests assert with `expectApproxEqAbs(_, _, 0.001)`; the ports keep
-//! that tolerance. The probe-pin tests assert EXACT bit patterns — they are
-//! the FP-determinism contract (see the module docs of `aggregates`).
+//! Approximate assertions use a 0.001 tolerance. Probe tests assert exact bit
+//! patterns because lane order and NaN/tie behavior are part of the FP profile.
 
 use columine_vm::aggregates::{
     AggKind, TypeMask, agg_count, agg_set_count, agg_set_value_f64, agg_set_value_i64,
@@ -18,12 +17,12 @@ fn approx(a: f64, b: f64) {
 }
 
 // ---------------------------------------------------------------------------
-// aggregates.zig test blocks 1-6: kernel basics
+//  test blocks 1-6: kernel basics
 // ---------------------------------------------------------------------------
 
 #[test]
 fn batch_agg_sum_f64_simd_reduction() {
-    // aggregates.zig:364
+    //
     let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
     approx(batch_agg_sum(&data[..7]), 28.0);
     approx(batch_agg_sum(&data[..4]), 10.0); // SIMD-only (no tail)
@@ -31,7 +30,7 @@ fn batch_agg_sum_f64_simd_reduction() {
 
 #[test]
 fn batch_agg_min_max_f64_simd() {
-    // aggregates.zig:370
+    //
     let data = [5.0, 2.0, 8.0, 1.0, 7.0];
     approx(batch_agg_min(&data, f64::INFINITY), 1.0);
     approx(batch_agg_max(&data, f64::NEG_INFINITY), 8.0);
@@ -39,7 +38,7 @@ fn batch_agg_min_max_f64_simd() {
 
 #[test]
 fn masked_agg_sum_type_filtered() {
-    // aggregates.zig:376
+    //
     let vals = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
     let types_col = [1u32, 2, 1, 2, 1, 2]; // type=1 rows: 10+30+50=90
     approx(masked_agg_sum(&vals, &types_col, 1), 90.0);
@@ -48,7 +47,7 @@ fn masked_agg_sum_type_filtered() {
 
 #[test]
 fn masked_agg_count_simd() {
-    // aggregates.zig:383
+    //
     let types_col = [1u32, 2, 1, 1, 2, 1, 2, 1];
     assert_eq!(masked_agg_count(&types_col, 1), 5);
     assert_eq!(masked_agg_count(&types_col, 2), 3);
@@ -56,14 +55,14 @@ fn masked_agg_count_simd() {
 
 #[test]
 fn reduce_col_i64_sum_simd() {
-    // aggregates.zig:389
+    //
     let data = [100i64, 200, 300, 400, 500];
     assert_eq!(reduce_col_i64(AggKind::Sum, &data, 0, None, None), 1500);
 }
 
 #[test]
 fn reduce_col_f64_with_predicate() {
-    // aggregates.zig:395
+    //
     let vals = [10.0, 20.0, 30.0, 40.0];
     let pred = [1u32, 0, 1, 0]; // only indices 0 and 2
     approx(
@@ -73,7 +72,7 @@ fn reduce_col_f64_with_predicate() {
 }
 
 // ---------------------------------------------------------------------------
-// aggregates.zig test blocks 7-9: AggSlot layout
+//  test blocks 7-9: AggSlot layout
 // ---------------------------------------------------------------------------
 
 const AGG_COUNT: u8 = 2;
@@ -82,7 +81,7 @@ const AGG_SUM_I64: u8 = 11;
 
 #[test]
 fn agg_slot_count_layout() {
-    // aggregates.zig:402 — COUNT: 8 bytes, count at offset 0.
+    //  — COUNT: 8 bytes, count at offset 0.
     let mut buf = [0u8; 16];
     assert_eq!(agg_count(&buf, 0, AGG_COUNT), 0);
     agg_set_count(&mut buf, 0, AGG_COUNT, 42);
@@ -94,7 +93,7 @@ fn agg_slot_count_layout() {
 
 #[test]
 fn agg_slot_sum_layout() {
-    // aggregates.zig:411 — SUM: 16 bytes, value at 0, count at 8.
+    //  — SUM: 16 bytes, value at 0, count at 8.
     let mut buf = [0u8; 16];
     approx(agg_value_f64(&buf, 0), 0.0);
     assert_eq!(agg_count(&buf, 0, AGG_SUM), 0);
@@ -108,7 +107,7 @@ fn agg_slot_sum_layout() {
 
 #[test]
 fn agg_slot_sum_i64_layout() {
-    // aggregates.zig:423
+    //
     let mut buf = [0u8; 16];
     agg_set_value_i64(&mut buf, 0, 999_999_999_999);
     agg_set_count(&mut buf, 0, AGG_SUM_I64, 1);
@@ -117,7 +116,7 @@ fn agg_slot_sum_i64_layout() {
 }
 
 // ---------------------------------------------------------------------------
-// aggregates.zig test blocks 10-16: parametric batch sizes
+//  test blocks 10-16: parametric batch sizes
 // ---------------------------------------------------------------------------
 
 const MAX_PARAM_LEN: usize = 256;
@@ -133,19 +132,19 @@ fn param_i64_vals() -> [i64; MAX_PARAM_LEN] {
     core::array::from_fn(|i| (i + 1) as i64)
 }
 
-/// Alternating type_ids: even indices = 1, odd = 2 (aggregates.zig:462).
+/// Alternating type_ids: even indices = 1, odd = 2 ().
 fn param_type_ids() -> [u32; MAX_PARAM_LEN] {
     core::array::from_fn(|i| if i % 2 == 0 { 1 } else { 2 })
 }
 
-/// Every 3rd element passes the predicate (aggregates.zig:471).
+/// Every 3rd element passes the predicate ().
 fn param_pred_col() -> [u32; MAX_PARAM_LEN] {
     core::array::from_fn(|i| u32::from(i % 3 == 0))
 }
 
 #[test]
 fn batch_agg_sum_parametric() {
-    // aggregates.zig:479
+    //
     let vals = param_f64_vals();
     for &n in &PARAMETRIC_F64_SIZES {
         let expected = (n as f64) * ((n + 1) as f64) / 2.0;
@@ -155,7 +154,7 @@ fn batch_agg_sum_parametric() {
 
 #[test]
 fn batch_agg_min_parametric() {
-    // aggregates.zig:487
+    //
     let vals = param_f64_vals();
     for &n in &PARAMETRIC_F64_SIZES {
         approx(batch_agg_min(&vals[..n], f64::INFINITY), 1.0);
@@ -164,7 +163,7 @@ fn batch_agg_min_parametric() {
 
 #[test]
 fn batch_agg_max_parametric() {
-    // aggregates.zig:494
+    //
     let vals = param_f64_vals();
     for &n in &PARAMETRIC_F64_SIZES {
         approx(batch_agg_max(&vals[..n], f64::NEG_INFINITY), n as f64);
@@ -173,7 +172,7 @@ fn batch_agg_max_parametric() {
 
 #[test]
 fn masked_agg_sum_parametric() {
-    // aggregates.zig:502
+    //
     let vals = param_f64_vals();
     let type_ids = param_type_ids();
     for &n in &PARAMETRIC_MASKED_SIZES {
@@ -184,7 +183,7 @@ fn masked_agg_sum_parametric() {
 
 #[test]
 fn masked_agg_count_parametric() {
-    // aggregates.zig:516
+    //
     let type_ids = param_type_ids();
     for &n in &PARAMETRIC_MASKED_SIZES {
         assert_eq!(masked_agg_count(&type_ids[..n], 1), n.div_ceil(2) as u32);
@@ -193,8 +192,7 @@ fn masked_agg_count_parametric() {
 
 #[test]
 fn masked_agg_min_max_type_filtered() {
-    // Not a Zig block — masked min/max lacked direct Zig coverage; pinned
-    // here against hand-computed filtered extrema.
+    // Masked min/max are checked against hand-computed filtered extrema.
     let vals = [5.0, -3.0, 8.0, 1.0, 9.0, -7.0];
     let ids = [1u32, 2, 1, 2, 1, 2];
     approx(masked_agg_min(&vals, &ids, 1, f64::INFINITY), 5.0);
@@ -205,7 +203,7 @@ fn masked_agg_min_max_type_filtered() {
 
 #[test]
 fn reduce_col_i64_sum_parametric() {
-    // aggregates.zig:525
+    //
     let vals = param_i64_vals();
     for &n in &PARAMETRIC_I64_SIZES {
         let n_i64 = n as i64;
@@ -219,7 +217,7 @@ fn reduce_col_i64_sum_parametric() {
 
 #[test]
 fn reduce_col_f64_sum_with_predicate_batch_32() {
-    // aggregates.zig:534
+    //
     let vals = param_f64_vals();
     let pred = param_pred_col();
     let expected: f64 = vals[..32].iter().step_by(3).sum();
@@ -230,9 +228,8 @@ fn reduce_col_f64_sum_with_predicate_batch_32() {
 }
 
 // ---------------------------------------------------------------------------
-// FP-probe bit pins (scratchpad fp-probe/probe.zig, zig 0.16.0, Debug ==
-// ReleaseSmall on aarch64). These are EXACT: they pin lane order and
-// min/max NaN/tie semantics, the part `approx` can't see.
+// FP-probe bit pins. These exact values pin lane order and min/max NaN/tie
+// semantics that approximate comparisons cannot observe.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -275,9 +272,8 @@ fn probe_pin_min_nan_and_signed_zero() {
 // Proptests: reference-model differential + scalar-path equivalences
 // ---------------------------------------------------------------------------
 
-/// Independent reimplementation of the probed Zig lane semantics, written
-/// differently (index math instead of lane iterators) as the differential
-/// reference.
+/// Independent lane model written with index arithmetic rather than lane
+/// iterators, used for differential comparison.
 fn ref_lane_sum(vals: &[f64]) -> f64 {
     let chunks = vals.len() / 4;
     let mut l = [0.0f64; 4];
@@ -319,7 +315,7 @@ proptest! {
         prop_assert!(a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()));
     }
 
-    /// min/max: against a sequential scalar fold with the probed zig min
+    /// min/max: against a sequential scalar fold with the probed reference min
     /// semantics — the lane split must not change the result for min/max
     /// (unlike sum), because min/max with the "NaN yields the other operand,
     /// ties yield the second operand" rule is associative-in-value up to
