@@ -51,6 +51,13 @@
     ];
   };
 
+  # One Go for every repository, same reasoning as the Rust toolchain: a compiler
+  # is part of a cache key, so two of them mean two caches. devenv pins it through
+  # the lock. ttsc's bundled Go is a separate, unavoidable second toolchain: it
+  # exposes no override — which is why its cache is placed in the shared store
+  # rather than left per checkout.
+  languages.go.enable = true;
+
   enterShell = lib.mkMerge [
     # Prologue, in order:
     #
@@ -60,10 +67,21 @@
     #    use, so a hook and a shell resolve one binary the same way.
     # 3. ttsc drives the native TypeScript 7 binary while Nx imports the TypeScript
     #    6 API, so the two must be named separately.
-    # 4. TTSC_CACHE_DIR holds content-keyed native plugin binaries and GOCACHE.
-    #    It stays outside node_modules so dependency installs and caches stay lean,
-    #    and an inherited value wins because CI restores .cache/ttsc/plugins into a
-    #    path it chooses.
+    # 4. On a cowshed host, Go and ttsc caches point at the shared store, so every
+    #    workspace reads one warm cache instead of growing its own copy inside its
+    #    image. Without one, ttsc stays in-tree for the CI cache action while Go
+    #    keeps its normal per-user defaults. Both Go caches are content-addressed,
+    #    so sharing them needs no patch — unlike Rust, Go keys on content and flags
+    #    rather than on where the files live. An inherited value always wins so CI
+    #    can place any of these caches itself. GOFLAGS carries -trimpath because it
+    #    is Go's stable way to keep absolute build paths out of the artifact, and
+    #    unlike Rust's trim-paths it costs no cache reuse.
+    #
+    #    ttsc's plugin builds use the Go it bundles; that is not overridable (it
+    #    exposes only TTSC_CACHE_DIR and TTSC_TSGO_BINARY), so the repository's own
+    #    Go modules and ttsc's plugin builds are two toolchains by construction.
+    #    Placing both caches in the shared store is what keeps that from costing a
+    #    rebuild per workspace.
     # 5. enter-shell.ts chdirs to the workspace root and runs setup-environment.ts;
     #    a failed bootstrap aborts shell entry instead of yielding a half-working
     #    shell.
@@ -93,8 +111,16 @@
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
       export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
-      export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
-      mkdir -p "$TTSC_CACHE_DIR"
+      if [ -d "$HOME/.cowshed/caches" ]; then
+        export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$HOME/.cowshed/caches/ttsc}"
+        export GOCACHE="''${GOCACHE:-$HOME/.cowshed/caches/go/build}"
+        export GOMODCACHE="''${GOMODCACHE:-$HOME/.cowshed/caches/go/mod}"
+        mkdir -p "$TTSC_CACHE_DIR" "$GOCACHE" "$GOMODCACHE"
+      else
+        export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
+        mkdir -p "$TTSC_CACHE_DIR"
+      fi
+      export GOFLAGS="''${GOFLAGS:--trimpath}"
       bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
 
       if [ -n "''${SCCACHE_DIR:-}" ] || [ -d "$HOME/.cowshed/caches/sccache" ]; then
