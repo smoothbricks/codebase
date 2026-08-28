@@ -695,7 +695,7 @@ impl NativeFilesystem {
                 .write(true)
                 .create_new(true)
                 .mode(mode)
-                .custom_flags(no_follow_flag())
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&path);
             let file = match opened {
                 Ok(file) => file,
@@ -829,19 +829,8 @@ fn open_existing_no_follow(path: &Path, write: bool) -> io::Result<File> {
     options
         .read(true)
         .write(write)
-        .custom_flags(no_follow_flag());
+        .custom_flags(libc::O_NOFOLLOW);
     options.open(path)
-}
-
-const fn no_follow_flag() -> i32 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        0x2_0000
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        0x100
-    }
 }
 
 fn require_file_kind(file: &File, subject: &'static str, expected: FileKind) -> io::Result<()> {

@@ -11,9 +11,9 @@ use tokio::process::Command;
 use crate::error::{CowshedError, Result};
 
 #[cfg(target_os = "macos")]
-const GIT: &str = "/usr/bin/git";
+pub const GIT: &str = "/usr/bin/git";
 #[cfg(not(target_os = "macos"))]
-const GIT: &str = "git";
+pub const GIT: &str = "git";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {

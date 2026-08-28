@@ -15,12 +15,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{Finding, FindingSeverity};
+use cowshed_core::git::GIT;
 use cowshed_core::{CowshedError, Result};
-
-#[cfg(target_os = "macos")]
-const GIT: &str = "/usr/bin/git";
-#[cfg(not(target_os = "macos"))]
-const GIT: &str = "git";
 
 const HINT: &str = "add an includeIf gitdir: pattern covering the workspace mount root; cowshed setup --mount-root does not rewrite git identity";
 
