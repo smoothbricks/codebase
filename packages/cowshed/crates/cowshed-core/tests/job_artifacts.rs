@@ -867,12 +867,11 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
         0o400
     );
 
-    let checkpoint = store.checkpoint(1).unwrap();
+    let checkpoint = store.checkpoint().unwrap();
     assert_eq!(checkpoint.record.barrier_id, 1);
-    assert!(matches!(
-        store.checkpoint(1),
-        Err(ArtifactError::Integrity { .. })
-    ));
+    // Allocation is the store's: the next barrier is the next id, never a caller-repeated one.
+    let second = store.checkpoint().unwrap();
+    assert_eq!(second.record.barrier_id, 2);
     assert_eq!(checkpoint.record.visible_jobs.len(), 2);
     let active = checkpoint
         .record
@@ -907,7 +906,7 @@ fn checkpoint_and_background_force_every_visible_prefix_to_durable_files() {
     .unwrap();
     assert!(matches!(
         &reopened.recovery().frames.last().unwrap().record,
-        ProtectedRecord::CheckpointManifest(manifest) if *manifest == checkpoint.record
+        ProtectedRecord::CheckpointManifest(manifest) if *manifest == second.record
     ));
 }
 
