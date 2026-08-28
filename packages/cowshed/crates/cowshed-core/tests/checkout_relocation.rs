@@ -151,7 +151,7 @@ impl Relocated {
             git(
                 &self.session,
                 [
-                    format!("config"),
+                    String::from("config"),
                     format!("merge.{name}.driver"),
                     format!("{}/{program} %O %A %B", self.dead_root.display()),
                 ],
