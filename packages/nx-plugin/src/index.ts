@@ -35,7 +35,14 @@ const HOST_PLATFORM_SUFFIX: string | null = (() => {
 
 export function hostPlatformTargetNames(targetNames: Iterable<string>): string[] {
   if (HOST_PLATFORM_SUFFIX === null) return [];
-  return [...new Set(targetNames)].filter((name) => name.endsWith(HOST_PLATFORM_SUFFIX)).sort();
+  return [...new Set(targetNames)]
+    .filter(
+      // Binary targets only. A toolchain prerequisite carries the same platform
+      // suffix but produces no artifact: the cross builds that need it depend
+      // on it directly, so the aggregate stays a list of outputs.
+      (name) => name.endsWith(HOST_PLATFORM_SUFFIX) && !name.startsWith(NAPI_TOOLCHAIN_TARGET_PREFIX),
+    )
+    .sort();
 }
 
 //#region smoo!n/rust-output-target-inference
@@ -94,6 +101,17 @@ const NAPI_TARGET_CONVENTIONS: Readonly<Record<string, NapiTargetConvention>> = 
     useNapiCross: true,
   },
 };
+
+const NAPI_TOOLCHAIN_TARGET_PREFIX = 'napi-toolchain-';
+
+/**
+ * Prerequisite target that extracts the cross toolchain one triple needs. The
+ * platform suffix keeps it inside its own platform family, so it can be a
+ * dependency of `napi-<arch>-linux` and package-local `cli-<arch>-linux`.
+ */
+export function napiToolchainTargetName(convention: NapiTargetConvention): string {
+  return `${NAPI_TOOLCHAIN_TARGET_PREFIX}${convention.architecture}-${convention.targetFamily}`;
+}
 
 function createCargoWasmTarget(projectRoot: string, config: ResolvedCargoWasmConfig): TargetConfiguration {
   const cargoTargetDirectory = posix.join(posix.dirname(config.manifestPath), 'target/cargo-wasm');
@@ -569,6 +587,26 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
 
   for (const triple of config.targets) {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
+    if (!convention?.useNapiCross) {
+      continue;
+    }
+    // One toolchain target per triple, shared by every cross build that needs
+    // it: the inferred napi-<arch>-linux plus any package-local cli-<arch>-linux.
+    // Nx runs a shared dependency once, which is what stops those builds from
+    // racing inside the Bun store. See the executor for the failure it removes.
+    // The name carries the platform suffix so a Linux platform target's
+    // dependency closure stays Linux-only (package-target-policy).
+    targets[napiToolchainTargetName(convention)] = {
+      executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
+      // Extraction lands in ~/.napi-rs, outside the workspace: a cache hit
+      // would skip work a cold home directory still needs.
+      cache: false,
+      options: { triple },
+    };
+  }
+
+  for (const triple of config.targets) {
+    const convention = NAPI_TARGET_CONVENTIONS[triple];
     if (!convention) {
       throw new Error(`Missing N-API target convention for ${triple}`);
     }
@@ -578,6 +616,7 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
     targets[targetName] = {
       executor: 'nx:run-commands',
       cache: true,
+      ...(convention.useNapiCross ? { dependsOn: [napiToolchainTargetName(convention)] } : {}),
       inputs: NAPI_INPUTS,
       outputs: [`{projectRoot}/${outputDirectory}`],
       options: {

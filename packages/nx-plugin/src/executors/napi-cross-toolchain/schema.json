@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "N-API Cross Toolchain Executor",
+  "description": "Extract the pinned @napi-rs cross toolchain into ~/.napi-rs so `napi build --use-napi-cross` never downloads it.",
+  "type": "object",
+  "properties": {
+    "triple": {
+      "type": "string",
+      "description": "Rust target triple to prepare, e.g. x86_64-unknown-linux-gnu."
+    }
+  },
+  "required": ["triple"],
+  "additionalProperties": false
+}

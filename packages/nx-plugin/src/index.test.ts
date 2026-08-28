@@ -400,6 +400,20 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'napi build --release --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/darwin-arm64',
       });
       expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
+      expect(targets['napi-arm64-macos']?.dependsOn).toBeUndefined();
+      expect(targets['napi-toolchain-arm64-linux']).toEqual({
+        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
+        cache: false,
+        options: { triple: 'aarch64-unknown-linux-gnu' },
+      });
+      expect(targets['napi-toolchain-x64-linux']).toEqual({
+        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
+        cache: false,
+        options: { triple: 'x86_64-unknown-linux-gnu' },
+      });
+      expect(targets['napi-x64-linux']?.dependsOn).toEqual(['napi-toolchain-x64-linux']);
+      expect(targets['napi-arm64-linux']?.dependsOn).toEqual(['napi-toolchain-arm64-linux']);
+      expect(targets['napi-toolchain-x64-macos']).toBeUndefined();
       expect(targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
       expect(targets['napi-x64-linux']?.options).toMatchObject({
         command:
@@ -423,10 +437,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         .filter((name) => name.endsWith(hostSuffix))
         .sort();
       expect(targets.build?.dependsOn).toEqual([...buildOutputDependencies, ...hostNapiTargets]);
-      for (const name of targets.build?.dependsOn ?? []) {
-        if (/-(?:arm64|x64)-(?:macos|linux)$/.test(name)) {
-          expect(name.endsWith(hostSuffix)).toBe(true);
-        }
+      const platformBuildDependencies = (targets.build?.dependsOn ?? []).filter(
+        (dependency): dependency is string =>
+          typeof dependency === 'string' && /-(?:arm64|x64)-(?:macos|linux)$/.test(dependency),
+      );
+      for (const name of platformBuildDependencies) {
+        expect(name.endsWith(hostSuffix)).toBe(true);
       }
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets['napi-test']).toMatchObject({
