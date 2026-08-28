@@ -9,6 +9,10 @@
 let
   git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
 in {
+  # The SmoothBricks shell contract: PATH, toolchain, compiler-cache policy, and
+  # the enterShell prologue/epilogue every repo shares. Managed by `smoo monorepo`.
+  imports = [./devenv.smoo.nix];
+
   # https://devenv.sh/overlays/
   overlays = [
     inputs.nixpkgs-overlay.overlays.default
@@ -88,12 +92,8 @@ in {
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
 
-  # sccache wiring lives in enterShell, not here: whether to wrap rustc depends
-  # on whether anything owns the cache storage, which is a runtime fact.
-
-  # Nx otherwise defaults to three workers. Scale to the cores available in each
-  # developer shell or CI runner; explicit --parallel flags still take precedence.
-  env.NX_PARALLEL = "100%";
+  # NX_PARALLEL, the PATH/toolchain exports, and the sccache policy come from
+  # ./devenv.smoo.nix.
 
   # https://devenv.sh/languages/
   # Python with pyarrow for Arrow IPC verification tests.
@@ -110,54 +110,6 @@ in {
   # We're not using Devenv's pre-commit-hooks, because this repo's pre-commit hook
   # uses `git-format-staged` to format only the content that is about to be committed.
   # See https://devenv.sh/pre-commit-hooks/ for more details (uses Python pre-commit)
-
-  # https://devenv.sh/scripts/#entershell
-  # This runs when entering the devenv shell
-  # - When using the devenv wrapper from tooling/, restore the original working directory
-  #   (The wrapper runs devenv from tooling/direnv but we want the shell to start where the user was)
-
-  # PATH order: most-specific → least-specific.
-  # ttsc needs the native TypeScript 7 binary while Nx imports the TypeScript 6 API.
-  # On Darwin, remove Nix CC/CXX so xcodebuild finds Xcode clang with -index-store-path support.
-  # Bun/node native addons find compilers through node-gyp.
-  enterShell = ''
-    cd "$DEVENV_ROOT/../.."
-    export PATH="$("$PWD/tooling/direnv/repo-path")"
-    export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
-    # Content-keyed native plugin binaries + GOCACHE. Keep outside node_modules so
-    # dependency installs/caches stay lean; CI restores .cache/ttsc/plugins only.
-    export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
-    mkdir -p "$TTSC_CACHE_DIR"
-
-    # Wrap rustc only where something owns the cache storage: a cowshed host
-    # exports SCCACHE_SERVER_UDS for the daemon behind /private/cowshed/caches
-    # (`cowshed sccache start`), and a CI runner may export SCCACHE_DIR for a
-    # persistent cache root. With neither, sccache would write an unbounded
-    # store on this machine that nothing ever reclaims, so leave rustc alone
-    # and let cargo keep its own incremental state instead — a warm cowshed
-    # workspace already carries target/ in its clone.
-    #
-    # SCCACHE_BASEDIR_CWD=1 activates the overlay's patched sccache
-    # (nixpkgs-overlay/sccache-rust-basedir-cwd.patch), which keys path-bearing
-    # hash inputs relative to the request cwd so workspaces at different mount
-    # paths share one cache. Incremental is off whenever the wrapper runs:
-    # sccache refuses incremental compilations, and a shared hit beats
-    # per-checkout incremental state (the old unconditional regime left 24G of
-    # incremental dirs in packages/cowshed/target).
-    if [ -n "''${SCCACHE_SERVER_UDS:-}" ] || [ -n "''${SCCACHE_DIR:-}" ]; then
-      export RUSTC_WRAPPER=sccache
-      export SCCACHE_BASEDIR_CWD=1
-      export CARGO_INCREMENTAL=0
-    fi
-
-    bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
-
-    ${lib.optionalString pkgs.stdenv.isDarwin "unset CC CXX"}
-
-    if [ -n "$DEVENV_SHELL_PWD" ]; then
-      cd "$DEVENV_SHELL_PWD"
-    fi
-  '';
 
   # See full reference at https://devenv.sh/reference/options/
 }

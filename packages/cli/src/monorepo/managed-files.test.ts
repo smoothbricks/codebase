@@ -7,6 +7,7 @@ import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbrick
 import fc from 'fast-check';
 import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
+  DEVENV_MODULE_IMPORT,
   deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
   hasExactTargetForTest,
@@ -18,6 +19,7 @@ import {
   platformTargetGlobsForTest,
   reinsertInlineLocalBlocksForTest,
   splitLocalSectionForTest,
+  validateDevenvModuleImport,
 } from './managed-files.js';
 
 const MANAGED = '# managed content\npath merge=driver\n';
@@ -196,6 +198,26 @@ describe('managed publish platform discovery', () => {
     ).toEqual(['arm64', 'x64']);
     expect(macosPlatformArchitecturesForTest(['simulator-arm64-ios', 'cli-arm64-macos'])).toEqual(['arm64']);
     expect(macosPlatformArchitecturesForTest(['build', 'cli-x64-linux', 'test'])).toEqual([]);
+  });
+});
+
+describe('managed devenv module import', () => {
+  it('accepts a devenv.nix that imports the module and reports one that does not', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-devenv-import-'));
+    try {
+      // No devenv.nix at all: nothing to enforce (a repo may not use devenv).
+      expect(validateDevenvModuleImport(root)).toBe(0);
+
+      await mkdir(join(root, 'tooling/direnv'), { recursive: true });
+      const target = join(root, 'tooling/direnv/devenv.nix');
+      await writeFile(target, '{...}: {\n  packages = [];\n}\n');
+      expect(validateDevenvModuleImport(root)).toBe(1);
+
+      await writeFile(target, `{...}: {\n  imports = [${DEVENV_MODULE_IMPORT}];\n}\n`);
+      expect(validateDevenvModuleImport(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

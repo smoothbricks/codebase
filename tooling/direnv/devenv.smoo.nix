@@ -1,0 +1,1 @@
+../../packages/cli/managed/raw/tooling/direnv/devenv.smoo.nix
