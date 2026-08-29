@@ -5,8 +5,15 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { $ } from 'bun';
 
+// DEVENV_ROOT is set by the devenv shell, which is how this script normally
+// runs. CI jobs that install dependencies without building that shell (the
+// publishing job installs Bun and Node directly) have no such variable, so fall
+// back to the git top level rather than resolving "undefined/../.." two levels
+// above the repository and failing with "could not find a package.json".
 const devenvRoot = process.env.DEVENV_ROOT;
-const projectRoot = path.resolve(`${devenvRoot}/../..`);
+const projectRoot = devenvRoot
+  ? path.resolve(`${devenvRoot}/../..`)
+  : (await $`git rev-parse --show-toplevel`.text()).trim();
 
 // A legitimate concurrent setup finishes well within this; anything older is a
 // leftover from an interrupted run (CTRL-C/kill before the finally-cleanup) and
