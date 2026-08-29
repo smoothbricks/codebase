@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import typia from 'typia';
 import { formatMarkerHits, scanRefChangedForMarkers } from '../lib/conflict-markers.js';
 import { readJson } from '../lib/json.js';
-import { run, runResult } from '../lib/run.js';
+import { printCommandOutput, run, runResult } from '../lib/run.js';
 
 /** 0 = clean/done, 2 = action required (conflicts to resolve), 1 = usage/error. */
 export type PrResolveExit = 0 | 1 | 2;
@@ -229,9 +229,11 @@ async function abortResolve(
 
 async function prMeta(shell: PrResolveShell, root: string, prArg: string): Promise<PrMeta> {
   const fields = 'number,url,headRefName,baseRefName,isCrossRepository';
-  const result = await shell.runResult('gh', ['pr', 'view', prArg, '--json', fields], root);
+  const args = ['pr', 'view', prArg, '--json', fields];
+  const result = await shell.runResult('gh', args, root);
   if (result.exitCode !== 0) {
-    throw new Error(`Could not resolve PR '${prArg}' via gh: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(`gh ${args.join(' ')} failed with exit code ${result.exitCode}`);
   }
   const raw = parseGhPrViewJson(result.stdout);
   if (!raw) {
@@ -253,7 +255,12 @@ async function inferRemote(shell: PrResolveShell, root: string, nameWithOwner: s
   if (nameWithOwner.length === 0) {
     return 'origin';
   }
-  const result = await shell.runResult('git', ['remote', '-v'], root);
+  const args = ['remote', '-v'];
+  const result = await shell.runResult('git', args, root);
+  if (result.exitCode !== 0) {
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(`git ${args.join(' ')} failed with exit code ${result.exitCode}`);
+  }
   const needle = nameWithOwner.toLowerCase();
   for (const line of result.stdout.split('\n')) {
     const [name, url] = line.split(/\s+/);
@@ -275,18 +282,20 @@ async function checkoutPrBranch(shell: PrResolveShell, root: string, remote: str
 
 async function pushResolvedBranch(shell: PrResolveShell, root: string, state: PrResolveState): Promise<void> {
   const refspec = `HEAD:refs/heads/${state.headBranch}`;
-  const ff = await shell.runResult('git', ['push', state.remote, refspec], root);
+  const fastForwardArgs = ['push', state.remote, refspec];
+  const ff = await shell.runResult('git', fastForwardArgs, root);
   if (ff.exitCode === 0) {
     return;
   }
+  printCommandOutput(ff.stdout, ff.stderr);
   // The resolution may have been rebased/amended onto a moved head; the branch is
   // the review branch we own, so force-with-lease is the safe way to update it.
   console.log('Fast-forward push rejected; retrying with --force-with-lease (review branch).');
-  const forced = await shell.runResult('git', ['push', '--force-with-lease', state.remote, refspec], root);
+  const forceWithLeaseArgs = ['push', '--force-with-lease', state.remote, refspec];
+  const forced = await shell.runResult('git', forceWithLeaseArgs, root);
   if (forced.exitCode !== 0) {
-    throw new Error(
-      `Failed to push '${state.headBranch}' to '${state.remote}': ${forced.stderr.trim() || ff.stderr.trim()}`,
-    );
+    printCommandOutput(forced.stdout, forced.stderr);
+    throw new Error(`git ${forceWithLeaseArgs.join(' ')} failed with exit code ${forced.exitCode}`);
   }
 }
 
@@ -301,19 +310,34 @@ async function fetchBranches(shell: PrResolveShell, root: string, remote: string
 }
 
 async function currentBranch(shell: PrResolveShell, root: string): Promise<string> {
-  const result = await shell.runResult('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], root);
-  return result.exitCode === 0 ? result.stdout.trim() : '';
+  const args = ['symbolic-ref', '--quiet', '--short', 'HEAD'];
+  const result = await shell.runResult('git', args, root);
+  if (result.exitCode === 0) {
+    return result.stdout.trim();
+  }
+  if (result.exitCode === 1) {
+    return '';
+  }
+  printCommandOutput(result.stdout, result.stderr);
+  throw new Error(`git ${args.join(' ')} failed with exit code ${result.exitCode}`);
 }
 
 async function isWorkingTreeClean(shell: PrResolveShell, root: string): Promise<boolean> {
-  const result = await shell.runResult('git', ['status', '--porcelain'], root);
-  return result.exitCode === 0 && result.stdout.trim().length === 0;
+  const args = ['status', '--porcelain'];
+  const result = await shell.runResult('git', args, root);
+  if (result.exitCode !== 0) {
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(`git ${args.join(' ')} failed with exit code ${result.exitCode}`);
+  }
+  return result.stdout.trim().length === 0;
 }
 
 async function absoluteGitDir(shell: PrResolveShell, root: string): Promise<string> {
-  const result = await shell.runResult('git', ['rev-parse', '--absolute-git-dir'], root);
+  const args = ['rev-parse', '--absolute-git-dir'];
+  const result = await shell.runResult('git', args, root);
   if (result.exitCode !== 0) {
-    throw new Error(`Not a git repository at ${root}: ${result.stderr.trim()}`);
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(`git ${args.join(' ')} failed with exit code ${result.exitCode}`);
   }
   return result.stdout.trim();
 }
@@ -321,7 +345,8 @@ async function absoluteGitDir(shell: PrResolveShell, root: string): Promise<stri
 async function mustRun(shell: PrResolveShell, root: string, args: string[]): Promise<string> {
   const result = await shell.runResult('git', args, root);
   if (result.exitCode !== 0) {
-    throw new Error(`git ${args.join(' ')} failed: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(`git ${args.join(' ')} failed with exit code ${result.exitCode}`);
   }
   return result.stdout;
 }
