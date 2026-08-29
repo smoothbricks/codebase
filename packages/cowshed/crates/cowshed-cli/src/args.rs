@@ -1353,10 +1353,12 @@ const MOVE: CommandSpec = CommandSpec {
     summary: "rename a workspace, move/re-identify main",
     about: &[
         "The source decides what the destination means. `mv main <path>` moves the adopted checkout to an absolute path and keeps every record of where it lives in step; `mv main --repo-id <owner/repo>` changes the adopted identity without consulting or changing Git remotes. Every other source renames a workspace, whose new name is subject to the ordinary name grammar and cannot be `main`.",
+        "Re-identifying main — and moving a main that mounts directly at its checkout — detaches its volume to rename the identity-scoped store paths, so it refuses while anything holds the mount. Run it from outside the checkout with editors and daemons off the volume; main must be attached, and session workspaces must be detached first (the refusal lists the exact detach commands). Renaming a session workspace touches only that workspace's volume and works fine from inside main.",
+        "The old identity is kept as a former one, so markers, certificates and artifact stamps minted under it stay valid. Nothing before the volume comes down is destructive: a refused or interrupted attempt leaves the project as it was.",
     ],
     options: &[Opt {
         spelling: "--repo-id <owner/repo>",
-        meaning: "`main` only: replace the adopted repository identity in all cowshed records",
+        meaning: "`main` only: replace the adopted repository identity in every cowshed record, keeping the old one as a former identity; detaches and remounts main's volume, so the mount must be quiesced",
     }],
 };
 
