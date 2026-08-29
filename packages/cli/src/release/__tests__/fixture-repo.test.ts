@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'bun:test';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { collectOwnedReleaseTagRecords, pendingReleaseTargets, type ReleasePackageInfo, releaseTag } from '../core.js';
+import {
+  classifyReleaseBranchPush,
+  collectOwnedReleaseTagRecords,
+  divergedReleaseBranchMessage,
+  pendingReleaseTargets,
+  type ReleasePackageInfo,
+  releaseTag,
+} from '../core.js';
 import { completeReleaseAtHead, type ReleaseRepairShell, repairPendingTargets } from '../orchestration.js';
 import {
   git,
@@ -277,6 +284,55 @@ describe('release planning with fixture git repositories', () => {
       await expect(gitSucceeds(runner, ['rev-parse', '--verify', 'refs/tags/@scope/cli@0.2.0'])).resolves.toBe(false);
     });
   });
+
+  it('refuses a release whose branch diverged mid-run instead of dying on raw git output', async () => {
+    await withFixtureRepo(async (author) => {
+      await writePackage(author, '@scope/cli', 'packages/cli', '0.1.0');
+      await git(author, ['add', '.']);
+      await git(author, ['commit', '-m', 'initial']);
+      await git(author, ['init', '--bare', 'remote.git']);
+      await git(author, ['remote', 'add', 'origin', join(author, 'remote.git')]);
+      await git(author, ['push', 'origin', 'main']);
+      await git(author, ['clone', '--branch', 'main', join(author, 'remote.git'), 'runner']);
+      const runner = join(author, 'runner');
+      await git(runner, ['config', 'user.name', 'Test User']);
+      await git(runner, ['config', 'user.email', 'test@example.com']);
+
+      // The release job's own version bump: a commit that exists only in this job.
+      await writePackage(runner, '@scope/cli', 'packages/cli', '0.2.0');
+      await git(runner, ['add', '.']);
+      await git(runner, ['commit', '-m', 'chore(release): publish']);
+      const releaseSha = await gitOutput(runner, ['rev-parse', 'HEAD']);
+
+      // An unrelated push lands on the release branch while the candidate builds.
+      await writeFile(join(author, 'readme.md'), 'concurrent work\n');
+      await git(author, ['add', '.']);
+      await git(author, ['commit', '-m', 'unrelated work']);
+      await git(author, ['push', 'origin', 'main']);
+      const remoteSha = await gitOutput(author, ['rev-parse', 'HEAD']);
+
+      const pkg: ReleasePackageInfo = {
+        name: '@scope/cli',
+        projectName: 'cli',
+        path: 'packages/cli',
+        version: '0.2.0',
+      };
+      const shell = new LocalGitRepairShell(runner);
+
+      expect(releaseSha).not.toBe(remoteSha);
+      await expect(shell.pushReleaseRefs([pkg])).rejects.toThrow(
+        new RegExp(
+          `diverged: origin/main is at ${remoteSha},.+release commit history at ${releaseSha}.+Nothing was published.+Re-run the release workflow`,
+          's',
+        ),
+      );
+      // The atomic ref push is the release transaction boundary: a refused release
+      // leaves no tag behind for npm publishing to be reconciled against.
+      await expect(
+        gitSucceeds(runner, ['ls-remote', '--exit-code', '--tags', 'origin', 'refs/tags/cli@0.2.0']),
+      ).resolves.toBe(false);
+    });
+  });
 });
 
 function releaseFixturePackages(): ReleasePackageInfo[] {
@@ -308,8 +364,24 @@ class LocalGitRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
       await this.ensureLocalReleaseTag(pkg);
     }
     const refspecs: string[] = [];
-    const remoteRefExists = await gitSucceeds(this.root, ['rev-parse', '--verify', 'origin/main']);
-    if (!remoteRefExists || !(await gitIsAncestor(this.root, await this.gitHead(), 'origin/main'))) {
+    const remoteExists = await gitSucceeds(this.root, ['rev-parse', '--verify', 'origin/main']);
+    const head = await this.gitHead();
+    const branchPush = classifyReleaseBranchPush({
+      remoteExists,
+      headIsAncestorOfRemote: remoteExists && (await gitIsAncestor(this.root, head, 'origin/main')),
+      remoteIsAncestorOfHead: remoteExists && (await gitIsAncestor(this.root, 'origin/main', head)),
+    });
+    if (branchPush === 'diverged') {
+      throw new Error(
+        divergedReleaseBranchMessage({
+          branch: 'main',
+          remoteRef: 'origin/main',
+          head,
+          remoteSha: await gitOutput(this.root, ['rev-parse', 'origin/main']),
+        }),
+      );
+    }
+    if (branchPush === 'push') {
       refspecs.push('HEAD:refs/heads/main');
     }
     for (const pkg of packages) {

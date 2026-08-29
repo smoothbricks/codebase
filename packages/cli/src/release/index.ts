@@ -34,7 +34,9 @@ import { autoReleaseCandidatePackages } from './candidates.js';
 import {
   type ReleaseTagRecord as CoreReleaseTagRecord,
   type ReleaseTarget as CoreReleaseTarget,
+  classifyReleaseBranchPush,
   collectOwnedReleaseTagRecords,
+  divergedReleaseBranchMessage,
   type GitReleaseTagInfo,
   pendingReleaseTargets,
   type ReleasePackageInfo,
@@ -968,7 +970,18 @@ async function pushReleaseRefs(root: string, packages: ReleasePackage[]): Promis
   const refspecs: string[] = [];
   const remoteRef = `${remote}/${branch}`;
   const head = await gitHead(root);
-  if (!(await gitRefExists(root, remoteRef)) || !(await gitIsAncestor(root, head, remoteRef))) {
+  const remoteExists = await gitRefExists(root, remoteRef);
+  const branchPush = classifyReleaseBranchPush({
+    remoteExists,
+    headIsAncestorOfRemote: remoteExists && (await gitIsAncestor(root, head, remoteRef)),
+    remoteIsAncestorOfHead: remoteExists && (await gitIsAncestor(root, remoteRef, head)),
+  });
+  if (branchPush === 'diverged') {
+    throw new Error(
+      divergedReleaseBranchMessage({ branch, remoteRef, head, remoteSha: await gitSha(root, remoteRef) }),
+    );
+  }
+  if (branchPush === 'push') {
     refspecs.push(`HEAD:refs/heads/${branch}`);
   }
   for (const pkg of packages) {
