@@ -58,11 +58,21 @@ runs:
         # matters. Shared fleet-wide on purpose — see the cache trust model in
         # the CI workflow's save step.
         FLEET_MACHINE_ID: 5cbb1f9a4d2e4f0f8b6a3c7d9e150246
-        NX_CACHE_ROOT: /var/cache/ci/nx/${{ github.repository }}
+        NX_CACHE_REPO: ${{ github.repository }}
+        NX_CACHE_LANE: ${{ github.workflow }}
       run: |
         printf '%s\n' "$FLEET_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null
-        # workspace-data carries project-graph/file-map, which are per workspace,
-        # so both roots are scoped by repository.
+        # Scoped per workflow, and it has to be. workspace-data is not a cache:
+        # it holds project-graph.json, file-map.json and nx_files for ONE
+        # checkout. It cannot be split from the artifacts either -- Nx rejects
+        # cache artifacts it has no DB row for ("Unrecognized Cache Artifacts"),
+        # and that DB lives in workspace-data. Since CI and Publish sit in
+        # different concurrency groups they run simultaneously on one host, so a
+        # repository-wide tree let one workflow rewrite the other's graph state
+        # mid-read; that is what failed a release with a bare non-zero
+        # `nx show project`. Per lane they stay warm and never overlap.
+        lane=$(printf '%s' "$NX_CACHE_LANE" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')
+        NX_CACHE_ROOT="/var/cache/ci/nx/$NX_CACHE_REPO/${lane:-default}"
         mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
         {
           echo "NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache"
