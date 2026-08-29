@@ -11,6 +11,7 @@ import {
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 
+import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
@@ -137,17 +138,42 @@ function createCargoWasmTarget(projectRoot: string, config: ResolvedCargoWasmCon
   };
 }
 
+/**
+ * Compilation is excluded from the bounded test window: a cold Cargo
+ * workspace can take many minutes to compile while still making progress,
+ * which is not a property of the tests. `cargo test --no-run` pays that cost
+ * in its own unbounded, cacheable target; the bounded runner then re-invokes
+ * cargo against a warm target directory, where only the suites' own runtime
+ * counts against the standard bound.
+ */
+export const CARGO_TEST_COMPILE_TARGET = 'cargo-test-compile';
+
+function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
+  return {
+    executor: 'nx:run-commands',
+    cache: true,
+    inputs: CARGO_INPUTS,
+    options: {
+      command: 'cargo test --workspace --no-run',
+      cwd: projectRoot,
+    },
+    configurations: {
+      production: { command: 'cargo test --workspace --release --no-run' },
+    },
+  };
+}
+
 function createCargoTestTarget(projectRoot: string): TargetConfiguration {
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
     inputs: CARGO_INPUTS,
+    dependsOn: [CARGO_TEST_COMPILE_TARGET],
     options: {
       command: 'cargo test --workspace',
       cwd: projectRoot,
-      // Cold macOS Cargo workspaces can exceed ten minutes while still making progress.
-      timeoutMs: 1200000,
-      killAfterMs: 10000,
+      timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+      killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
     configurations: {
       production: { command: 'cargo test --workspace --release' },
@@ -315,6 +341,9 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   // never per-crate — one Nx project per Cargo workspace.
   if (isCargoWorkspace) {
     const declared = declaredTargets;
+    if (!(CARGO_TEST_COMPILE_TARGET in declared)) {
+      targets[CARGO_TEST_COMPILE_TARGET] = createCargoTestCompileTarget(projectRoot);
+    }
     if (!('cargo-test' in declared)) {
       targets['cargo-test'] = createCargoTestTarget(projectRoot);
     }
