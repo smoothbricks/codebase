@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -107,10 +107,24 @@ function isWithin(candidate: string, parent: string): boolean {
 
 function containsTrackedFiles(outputDir: string, workspaceRoot: string): boolean {
   const relativeOutputDir = path.relative(workspaceRoot, outputDir);
-  const trackedFiles = execFileSync('git', ['ls-files', '--', relativeOutputDir], {
+  const result = spawnSync('git', ['ls-files', '--', relativeOutputDir], {
     cwd: workspaceRoot,
     encoding: 'utf8',
   });
+  const command = `git ls-files -- ${relativeOutputDir}`;
+  if (typeof result.stdout === 'string' && result.stdout.length > 0) {
+    process.stdout.write(result.stdout);
+  }
+  if (typeof result.stderr === 'string' && result.stderr.length > 0) {
+    process.stderr.write(result.stderr);
+  }
+  if (result.error) {
+    console.error(result.error.message);
+    throw new Error(`${command} failed with exit code ${result.status ?? 1}`, { cause: result.error });
+  }
+  if (result.status !== 0) {
+    throw new Error(`${command} failed with exit code ${result.status ?? 1}`);
+  }
 
-  return trackedFiles.trim().length > 0;
+  return result.stdout.trim().length > 0;
 }

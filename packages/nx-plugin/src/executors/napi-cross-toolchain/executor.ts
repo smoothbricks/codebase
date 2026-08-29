@@ -120,6 +120,7 @@ export function prewarmCrossToolchain(options: {
 
   mkdirSync(path.dirname(destination), { recursive: true });
   const staging = mkdtempSync(`${destination}.staging-`);
+  const command = `tar -xJf ${tarball} -C ${staging}`;
   try {
     execFileSync('tar', ['-xJf', tarball, '-C', staging], { stdio: 'inherit' });
     if (!existsSync(path.join(staging, 'package.json'))) {
@@ -133,6 +134,13 @@ export function prewarmCrossToolchain(options: {
     const code = error instanceof Error && 'code' in error ? error.code : undefined;
     if ((code === 'ENOTEMPTY' || code === 'EEXIST') && existsSync(marker)) {
       return 'ready';
+    }
+    const status = error instanceof Error && 'status' in error ? error.status : undefined;
+    if (status !== undefined) {
+      if (error instanceof Error) {
+        console.error(error.message);
+      }
+      throw new Error(`${command} failed with exit code ${typeof status === 'number' ? status : 1}`, { cause: error });
     }
     throw error;
   }

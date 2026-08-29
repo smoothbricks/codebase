@@ -11,9 +11,38 @@ import { $ } from 'bun';
 // back to the git top level rather than resolving "undefined/../.." two levels
 // above the repository and failing with "could not find a package.json".
 const devenvRoot = process.env.DEVENV_ROOT;
-const projectRoot = devenvRoot
-  ? path.resolve(`${devenvRoot}/../..`)
-  : (await $`git rev-parse --show-toplevel`.text()).trim();
+
+class CapturedCommandError extends Error {
+  constructor(
+    public readonly command: string,
+    public readonly exitCode: number,
+    public readonly stdout: Uint8Array,
+    public readonly stderr: Uint8Array,
+  ) {
+    super(`${command} failed with exit code ${exitCode}`);
+  }
+}
+
+async function resolveProjectRoot(): Promise<string> {
+  if (devenvRoot) {
+    return path.resolve(`${devenvRoot}/../..`);
+  }
+
+  const result = await $`git rev-parse --show-toplevel`.quiet().nothrow();
+  if (result.exitCode !== 0) {
+    const error = new CapturedCommandError(
+      'git rev-parse --show-toplevel',
+      result.exitCode,
+      result.stdout,
+      result.stderr,
+    );
+    replayCapturedOutput(error);
+    throw error;
+  }
+  return new TextDecoder().decode(result.stdout).trim();
+}
+
+const projectRoot = await resolveProjectRoot();
 
 // A legitimate concurrent setup finishes well within this; anything older is a
 // leftover from an interrupted run (CTRL-C/kill before the finally-cleanup) and
@@ -29,17 +58,6 @@ const STALE_LOCK_MS = 10 * 60_000;
 // Keep @typescript/native for ttsc via TTSC_TSGO_BINARY. See https://github.com/oven-sh/bun/issues/33834.
 const TYPESCRIPT_API_VERSION = '6.0.3';
 
-class CapturedCommandError extends Error {
-  constructor(
-    public readonly command: string,
-    public readonly exitCode: number,
-    public readonly stdout: Uint8Array,
-    public readonly stderr: Uint8Array,
-  ) {
-    super(`${command} failed with exit code ${exitCode}`);
-  }
-}
-
 // Go to project root
 process.chdir(projectRoot);
 
@@ -53,9 +71,21 @@ try {
     } catch (error) {
       console.error('! Failed to install dependencies with frozen lockfile');
       replayCapturedOutput(error);
-      await runSetupCommand('bun install', $`bun install`, { quiet: false });
+      try {
+        await runSetupCommand('bun install', $`bun install`, { quiet: false });
+      } catch (fallbackError) {
+        reportSetupFailure(fallbackError);
+      }
       console.error('git diff after install:');
-      await runSetupCommand('git diff', $`git diff`, { quiet: false, allowNonzero: true });
+      try {
+        await runSetupCommand('git diff', $`git diff`, { quiet: false });
+      } catch (diffError) {
+        // This diff is diagnostics for the install failure we are already
+        // reporting, so it must never become the failure: say it broke and keep
+        // the original exit path. Plain `git diff` exits 0 even when the
+        // lockfile drifted, so a non-zero here means git itself failed.
+        console.error(`! git diff failed: ${diffError instanceof Error ? diffError.message : String(diffError)}`);
+      }
       process.exit(1);
     }
   } else {
@@ -67,15 +97,7 @@ try {
 
   await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
-  if (error instanceof CapturedCommandError) {
-    console.error(`--- ERROR: setup-environment.ts failed while running: ${error.command}`);
-    console.error(`exit code: ${error.exitCode}`);
-  } else {
-    console.error(`--- ERROR: setup-environment.ts failed: ${error}`);
-  }
-  replayCapturedOutput(error);
-  console.error('\n---');
-  process.exit(1);
+  reportSetupFailure(error);
 }
 
 async function installLocalDependencies(): Promise<void> {
@@ -195,21 +217,36 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
 async function applyWorkspaceGitConfig(root: string): Promise<void> {
   const gitDirResult = await $`git rev-parse --git-dir`.cwd(root).quiet().nothrow();
   if (gitDirResult.exitCode !== 0) {
-    throw new Error('Not in a git repository');
+    throw new CapturedCommandError(
+      'git rev-parse --git-dir',
+      gitDirResult.exitCode,
+      gitDirResult.stdout,
+      gitDirResult.stderr,
+    );
   }
 
   const gitDir = path.resolve(root, new TextDecoder().decode(gitDirResult.stdout).trim());
   const tooling = path.join(root, 'tooling');
 
-  await $`git config --local include.path ${path.join(tooling, 'workspace.gitconfig')}`.cwd(root);
+  await runSetupCommand(
+    `git config --local include.path ${path.join(tooling, 'workspace.gitconfig')}`,
+    $`git config --local include.path ${path.join(tooling, 'workspace.gitconfig')}`,
+    { quiet: false },
+  );
 
   // Keep the newer runtime version pins on any merge (nvfetcher overlay +
   // devenv.lock) so a mirror sync's `git am --3way` never stalls on a version
   // conflict. Mapped by the managed .gitattributes (merge=smoo-newer-pins);
   // implemented in tooling/direnv/merge-newer-pins.sh.
-  await $`git config --local merge.smoo-newer-pins.name ${'keep the newer devenv/nvfetcher runtime pins'}`.cwd(root);
-  await $`git config --local merge.smoo-newer-pins.driver ${'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P'}`.cwd(
-    root,
+  await runSetupCommand(
+    'git config --local merge.smoo-newer-pins.name keep the newer devenv/nvfetcher runtime pins',
+    $`git config --local merge.smoo-newer-pins.name ${'keep the newer devenv/nvfetcher runtime pins'}`,
+    { quiet: false },
+  );
+  await runSetupCommand(
+    'git config --local merge.smoo-newer-pins.driver bash tooling/direnv/merge-newer-pins.sh %O %A %B %P',
+    $`git config --local merge.smoo-newer-pins.driver ${'bash tooling/direnv/merge-newer-pins.sh %O %A %B %P'}`,
+    { quiet: false },
   );
   linkHook(gitDir, tooling, 'pre-commit');
   linkHook(gitDir, tooling, 'commit-msg');
@@ -243,13 +280,13 @@ function readLinkOrNull(hookPath: string): string | null {
 async function runSetupCommand(
   command: string,
   shell: ReturnType<typeof $>,
-  options: { quiet?: boolean; allowNonzero?: boolean } = {},
+  options: { quiet?: boolean } = {},
 ): Promise<void> {
   const result = await shell
     .quiet(options.quiet ?? true)
     .nothrow()
     .cwd(projectRoot);
-  if (result.exitCode !== 0 && options.allowNonzero !== true) {
+  if (result.exitCode !== 0) {
     throw new CapturedCommandError(command, result.exitCode, result.stdout, result.stderr);
   }
 }
@@ -305,6 +342,18 @@ async function isStaleLock(lockDir: string): Promise<boolean> {
 
 function isFileExistsError(error: unknown): boolean {
   return error instanceof Error && 'code' in error && error.code === 'EEXIST';
+}
+
+function reportSetupFailure(error: unknown): never {
+  if (error instanceof CapturedCommandError) {
+    console.error(`--- ERROR: setup-environment.ts failed while running: ${error.command}`);
+    console.error(`exit code: ${error.exitCode}`);
+  } else {
+    console.error(`--- ERROR: setup-environment.ts failed: ${error}`);
+  }
+  replayCapturedOutput(error);
+  console.error('\n---');
+  process.exit(1);
 }
 
 function replayCapturedOutput(error: unknown): void {
