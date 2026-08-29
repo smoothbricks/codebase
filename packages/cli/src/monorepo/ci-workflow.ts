@@ -156,6 +156,11 @@ function commentLinesForStep(step: CiWorkflowStep): string[] {
       '      # metadata restored together; GitHub Actions cache is only the archive',
       '      # transport. Save runs only after prior required steps succeed on the default',
       '      # branch, so PRs may restore shared cache but cannot publish it.',
+      '      #',
+      '      # Host-nix runners skip the transport entirely: setup-devenv puts their',
+      '      # Nx cache on the shared /var/cache/ci bind, which already survives the',
+      '      # job, so shipping it through the Actions cache would upload a copy of a',
+      '      # cache the next job reads directly.',
     ];
   }
   return [`      # Step ${step.number}`];
@@ -184,7 +189,14 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         '          workflow-id: ci.yml',
       ];
     case CiWorkflowStepKind.RestoreNxCache:
-      return [`      - name: ${step.name}`, '        id: nx-cache', '        uses: ./.github/actions/cache-nx'];
+      return [
+        `      - name: ${step.name}`,
+        '        id: nx-cache',
+        // The shared bind is the cache on host runners; a restore there would
+        // overwrite it with an older archive.
+        "        if: steps.setup.outputs.host-runner != 'true'",
+        '        uses: ./.github/actions/cache-nx',
+      ];
     case CiWorkflowStepKind.Build:
       return nxSmartStep(step, 'build', 'Build');
     case CiWorkflowStepKind.BrowserTests:
@@ -232,8 +244,9 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return [
         `      - name: ${step.name}`,
         '        if:',
-        "          ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}',",
-        "          github.event.repository.default_branch) && steps.nx-cache.outputs.cache-hit != 'true' }}",
+        "          ${{ steps.setup.outputs.host-runner != 'true' && github.event_name == 'push' &&",
+        "          github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&",
+        "          steps.nx-cache.outputs.cache-hit != 'true' }}",
         '        uses: actions/cache/save@v5.0.5',
         '        with:',
         '          path: |',
