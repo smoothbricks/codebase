@@ -1,0 +1,132 @@
+name: Nx cache probe
+
+# THROWAWAY DIAGNOSTIC. Delete once the Nx cache question is settled.
+#
+# Nx names its cache metadata DB after the machine identity
+# (.nx/workspace-data/<id>-v3.db) and refuses artifacts written by a different
+# machine. This probe answers three things by measurement:
+#
+#   1. Which identity source Nx actually reads — it prints every candidate next
+#      to the observed DB filename, so the mapping is proved, not assumed.
+#   2. Whether that identity is stable across runs, per runner class.
+#   3. Whether a restored cache is usable once the identity is stable.
+#
+# Run it at least twice per runner class: the first run seeds the cache, later
+# runs exercise the restore path.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stabilize:
+        description: Overwrite /etc/machine-id with a fixed UUID before running Nx.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # Arbitrary fixed UUID; only its stability matters.
+  PROBE_MACHINE_ID: 0ab1cd2e3f45678901bcdef234567890
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [garm, public]
+    runs-on: ${{ matrix.runner == 'garm' && fromJSON('["nixos-latest-x64","self-hosted"]') || 'ubuntu-latest' }}
+    steps:
+      - name: 🔎 Identity before any mutation
+        run: |
+          echo "runner-class      : ${{ matrix.runner }}"
+          echo "runner-name       : $RUNNER_NAME"
+          echo "hostname          : $(hostname)"
+          echo "NIX_REMOTE        : ${NIX_REMOTE:-<unset>}"
+          echo "/var/cache/ci     : $([ -d /var/cache/ci ] && echo present || echo absent)"
+          echo "/etc/machine-id   : $(cat /etc/machine-id 2>&1 || echo '<unreadable>')"
+          echo "dbus machine-id   : $(cat /var/lib/dbus/machine-id 2>&1 || echo '<absent>')"
+          echo "product_uuid      : $(sudo cat /sys/class/dmi/id/product_uuid 2>/dev/null || echo '<unreadable>')"
+          echo "boot_id           : $(cat /proc/sys/kernel/random/boot_id 2>&1 || echo '<absent>')"
+
+      # Whether this succeeds is itself a result: systemd frequently keeps
+      # /etc/machine-id bind-mounted read-only after first boot.
+      - name: 🩹 Try to stabilize the machine id
+        if: inputs.stabilize
+        continue-on-error: true
+        run: |
+          echo "$PROBE_MACHINE_ID" | sudo tee /etc/machine-id || echo "WRITE FAILED (exit $?)"
+          echo "after write       : $(cat /etc/machine-id 2>&1)"
+          mount | grep -F /etc/machine-id || echo "(machine-id is not a mount point)"
+
+      - name: 📥 Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          filter: blob:none
+          fetch-depth: 0
+
+      - name: 🥟 Install Bun
+        uses: oven-sh/setup-bun@v2.2.0
+
+      - name: 🟢 Install Node
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: package.json
+
+      # Same wiring the publishing job uses: the managed script owns the
+      # frozen-lockfile install and the TypeScript API pinning, and ttsc's
+      # native compiler comes from node_modules rather than the devenv shell.
+      - name: 📦 Install workspace dependencies
+        env:
+          TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
+        run: bun tooling/direnv/setup-environment.ts
+
+      # Prefix-restore so a later run picks up an earlier run's entry.
+      - name: 🧠 Restore probe cache
+        id: cache
+        uses: actions/cache/restore@v5.0.5
+        with:
+          path: |
+            .nx/cache
+            .nx/workspace-data/*.db*
+          key: nxprobe-${{ matrix.runner }}-v1-${{ github.run_id }}
+          restore-keys: |
+            nxprobe-${{ matrix.runner }}-v1-
+
+      - name: 🧾 What the restore delivered
+        run: |
+          echo "cache-hit         : ${{ steps.cache.outputs.cache-hit }}"
+          echo "matched-key       : ${{ steps.cache.outputs.cache-matched-key }}"
+          echo "--- .nx/workspace-data ---"
+          ls -1 .nx/workspace-data/ 2>&1 || echo "(absent)"
+          echo "--- .nx/cache entry count ---"
+          ls -1 .nx/cache 2>/dev/null | wc -l
+
+      # One real cacheable task. Run 1 seeds it; a later run must report a
+      # cache hit here, or print the Unrecognized Cache Artifacts warning.
+      - name: 🔨 Build one package through Nx
+        env:
+          TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
+        run: bunx nx build validation 2>&1 | tee /tmp/nx-build.log
+
+      - name: 📊 Verdict
+        run: |
+          echo "--- DB filename Nx opened, next to the ids printed above ---"
+          ls -1 .nx/workspace-data/*.db 2>&1 || echo "(no db)"
+          echo "machine-id now    : $(cat /etc/machine-id 2>&1)"
+          echo "--- cache outcome ---"
+          grep -qi "Unrecognized Cache Artifacts" /tmp/nx-build.log &&
+            echo "REJECTED: artifacts present, metadata not recognized" ||
+            echo "no rejection warning"
+          grep -qiE "existing outputs match|read the output from the cache|\[existing outputs match the cache" /tmp/nx-build.log &&
+            echo "CACHE HIT" ||
+            echo "no cache hit (ran the task)"
+
+      - name: 💾 Save probe cache
+        if: always()
+        uses: actions/cache/save@v5.0.5
+        with:
+          path: |
+            .nx/cache
+            .nx/workspace-data/*.db*
+          key: nxprobe-${{ matrix.runner }}-v1-${{ github.run_id }}
