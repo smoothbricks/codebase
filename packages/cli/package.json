@@ -111,5 +111,8 @@
     "type": "git",
     "url": "git+https://github.com/smoothbricks/codebase.git",
     "directory": "packages/cli"
+  },
+  "peerDependencies": {
+    "nx": ">=21"
   }
 }
