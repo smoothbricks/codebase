@@ -57,6 +57,10 @@ formatters:
       # Binary artifacts: not text, nothing for Prettier to do.
       - '!*.wasm'
       - '!*.wasm.sha256'
+      # Prettier has no parser for these; --ignore-unknown swallows stdin and
+      # emits nothing, so formatting them would truncate the file.
+      - '!*.jsonl'
+      - '!*.tsv'
 
   # rustfmt for Rust files
   rustfmt:
