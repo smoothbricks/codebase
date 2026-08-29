@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  classifyReleaseBranchPush,
   collectOwnedReleaseTagRecords,
   groupReleaseTargets,
   legacyReleaseTag,
@@ -116,5 +117,28 @@ describe('release core planning', () => {
     expect(durableCalls).toEqual(['a@1.0.0', 'b@2.0.0-beta.1']);
     expect(maxActive).toBeGreaterThan(1);
     expect(records.map((releaseRecord) => releaseRecord.tag)).toEqual(['a@1.0.0', 'b@2.0.0-beta.1']);
+  });
+
+  it('classifies every release branch position against the remote', () => {
+    // A brand new branch has nothing to compare against.
+    expect(
+      classifyReleaseBranchPush({ remoteExists: false, headIsAncestorOfRemote: false, remoteIsAncestorOfHead: false }),
+    ).toBe('push');
+    // Equal refs answer true to both ancestor checks; nothing is left to push.
+    expect(
+      classifyReleaseBranchPush({ remoteExists: true, headIsAncestorOfRemote: true, remoteIsAncestorOfHead: true }),
+    ).toBe('skip');
+    // The repair path: the release commit already landed and the branch moved past it.
+    expect(
+      classifyReleaseBranchPush({ remoteExists: true, headIsAncestorOfRemote: true, remoteIsAncestorOfHead: false }),
+    ).toBe('skip');
+    // The normal release: a fast-forward from the remote tip.
+    expect(
+      classifyReleaseBranchPush({ remoteExists: true, headIsAncestorOfRemote: false, remoteIsAncestorOfHead: true }),
+    ).toBe('push');
+    // A concurrent push: neither ref reaches the other.
+    expect(
+      classifyReleaseBranchPush({ remoteExists: true, headIsAncestorOfRemote: false, remoteIsAncestorOfHead: false }),
+    ).toBe('diverged');
   });
 });
