@@ -435,7 +435,13 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         '        # export map in its own node process, and versioning runs before the',
         '        # build phase, so the hook must exist in dist first. Downstream',
         '        # consumers install the published package and skip this bootstrap.',
-        '        run: nx build nx-plugin',
+        '        #',
+        '        # `nx` cannot do it: the project graph loads this very plugin, so',
+        '        # `nx build nx-plugin` deadlocks on the executor it is building.',
+        '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
+        '        # shell runs (tooling/direnv/enter-shell.ts).',
+        '        working-directory: packages/nx-plugin',
+        '        run: ttsc -p tsconfig.lib.json --emit',
       ];
     case PublishWorkflowStepKind.RepairPendingReleases:
       return [
@@ -824,7 +830,13 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
       '        # export map in its own node process, and versioning runs before the',
       '        # build phase, so the hook must exist in dist first. Downstream',
       '        # consumers install the published package and skip this bootstrap.',
-      '        run: nx build nx-plugin',
+      '        #',
+      '        # `nx` cannot do it: the project graph loads this very plugin, so',
+      '        # `nx build nx-plugin` deadlocks on the executor it is building.',
+      '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
+      '        # shell runs (tooling/direnv/enter-shell.ts).',
+      '        working-directory: packages/nx-plugin',
+      '        run: ttsc -p tsconfig.lib.json --emit',
     );
   }
   lines.push(
@@ -969,7 +981,13 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       '        # condition, so the next-prerelease bump inside smoo release publish',
       '        # needs dist/version-actions.cjs on disk. Downstream consumers install',
       '        # the published package and skip this bootstrap.',
-      '        run: nx build nx-plugin',
+      '        #',
+      '        # `nx` cannot do it: the project graph loads this very plugin, so',
+      '        # `nx build nx-plugin` deadlocks on the executor it is building.',
+      '        # ttsc needs only the package tsconfig -- same bootstrap the devenv',
+      '        # shell runs (tooling/direnv/enter-shell.ts).',
+      '        working-directory: packages/nx-plugin',
+      '        run: ttsc -p tsconfig.lib.json --emit',
     );
   }
   lines.push(
