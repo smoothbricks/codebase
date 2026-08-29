@@ -44,7 +44,7 @@ install_devenv() {
   # devenv from github:cachix/devenv; otherwise profile-add the same flake
   # (links store paths; re-fetch only when missing).
   if command -v devenv >/dev/null 2>&1; then
-    echo "using existing devenv: $(command -v devenv) ($(devenv version 2>/dev/null || true))"
+    echo "using existing devenv: $(command -v devenv) ($(devenv version))"
   else
     echo "nix profile add ${DEVENV_FLAKE}"
     nix profile add --accept-flake-config "$DEVENV_FLAKE"
