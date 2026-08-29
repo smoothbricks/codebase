@@ -60,6 +60,47 @@ export function npmDistTagForVersion(version: string): string {
   return version.includes('-') ? 'next' : 'latest';
 }
 
+export type ReleaseBranchPushAction = 'push' | 'skip' | 'diverged';
+
+/**
+ * Decide how the release commit relates to the release branch on the remote.
+ *
+ * `skip` covers the release commit already being on the remote, which is the repair
+ * path re-pushing only missing tags. `diverged` is unresolvable inside the run: the
+ * release candidate's artifacts are built from the release commit's tree, so rebasing
+ * onto the new remote tip would publish package contents that do not match the tagged
+ * commit. Refusing keeps the tag and the tarball describing the same tree.
+ */
+export function classifyReleaseBranchPush(state: {
+  remoteExists: boolean;
+  headIsAncestorOfRemote: boolean;
+  remoteIsAncestorOfHead: boolean;
+}): ReleaseBranchPushAction {
+  if (!state.remoteExists) {
+    return 'push';
+  }
+  if (state.headIsAncestorOfRemote) {
+    return 'skip';
+  }
+  return state.remoteIsAncestorOfHead ? 'push' : 'diverged';
+}
+
+export function divergedReleaseBranchMessage(state: {
+  branch: string;
+  remoteRef: string;
+  head: string;
+  remoteSha: string;
+}): string {
+  return [
+    `Release branch ${state.branch} diverged: ${state.remoteRef} is at ${state.remoteSha},`,
+    `which is not in the release commit history at ${state.head}.`,
+    'Something pushed to the branch after this release started.',
+    'Nothing was published: the atomic ref push is the release transaction boundary,',
+    'so this attempt left no tags on the remote and no versions on npm.',
+    `Re-run the release workflow to release from ${state.remoteRef}.`,
+  ].join(' ');
+}
+
 export function releasePackageForTag<Package extends Omit<ReleasePackageInfo, 'version'>>(
   packages: Package[],
   tag: string,
