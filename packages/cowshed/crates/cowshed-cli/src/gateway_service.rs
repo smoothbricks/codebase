@@ -3,8 +3,9 @@ use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableInstallState, ExecutableSource, ExistingPlist,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, RemovalOutcome, classify_executable_source, containing_mount_point,
-    plan_executable_install, plan_executable_remove, plan_install, plan_remove,
+    NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE, classify_executable_source,
+    containing_mount_point, plan_executable_install, plan_executable_remove, plan_install,
+    plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
@@ -612,6 +613,73 @@ where
     Ok(executable)
 }
 
+/// The outcome of reconciling one installed host-service binary with the invoking build.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceBinaryRefresh {
+    /// The installed copy was stale; it was reinstalled and the service kickstarted.
+    Refreshed { service: String },
+    /// The installed copy is stale, but this invocation cannot durably refresh it; the remedy
+    /// names what can.
+    Stale { service: String, remedy: String },
+}
+
+/// Whether the observed installed binary needs refreshing from the invoking build.
+pub fn installed_binary_is_stale(state: &ExecutableInstallState) -> bool {
+    !state
+        .installed
+        .is_some_and(|installed| installed.mode == STABLE_BINARY_MODE && installed.matches_source)
+}
+
+/// Reconcile the gateway's installed stable binary with the build running this command.
+///
+/// Setup never refuses to repair a host, and a service left running a binary from before the
+/// build being invoked is exactly the drift a repair exists to end. `None` means there is
+/// nothing to say: no gateway agent installed (nothing runs the binary), the bytes already
+/// match, or this IS the installed copy speaking. A stale copy is reinstalled through the same
+/// atomic plan `gateway start` uses and the agent is kickstarted so the running daemon picks the
+/// new bytes up; a source launchd could not reach at boot (a workspace-resident build) reports
+/// the drift and the durable remedy instead of installing a binary that would dangle.
+pub fn refresh_gateway_binary(home: &Path) -> Result<Option<ServiceBinaryRefresh>> {
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let source = running_executable()?;
+    if source == executable.path() {
+        return Ok(None);
+    }
+    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
+    let observed = inspect_install_state(&spec)?;
+    if observed.plist.is_none() {
+        return Ok(None);
+    }
+    let state = observe_executable_install(&executable, &source)?;
+    if !installed_binary_is_stale(&state) {
+        return Ok(None);
+    }
+    if require_durable_source(home, &executable, &source).is_err() {
+        return Ok(Some(ServiceBinaryRefresh::Stale {
+            service: spec.label().to_owned(),
+            remedy: format!(
+                "run cowshed setup from a build outside every workspace mount (the installed copy is {})",
+                executable.path().display()
+            ),
+        }));
+    }
+    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    executor
+        .execute_install(&plan_executable_install(&executable, &source, state))
+        .map_err(launchd_error)?;
+    // `Changed` forces the deactivate half of activation: the daemon currently running the old
+    // bytes has to exit before the kickstart can start the new ones.
+    activate_launch_agent(
+        &mut executor,
+        effective_uid(),
+        &spec,
+        InstallOutcome::Changed,
+    )?;
+    Ok(Some(ServiceBinaryRefresh::Refreshed {
+        service: spec.label().to_owned(),
+    }))
+}
+
 /// Refuse a source launchd could not reach at boot, saying which volume and why.
 ///
 /// The hint names the installed copy when there is one, because that is the case an operator
@@ -872,6 +940,50 @@ pub(crate) fn output_error(error: io::Error) -> CowshedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Aug drift in one test: a binary installed days earlier, byte-different from the build
+    /// running setup, observed as exactly that — stale — while identical bytes are current. This
+    /// is the decision `refresh_gateway_binary` acts on; the observation is pure filesystem, so
+    /// it is provable without launchd.
+    #[test]
+    fn planted_binary_drift_is_observed_as_stale_and_identical_bytes_as_current() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let home =
+            std::env::temp_dir().join(format!("cowshed-drift-{}-{nonce}", std::process::id()));
+        let executable = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).expect("executable");
+        fs::create_dir_all(executable.directory()).expect("bin directory");
+        let source = home.join("fresh-build");
+        fs::write(&source, b"the build running setup").expect("source");
+
+        // Nothing installed at all is stale: there is no current copy to be running.
+        let state = observe_executable_install(&executable, &source).expect("observe absent");
+        assert!(installed_binary_is_stale(&state));
+
+        // Drifted bytes at the stable path are stale.
+        fs::write(executable.path(), b"the binary from days ago").expect("plant drift");
+        fs::set_permissions(
+            executable.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(STABLE_BINARY_MODE),
+        )
+        .expect("stable mode");
+        let state = observe_executable_install(&executable, &source).expect("observe drift");
+        assert!(installed_binary_is_stale(&state));
+
+        // Identical bytes are current, so a repair plans nothing for them.
+        fs::write(executable.path(), b"the build running setup").expect("refresh");
+        fs::set_permissions(
+            executable.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(STABLE_BINARY_MODE),
+        )
+        .expect("stable mode");
+        let state = observe_executable_install(&executable, &source).expect("observe current");
+        assert!(!installed_binary_is_stale(&state));
+
+        fs::remove_dir_all(&home).ok();
+    }
 
     /// The guidance for an unavailable gateway has to work on a host where the
     /// launch agent was never installed, which is where it is reached from

@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, ProjectDiscovery, SetupArgs, parse_args};
+use cowshed_cli::gateway_service::ServiceBinaryRefresh;
 use cowshed_cli::help;
 use cowshed_cli::launchd::RemovalOutcome;
 use cowshed_cli::output::Output;
@@ -42,6 +43,9 @@ struct FakeHost {
     /// What the escalating phase fails with, so the decline path is provable without a dialog.
     execute_error: Option<CowshedError>,
     mount_root_error: Option<CowshedError>,
+    /// What reconciling the installed service binaries found, so the drift sentences are
+    /// provable without launchd or a real installed copy.
+    services: Vec<ServiceBinaryRefresh>,
 }
 
 /// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
@@ -112,6 +116,7 @@ impl Default for FakeHost {
             },
             execute_error: None,
             mount_root_error: None,
+            services: Vec::new(),
         }
     }
 }
@@ -157,6 +162,11 @@ impl HostSetup for FakeHost {
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>> {
         self.events.push(String::from("remove-host-services"));
         Ok(self.removals.clone())
+    }
+
+    async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
+        self.events.push(String::from("refresh-services"));
+        Ok(self.services.clone())
     }
 
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport> {
@@ -505,9 +515,73 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "execute",
             "unmounted-mains",
             "configure-sccache-client",
+            "refresh-services",
             "census"
         ]
     );
+}
+
+/// The drift this exists for: a gateway kept running an installed binary from days before the
+/// build being invoked, and `setup` answered "everything already set up" without touching it.
+/// A refreshed service is reported, and the status line owns the fact instead of denying it.
+#[tokio::test]
+async fn a_refreshed_service_binary_is_reported_and_owns_the_status_line() {
+    let mut host = FakeHost {
+        services: vec![ServiceBinaryRefresh::Refreshed {
+            service: String::from("dev.cowshed.gateway"),
+        }],
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    let refreshed = streams
+        .stderr
+        .find("cowshed: dev.cowshed.gateway ran a stale binary; refreshed and restarted\n")
+        .expect("the refresh is reported");
+    let status = streams
+        .stderr
+        .find("cowshed: host services refreshed\n")
+        .expect("the status line owns the refresh");
+    assert!(refreshed < status);
+    assert!(
+        !streams.stderr.contains("everything already set up"),
+        "a host that needed a service refresh was not already set up"
+    );
+}
+
+/// A stale binary this run cannot durably refresh is still drift, and claiming readiness over it
+/// would be the comfortable answer rather than the true one: the status line names the stale
+/// service and the hint carries the remedy.
+#[tokio::test]
+async fn a_stale_service_binary_falsifies_the_ready_sentence_and_names_the_remedy() {
+    let mut host = FakeHost {
+        services: vec![ServiceBinaryRefresh::Stale {
+            service: String::from("dev.cowshed.gateway"),
+            remedy: String::from("run cowshed setup from a build outside every workspace mount"),
+        }],
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams.stderr.contains(
+            "cowshed: host storage is set up, but dev.cowshed.gateway runs a stale binary\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("next: run cowshed setup from a build outside every workspace mount\n"),
+        "{}",
+        streams.stderr
+    );
+    assert!(!streams.stderr.contains("everything already set up"));
 }
 
 /// The defect this line exists for: an sccache client that inherited no cowshed environment
@@ -676,6 +750,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             "execute",
             "unmounted-mains",
             "configure-sccache-client",
+            "refresh-services",
             "census"
         ]
     );
@@ -1675,6 +1750,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "execute",
             "unmounted-mains",
             "configure-sccache-client",
+            "refresh-services",
             "census"
         ]
     );

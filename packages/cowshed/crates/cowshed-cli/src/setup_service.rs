@@ -18,8 +18,8 @@
 
 use crate::args::SetupArgs;
 use crate::gateway_service::{
-    canonical_home, gateway_launch_agent, output_error, remove_host_stable_executable,
-    remove_launch_agent,
+    ServiceBinaryRefresh, canonical_home, gateway_launch_agent, output_error,
+    remove_host_stable_executable, remove_launch_agent,
 };
 use crate::launchd::RemovalOutcome;
 use crate::output::Output;
@@ -160,6 +160,14 @@ pub trait HostSetup: Send {
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport>;
     /// Record the host session mount root. Refused while any session workspace is attached.
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf>;
+    /// Reconcile installed host-service binaries with the build running this repair.
+    ///
+    /// Default-empty so test hosts modelling only the volume flows stay valid; the native host
+    /// overrides it — a service running a binary from before the invoking build is host drift,
+    /// and a repair that leaves it while claiming "everything already set up" lies.
+    async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
+        Ok(Vec::new())
+    }
 }
 
 /// The real host, rooted at the canonical home every other host verb resolves.
@@ -191,6 +199,12 @@ impl HostSetup for NativeHostSetup {
 
     async fn execute_uninstall(&mut self) -> Result<UninstallReport> {
         execute_host_uninstall(&self.home).await
+    }
+
+    async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
+        Ok(crate::gateway_service::refresh_gateway_binary(&self.home)?
+            .into_iter()
+            .collect())
     }
 
     /// Count what the store holds, or say why it could not be counted.
@@ -492,6 +506,12 @@ where
         Some(_) => None,
         None => Some(setup.configure_sccache_client().await?),
     };
+    // Installed service binaries are host state exactly like the volumes: a gateway still
+    // running a build from before this one is drift a repair must end (or at least name).
+    let services = match &failure {
+        Some(_) => Vec::new(),
+        None => setup.refresh_host_services().await?,
+    };
     if json {
         // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
         // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
@@ -503,10 +523,24 @@ where
                 // has to resolve still reaches them in a scripted run.
                 emit_sccache_client(sccache.as_ref(), output)?;
             }
-            Some(_) => render_repair(&plan, &report, mains.as_ref(), sccache.as_ref(), output)?,
+            Some(_) => render_repair(
+                &plan,
+                &report,
+                mains.as_ref(),
+                sccache.as_ref(),
+                &services,
+                output,
+            )?,
         }
     } else {
-        render_repair(&plan, &report, mains.as_ref(), sccache.as_ref(), output)?;
+        render_repair(
+            &plan,
+            &report,
+            mains.as_ref(),
+            sccache.as_ref(),
+            &services,
+            output,
+        )?;
     }
     if let Some(failure) = failure {
         return Err(partial_setup_failure(failure));
@@ -788,6 +822,7 @@ fn render_repair<W: Write, E: Write>(
     report: &HostSetupReport,
     mains: Option<&MainMounts>,
     sccache: Option<&ConfigReport>,
+    services: &[ServiceBinaryRefresh],
     output: &mut Output<W, E>,
 ) -> Result<()> {
     // The per-action outcomes come first and only when there is something to say: they are the
@@ -812,9 +847,23 @@ fn render_repair<W: Write, E: Write>(
     // Before the status line, which is the last thing a reader sees and is a claim about the whole
     // host rather than about one file.
     emit_sccache_client(sccache, output)?;
+    for refresh in services {
+        if let ServiceBinaryRefresh::Refreshed { service } = refresh {
+            output
+                .guidance(&format!(
+                    "{service} ran a stale binary; refreshed and restarted"
+                ))
+                .map_err(output_error)?;
+        }
+    }
     output
-        .guidance(&repair_status(plan, report, mains))
+        .guidance(&repair_status(plan, report, mains, services))
         .map_err(output_error)?;
+    for refresh in services {
+        if let ServiceBinaryRefresh::Stale { remedy, .. } = refresh {
+            output.hint(remedy).map_err(output_error)?;
+        }
+    }
     Ok(())
 }
 
@@ -1032,6 +1081,7 @@ fn repair_status(
     plan: &HostSetupPlan,
     report: &HostSetupReport,
     mains: Option<&MainMounts>,
+    services: &[ServiceBinaryRefresh],
 ) -> String {
     if report.failure().is_some() {
         let done = count_outcomes(report, |result| matches!(result, HostActionResult::Done));
@@ -1056,7 +1106,23 @@ fn repair_status(
             plural(unresolved, "volume lives", "volumes live"),
         );
     }
-    let ready = if plan.actions.is_empty() && !plan.requires_authorization {
+    // A stale service binary this run could not refresh falsifies every ready sentence the
+    // same way an unmounted main does: the volumes may be fine, but the host is not what the
+    // invoking build says it should be.
+    if let Some(ServiceBinaryRefresh::Stale { service, .. }) = services
+        .iter()
+        .find(|refresh| matches!(refresh, ServiceBinaryRefresh::Stale { .. }))
+    {
+        return format!("host storage is set up, but {service} runs a stale binary");
+    }
+    let refreshed = services
+        .iter()
+        .any(|refresh| matches!(refresh, ServiceBinaryRefresh::Refreshed { .. }));
+    let ready = if refreshed {
+        // The volumes needed nothing, but the host still drifted and was repaired; claiming
+        // "already set up" over a service that just restarted would erase the one thing done.
+        String::from("host services refreshed")
+    } else if plan.actions.is_empty() && !plan.requires_authorization {
         String::from("everything already set up")
     } else if report.authorized {
         String::from("host storage is set up (one administrator authorization was used)")
