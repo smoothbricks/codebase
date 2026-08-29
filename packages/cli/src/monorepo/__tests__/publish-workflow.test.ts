@@ -155,8 +155,8 @@ describe('publish workflow definition', () => {
     // versions must materialize that one package first -- never the whole CLI
     // dependency chain, which is what this step used to build.
     for (const job of [...candidates, finalJob]) {
-      expect(job).toContain('        run: nx build nx-plugin');
-      expect(job).not.toContain('nx build cli');
+      expect(job).toContain('        run: ttsc -p tsconfig.lib.json --emit');
+      expect(job).not.toContain('run: nx build');
     }
     for (const candidate of candidates) {
       expect(candidate.indexOf(bootstrap)).toBeLessThan(candidate.indexOf('- name: 🔢 Version release'));
@@ -165,7 +165,7 @@ describe('publish workflow definition', () => {
     // `nx release version` run and therefore also needs the hook on disk.
     expect(finalJob.indexOf(bootstrap)).toBeLessThan(finalJob.indexOf('- name: 📦 Publish release'));
     // Consumers resolve the hook from the published package instead.
-    expect(renderPublishWorkflowYaml({ repoName: '@acme/widgets' })).not.toContain('nx build nx-plugin');
+    expect(renderPublishWorkflowYaml({ repoName: '@acme/widgets' })).not.toContain('ttsc -p tsconfig.lib.json');
   });
 
   it('tags only in the publishing job, after repair and before the npm publish', () => {
