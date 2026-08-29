@@ -53,7 +53,7 @@ async function clearNxDaemonState(): Promise<void> {
   // resolved configuration, so entries produced by the previous plugin build are
   // unreachable rather than wrong once inference changes. Clearing the graph DB is
   // what makes the new plugin take effect; clearing results was only collateral.
-  await $`rm -rf ${path.join(projectRoot, '.nx/workspace-data')}`.quiet(true).nothrow();
+  await runQuietly('rm', ['-rf', path.join(projectRoot, '.nx/workspace-data')], projectRoot);
 }
 
 async function runQuietly(command: string, args: readonly string[], cwd: string): Promise<void> {
