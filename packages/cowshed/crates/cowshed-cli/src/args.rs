@@ -1026,7 +1026,7 @@ const GATEWAY: CommandSpec = CommandSpec {
     about: &[
         "The gateway is the one trusted process outside every sandbox: workspaces reach the network, main's repository, and each other only through its authenticated Unix socket. `start` installs and loads the per-user LaunchAgent and waits until that socket answers; `stop` boots it out; `status` reports health without starting anything. Both mutations are idempotent.",
         "`run` is the LaunchAgent's own foreground entrypoint. It validates already-mounted storage and never creates any, so a background start can report missing setup but can never raise an authorization prompt.",
-        "An ordinary `stop` leaves the host-stable binary copy the agent ran, because that copy is host state rather than agent state and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes it, for a host that is done with the gateway rather than pausing it.",
+        "An ordinary `stop` leaves the host-stable binary copy the agent ran: that copy is host state rather than agent state, and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes it, for a host that is done with the gateway rather than pausing it.",
     ],
     options: &[Opt {
         spelling: "--purge",
@@ -1063,7 +1063,7 @@ const SCCACHE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "manage the host sccache daemon",
     about: &[
-        "Runs the shared compile cache as a supervised LaunchAgent, so its configuration is pinned before any client speaks to it. sccache reads its store path, its cache cap, and its base directories once, at server start, and never again — so the first client to need a server and spawn one implicitly would freeze its own environment into the daemon every later workspace then shares. Starting the daemon deliberately is what keeps the cap and the store where the host meant them.",
+        "Runs the shared compile cache as a supervised LaunchAgent, so its configuration is pinned before any client speaks to it. sccache reads its store path, its cache cap, and its base directories once, at server start, and never again. A first client that spawned a server implicitly would therefore freeze its own environment into the daemon every later workspace shares; starting it deliberately keeps the cap and the store where the host meant them.",
         "The gateway daemon starts this agent itself, so a healthy host already has it; these verbs are for repair, inspection, and resizing. `status` reports launchd and socket health without starting anything, and surfaces the daemon's own statistics whenever it answers. Hits are reported per language on purpose: cross-workspace C and C++ reuse needs no build slot, so a healthy aggregate hit rate routinely hides a Rust hit rate of zero.",
     ],
     options: &[Opt {
@@ -1176,7 +1176,7 @@ const ADOPT: CommandSpec = CommandSpec {
     about: &[
         "Converts an existing checkout into this repository's image-backed main workspace, at the same path. Run it once per repository; every other verb finds its project from the cwd or `--project`. Adoption is the only operation that copies a source tree into an image, and one of only two commands that may create host storage — so the first adopt on a host may raise one administrator prompt while the cowshed volumes are created, and no ordinary command ever can.",
         "`cowshed setup` is the other, and the one every storage error points at: it repairs a host without needing a checkout to adopt. Reach for adopt when you have a repository to bring in, and for setup when the machine itself is wrong.",
-        "The secret gate runs before anything changes. A refusal names every offending file and prints the exact controller-owned `waivers.json` path plus a valid entry example: entries carry an exact repository-relative `path` and a non-empty `reason`, and only intentionally committed synthetic or public detector fixtures that can never hold live credentials may be waived — never live, temporary, copied, developer-local, deployment, or recoverable credentials. A waiver unblocks adoption while every waived finding stays retained for audit.",
+        "The secret gate runs before anything changes. A refusal names every offending file and prints the exact controller-owned `waivers.json` path plus a valid entry example. Entries carry an exact repository-relative `path` and a non-empty `reason`. Only intentionally committed synthetic or public detector fixtures that can never hold live credentials may be waived — never live, temporary, copied, developer-local, deployment, or recoverable credentials. A waiver unblocks adoption while every waived finding stays retained for audit.",
     ],
     options: &[
         Opt {
@@ -1261,7 +1261,7 @@ const NEW: CommandSpec = CommandSpec {
     summary: "create a workspace",
     about: &[
         "Clones a live image of the project's main workspace and mounts it. The clone is copy-on-write, so a workspace costs the writes it makes rather than a copy of the tree, and it inherits main's source, dependencies, and build state warm.",
-        "A build slot is a stable mount path — `mnt/<owner>/<repo>/slot@<n>` — held by one workspace at a time and released when that workspace is removed or renamed, so the next tenant of slot n builds through byte-identical absolute paths. That path identity is the whole feature: cargo derives `-C metadata` from a package id carrying the absolute manifest directory, and sccache hashes the compiler's physical working directory, so the same sources built at two paths are two different compilations that share no compile cache. A slot tenant is therefore also given `RUSTC_WRAPPER=sccache` and `CARGO_INCREMENTAL=0`, trading local incrementality for a cache its successors can hit; main cannot take a slot, because its mount is fixed by the checkout layout.",
+        "A build slot is a stable mount path, `mnt/<owner>/<repo>/slot@<n>`, held by one workspace at a time and released when that workspace is removed or renamed, so the next tenant of slot n builds through byte-identical absolute paths. That path identity is the whole feature: cargo derives `-C metadata` from a package id carrying the absolute manifest directory, and sccache hashes the compiler's physical working directory, so the same sources built at two paths are two different compilations sharing no compile cache. A slot tenant is also given `RUSTC_WRAPPER=sccache` and `CARGO_INCREMENTAL=0`, trading local incrementality for a cache its successors can hit. Main cannot take a slot: its mount is fixed by the checkout layout.",
     ],
     options: &[
         Opt {
@@ -1352,7 +1352,7 @@ const MOVE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "rename a workspace, move/re-identify main",
     about: &[
-        "The source decides what the destination means. `mv main <path>` moves the adopted checkout to an absolute path and keeps every record of where it lives in step; `mv main --repo-id <owner/repo>` changes the adopted identity without consulting or changing Git remotes. Every other source renames a workspace, whose new name is subject to the ordinary name grammar and cannot be `main`.",
+        "Three jobs, and the source decides which. `mv <ws> <new-name>` renames a session workspace (the new name follows the ordinary name grammar and cannot be `main`). `mv main <path>` moves the adopted checkout to an absolute path and keeps every record of where it lives in step. `mv main --repo-id <owner/repo>` changes the adopted repository identity, without consulting or changing Git remotes.",
         "Re-identifying main — and moving a main that mounts directly at its checkout — detaches its volume to rename the identity-scoped store paths, so it refuses while anything holds the mount. Run it from outside the checkout with editors and daemons off the volume; main must be attached, and session workspaces must be detached first (the refusal lists the exact detach commands). Renaming a session workspace touches only that workspace's volume and works fine from inside main.",
         "The old identity is kept as a former one, so markers, certificates and artifact stamps minted under it stay valid. Nothing before the volume comes down is destructive: a refused or interrupted attempt leaves the project as it was.",
     ],
@@ -1435,7 +1435,7 @@ const CHECKPOINT: CommandSpec = CommandSpec {
     trailing: "",
     summary: "create a checkpoint",
     about: &[
-        "Clonefiles the workspace image under a label — generated from the UTC timestamp when you do not give one — after a supervisor barrier seals complete job output, so the snapshot is crash-consistent rather than merely recent. Omit the workspace to checkpoint the one you are standing in.",
+        "Snapshots a workspace by clonefiling its image under a label (a UTC timestamp when you give none). The copy is taken after a supervisor barrier seals complete job output, so it is crash-consistent rather than merely recent. Omit the workspace to checkpoint the one you are standing in.",
     ],
     options: &[Opt {
         spelling: "--keep",
@@ -1735,7 +1735,7 @@ const ATTACH: CommandSpec = CommandSpec {
     trailing: "",
     summary: "attach session workspace(s)",
     about: &[
-        "<ws> one; cwd in a project = that project's sessions; --all store-wide. Mains always mounted (05).",
+        "Mounts detached session workspaces. `attach <ws>` mounts one; with no argument, standing in a project attaches every detached session of that project; `--all` attaches every detached session store-wide. Mains are never attach targets, because a main is always mounted at its checkout.",
     ],
     options: &[
         Opt {
@@ -1778,7 +1778,7 @@ const DETACH: CommandSpec = CommandSpec {
     trailing: "",
     summary: "detach session workspace(s)",
     about: &[
-        "<ws> one, resolved from the store without cwd or git discovery; cwd/--project still override. --all store-wide attached sessions. Mains are never detach targets.",
+        "Unmounts session workspaces. `detach <ws>` names one, resolved from the store directly so it works from any directory; with no argument, the project from the cwd or `--project` scopes it; `--all` detaches every attached session store-wide. Mains are never detach targets.",
     ],
     options: &[Opt {
         spelling: "--all",
