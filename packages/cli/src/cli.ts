@@ -1,7 +1,7 @@
 import { Command, CommanderError } from 'commander';
 import { variants } from './generate/index.js';
 import { cliPackageVersion } from './lib/cli-package.js';
-import { findRepoRoot } from './lib/run.js';
+import { decode, findRepoRoot, printCommandOutput } from './lib/run.js';
 import { ensureChromium } from './playwright/index.js';
 import { resolvePrConflicts } from './pr/index.js';
 import { cleanupPullRequest, deployStage } from './wrangler/deploy-stage.js';
@@ -18,10 +18,49 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
       }
       return;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(message);
+    reportFatal(error);
     process.exitCode = 1;
   }
+}
+
+// A failure's diagnostics must never die here. This printed only `error.message`,
+// so a Bun ShellError -- whose message is the useless literal "Failed with exit
+// code 1" and whose captured stdout/stderr hang off the error as properties --
+// reduced a real CI failure to one unactionable line. Print everything the error
+// carries: captured output, the cause chain, and the stack that names the call
+// site that ran the command.
+function reportFatal(error: unknown): void {
+  if (!(error instanceof Error)) {
+    console.error(String(error));
+    return;
+  }
+  console.error(error.stack ?? error.message);
+  printCapturedStreams(error);
+  let cause: unknown = error.cause;
+  while (cause !== undefined) {
+    if (!(cause instanceof Error)) {
+      console.error(`Caused by: ${String(cause)}`);
+      return;
+    }
+    console.error(`Caused by: ${cause.stack ?? cause.message}`);
+    printCapturedStreams(cause);
+    cause = cause.cause;
+  }
+}
+
+function printCapturedStreams(error: Error): void {
+  printCommandOutput(capturedStream(error, 'stdout'), capturedStream(error, 'stderr'));
+}
+
+function capturedStream(error: Error, key: 'stdout' | 'stderr'): string {
+  if (!(key in error)) {
+    return '';
+  }
+  const value: unknown = Reflect.get(error, key);
+  if (typeof value === 'string') {
+    return value;
+  }
+  return value instanceof Uint8Array ? decode(value) : '';
 }
 
 function buildProgram(): Command {
