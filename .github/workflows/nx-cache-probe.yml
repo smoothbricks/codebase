@@ -83,7 +83,9 @@ jobs:
 
       - name: 📦 Install workspace dependencies
         if: matrix.runner != 'garm'
-        run: bun tooling/direnv/setup-environment.ts
+        run: |
+          bun tooling/direnv/setup-environment.ts
+          tooling/direnv/repo-path --github-path
 
       # `nx` cannot build the plugin the project graph loads; ttsc needs only the
       # package tsconfig. Same bootstrap the devenv shell and publish jobs run.
