@@ -1,6 +1,5 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
-import { $ } from 'bun';
-import { decode, run } from '../lib/run.js';
+import { printCommandOutput, run, runResult } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
 import { readProjectTargets } from '../nx/index.js';
 import { validateCargoCachePolicy } from './cargo-policy.js';
@@ -108,12 +107,7 @@ export async function updateManagedFiles(root: string): Promise<void> {
   await applyToolConfigDefaults(root);
   syncBunLockfileVersions(root, { mode: 'install' });
   console.log('installing     workspace dependencies (bun install)');
-  const install = await $`bun install --no-summary`.cwd(root).nothrow();
-  if (install.exitCode !== 0) {
-    const stderr = decode(install.stderr).trim();
-    const stdout = decode(install.stdout).trim();
-    throw new Error(`bun install failed after monorepo update${stderr || stdout ? `:\n${stderr || stdout}` : ''}`);
-  }
+  await run('bun', ['install', '--no-summary'], root);
 }
 
 export async function checkManagedFiles(root: string, options: { warn?: boolean } = {}): Promise<void> {
@@ -276,14 +270,18 @@ function splitCommaList(value: string | undefined): string[] {
 }
 
 async function hasNewWorkspacePackage(root: string): Promise<boolean> {
-  const result = await $`git diff --cached --name-only --diff-filter=A -- ${'*/package.json'}`
-    .cwd(root)
-    .quiet()
-    .nothrow();
+  const result = await runResult(
+    'git',
+    ['diff', '--cached', '--name-only', '--diff-filter=A', '--', '*/package.json'],
+    root,
+  );
   if (result.exitCode !== 0) {
-    throw new Error('Unable to inspect staged package manifests.');
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(
+      `git diff --cached --name-only --diff-filter=A -- */package.json failed with exit code ${result.exitCode}`,
+    );
   }
-  const manifests = decode(result.stdout)
+  const manifests = result.stdout
     .split('\n')
     .map((path) => path.trim())
     .filter(Boolean);

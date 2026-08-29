@@ -1,6 +1,7 @@
-import { execSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { printCommandOutput } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages } from '../lib/workspace.js';
 
 export interface SyncBunLockfileVersionsOptions {
@@ -75,7 +76,13 @@ export function syncBunLockfileVersions(root: string, options: SyncBunLockfileVe
   if (updated > 0) {
     writeFileSync(lockfilePath, lockfile);
     if (options.stage) {
-      execSync('git add bun.lock', { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] });
+      const result = spawnSync('git', ['add', 'bun.lock'], { cwd: root, stdio: 'inherit' });
+      if (result.error) {
+        throw new Error(`git add bun.lock failed to start: ${result.error.message}`);
+      }
+      if (result.status !== 0) {
+        throw new Error(`git add bun.lock failed with exit code ${result.status ?? 1}`);
+      }
     }
   }
   if (log || updated > 0) {
@@ -142,23 +149,27 @@ function lockfileTargetVersion(
 }
 
 function latestStableTagVersion(root: string, projectName: string): string | null {
-  try {
-    const output = execSync(`git tag --list '${projectName}@*' --sort=-v:refname`, {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const prefix = `${projectName}@`;
-    for (const line of output.split('\n')) {
-      const tag = line.trim();
-      if (!tag.startsWith(prefix)) continue;
-      const version = tag.slice(prefix.length);
-      if (version && !version.includes('-')) {
-        return version;
-      }
-    }
-    return null;
-  } catch {
+  const args = ['tag', '--list', `${projectName}@*`, '--sort=-v:refname'];
+  const command = `git ${args.join(' ')}`;
+  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+  if (result.error) {
+    printCommandOutput(result.stdout ?? '', result.stderr ?? '');
+    console.error(`${command} failed to start: ${result.error.message}`);
     return null;
   }
+  if (result.status !== 0) {
+    printCommandOutput(result.stdout ?? '', result.stderr ?? '');
+    console.error(`${command} failed with exit code ${result.status ?? 1}`);
+    return null;
+  }
+  const prefix = `${projectName}@`;
+  for (const line of result.stdout.split('\n')) {
+    const tag = line.trim();
+    if (!tag.startsWith(prefix)) continue;
+    const version = tag.slice(prefix.length);
+    if (version && !version.includes('-')) {
+      return version;
+    }
+  }
+  return null;
 }

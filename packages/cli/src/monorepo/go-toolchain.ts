@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { $ } from 'bun';
 import { readJsonObject } from '../lib/json.js';
+import { runText } from '../lib/run.js';
 
 /**
  * devenv's Go and the Go SDK ttsc vendors inside its native package, as a pair.
@@ -144,7 +144,7 @@ export async function validateGoToolchainAgreement(root: string): Promise<number
   const goBinary = goCommand(root);
   let devenvGoVersionText: string;
   try {
-    devenvGoVersionText = await $`${goBinary} version`.cwd(root).text();
+    devenvGoVersionText = await runText(goBinary, ['version'], root);
   } catch (error) {
     console.error(`Unable to run \`${goBinary} version\`: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
