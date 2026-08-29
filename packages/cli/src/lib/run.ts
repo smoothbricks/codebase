@@ -70,6 +70,26 @@ export async function runResult(
   };
 }
 
+// Captured output MUST survive failure. A non-zero exit whose diagnostics were
+// swallowed is unactionable in CI, and Bun's raw `$` is the trap: without
+// `.nothrow()` it throws a ShellError whose entire message is "Failed with exit
+// code 1" and whose captured stdout/stderr die with it. Anything that needs a
+// command's output goes through here instead of a bare `.quiet()`/`.text()`
+// template, so the diagnostics reach the log before the error does.
+export async function runText(
+  command: string,
+  args: string[],
+  cwd: string,
+  env?: Record<string, string>,
+): Promise<string> {
+  const result = await runResult(command, args, cwd, env);
+  if (result.exitCode !== 0) {
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`);
+  }
+  return result.stdout;
+}
+
 export function printCommandOutput(stdout: string, stderr: string): void {
   if (stdout.length > 0) {
     console.log(trimTrailingNewline(stdout));
