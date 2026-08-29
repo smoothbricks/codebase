@@ -255,15 +255,24 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-lint',
         'cargo-lint-cross',
         'cargo-test',
+        'cargo-test-compile',
         'lint',
         'mutation',
         'test',
       ]);
+      // Compilation is excluded from the bounded window: the compile target is
+      // unbounded and cacheable, the runner holds the standard bound.
+      expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
+      expect(targets['cargo-test-compile']?.options).toMatchObject({
+        command: 'cargo test --workspace --no-run',
+        cwd: 'packages/ferris',
+      });
       expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-compile']);
       expect(targets['cargo-test']?.options).toMatchObject({
         command: 'cargo test --workspace',
         cwd: 'packages/ferris',
-        timeoutMs: 1_200_000,
+        timeoutMs: 120_000,
       });
       expect(targets['cargo-test']?.inputs).toEqual([
         '{projectRoot}/**/*.rs',
