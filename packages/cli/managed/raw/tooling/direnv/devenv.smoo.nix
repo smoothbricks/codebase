@@ -161,6 +161,11 @@
     (import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go
     pkgs.nodejs_26
     pkgs.binaryen
+    # Target-dir GC for the inferred cargo-sweep target: cargo never removes
+    # superseded artifacts on its own (a busy workspace accumulated ~18k stale
+    # variants per crate and 26 GB of junk before this existed), and a sweep
+    # prunes them without touching the warm current-fingerprint surface.
+    pkgs.cargo-sweep
   ];
 
   enterShell = lib.mkMerge [

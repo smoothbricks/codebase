@@ -254,12 +254,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'bench',
         'cargo-lint',
         'cargo-lint-cross',
+        'cargo-sweep',
         'cargo-test',
         'cargo-test-compile',
         'lint',
         'mutation',
         'test',
       ]);
+      expect(targets['cargo-sweep']?.options).toMatchObject({
+        command: 'cargo sweep --time 7',
+        cwd: 'packages/ferris',
+      });
+      expect(targets['cargo-sweep']?.cache).toBe(false);
       // Compilation is excluded from the bounded window: the compile target is
       // unbounded and cacheable, the runner holds the standard bound.
       expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');

@@ -415,6 +415,18 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         options: { command: 'cargo bench --workspace', cwd: projectRoot },
       };
     }
+    if (!('cargo-sweep' in declared)) {
+      // Target-dir GC. Cargo never removes superseded artifacts, so a busy
+      // workspace grows tens of GB of stale variants no fingerprint references;
+      // sweeping by age prunes exactly that junk while the warm current
+      // surface — the gated asset — survives untouched. Never cached: the
+      // verdict is about this machine's disk, not the commit.
+      targets['cargo-sweep'] = {
+        executor: 'nx:run-commands',
+        cache: false,
+        options: { command: 'cargo sweep --time 7', cwd: projectRoot },
+      };
+    }
   }
 
   if (hasOrdinaryBuildOutputTarget) {
