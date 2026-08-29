@@ -103,6 +103,56 @@ describe('package target policy', () => {
     }
   });
 
+  it('preserves cross-project dependsOn references in apply and check', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@scope/root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      await writeJson(join(root, 'packages/lib/package.json'), {
+        name: '@scope/lib',
+        dependencies: { '@scope/schema': 'workspace:*' },
+        nx: {
+          name: 'lib',
+          targets: {
+            // `wire-schema:build` is Nx's project:target syntax pointing at a real
+            // sibling project; only its suffix collides with this project's own
+            // `build`, which is exactly what the legacy colon-name migration used
+            // to swallow.
+            build: {
+              executor: 'nx:run-commands',
+              options: { command: 'tsc --build tsconfig.lib.json', cwd: '{projectRoot}' },
+              dependsOn: ['^build', 'wire-schema:build'],
+            },
+          },
+        },
+      });
+      await writeJson(join(root, 'packages/schema/package.json'), {
+        name: '@scope/schema',
+        nx: {
+          name: 'wire-schema',
+          targets: {
+            build: {
+              executor: 'nx:run-commands',
+              options: { command: 'bun run emit.ts', cwd: '{projectRoot}' },
+            },
+          },
+        },
+      });
+
+      applyPackageTargetPolicy(root);
+
+      const lib = JSON.parse(await readFile(join(root, 'packages/lib/package.json'), 'utf8'));
+      expect(lib.nx.targets.build.dependsOn).toEqual(['^build', 'wire-schema:build']);
+      const issues = checkPackageTargetPolicy(root);
+      expect(issues.filter((issue) => issue.message.includes('wire-schema:build'))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('removes noop aggregate build targets matching resolved plugin output', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoothbricks-pkg-target-'));
     try {
