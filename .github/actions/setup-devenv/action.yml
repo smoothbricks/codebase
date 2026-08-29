@@ -35,6 +35,46 @@ runs:
           echo "ephemeral runner (install Nix + GH caches)"
         fi
 
+    # Nx names its cache metadata DB after the machine identity
+    # (.nx/workspace-data/<machine-id>-v3.db) and refuses artifacts written by a
+    # different machine. Each runner instance is a fresh clone that generates its
+    # own id on first boot, so a restored DB is never the file Nx opens: measured,
+    # every artifact came back unrecognized and the transfer was wasted. GitHub's
+    # hosted images ship one baked id, which is why the same wiring works there.
+    #
+    # Pin the id, then keep the cache on the shared mutable bind instead of
+    # shipping it through the Actions cache. One host is then one cache with one
+    # identity, which is the only arrangement Nx trusts. Artifacts AND metadata
+    # must move together: the DB alone is where "Nx recognizes this" lives.
+    #
+    # /etc/machine-id is a plain writable file here, not a mount point. The
+    # durable home for this is the runner image; doing it per job keeps the fix
+    # in one managed place until then.
+    - name: 🧠 Pin the machine id and locate the Nx cache
+      if: steps.runner-kind.outputs.host == 'true'
+      shell: bash
+      env:
+        # Any valid 32-char lowercase hex; only its stability across instances
+        # matters. Shared fleet-wide on purpose — see the cache trust model in
+        # the CI workflow's save step.
+        FLEET_MACHINE_ID: 5cbb1f9a4d2e4f0f8b6a3c7d9e150246
+        NX_CACHE_ROOT: /var/cache/ci/nx/${{ github.repository }}
+      run: |
+        printf '%s\n' "$FLEET_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null
+        # workspace-data carries project-graph/file-map, which are per workspace,
+        # so both roots are scoped by repository.
+        mkdir -p "$NX_CACHE_ROOT/cache" "$NX_CACHE_ROOT/workspace-data"
+        {
+          echo "NX_CACHE_DIRECTORY=$NX_CACHE_ROOT/cache"
+          echo "NX_WORKSPACE_DATA_DIRECTORY=$NX_CACHE_ROOT/workspace-data"
+          # Nx's own eviction. It drops artifacts and their DB rows together, so
+          # never age this tree out with tmpfiles: deleting artifacts alone is a
+          # silent miss, but deleting the DB orphans every artifact.
+          echo "NX_MAX_CACHE_SIZE=20GB"
+        } >> "$GITHUB_ENV"
+        echo "machine id : $(cat /etc/machine-id)"
+        echo "nx cache   : $NX_CACHE_ROOT"
+
     # Devenv segment (own key): tooling/direnv/.devenv + .direnv — includes
     # nix-eval-cache.db. Independent of the nix NAR; restore on host and ephemeral
     # whether or not the store cache hit. Missing store paths are fine: devenv
