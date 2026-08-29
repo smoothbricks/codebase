@@ -117,16 +117,55 @@ describe('publish workflow definition', () => {
     expect(macosPlatform).toContain('# Step 6\n      - name: 🔢 Version release');
     expect(macosPlatform).toContain('# Step 7\n      - name: 🍎 Build selected macOS and iOS release outputs');
     expect(macosPlatform).toContain('# Step 10\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(finalJob).toContain('# Step 7\n      - name: 🧯 Repair pending releases');
-    expect(finalJob).toContain('# Step 8\n      - name: ♻️ Restore validated release state');
-    expect(finalJob).toContain('# Step 9\n      - name: 📦 Apply verified Linux outputs');
-    expect(finalJob).toContain('# Step 10\n      - name: 🍎 Apply verified macOS outputs');
-    expect(finalJob).toContain('# Step 12\n      - name: 🏷️ Tag release');
+    expect(finalJob).toContain('# Step 4\n      - name: 🥟 Install Bun');
+    expect(finalJob).toContain('# Step 5\n      - name: 🟢 Install Node');
+    expect(finalJob).toContain('# Step 6\n      - name: 📦 Install workspace dependencies');
+    expect(finalJob).toContain('# Step 8\n      - name: 🏗️ Build smoo Nx version actions');
+    expect(finalJob).toContain('# Step 9\n      - name: 🧯 Repair pending releases');
+    expect(finalJob).toContain('# Step 10\n      - name: ♻️ Restore validated release state');
+    expect(finalJob).toContain('# Step 11\n      - name: 📦 Apply verified Linux outputs');
+    expect(finalJob).toContain('# Step 12\n      - name: 🍎 Apply verified macOS outputs');
+    expect(finalJob).toContain('# Step 13\n      - name: 🏷️ Tag release');
     expect(finalJob).toContain(
-      '# Step 13\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
+      '# Step 14\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
     );
-    expect(finalJob).toContain('# Step 14\n      - name: 🚀 Deploy production');
-    expect(finalJob).toContain('# Step 15\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('# Step 15\n      - name: 🚀 Deploy production');
+    // The publishing job combines, tags, and publishes; it never builds the
+    // workspace, so it installs Bun and Node directly and owns no Nix cache.
+    expect(finalJob).not.toContain('setup-devenv');
+    expect(finalJob).not.toContain('save-nix-devenv');
+    expect(finalJob).not.toContain('smoo monorepo validate');
+  });
+
+  it('bootstraps only the Nx version actions package, and only for the self-hosting repo', () => {
+    const platform = renderPublishWorkflowYaml({
+      repoName: '@smoothbricks/codebase',
+      platformTargetGlobs: PLATFORM_TARGET_GLOBS,
+      macosPlatformArchitectures: ['arm64', 'x64'],
+    });
+    const candidates = [
+      platform.slice(platform.indexOf('  linux-release-candidate:'), platform.indexOf('  macos-platform:')),
+      platform.slice(platform.indexOf('  macos-platform:'), platform.indexOf('  publish-on-linux:')),
+    ];
+    const finalJob = platform.slice(platform.indexOf('  publish-on-linux:'));
+    const bootstrap = '- name: 🏗️ Build smoo Nx version actions';
+
+    // Nx Release loads the version-actions hook from dist through the export map,
+    // in its own node process where no source condition applies. Every job that
+    // versions must materialize that one package first -- never the whole CLI
+    // dependency chain, which is what this step used to build.
+    for (const job of [...candidates, finalJob]) {
+      expect(job).toContain('        run: nx build nx-plugin');
+      expect(job).not.toContain('nx build cli');
+    }
+    for (const candidate of candidates) {
+      expect(candidate.indexOf(bootstrap)).toBeLessThan(candidate.indexOf('- name: 🔢 Version release'));
+    }
+    // The publishing job bumps to the next prerelease, which is also an
+    // `nx release version` run and therefore also needs the hook on disk.
+    expect(finalJob.indexOf(bootstrap)).toBeLessThan(finalJob.indexOf('- name: 📦 Publish release'));
+    // Consumers resolve the hook from the published package instead.
+    expect(renderPublishWorkflowYaml({ repoName: '@acme/widgets' })).not.toContain('nx build nx-plugin');
   });
 
   it('tags only in the publishing job, after repair and before the npm publish', () => {
@@ -161,9 +200,6 @@ describe('publish workflow definition', () => {
     expect(platform.match(/smoo release tag /g)).toHaveLength(1);
     expect(finalJob).toContain('        run: smoo release tag --dry-run "${{ inputs.dry_run }}"');
     expect(finalJob.indexOf('- name: 🧯 Repair pending releases')).toBeLessThan(
-      finalJob.indexOf('- name: 🏷️ Tag release'),
-    );
-    expect(finalJob.indexOf('- name: ✅ Validate restored release')).toBeLessThan(
       finalJob.indexOf('- name: 🏷️ Tag release'),
     );
     expect(finalJob.indexOf('- name: 🏷️ Tag release')).toBeLessThan(finalJob.indexOf('- name: 📦 Publish release'));
@@ -343,7 +379,7 @@ describe('publish workflow definition', () => {
       finalJob.indexOf('♻️ Restore validated release state'),
     );
     expect(finalJob.indexOf('♻️ Restore validated release state')).toBeGreaterThan(
-      finalJob.indexOf('🧱 Setup Nix/devenv'),
+      finalJob.indexOf('📦 Install workspace dependencies'),
     );
     expect(rendered).not.toContain('GITHUB_SHA:');
     expect(finalJob).toContain("needs.linux-release-candidate.outputs.mode != 'none'");
@@ -435,12 +471,12 @@ describe('publish workflow definition', () => {
       version: { mode: 'none', projects: [] },
     }).run();
 
-    expect(smoothbricks.selfHostedCliBuilt).toBe(true);
-    expect(smoothbricks.repairSawSelfHostedCli).toBe(true);
-    expect(smoothbricks.versionSawSelfHostedCli).toBe(true);
-    expect(downstream.selfHostedCliBuilt).toBe(false);
-    expect(downstream.repairSawSelfHostedCli).toBe(false);
-    expect(downstream.versionSawSelfHostedCli).toBe(false);
+    expect(smoothbricks.nxVersionActionsBuilt).toBe(true);
+    expect(smoothbricks.repairSawNxVersionActions).toBe(true);
+    expect(smoothbricks.versionSawNxVersionActions).toBe(true);
+    expect(downstream.nxVersionActionsBuilt).toBe(false);
+    expect(downstream.repairSawNxVersionActions).toBe(false);
+    expect(downstream.versionSawNxVersionActions).toBe(false);
   });
 
   it('repairs older gaps, skips validation for mode none, and still completes current HEAD publish', async () => {
@@ -550,9 +586,9 @@ interface WorkflowScenarioConfig {
 interface WorkflowOutcome {
   fixtureRepoSetup: boolean;
   releaseAuthorConfigured: boolean;
-  selfHostedCliBuilt: boolean;
-  repairSawSelfHostedCli: boolean;
-  versionSawSelfHostedCli: boolean;
+  nxVersionActionsBuilt: boolean;
+  repairSawNxVersionActions: boolean;
+  versionSawNxVersionActions: boolean;
   repairedTags: string[];
   repairBuildArtifacts: string[];
   validation: { checks: number; builds: string[]; lints: string[]; tests: string[]; validates: number };
@@ -581,9 +617,9 @@ function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promi
 class WorkflowScenarioState {
   private fixtureSetup = false;
   private authorConfigured = false;
-  private selfHostedCli = false;
-  private repairObservedSelfHostedCli = false;
-  private versionObservedSelfHostedCli = false;
+  private nxVersionActions = false;
+  private repairObservedNxVersionActions = false;
+  private versionObservedNxVersionActions = false;
   private publishReleaseRan = false;
   private productionDeployRan = false;
   private publishSawValidation = false;
@@ -628,11 +664,11 @@ class WorkflowScenarioState {
       configureReleaseAuthor: async () => {
         this.authorConfigured = true;
       },
-      buildSelfHostedCli: async () => {
-        this.selfHostedCli = true;
+      buildNxVersionActions: async () => {
+        this.nxVersionActions = true;
       },
       repairPendingReleases: async ({ dryRun }) => {
-        this.repairObservedSelfHostedCli = this.selfHostedCli;
+        this.repairObservedNxVersionActions = this.nxVersionActions;
         if (dryRun) {
           return;
         }
@@ -648,7 +684,7 @@ class WorkflowScenarioState {
         }
       },
       versionRelease: async ({ bump, dryRun }) => {
-        this.versionObservedSelfHostedCli = this.selfHostedCli;
+        this.versionObservedNxVersionActions = this.nxVersionActions;
         expect(bump).toBe(this.config.bump);
         expect(dryRun).toBe(this.config.dryRun);
         return this.config.version;
@@ -705,9 +741,9 @@ class WorkflowScenarioState {
     return {
       fixtureRepoSetup: this.fixtureSetup,
       releaseAuthorConfigured: this.authorConfigured,
-      selfHostedCliBuilt: this.selfHostedCli,
-      repairSawSelfHostedCli: this.repairObservedSelfHostedCli,
-      versionSawSelfHostedCli: this.versionObservedSelfHostedCli,
+      nxVersionActionsBuilt: this.nxVersionActions,
+      repairSawNxVersionActions: this.repairObservedNxVersionActions,
+      versionSawNxVersionActions: this.versionObservedNxVersionActions,
       repairedTags: [...this.repaired].sort(),
       repairBuildArtifacts: [...this.repairBuilds].sort(),
       validation: {
