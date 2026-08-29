@@ -70,7 +70,12 @@ export async function collectNxOutputs(
           }
           claimedPaths.set(path, { project: project.project, target: run.target });
           const source = resolveWorkspacePath(root, path, 'output file');
-          const stat = await lstat(source);
+          let stat: Stats;
+          try {
+            stat = await lstat(source);
+          } catch (error) {
+            throw new Error(`Output file is missing: ${path}: ${describeError(error)}`, { cause: error });
+          }
           if (!stat.isFile() || stat.isSymbolicLink()) {
             throw new Error(`Output file must be a regular file: ${path}`);
           }
@@ -81,7 +86,7 @@ export async function collectNxOutputs(
             path,
             size: stat.size,
             mode: stat.mode & 0o7777,
-            sha256: await sha256File(source),
+            sha256: await checksumFile(source, 'Unable to checksum output file'),
             source,
           });
         }
@@ -92,10 +97,18 @@ export async function collectNxOutputs(
   pending.sort((left, right) => left.path.localeCompare(right.path));
   await requireEmptyDestination(destination);
   const workspace = resolve(destination, 'workspace');
-  await mkdir(workspace);
+  try {
+    await mkdir(workspace);
+  } catch (error) {
+    throw new Error(`Unable to create output workspace ${workspace}: ${describeError(error)}`, { cause: error });
+  }
   for (const file of pending) {
     const staged = await prepareSafeOutputPath(workspace, file.path, 'staged output file');
-    await copyFile(file.source, staged);
+    try {
+      await copyFile(file.source, staged);
+    } catch (error) {
+      throw new Error(`Unable to stage output ${file.path} at ${staged}: ${describeError(error)}`, { cause: error });
+    }
   }
 
   const manifest: CollectedOutputsManifest = {
@@ -103,7 +116,15 @@ export async function collectNxOutputs(
     sourceSha,
     files: pending.map(({ source: _source, ...file }) => file),
   };
-  await writeFile(resolve(destination, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  const manifestPath = resolve(destination, 'manifest.json');
+  try {
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    throw new Error(
+      `Unable to write collected output manifest ${manifestPath} for source SHA ${sourceSha}: ${describeError(error)}`,
+      { cause: error },
+    );
+  }
   return manifest;
 }
 
@@ -128,7 +149,7 @@ export async function applyCollectedOutputs(
     try {
       manifest = assertExactManifest(parseManifest(await readFile(manifestPath, 'utf8')));
     } catch (error) {
-      throw new Error(`Invalid collected output manifest ${manifestPath}.`, { cause: error });
+      throw new Error(`Invalid collected output manifest ${manifestPath}: ${describeError(error)}`, { cause: error });
     }
     assertGitSha(manifest.sourceSha, `Manifest source SHA in ${manifestPath}`);
     if (manifest.sourceSha !== expectedSourceSha) {
@@ -140,18 +161,22 @@ export async function applyCollectedOutputs(
     const workspace = resolve(directory, 'workspace');
     const declaredPaths = new Set<string>();
     for (const file of manifest.files) {
-      assertExactManifestName(file.project, 'Manifest project');
-      assertExactManifestName(file.target, 'Manifest target');
+      assertExactManifestName(file.project, `Manifest project in ${manifestPath}`);
+      assertExactManifestName(file.target, `Manifest target in ${manifestPath}`);
       const project = projectsByName.get(file.project);
       if (!project) {
-        throw new Error(`Manifest references unknown Nx project ${file.project}.`);
+        throw new Error(`Manifest ${manifestPath} references unknown Nx project ${file.project} for ${file.path}.`);
       }
       if (!project.targets.includes(file.target)) {
-        throw new Error(`Manifest references unknown Nx target ${file.project}:${file.target}.`);
+        throw new Error(
+          `Manifest ${manifestPath} references unknown Nx target ${file.project}:${file.target} for ${file.path}.`,
+        );
       }
       const declaredOutputs = project.targetOutputs?.get(file.target) ?? [];
       if (!declaredOutputs.includes(file.output)) {
-        throw new Error(`Manifest output ${file.output} is not declared by Nx target ${file.project}:${file.target}.`);
+        throw new Error(
+          `Manifest output ${file.output} for ${file.path} is not declared by Nx target ${file.project}:${file.target}.`,
+        );
       }
       const path = validateWorkspaceRelativePath(file.path, 'manifest file path');
       const output = resolveDeclaredOutput(file.output, project);
@@ -159,10 +184,10 @@ export async function applyCollectedOutputs(
         throw new Error(`Manifest file ${path} is not contained by declared output ${file.output}.`);
       }
       if (declaredPaths.has(path)) {
-        throw new Error(`Manifest contains a duplicate output file: ${path}`);
+        throw new Error(`Manifest ${manifestPath} contains a duplicate output file: ${path}`);
       }
       if (claimedPaths.has(path)) {
-        throw new Error(`Output collision across collected trees: ${path}`);
+        throw new Error(`Output collision across collected trees in ${manifestPath}: ${path}`);
       }
       declaredPaths.add(path);
       claimedPaths.add(path);
@@ -172,7 +197,7 @@ export async function applyCollectedOutputs(
       try {
         stat = await lstat(source);
       } catch (error) {
-        throw new Error(`Staged output file is missing: ${path}`, { cause: error });
+        throw new Error(`Staged output file is missing: ${path}: ${describeError(error)}`, { cause: error });
       }
       if (!stat.isFile() || stat.isSymbolicLink()) {
         throw new Error(`Staged output must be a regular file: ${path}`);
@@ -180,9 +205,9 @@ export async function applyCollectedOutputs(
       if (stat.size !== file.size) {
         throw new Error(`Size mismatch for staged output ${path}: expected ${file.size}, received ${stat.size}.`);
       }
-      const checksum = await sha256File(source);
+      const checksum = await checksumFile(source, 'Unable to checksum staged output');
       if (checksum !== file.sha256) {
-        throw new Error(`SHA-256 mismatch for staged output ${path}.`);
+        throw new Error(`SHA-256 mismatch for staged output ${path}: expected ${file.sha256}, received ${checksum}.`);
       }
       overlays.push({ source, destination: path, mode: file.mode });
     }
@@ -195,7 +220,7 @@ export async function applyCollectedOutputs(
       if (manifest.files.length === 0 && isMissingPathError(error)) {
         continue;
       }
-      throw new Error(`Collected output workspace is missing: ${workspace}`, { cause: error });
+      throw new Error(`Collected output workspace is missing: ${workspace}: ${describeError(error)}`, { cause: error });
     }
     if (workspaceStat.isSymbolicLink() || !workspaceStat.isDirectory()) {
       throw new Error(`Collected output workspace must be a real directory: ${workspace}`);
@@ -204,15 +229,22 @@ export async function applyCollectedOutputs(
     for (const stagedFile of stagedFiles) {
       const path = workspaceRelativePath(workspace, stagedFile, 'staged output file');
       if (!declaredPaths.has(path)) {
-        throw new Error(`Undeclared staged output file: ${path}`);
+        throw new Error(`Undeclared staged output file in ${manifestPath}: ${path}`);
       }
     }
   }
 
   for (const overlay of overlays) {
     const destination = await prepareSafeOutputPath(root, overlay.destination, 'workspace output file');
-    await copyFile(overlay.source, destination);
-    chmodSync(destination, overlay.mode);
+    try {
+      await copyFile(overlay.source, destination);
+      chmodSync(destination, overlay.mode);
+    } catch (error) {
+      throw new Error(
+        `Unable to apply staged output ${overlay.destination} at ${destination}: ${describeError(error)}`,
+        { cause: error },
+      );
+    }
   }
 }
 
@@ -489,7 +521,7 @@ async function prepareSafeOutputPath(root: string, path: string, description: st
 
 function assertGitSha(value: string, description: string): void {
   if (!GIT_SHA.test(value)) {
-    throw new Error(`${description} must be a 40- or 64-character hexadecimal Git SHA.`);
+    throw new Error(`${description} is invalid: ${value}. Expected a 40- or 64-character hexadecimal Git SHA.`);
   }
 }
 
@@ -505,4 +537,16 @@ function sha256File(path: string): Promise<string> {
     stream.on('error', reject);
     stream.on('end', () => resolveHash(hash.digest('hex')));
   });
+}
+
+async function checksumFile(path: string, description: string): Promise<string> {
+  try {
+    return await sha256File(path);
+  } catch (error) {
+    throw new Error(`${description} ${path}: ${describeError(error)}`, { cause: error });
+  }
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

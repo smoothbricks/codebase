@@ -6,7 +6,7 @@ import { PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-
 import { $ } from 'bun';
 import typia from 'typia';
 import { parseStringArrayText } from '../lib/json.js';
-import { decode, run, runStatus } from '../lib/run.js';
+import { decode, printCommandOutput, run, runResult, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
 import type { NxTargetRun } from './outputs.js';
@@ -70,7 +70,14 @@ export async function cleanupGithubCiCache(root: string): Promise<void> {
     await markCacheReady(false);
     return;
   }
-  await runStatus(nixStore, ['--verify', '--check-contents', '--repair'], root);
+  const verifyArgs = ['--verify', '--check-contents', '--repair'];
+  const verifyResult = await runResult(nixStore, verifyArgs, root);
+  if (verifyResult.exitCode !== 0) {
+    printCommandOutput(verifyResult.stdout, verifyResult.stderr);
+    console.error(
+      `${nixStore} ${verifyArgs.join(' ')} failed with exit code ${verifyResult.exitCode}; continuing cache save.`,
+    );
+  }
   await exportNixStoreCache(root, nar, nixStore, devenvProfile);
   await markCacheReady(true);
 }
@@ -82,9 +89,9 @@ async function exportNixStoreCache(root: string, nar: string, nixStore: string, 
   const roots = new Set<string>();
 
   try {
-    await $`rm -f ${nar}`.cwd(root);
-    await $`sudo rm -rf ${gcRootDir}`.cwd(root);
-    await $`sudo mkdir -p ${gcRootDir}`.cwd(root);
+    await run('rm', ['-f', nar], root);
+    await run('sudo', ['rm', '-rf', gcRootDir], root);
+    await run('sudo', ['mkdir', '-p', gcRootDir], root);
 
     // The Nix cache must include every live store path referenced by the
     // restored shell state, not just the devenv profile. .direnv stores paths to
@@ -104,7 +111,7 @@ async function exportNixStoreCache(root: string, nar: string, nixStore: string, 
     let index = 0;
     for (const target of roots) {
       const link = `${gcRootDir}/root-${index}`;
-      await $`sudo ln -s ${target} ${link}`.cwd(root);
+      await run('sudo', ['ln', '-s', target, link], root);
       rootLinks.push(link);
       index += 1;
     }
@@ -113,9 +120,9 @@ async function exportNixStoreCache(root: string, nar: string, nixStore: string, 
       throw new Error('No live Nix store roots found; skipping Nix cache save.');
     }
 
-    await $`nix-collect-garbage --quiet`.cwd(root);
-    const closureOutput = await $`sudo ${nixStore} -qR ${rootLinks}`.cwd(root).quiet();
-    const closure = decode(closureOutput.stdout)
+    await run('nix-collect-garbage', ['--quiet'], root);
+    const closureOutput = await runText('sudo', [nixStore, '-qR', ...rootLinks], root);
+    const closure = closureOutput
       .split('\n')
       .map((line) => line.trim())
       .filter(Boolean);
@@ -123,11 +130,19 @@ async function exportNixStoreCache(root: string, nar: string, nixStore: string, 
       throw new Error('No Nix store closure paths found; skipping Nix cache save.');
     }
 
-    await $`sudo ${nixStore} --export --quiet ${closure} > ${tmpNar}`.cwd(root);
-    await $`test -s ${tmpNar}`.cwd(root);
+    // NAR is binary; keep the export on disk instead of decoding it into text.
+    // `.nothrow()` lets us print stderr before naming the failed command and exit code.
+    const exportResult = await $`sudo ${nixStore} --export --quiet ${closure} > ${tmpNar}`.cwd(root).nothrow();
+    if (exportResult.exitCode !== 0) {
+      printCommandOutput('', decode(exportResult.stderr));
+      throw new Error(
+        `sudo ${nixStore} --export --quiet ${closure.join(' ')} failed with exit code ${exportResult.exitCode}`,
+      );
+    }
+    await run('test', ['-s', tmpNar], root);
     await rename(tmpNar, nar);
   } finally {
-    await $`sudo rm -rf ${gcRootDir}`.cwd(root).nothrow();
+    await run('sudo', ['rm', '-rf', gcRootDir], root);
     await rm(tmpDir, { recursive: true, force: true });
   }
 }
@@ -348,8 +363,8 @@ export function nxRunManyBatchArgs(runs: NxTargetRun[], configuration?: string):
 }
 
 export async function readGitHeadSha(root: string): Promise<string> {
-  // invariant throw: GitHub CI commands require a valid repository root.
-  return decode((await $`git rev-parse HEAD`.cwd(root).quiet()).stdout).trim();
+  // GitHub CI requires a valid repository root; runText keeps Git's diagnostics visible.
+  return (await runText('git', ['rev-parse', 'HEAD'], root)).trim();
 }
 
 export async function githubCiNxRunMany(root: string, options: NxRunManyOptions): Promise<ExpandedNxTargetRuns> {
@@ -617,12 +632,12 @@ async function listNxProjectsWithTarget(
   listArgs.push('--withTarget', target);
   if (target === 'deploy') listArgs.push(`--exclude=${deployExclusions(stage)}`);
   listArgs.push('--json');
-  const result = await $`nx ${listArgs}`.cwd(root).quiet();
-  const candidates = nxProjectList(decode(result.stdout)).sort((left, right) => left.localeCompare(right));
+  const candidates = nxProjectList(await runText('nx', listArgs, root)).sort((left, right) =>
+    left.localeCompare(right),
+  );
   if (target !== 'deploy') return candidates;
   return selectStageDeployProjects(candidates, stage, async (project) => {
-    const projectResult = await $`nx show project ${project} --json`.cwd(root).quiet();
-    const parsed = parseNxProjectDeployTarget(decode(projectResult.stdout));
+    const parsed = parseNxProjectDeployTarget(await runText('nx', ['show', 'project', project, '--json'], root));
     if (!parsed) throw new Error(`nx show project ${project} returned invalid JSON.`);
     return parsed;
   });
@@ -677,7 +692,9 @@ export class NodeGithubApiProcessRunner implements GithubApiProcessRunner {
     child.stderr.on('data', (chunk: string) => {
       stderr += chunk;
     });
-    child.once('error', reject);
+    child.once('error', (error) => {
+      reject(new Error(`gh ${args.join(' ')} failed to start`, { cause: error }));
+    });
     child.once('close', (code) => {
       resolve({ exitCode: code ?? -1, stdout, stderr });
     });
@@ -703,56 +720,52 @@ export async function publishGithubDeployment(
     transient_environment: true,
     production_environment: false,
   });
-  const createResult = await runner.run(
-    [
-      'api',
-      '--method',
-      'POST',
-      '-H',
-      'Accept: application/vnd.github+json',
-      `/repos/${repository}/deployments`,
-      '--input',
-      '-',
-    ],
-    createBody,
-    process.cwd(),
-  );
+  const createArgs = [
+    'api',
+    '--method',
+    'POST',
+    '-H',
+    'Accept: application/vnd.github+json',
+    `/repos/${repository}/deployments`,
+    '--input',
+    '-',
+  ];
+  const createResult = await runner.run(createArgs, createBody, process.cwd());
   if (createResult.exitCode !== 0) {
-    throw new Error(
-      `GitHub deployment creation failed with exit code ${createResult.exitCode}: ${createResult.stderr.trim()}`,
-    );
+    printCommandOutput(createResult.stdout, createResult.stderr);
+    throw new Error(`gh ${createArgs.join(' ')} failed with exit code ${createResult.exitCode}`);
   }
   let deployment: unknown;
   try {
     deployment = JSON.parse(createResult.stdout);
   } catch {
-    throw new Error('GitHub returned invalid JSON while creating a deployment.');
+    printCommandOutput(createResult.stdout, createResult.stderr);
+    throw new Error(`gh ${createArgs.join(' ')} returned invalid JSON while creating a deployment.`);
   }
-  if (!isGithubDeployment(deployment)) throw new Error('GitHub returned an invalid deployment response.');
+  if (!isGithubDeployment(deployment)) {
+    printCommandOutput(createResult.stdout, createResult.stderr);
+    throw new Error(`gh ${createArgs.join(' ')} returned an invalid deployment response.`);
+  }
   const statusBody = JSON.stringify({
     state: 'success',
     environment,
     environment_url: url,
     auto_inactive: false,
   });
-  const statusResult = await runner.run(
-    [
-      'api',
-      '--method',
-      'POST',
-      '-H',
-      'Accept: application/vnd.github+json',
-      `/repos/${repository}/deployments/${deployment.id}/statuses`,
-      '--input',
-      '-',
-    ],
-    statusBody,
-    process.cwd(),
-  );
+  const statusArgs = [
+    'api',
+    '--method',
+    'POST',
+    '-H',
+    'Accept: application/vnd.github+json',
+    `/repos/${repository}/deployments/${deployment.id}/statuses`,
+    '--input',
+    '-',
+  ];
+  const statusResult = await runner.run(statusArgs, statusBody, process.cwd());
   if (statusResult.exitCode !== 0) {
-    throw new Error(
-      `GitHub deployment status failed with exit code ${statusResult.exitCode}: ${statusResult.stderr.trim()}`,
-    );
+    printCommandOutput(statusResult.stdout, statusResult.stderr);
+    throw new Error(`gh ${statusArgs.join(' ')} failed with exit code ${statusResult.exitCode}`);
   }
 }
 
