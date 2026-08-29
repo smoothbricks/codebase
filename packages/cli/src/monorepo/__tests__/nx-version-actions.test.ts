@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { $ } from 'bun';
+import { run } from '../../lib/run.js';
 import { syncBunLockfileVersions } from '../lockfile.js';
 
 describe('nx-version-actions Bun lockfile workaround', () => {
@@ -14,10 +14,10 @@ describe('nx-version-actions Bun lockfile workaround', () => {
         dependencies: { '@fixture/b': 'workspace:*' },
       });
       await writePackage(root, 'b', { name: '@fixture/b', version: '1.0.0' });
-      await $`bun install --lockfile-only`.cwd(root).quiet();
+      await run('bun', ['install', '--lockfile-only'], root);
 
       await writePackage(root, 'b', { name: '@fixture/b', version: '1.0.1' });
-      await $`bun install --lockfile-only`.cwd(root).quiet();
+      await run('bun', ['install', '--lockfile-only'], root);
 
       const stalePackedVersion = await packedDependencyVersion(root, 1);
       if (stalePackedVersion !== '1.0.0') {
@@ -64,8 +64,8 @@ async function packedDependencyVersion(root: string, index: number): Promise<str
   const tarball = join(root, `a-${index}.tgz`);
   const unpacked = join(root, `unpacked-${index}`);
   await mkdir(unpacked);
-  await $`bun pm pack --filename ${tarball} --ignore-scripts --quiet`.cwd(join(root, 'packages/a')).quiet();
-  await $`tar -xzf ${tarball} -C ${unpacked}`.quiet();
+  await run('bun', ['pm', 'pack', '--filename', tarball, '--ignore-scripts', '--quiet'], join(root, 'packages/a'));
+  await run('tar', ['-xzf', tarball, '-C', unpacked], root);
   const manifest = JSON.parse(await readFile(join(unpacked, 'package', 'package.json'), 'utf8'));
   const version = manifest.dependencies?.['@fixture/b'];
   if (typeof version !== 'string') {

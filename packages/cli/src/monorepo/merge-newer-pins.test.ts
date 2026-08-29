@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { printCommandOutput } from '../lib/run.js';
 
 const script = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -23,6 +24,9 @@ function mergedOurs(oursContent: string, theirsContent: string): string {
     writeFileSync(ours, oursContent);
     writeFileSync(theirs, theirsContent);
     const r = spawnSync('bash', [script, base, ours, theirs, 'pins'], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      printCommandOutput(r.stdout ?? '', r.stderr ?? '');
+    }
     expect(r.status).toBe(0);
     return readFileSync(ours, 'utf8');
   } finally {

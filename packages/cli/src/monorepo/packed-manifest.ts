@@ -1,16 +1,18 @@
-import { $ } from 'bun';
 import { type PackageJson, parsePackageJsonText } from '../lib/json.js';
-import { decode } from '../lib/run.js';
+import { printCommandOutput, runResult } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
 import { getWorkspacePackages, workspaceDependencyFields } from '../lib/workspace.js';
 import { publishPackDependencyVersion } from './lockfile.js';
 
 export async function readPackedPackageJson(root: string, tarball: string, packageName: string): Promise<PackageJson> {
-  const result = await $`tar -xOf ${tarball} package/package.json`.cwd(root).quiet().nothrow();
+  const result = await runResult('tar', ['-xOf', tarball, 'package/package.json'], root);
   if (result.exitCode !== 0) {
-    throw new Error(`${packageName}: unable to inspect packed package.json.`);
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(
+      `${packageName}: tar -xOf ${tarball} package/package.json failed with exit code ${result.exitCode}`,
+    );
   }
-  const parsed = parsePackageJsonText(decode(result.stdout));
+  const parsed = parsePackageJsonText(result.stdout);
   if (!parsed) {
     throw new Error(`${packageName}: packed package.json is invalid.`);
   }

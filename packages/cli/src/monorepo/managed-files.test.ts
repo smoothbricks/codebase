@@ -331,8 +331,8 @@ describe('managed raw files', () => {
               PATH: `${bin}:${Bun.env.PATH ?? ''}`,
               TTSC_CACHE_DIR: cache.input,
             },
-            stderr: 'pipe',
-            stdout: 'pipe',
+            stderr: 'inherit',
+            stdout: 'inherit',
           },
         );
         expect(await process.exited).toBe(0);
