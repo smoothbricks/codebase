@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   classifyReleaseBranchPush,
@@ -117,6 +118,37 @@ describe('release planning with fixture git repositories', () => {
 
       await expect(readFile(join(root, 'packages/a/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
       await expect(readFile(join(root, 'packages/b/dist/index.js'), 'utf8')).resolves.toBe('{}\n');
+    });
+  });
+
+  it('keeps fixture Nx state out of a shared workspace-data directory', async () => {
+    // Host CI runners export these to a per-lane tree shared by every task in the
+    // run. A fixture inheriting them overwrote the real workspace's project graph
+    // with its own one-project graph, and the concurrent `nx run-many -t test`
+    // died with "Could not find project lmao-ttsc". Assert the outer directories
+    // stay untouched, which is the only thing that made that failure possible.
+    await withFixtureRepo(async (root) => {
+      const shared = await mkdtemp(join(tmpdir(), 'nx-shared-'));
+      const sharedData = join(shared, 'workspace-data');
+      const sharedCache = join(shared, 'cache');
+      await mkdir(sharedData, { recursive: true });
+      await mkdir(sharedCache, { recursive: true });
+      process.env.NX_WORKSPACE_DATA_DIRECTORY = sharedData;
+      process.env.NX_CACHE_DIRECTORY = sharedCache;
+      try {
+        await writeWorkspace(root);
+        await writeBuildablePackage(root, '@scope/a', 'packages/a');
+
+        await runFixtureNx(root, ['run-many', '-t', 'build', '--projects=a']);
+
+        expect(await readdir(sharedData)).toEqual([]);
+        expect(await readdir(sharedCache)).toEqual([]);
+        expect(await readdir(join(root, '.nx'))).toContain('workspace-data');
+      } finally {
+        delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
+        delete process.env.NX_CACHE_DIRECTORY;
+        await rm(shared, { recursive: true, force: true });
+      }
     });
   });
 
