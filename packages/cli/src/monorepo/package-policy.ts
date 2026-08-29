@@ -1,5 +1,5 @@
-import { type Dirent, readdirSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { type Dirent, readdirSync, readFileSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import {
   applyWorkspaceBoundedTestTargetPolicy,
   checkWorkspaceBoundedTestTargetPolicy,
@@ -346,6 +346,8 @@ const testScanSkippedDirectories = new Set([
   '.direnv',
   '.nx',
   '.cache',
+  'build',
+  'dist-types',
 ]);
 
 /**
@@ -368,8 +370,53 @@ export function validateTestFileLocations(root: string): number {
   return failures;
 }
 
+/**
+ * Concatenates every manifest and tsconfig the package owns, so wiring evidence is a
+ * single searchable string: a path or include-glob the package names is its own.
+ */
+function wiredConfigText(packagePath: string): string {
+  const parts: string[] = [];
+  for (const entry of readdirSync(packagePath, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    if (entry.name === 'package.json' || (entry.name.startsWith('tsconfig') && entry.name.endsWith('.json'))) {
+      try {
+        parts.push(readFileSync(join(packagePath, entry.name), 'utf8'));
+      } catch {
+        // A manifest that cannot be read contributes no wiring evidence; the
+        // file-level rules below still apply.
+      }
+    }
+  }
+  return parts.join('\n');
+}
+
+// A test file the package's own configuration already names is neither untyped nor
+// unrun: verbatim mentions cover individually-wired suites, and `<dir>/**` covers a
+// tsconfig include glob that pulls a whole directory into typecheck. Everything else
+// outside src/ keeps the failure the check exists to produce.
+function isWired(configText: string, relativePath: string): boolean {
+  const posix = relativePath.split(sep).join('/');
+  if (configText.includes(posix)) return true;
+  const dir = dirname(posix);
+  return configText.includes(`${dir}/**`);
+}
+
+function hasOwnTsconfig(directory: string): boolean {
+  try {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.startsWith('tsconfig') && entry.name.endsWith('.json')) {
+        return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 function strayTestFiles(packagePath: string): string[] {
   const stray: string[] = [];
+  const configText = wiredConfigText(packagePath);
   const walk = (directory: string): void => {
     let entries: Dirent[];
     try {
@@ -380,17 +427,39 @@ function strayTestFiles(packagePath: string): string[] {
     for (const entry of entries) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
-        if (testScanSkippedDirectories.has(entry.name)) {
+        // Dot-directories are vendored or machine-local trees (.bun-pin, .runtime,
+        // ...): not workspace sources, so their contents say nothing about which test
+        // files this package owns.
+        if (testScanSkippedDirectories.has(entry.name) || entry.name.startsWith('.')) {
           continue;
         }
         if (directory === packagePath && entry.name === 'src') {
           continue; // src/ is where tests belong.
         }
+        // Established layout: top-level test/, tests/, and fixtures/ directories are
+        // owned wholesale - the former two by these packages' tsconfig includes and
+        // bun-test targets, fixtures because files named *.test.ts there are fixture
+        // DATA compiled by gate harnesses, not suites. Retroactively failing them
+        // would reclassify every existing suite as a regression without changing
+        // what runs.
+        if (
+          entry.name === 'fixtures' ||
+          (directory === packagePath && (entry.name === 'test' || entry.name === 'tests'))
+        ) {
+          continue;
+        }
+        // An owned project scope: a subdirectory with its own tsconfig*.json typechecks
+        // what it includes, so the package deliberately made it a project of its own.
+        if (hasOwnTsconfig(join(directory, entry.name))) {
+          continue;
+        }
         walk(path);
         continue;
       }
       if (entry.isFile() && testFilePattern.test(entry.name)) {
-        stray.push(relative(packagePath, path));
+        const rel = relative(packagePath, path);
+        if (isWired(configText, rel)) continue;
+        stray.push(rel);
       }
     }
   };
