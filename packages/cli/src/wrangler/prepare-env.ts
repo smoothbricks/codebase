@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { $ } from 'bun';
 import { type AST, getStaticTOMLValue, parseTOML } from 'toml-eslint-parser';
 import typia from 'typia';
+import { decode, printCommandOutput, runText } from '../lib/run.js';
 
 // ── runtime narrowing (wrangler TOML/JSON is external data — no casts) ───────
 
@@ -50,11 +51,6 @@ interface WranglerSecretRow {
   name?: string;
 }
 
-interface ShellErrorShape {
-  stderr?: unknown;
-  exitCode?: unknown;
-}
-
 const isWranglerTomlRoot = typia.createIs<WranglerTomlRoot>();
 const isWranglerEnvBlock = typia.createIs<WranglerEnvBlock>();
 const isWranglerKvRow = typia.createIs<WranglerKvRow>();
@@ -62,7 +58,6 @@ const isWranglerD1Row = typia.createIs<WranglerD1Row>();
 const isWranglerSecretRow = typia.createIs<WranglerSecretRow>();
 const isKvNamespaceRow = typia.createIs<{ id: string; title: string }>();
 const isD1DatabaseRow = typia.createIs<{ uuid: string; name: string }>();
-const isShellErrorShape = typia.createIs<ShellErrorShape>();
 
 // ── wrangler.toml editors (CST: read via getStaticTOMLValue, write via
 // node-range splice — comment/format-preserving by construction, no regex) ─────
@@ -341,18 +336,14 @@ function asSecretNames(json: unknown): string[] {
   return json.flatMap((row) => (isWranglerSecretRow(row) && typeof row.name === 'string' ? [row.name] : []));
 }
 
-/** Best-effort ERROR line from a Bun ShellError (thrown on non-zero exit). */
-export function errText(err: unknown): string {
-  if (!isShellErrorShape(err)) return 'unknown error';
-  const stderr = err.stderr != null ? String(err.stderr) : '';
-  const exit = err.exitCode != null ? String(err.exitCode) : '?';
-  return stderr.split('\n').find((l) => l.includes('ERROR')) ?? `exit ${exit}`;
-}
+const parseKvNamespacesJson = typia.json.createIsParse<Array<{ id: string; title: string }>>();
+const parseD1DatabasesJson = typia.json.createIsParse<Array<{ uuid: string; name: string }>>();
+const parseSecretRowsJson = typia.json.createIsParse<WranglerSecretRow[]>();
 
 /** Live KV namespaces on the account (`kv namespace list` emits a pure JSON array); `[]` when offline/unauthenticated. */
 export async function listNamespaces(cwd: string): Promise<KvNamespace[]> {
   try {
-    return asKvNamespaces(await $`bunx wrangler kv namespace list`.cwd(cwd).quiet().json());
+    return asKvNamespaces(parseKvNamespacesJson(await runText('wrangler', ['kv', 'namespace', 'list'], cwd)));
   } catch {
     return [];
   }
@@ -367,9 +358,9 @@ export async function ensureNamespace(logical: string, existing: KvNamespace[], 
   const match = existing.find((n) => n.title === logical);
   if (match) return match.id;
   try {
-    await $`bunx wrangler kv namespace create ${logical}`.cwd(cwd).quiet();
-  } catch (err) {
-    return errText(err).includes('already') ? await reList(logical, cwd) : null;
+    await runText('wrangler', ['kv', 'namespace', 'create', logical], cwd);
+  } catch {
+    return reList(logical, cwd);
   }
   return reList(logical, cwd);
 }
@@ -391,7 +382,7 @@ function asD1Databases(json: unknown): D1Database[] {
 /** Live D1 databases on the account (`d1 list --json`); `[]` when offline/unauthenticated. */
 export async function listD1Databases(cwd: string): Promise<D1Database[]> {
   try {
-    return asD1Databases(await $`bunx wrangler d1 list --json`.cwd(cwd).quiet().json());
+    return asD1Databases(parseD1DatabasesJson(await runText('wrangler', ['d1', 'list', '--json'], cwd)));
   } catch {
     return [];
   }
@@ -406,9 +397,9 @@ export async function ensureD1Database(name: string, existing: D1Database[], cwd
   const match = existing.find((d) => d.name === name);
   if (match) return match.uuid;
   try {
-    await $`bunx wrangler d1 create ${name}`.cwd(cwd).quiet();
-  } catch (err) {
-    return errText(err).includes('already') ? reListD1(name, cwd) : null;
+    await runText('wrangler', ['d1', 'create', name], cwd);
+  } catch {
+    return reListD1(name, cwd);
   }
   return reListD1(name, cwd);
 }
@@ -420,7 +411,9 @@ async function reListD1(name: string, cwd: string): Promise<string | null> {
 /** Current secret names on the worker for `env`; `[]` when none/unreachable (Cloudflare allows setting pre-deploy). */
 export async function listSecretNames(env: string, cwd: string): Promise<string[]> {
   try {
-    return asSecretNames(await $`bunx wrangler secret list --format json --env ${env}`.cwd(cwd).quiet().json());
+    return asSecretNames(
+      parseSecretRowsJson(await runText('wrangler', ['secret', 'list', '--format', 'json', '--env', env], cwd)),
+    );
   } catch {
     return [];
   }
@@ -428,10 +421,12 @@ export async function listSecretNames(env: string, cwd: string): Promise<string[
 
 /** `wrangler secret put <name> --env <env>` piping `value` on stdin (never a CLI arg). Returns success. */
 export async function putSecret(name: string, value: string, env: string, cwd: string): Promise<boolean> {
-  try {
-    await $`bunx wrangler secret put ${name} --env ${env} < ${Buffer.from(value)}`.cwd(cwd).quiet();
-    return true;
-  } catch {
-    return false;
+  const command = 'wrangler';
+  const args = ['secret', 'put', name, '--env', env];
+  const result = await $`wrangler secret put ${name} --env ${env} < ${Buffer.from(value)}`.cwd(cwd).quiet().nothrow();
+  if (result.exitCode !== 0) {
+    printCommandOutput(decode(result.stdout), decode(result.stderr));
+    throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`);
   }
+  return true;
 }

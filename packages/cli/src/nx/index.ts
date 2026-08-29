@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createProjectGraphAsync } from 'nx/src/project-graph/project-graph.js';
 import { workspaceRoot as primaryWorkspaceRoot } from 'nx/src/utils/workspace-root.js';
 import type { NxDependsOn, NxProjectJson, NxTargetConfig, NxTargetOptions } from '../lib/json.js';
-import { run, runResult } from '../lib/run.js';
+import { printCommandOutput, run, runResult } from '../lib/run.js';
 
 export interface ProjectTargets {
   project: string;
@@ -259,7 +259,10 @@ async function loadForeignNxProjects(root: string): Promise<NxProjects> {
     NX_WORKSPACE_ROOT_PATH: root,
   });
   if (result.exitCode !== 0) {
-    throw new Error(`Failed to load Nx project graph for ${root}: ${result.stderr.trim()}`);
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(
+      `Failed to load Nx project graph for ${root}: ${process.execPath} --eval <foreign graph script> failed with exit code ${result.exitCode}`,
+    );
   }
   const parsed: unknown = JSON.parse(result.stdout);
   if (!isNxProjects(parsed)) {

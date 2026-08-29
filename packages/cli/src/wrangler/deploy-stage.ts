@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import typia from 'typia';
+import { printCommandOutput } from '../lib/run.js';
 import { type CloudflareClient, CloudflareRestClient } from './cloudflare.js';
 import { parseDevVarsExample } from './prepare-env.js';
 import {
@@ -429,7 +430,8 @@ async function wranglerJson(runner: ProcessRunner, args: string[], cwd: string):
 async function wrangler(runner: ProcessRunner, args: string[], cwd: string): Promise<ProcessResult> {
   const result = await runner.run('wrangler', args, { cwd });
   if (result.exitCode !== 0) {
-    throw new Error(`wrangler ${args.join(' ')} failed with exit code ${result.exitCode}: ${result.stderr.trim()}`);
+    printCommandOutput(result.stdout, result.stderr);
+    throw new Error(`wrangler ${args.join(' ')} failed with exit code ${result.exitCode}`);
   }
   return result;
 }

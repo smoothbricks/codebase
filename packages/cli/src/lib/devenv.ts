@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { decode } from './run.js';
+import { decode, printCommandOutput } from './run.js';
 
 type EnvSnapshot = Record<string, string>;
 
@@ -26,7 +26,10 @@ async function loadDevenvEnv(root: string): Promise<EnvSnapshot> {
       .quiet()
       .nothrow();
     if (result.exitCode !== 0) {
-      throw new Error('devenv shell failed. Ensure devenv is installed and the tooling/direnv shell is valid.');
+      printCommandOutput(decode(result.stdout), decode(result.stderr));
+      throw new Error(
+        `devenv shell failed with exit code ${result.exitCode}. Ensure devenv is installed and the tooling/direnv shell is valid.`,
+      );
     }
     return parseNulEnv(await readFile(envPath));
   } finally {
