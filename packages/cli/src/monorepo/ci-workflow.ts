@@ -244,9 +244,9 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
       return [
         `      - name: ${step.name}`,
         '        if:',
-        "          ${{ steps.setup.outputs.host-runner != 'true' && github.event_name == 'push' &&",
-        "          github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&",
-        "          steps.nx-cache.outputs.cache-hit != 'true' }}",
+        "          ${{ steps.setup.outputs.host-runner != 'true' && github.event_name == 'push' && github.ref ==",
+        "          format('refs/heads/{0}', github.event.repository.default_branch) && steps.nx-cache.outputs.cache-hit != 'true'",
+        '          }}',
         '        uses: actions/cache/save@v5.0.5',
         '        with:',
         '          path: |',
