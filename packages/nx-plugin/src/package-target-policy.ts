@@ -229,6 +229,38 @@ function isBuildOutputDependencyPattern(dependency: string): boolean {
   return BUILD_OUTPUT_DEPENDENCIES.some((pattern) => pattern === dependency);
 }
 
+/**
+ * `project:target` in dependsOn is Nx's cross-project dependency syntax. When
+ * the prefix names a real workspace project, the entry references that
+ * project's target — it is not a legacy colon-named local target, so neither
+ * migration nor validation may touch it.
+ */
+function isCrossProjectTargetDependency(dependency: string, projectNames?: ReadonlySet<string>): boolean {
+  const split = dependency.lastIndexOf(':');
+  return split > 0 && projectNames?.has(dependency.slice(0, split)) === true;
+}
+
+function projectNamesFromOptions(options: PackageTargetPolicyOptions): ReadonlySet<string> | undefined {
+  return options.resolvedTargetsByProject ? new Set(options.resolvedTargetsByProject.keys()) : undefined;
+}
+
+/**
+ * The resolved-target map alone can be absent (unit-scale callers), so the
+ * workspace's declared package project names back it up: a dependsOn prefix is
+ * cross-project if either source knows the name.
+ */
+function collectWorkspaceProjectNames(root: string, options: PackageTargetPolicyOptions): ReadonlySet<string> {
+  const names = new Set(projectNamesFromOptions(options) ?? []);
+  for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
+    const pkg = readJsonObject(packageJsonPath);
+    const projectName = pkg ? packageNxProjectName(pkg) : null;
+    if (projectName) {
+      names.add(projectName);
+    }
+  }
+  return names;
+}
+
 function expectedTargetDependencies(targetName: string): string[] {
   if (targetName === 'preview') return ['build'];
   if (targetName.endsWith('-js')) return ['^*-js'];
@@ -587,6 +619,7 @@ function validateExplicitNxTargets(
   pkg: Record<string, unknown>,
   packagePath: string,
   resolvedProject?: ReadonlySet<string> | ResolvedProjectTargets,
+  projectNames?: ReadonlySet<string>,
 ): NxPolicyIssue[] {
   const issues = validatePlatformTargetDependencies(packagePath, resolvedProject);
   const nx = recordProperty(pkg, 'nx');
@@ -611,6 +644,7 @@ function validateExplicitNxTargets(
         rawTarget,
         `${packagePath}: nx.targets.${targetName}`,
         resolvedProjectTargetNames(resolvedProject),
+        projectNames,
       ),
     );
   }
@@ -684,6 +718,7 @@ function validateTargetDependencies(
   target: Record<string, unknown>,
   label: string,
   resolvedTargets?: ReadonlySet<string>,
+  projectNames?: ReadonlySet<string>,
 ): NxPolicyIssue[] {
   if (!Array.isArray(target.dependsOn)) {
     return [];
@@ -691,6 +726,9 @@ function validateTargetDependencies(
   const issues: NxPolicyIssue[] = [];
   for (const dependency of target.dependsOn) {
     if (typeof dependency !== 'string') {
+      continue;
+    }
+    if (isCrossProjectTargetDependency(dependency, projectNames)) {
       continue;
     }
     if (dependency.includes(':')) {
@@ -959,8 +997,10 @@ function validateTestEntrypointPresenceTree(
 export function checkPackageTargetPolicyTree(tree: Tree, options: PackageTargetPolicyOptions = {}): NxPolicyIssue[] {
   const issues: NxPolicyIssue[] = [];
   const workspaceNames = collectWorkspaceNamesTree(tree);
+  const projects = getProjects(tree);
+  const projectNames = new Set([...(projectNamesFromOptions(options) ?? []), ...projects.keys()]);
 
-  for (const [projectName, config] of getProjects(tree)) {
+  for (const [projectName, config] of projects) {
     const pkgPath = `${config.root}/package.json`;
     if (!tree.exists(pkgPath)) {
       continue;
@@ -970,7 +1010,7 @@ export function checkPackageTargetPolicyTree(tree: Tree, options: PackageTargetP
     const resolvedProject = options.resolvedTargetsByProject?.get(projectName);
     const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
 
-    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject));
+    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject, projectNames));
     issues.push(...validateTestEntrypointPresenceTree(tree, packagePath, pkg));
     issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets }));
   }
@@ -986,8 +1026,10 @@ export function checkPackageTargetPolicyTree(tree: Tree, options: PackageTargetP
 export function applyPackageTargetPolicyTree(tree: Tree, options: PackageTargetPolicyOptions = {}): boolean {
   let changed = false;
   const workspaceNames = collectWorkspaceNamesTree(tree);
+  const projects = getProjects(tree);
+  const projectNames = new Set([...(projectNamesFromOptions(options) ?? []), ...projects.keys()]);
 
-  for (const [projectName, config] of getProjects(tree)) {
+  for (const [projectName, config] of projects) {
     const pkgPath = `${config.root}/package.json`;
     if (!tree.exists(pkgPath)) {
       continue;
@@ -998,7 +1040,7 @@ export function applyPackageTargetPolicyTree(tree: Tree, options: PackageTargetP
 
     updateJson(tree, pkgPath, (pkg: Record<string, unknown>) => {
       let packageChanged = migratePackageColonTargets(pkg, resolvedTargets);
-      packageChanged = rewriteColonTargetDependenciesInPackage(pkg, resolvedTargets) || packageChanged;
+      packageChanged = rewriteColonTargetDependenciesInPackage(pkg, resolvedTargets, projectNames) || packageChanged;
       packageChanged = removePackageColonTargets(pkg) || packageChanged;
       packageChanged = removeRedundantNoopBuildTarget(pkg, resolvedProject) || packageChanged;
       packageChanged =
@@ -1032,6 +1074,7 @@ function removePackageColonTargets(pkg: Record<string, unknown>): boolean {
 function rewriteColonTargetDependenciesInPackage(
   pkg: Record<string, unknown>,
   resolvedTargets?: ReadonlySet<string>,
+  projectNames?: ReadonlySet<string>,
 ): boolean {
   const nx = recordProperty(pkg, 'nx');
   const targets = nx ? recordProperty(nx, 'targets') : null;
@@ -1047,6 +1090,9 @@ function rewriteColonTargetDependenciesInPackage(
     }
     target.dependsOn = target.dependsOn.map((dependency) => {
       if (typeof dependency !== 'string' || !dependency.includes(':')) {
+        return dependency;
+      }
+      if (isCrossProjectTargetDependency(dependency, projectNames)) {
         return dependency;
       }
       const next = scriptAliases.get(dependency) ?? replacementTargetName(dependency, null, resolvedTargets);
@@ -1163,18 +1209,19 @@ export function checkPackageTargets(
   pkg: Record<string, unknown>,
   packagePath: string,
   resolvedTargets?: ReadonlySet<string>,
+  projectNames?: ReadonlySet<string>,
 ): NxPolicyIssue[] {
-  return [...validateExplicitNxTargets(pkg, packagePath, resolvedTargets)];
+  return [...validateExplicitNxTargets(pkg, packagePath, resolvedTargets, projectNames)];
 }
 
 export function applyPackageTargets(
   pkg: Record<string, unknown>,
   packagePath: string,
   workspaceNames: ReadonlySet<string>,
-  options: { resolvedTargets?: ReadonlySet<string> } = {},
+  options: { resolvedTargets?: ReadonlySet<string>; projectNames?: ReadonlySet<string> } = {},
 ): boolean {
   let changed = migratePackageColonTargets(pkg, options.resolvedTargets);
-  changed = rewriteColonTargetDependenciesInPackage(pkg, options.resolvedTargets) || changed;
+  changed = rewriteColonTargetDependenciesInPackage(pkg, options.resolvedTargets, options.projectNames) || changed;
   changed = removePackageColonTargets(pkg) || changed;
   changed = applyPackageScriptPolicyForPkg(pkg, packagePath, workspaceNames, options) || changed;
   return changed;
@@ -1183,6 +1230,7 @@ export function applyPackageTargets(
 export function checkPackageTargetPolicy(root: string, options: PackageTargetPolicyOptions = {}): NxPolicyIssue[] {
   const issues: NxPolicyIssue[] = [];
   const workspaceNames = getWorkspacePackageNames(root);
+  const projectNames = collectWorkspaceProjectNames(root, options);
 
   for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
     const pkg = readJsonObject(packageJsonPath);
@@ -1193,7 +1241,7 @@ export function checkPackageTargetPolicy(root: string, options: PackageTargetPol
     const projectName = packageNxProjectName(pkg);
     const resolvedProject = projectName ? options.resolvedTargetsByProject?.get(projectName) : undefined;
 
-    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject));
+    issues.push(...validateExplicitNxTargets(pkg, packagePath, resolvedProject, projectNames));
     issues.push(...validateTestEntrypointPresence(root, packagePath, pkg));
     issues.push(...validatePackageScriptPolicy(pkg, packagePath, workspaceNames, { resolvedTargets: resolvedProject }));
   }
@@ -1204,6 +1252,7 @@ export function checkPackageTargetPolicy(root: string, options: PackageTargetPol
 export function applyPackageTargetPolicy(root: string, options: PackageTargetPolicyOptions = {}): boolean {
   let changed = false;
   const workspaceNames = getWorkspacePackageNames(root);
+  const projectNames = collectWorkspaceProjectNames(root, options);
 
   for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
     const pkg = readJsonObject(packageJsonPath);
@@ -1216,7 +1265,7 @@ export function applyPackageTargetPolicy(root: string, options: PackageTargetPol
     const resolvedTargets = resolvedProjectTargetNames(resolvedProject);
 
     let packageChanged = migratePackageColonTargets(pkg, resolvedTargets);
-    packageChanged = rewriteColonTargetDependenciesInPackage(pkg, resolvedTargets) || packageChanged;
+    packageChanged = rewriteColonTargetDependenciesInPackage(pkg, resolvedTargets, projectNames) || packageChanged;
     packageChanged = removePackageColonTargets(pkg) || packageChanged;
     packageChanged = removeRedundantNoopBuildTarget(pkg, resolvedProject) || packageChanged;
     packageChanged =
