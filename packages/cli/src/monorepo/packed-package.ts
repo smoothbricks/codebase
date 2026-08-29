@@ -158,7 +158,7 @@ async function createAttwPackageFromTarball(attw: AttwCore, root: string, tarbal
     const extract = await runResult('tar', ['-xzf', tarballPath, '-C', temp], root);
     if (extract.exitCode !== 0) {
       printCommandOutput(extract.stdout, extract.stderr);
-      throw new Error('unable to extract packed package for are-the-types-wrong');
+      throw new Error(`tar -xzf ${tarballPath} -C ${temp} failed with exit code ${extract.exitCode}`);
     }
     return createAttwPackageFromDirectory(attw, join(temp, 'package'));
   } finally {

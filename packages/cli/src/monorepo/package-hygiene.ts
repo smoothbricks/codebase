@@ -62,5 +62,5 @@ async function runPackageHygieneCommand(
   if (!verbose && shell.runResult) {
     return shell.runResult(command, args, root);
   }
-  return { exitCode: await shell.runStatus(command, args, root, !verbose), stdout: '', stderr: '' };
+  return { exitCode: await shell.runStatus(command, args, root, false), stdout: '', stderr: '' };
 }

@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, it } from 'bun:test';
-import { execSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import fc from 'fast-check';
+import { printCommandOutput } from '../lib/run.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from './lockfile.js';
 
 const cleanupRoots: string[] = [];
@@ -14,11 +15,17 @@ afterAll(() => {
 });
 
 function git(root: string, args: string): string {
-  return execSync(`git ${args}`, {
-    cwd: root,
-    encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  const result = spawnSync('git', args.split(' '), { cwd: root, encoding: 'utf8' });
+  const command = `git ${args}`;
+  if (result.error) {
+    printCommandOutput(result.stdout ?? '', result.stderr ?? '');
+    throw new Error(`${command} failed to start: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    printCommandOutput(result.stdout ?? '', result.stderr ?? '');
+    throw new Error(`${command} failed with exit code ${result.status ?? 1}`);
+  }
+  return result.stdout;
 }
 
 interface FixtureOptions {

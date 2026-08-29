@@ -1,6 +1,5 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { $ } from 'bun';
 import {
   ensureDependencyMap,
   ensureEngines,
@@ -11,6 +10,7 @@ import {
   setStringProperty,
   writeJsonObject,
 } from '../lib/json.js';
+import { runText } from '../lib/run.js';
 
 export interface RuntimeVersions {
   node: string;
@@ -22,8 +22,8 @@ export async function runtimeVersionsFromPath(root: string): Promise<RuntimeVers
   const node = runtimeCommand(root, 'node');
   const bun = runtimeCommand(root, 'bun');
   return {
-    node: (await $`${node} --version`.cwd(root).text()).trim().replace(/^v/, ''),
-    bun: (await $`${bun} --version`.cwd(root).text()).trim(),
+    node: (await runText(node, ['--version'], root)).trim().replace(/^v/, ''),
+    bun: (await runText(bun, ['--version'], root)).trim(),
   };
 }
 
@@ -118,7 +118,7 @@ async function runtimeTypesRange(
   runtimeVersion: string,
   pinMode: RuntimeTypesPinMode,
 ): Promise<string> {
-  const versionsText = await $`bun pm view ${packageName} versions --json`.cwd(root).text();
+  const versionsText = await runText('bun', ['pm', 'view', packageName, 'versions', '--json'], root);
   const versions = parseStringArrayText(versionsText);
   if (!versions) {
     throw new Error(`Unable to read published ${packageName} versions`);

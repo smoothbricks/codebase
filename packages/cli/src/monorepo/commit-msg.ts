@@ -109,10 +109,8 @@ function wrapBodyWithFmt(paragraph: string): string {
     );
   }
   if (result.status !== 0) {
-    throw new Error(
-      [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join('\n') ||
-        'fmt failed to wrap commit message body.',
-    );
+    const output = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join('\n');
+    throw new Error(`fmt -w 72 failed with exit code ${result.status ?? 1}${output ? `:\n${output}` : ''}`);
   }
   return result.stdout;
 }
