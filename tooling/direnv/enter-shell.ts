@@ -53,6 +53,13 @@ async function clearNxDaemonState(): Promise<void> {
   // resolved configuration, so entries produced by the previous plugin build are
   // unreachable rather than wrong once inference changes. Clearing the graph DB is
   // what makes the new plugin take effect; clearing results was only collateral.
+  //
+  // Deliberately the workspace-local path, NOT NX_WORKSPACE_DATA_DIRECTORY. Host
+  // CI runners redirect that to a shared per-lane tree which also holds the cache
+  // provenance DB, and a fresh checkout has no build marker, so this runs on every
+  // job: following the variable would delete that DB every time and the shared
+  // cache could never be warm. Nx's own graph cache accounts for changed plugin
+  // files, so the redirected case needs no help from here.
   await runQuietly('rm', ['-rf', path.join(projectRoot, '.nx/workspace-data')], projectRoot);
 }
 
