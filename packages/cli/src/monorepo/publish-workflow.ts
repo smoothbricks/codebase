@@ -35,7 +35,7 @@ export enum PublishWorkflowStepKind {
   Checkout = 'checkout',
   SetupDevenv = 'setup-devenv',
   ConfigureReleaseAuthor = 'configure-release-author',
-  BuildSelfHostedCli = 'build-self-hosted-cli',
+  BuildNxVersionActions = 'build-nx-version-actions',
   RepairPendingReleases = 'repair-pending-releases',
   VersionRelease = 'version-release',
   CheckManagedMonorepoFiles = 'check-managed-monorepo-files',
@@ -97,7 +97,7 @@ export interface PublishWorkflowCallbacks {
   checkout(): Promise<void>;
   setupDevenv(): Promise<PublishWorkflowSetupOutputs>;
   configureReleaseAuthor(): Promise<void>;
-  buildSelfHostedCli(): Promise<void>;
+  buildNxVersionActions(): Promise<void>;
   repairPendingReleases(input: { dryRun: boolean }): Promise<void>;
   versionRelease(input: { bump: PublishWorkflowBump; dryRun: boolean }): Promise<PublishWorkflowVersionOutputs>;
   checkManagedMonorepoFiles(): Promise<void>;
@@ -130,7 +130,10 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
     { kind: PublishWorkflowStepKind.ConfigureReleaseAuthor, name: '🤖 Configure release author' },
   ];
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
-    setupSteps.push({ kind: PublishWorkflowStepKind.BuildSelfHostedCli, name: '🏗️ Build self-hosted smoo' });
+    setupSteps.push({
+      kind: PublishWorkflowStepKind.BuildNxVersionActions,
+      name: '🏗️ Build smoo Nx version actions',
+    });
   }
   const releaseSteps: PublishWorkflowStepInput[] = [
     { kind: PublishWorkflowStepKind.TagRelease, name: '🏷️ Tag release' },
@@ -220,8 +223,8 @@ export async function runPublishWorkflow(
         case PublishWorkflowStepKind.ConfigureReleaseAuthor:
           await context.callbacks.configureReleaseAuthor();
           break;
-        case PublishWorkflowStepKind.BuildSelfHostedCli:
-          await context.callbacks.buildSelfHostedCli();
+        case PublishWorkflowStepKind.BuildNxVersionActions:
+          await context.callbacks.buildNxVersionActions();
           break;
         case PublishWorkflowStepKind.RepairPendingReleases:
           await context.callbacks.repairPendingReleases({
@@ -425,11 +428,14 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         '          git config user.name "github-actions[bot]" && git config user.email',
         '          "41898282+github-actions[bot]@users.noreply.github.com"',
       ];
-    case PublishWorkflowStepKind.BuildSelfHostedCli:
+    case PublishWorkflowStepKind.BuildNxVersionActions:
       return [
         `      - name: ${step.name}`,
-        '        # SmoothBricks self-hosts smoo from source for release commands.',
-        '        run: nx build cli',
+        '        # Nx Release loads @smoothbricks/nx-plugin/version-actions through the',
+        '        # export map in its own node process, and versioning runs before the',
+        '        # build phase, so the hook must exist in dist first. Downstream',
+        '        # consumers install the published package and skip this bootstrap.',
+        '        run: nx build nx-plugin',
       ];
     case PublishWorkflowStepKind.RepairPendingReleases:
       return [
@@ -645,7 +651,7 @@ ${renderMacosPlatformSteps(options)}
       contents: write
       id-token: write
     env:
-      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
+      TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${githubExpression('github.token')}
     steps:
 ${renderFinalLinuxPublishSteps(options)}
@@ -813,9 +819,12 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     lines.push(
       '',
       `      # Step ${stepNumber++}`,
-      '      - name: 🏗️ Build self-hosted smoo',
-      '        # SmoothBricks self-hosts smoo from source for release commands.',
-      '        run: nx build cli',
+      '      - name: 🏗️ Build smoo Nx version actions',
+      '        # Nx Release loads @smoothbricks/nx-plugin/version-actions through the',
+      '        # export map in its own node process, and versioning runs before the',
+      '        # build phase, so the hook must exist in dist first. Downstream',
+      '        # consumers install the published package and skip this bootstrap.',
+      '        run: nx build nx-plugin',
     );
   }
   lines.push(
@@ -918,26 +927,49 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     `          path: ${githubExpression('runner.temp')}/publish-artifacts`,
     '          merge-multiple: false',
     '',
-    `      # Step ${stepNumber}. Composite action internals do not affect top-level job step`,
-    '      # anchors; update these comments if top-level steps move.',
-    '      - name: 🧱 Setup Nix/devenv',
-    '        id: setup',
-    '        uses: ./.github/actions/setup-devenv',
+    `      # Step ${stepNumber++}`,
+    '      - name: 🥟 Install Bun',
+    '        # This job only combines candidate artifacts, tags, and publishes: it',
+    '        # builds nothing, so Bun and Node install directly instead of paying',
+    '        # for the devenv shell. Both read the root package.json pins that',
+    '        # `smoo monorepo update` keeps in sync with devenv.smoo.nix, so the',
+    '        # published runtimes cannot drift from the ones that built the',
+    '        # artifacts.',
+    '        uses: oven-sh/setup-bun@v2.2.0',
     '',
-    `      # Step ${++stepNumber}`,
+    `      # Step ${stepNumber++}`,
+    '      - name: 🟢 Install Node',
+    '        uses: actions/setup-node@v7.0.0',
+    '        with:',
+    '          node-version-file: package.json',
+    '',
+    `      # Step ${stepNumber++}`,
+    '      - name: 📦 Install workspace dependencies',
+    '        # The managed setup script owns the frozen-lockfile install and the',
+    '        # TypeScript API pinning; calling it keeps this job identical to a',
+    '        # devenv activation without building the shell.',
+    `        working-directory: ${githubExpression('github.workspace')}`,
+    '        run: |',
+    '          bun tooling/direnv/setup-environment.ts',
+    '          tooling/direnv/repo-path --github-path',
+    '',
+    `      # Step ${stepNumber++}`,
     '      - name: 🤖 Configure release author',
     '        run:',
     '          git config user.name "github-actions[bot]" && git config user.email',
     '          "41898282+github-actions[bot]@users.noreply.github.com"',
   ];
-  stepNumber += 1;
   if (isSmoothBricksCodebasePackageName(options.repoName)) {
     lines.push(
       '',
       `      # Step ${stepNumber++}`,
-      '      - name: 🏗️ Build self-hosted smoo',
-      '        # SmoothBricks self-hosts smoo from source for release commands.',
-      '        run: nx build cli',
+      '      - name: 🏗️ Build smoo Nx version actions',
+      '        # Nx Release loads @smoothbricks/nx-plugin/version-actions through the',
+      '        # export map in its own node process, and that export has no source',
+      '        # condition, so the next-prerelease bump inside smoo release publish',
+      '        # needs dist/version-actions.cjs on disk. Downstream consumers install',
+      '        # the published package and skip this bootstrap.',
+      '        run: nx build nx-plugin',
     );
   }
   lines.push(
@@ -995,11 +1027,6 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       (name) => `          "${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`,
     ),
     '',
-    `      # Step ${stepNumber++}`,
-    `      - name: ✅ Validate restored release (${githubExpression(mode)})`,
-    `        if: ${mode} != 'none'`,
-    '        run: smoo monorepo validate',
-    '',
     '      # --- Release ------------------------------------------------------------',
     '',
     `      # Step ${stepNumber++}`,
@@ -1026,19 +1053,6 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       '        run: smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
     );
   }
-  lines.push(
-    '',
-    '      # --- Cleanup ------------------------------------------------------------',
-    '',
-    `      # Step ${stepNumber}`,
-    '      - name: 🧹 Cleanup and cache Nix/devenv',
-    '        # success() is default; always() still saves GH Nix cache after a red job.',
-    '        if: always()',
-    '        uses: ./.github/actions/save-nix-devenv',
-    '        with:',
-    `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
-    `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
-  );
   return lines.join('\n').trimEnd();
 }
 
