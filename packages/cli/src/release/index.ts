@@ -18,7 +18,7 @@ import {
   parseNxProjectJsonText,
   parsePackageJsonText,
 } from '../lib/json.js';
-import { decode, run, runInteractiveStatus, runResult } from '../lib/run.js';
+import { decode, run, runInteractiveStatus, runResult, runText } from '../lib/run.js';
 import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
@@ -1428,10 +1428,14 @@ async function packageBuildInputPatterns(root: string, projectName: string, _pac
 }
 
 async function nxProjectJson(root: string, projectName: string): Promise<NxProjectJson> {
-  const result = await $`nx show project ${projectName} --json`.cwd(root).quiet();
-  const parsed = parseNxProjectJsonText(decode(result.stdout));
+  // `nx show project` computes the project graph, so it fails for real
+  // environmental reasons -- an unbuilt plugin, an unreadable cache, a graph
+  // error. runText prints what nx said before throwing; a bare `.quiet()`
+  // template here reported only "Failed with exit code 1" and dropped the rest.
+  const stdout = await runText('nx', ['show', 'project', projectName, '--json'], root);
+  const parsed = parseNxProjectJsonText(stdout);
   if (!parsed) {
-    throw new Error(`Unable to inspect Nx project ${projectName}.`);
+    throw new Error(`Unable to inspect Nx project ${projectName}: nx show project returned unparseable JSON.`);
   }
   return parsed;
 }
