@@ -125,11 +125,17 @@ pub trait CliService: Send {
 enum RuntimeOpenMode {
     Provision,
     ExistingOnly,
+    /// `mv … --repo-id` alone: opens with the binding's remote check relaxed, because the verb is
+    /// about to supersede the recorded identity a moved remote would otherwise contradict.
+    IdentityChange,
 }
 
 fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
     match command {
         Command::Adopt(_) => RuntimeOpenMode::Provision,
+        Command::Move(args) if matches!(args.destination, MoveDestination::RepoId(_)) => {
+            RuntimeOpenMode::IdentityChange
+        }
         Command::New(_)
         | Command::Fork(_)
         | Command::Move(_)
@@ -180,6 +186,12 @@ impl ActorBridge {
 
     pub async fn open_existing(project_root: &Path) -> Result<Self> {
         let runtime = ProjectRuntime::open_existing(project_root).await?;
+        Self::from_runtime(project_root, runtime).await
+    }
+
+    /// [`Self::open_existing`] for the identity-change verb alone (`cowshed mv … --repo-id`).
+    pub async fn open_existing_for_identity_change(project_root: &Path) -> Result<Self> {
+        let runtime = ProjectRuntime::open_existing_for_identity_change(project_root).await?;
         Self::from_runtime(project_root, runtime).await
     }
 
@@ -3035,6 +3047,9 @@ where
     let bridge = match mode {
         RuntimeOpenMode::Provision => ActorBridge::open_for_adopt(&root, requested_repo_id).await,
         RuntimeOpenMode::ExistingOnly => ActorBridge::open_existing(&root).await,
+        RuntimeOpenMode::IdentityChange => {
+            ActorBridge::open_existing_for_identity_change(&root).await
+        }
     };
     let bridge = match bridge {
         Ok(bridge) => bridge,
@@ -3438,6 +3453,12 @@ mod tests {
     fn only_adopt_receives_provisioning_authority() {
         let cases = [
             (vec!["adopt", "/repo"], RuntimeOpenMode::Provision),
+            (vec!["mv", "raven", "falcon"], RuntimeOpenMode::ExistingOnly),
+            (
+                // The rebind verb must open even when the remote already names the new identity.
+                vec!["mv", "main", "--repo-id", "other/widget"],
+                RuntimeOpenMode::IdentityChange,
+            ),
             (vec!["new", "raven"], RuntimeOpenMode::ExistingOnly),
             (
                 vec!["fork", "raven", "falcon"],
