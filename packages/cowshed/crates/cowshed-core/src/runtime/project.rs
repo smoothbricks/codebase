@@ -243,6 +243,21 @@ fn continuity_from_environment() -> Result<crate::storage::audit::ContinuityAudi
     })
 }
 
+/// How opening a recorded project reconciles its binding's remote URLs with Git configuration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BindingRemoteValidation {
+    /// The default: a transport move — the same owner/repo identity behind a new URL — heals the
+    /// recorded URL in place, because identity is the owner/repo and the URL is only how to reach
+    /// it. An identity move still refuses, naming the rebind verb.
+    #[default]
+    Strict,
+    /// The identity-change verb only (`cowshed mv … --repo-id`). That verb supersedes the recorded
+    /// identity and deliberately never touches the remote, so a remote already naming the new
+    /// identity must not block the one verb that can record it. Nothing is healed or persisted on
+    /// this path — the identity change rewrites the binding durably itself.
+    ForIdentityChange,
+}
+
 impl ProjectRuntime {
     /// Opens the production runtime with foreground provisioning authority.
     ///
@@ -256,6 +271,7 @@ impl ProjectRuntime {
             crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
             requested_repo_id,
             continuity_from_environment()?,
+            BindingRemoteValidation::Strict,
         )
         .await
     }
@@ -269,6 +285,22 @@ impl ProjectRuntime {
         Self::open_existing_with_audit(project_root, continuity_from_environment()?).await
     }
 
+    /// [`Self::open_existing`] for the identity-change verb alone.
+    ///
+    /// Only the parsed `cowshed mv … --repo-id` command may call this entrypoint: it relaxes the
+    /// binding's remote check to [`BindingRemoteValidation::ForIdentityChange`] so the verb stays
+    /// reachable after the remote already moved to the identity it is about to record.
+    pub async fn open_existing_for_identity_change(project_root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_native(
+            project_root.as_ref(),
+            crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
+            None,
+            continuity_from_environment()?,
+            BindingRemoteValidation::ForIdentityChange,
+        )
+        .await
+    }
+
     /// [`Self::open_existing`] with the host's own audit sink — the entrypoint a supervising
     /// runtime uses to route controller audit records into its durable log instead of Arrow files.
     pub async fn open_existing_with_audit(
@@ -280,6 +312,7 @@ impl ProjectRuntime {
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
             None,
             continuity,
+            BindingRemoteValidation::Strict,
         )
         .await
     }
@@ -289,6 +322,7 @@ impl ProjectRuntime {
         mode: crate::storage::bootstrap::native::NativeBootstrapMode,
         requested_repo_id: Option<RepoId>,
         continuity: crate::storage::audit::ContinuityAudit,
+        validation: BindingRemoteValidation,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
@@ -297,13 +331,20 @@ impl ProjectRuntime {
                 mode,
                 requested_repo_id.as_ref(),
                 continuity,
+                validation,
             )
             .await?;
             Self::start(host).await
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (project_root, mode, requested_repo_id, continuity);
+            let _ = (
+                project_root,
+                mode,
+                requested_repo_id,
+                continuity,
+                validation,
+            );
             Err(CowshedError::environment_missing(
                 "the native cowshed project runtime requires macOS APFS",
                 "run the controller on macOS or use an injected test host",
@@ -1384,6 +1425,10 @@ struct NativeProjectRuntimeHost {
     telemetry_root: PathBuf,
     lifecycle_intents_path: PathBuf,
     lifecycle_intents: crate::storage::recovery::LifecycleIntentJournal,
+    /// How this host reconciles the binding's remotes, both at recovery and per verb. A host
+    /// opened for the identity change skips the pairing that verb exists to supersede; every
+    /// other host heals transport moves exactly like a fresh open would.
+    binding_remote_validation: BindingRemoteValidation,
 }
 
 #[cfg(target_os = "macos")]
@@ -1573,6 +1618,7 @@ impl NativeProjectRuntimeHost {
         bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
         requested_repo_id: Option<&RepoId>,
         continuity: crate::storage::audit::ContinuityAudit,
+        validation: BindingRemoteValidation,
     ) -> Result<Self> {
         use crate::storage::apfs::ApfsExecutionHost;
         use crate::storage::lifecycle::Substrate;
@@ -1677,7 +1723,18 @@ impl NativeProjectRuntimeHost {
                         .repo_id
                         .clone();
                     let remotes = git.remotes().await?;
-                    validate_binding_against_remotes(&binding, &remotes)?;
+                    // A transport move heals here, at the one place the binding is loaded, so
+                    // everything downstream — the descriptor, the gateway inventory — reads the
+                    // URL Git actually uses. An identity move refuses with the rebind verb, and
+                    // that verb reaches this arm under `ForIdentityChange` without tripping it.
+                    let binding =
+                        match reconcile_binding_with_remotes(&binding, &remotes, validation)? {
+                            Some(updated) => {
+                                persist_reconciled_binding(&layout, &updated).await?;
+                                updated
+                            }
+                            None => binding,
+                        };
                     (repo_id, layout, binding)
                 }
                 // Nothing adopted under this identity: the remotes are the only source left, and
@@ -1838,6 +1895,7 @@ impl NativeProjectRuntimeHost {
             telemetry_root,
             lifecycle_intents_path,
             lifecycle_intents,
+            binding_remote_validation: validation,
         })
     }
     async fn replace_lifecycle_intents(
@@ -2050,9 +2108,27 @@ impl NativeProjectRuntimeHost {
         Ok(true)
     }
 
-    async fn validate_binding(&self) -> Result<()> {
+    /// The binding gate every verb (and recovery) runs on a live host.
+    ///
+    /// Reuses the open-time reconcile so a resident host follows a transport move the same way a
+    /// fresh open does — healed, persisted, and reflected in its own descriptor — instead of
+    /// refusing every verb until a reopen. A host opened for the identity change skips the remote
+    /// pairing entirely: recovery runs before the verb dispatches, and the pairing it would
+    /// enforce is exactly the one `mv … --repo-id` exists to supersede.
+    async fn validate_binding(&mut self) -> Result<()> {
+        if self.binding_remote_validation == BindingRemoteValidation::ForIdentityChange {
+            return Ok(());
+        }
         let remotes = self.git.remotes().await?;
-        validate_binding_against_remotes(&self.descriptor.binding, &remotes)
+        if let Some(updated) = reconcile_binding_with_remotes(
+            &self.descriptor.binding,
+            &remotes,
+            BindingRemoteValidation::Strict,
+        )? {
+            persist_reconciled_binding(&self.layout, &updated).await?;
+            self.descriptor.binding = updated;
+        }
+        Ok(())
     }
 
     async fn authoritative(&self) -> Result<Vec<NativeWorkspace>> {
@@ -6998,26 +7074,98 @@ fn names_one_root(recorded: &Path, observed: &Path) -> bool {
     recorded == observed
 }
 
-#[cfg(target_os = "macos")]
-fn validate_binding_against_remotes(
+/// Reconciles a loaded binding's recorded remote URLs with the checkout's Git configuration.
+///
+/// Identity is the owner/repo ([`crate::repository::normalize_remote_url`] strips the host on
+/// purpose); the URL is only transport. So a recorded remote whose current URL still derives the
+/// same identity has merely moved servers, and the recorded transport follows it — the healed
+/// binding is returned for the caller to persist. A current URL deriving a *different* identity is
+/// a real divergence: the refusal names both identities and the rebind verb, which is the correct
+/// next move because [`ProjectRuntimeHost::change_repo_id`] records identity while deliberately
+/// never touching the remote.
+///
+/// `Ok(None)` means the binding already matches (or the caller opened for the identity change,
+/// where the recorded pairing is about to be superseded and must not block its own supersession).
+#[cfg(any(target_os = "macos", test))]
+fn reconcile_binding_with_remotes(
     binding: &RepositoryBinding,
     remotes: &[crate::git::RemoteUrl],
-) -> Result<()> {
+    validation: BindingRemoteValidation,
+) -> Result<Option<RepositoryBinding>> {
     binding.validate().map_err(native_integrity_error)?;
-    for identity in &binding.identities {
-        if let (Some(name), Some(url)) = (&identity.remote_name, &identity.remote_url)
-            && !remotes.iter().any(|remote| {
-                &remote.name == name
-                    && persistable_remote_url(&remote.url).as_deref() == Some(url.as_str())
-            })
-        {
+    if validation == BindingRemoteValidation::ForIdentityChange {
+        return Ok(None);
+    }
+    let mut identities = binding.identities.clone();
+    let mut healed = false;
+    for identity in &mut identities {
+        let (Some(name), Some(url)) = (identity.remote_name.clone(), identity.remote_url.clone())
+        else {
+            continue;
+        };
+        let Some(remote) = remotes.iter().find(|remote| remote.name == name) else {
             return Err(CowshedError::conflict(
                 format!("repository binding remote {name} does not match Git configuration"),
                 "restore the recorded remote before opening cowshed",
             ));
+        };
+        let current = persistable_remote_url(&remote.url);
+        if current.as_deref() == Some(url.as_str()) {
+            continue;
+        }
+        match crate::repository::normalize_remote_url(&remote.url) {
+            Ok(derived) if derived == identity.repo_id => {
+                // Same identity, new transport: follow the move. The persistable form is what
+                // comparisons above use, so it is what gets recorded; a URL it cannot express
+                // was already refused by the parse succeeding only on supported transports.
+                identity.remote_url = current.or(Some(remote.url.clone()));
+                healed = true;
+            }
+            Ok(derived) => {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "repository binding names {} for remote {name}, but Git configuration now names {derived}",
+                        identity.repo_id
+                    ),
+                    format!(
+                        "adopt the new identity with: cowshed mv main --repo-id {derived} (or restore the recorded remote)"
+                    ),
+                ));
+            }
+            Err(_) => {
+                return Err(CowshedError::conflict(
+                    format!("repository binding remote {name} does not match Git configuration"),
+                    "restore the recorded remote before opening cowshed",
+                ));
+            }
         }
     }
-    Ok(())
+    if !healed {
+        return Ok(None);
+    }
+    let updated = RepositoryBinding {
+        version: binding.version,
+        identities,
+        former_identities: binding.former_identities.clone(),
+    };
+    updated.validate().map_err(native_integrity_error)?;
+    Ok(Some(updated))
+}
+
+/// Persists a binding a transport-move heal updated, atomically, off the async runtime.
+#[cfg(target_os = "macos")]
+async fn persist_reconciled_binding(
+    layout: &crate::storage::StorageLayout,
+    binding: &RepositoryBinding,
+) -> Result<()> {
+    let path = layout.project().repository_binding.clone();
+    let binding = binding.clone();
+    crate::storage::lifecycle::dispatch_blocking(move || {
+        crate::metadata::write_json(&path, &binding)
+    })
+    .await
+    .map_err(|error| CowshedError::internal(error.to_string()))?
+    .map_err(native_integrity_error)
 }
 
 #[cfg(target_os = "macos")]
@@ -7190,8 +7338,16 @@ async fn load_or_validate_binding(
         ));
     }
     let remotes = git.remotes().await?;
-    validate_binding_against_remotes(&binding, &remotes)?;
-    Ok(binding)
+    // Re-adoption after a server move lands here with a persisted binding recording the old
+    // transport; the same heal that fixes open fixes it, persisted immediately for the same
+    // reason: every later reader must see the URL Git actually uses.
+    match reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)? {
+        Some(updated) => {
+            persist_reconciled_binding(layout, &updated).await?;
+            Ok(updated)
+        }
+        None => Ok(binding),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -9813,6 +9969,59 @@ mod workspace_origin_tests {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod binding_heal_persistence_tests {
+    use super::*;
+
+    /// The healed transport survives a re-read from disk: open persists what it reconciled, so
+    /// every later reader — and the next open — sees the URL Git actually uses.
+    #[tokio::test]
+    async fn a_healed_binding_round_trips_through_the_persisted_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let store =
+            std::env::temp_dir().join(format!("cowshed-heal-{}-{nonce}", std::process::id()));
+        let repo_id = RepoId::parse("acme/widget").expect("repo");
+        let layout = crate::storage::StorageLayout::new(&store, &repo_id).expect("layout");
+        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
+        let recorded = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id.clone(),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://github.com/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        crate::metadata::write_json(&layout.project().repository_binding, &recorded)
+            .expect("persist recorded binding");
+
+        let remotes = [crate::git::RemoteUrl {
+            name: "origin".to_owned(),
+            url: "ssh://git@forge.example.test:2223/acme/widget.git".to_owned(),
+        }];
+        let healed =
+            reconcile_binding_with_remotes(&recorded, &remotes, BindingRemoteValidation::Strict)
+                .expect("transport move reconciles")
+                .expect("recorded transport follows the move");
+        persist_reconciled_binding(&layout, &healed)
+            .await
+            .expect("persist healed binding");
+
+        let reread = read_persisted_binding(&layout)
+            .await
+            .expect("read persisted binding")
+            .expect("binding file exists");
+        assert_eq!(reread, healed);
+        assert_eq!(
+            reread.primary().expect("primary").remote_url.as_deref(),
+            Some("ssh://forge.example.test:2223/acme/widget.git"),
+        );
+
+        std::fs::remove_dir_all(&store).ok();
+    }
+}
+
 #[cfg(test)]
 mod binding_tests {
     use super::*;
@@ -9826,6 +10035,157 @@ mod binding_tests {
             name: name.to_owned(),
             url: url.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_transport_move_heals_the_recorded_remote_url() {
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://github.com/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        // Same owner/repo, entirely new server and transport (with userinfo to strip).
+        let remotes = [remote(
+            "origin",
+            "ssh://git@forge.example.test:2223/acme/widget.git",
+        )];
+        let updated =
+            reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)
+                .expect("transport move reconciles")
+                .expect("recorded transport follows the move");
+        assert_eq!(
+            updated.primary().expect("primary").remote_url.as_deref(),
+            Some("ssh://forge.example.test:2223/acme/widget.git"),
+        );
+        assert_eq!(
+            updated.primary().expect("primary").repo_id,
+            repo_id("acme/widget")
+        );
+
+        // A second reconcile against the healed binding is a no-op.
+        assert!(
+            reconcile_binding_with_remotes(&updated, &remotes, BindingRemoteValidation::Strict)
+                .expect("healed binding matches")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_identity_move_refuses_and_names_the_rebind_verb() {
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://github.com/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        let remotes = [remote(
+            "origin",
+            "ssh://git@forge.example.test:2223/other/widget.git",
+        )];
+        let error =
+            reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)
+                .expect_err("a different owner/repo is a real divergence");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains("acme/widget"), "{}", error.message);
+        assert!(error.message.contains("other/widget"), "{}", error.message);
+        assert!(
+            error
+                .hint
+                .contains("cowshed mv main --repo-id other/widget"),
+            "{}",
+            error.hint
+        );
+    }
+
+    #[test]
+    fn the_identity_change_open_tolerates_a_moved_remote() {
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://github.com/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        let remotes = [remote(
+            "origin",
+            "ssh://git@forge.example.test:2223/other/widget.git",
+        )];
+        assert!(
+            reconcile_binding_with_remotes(
+                &binding,
+                &remotes,
+                BindingRemoteValidation::ForIdentityChange,
+            )
+            .expect("the rebind verb must stay reachable")
+            .is_none()
+        );
+    }
+
+    /// The live-host regression: recovery runs this same gate before the identity-change verb
+    /// can dispatch, so the mode must win over every refusal arm — a moved identity, a deleted
+    /// remote name, and an unparseable URL alike. (The strict per-pair validator this replaces
+    /// refused all three and made `mv … --repo-id` unreachable on a live host.)
+    #[test]
+    fn the_identity_change_mode_outranks_every_refusal_arm() {
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://github.com/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        for remotes in [
+            // Identity moved.
+            vec![remote(
+                "origin",
+                "ssh://git@forge.example.test:2223/other/widget.git",
+            )],
+            // Recorded remote deleted.
+            vec![],
+            // Unparseable URL.
+            vec![remote("origin", "not a remote url \\")],
+        ] {
+            assert!(
+                reconcile_binding_with_remotes(
+                    &binding,
+                    &remotes,
+                    BindingRemoteValidation::ForIdentityChange,
+                )
+                .expect("the rebind verb must stay reachable")
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn a_matching_or_absent_remote_pairing_reconciles_to_nothing_or_refuses() {
+        let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
+            repo_id: repo_id("acme/widget"),
+            remote_name: Some("origin".to_owned()),
+            remote_url: Some("https://example.test/acme/widget.git".to_owned()),
+            primary: true,
+        }])
+        .expect("binding");
+        let matching = [remote("origin", "https://example.test/acme/widget.git")];
+        assert!(
+            reconcile_binding_with_remotes(&binding, &matching, BindingRemoteValidation::Strict)
+                .expect("matching remotes")
+                .is_none()
+        );
+        // The recorded remote name no longer exists at all: identity cannot be derived from
+        // anything, so the original restore guidance stands.
+        let renamed = [remote("upstream", "https://example.test/acme/widget.git")];
+        let error =
+            reconcile_binding_with_remotes(&binding, &renamed, BindingRemoteValidation::Strict)
+                .expect_err("a deleted remote pairing still refuses");
+        assert!(
+            error.hint.contains("restore the recorded remote"),
+            "{}",
+            error.hint
+        );
     }
 
     #[test]
@@ -9950,8 +10310,9 @@ mod binding_tests {
             "https://github.com/smoothbricks/codebase.git",
         )];
 
-        let error = validate_binding_against_remotes(&binding, &remotes)
-            .expect_err("the recorded remote name is part of the binding");
+        let error =
+            reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)
+                .expect_err("the recorded remote name is part of the binding");
 
         assert_eq!(error.code, ErrorCode::Conflict);
         assert_eq!(
