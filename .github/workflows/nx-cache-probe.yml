@@ -2,17 +2,17 @@ name: Nx cache probe
 
 # THROWAWAY DIAGNOSTIC. Delete once the Nx cache question is settled.
 #
-# Nx names its cache metadata DB after the machine identity
-# (.nx/workspace-data/<id>-v3.db) and refuses artifacts written by a different
-# machine. This probe answers three things by measurement:
+# Findings so far, from runs 33248053846 / 33248174262 / 33248253738:
+#   - Nx's metadata DB is /etc/machine-id + "-v3.db". Proved on a public runner:
+#     id f7f1c74ac1684528821bea1ea20963ae, file
+#     .nx/workspace-data/f7f1c74ac1684528821bea1ea20963ae-v3.db.
+#   - Public runners share one baked id across VMs (product_uuid differs, id does
+#     not), so their restores are usable.
+#   - GARM gets a fresh id per job (0e064ea4..., c56d3532...), so every restored
+#     artifact is orphaned and the transfer is wasted.
 #
-#   1. Which identity source Nx actually reads — it prints every candidate next
-#      to the observed DB filename, so the mapping is proved, not assumed.
-#   2. Whether that identity is stable across runs, per runner class.
-#   3. Whether a restored cache is usable once the identity is stable.
-#
-# Run it at least twice per runner class: the first run seeds the cache, later
-# runs exercise the restore path.
+# Remaining question: does a restore actually produce a task cache hit where the
+# id is stable? Run twice — the first seeds, the second must report CACHE HIT.
 
 on:
   workflow_dispatch:
@@ -28,6 +28,7 @@ permissions:
 env:
   # Arbitrary fixed UUID; only its stability matters.
   PROBE_MACHINE_ID: 0ab1cd2e3f45678901bcdef234567890
+  TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
 
 jobs:
   probe:
@@ -59,74 +60,83 @@ jobs:
           echo "after write       : $(cat /etc/machine-id 2>&1)"
           mount | grep -F /etc/machine-id || echo "(machine-id is not a mount point)"
 
+      # Everything below is public-only. setup-bun ships a glibc-linked binary
+      # with no dynamic loader on the NixOS runners ("Unable to locate executable
+      # file: /home/runner/.bun/bin/bun"), and the GARM leg has already answered
+      # its question in the step above.
       - name: 📥 Checkout
+        if: matrix.runner != 'garm'
         uses: actions/checkout@v6.0.2
         with:
           filter: blob:none
           fetch-depth: 0
 
       - name: 🥟 Install Bun
+        if: matrix.runner != 'garm'
         uses: oven-sh/setup-bun@v2.2.0
 
       - name: 🟢 Install Node
+        if: matrix.runner != 'garm'
         uses: actions/setup-node@v7.0.0
         with:
           node-version-file: package.json
 
-      # Same wiring the publishing job uses: the managed script owns the
-      # frozen-lockfile install and the TypeScript API pinning, and ttsc's
-      # native compiler comes from node_modules rather than the devenv shell.
       - name: 📦 Install workspace dependencies
-        env:
-          TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
+        if: matrix.runner != 'garm'
         run: bun tooling/direnv/setup-environment.ts
+
+      # `nx` cannot build the plugin the project graph loads; ttsc needs only the
+      # package tsconfig. Same bootstrap the devenv shell and publish jobs run.
+      - name: 🏗️ Bootstrap the Nx plugin
+        if: matrix.runner != 'garm'
+        working-directory: packages/nx-plugin
+        run: ttsc -p tsconfig.lib.json --emit
 
       # Prefix-restore so a later run picks up an earlier run's entry.
       - name: 🧠 Restore probe cache
         id: cache
+        if: matrix.runner != 'garm'
         uses: actions/cache/restore@v5.0.5
         with:
           path: |
             .nx/cache
             .nx/workspace-data/*.db*
-          key: nxprobe-${{ matrix.runner }}-v1-${{ github.run_id }}
+          key: nxprobe-${{ matrix.runner }}-v2-${{ github.run_id }}
           restore-keys: |
-            nxprobe-${{ matrix.runner }}-v1-
+            nxprobe-${{ matrix.runner }}-v2-
 
       - name: 🧾 What the restore delivered
+        if: matrix.runner != 'garm'
         run: |
           echo "cache-hit         : ${{ steps.cache.outputs.cache-hit }}"
           echo "matched-key       : ${{ steps.cache.outputs.cache-matched-key }}"
-          echo "--- .nx/workspace-data ---"
-          ls -1 .nx/workspace-data/ 2>&1 || echo "(absent)"
-          echo "--- .nx/cache entry count ---"
-          ls -1 .nx/cache 2>/dev/null | wc -l
+          ls -1 .nx/workspace-data/ 2>&1 || echo "(no workspace-data)"
+          echo "cache entries     : $(ls -1 .nx/cache 2>/dev/null | wc -l)"
 
-      # One real cacheable task. Run 1 seeds it; a later run must report a
-      # cache hit here, or print the Unrecognized Cache Artifacts warning.
+      # pipefail so a failing Nx run fails the step; `tee` alone masked it.
       - name: 🔨 Build one package through Nx
-        env:
-          TTSC_TSGO_BINARY: ${{ github.workspace }}/node_modules/@typescript/native/bin/tsc
-        run: bunx nx build validation 2>&1 | tee /tmp/nx-build.log
+        if: matrix.runner != 'garm'
+        run: |
+          set -o pipefail
+          bunx nx build validation 2>&1 | tee /tmp/nx-build.log
 
       - name: 📊 Verdict
+        if: matrix.runner != 'garm'
         run: |
-          echo "--- DB filename Nx opened, next to the ids printed above ---"
-          ls -1 .nx/workspace-data/*.db 2>&1 || echo "(no db)"
+          echo "db Nx opened      : $(ls -1 .nx/workspace-data/*.db 2>&1)"
           echo "machine-id now    : $(cat /etc/machine-id 2>&1)"
-          echo "--- cache outcome ---"
           grep -qi "Unrecognized Cache Artifacts" /tmp/nx-build.log &&
             echo "REJECTED: artifacts present, metadata not recognized" ||
             echo "no rejection warning"
-          grep -qiE "existing outputs match|read the output from the cache|\[existing outputs match the cache" /tmp/nx-build.log &&
+          grep -qiE "existing outputs match|from the cache" /tmp/nx-build.log &&
             echo "CACHE HIT" ||
             echo "no cache hit (ran the task)"
 
       - name: 💾 Save probe cache
-        if: always()
+        if: matrix.runner != 'garm' && always()
         uses: actions/cache/save@v5.0.5
         with:
           path: |
             .nx/cache
             .nx/workspace-data/*.db*
-          key: nxprobe-${{ matrix.runner }}-v1-${{ github.run_id }}
+          key: nxprobe-${{ matrix.runner }}-v2-${{ github.run_id }}
