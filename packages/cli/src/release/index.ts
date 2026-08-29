@@ -310,7 +310,7 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
             listReleasePackages: () => listReleasePackages(root),
             packageExists: (name) => npmPackageExists(root, name),
             packageVersionExists: (name, version) => npmPublishedVersionExists(root, name, version),
-            login: () => runLatestNpm(root, ['login', '--auth-type=web']),
+            login: () => runNpm(root, ['login', '--auth-type=web']),
             publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
             promptOtp: (packageName) => promptForNpmOtp(packageName),
             wait: delay,
@@ -319,9 +319,9 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
           bootstrapOptions,
         ),
       trustPublisher: (pkg, dryRun, env) =>
-        runLatestNpmTrust(root, npmTrustGithubArgs(pkg.name, repository, workflow, dryRun), env),
+        runNpmTrust(root, npmTrustGithubArgs(pkg.name, repository, workflow, dryRun), env),
       trustedPublishers: (pkg) => listTrustedPublishers(root, pkg),
-      login: () => runLatestNpm(root, ['login', '--auth-type=web']),
+      login: () => runNpm(root, ['login', '--auth-type=web']),
       log: (message) => console.log(message),
       error: (message) => console.error(message),
     },
@@ -521,7 +521,7 @@ export async function releaseBootstrapNpmPackages(
       listReleasePackages: () => listReleasePackages(root),
       packageExists: (name) => npmPackageExists(root, name),
       packageVersionExists: (name, version) => npmPublishedVersionExists(root, name, version),
-      login: () => runLatestNpm(root, ['login', '--auth-type=web']),
+      login: () => runNpm(root, ['login', '--auth-type=web']),
       publishPlaceholder: (pkg, env) => publishPlaceholderPackage(root, pkg, env),
       promptOtp: (packageName) => promptForNpmOtp(packageName),
       wait: delay,
@@ -616,7 +616,7 @@ async function publishPackedPackage(root: string, pkg: ReleasePackage, tag: stri
     await publishWithAuthDiagnostics(
       pkg,
       {
-        publish: () => runLatestNpmPublish(root, args),
+        publish: () => runNpmPublish(root, args),
         versionExists: () => npmVersionExists(root, pkg.name, pkg.version),
         log: (message) => console.log(message),
         error: (message) => console.error(message),
@@ -668,7 +668,7 @@ async function publishPlaceholderPackage(
       join(tempDir, 'README.md'),
       `# ${pkg.name}\n\nThis is a bootstrap placeholder. Real package versions are published by SmoothBricks release automation.\n`,
     );
-    await runLatestNpm(root, ['publish', tempDir, '--access', 'public', '--tag', NPM_BOOTSTRAP_DIST_TAG], env);
+    await runNpm(root, ['publish', tempDir, '--access', 'public', '--tag', NPM_BOOTSTRAP_DIST_TAG], env);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -1558,7 +1558,7 @@ async function npmPackageExists(root: string, name: string): Promise<boolean> {
 async function npmPublishedVersionExists(root: string, name: string, version: string): Promise<boolean> {
   const spec = `${name}@${version}`;
   const args = ['view', spec, 'version', '--json'];
-  const result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
+  const result = await runResult('npm', args, root);
   if (result.exitCode === 0) {
     return true;
   }
@@ -1669,21 +1669,16 @@ function githubRepositoryFromUrl(url: string): string {
   throw new Error(`Root package.json repository.url must be a GitHub repository URL, got ${url}`);
 }
 
-async function runLatestNpm(root: string, npmArgs: string[], env?: Record<string, string>): Promise<void> {
-  await run('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root, env);
+async function runNpm(root: string, npmArgs: string[], env?: Record<string, string>): Promise<void> {
+  await run('npm', npmArgs, root, env);
 }
 
-async function runLatestNpmTrust(
+async function runNpmTrust(
   root: string,
   npmArgs: string[],
   env?: Record<string, string>,
 ): Promise<TrustPublisherResult> {
-  const status = await runInteractiveStatus(
-    'nix',
-    ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs],
-    root,
-    env,
-  );
+  const status = await runInteractiveStatus('npm', npmArgs, root, env);
   if (status === 0) {
     return 'configured';
   }
@@ -1692,13 +1687,13 @@ async function runLatestNpmTrust(
 
 async function listTrustedPublishers(root: string, pkg: Pick<ReleasePackage, 'name'>): Promise<TrustedPublisherLookup> {
   const args = ['trust', 'list', pkg.name, '--json'];
-  let result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
+  let result = await runResult('npm', args, root);
   if (result.exitCode !== 0 && /\bEOTP\b/.test(`${result.stdout}\n${result.stderr}`)) {
-    const status = await runInteractiveStatus('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
+    const status = await runInteractiveStatus('npm', args, root);
     if (status !== 0) {
       throw new Error(npmCommandFailedMessage(args, status));
     }
-    result = await runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...args], root);
+    result = await runResult('npm', args, root);
   }
   if (result.exitCode !== 0 && npmTrustListAccessDenied(result.stdout, result.stderr)) {
     return npmTrustAccessDetails(root, pkg.name);
@@ -1722,7 +1717,7 @@ export function npmTrustListAccessDenied(stdout: string, stderr: string): boolea
 }
 
 function npmCommandFailedMessage(npmArgs: string[], exitCode: number, stdout = '', stderr = ''): string {
-  const command = `nix shell nixpkgs#nodejs_latest -c npm ${npmArgs.join(' ')}`;
+  const command = `npm ${npmArgs.join(' ')}`;
   const detail = npmFailureDetail(stdout, stderr);
   return detail.length > 0
     ? `${command} failed with exit code ${exitCode}\n${detail}`
@@ -1749,8 +1744,8 @@ function npmFailureDetail(stdout: string, stderr: string): string {
 
 async function npmTrustAccessDetails(root: string, packageName: string): Promise<NpmTrustAccessDenied> {
   const [identityResult, ownersResult] = await Promise.all([
-    runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', 'whoami'], root),
-    runResult('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', 'owner', 'ls', packageName], root),
+    runResult('npm', ['whoami'], root),
+    runResult('npm', ['owner', 'ls', packageName], root),
   ]);
   return {
     status: 'access-denied',
@@ -1794,8 +1789,8 @@ interface TrustedPublisherJson {
 
 const parseTrustedPublisherJson = typia.json.createIsParse<TrustedPublisherJson | TrustedPublisherJson[]>();
 
-async function runLatestNpmPublish(root: string, npmArgs: string[]): Promise<void> {
-  await runLatestNpm(root, npmArgs, { NODE_AUTH_TOKEN: '', NPM_TOKEN: '' });
+async function runNpmPublish(root: string, npmArgs: string[]): Promise<void> {
+  await runNpm(root, npmArgs, { NODE_AUTH_TOKEN: '', NPM_TOKEN: '' });
 }
 
 function missingNpmPackagePublishGuidance(pkg: Pick<ReleasePackage, 'name'>): string {
