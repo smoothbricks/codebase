@@ -83,6 +83,9 @@ export function applyWorkspaceBoundedTestTargetPolicy(root: string, options: Pac
     if (checkBoundedTestTargetPolicy(packageJson, { projectName, projectJson, resolvedProject })) {
       continue;
     }
+    if (!boundableTestTarget(packageJson, projectJson)) {
+      continue;
+    }
     const beforePackageJson = JSON.stringify(packageJson);
     const beforeProjectJson = JSON.stringify(projectJson);
     applyBoundedTestTargetPolicy(packageJson, { projectName, projectJson });
@@ -155,6 +158,33 @@ export function checkBoundedTestTargetPolicy(
     return false;
   }
   return resolvedAggregateTestIsBounded(options.resolvedProject);
+}
+
+/**
+ * Apply may only rewrite a test target it can express faithfully as one
+ * bounded `bun test` command. A `commands` array (a multi-runner gate) would
+ * be flattened to the default command — deleting the very checks the target
+ * exists to run — and a non-bun runner (cargo, go) would inherit wall-clock
+ * bounds scaled for bun suites. Those targets are left in place for the check
+ * to report, so restructuring them stays a human decision.
+ */
+function boundableTestTarget(
+  packageJson: BoundedTestPolicyPackageJson,
+  projectJson: BoundedTestPolicyProjectJson | undefined,
+): boolean {
+  const target = projectJson?.targets?.test ?? packageJson.nx?.targets?.test;
+  if (!isRecord(target)) {
+    return true;
+  }
+  if (isNoopAggregateTarget(target)) {
+    return true;
+  }
+  const targetOptions = isRecord(target.options) ? target.options : undefined;
+  if (targetOptions && Array.isArray(targetOptions.commands)) {
+    return false;
+  }
+  const command = resolveTargetCommand(target);
+  return command === null || BUN_TEST_PREFIX.test(command);
 }
 
 function isNoopAggregateTarget(target: Record<string, unknown>): boolean {

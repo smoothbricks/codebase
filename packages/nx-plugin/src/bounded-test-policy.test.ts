@@ -263,6 +263,48 @@ describe('bounded test target policy', () => {
     }
   });
 
+  it('leaves multi-command and non-bun test targets for the check to report', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoothbricks-bounded-policy-'));
+    try {
+      await writeJson(join(root, 'package.json'), {
+        name: '@scope/root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      const corpusTarget = {
+        executor: 'nx:run-commands',
+        options: {
+          commands: ['bun test test/', 'cd go && go test ./...'],
+          parallel: false,
+          cwd: 'packages/schema',
+        },
+      };
+      const cargoTarget = {
+        executor: 'nx:run-commands',
+        options: { command: 'cargo test --workspace', cwd: 'packages/native' },
+      };
+      await writeJson(join(root, 'packages/schema/package.json'), {
+        name: '@scope/schema',
+        nx: { name: 'schema', targets: { test: corpusTarget } },
+      });
+      await writeJson(join(root, 'packages/native/package.json'), {
+        name: '@scope/native',
+        nx: { name: 'native', targets: { test: cargoTarget } },
+      });
+
+      expect(applyWorkspaceBoundedTestTargetPolicy(root)).toBe(false);
+
+      const schema = JSON.parse(await readFile(join(root, 'packages/schema/package.json'), 'utf8'));
+      expect(schema.nx.targets.test).toEqual(corpusTarget);
+      const native = JSON.parse(await readFile(join(root, 'packages/native/package.json'), 'utf8'));
+      expect(native.nx.targets.test).toEqual(cargoTarget);
+      // Still reported: apply refusing to flatten does not silently bless them.
+      expect(checkWorkspaceBoundedTestTargetPolicy(root).length).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('preserves a resolved bounded aggregate during workspace updates', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoothbricks-bounded-policy-'));
     try {
