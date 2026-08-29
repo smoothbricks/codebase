@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $ } from 'bun';
+import { decode, printCommandOutput } from '../../../lib/run.js';
 import type { GitReleaseTagInfo } from '../../core.js';
 
 const GIT_TIMEOUT_MS = 10_000;
@@ -149,10 +150,29 @@ async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
 }
 
 export async function runFixtureNx(root: string, args: string[]): Promise<void> {
-  await $`nx ${args}`
+  // A fixture is a throwaway one-project workspace, so its Nx state MUST live
+  // inside it. Host CI runners export NX_CACHE_DIRECTORY and
+  // NX_WORKSPACE_DATA_DIRECTORY to a shared per-lane tree, and inheriting those
+  // absolute paths made this fixture overwrite the REAL workspace's project
+  // graph mid-run: a concurrent `nx run-many -t test` then failed with
+  // "Could not find project <name>" for projects the fixture had never heard of,
+  // and Nx aborted the whole run. Reproduced locally by exporting those two
+  // variables and running this file: the outer directory ends up holding this
+  // fixture's 612-byte file-map, byte-identical to the runner's.
+  const result = await $`nx ${args}`
     .cwd(root)
-    .env({ ...definedProcessEnv(), NX_DAEMON: 'false' })
-    .quiet();
+    .env({
+      ...definedProcessEnv(),
+      NX_DAEMON: 'false',
+      NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
+      NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
+    })
+    .quiet()
+    .nothrow();
+  if (result.exitCode !== 0) {
+    printCommandOutput(decode(result.stdout), decode(result.stderr));
+    throw new Error(`nx ${args.join(' ')} failed with exit code ${result.exitCode}`);
+  }
 }
 
 function definedProcessEnv(): Record<string, string> {
