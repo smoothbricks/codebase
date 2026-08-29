@@ -232,12 +232,15 @@ export function platformOutputRoots(root: string, platformOutputs: string | unde
     .map((entry) => resolve(root, entry));
 }
 
+const REPAIR_LABEL = 'Repair pending releases';
+const PLATFORM_OUTPUTS_LABEL = 'Release platform outputs';
+
 export async function releaseRepairPending(root: string, options: ReleaseRepairPendingOptions): Promise<void> {
-  const repairRef = await fetchReleaseRepairRef(root, options.ref);
+  const repairRef = await fetchReleaseRepairRef(root, REPAIR_LABEL, options.ref);
   const restoreRef = options.ref ? await gitHead(root) : repairRef;
-  console.log(`Repair pending releases: planning from ${repairRef}.`);
-  const targets = await listPendingReleaseTargets(root, repairRef);
-  logPendingReleaseTargets(targets);
+  console.log(`${REPAIR_LABEL}: planning from ${repairRef}.`);
+  const targets = await listPendingReleaseTargets(root, repairRef, REPAIR_LABEL);
+  logPendingReleaseTargets(targets, REPAIR_LABEL);
   const platformOutputs = platformOutputRoots(root, options.platformOutputs);
   const summaries = await repairPendingTargets(
     releaseRepairShell(root, platformOutputs),
@@ -253,7 +256,7 @@ export async function releaseCollectPlatformOutputs(
   options: ReleasePlatformOutputsOptions,
 ): Promise<void> {
   const restoreRef = await gitHead(root);
-  const releaseRef = await fetchReleaseRepairRef(root, options.ref);
+  const releaseRef = await fetchReleaseRepairRef(root, PLATFORM_OUTPUTS_LABEL, options.ref);
   const packages = releasePackages(root);
   const packagesAtHead = await releasePackagesAtHead(root, packages);
   const currentPackages =
@@ -262,8 +265,8 @@ export async function releaseCollectPlatformOutputs(
       : await releasePlatformPackages(root, packages, releaseBumpArg(options.bump));
   console.log(
     currentPackages.length === 0
-      ? 'Release platform outputs: no current release packages selected.'
-      : `Release platform outputs: building current outputs for ${packageSummary(currentPackages)}.`,
+      ? `${PLATFORM_OUTPUTS_LABEL}: no current release packages selected.`
+      : `${PLATFORM_OUTPUTS_LABEL}: building current outputs for ${packageSummary(currentPackages)}.`,
   );
   const outputRoot = resolve(root, options.output);
   // This job already committed its own version bump, so its HEAD is a coordinate
@@ -279,9 +282,12 @@ export async function releaseCollectPlatformOutputs(
     allowEmptyProjects: true,
   });
 
-  console.log(`Repair platform outputs: planning from ${releaseRef}.`);
-  const targets = await listPendingReleaseTargets(root, releaseRef);
-  logPendingReleaseTargets(targets);
+  // Only a macOS runner can produce these, and the Linux publishing job that
+  // repairs a pending release cannot. So this builds the macOS half for every
+  // still-incomplete release alongside the current one; nothing is repaired here.
+  console.log(`${PLATFORM_OUTPUTS_LABEL}: planning repair outputs from ${releaseRef}.`);
+  const targets = await listPendingReleaseTargets(root, releaseRef, PLATFORM_OUTPUTS_LABEL);
+  logPendingReleaseTargets(targets, PLATFORM_OUTPUTS_LABEL);
   await collectRepairPlatformOutputs(
     releaseRepairOutputsShell(root, options.targets, join(outputRoot, 'repairs')),
     targets,
@@ -1103,10 +1109,15 @@ function releaseRetagShell(root: string, remote: string) {
   };
 }
 
-async function fetchReleaseRepairRef(root: string, requestedRef?: string): Promise<string> {
+// These helpers serve two commands. Hardcoding "Repair pending releases" made
+// `release build-platform-outputs` announce a repair it was not performing: it
+// plans pending targets only because macOS artifacts cannot be built by the
+// Linux publishing job that repairs them. The label says which command is
+// speaking.
+async function fetchReleaseRepairRef(root: string, label: string, requestedRef?: string): Promise<string> {
   const branch = await releaseBranch(root);
   const remote = await releaseRemote(root, branch);
-  console.log(`Repair pending releases: fetching ${remote}/${branch} and tags.`);
+  console.log(`${label}: fetching ${remote}/${branch} and tags.`);
   await fetchReleaseRefs(root, remote, branch);
   if (requestedRef) {
     return requestedRef;
@@ -1115,25 +1126,25 @@ async function fetchReleaseRepairRef(root: string, requestedRef?: string): Promi
   return (await gitRefExists(root, remoteRef)) ? remoteRef : gitHead(root);
 }
 
-function logPendingReleaseTargets(targets: ReleaseTarget[]): void {
+function logPendingReleaseTargets(targets: ReleaseTarget[], label: string): void {
   console.log(
     targets.length === 0
-      ? 'Repair pending releases: no pending durable state repairs found.'
-      : `Repair pending releases: ${targets.length} release target${targets.length === 1 ? '' : 's'} need repair.`,
+      ? `${label}: no pending durable state repairs found.`
+      : `${label}: ${targets.length} release target${targets.length === 1 ? '' : 's'} need repair.`,
   );
   for (const target of targets) {
-    console.log(`Repair pending releases: target ${target.sha.slice(0, 12)} needs ${repairTargetSummary(target)}.`);
+    console.log(`${label}: target ${target.sha.slice(0, 12)} needs ${repairTargetSummary(target)}.`);
   }
 }
 
-async function listPendingReleaseTargets(root: string, ref: string): Promise<ReleaseTarget[]> {
+async function listPendingReleaseTargets(root: string, ref: string, label: string): Promise<ReleaseTarget[]> {
   const head = await gitHead(root);
-  return pendingReleaseTargets(await listOwnedReleaseTagRecords(root, ref), head);
+  return pendingReleaseTargets(await listOwnedReleaseTagRecords(root, ref, label), head);
 }
 
-async function listOwnedReleaseTagRecords(root: string, ref: string): Promise<ReleaseTagRecord[]> {
+async function listOwnedReleaseTagRecords(root: string, ref: string, label: string): Promise<ReleaseTagRecord[]> {
   const tags = await gitReleaseTagsByCreatorDate(root);
-  console.log(`Repair pending releases: scanning ${tags.length} local tag${tags.length === 1 ? '' : 's'}.`);
+  console.log(`${label}: scanning ${tags.length} local tag${tags.length === 1 ? '' : 's'}.`);
   return collectOwnedReleaseTagRecords(releasePackages(root), ref, {
     listReleaseTagsByCreatorDate: async () => tags,
     isAncestor: (ancestor, descendant) => gitIsAncestor(root, ancestor, descendant),
