@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import {
   type ColumnInput,
   ErrorCode,
@@ -13,8 +13,11 @@ import {
 } from '../types.js';
 import { createColumineWasmBackend } from '../wasm-backend.js';
 
-const WASM_PATH = new URL('../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm', import.meta.url);
-const HAS_WASM = existsSync(WASM_PATH);
+// The wasm-opt output, which is what ships and what `cargo-wasm` declares as its Nx
+// output. The pre-optimization intermediate under target/ is neither: a cached build
+// never restores it, so gating on its presence skipped these tests silently, and when
+// they did run they exercised bytes nobody ships.
+const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
 
 function reducer(
   reduce: readonly number[],
@@ -44,7 +47,7 @@ function columns(...values: readonly Uint32Array[]): ColumnInput[] {
 }
 
 describe('StructMap2 public WASM readers', () => {
-  it.skipIf(!HAS_WASM)('reduces pair rows and restores checkpoint bytes with point lookup and iteration', async () => {
+  it('reduces pair rows and restores checkpoint bytes with point lookup and iteration', async () => {
     const backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
     const getRow = backend.structMap2GetRow;
     const entries = backend.structMap2Entries;
@@ -98,7 +101,7 @@ describe('StructMap2 public WASM readers', () => {
     expect(entries(restored, upsert, 0)).toHaveLength(2);
   });
 
-  it.skipIf(!HAS_WASM)('executes strict signed i64x2 max in the built WASM dispatcher', async () => {
+  it('executes strict signed i64x2 max in the built WASM dispatcher', async () => {
     expect(Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2).toBe(0x87);
     const backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
     const getRow = backend.structMap2GetRow;

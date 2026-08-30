@@ -9,7 +9,6 @@
  */
 
 import { beforeAll, describe, expect, it } from 'bun:test';
-import { existsSync } from 'node:fs';
 
 import {
   AggType,
@@ -28,11 +27,11 @@ import {
 import { loadColumineWasm } from '../wasm-backend.js';
 
 // =============================================================================
-// WASM Binary Detection
+// WASM Binary
 // =============================================================================
 
+// A prerequisite, not a condition — see columine-integration.test.ts.
 const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
-const WASM_EXISTS = existsSync(WASM_PATH.pathname);
 const TEST_PARSE_BACKEND: ParseCompactBackend = {
   backend: 'test-parse',
   parse: () => ({ arrowIpc: new Uint8Array(0), eventCount: 0 }),
@@ -127,7 +126,6 @@ describe('Pipeline undo integration', () => {
   let backend: ColumineBackend;
 
   beforeAll(async () => {
-    if (!WASM_EXISTS) return;
     backend = await loadColumineWasm(WASM_PATH);
   });
 
@@ -135,7 +133,7 @@ describe('Pipeline undo integration', () => {
   // 1. checkpoint + commit (no rollback)
   // ---------------------------------------------------------------------------
 
-  it.skipIf(!WASM_EXISTS)('checkpoint + commit keeps HashMap inserts', async () => {
+  it('checkpoint + commit keeps HashMap inserts', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
@@ -172,7 +170,7 @@ describe('Pipeline undo integration', () => {
   // 2. checkpoint + rollback restores state
   // ---------------------------------------------------------------------------
 
-  it.skipIf(!WASM_EXISTS)('rollback restores HashMap to pre-checkpoint state', async () => {
+  it('rollback restores HashMap to pre-checkpoint state', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
@@ -237,7 +235,7 @@ describe('Pipeline undo integration', () => {
   // 3. rollback restores Aggregate values
   // ---------------------------------------------------------------------------
 
-  it.skipIf(!WASM_EXISTS)('rollback restores Aggregate SUM to pre-checkpoint value', async () => {
+  it('rollback restores Aggregate SUM to pre-checkpoint value', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
@@ -271,7 +269,7 @@ describe('Pipeline undo integration', () => {
   // 4. rollback restores HashSet
   // ---------------------------------------------------------------------------
 
-  it.skipIf(!WASM_EXISTS)('rollback restores HashSet to pre-checkpoint elements', async () => {
+  it('rollback restores HashSet to pre-checkpoint elements', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
@@ -319,7 +317,7 @@ describe('Pipeline undo integration', () => {
   // 5. multiple checkpoint/rollback cycles
   // ---------------------------------------------------------------------------
 
-  it.skipIf(!WASM_EXISTS)('commit then rollback: committed changes persist, rolled-back do not', async () => {
+  it('commit then rollback: committed changes persist, rolled-back do not', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
@@ -385,7 +383,7 @@ describe('Pipeline undo integration', () => {
   // 6. commit after partial execution (multiple batches)
   // ---------------------------------------------------------------------------
 
-  it.skipIf(!WASM_EXISTS)('commit after multiple batches preserves all effects', async () => {
+  it('commit after multiple batches preserves all effects', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
