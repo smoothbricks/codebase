@@ -186,7 +186,7 @@ fn extract_typed_value(
             if first == 0xc0 {
                 reader.skip_value();
                 None
-            } else if is_integer(first) {
+            } else if Reader::is_integer(first) {
                 let wide = reader
                     .read_integer()
                     .ok_or(ExtractionError::InvalidFieldType)?;
@@ -200,13 +200,13 @@ fn extract_typed_value(
             if first == 0xc0 {
                 reader.skip_value();
                 None
-            } else if is_integer(first) {
+            } else if Reader::is_integer(first) {
                 Some(ColumnValue::Int64(
                     reader
                         .read_integer()
                         .ok_or(ExtractionError::InvalidFieldType)?,
                 ))
-            } else if is_string(first) {
+            } else if Reader::is_string(first) {
                 let text = std::str::from_utf8(
                     reader
                         .read_string()
@@ -227,13 +227,13 @@ fn extract_typed_value(
             if first == 0xc0 {
                 reader.skip_value();
                 None
-            } else if matches!(first, 0xca | 0xcb) {
+            } else if Reader::is_float(first) {
                 Some(ColumnValue::Float64(
                     reader
                         .read_float()
                         .ok_or(ExtractionError::InvalidFieldType)?,
                 ))
-            } else if is_integer(first) {
+            } else if Reader::is_integer(first) {
                 Some(ColumnValue::Float64(
                     reader
                         .read_integer()
@@ -296,12 +296,6 @@ fn append(
         ParseError::BufferOverflow => ExtractionError::BufferOverflow,
         _ => ExtractionError::InvalidFieldType,
     })
-}
-fn is_integer(byte: u8) -> bool {
-    byte & 0x80 == 0 || byte & 0xe0 == 0xe0 || (0xcc..=0xd3).contains(&byte)
-}
-fn is_string(byte: u8) -> bool {
-    byte & 0xe0 == 0xa0 || matches!(byte, 0xd9..=0xdb)
 }
 
 #[cfg(test)]
