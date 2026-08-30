@@ -44,8 +44,17 @@ impl RepoId {
             return Err(RepoIdError::ComponentCount);
         }
 
-        validate_identity_component(owner, RepoIdComponent::Owner)?;
-        validate_identity_component(repo, RepoIdComponent::Repo)?;
+        reject_empty_or_traversal(owner, RepoIdComponent::Owner)?;
+        reject_empty_or_traversal(repo, RepoIdComponent::Repo)?;
+        // Character class and component length live in cowshed-gateway::validate_repo_id.
+        cowshed_gateway::validate_repo_id(value).map_err(|_| {
+            let component = if cowshed_gateway::validate_repo_id(&format!("{owner}/x")).is_err() {
+                RepoIdComponent::Owner
+            } else {
+                RepoIdComponent::Repo
+            };
+            RepoIdError::InvalidComponent { component }
+        })?;
         Ok(Self(format!("{owner}/{repo}")))
     }
 
@@ -111,29 +120,12 @@ impl fmt::Display for RepoIdComponent {
     }
 }
 
-fn validate_identity_component(value: &str, component: RepoIdComponent) -> Result<(), RepoIdError> {
+fn reject_empty_or_traversal(value: &str, component: RepoIdComponent) -> Result<(), RepoIdError> {
     if value.is_empty() {
         return Err(RepoIdError::EmptyComponent { component });
     }
-    if value == "." {
+    if value == "." || value == ".." {
         return Err(RepoIdError::TraversalComponent { component });
-    }
-    if value == ".." {
-        return Err(RepoIdError::TraversalComponent { component });
-    }
-
-    let Some(first) = value.as_bytes().first() else {
-        return Err(RepoIdError::EmptyComponent { component });
-    };
-    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
-        return Err(RepoIdError::InvalidComponent { component });
-    }
-    if !value
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte))
-    {
-        return Err(RepoIdError::InvalidComponent { component });
     }
     Ok(())
 }
@@ -821,6 +813,9 @@ mod tests {
         ] {
             assert!(RepoId::parse(invalid).is_err(), "accepted {invalid:?}");
         }
+        let max_component = "a".repeat(128);
+        assert!(RepoId::parse(&format!("{max_component}/{max_component}")).is_ok());
+        assert!(RepoId::parse(&format!("{}/widget", "a".repeat(129))).is_err());
     }
 
     #[test]
