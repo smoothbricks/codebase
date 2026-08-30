@@ -414,6 +414,12 @@ until those tests miss their timeout — 62 images attached, only 27 this projec
 holding commits main lacks by ancestry or patch equivalence, which is the only check that catches a land you _think_
 succeeded. Piping `git merge --ff-only` through `tail` makes the exit status `tail`'s, so a failed merge prints success.
 
+**A fleet touching `cfg(target_os)` code MUST run `bun run check:linux` before the last land, not after.** macOS gates
+cannot see the `not(target_os = "macos")` branch, so a green `clippy -D warnings` on every branch still lands a red CI.
+One session put four regressions in that blind spot — a gated `impl` orphaning its imports, an ungated caller reaching a
+gated helper, two macOS-only consumers leaving shared items unread. Enumerate with `--keep-going`: compilation stops at
+the first error per crate, so fixing one reveals the next, and gating an item can cascade into whatever only it read.
+
 --
 
 --
