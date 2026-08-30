@@ -915,6 +915,9 @@ impl WorkspaceRef {
 }
 
 #[cfg(test)]
+mod wire_contract;
+
+#[cfg(test)]
 mod parity_tests {
     use cowshed_cli::args::{Command, parse_args};
     use cowshed_core::api::StdinSource;

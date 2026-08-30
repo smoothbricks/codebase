@@ -200,11 +200,16 @@ export interface OutputPublication {
 }
 
 export interface ExecRequest {
+  /**
+   * UTF-8 arguments. Not `CommandArg[]` like `JobInfo.argv`, and deliberately so: a JS string is
+   * UTF-16 and cannot hold a non-UTF-8 byte sequence, so `string[]` is exactly the set this
+   * caller can express and `String -> CommandArg` is exact for all of it.
+   */
   readonly argv: readonly string[];
   readonly cwd?: string;
   readonly mode?: RunSandboxMode;
   readonly env?: Readonly<Record<string, string>>;
-  readonly trace?: { readonly traceId: string; readonly spanId: string };
+  readonly trace?: TraceContext;
   /** UTF-8 stdin. Use stdinWorkspacePath for an existing workspace-relative file. */
   readonly stdin?: string;
   readonly stdinWorkspacePath?: string;
@@ -254,6 +259,83 @@ export interface PushReport {
   readonly previousDestinationHead?: string;
 }
 
+/**
+ * Byte-exact bytes spelled as JSON, tagged with which spelling carries them.
+ *
+ * `utf8` holds the bytes verbatim. `base64` holds canonical padded standard base64 of a byte
+ * sequence that is *not* valid UTF-8, so the tag is a fact about the bytes rather than a
+ * producer's choice and decoding is never lossy. Rust: `CommandArg` and `BinaryData` in
+ * `cowshed-core::api::dto` share this grammar.
+ */
+export interface TaggedBytes {
+  readonly encoding: 'utf8' | 'base64';
+  readonly data: string;
+}
+
+/** One immutable operating-system command argument, preserved byte-for-byte. */
+export type CommandArg = TaggedBytes;
+
+/** Stream bytes small enough to live in the job DTO instead of a protected file. */
+export type BinaryPayload = TaggedBytes;
+
+/** How a process ended. Both the `signaled` and `killed` job states carry `signaled`. */
+export type ExitStatus =
+  | { readonly kind: 'exited'; readonly code: number }
+  | { readonly kind: 'signaled'; readonly signal: number; readonly coreDumped: boolean };
+
+/** Where the tamper-evident copy of a stream lives. */
+export type ProtectedOutput =
+  | { readonly kind: 'inline'; readonly data: BinaryPayload }
+  | { readonly kind: 'file'; readonly path: string };
+
+/**
+ * How a stream reached storage. `redirect` additionally names the workspace path the job itself
+ * wrote to; `artifact` is the protected copy either way.
+ */
+export type OutputStorage =
+  | { readonly kind: 'captured'; readonly artifact: ProtectedOutput }
+  | { readonly kind: 'redirect'; readonly source: string; readonly artifact: ProtectedOutput };
+
+/** A bounded, human-readable projection of a stream. Never the stream itself. */
+export interface OutputSummary {
+  readonly version: number;
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
+/** One captured job stream. `bytes` and `sha256` describe the whole stream, not the summary. */
+export interface StreamInfo {
+  readonly storage: OutputStorage;
+  readonly bytes: number;
+  /** 64 lowercase hexadecimal characters. */
+  readonly sha256: string;
+  readonly summary: OutputSummary;
+}
+
+export type StdinKind = 'empty' | 'inline' | 'stream' | 'workspaceFile';
+
+export interface StdinInfo {
+  readonly kind: StdinKind;
+  readonly bytes: number;
+  /** Present only for the `workspaceFile` kind. */
+  readonly workspacePath?: string;
+  /** False when a streamed stdin was still open when the job ended. */
+  readonly complete: boolean;
+}
+
+/** The limit a job crossed, and the byte count that crossed it. */
+export interface OutputLimitInfo {
+  readonly limitBytes: number;
+  readonly crossingBytes: number;
+}
+
+export interface TraceContext {
+  /** 32 lowercase hexadecimal characters. */
+  readonly traceId: string;
+  /** 16 lowercase hexadecimal characters. */
+  readonly spanId: string;
+}
+
 export interface JobInfo {
   readonly repoId: string;
   readonly workspaceIncarnation: string;
@@ -261,16 +343,22 @@ export interface JobInfo {
   readonly state: JobState;
   readonly pid?: number;
   readonly grantRevision: number;
-  readonly argv: readonly string[];
-  readonly cwd?: string;
+  readonly argv: readonly CommandArg[];
+  /**
+   * The job's working directory, or `null` for the workspace root. Explicitly `null` rather than
+   * absent: unlike every other optional here, the controller always emits this key.
+   */
+  readonly cwd: string | null;
   readonly started: string;
+  /** Present exactly for terminal states. */
   readonly durationMs?: number;
-  readonly exit?: unknown;
-  readonly stdout: unknown;
-  readonly stderr: unknown;
-  readonly trace: { readonly traceId: string; readonly spanId: string };
-  readonly outputLimit?: unknown;
-  readonly stdin: unknown;
+  readonly exit?: ExitStatus;
+  readonly stdout: StreamInfo;
+  readonly stderr: StreamInfo;
+  readonly trace: TraceContext;
+  /** Present exactly for the `outputLimit` state. */
+  readonly outputLimit?: OutputLimitInfo;
+  readonly stdin: StdinInfo;
 }
 
 /**

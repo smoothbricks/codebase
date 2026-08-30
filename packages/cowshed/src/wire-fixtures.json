@@ -1,0 +1,921 @@
+{
+  "DoctorReport": {
+    "healthy": {
+      "findings": [],
+      "healthy": true
+    },
+    "unhealthy": {
+      "findings": [
+        {
+          "code": "storage.sparse-fallback",
+          "hint": "upgrade to a host that supports ASIF",
+          "message": "the host fell back to a sparse image",
+          "severity": "info"
+        },
+        {
+          "code": "gateway.certificate-expiring",
+          "hint": "run cowshed gateway renew",
+          "message": "the gateway certificate expires in 6 days",
+          "path": "/Users/fixture/Library/Application Support",
+          "severity": "warning"
+        },
+        {
+          "code": "controller.socket-missing",
+          "hint": "run cowshed setup",
+          "message": "the controller socket is absent",
+          "severity": "error"
+        }
+      ],
+      "healthy": false
+    }
+  },
+  "GcReport": {
+    "dryRun": {
+      "candidates": [
+        {
+          "bytes": 1024,
+          "identity": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+          "path": "/Users/fixture/Dev/.cowshed/gc/0",
+          "reason": "retiredWorkspace"
+        },
+        {
+          "bytes": 2048,
+          "identity": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+          "path": "/Users/fixture/Dev/.cowshed/gc/1",
+          "reason": "orphanStagingImage"
+        },
+        {
+          "bytes": 3072,
+          "identity": "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986",
+          "path": "/Users/fixture/Dev/.cowshed/gc/2",
+          "reason": "orphanStagingMetadata"
+        },
+        {
+          "bytes": 4096,
+          "identity": "084fed08b978af4d7d196a7446a86b58009e636b611db16211b65a9aadff29c5",
+          "path": "/Users/fixture/Dev/.cowshed/gc/3",
+          "reason": "expiredCheckpoint"
+        },
+        {
+          "bytes": 5120,
+          "identity": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71",
+          "path": "/Users/fixture/Dev/.cowshed/gc/4",
+          "reason": "detachedImageCompaction"
+        }
+      ],
+      "dryRun": true,
+      "examined": 5,
+      "freedBytes": 0,
+      "reclaimed": 0,
+      "retainedPinned": 1
+    },
+    "swept": {
+      "candidates": [],
+      "dryRun": false,
+      "examined": 5,
+      "freedBytes": 15360,
+      "reclaimed": 4,
+      "retainedPinned": 1
+    }
+  },
+  "GrantSet": {
+    "closed": {
+      "egress": [],
+      "read": [],
+      "revision": 0,
+      "sim": [],
+      "write": []
+    },
+    "open": {
+      "egress": [
+        {
+          "host": "crates.io"
+        },
+        {
+          "host": "github.com",
+          "impersonate": "fixture-bot",
+          "mode": "opaque",
+          "ports": [
+            22,
+            443
+          ]
+        }
+      ],
+      "portBlock": {
+        "base": 51200,
+        "size": 16
+      },
+      "read": [
+        "/Users/fixture/.cargo/registry"
+      ],
+      "repos": [
+        "smoothbricks/*"
+      ],
+      "revision": 12,
+      "sim": [
+        "openurl",
+        "install"
+      ],
+      "write": [
+        "/Users/fixture/Library/Caches/sccache"
+      ]
+    }
+  },
+  "JobInfo": {
+    "exited": {
+      "argv": [
+        {
+          "data": "sh",
+          "encoding": "utf8"
+        },
+        {
+          "data": "-c",
+          "encoding": "utf8"
+        }
+      ],
+      "cwd": null,
+      "durationMs": 1234,
+      "exit": {
+        "code": 0,
+        "kind": "exited"
+      },
+      "grantRevision": 7,
+      "jobId": 3,
+      "pid": 4243,
+      "repoId": "smoothbricks/codebase",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "exited",
+      "stderr": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 5,
+        "complete": true,
+        "kind": "inline"
+      },
+      "stdout": {
+        "bytes": 3,
+        "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "ok\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "ok\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "failed": {
+      "argv": [
+        {
+          "data": "sh",
+          "encoding": "utf8"
+        },
+        {
+          "data": "-c",
+          "encoding": "utf8"
+        }
+      ],
+      "cwd": null,
+      "durationMs": 1234,
+      "grantRevision": 7,
+      "jobId": 7,
+      "repoId": "smoothbricks/codebase",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "failed",
+      "stderr": {
+        "bytes": 14,
+        "sha256": "791fda75a4a9e9d00fb9c8187607873074a0ff56d39b4d68e1893c749bfc8f91",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "spawn refused\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "spawn refused\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 5,
+        "complete": true,
+        "kind": "inline"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "killed": {
+      "argv": [
+        {
+          "data": "printf",
+          "encoding": "utf8"
+        },
+        {
+          "data": "%s",
+          "encoding": "utf8"
+        },
+        {
+          "data": "//6A",
+          "encoding": "base64"
+        }
+      ],
+      "cwd": null,
+      "durationMs": 9,
+      "exit": {
+        "coreDumped": false,
+        "kind": "signaled",
+        "signal": 15
+      },
+      "grantRevision": 9,
+      "jobId": 6,
+      "pid": 4244,
+      "repoId": "smoothbricks/codebase",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "killed",
+      "stderr": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 0,
+        "complete": true,
+        "kind": "empty"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "list": [
+      {
+        "argv": [
+          {
+            "data": "true",
+            "encoding": "utf8"
+          }
+        ],
+        "cwd": null,
+        "grantRevision": 0,
+        "jobId": 1,
+        "repoId": "smoothbricks/codebase",
+        "started": "2026-01-02T03:04:05Z",
+        "state": "queued",
+        "stderr": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "storage": {
+            "artifact": {
+              "data": {
+                "data": "",
+                "encoding": "utf8"
+              },
+              "kind": "inline"
+            },
+            "kind": "captured"
+          },
+          "summary": {
+            "text": "",
+            "truncated": false,
+            "version": 1
+          }
+        },
+        "stdin": {
+          "bytes": 0,
+          "complete": true,
+          "kind": "empty"
+        },
+        "stdout": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "storage": {
+            "artifact": {
+              "data": {
+                "data": "",
+                "encoding": "utf8"
+              },
+              "kind": "inline"
+            },
+            "kind": "captured"
+          },
+          "summary": {
+            "text": "",
+            "truncated": false,
+            "version": 1
+          }
+        },
+        "trace": {
+          "spanId": "0011223344556677",
+          "traceId": "00112233445566778899aabbccddeeff"
+        },
+        "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+      },
+      {
+        "argv": [
+          {
+            "data": "cargo",
+            "encoding": "utf8"
+          },
+          {
+            "data": "test",
+            "encoding": "utf8"
+          },
+          {
+            "data": "--workspace",
+            "encoding": "utf8"
+          }
+        ],
+        "cwd": "packages/cowshed",
+        "grantRevision": 7,
+        "jobId": 2,
+        "pid": 4242,
+        "repoId": "smoothbricks/codebase",
+        "started": "2026-01-02T03:04:05Z",
+        "state": "running",
+        "stderr": {
+          "bytes": 128,
+          "sha256": "b737815f5ca9697f685dfe2b5fe1f7b12a180562f97da5a72e90eaedd9890876",
+          "storage": {
+            "artifact": {
+              "kind": "file",
+              "path": ".cowshed/job/2/err"
+            },
+            "kind": "captured"
+          },
+          "summary": {
+            "text": "captured to the protected job directory",
+            "truncated": true,
+            "version": 1
+          }
+        },
+        "stdin": {
+          "bytes": 12,
+          "complete": true,
+          "kind": "workspaceFile",
+          "workspacePath": "fixtures/input.txt"
+        },
+        "stdout": {
+          "bytes": 4096,
+          "sha256": "adbb729b7e9db01a9469d540d24270e511ca8689c9c103870b442bcc4c53c6e0",
+          "storage": {
+            "artifact": {
+              "kind": "file",
+              "path": ".cowshed/job/2/out"
+            },
+            "kind": "redirect",
+            "source": "build.log"
+          },
+          "summary": {
+            "text": "redirected into the workspace",
+            "truncated": false,
+            "version": 1
+          }
+        },
+        "trace": {
+          "spanId": "0011223344556677",
+          "traceId": "00112233445566778899aabbccddeeff"
+        },
+        "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+      }
+    ],
+    "outputLimit": {
+      "argv": [
+        {
+          "data": "yes",
+          "encoding": "utf8"
+        }
+      ],
+      "cwd": null,
+      "durationMs": 50,
+      "grantRevision": 9,
+      "jobId": 5,
+      "outputLimit": {
+        "crossingBytes": 1048577,
+        "limitBytes": 1048576
+      },
+      "pid": 4245,
+      "repoId": "smoothbricks/codebase",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "outputLimit",
+      "stderr": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 64,
+        "complete": false,
+        "kind": "stream"
+      },
+      "stdout": {
+        "bytes": 1048576,
+        "sha256": "b737815f5ca9697f685dfe2b5fe1f7b12a180562f97da5a72e90eaedd9890876",
+        "storage": {
+          "artifact": {
+            "kind": "file",
+            "path": ".cowshed/job/5/out"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "captured to the protected job directory",
+          "truncated": true,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "queued": {
+      "argv": [
+        {
+          "data": "true",
+          "encoding": "utf8"
+        }
+      ],
+      "cwd": null,
+      "grantRevision": 0,
+      "jobId": 1,
+      "repoId": "smoothbricks/codebase",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "queued",
+      "stderr": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 0,
+        "complete": true,
+        "kind": "empty"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "running": {
+      "argv": [
+        {
+          "data": "cargo",
+          "encoding": "utf8"
+        },
+        {
+          "data": "test",
+          "encoding": "utf8"
+        },
+        {
+          "data": "--workspace",
+          "encoding": "utf8"
+        }
+      ],
+      "cwd": "packages/cowshed",
+      "grantRevision": 7,
+      "jobId": 2,
+      "pid": 4242,
+      "repoId": "smoothbricks/codebase",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "running",
+      "stderr": {
+        "bytes": 128,
+        "sha256": "b737815f5ca9697f685dfe2b5fe1f7b12a180562f97da5a72e90eaedd9890876",
+        "storage": {
+          "artifact": {
+            "kind": "file",
+            "path": ".cowshed/job/2/err"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "captured to the protected job directory",
+          "truncated": true,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 12,
+        "complete": true,
+        "kind": "workspaceFile",
+        "workspacePath": "fixtures/input.txt"
+      },
+      "stdout": {
+        "bytes": 4096,
+        "sha256": "adbb729b7e9db01a9469d540d24270e511ca8689c9c103870b442bcc4c53c6e0",
+        "storage": {
+          "artifact": {
+            "kind": "file",
+            "path": ".cowshed/job/2/out"
+          },
+          "kind": "redirect",
+          "source": "build.log"
+        },
+        "summary": {
+          "text": "redirected into the workspace",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "signaledNonUtf8Argv": {
+      "argv": [
+        {
+          "data": "printf",
+          "encoding": "utf8"
+        },
+        {
+          "data": "%s",
+          "encoding": "utf8"
+        },
+        {
+          "data": "//6A",
+          "encoding": "base64"
+        }
+      ],
+      "cwd": null,
+      "durationMs": 9,
+      "exit": {
+        "coreDumped": true,
+        "kind": "signaled",
+        "signal": 9
+      },
+      "grantRevision": 9,
+      "jobId": 4,
+      "pid": 4244,
+      "repoId": "smoothbricks/codebase",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "signaled",
+      "stderr": {
+        "bytes": 7,
+        "sha256": "f9357dc03ac96360e8cde4ac40852ad2d1a3e3df0e160c5b4b8c09b27cc6a0ff",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "killed\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "killed\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 0,
+        "complete": true,
+        "kind": "empty"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    }
+  },
+  "LandReport": {
+    "firstLanding": {
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
+    "retired": {
+      "landedHead": "1111111111111111111111111111111111111111",
+      "previousTargetHead": "2222222222222222222222222222222222222222",
+      "retired": true,
+      "targetBranch": "main",
+      "targetWasCheckedOut": true
+    }
+  },
+  "PushReport": {
+    "fastForward": {
+      "destinationRef": "refs/heads/cowshed/cs-seam",
+      "previousDestinationHead": "4444444444444444444444444444444444444444",
+      "sourceHead": "3333333333333333333333333333333333333333"
+    },
+    "newBranch": {
+      "destinationRef": "refs/heads/cowshed/cs-seam",
+      "sourceHead": "3333333333333333333333333333333333333333"
+    }
+  },
+  "RemoveReport": {
+    "abandoned": {
+      "abandoned": {
+        "bundle": "/Users/fixture/Dev/.cowshed/abandoned/cs-seam.bundle",
+        "head": "5555555555555555555555555555555555555555",
+        "targetBranch": "main",
+        "targetHead": "6666666666666666666666666666666666666666",
+        "unlandedCommits": 4
+      }
+    },
+    "imageOnly": {}
+  },
+  "ResizeResult": {
+    "grown": {
+      "capacity": "200g",
+      "previousCapacity": "100g",
+      "workspace": "cs-seam"
+    }
+  },
+  "WorkspaceInfo": {
+    "landingIndeterminate": {
+      "checkpoints": [],
+      "imageFormat": "asif",
+      "landing": {
+        "commits": {
+          "reason": "the target branch does not exist",
+          "state": "indeterminate"
+        }
+      },
+      "mount": "/Users/fixture/Dev/codebase",
+      "repoId": "smoothbricks/codebase",
+      "role": "workspace",
+      "snapshotStale": false,
+      "state": "attached",
+      "workspace": "cs-gateway",
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "landingMeasured": {
+      "baseCommit": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
+      "branch": "cowshed/cs-seam",
+      "checkpoints": [
+        {
+          "label": "pre-rebase",
+          "pinned": true,
+          "revision": 3
+        },
+        {
+          "label": "nightly",
+          "pinned": false,
+          "revision": 4
+        }
+      ],
+      "createdAt": "2026-01-02T03:04:05Z",
+      "imageFormat": "sparse",
+      "landing": {
+        "commits": {
+          "behind": 5,
+          "landed": 1,
+          "state": "measured",
+          "targetBranch": "main",
+          "targetHead": "89abcdef0123456789abcdef0123456789abcdef",
+          "unlanded": 3
+        },
+        "dirtyFiles": 2
+      },
+      "mount": "/Users/fixture/Dev/.cowshed/codebase/cs-seam",
+      "repoId": "smoothbricks/codebase",
+      "role": "workspace",
+      "snapshotStale": true,
+      "state": "detached",
+      "workspace": "cs-seam",
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
+    "list": [
+      {
+        "checkpoints": [],
+        "imageFormat": "asif",
+        "mount": "/Users/fixture/Dev/codebase",
+        "repoId": "smoothbricks/codebase",
+        "role": "main",
+        "snapshotStale": false,
+        "state": "attached",
+        "workspace": "main",
+        "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+      },
+      {
+        "baseCommit": "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
+        "branch": "cowshed/cs-seam",
+        "checkpoints": [
+          {
+            "label": "pre-rebase",
+            "pinned": true,
+            "revision": 3
+          },
+          {
+            "label": "nightly",
+            "pinned": false,
+            "revision": 4
+          }
+        ],
+        "createdAt": "2026-01-02T03:04:05Z",
+        "imageFormat": "sparse",
+        "landing": {
+          "commits": {
+            "behind": 5,
+            "landed": 1,
+            "state": "measured",
+            "targetBranch": "main",
+            "targetHead": "89abcdef0123456789abcdef0123456789abcdef",
+            "unlanded": 3
+          },
+          "dirtyFiles": 2
+        },
+        "mount": "/Users/fixture/Dev/.cowshed/codebase/cs-seam",
+        "repoId": "smoothbricks/codebase",
+        "role": "workspace",
+        "snapshotStale": true,
+        "state": "detached",
+        "workspace": "cs-seam",
+        "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+      },
+      {
+        "checkpoints": [],
+        "imageFormat": "asif",
+        "landing": {
+          "commits": {
+            "reason": "the target branch does not exist",
+            "state": "indeterminate"
+          }
+        },
+        "mount": "/Users/fixture/Dev/codebase",
+        "repoId": "smoothbricks/codebase",
+        "role": "workspace",
+        "snapshotStale": false,
+        "state": "attached",
+        "workspace": "cs-gateway",
+        "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+      }
+    ],
+    "main": {
+      "checkpoints": [],
+      "imageFormat": "asif",
+      "mount": "/Users/fixture/Dev/codebase",
+      "repoId": "smoothbricks/codebase",
+      "role": "main",
+      "snapshotStale": false,
+      "state": "attached",
+      "workspace": "main",
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    }
+  }
+}
