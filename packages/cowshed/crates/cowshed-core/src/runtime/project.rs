@@ -7099,7 +7099,7 @@ fn reconcile_binding_with_remotes(
     validation: BindingRemoteValidation,
     checkout: &Path,
 ) -> Result<Option<RepositoryBinding>> {
-    binding.validate().map_err(native_integrity_error)?;
+    binding.validate().map_err(binding_integrity_error)?;
     if validation == BindingRemoteValidation::ForIdentityChange {
         return Ok(None);
     }
@@ -7159,7 +7159,7 @@ fn reconcile_binding_with_remotes(
         identities,
         former_identities: binding.former_identities.clone(),
     };
-    updated.validate().map_err(native_integrity_error)?;
+    updated.validate().map_err(binding_integrity_error)?;
     Ok(Some(updated))
 }
 
