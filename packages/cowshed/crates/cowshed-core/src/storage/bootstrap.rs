@@ -1691,26 +1691,15 @@ pub(crate) fn parse_created_apfs_identifier(
         )));
     }
     let identifier = identifiers[0];
-    if !valid_apfs_volume_identifier(identifier) {
+    // `device` owns the `diskN[sM…]` grammar, and the inventory parser this identifier is later
+    // compared against uses it. Depth one is an APFS volume: `disk3` is a container and
+    // `disk3s1s4` is a snapshot of a slice, neither of which addVolume returns.
+    if crate::device::identifier_depth(identifier) != Some(1) {
         return Err(BootstrapExecutionError::CreatedVolumeOutput(format!(
             "malformed created DeviceIdentifier {identifier:?}"
         )));
     }
     Ok(identifier.to_owned())
-}
-
-#[cfg(target_os = "macos")]
-fn valid_apfs_volume_identifier(identifier: &str) -> bool {
-    let Some(rest) = identifier.strip_prefix("disk") else {
-        return false;
-    };
-    let Some((disk, slice)) = rest.split_once('s') else {
-        return false;
-    };
-    !disk.is_empty()
-        && disk.bytes().all(|byte| byte.is_ascii_digit())
-        && !slice.is_empty()
-        && slice.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(target_os = "macos")]
@@ -1839,6 +1828,33 @@ mod tests {
         }
         for name in ["acme", "widget", "cache", "temp", ""] {
             assert!(!is_reserved_store_namespace(name), "{name}");
+        }
+    }
+
+    /// `device::identifier_depth` is the one device grammar, and it rejects leading zeros because
+    /// the kernel never prints them and these identifiers gate mount and detach decisions by
+    /// textual comparison. A volume attested as `disk01s1` would be recorded under a spelling the
+    /// inventory parser refuses, so provisioning could never match it to the device again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn created_volume_identifier_shares_the_device_grammar() {
+        use super::parse_created_apfs_identifier;
+
+        assert_eq!(
+            parse_created_apfs_identifier(b"Created new APFS Volume disk3s5\n").unwrap(),
+            "disk3s5"
+        );
+        for rejected in [
+            &b"Created new APFS Volume disk01s1\n"[..],
+            b"Created new APFS Volume disk3s1s4\n",
+            b"Created new APFS Volume disk3\n",
+            b"Created new APFS Volume disk3sx\n",
+        ] {
+            assert!(
+                parse_created_apfs_identifier(rejected).is_err(),
+                "{}",
+                String::from_utf8_lossy(rejected)
+            );
         }
     }
 }
