@@ -72,17 +72,24 @@ impl From<bool> for ColumnValue {
 
 /// Tracer-agnostic query surface (same selector, any backend).
 pub trait TraceQuery {
+    /// The backend's native query error.
+    type Error;
+
     /// Rows matching the selector (count is enough for most assertions).
-    fn count(&self, selector: &Selector) -> usize;
+    fn count(&self, selector: &Selector) -> Result<usize, Self::Error>;
 
     /// Negative assertion helper: true iff NO row matches. Note (08-trace-testing):
     /// proves absence of an EMITTED event, not absence of underlying work.
-    fn never(&self, selector: &Selector) -> bool {
-        self.count(selector) == 0
+    fn never(&self, selector: &Selector) -> Result<bool, Self::Error> {
+        Ok(self.count(selector)? == 0)
     }
 
     /// Causal-ordering assertion: every row matching `child` belongs to a span whose
     /// `(trace_id, parent_span_id)` points at a span with a row matching `parent`.
     /// Vacuously true when nothing matches `child` — pair with a positive `count`.
-    fn all_children_of(&self, child: &Selector, parent: &Selector) -> bool;
+    fn all_children_of(
+        &self,
+        child: &Selector,
+        parent: &Selector,
+    ) -> Result<bool, Self::Error>;
 }
