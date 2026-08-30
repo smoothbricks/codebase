@@ -11,8 +11,9 @@
 
 use crate::bytes;
 use crate::hash_table::{ENTRY_U32, FlatTable};
-use crate::hooks::{MutationOp, MutationRecord, VmHooks};
+use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
+use crate::undo_log::FlatUndoOp;
 use columine_types::types::{ChangeFlag, ErrorCode};
 
 /// HashMap upsert strategy.
@@ -230,14 +231,14 @@ pub fn batch_map_upsert(
                     delta_mode,
                     state,
                     MutationRecord {
-                        op: MutationOp::MapInsert,
+                        op: FlatUndoOp::MapInsert,
                         slot: slot_idx,
                         key,
                         prev_value: 0,
                         aux: 0,
                     },
                     MutationRecord {
-                        op: MutationOp::MapDelete,
+                        op: FlatUndoOp::MapDelete,
                         slot: slot_idx,
                         key,
                         prev_value: val,
@@ -288,14 +289,14 @@ pub fn batch_map_upsert(
                     delta_mode,
                     state,
                     MutationRecord {
-                        op: MutationOp::MapUpdate,
+                        op: FlatUndoOp::MapUpdate,
                         slot: slot_idx,
                         key,
                         prev_value: tbl.entry_u32_at(state, pos),
                         aux: prev_cmp,
                     },
                     MutationRecord {
-                        op: MutationOp::MapUpdate,
+                        op: FlatUndoOp::MapUpdate,
                         slot: slot_idx,
                         key,
                         prev_value: val,
@@ -359,14 +360,14 @@ pub fn batch_map_remove(
                 delta_mode,
                 state,
                 MutationRecord {
-                    op: MutationOp::MapDelete,
+                    op: FlatUndoOp::MapDelete,
                     slot: slot_idx,
                     key,
                     prev_value: tbl.entry_u32_at(state, pos),
                     aux: prev_aux,
                 },
                 MutationRecord {
-                    op: MutationOp::MapInsert,
+                    op: FlatUndoOp::MapInsert,
                     slot: slot_idx,
                     key,
                     prev_value: 0,

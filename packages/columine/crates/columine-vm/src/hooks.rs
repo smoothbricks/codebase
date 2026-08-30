@@ -6,6 +6,7 @@
 //! those services are not wired.
 
 use crate::meta::SlotMetaView;
+use crate::undo_log::FlatUndoOp;
 use columine_types::types::ErrorCode;
 
 /// One side of an undo/redo pair.
@@ -14,7 +15,7 @@ use columine_types::types::ErrorCode;
 /// of this in-memory record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationRecord {
-    pub op: MutationOp,
+    pub op: FlatUndoOp,
     pub slot: u8,
     pub key: u32,
     pub prev_value: u32,
@@ -22,15 +23,26 @@ pub struct MutationRecord {
     pub aux: u64,
 }
 
-/// The mutation opcodes the container family emits (subset of the undo-log
-/// op enum; the undo_log slice completes it).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MutationOp {
-    SetInsert,
-    SetDelete,
-    MapInsert,
-    MapDelete,
-    MapUpdate,
+impl MutationRecord {
+    pub const fn set_insert(slot: u8, key: u32) -> Self {
+        Self {
+            op: FlatUndoOp::SetInsert,
+            slot,
+            key,
+            prev_value: 0,
+            aux: 0,
+        }
+    }
+
+    pub const fn set_delete(slot: u8, key: u32, prev_ts_bits: u64) -> Self {
+        Self {
+            op: FlatUndoOp::SetDelete,
+            slot,
+            key,
+            prev_value: 0,
+            aux: prev_ts_bits,
+        }
+    }
 }
 
 /// Services container operations may request from the VM.

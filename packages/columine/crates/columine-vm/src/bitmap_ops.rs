@@ -13,7 +13,7 @@
 //! Scratch-related failure codes are therefore unreachable and are not
 //! emulated.
 use crate::bytes;
-use crate::hooks::{MutationOp, MutationRecord, VmHooks};
+use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
 use crate::minroar::MiniRoaring as RoaringBitmap;
 use columine_types::types::{
@@ -109,20 +109,8 @@ fn commit_bitmap_mutations(
                     hooks.append_mutation(
                         delta_mode,
                         state,
-                        MutationRecord {
-                            op: MutationOp::SetInsert,
-                            slot: slot_idx,
-                            key,
-                            prev_value: 0,
-                            aux: 0,
-                        },
-                        MutationRecord {
-                            op: MutationOp::SetDelete,
-                            slot: slot_idx,
-                            key,
-                            prev_value: 0,
-                            aux: 0,
-                        },
+                        MutationRecord::set_insert(slot_idx, key),
+                        MutationRecord::set_delete(slot_idx, key, 0),
                     );
                 }
                 if meta.has_ttl() {
@@ -148,20 +136,8 @@ fn commit_bitmap_mutations(
                     hooks.append_mutation(
                         delta_mode,
                         state,
-                        MutationRecord {
-                            op: MutationOp::SetDelete,
-                            slot: slot_idx,
-                            key,
-                            prev_value: 0,
-                            aux: previous_ts_bits,
-                        },
-                        MutationRecord {
-                            op: MutationOp::SetInsert,
-                            slot: slot_idx,
-                            key,
-                            prev_value: 0,
-                            aux: 0,
-                        },
+                        MutationRecord::set_delete(slot_idx, key, previous_ts_bits),
+                        MutationRecord::set_insert(slot_idx, key),
                     );
                 }
                 if meta.has_ttl() {
