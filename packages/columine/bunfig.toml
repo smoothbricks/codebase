@@ -1,2 +1,7 @@
 [test]
 preload = ["@smoothbricks/validation/bun/preload"]
+# `bun test <arg>` treats its argument as a FILTER and scans the package, following
+# symlinks. `target/cargo-lint-cross-home/git` points at ~/.cargo/git, which holds a
+# git checkout of this repository, so an unscoped scan collects a stale vendored copy
+# of these same test files and counts its results — skips included. Scan only src.
+root = "src"
