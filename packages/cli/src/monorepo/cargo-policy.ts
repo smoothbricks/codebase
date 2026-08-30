@@ -458,6 +458,77 @@ function cargoIncrementalPolicy(
   return failures;
 }
 
+/// Blank out comments while preserving every newline, so a match's line number is unchanged.
+///
+/// The advisory exists to find the macro COMPILED into a crate, because rustc records those as
+/// `# env-dep:` and the patched sccache never normalises them. An occurrence inside a comment
+/// compiles to nothing, and this repository documents the sccache behaviour by naming the macro
+/// in prose — so a raw text scan reports the documentation as the defect it describes.
+///
+/// String and raw-string states are tracked because a literal may legitimately contain `//`
+/// or `/*`; mistaking one for a comment would blank real code and silently lose a finding.
+function stripRustComments(text: string): string {
+  const out = Array.from(text);
+  let index = 0;
+  const blank = (from: number, to: number): void => {
+    for (let cursor = from; cursor < to; cursor += 1) {
+      if (out[cursor] !== '\n') {
+        out[cursor] = ' ';
+      }
+    }
+  };
+  while (index < text.length) {
+    const character = text[index];
+    if (character === '"') {
+      index += 1;
+      while (index < text.length && text[index] !== '"') {
+        index += text[index] === '\\' ? 2 : 1;
+      }
+      index += 1;
+      continue;
+    }
+    if (character === 'r' && (text[index + 1] === '"' || text[index + 1] === '#')) {
+      let hashes = 0;
+      while (text[index + 1 + hashes] === '#') {
+        hashes += 1;
+      }
+      if (text[index + 1 + hashes] === '"') {
+        const terminator = `"${'#'.repeat(hashes)}`;
+        const end = text.indexOf(terminator, index + 2 + hashes);
+        index = end === -1 ? text.length : end + terminator.length;
+        continue;
+      }
+    }
+    if (character === '/' && text[index + 1] === '/') {
+      const end = text.indexOf('\n', index);
+      const stop = end === -1 ? text.length : end;
+      blank(index, stop);
+      index = stop;
+      continue;
+    }
+    if (character === '/' && text[index + 1] === '*') {
+      let depth = 1;
+      let cursor = index + 2;
+      while (cursor < text.length && depth > 0) {
+        if (text[cursor] === '/' && text[cursor + 1] === '*') {
+          depth += 1;
+          cursor += 2;
+        } else if (text[cursor] === '*' && text[cursor + 1] === '/') {
+          depth -= 1;
+          cursor += 2;
+        } else {
+          cursor += 1;
+        }
+      }
+      blank(index, cursor);
+      index = cursor;
+      continue;
+    }
+    index += 1;
+  }
+  return out.join('');
+}
+
 function reportManifestDirectoryAdvisories(repositoryRoot: string, ignoredDirectories: string[]): void {
   const advisories: Array<{ path: string; line: number }> = [];
   for (const path of filterIgnoredPaths(
@@ -475,7 +546,8 @@ function reportManifestDirectoryAdvisories(repositoryRoot: string, ignoredDirect
     } catch {
       continue;
     }
-    for (const match of text.matchAll(MANIFEST_DIRECTORY_MACRO)) {
+    const code = stripRustComments(text);
+    for (const match of code.matchAll(MANIFEST_DIRECTORY_MACRO)) {
       const line = text.slice(0, match.index ?? 0).split('\n').length;
       advisories.push({ path, line });
     }
