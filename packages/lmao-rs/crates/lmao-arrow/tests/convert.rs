@@ -123,17 +123,19 @@ fn single_trace_is_single_partition() {
 }
 
 /// Cross-implementation check: pyarrow must be able to read our IPC bytes and agree
-/// on row count + schema field names. Skips (with a note) when python3/pyarrow is
-/// unavailable — the arrow-rs roundtrip in properties.rs still covers self-consistency.
+/// on the row count and schema. The development shell provisions pyarrow specifically
+/// for this test, so a missing interpreter is a broken test environment, not a skip.
 #[test]
 fn pyarrow_reads_our_ipc() {
     let probe = std::process::Command::new("python3")
         .args(["-c", "import pyarrow"])
-        .output();
-    if !probe.map(|o| o.status.success()).unwrap_or(false) {
-        eprintln!("SKIP: python3/pyarrow not available; relying on arrow-rs roundtrip");
-        return;
-    }
+        .output()
+        .expect("python3 must be available for the mandatory pyarrow oracle");
+    assert!(
+        probe.status.success(),
+        "pyarrow must be installed for the mandatory IPC oracle: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
 
     let empty_catalog = StableVocabularyCatalog::EMPTY;
     let batch = convert_span_trees(&[real_root("pyarrow-trace", 1, 10)], &empty_catalog).unwrap();
