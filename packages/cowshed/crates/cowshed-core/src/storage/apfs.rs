@@ -2999,27 +2999,24 @@ fn undo_image(
         )))
 }
 
-/// `<project>/sessions/<TRASH_NAMESPACE>/<name>-<incarnation>.<ext>`, from parts, for callers
-/// that hold a project root and (possibly enumeration-derived) format rather than a full config.
+/// `<sessions>/<TRASH_NAMESPACE>/<name>-<incarnation>.<ext>`. `sessions` is
+/// [`crate::repository::ProjectPaths::sessions`]; this helper does not name that directory.
 ///
 /// The `-` between name and incarnation is the separator [`split_retired_stem`] reverses; the two
 /// live side by side so the pair cannot drift. Incarnations are fixed-width lowercase hex, which
 /// is what keeps `rsplit_once` unambiguous even though workspace names contain hyphens.
 fn retired_image_below(
-    project_root: &Path,
+    sessions: &Path,
     workspace: &WorkspaceName,
     incarnation: &WorkspaceIncarnation,
     format: ImageFormat,
 ) -> PathBuf {
-    project_root
-        .join("sessions")
-        .join(TRASH_NAMESPACE)
-        .join(format!(
-            "{}-{}.{}",
-            workspace.as_str(),
-            incarnation.as_str(),
-            format.extension()
-        ))
+    sessions.join(TRASH_NAMESPACE).join(format!(
+        "{}-{}.{}",
+        workspace.as_str(),
+        incarnation.as_str(),
+        format.extension()
+    ))
 }
 
 /// Splits a `<name>-<incarnation>` trash stem: the exact inverse of the stem written by
@@ -3036,12 +3033,9 @@ fn retired_image_path(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
-    let project = layout(config, workspace.repo())?
-        .project()
-        .project_root
-        .clone();
+    let sessions = layout(config, workspace.repo())?.project().sessions.clone();
     Ok(retired_image_below(
-        &project,
+        &sessions,
         workspace.name(),
         workspace.incarnation(),
         workspace.format(),
