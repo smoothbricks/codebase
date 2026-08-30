@@ -25,6 +25,7 @@ import type {
   StructMap2RowRef,
 } from './types.js';
 import { AggType, ErrorCode, SlotType, SlotTypeFlag } from './types.js';
+import { align8, ensureWasmMemoryForWorkingSet, loadWasmBytes, WASM_PAGE_BYTES } from './wasm-memory-contract.js';
 
 // =============================================================================
 // Constants
@@ -41,7 +42,7 @@ const SLOT_META_TYPE_FLAGS_OFFSET = 12;
 const SLOT_META_EVICTED_BUFFER_OFFSET = 36;
 const SLOT_META_EVICTED_COUNT_OFFSET = 40;
 const EVICTION_ENTRY_SIZE = 16;
-const WASM_PAGE_SIZE = 64 * 1024;
+const WASM_PAGE_SIZE = WASM_PAGE_BYTES;
 const STATE_REGION_OFFSET = WASM_PAGE_SIZE;
 
 // WASM returns u32 as signed i32, so 0xFFFFFFFF becomes -1
@@ -239,10 +240,6 @@ function isWasmStateHandle(state: StateHandle): state is WasmStateHandle {
   );
 }
 
-function align8(n: number): number {
-  return Math.ceil(n / 8) * 8;
-}
-
 /**
  * Map a raw non-OK status from the WASM VM to its ErrorCode member.
  *
@@ -305,11 +302,12 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
   };
 
   const ensureMemory = (endExclusive: number): void => {
-    if (!Number.isSafeInteger(endExclusive) || endExclusive < 0) {
-      throw new RangeError(`Invalid WASM memory extent: ${endExclusive}`);
-    }
-    const missing = endExclusive - wasmInstance.memory.buffer.byteLength;
-    if (missing > 0) wasmInstance.memory.grow(Math.ceil(missing / WASM_PAGE_SIZE));
+    ensureWasmMemoryForWorkingSet(wasmInstance.memory, {
+      inputBytes: endExclusive,
+      outputBytes: 0,
+      workspaceBytes: 0,
+      regionsBytes: 0,
+    });
   };
 
   const copyStateIn = (state: WasmStateHandle): number => {
@@ -749,47 +747,4 @@ export async function loadColumineWasm(wasmPath?: string | URL, memoryPages?: nu
     );
   }
   return createColumineWasmBackend(wasmBytes, memoryPages);
-}
-
-/**
- * Helper to load WASM bytes from path or default locations.
- */
-async function loadWasmBytes(
-  customPath: string | URL | undefined,
-  defaultFileName: string,
-): Promise<ArrayBuffer | undefined> {
-  if (customPath) {
-    try {
-      const response = await fetch(customPath);
-      if (response.ok) {
-        return await response.arrayBuffer();
-      }
-    } catch {
-      // File not found or other error
-    }
-    return undefined;
-  }
-
-  // Try default locations
-  const defaultPaths = [
-    // Built module: dist/ts/*.js -> dist/*.wasm.
-    new URL(`../${defaultFileName}`, import.meta.url),
-    // Development source: src/*.ts -> dist/*.wasm.
-    new URL(`../dist/${defaultFileName}`, import.meta.url),
-  ];
-
-  for (const path of defaultPaths) {
-    try {
-      const response = await fetch(path);
-      if (response.ok) {
-        // Note: Bun's fetch can return ok=true for file:// URLs even if file doesn't exist
-        // The actual error is thrown when reading the body
-        return await response.arrayBuffer();
-      }
-    } catch {
-      // Try next
-    }
-  }
-
-  return undefined;
 }
