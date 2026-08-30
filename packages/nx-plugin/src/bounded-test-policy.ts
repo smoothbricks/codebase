@@ -136,16 +136,23 @@ export function checkWorkspaceBoundedTestTargetPolicy(
 }
 
 /**
- * A cargo workspace's `test` aggregate MUST reach `cargo-test`.
+ * A cargo workspace's `test` aggregate MUST reach `cargo-test`, and `cargo-test`
+ * must actually RUN tests.
  *
- * Inference already wires `test` to `cargo-test` (see `index.ts`), but
- * `targetDefaults.test.dependsOn` in `nx.json` REPLACES an inferred `dependsOn`
- * rather than merging with it, and a package-local `nx.targets.test` replaces it
- * outright. Either path silently drops every Rust test from the aggregate the
- * gate runs, and the result is green: `nx test <project>` on a cargo workspace
- * reported success having executed nothing. Only project-level config outranks
- * `targetDefaults`, so the fix is per-project and therefore forgettable — hence
- * this check.
+ * Inference wires `test` to `cargo-test` (see `index.ts`), but two things unwire
+ * it silently and both leave the target green:
+ *
+ * 1. `targetDefaults.test.dependsOn` in `nx.json` REPLACES an inferred
+ *    `dependsOn` rather than merging, and a package-local `nx.targets.test`
+ *    replaces it outright. `nx test <project>` then executes nothing.
+ * 2. A PARTIAL package-local override of `cargo-test` itself replaces the whole
+ *    inferred target, not just the named field: declaring only `dependsOn`
+ *    leaves `executor: nx:noop` with empty options, so `cargo-test` still
+ *    "reaches" its dependencies while no test binary is ever run. Reachability
+ *    alone cannot see this, because `cargo-test-compile` is `--no-run`.
+ *
+ * So this checks both: `test` reaches `cargo-test`, AND some target in
+ * `cargo-test`'s closure actually executes tests rather than only compiling them.
  */
 export function checkWorkspaceCargoTestReachabilityPolicy(
   root: string,
@@ -166,16 +173,60 @@ export function checkWorkspaceCargoTestReachabilityPolicy(
     if (!resolvedProject?.targets?.has(CARGO_TEST_TARGET) || !resolvedProject.targets.has('test')) {
       continue;
     }
+    const scope = projectJson ? 'targets' : 'nx.targets';
+    const path = projectJson ? projectJsonPath : packageJsonPath;
     if (!resolvedTargetReaches(resolvedProject, 'test', CARGO_TEST_TARGET)) {
       issues.push({
-        path: projectJson ? projectJsonPath : packageJsonPath,
+        path,
         message:
-          `${projectJson ? 'targets' : 'nx.targets'}.test must depend on ${CARGO_TEST_TARGET} ` +
+          `${scope}.test must depend on ${CARGO_TEST_TARGET} ` +
           'so the Rust tests run in the test aggregate; nx.json targetDefaults replaces the inferred dependsOn',
+      });
+    } else if (!resolvedTargetRunsTests(resolvedProject, CARGO_TEST_TARGET)) {
+      issues.push({
+        path,
+        message:
+          `${scope}.${CARGO_TEST_TARGET} reaches no target that RUNS tests — only ones that compile them. ` +
+          'A partial override replaces the whole inferred target, leaving nx:noop with empty options',
       });
     }
   }
   return issues;
+}
+
+/**
+ * True when `target`, or something in its dependency closure, invokes cargo in a
+ * mode that executes tests. `cargo-test-compile` is deliberately excluded: it is
+ * `cargo test --no-run`, so it proves the binaries build and nothing about them
+ * running.
+ */
+function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string): boolean {
+  const visiting = new Set<string>();
+  const visit = (targetName: string): boolean => {
+    if (visiting.has(targetName) || !project.targets.has(targetName)) {
+      return false;
+    }
+    visiting.add(targetName);
+    const command = commandOf(project, targetName);
+    const runs = command !== undefined && /\btest\b|\bnextest\b/.test(command) && !command.includes('--no-run');
+    const reached =
+      runs ||
+      (project.targetDependencies?.get(targetName) ?? []).some((dependency) =>
+        matchingResolvedTargets(dependency, project.targets).some(visit),
+      );
+    visiting.delete(targetName);
+    return reached;
+  };
+  return visit(target);
+}
+
+function commandOf(project: ResolvedProjectTargets, targetName: string): string | undefined {
+  const options = project.targetOptions?.get(targetName);
+  if (options === undefined || options === null) {
+    return undefined;
+  }
+  const command = (options as Record<string, unknown>).command;
+  return typeof command === 'string' ? command : undefined;
 }
 
 function resolvedTargetReaches(project: ResolvedProjectTargets, from: string, goal: string): boolean {
