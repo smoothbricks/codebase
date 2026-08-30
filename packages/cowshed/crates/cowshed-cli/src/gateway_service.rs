@@ -3,8 +3,8 @@ use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, plan_executable_install,
-    plan_executable_remove, plan_install, plan_remove,
+    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, kickstart_hint,
+    plan_executable_install, plan_executable_remove, plan_install, plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
@@ -261,7 +261,7 @@ where
                     "gateway did not become healthy within {}s of starting",
                     START_DEADLINE.as_secs()
                 ),
-                kickstart_hint(uid),
+                kickstart_hint(uid, GATEWAY_LABEL),
             ));
         }
         if let Some(line) = progress.line(waited) {
@@ -864,12 +864,6 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     })
 }
 
-/// Restarting an already-installed agent, for guidance that follows a
-/// successful install.
-fn kickstart_hint(uid: u32) -> String {
-    format!("launchctl kickstart -k gui/{uid}/{GATEWAY_LABEL}")
-}
-
 pub(crate) fn launchd_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::internal(format!("LaunchAgent operation failed: {error}"))
 }
@@ -945,7 +939,7 @@ mod tests {
     #[test]
     fn kickstart_guidance_targets_the_per_user_domain() {
         assert_eq!(
-            kickstart_hint(501),
+            kickstart_hint(501, GATEWAY_LABEL),
             "launchctl kickstart -k gui/501/dev.cowshed.gateway"
         );
     }
