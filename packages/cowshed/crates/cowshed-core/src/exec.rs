@@ -114,6 +114,19 @@ pub struct SpawnFailure {
     pub source: io::Error,
 }
 
+impl From<SpawnFailure> for ExecError {
+    fn from(failure: SpawnFailure) -> Self {
+        Self::WrapperFailure {
+            stage: failure.stage,
+            message: format!(
+                "sandbox wrapper failed during {:?}: {}",
+                failure.stage, failure.source
+            ),
+            source: Some(failure.source),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemSpawnRunner;
 
@@ -317,16 +330,7 @@ pub fn execute_with<R: SpawnRunner>(
     runner: &R,
 ) -> Result<ExecOutcome, ExecError> {
     let plan = plan_exec(request, sandbox)?;
-    let status = runner
-        .run(&plan)
-        .map_err(|failure| ExecError::WrapperFailure {
-            stage: failure.stage,
-            message: format!(
-                "sandbox wrapper failed during {:?}: {}",
-                failure.stage, failure.source
-            ),
-            source: Some(failure.source),
-        })?;
+    let status = runner.run(&plan).map_err(ExecError::from)?;
     Ok(ExecOutcome { status })
 }
 
