@@ -707,9 +707,9 @@ impl ArtifactStore {
         record: JobArtifactRecord,
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
         let path = records_path(&self.workspace_root);
-        let _lock = RecordsLock::acquire(&path)?;
-        let recovery = recover_records_with_budget_unlocked(
-            &path,
+        let lock = RecordsLock::acquire(&path)?;
+        let recovery = recover_records_with_budget_under_lock(
+            &lock,
             self.config.retained_recovery_budget_bytes,
             SequencePolicy::Strict,
         )?;
@@ -748,7 +748,7 @@ impl ArtifactStore {
         let batch = protected_record_to_batch(&ProtectedRecord::Job(record.clone()))?;
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
-        append_framed_batch_unlocked(&path, &payload, digest, None)?;
+        append_framed_batch_under_lock(&lock, &payload, digest, None)?;
         if !matches!(record.state, JobState::Queued | JobState::Running) {
             self.committed_jobs.insert(record.job_id, record.clone());
         }
@@ -775,9 +775,9 @@ impl ArtifactStore {
             visible.insert(job_id, commitment);
         }
         let path = records_path(&self.workspace_root);
-        let _lock = RecordsLock::acquire(&path)?;
-        let recovery = recover_records_with_budget_unlocked(
-            &path,
+        let lock = RecordsLock::acquire(&path)?;
+        let recovery = recover_records_with_budget_under_lock(
+            &lock,
             self.config.retained_recovery_budget_bytes,
             SequencePolicy::Strict,
         )?;
@@ -819,7 +819,12 @@ impl ArtifactStore {
             protected_record_to_batch(&ProtectedRecord::CheckpointManifest(record.clone()))?;
         let payload = encode_batch(&batch)?;
         let manifest_batch_sha256 = Sha256Digest::compute(&payload);
-        append_framed_batch_unlocked(&path, &payload, manifest_batch_sha256, None)?;
+        append_framed_batch_under_lock(
+            &lock,
+            &payload,
+            manifest_batch_sha256,
+            None,
+        )?;
         Ok(SealedCheckpointManifest {
             record,
             manifest_batch_sha256,
@@ -1942,12 +1947,13 @@ fn records_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".cowshed/job/records.arrow")
 }
 
-struct RecordsLock {
+struct RecordsLock<'path> {
     _file: File,
+    records: &'path Path,
 }
 
-impl RecordsLock {
-    fn acquire(records: &Path) -> Result<Self, ArtifactError> {
+impl<'path> RecordsLock<'path> {
+    fn acquire(records: &'path Path) -> Result<Self, ArtifactError> {
         verify_records_layout(records)?;
         let workspace_root = records
             .parent()
@@ -1955,6 +1961,12 @@ impl RecordsLock {
             .and_then(Path::parent)
             .ok_or_else(|| integrity(0, "records path has no workspace root"))?;
         let job_root = ensure_private_job_root(workspace_root)?;
+        // WHY lock: packages/containium-bun/clippy.toml:8 / Containium 90 §1 prefers one
+        // actor writer. Here independent CLI and embedding processes have no shared always-live
+        // owner; choosing an actor would invent a daemon availability boundary. Sequence allocation
+        // and the framed byte append must be one atomic operation across processes. The guard also
+        // spans recovery, terminal duplicate validation, the whole append and rollback; narrowing
+        // it recreates the duplicate-allocation or torn-recovery race.
         let path = job_root.join("records.lock");
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
@@ -1987,7 +1999,10 @@ impl RecordsLock {
         return Err(ArtifactError::InvalidConfig(
             "cross-process artifact locking requires Unix flock",
         ));
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            records,
+        })
     }
 }
 
@@ -2192,16 +2207,17 @@ fn append_framed_batch_impl(
     digest: Sha256Digest,
     fail_after_bytes: Option<usize>,
 ) -> Result<(), ArtifactError> {
-    let _lock = RecordsLock::acquire(path)?;
-    append_framed_batch_unlocked(path, payload, digest, fail_after_bytes)
+    let lock = RecordsLock::acquire(path)?;
+    append_framed_batch_under_lock(&lock, payload, digest, fail_after_bytes)
 }
 
-fn append_framed_batch_unlocked(
-    path: &Path,
+fn append_framed_batch_under_lock(
+    lock: &RecordsLock<'_>,
     payload: &[u8],
     digest: Sha256Digest,
     mut fail_after_bytes: Option<usize>,
 ) -> Result<(), ArtifactError> {
+    let path = lock.records;
     let payload_len = u64::try_from(payload.len())
         .map_err(|_| ArtifactError::Arrow("record batch is too large".into()))?;
     if payload_len > MAX_RECORD_BATCH_BYTES {
@@ -2308,8 +2324,12 @@ pub fn recover_records_with_budget(
     path: &Path,
     retained_budget_bytes: usize,
 ) -> Result<RecoveryReport, ArtifactError> {
-    let _lock = RecordsLock::acquire(path)?;
-    recover_records_with_budget_unlocked(path, retained_budget_bytes, SequencePolicy::Strict)
+    let lock = RecordsLock::acquire(path)?;
+    recover_records_with_budget_under_lock(
+        &lock,
+        retained_budget_bytes,
+        SequencePolicy::Strict,
+    )
 }
 
 enum SequencePolicy<'a> {
@@ -2317,11 +2337,12 @@ enum SequencePolicy<'a> {
     Collect(&'a mut Vec<RecordSequenceViolation>),
 }
 
-fn recover_records_with_budget_unlocked(
-    path: &Path,
+fn recover_records_with_budget_under_lock(
+    lock: &RecordsLock<'_>,
     retained_budget_bytes: usize,
     mut sequence_policy: SequencePolicy<'_>,
 ) -> Result<RecoveryReport, ArtifactError> {
+    let path = lock.records;
     if retained_budget_bytes == 0 {
         return Err(ArtifactError::InvalidConfig(
             "retained recovery budget must be positive",
@@ -3820,10 +3841,10 @@ pub fn repair_workspace_record_sequences(
     retained_budget_bytes: usize,
 ) -> Result<ArtifactRepairReport, ArtifactError> {
     let path = records_path(workspace_root);
-    let _lock = RecordsLock::acquire(&path)?;
+    let lock = RecordsLock::acquire(&path)?;
     let mut violations = Vec::new();
-    let recovery = recover_records_with_budget_unlocked(
-        &path,
+    let recovery = recover_records_with_budget_under_lock(
+        &lock,
         retained_budget_bytes,
         SequencePolicy::Collect(&mut violations),
     )?;
@@ -3931,7 +3952,11 @@ pub fn repair_workspace_record_sequences(
     drop(file);
     fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
     sync_parent_directory(&path)?;
-    recover_records_with_budget_unlocked(&path, retained_budget_bytes, SequencePolicy::Strict)?;
+    recover_records_with_budget_under_lock(
+        &lock,
+        retained_budget_bytes,
+        SequencePolicy::Strict,
+    )?;
 
     Ok(ArtifactRepairReport {
         records_path: path,
