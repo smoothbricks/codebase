@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -246,42 +246,137 @@ where
         .map_err(NativeBootstrapError::Execution)
 }
 
+/// One classification of a host operation. ExistingOnly and read-only validation
+/// keep distinct policies; they both match this enum so a new `HostOperation`
+/// variant cannot compile in one table and vanish from the other.
+enum HostOperationClass<'a> {
+    GuardMountpoint,
+    VerifyZfsDelegation {
+        required_root: &'a str,
+    },
+    EnsureDirectory(&'a Path),
+    ReclaimMountpoint(&'a Path),
+    MountApfsVolume {
+        mountpoint: &'a Path,
+    },
+    RunCommand {
+        command: &'a HostCommand,
+        unprivileged_remount: bool,
+    },
+    ProvisionApfsVolumes {
+        volumes: &'a [ApfsVolumeProvision],
+    },
+    WriteMarkerAtomic {
+        path: &'a Path,
+    },
+    PinVolumesInFstab,
+    ReportVolumeIssue {
+        detail: &'a str,
+    },
+}
+
+fn classify_operation(operation: &HostOperation) -> HostOperationClass<'_> {
+    match operation {
+        HostOperation::GuardMountpoint { .. } => HostOperationClass::GuardMountpoint,
+        HostOperation::VerifyZfsDelegation { required_root, .. } => {
+            HostOperationClass::VerifyZfsDelegation { required_root }
+        }
+        HostOperation::EnsureDirectory(path) => HostOperationClass::EnsureDirectory(path),
+        HostOperation::ReclaimMountpoint(path) => HostOperationClass::ReclaimMountpoint(path),
+        HostOperation::MountApfsVolume { mountpoint, .. } => {
+            HostOperationClass::MountApfsVolume { mountpoint }
+        }
+        HostOperation::RunCommand(command) => HostOperationClass::RunCommand {
+            command,
+            unprivileged_remount: is_unprivileged_apfs_remount(command),
+        },
+        HostOperation::ProvisionApfsVolumes { volumes, .. } => {
+            HostOperationClass::ProvisionApfsVolumes { volumes }
+        }
+        HostOperation::WriteMarkerAtomic { path, .. } => {
+            HostOperationClass::WriteMarkerAtomic { path }
+        }
+        HostOperation::PinVolumesInFstab { .. } => HostOperationClass::PinVolumesInFstab,
+        HostOperation::ReportVolumeIssue { detail, .. } => {
+            HostOperationClass::ReportVolumeIssue { detail }
+        }
+    }
+}
+
+fn provision_volumes_action(volumes: &[ApfsVolumeProvision]) -> String {
+    format!(
+        "create APFS volumes {}",
+        volumes
+            .iter()
+            .map(ApfsVolumeProvision::name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn write_marker_action(path: &Path) -> String {
+    format!("write volume marker {}", path.display())
+}
+
+const PIN_FSTAB_ACTION: &str = "pin cowshed APFS volumes in /etc/fstab";
+
 pub(crate) fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
     plan.operations()
         .iter()
-        .filter_map(|operation| match operation {
-            HostOperation::VerifyZfsDelegation { .. }
-            | HostOperation::GuardMountpoint { .. }
-            | HostOperation::EnsureDirectory(_)
-            | HostOperation::ReclaimMountpoint(_)
-            | HostOperation::MountApfsVolume { .. }
-            | HostOperation::ReportVolumeIssue { .. } => None,
-            HostOperation::RunCommand(command) => {
-                remount_setup_action(command).map(|action| action.to_owned())
+        .filter_map(|operation| match classify_operation(operation) {
+            HostOperationClass::GuardMountpoint
+            | HostOperationClass::VerifyZfsDelegation { .. }
+            | HostOperationClass::EnsureDirectory(_)
+            | HostOperationClass::ReclaimMountpoint(_)
+            | HostOperationClass::MountApfsVolume { .. }
+            | HostOperationClass::ReportVolumeIssue { .. }
+            | HostOperationClass::RunCommand {
+                unprivileged_remount: true,
+                ..
+            } => None,
+            HostOperationClass::RunCommand {
+                unprivileged_remount: false,
+                ..
+            } => Some("run privileged host command".to_owned()),
+            HostOperationClass::ProvisionApfsVolumes { volumes } => {
+                Some(provision_volumes_action(volumes))
             }
-            HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(format!(
-                "create APFS volumes {}",
-                volumes
-                    .iter()
-                    .map(ApfsVolumeProvision::name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            HostOperation::WriteMarkerAtomic { path, .. } => {
-                Some(format!("write volume marker {}", path.display()))
-            }
-            HostOperation::PinVolumesInFstab { .. } => {
-                Some("pin cowshed APFS volumes in /etc/fstab".to_owned())
-            }
+            HostOperationClass::WriteMarkerAtomic { path } => Some(write_marker_action(path)),
+            HostOperationClass::PinVolumesInFstab => Some(PIN_FSTAB_ACTION.to_owned()),
         })
         .collect()
 }
 
-fn remount_setup_action(command: &HostCommand) -> Option<&'static str> {
-    if is_unprivileged_apfs_remount(command) {
-        return None;
-    }
-    Some("run privileged host command")
+pub(crate) fn read_only_validation_actions(plan: &BootstrapPlan) -> Vec<String> {
+    plan.operations()
+        .iter()
+        .filter_map(|operation| match classify_operation(operation) {
+            HostOperationClass::GuardMountpoint => None,
+            HostOperationClass::VerifyZfsDelegation { required_root } => {
+                Some(format!("verify delegated ZFS root {required_root}"))
+            }
+            HostOperationClass::EnsureDirectory(path) => {
+                Some(format!("create mountpoint {}", path.display()))
+            }
+            HostOperationClass::ReclaimMountpoint(path) => {
+                Some(format!("reclaim mountpoint {}", path.display()))
+            }
+            HostOperationClass::MountApfsVolume { mountpoint } => {
+                Some(format!("mount APFS volume at {}", mountpoint.display()))
+            }
+            HostOperationClass::RunCommand { command, .. } => Some(format!(
+                "run {} {}",
+                command.program(),
+                command.args().join(" ")
+            )),
+            HostOperationClass::ProvisionApfsVolumes { volumes } => {
+                Some(provision_volumes_action(volumes))
+            }
+            HostOperationClass::WriteMarkerAtomic { path } => Some(write_marker_action(path)),
+            HostOperationClass::PinVolumesInFstab => Some(PIN_FSTAB_ACTION.to_owned()),
+            HostOperationClass::ReportVolumeIssue { detail } => Some(detail.to_owned()),
+        })
+        .collect()
 }
 
 fn is_unprivileged_apfs_remount(command: &HostCommand) -> bool {

@@ -29,7 +29,7 @@ use super::shared::{
     HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode, SystemBootstrapHost,
     UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState,
     execute_native_bootstrap_plan, existing_host_storage_error, platform_host_error,
-    setup_execution_error,
+    read_only_validation_actions, setup_execution_error,
 };
 use crate::error::CowshedError;
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
@@ -6407,47 +6407,6 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(error.to_string().contains("unresponsive"));
     }
-}
-
-fn read_only_validation_actions(plan: &BootstrapPlan) -> Vec<String> {
-    plan.operations()
-        .iter()
-        .filter_map(|operation| match operation {
-            HostOperation::GuardMountpoint { .. } => None,
-            HostOperation::VerifyZfsDelegation { required_root, .. } => {
-                Some(format!("verify delegated ZFS root {required_root}"))
-            }
-            HostOperation::EnsureDirectory(path) => {
-                Some(format!("create mountpoint {}", path.display()))
-            }
-            HostOperation::ReclaimMountpoint(path) => {
-                Some(format!("reclaim mountpoint {}", path.display()))
-            }
-            HostOperation::MountApfsVolume { mountpoint, .. } => {
-                Some(format!("mount APFS volume at {}", mountpoint.display()))
-            }
-            HostOperation::RunCommand(command) => Some(format!(
-                "run {} {}",
-                command.program(),
-                command.args().join(" ")
-            )),
-            HostOperation::ProvisionApfsVolumes { volumes, .. } => Some(format!(
-                "create APFS volumes {}",
-                volumes
-                    .iter()
-                    .map(ApfsVolumeProvision::name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            HostOperation::WriteMarkerAtomic { path, .. } => {
-                Some(format!("write volume marker {}", path.display()))
-            }
-            HostOperation::PinVolumesInFstab { .. } => {
-                Some("pin cowshed APFS volumes in /etc/fstab".to_owned())
-            }
-            HostOperation::ReportVolumeIssue { detail, .. } => Some(detail.clone()),
-        })
-        .collect()
 }
 
 fn require_host_canonical(path: &Path) -> Result<(), HostError> {
