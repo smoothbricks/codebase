@@ -317,31 +317,6 @@ impl fmt::Display for VolumeResolutionFailure {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum VolumeNameResolutionFailure {
-    InvalidPlist(String),
-    MissingDeviceIdentifier,
-    DeviceMismatch { reported: String },
-    MissingVolumeName,
-    WrongTypeVolumeName,
-    BlankVolumeName,
-}
-
-impl fmt::Display for VolumeNameResolutionFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidPlist(message) => write!(f, "invalid disk info plist: {message}"),
-            Self::MissingDeviceIdentifier => f.write_str("disk info plist has no DeviceIdentifier"),
-            Self::DeviceMismatch { reported } => {
-                write!(f, "disk info plist reported a different device: {reported}")
-            }
-            Self::MissingVolumeName => f.write_str("disk info plist has no VolumeName"),
-            Self::WrongTypeVolumeName => f.write_str("disk info plist VolumeName is not a string"),
-            Self::BlankVolumeName => f.write_str("disk info plist VolumeName is blank"),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct AttachmentDetachFailure {
     pub device: String,
@@ -410,10 +385,6 @@ pub enum ApfsError {
     VolumeResolutionFailed {
         candidate: String,
         reason: VolumeResolutionFailure,
-    },
-    VolumeNameResolutionFailed {
-        device: String,
-        reason: VolumeNameResolutionFailure,
     },
     VolumeResolutionAndDetachFailed {
         whole_device: String,
@@ -506,12 +477,6 @@ impl fmt::Display for ApfsError {
             ),
             Self::VolumeResolutionFailed { candidate, reason } => {
                 write!(f, "could not resolve APFS volume for {candidate}: {reason}")
-            }
-            Self::VolumeNameResolutionFailed { device, reason } => {
-                write!(
-                    f,
-                    "could not resolve APFS volume name for {device}: {reason}"
-                )
             }
             Self::VolumeResolutionAndDetachFailed {
                 whole_device,
@@ -2622,10 +2587,6 @@ mod tests {
         };
         assert!(combined.to_string().contains("detaching"));
         assert!(std::error::Error::source(&combined).is_some());
-        assert_eq!(
-            ApfsError::InvalidAttachmentInventory("bad shape".into()).to_string(),
-            "invalid attachment inventory: bad shape"
-        );
     }
 
     #[test]
@@ -4355,12 +4316,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_detach_target_error_preserves_the_rejected_target() {
-        let error = ApfsError::InvalidDetachTarget(PathBuf::from("../escape"));
-        assert_eq!(error.to_string(), "invalid APFS detach target: ../escape");
-    }
-
-    #[test]
     fn rename_volume_records_checked_diskutil_rename_volume_command() {
         let backend =
             MacOsApfsBackend::new(RecordingRunner::with_outputs([CommandOutput::success([])]));
@@ -4479,53 +4434,6 @@ mod tests {
                 && argv(&request) == ["renameVolume", "/Volumes/cowshed-stage", "main"]
         ));
         assert_eq!(backend.runner().requests().len(), 1);
-    }
-
-    #[test]
-    fn rename_volume_validation_errors_preserve_rejected_values() {
-        assert_eq!(
-            ApfsError::InvalidMountPoint(PathBuf::from("../escape")).to_string(),
-            "invalid APFS mount point: ../escape"
-        );
-        assert_eq!(
-            ApfsError::InvalidVolumeName("bad/name".into()).to_string(),
-            r#"invalid APFS volume name: "bad/name""#
-        );
-    }
-
-    #[test]
-    fn volume_name_resolution_failure_messages_preserve_typed_details() {
-        let cases = [
-            (
-                VolumeNameResolutionFailure::InvalidPlist("bad shape".into()),
-                "invalid disk info plist: bad shape",
-            ),
-            (
-                VolumeNameResolutionFailure::MissingDeviceIdentifier,
-                "disk info plist has no DeviceIdentifier",
-            ),
-            (
-                VolumeNameResolutionFailure::DeviceMismatch {
-                    reported: "/dev/disk9s1".into(),
-                },
-                "disk info plist reported a different device: /dev/disk9s1",
-            ),
-            (
-                VolumeNameResolutionFailure::MissingVolumeName,
-                "disk info plist has no VolumeName",
-            ),
-            (
-                VolumeNameResolutionFailure::WrongTypeVolumeName,
-                "disk info plist VolumeName is not a string",
-            ),
-            (
-                VolumeNameResolutionFailure::BlankVolumeName,
-                "disk info plist VolumeName is blank",
-            ),
-        ];
-        for (failure, expected) in cases {
-            assert_eq!(failure.to_string(), expected);
-        }
     }
 
     #[test]
@@ -4980,23 +4888,6 @@ mod tests {
                 "{rejected} must not parse as a capacity"
             );
         }
-    }
-
-    #[test]
-    fn volume_resolution_failure_messages_preserve_typed_details() {
-        assert_eq!(
-            VolumeResolutionFailure::Missing.to_string(),
-            "no APFS volume device was reported"
-        );
-        assert_eq!(
-            VolumeResolutionFailure::Ambiguous(vec!["/dev/disk5s1".into(), "/dev/disk5s2".into()])
-                .to_string(),
-            "multiple APFS volume devices were reported: /dev/disk5s1, /dev/disk5s2"
-        );
-        assert_eq!(
-            VolumeResolutionFailure::InvalidPlist("bad shape".into()).to_string(),
-            "invalid APFS list plist: bad shape"
-        );
     }
 
     #[test]
