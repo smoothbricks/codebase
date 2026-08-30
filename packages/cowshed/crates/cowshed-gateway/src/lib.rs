@@ -27,7 +27,7 @@ pub use cache::{
     DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, ObjectDigest, ObjectExpectation,
 };
 pub use config::{
-    ConfigError, ControlTcpConfig, GatewayConfig, GatewayLimits, GatewayTimeouts,
+    CONTROL_TCP_ADDR, ConfigError, ControlTcpConfig, GatewayConfig, GatewayLimits, GatewayTimeouts,
     MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorCacheConfig, TOKEN_BYTES,
     WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken,
 };
