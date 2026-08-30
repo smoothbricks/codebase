@@ -46,6 +46,9 @@ const RECORDS_FILE: &str = "records.arrow";
 const RECORD_SEQUENCE_FILE: &str = "records.sequence";
 const RECORD_SEQUENCE_MAGIC: &[u8; 8] = b"CSSEQ001";
 const RECORD_SEQUENCE_BYTES: usize = 24;
+const CHECKPOINT_BARRIER_FILE_PREFIX: &str = "records.barrier.";
+const CHECKPOINT_BARRIER_MAGIC: &[u8; 8] = b"CSBAR001";
+const CHECKPOINT_BARRIER_BYTES: usize = 24;
 const RECORD_SCHEMA_VERSION: u64 = 2;
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
@@ -617,6 +620,7 @@ impl ArtifactStore {
             }
         }
         ensure_record_sequence_counter(&lock, &recovery)?;
+        ensure_checkpoint_barrier_counter(&lock, &recovery, &workspace_incarnation)?;
         drop(lock);
         let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
         Ok(Self {
@@ -751,10 +755,10 @@ impl ArtifactStore {
     }
 
     /// Take the checkpoint artifact barrier: force every visible stream prefix durable and append
-    /// the manifest. The store allocates the barrier id by continuing the durable sequence
-    /// replayed from this incarnation's manifests — the same ownership as job ids — so a
-    /// checkpoint that fails after its barrier merely skips an id instead of leaving a consumed
-    /// id that every later checkpoint trips over.
+    /// the manifest. The store allocates the barrier id from this incarnation's durable barrier
+    /// counter — the same ownership as job record sequences — so a checkpoint that fails after its
+    /// barrier merely skips an id instead of leaving a consumed id that every later checkpoint
+    /// trips over.
     pub fn checkpoint(&mut self) -> Result<SealedCheckpointManifest, ArtifactError> {
         let mut visible = self
             .committed_jobs
@@ -771,27 +775,12 @@ impl ArtifactStore {
         }
         let path = records_path(&self.workspace_root);
         let lock = RecordsLock::acquire(&path)?;
-        let recovery = recover_records_with_budget_under_lock(
-            &lock,
-            self.config.retained_recovery_budget_bytes,
-        )?;
-        let barrier_id = recovery
-            .frames
-            .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::CheckpointManifest(manifest)
-                    if manifest.origin_incarnation == self.workspace_incarnation =>
-                {
-                    Some(manifest.barrier_id)
-                }
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(ArtifactError::InvalidConfig(
-                "checkpoint barrier allocation exhausted",
-            ))?;
+        // Recovery is the tail repair for this path, not its allocator: it truncates an incomplete
+        // frame under this lock, before `records_sha256` hashes the file and before the manifest is
+        // appended. Appending over a partial frame would make every later recovery truncate this
+        // manifest — and everything after it — away.
+        recover_records_with_budget_under_lock(&lock, self.config.retained_recovery_budget_bytes)?;
+        let barrier_id = allocate_checkpoint_barrier(&lock, &self.workspace_incarnation)?;
         let records_sha256 = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.len() == 0 => Sha256Digest::compute(RECORD_MAGIC),
             Ok(_) => hash_file_incrementally(&path)?,
@@ -2113,6 +2102,156 @@ fn allocate_record_sequence(lock: &RecordsLock<'_>) -> Result<u64, ArtifactError
     // Publish before appending: a crash may leave a gap, but can never hand the allocation out
     // twice. Both writes remain under the same cross-process lock.
     publish_record_sequence_counter(lock, next)?;
+    Ok(next)
+}
+
+/// The barrier counter is scoped to one incarnation: barrier ids are dense and start at 1 for
+/// every incarnation, so a clone that inherits an ancestor's records — and its ancestor's counter
+/// file — must still begin its own sequence at 1. The incarnation is 32 lowercase hex characters,
+/// so it is a safe single path component and no two incarnations can name the same counter.
+fn checkpoint_barrier_path(
+    lock: &RecordsLock<'_>,
+    incarnation: &WorkspaceIncarnation,
+) -> Result<PathBuf, ArtifactError> {
+    let job_root = lock
+        .records
+        .parent()
+        .ok_or_else(|| integrity(0, "records path has no job parent"))?;
+    Ok(job_root.join(format!(
+        "{CHECKPOINT_BARRIER_FILE_PREFIX}{}",
+        incarnation.as_str()
+    )))
+}
+
+fn highest_checkpoint_barrier(
+    recovery: &RecoveryReport,
+    incarnation: &WorkspaceIncarnation,
+) -> u64 {
+    recovery
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            ProtectedRecord::CheckpointManifest(manifest)
+                if manifest.origin_incarnation == *incarnation =>
+            {
+                Some(manifest.barrier_id)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn read_checkpoint_barrier_counter(
+    lock: &RecordsLock<'_>,
+    incarnation: &WorkspaceIncarnation,
+) -> Result<Option<u64>, ArtifactError> {
+    let path = checkpoint_barrier_path(lock, incarnation)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(&path, error)),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(integrity(
+            0,
+            "checkpoint barrier counter is not a regular protected file",
+        ));
+    }
+    reject_hardlink(&path, &metadata)?;
+    verify_private_file_mode(&path, &metadata, false)?;
+    let bytes = fs::read(&path).map_err(|error| io_error(&path, error))?;
+    if bytes.len() != CHECKPOINT_BARRIER_BYTES || &bytes[..8] != CHECKPOINT_BARRIER_MAGIC {
+        return Err(integrity(
+            0,
+            "checkpoint barrier counter encoding is invalid",
+        ));
+    }
+    let current = u64::from_le_bytes(
+        bytes[8..16]
+            .try_into()
+            .expect("validated checkpoint barrier counter has eight value bytes"),
+    );
+    let complement = u64::from_le_bytes(
+        bytes[16..24]
+            .try_into()
+            .expect("validated checkpoint barrier counter has eight complement bytes"),
+    );
+    if complement != !current {
+        return Err(integrity(
+            0,
+            "checkpoint barrier counter complement is invalid",
+        ));
+    }
+    Ok(Some(current))
+}
+
+fn publish_checkpoint_barrier_counter(
+    lock: &RecordsLock<'_>,
+    incarnation: &WorkspaceIncarnation,
+    current: u64,
+) -> Result<(), ArtifactError> {
+    let path = checkpoint_barrier_path(lock, incarnation)?;
+    let mut bytes = [0_u8; CHECKPOINT_BARRIER_BYTES];
+    bytes[..8].copy_from_slice(CHECKPOINT_BARRIER_MAGIC);
+    bytes[8..16].copy_from_slice(&current.to_le_bytes());
+    bytes[16..24].copy_from_slice(&(!current).to_le_bytes());
+    crate::fsio::publish_private_file::<io::Error>(&path, |writer| writer.write_all(&bytes))
+        .map_err(|error| match error {
+            crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
+            crate::fsio::PublishError::Write(source) => io_error(&path, source),
+        })
+}
+
+fn ensure_checkpoint_barrier_counter(
+    lock: &RecordsLock<'_>,
+    recovery: &RecoveryReport,
+    incarnation: &WorkspaceIncarnation,
+) -> Result<(), ArtifactError> {
+    let observed = highest_checkpoint_barrier(recovery, incarnation);
+    match read_checkpoint_barrier_counter(lock, incarnation)? {
+        Some(durable) if durable < observed => Err(integrity(
+            0,
+            &format!(
+                "checkpoint barrier counter {durable} trails durable checkpoint barrier {observed}"
+            ),
+        )),
+        Some(_) => Ok(()),
+        None if recovery.truncated_bytes != 0 => Err(integrity(
+            0,
+            "cannot initialize checkpoint barrier counter after an incomplete tail; create a fresh store",
+        )),
+        None => {
+            // An incarnation that has never checkpointed here observes zero and starts at 1; a
+            // pre-counter store is migrated once from its own manifests. Either way the counter is
+            // published while holding the append lock, so from here on checkpoints never derive a
+            // barrier from recovered frames and tail loss can only leave the counter ahead of the
+            // log, which preserves monotonic allocation.
+            publish_checkpoint_barrier_counter(lock, incarnation, observed)
+        }
+    }
+}
+
+fn allocate_checkpoint_barrier(
+    lock: &RecordsLock<'_>,
+    incarnation: &WorkspaceIncarnation,
+) -> Result<u64, ArtifactError> {
+    // Opening the store publishes this incarnation's counter, so its absence is the same integrity
+    // fault as a missing record sequence counter: the file that names every barrier already handed
+    // out is gone, and the log alone cannot say what it held — a lost tail erases exactly the
+    // manifests whose barriers a fold would need.
+    let durable = read_checkpoint_barrier_counter(lock, incarnation)?.ok_or_else(|| {
+        integrity(
+            0,
+            "checkpoint barrier counter is missing after store initialization",
+        )
+    })?;
+    let next = durable.checked_add(1).ok_or(ArtifactError::InvalidConfig(
+        "checkpoint barrier allocation exhausted",
+    ))?;
+    // Publish before appending: a crash may leave a gap, but can never hand the barrier out twice.
+    // Both writes remain under the same cross-process lock.
+    publish_checkpoint_barrier_counter(lock, incarnation, next)?;
     Ok(next)
 }
 
