@@ -405,7 +405,7 @@ fn image_name(file_name: &str) -> Option<(&str, ImageFormat)> {
 /// Days since 1970-01-01 to a proleptic-Gregorian civil date (Howard Hinnant's algorithm,
 /// restricted to the non-negative domain). Total over every `u64` second count, unlike
 /// `libc::gmtime_r`, which rejects out-of-range `time_t` — a label generator must not fail.
-const fn civil_from_days(days: u64) -> (u64, u64, u64) {
+pub(crate) const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
     let era = z / 146_097;
     let day_of_era = z % 146_097;
