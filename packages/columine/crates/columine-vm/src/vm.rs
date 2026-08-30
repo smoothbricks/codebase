@@ -32,8 +32,9 @@ use crate::undo_log::{
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
-    PROGRAM_HEADER_SIZE, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
-    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, struct_field_size,
+    PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC,
+    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
+    struct_field_size,
 };
 use core::sync::atomic::Ordering;
 
@@ -2678,20 +2679,25 @@ impl Vm {
             return INVALID_PROGRAM;
         }
         let content = &program[PROGRAM_HASH_PREFIX as usize..];
-        if !state_init::accepts_program_magic(
-            bytes::read_u32(content, 0),
-            self.accepted_program_magics,
-        ) {
+        let Some(header_bytes) = content
+            .get(..ProgramHeader::WIRE_SIZE)
+            .and_then(|bytes| <[u8; ProgramHeader::WIRE_SIZE]>::try_from(bytes).ok())
+        else {
+            return INVALID_PROGRAM;
+        };
+        let header = ProgramHeader::from_wire_bytes(header_bytes);
+        if !state_init::accepts_program_magic(header.magic, self.accepted_program_magics) {
             return INVALID_PROGRAM;
         }
-        // Content header: magic(4) version(2) numSlots(1) numInputs(1)
-        // reserved(2) initLen(2) reduceLen(2) = 14 bytes.
-        let init_len = u32::from(bytes::read_u16(content, 10));
-        let reduce_len = u32::from(bytes::read_u16(content, 12));
-        if PROGRAM_HEADER_SIZE + init_len + reduce_len > program.len() as u32 {
+        let init_len = u32::from(header.init_code_len);
+        let reduce_len = u32::from(header.reduce_code_len);
+        if PROGRAM_HASH_PREFIX + ProgramHeader::WIRE_SIZE as u32 + init_len + reduce_len
+            > program.len() as u32
+        {
             return INVALID_PROGRAM;
         }
-        let code = &content[(14 + init_len) as usize..(14 + init_len + reduce_len) as usize];
+        let code_start = ProgramHeader::WIRE_SIZE + init_len as usize;
+        let code = &content[code_start..code_start + reduce_len as usize];
 
         let mut pc = 0usize;
         while pc < code.len() {
