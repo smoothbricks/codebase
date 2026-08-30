@@ -411,13 +411,17 @@ impl ColumnStorage {
         Some(&self.bool_data.as_ref()?[..(row_count as usize).div_ceil(8)])
     }
 
-    pub fn read_fixed_i32(&self, row: u32) -> Option<u32> {
+    /// Read the raw four-byte plane of a 32-bit column.
+    pub fn read_fixed_i32(&self, row: u32) -> Option<i32> {
         let fixed = self.fixed.as_ref()?;
         let start = row as usize * 4;
-        Some(u32::from_le_bytes(fixed[start..start + 4].try_into().ok()?))
+        Some(i32::from_le_bytes(fixed[start..start + 4].try_into().ok()?))
     }
     pub fn read_fixed_i64(&self, row: u32) -> Option<i64> {
         let fixed = self.fixed.as_ref()?;
+        // A four-byte plane holds a signed Int32 (the only logical type that
+        // maps to `ArrowType::Int32`), so widening must sign-extend. Reading
+        // it unsigned turns every negative cell into a large positive one.
         if self.fixed_width == 4 {
             return self.read_fixed_i32(row).map(i64::from);
         }
@@ -675,8 +679,7 @@ impl DynamicColumns {
         Ok(())
     }
 
-    /// Append a physical 32-bit value. Negative signed values and the full
-    /// UInt32 domain share the same four-byte Arrow representation.
+    /// Append a signed 32-bit value into a four-byte plane.
     pub fn append_int32(&mut self, col_idx: u32, value: i64) -> Result<(), ParseError> {
         if self
             .columns
@@ -698,10 +701,11 @@ impl DynamicColumns {
         let fixed = col.fixed.as_mut().ok_or(ParseError::InvalidFieldType)?;
         match (col.col_type, col.fixed_width) {
             (ColumnType::Int64, 4) => {
-                if !(i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&value) {
-                    return Err(ParseError::InvalidFieldType);
-                }
-                fixed[row_idx * 4..row_idx * 4 + 4].copy_from_slice(&(value as u32).to_le_bytes());
+                // A four-byte plane is a signed Int32. Accepting the unsigned
+                // upper half would store a value that no reader of this
+                // column can name.
+                let narrow = i32::try_from(value).map_err(|_| ParseError::InvalidFieldType)?;
+                fixed[row_idx * 4..row_idx * 4 + 4].copy_from_slice(&narrow.to_le_bytes());
             }
             (ColumnType::Int64, 8) => {
                 fixed[row_idx * 8..row_idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
@@ -955,6 +959,35 @@ mod tests {
             cols.end_row();
         }
         assert_eq!(cols.count, 3);
+    }
+
+    /// A four-byte plane is a signed Int32 end to end: what is appended is
+    /// what is read back, and the unsigned upper half is refused rather than
+    /// stored as a value no reader can name.
+    #[test]
+    fn int32_column_is_signed_end_to_end() {
+        let fields = [field(ArrowType::Int32, false)];
+        let mut cols = DynamicColumns::new(&fields, 8);
+        for value in [0, -1, i64::from(i32::MIN), i64::from(i32::MAX)] {
+            assert!(cols.begin_row());
+            cols.append_int32(0, value).unwrap();
+            cols.end_row();
+        }
+        let plane = &cols.columns[0];
+        assert_eq!(plane.read_fixed_i64(0).unwrap(), 0);
+        assert_eq!(plane.read_fixed_i64(1).unwrap(), -1);
+        assert_eq!(plane.read_fixed_i64(2).unwrap(), i64::from(i32::MIN));
+        assert_eq!(plane.read_fixed_i64(3).unwrap(), i64::from(i32::MAX));
+
+        assert!(cols.begin_row());
+        assert_eq!(
+            cols.append_int32(0, i64::from(i32::MAX) + 1),
+            Err(ParseError::InvalidFieldType)
+        );
+        assert_eq!(
+            cols.append_int32(0, i64::from(i32::MIN) - 1),
+            Err(ParseError::InvalidFieldType)
+        );
     }
 
     // test "DynamicColumns - reset for reuse"

@@ -386,8 +386,8 @@ mod tests {
     use crate::record_batch::{MetadataLimits, MetadataStorage};
     use crate::schema::{ArrowType, DynamicSchemaConfig, SignalSchemaField};
     use arrow_array::{
-        Array, BinaryArray, BooleanArray, Float64Array, Int64Array, NullArray, StringArray,
-        UInt32Array,
+        Array, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, NullArray,
+        StringArray,
     };
     use arrow_ipc::reader::StreamReader;
     use arrow_ipc::writer::StreamWriter;
@@ -528,7 +528,7 @@ mod tests {
             SignalSchemaField::new(ArrowType::Null, true),
         ];
         let schema = Schema::new(vec![
-            Field::new("u32", DataType::UInt32, false),
+            Field::new("i32", DataType::Int32, false),
             Field::new("f64", DataType::Float64, true),
             Field::new("i64", DataType::Int64, false),
             Field::new("binary", DataType::Binary, true),
@@ -545,9 +545,11 @@ mod tests {
         let config = DynamicSchemaConfig::new(&encoded_schema, &fields).unwrap();
         assert_eq!(config.compute_buffer_count(), 14);
 
-        let u32_data = [0u32, 1 << 31, u32::MAX]
+        // Same four-byte plane, named honestly: the extreme cells are the
+        // signed boundaries, which is what a reader of this column gets.
+        let i32_data = [0_i32, i32::MIN, -1]
             .into_iter()
-            .flat_map(u32::to_le_bytes)
+            .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
         let f64_data = [1.5f64, 0.0, f64::NEG_INFINITY]
             .into_iter()
@@ -576,7 +578,7 @@ mod tests {
             &mut output,
             &mut metadata,
             |index| match index {
-                0 => Ok(DynamicColumn::int32(0, false, None, &u32_data)),
+                0 => Ok(DynamicColumn::int32(0, false, None, &i32_data)),
                 1 => Ok(DynamicColumn::float64(1, true, Some(&validity), &f64_data)),
                 2 => Ok(DynamicColumn::int64(2, false, None, &i64_data)),
                 3 => Ok(DynamicColumn::binary(
@@ -617,12 +619,12 @@ mod tests {
         let batch = reader.next().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 3);
 
-        let u32s = batch
+        let i32s = batch
             .column(0)
             .as_any()
-            .downcast_ref::<UInt32Array>()
+            .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(u32s.values(), &[0, 1 << 31, u32::MAX]);
+        assert_eq!(i32s.values(), &[0, i32::MIN, -1]);
         let floats = batch
             .column(1)
             .as_any()
