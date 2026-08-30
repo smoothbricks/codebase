@@ -371,9 +371,9 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     let batch = reader.next().expect("one batch").expect("valid batch");
     assert_eq!(batch.num_rows(), 4);
     assert_eq!(batch.schema().field(0).name(), "timestamp");
-    assert_eq!(batch.schema().field(22).name(), "mirror_cache_status");
     let cache_status = batch
-        .column(22)
+        .column_by_name("mirror_cache_status")
+        .expect("mirror cache status column")
         .as_any()
         .downcast_ref::<arrow_array::StringArray>()
         .expect("mirror cache status string column");
