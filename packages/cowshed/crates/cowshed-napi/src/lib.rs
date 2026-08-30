@@ -944,7 +944,9 @@ mod wire_contract;
 
 #[cfg(test)]
 mod parity_tests {
-    use cowshed_cli::args::{Command, parse_args};
+    use std::collections::BTreeSet;
+
+    use cowshed_cli::args::{COMMANDS, Command, parse_args};
     use cowshed_core::api::StdinSource;
 
     /// Compile-visible seam over core's `StdinSource`: every variant must name the JS wire field
@@ -962,6 +964,9 @@ mod parity_tests {
 
     #[test]
     fn every_core_stdin_variant_has_a_wire_verdict() {
+        // All four, not just the two that were asserted before: an unasserted arm means the JS
+        // field name it pins can be renamed without a single test going red, which is exactly
+        // what `stdinWorkspacePath` needs protecting from.
         assert_eq!(
             wire_stdin_spelling(&StdinSource::Empty),
             "omit stdin and stdinWorkspacePath"
@@ -970,73 +975,141 @@ mod parity_tests {
             wire_stdin_spelling(&StdinSource::Inline(Vec::new().into())),
             "stdin"
         );
+        assert_eq!(
+            wire_stdin_spelling(&StdinSource::WorkspaceFile(
+                cowshed_core::api::WorkspacePath::new("fixtures/input.txt")
+                    .expect("a relative fixture path")
+            )),
+            "stdinWorkspacePath"
+        );
+        assert_eq!(
+            wire_stdin_spelling(&StdinSource::Stream(Box::pin(&b""[..]))),
+            "(no wire spelling: process stdin is CLI-only)"
+        );
     }
 
-    fn napi_export(command: &Command) -> &'static str {
+    /// The capability export a CLI verb corresponds to, or `None` when the verb has no export at
+    /// all: host management runs the packaged binary through the `cli.ts` trampoline, and the
+    /// addon deliberately does not link the CLI to offer a second in-process copy of it.
+    ///
+    /// Adding a `Command` variant breaks this match. Adding an arm without adding it to `SAMPLES`
+    /// breaks `every_napi_export_is_exercised_by_a_sample`.
+    fn napi_export(command: &Command) -> Option<&'static str> {
         match command {
-            Command::Adopt(_) => "Coordinator.adopt",
-            Command::New(_) => "Coordinator.create",
-            Command::Fork(_) => "Coordinator.fork",
-            Command::Move(_) => "Coordinator.rename|Coordinator.moveCheckout",
-            Command::Checkpoint(_) => "WorkspaceHandle.checkpoint",
-            Command::Restore(_) => "Coordinator.restore",
-            Command::List(_) => "Project.listWorkspaces|runCli",
-            Command::Path(_) => "Project.path",
-            Command::Exec(_) => "WorkspaceHandle.exec",
-            Command::Remove(_) => "Coordinator.remove",
-            Command::Attach(_) => "WorkspaceRef.attach",
-            Command::Detach(_) => "Coordinator.detach",
-            Command::Resize(_) => "Coordinator.resize",
-            Command::Gc(_) => "Coordinator.gc",
-            Command::Push(_) => "WorkspaceHandle.push",
-            Command::Rebase(_) => "Coordinator.rebase",
-            Command::Land(_) => "Coordinator.land",
-            Command::Doctor(_) => "Coordinator.doctor",
+            Command::Adopt(_) => Some("Coordinator.adopt"),
+            Command::New(_) => Some("Coordinator.create"),
+            Command::Fork(_) => Some("Coordinator.fork"),
+            Command::Move(_) => Some("Coordinator.rename|Coordinator.moveCheckout"),
+            Command::Checkpoint(_) => Some("WorkspaceHandle.checkpoint"),
+            Command::Restore(_) => Some("Coordinator.restore"),
+            Command::List(_) => Some("Project.listWorkspaces"),
+            Command::Path(_) => Some("Project.path"),
+            Command::Exec(_) => Some("WorkspaceHandle.exec"),
+            Command::Remove(_) => Some("Coordinator.remove"),
+            Command::Attach(_) => Some("WorkspaceRef.attach"),
+            Command::Detach(_) => Some("Coordinator.detach"),
+            Command::Resize(_) => Some("Coordinator.resize"),
+            Command::Gc(_) => Some("Coordinator.gc"),
+            Command::Push(_) => Some("WorkspaceHandle.push"),
+            Command::Rebase(_) => Some("Coordinator.rebase"),
+            Command::Land(_) => Some("Coordinator.land"),
+            Command::Doctor(_) => Some("Coordinator.doctor"),
             Command::Gateway(_)
             | Command::Sccache(_)
             | Command::Skill(_)
             | Command::Setup(_)
             | Command::Version
-            | Command::Help(_) => "runCli",
+            | Command::Help(_) => None,
         }
     }
 
-    #[test]
-    fn every_cli_command_has_a_napi_export() {
-        let samples: &[&[&str]] = &[
-            &["adopt"],
-            &["new", "parity"],
-            &["fork", "main", "parity"],
+    /// One representative argv per `Command` arm, paired with the export it must map to. The
+    /// pairing is the assertion: the previous `!is_empty()` check passed for every arm that
+    /// returned any literal at all, so no rename and no re-pointing of a verb could fail it.
+    const SAMPLES: &[(&[&str], Option<&str>)] = &[
+        (&["adopt"], Some("Coordinator.adopt")),
+        (&["new", "parity"], Some("Coordinator.create")),
+        (&["fork", "main", "parity"], Some("Coordinator.fork")),
+        (
             &["mv", "parity", "renamed"],
+            Some("Coordinator.rename|Coordinator.moveCheckout"),
+        ),
+        (
             &["checkpoint", "parity"],
-            &["restore", "parity", "saved"],
-            &["ls"],
-            &["path", "parity"],
+            Some("WorkspaceHandle.checkpoint"),
+        ),
+        (&["restore", "parity", "saved"], Some("Coordinator.restore")),
+        (&["ls"], Some("Project.listWorkspaces")),
+        (&["path", "parity"], Some("Project.path")),
+        (
             &["exec", "parity", "--", "true"],
-            &["rm", "parity"],
-            &["attach", "parity"],
-            &["detach", "parity"],
-            &["resize", "parity", "200g"],
-            &["gc"],
-            &["push", "parity"],
-            &["rebase", "parity"],
-            &["land", "parity"],
-            &["doctor"],
-            &["gateway", "status"],
-            &["sccache", "status"],
-            &["skill", "install"],
-            &["help"],
-            &["setup"],
-            &["--version"],
-        ];
+            Some("WorkspaceHandle.exec"),
+        ),
+        (&["rm", "parity"], Some("Coordinator.remove")),
+        (&["attach", "parity"], Some("WorkspaceRef.attach")),
+        (&["detach", "parity"], Some("Coordinator.detach")),
+        (&["resize", "parity", "200g"], Some("Coordinator.resize")),
+        (&["gc"], Some("Coordinator.gc")),
+        (&["push", "parity"], Some("WorkspaceHandle.push")),
+        (&["rebase", "parity"], Some("Coordinator.rebase")),
+        (&["land", "parity"], Some("Coordinator.land")),
+        (&["doctor"], Some("Coordinator.doctor")),
+        (&["gateway", "status"], None),
+        (&["sccache", "status"], None),
+        (&["skill", "install"], None),
+        (&["help"], None),
+        (&["setup"], None),
+        (&["--version"], None),
+    ];
 
-        for argv in samples {
+    #[test]
+    fn every_cli_command_maps_to_its_named_napi_export() {
+        for (argv, expected) in SAMPLES {
             let parsed =
                 parse_args(argv.iter().copied()).expect("representative CLI command parses");
-            assert!(
-                !napi_export(&parsed.command).is_empty(),
-                "CLI command {argv:?} has no N-API export"
+            assert_eq!(
+                napi_export(&parsed.command),
+                *expected,
+                "CLI command {argv:?} does not map to the export the parity table names"
             );
         }
+    }
+
+    /// Every verb the CLI dispatches must appear in the parity table.
+    ///
+    /// `COMMANDS` is the command map `cowshed --help` prints and the list the parser is generated
+    /// from, so this is red the moment a verb is added without naming the capability export it
+    /// corresponds to — which is the hole the old `!napi_export(..).is_empty()` left wide open.
+    #[test]
+    fn every_cli_verb_has_a_parity_sample() {
+        let dispatched: BTreeSet<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        let sampled: BTreeSet<&str> = SAMPLES
+            .iter()
+            .filter_map(|(argv, _)| argv.first().copied())
+            .collect();
+
+        assert_eq!(
+            dispatched.difference(&sampled).copied().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "CLI verbs the parity table does not sample"
+        );
+        // `help` and `--version` resolve to a `Command` without being entries in the command map,
+        // so they are the only tokens allowed to be sampled without being dispatched verbs.
+        assert_eq!(
+            sampled.difference(&dispatched).copied().collect::<Vec<_>>(),
+            vec!["--version", "help"],
+            "the parity table samples a token the CLI does not dispatch"
+        );
+    }
+
+    /// No two verbs may claim one export: that would mean the table has stopped describing the
+    /// seam it is named after.
+    #[test]
+    fn no_two_verbs_claim_one_napi_export() {
+        let mut claimed: Vec<&str> = SAMPLES.iter().filter_map(|(_, export)| *export).collect();
+        let distinct: BTreeSet<&str> = claimed.iter().copied().collect();
+        claimed.sort_unstable();
+
+        assert_eq!(claimed.len(), distinct.len(), "duplicate N-API export claim");
     }
 }
