@@ -15,6 +15,7 @@ mod mirror;
 mod platform;
 mod policy;
 mod proxy;
+mod repo_id;
 mod repo_mirror;
 mod sim_broker;
 mod telemetry;
@@ -50,6 +51,7 @@ pub use policy::{
     CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
     MirrorRoute, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy, normalize_path,
 };
+pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use repo_mirror::{
     GATEWAY_GIT_FETCH_HELPER_ARG, GitFetchHelperError, MirrorInfo, RepoFetchOutcome, RepoFetchPlan,
     RepoMirrorError, RepoMirrorRequest, RepoTransport, run_gateway_git_fetch_helper,

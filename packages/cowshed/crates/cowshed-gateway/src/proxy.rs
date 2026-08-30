@@ -724,6 +724,7 @@ fn sim_error(error: &SimBrokerError) -> (StatusCode, AuditStatus, &'static str) 
         | SimBrokerError::InvalidApp
         | SimBrokerError::DigestMismatch
         | SimBrokerError::InvalidDigest
+        | SimBrokerError::InvalidRepoId
         | SimBrokerError::InvalidIdentifier
         | SimBrokerError::ReceiptReplay => (
             StatusCode::BAD_REQUEST,

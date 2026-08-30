@@ -185,7 +185,7 @@ pub struct WorkspaceSession {
 impl WorkspaceSession {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_identifier("workspace_id", &self.workspace_id)?;
-        validate_repo_id(&self.repo_id)?;
+        crate::validate_repo_id(&self.repo_id).map_err(|_| ConfigError::InvalidRepoId)?;
         self.endpoint.validate_for_current_platform()?;
         self.policy.validate()?;
         Ok(())
@@ -216,15 +216,6 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), ConfigErr
     {
         return Err(ConfigError::InvalidIdentifier { field });
     }
-    Ok(())
-}
-fn validate_repo_id(value: &str) -> Result<(), ConfigError> {
-    let (owner, name) = value.split_once('/').ok_or(ConfigError::InvalidRepoId)?;
-    if name.contains('/') || matches!(owner, "." | "..") || matches!(name, "." | "..") {
-        return Err(ConfigError::InvalidRepoId);
-    }
-    validate_identifier("repo_id", owner).map_err(|_| ConfigError::InvalidRepoId)?;
-    validate_identifier("repo_id", name).map_err(|_| ConfigError::InvalidRepoId)?;
     Ok(())
 }
 
@@ -673,4 +664,29 @@ pub enum ConfigError {
     InvalidControlCredentialFile,
     #[error(transparent)]
     Policy(#[from] crate::policy::PolicyError),
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::validate_repo_id;
+
+    #[test]
+    fn repository_ids_use_the_store_grammar() {
+        for value in ["owner/repo", "owner/repo.name", "0owner/repo_1"] {
+            assert!(validate_repo_id(value).is_ok(), "{value}");
+        }
+        let over_length = format!("owner/{}", "a".repeat(129));
+        for value in [
+            "",
+            "owner",
+            "Owner/repo",
+            "owner/Repo",
+            "-owner/repo",
+            "owner/-repo",
+            "owner/",
+            over_length.as_str(),
+        ] {
+            assert!(validate_repo_id(value).is_err(), "{value}");
+        }
+    }
 }
