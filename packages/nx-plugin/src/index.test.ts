@@ -266,19 +266,17 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/ferris',
       });
       expect(targets['cargo-sweep']?.cache).toBe(false);
-      // Compilation is excluded from the bounded window: compile stages
-      // binaries out of target/, the run phase executes those copies in
-      // parallel with a per-binary timeout and never takes Cargo's lock.
-      expect(targets['cargo-test-compile']?.executor).toBe('@smoothbricks/nx-plugin:cargo-test');
+      // Compilation is excluded from the bounded window: the compile target is
+      // unbounded and cacheable, the runner holds the standard bound.
+      expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-compile']?.options).toMatchObject({
-        phase: 'compile',
+        command: 'cargo test --workspace --no-run',
         cwd: 'packages/ferris',
       });
-      expect(targets['cargo-test-compile']?.outputs).toEqual(['{projectRoot}/.cache/cargo-test-bins']);
-      expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:cargo-test');
+      expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-compile']);
       expect(targets['cargo-test']?.options).toMatchObject({
-        phase: 'run',
+        command: 'cargo test --workspace',
         cwd: 'packages/ferris',
         timeoutMs: 120_000,
       });
@@ -291,7 +289,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '!{projectRoot}/**/target/**',
       ]);
       expect(targets['cargo-lint']?.options).toMatchObject({
-        commands: ['cargo fmt --all --check', 'cargo clippy --workspace --all-targets -- -D warnings'],
+        commands: [
+          'cargo fmt --all --check',
+          'cargo clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
+        ],
       });
       expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
       expect(targets[CARGO_CROSS_LINT_TARGET]?.options).toMatchObject({
@@ -303,11 +304,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // CI's own already-native Linux lint, would then require the opt-in 0.4 GiB
       // cross toolchain to run at all.
       expect(targets.lint?.dependsOn).not.toContain(CARGO_CROSS_LINT_TARGET);
-      expect(targets.test?.executor).toBe('@smoothbricks/nx-plugin:cargo-test');
+      expect(targets.test?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(targets.test?.options).toMatchObject({
-        phase: 'run',
+        command: 'cargo test --workspace',
         cwd: 'packages/ferris',
-        timeoutMs: 120_000,
       });
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo mutants --workspace' });
@@ -513,6 +513,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
             'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir .cache/native-debug',
         },
       });
+      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-compile', 'napi-debug']);
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
         cache: true,
