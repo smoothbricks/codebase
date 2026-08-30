@@ -5,6 +5,7 @@ import { chmodSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { platformDirectory } from './platform.js';
 
 const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
 
@@ -48,7 +49,7 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? process.arch;
   const fileExists = options.exists ?? existsSync;
-  const platformDirectory = binaryPlatformDirectory(platform, arch);
+  const binaryDirectory = platformDirectory(platform, arch);
 
   if (isServiceVerb(options.argv)) {
     // launchd keeps running the installed copy, so for daemon verbs it is authoritative even when
@@ -69,8 +70,8 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
     }
   }
 
-  if (platformDirectory !== null) {
-    const packagedBinary = join(options.packageRoot, 'dist', 'bin', platformDirectory, 'cowshed');
+  if (binaryDirectory !== null) {
+    const packagedBinary = join(options.packageRoot, 'dist', 'bin', binaryDirectory, 'cowshed');
     if (fileExists(packagedBinary)) {
       return { kind: 'native', path: packagedBinary, source: 'package' };
     }
@@ -90,16 +91,6 @@ export async function runCli(argv: readonly string[], options: RunCliOptions): P
     return (options.spawnBinary ?? spawnBinary)(backend.path, argv);
   }
   return (options.runNapi ?? runNapiFallback)(argv);
-}
-
-function binaryPlatformDirectory(platform: NodeJS.Platform, arch: string): string | null {
-  if (platform === 'darwin' && (arch === 'arm64' || arch === 'x64')) {
-    return `darwin-${arch}`;
-  }
-  if (platform === 'linux' && (arch === 'arm64' || arch === 'x64')) {
-    return `linux-${arch}-gnu`;
-  }
-  return null;
 }
 
 async function runNapiFallback(argv: readonly string[]): Promise<number> {
