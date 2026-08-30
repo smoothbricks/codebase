@@ -494,4 +494,3 @@ pub unsafe extern "C" fn vm_delta_apply_rollforward_segment(
     rt().vm
         .delta_apply_rollforward_segment(state, segment, entry_size);
 }
-
