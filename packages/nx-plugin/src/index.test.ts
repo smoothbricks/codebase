@@ -257,6 +257,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-sweep',
         'cargo-test',
         'cargo-test-compile',
+        'cargo-test-ferris-core',
+        'cargo-test-ferris-wasm',
         'lint',
         'mutation',
         'test',
@@ -266,24 +268,23 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/ferris',
       });
       expect(targets['cargo-sweep']?.cache).toBe(false);
-      // Compilation is excluded from the bounded window: the compile target is
-      // unbounded and cacheable, the runner holds the standard bound.
       expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-compile']?.options).toMatchObject({
         command: 'cargo test --workspace --no-run',
         cwd: 'packages/ferris',
       });
-      expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
-      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-compile']);
-      expect(targets['cargo-test']?.options).toMatchObject({
-        command: 'cargo test --workspace',
-        cwd: 'packages/ferris',
-        timeoutMs: 120_000,
-      });
-      expect(targets['cargo-test']?.inputs).toEqual([
-        '{projectRoot}/**/*.rs',
-        '{projectRoot}/**/Cargo.toml',
-        '{projectRoot}/**/Cargo.lock',
+      expect(targets['cargo-test']?.executor).toBe('nx:noop');
+      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-test-compile']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-test-ferris-core']);
+      expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
+        /^cargo nextest run --workspace --package ferris-core --user-config-file none --config-file /,
+      );
+      expect(targets['cargo-test-ferris-core']?.inputs).toEqual([
+        '{projectRoot}/Cargo.toml',
+        '{projectRoot}/Cargo.lock',
+        '{projectRoot}/crates/ferris-core/**/*.rs',
+        '{projectRoot}/crates/ferris-core/Cargo.toml',
         '{projectRoot}/**/.cargo/config.toml',
         '{projectRoot}/scripts/*.sh',
         '!{projectRoot}/**/target/**',
@@ -300,15 +301,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/ferris',
       });
       expect(targets[CARGO_CROSS_LINT_TARGET]?.cache).toBe(true);
-      // The cross gate must never join the lint aggregate: `bun run lint`, and
-      // CI's own already-native Linux lint, would then require the opt-in 0.4 GiB
-      // cross toolchain to run at all.
       expect(targets.lint?.dependsOn).not.toContain(CARGO_CROSS_LINT_TARGET);
-      expect(targets.test?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
-      expect(targets.test?.options).toMatchObject({
-        command: 'cargo test --workspace',
-        cwd: 'packages/ferris',
-      });
+      expect(targets.test?.executor).toBe('nx:noop');
+      expect(targets.test?.dependsOn).toEqual(['cargo-test']);
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo mutants --workspace' });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo bench --workspace' });
@@ -513,7 +508,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
             'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir .cache/native-debug',
         },
       });
-      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-compile', 'napi-debug']);
+      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
+      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['napi-debug']);
+      expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
+        /^cargo nextest run --workspace --package cowshed-napi --user-config-file none --config-file /,
+      );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
         cache: true,
