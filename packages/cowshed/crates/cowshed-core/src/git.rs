@@ -9,6 +9,7 @@ use std::process::Output;
 use tokio::process::Command;
 
 use crate::error::{CowshedError, Result};
+use crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {
@@ -97,10 +98,15 @@ pub struct CowshedUpstream {
 const WORKTREE_STAGING: &str = ".cowshed/worktree-staging";
 
 const WORKSPACE_ENVIRONMENT_MARKER: &[u8] = b"# cowshed: workspace environment";
-const WORKSPACE_ENVIRONMENT_SOURCE: &[u8] = b"source_env_if_present .cowshed/env";
 const LOCAL_ENVIRONMENT_LOADER: &[u8] = b"source_env_if_exists \"$local_override\"";
-const LOCAL_WORKSPACE_ENVIRONMENT_SOURCE: &[u8] =
-    b"source_env_if_exists \"${local_override%/*}/.cowshed/env\"";
+
+fn workspace_environment_source() -> String {
+    format!("source_env_if_present {WORKSPACE_ENVIRONMENT_PATH}")
+}
+
+fn local_workspace_environment_source() -> String {
+    format!("source_env_if_exists \"${{local_override%/*}}/{WORKSPACE_ENVIRONMENT_PATH}\"")
+}
 
 /// The name of the remote main registers for a workspace under `--register`.
 pub fn workspace_remote_name(workspace: &str) -> String {
@@ -646,7 +652,7 @@ impl GitRepository {
                 "workspace environment inspection task failed: {error}"
             ))
         })??;
-        if environment_hook_contains(&existing, WORKSPACE_ENVIRONMENT_SOURCE) {
+        if environment_hook_contains(&existing, workspace_environment_source().as_bytes()) {
             return Ok(());
         }
 
@@ -674,7 +680,10 @@ impl GitRepository {
                         "workspace local environment inspection task failed: {error}"
                     ))
                 })??;
-                if environment_hook_contains(&local_existing, LOCAL_WORKSPACE_ENVIRONMENT_SOURCE) {
+                if environment_hook_contains(
+                    &local_existing,
+                    local_workspace_environment_source().as_bytes(),
+                ) {
                     return Ok(());
                 }
                 return Err(CowshedError::integrity(
@@ -688,7 +697,7 @@ impl GitRepository {
                     "add .envrc-local to the repository ignore rules before creating a workspace",
                 ));
             }
-            (local_path, LOCAL_WORKSPACE_ENVIRONMENT_SOURCE)
+            (local_path, local_workspace_environment_source())
         } else {
             if !hook.exists && !self.path_is_ignored(&hook.relative).await? {
                 return Err(CowshedError::integrity(
@@ -696,15 +705,17 @@ impl GitRepository {
                     "track a workspace environment hook or ignore .envrc before creating a workspace",
                 ));
             }
-            (hook.path, WORKSPACE_ENVIRONMENT_SOURCE)
+            (hook.path, workspace_environment_source())
         };
 
         let root = self.root.clone();
-        tokio::task::spawn_blocking(move || append_environment_hook(&root, &path, source))
-            .await
-            .map_err(|error| {
-                CowshedError::internal(format!("workspace environment wiring task failed: {error}"))
-            })?
+        tokio::task::spawn_blocking(move || {
+            append_environment_hook(&root, &path, source.as_bytes())
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("workspace environment wiring task failed: {error}"))
+        })?
     }
 
     /// Resolve `revision` to the commit object this repository actually holds for it.
