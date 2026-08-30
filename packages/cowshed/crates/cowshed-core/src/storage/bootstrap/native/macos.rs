@@ -26,10 +26,10 @@ use super::super::{
 };
 use super::shared::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
-    HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode, SystemBootstrapHost,
-    UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome, VolumeOutcome, VolumeState,
-    execute_native_bootstrap_plan, existing_host_storage_error, platform_host_error,
-    read_only_validation_actions, setup_execution_error,
+    HostUninstallPlan, NativeBootstrapError, NativeBootstrapMode, PIN_FSTAB_ACTION,
+    SystemBootstrapHost, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
+    VolumeOutcome, VolumeState, execute_native_bootstrap_plan, existing_host_storage_error,
+    platform_host_error, provision_volumes_action, setup_execution_error, write_marker_action,
 };
 use crate::error::CowshedError;
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
@@ -328,6 +328,47 @@ pub async fn validate_existing_host_storage(home: &Path) -> crate::Result<Valida
         .and_then(|result| result)
         .map_err(existing_host_storage_error)?;
     validate_existing_plan(&plan, host, &lane).await
+}
+
+/// Everything a read-only validation would have had to do, named for the
+/// operator. Only `GuardMountpoint` is silent: guarding a mountpoint asserts an
+/// invariant rather than requesting work.
+///
+/// This lives in the macOS adapter because only macOS plans host storage; the
+/// Linux entrypoints fail closed before a `BootstrapPlan` exists. Its
+/// counterpart is `shared::mutating_setup_actions`, which keeps the inverse
+/// policy and matches `HostOperation` exhaustively too, so a new variant cannot
+/// compile in one table and vanish from the other.
+fn read_only_validation_actions(plan: &BootstrapPlan) -> Vec<String> {
+    plan.operations()
+        .iter()
+        .filter_map(|operation| match operation {
+            HostOperation::GuardMountpoint { .. } => None,
+            HostOperation::VerifyZfsDelegation { required_root, .. } => {
+                Some(format!("verify delegated ZFS root {required_root}"))
+            }
+            HostOperation::EnsureDirectory(path) => {
+                Some(format!("create mountpoint {}", path.display()))
+            }
+            HostOperation::ReclaimMountpoint(path) => {
+                Some(format!("reclaim mountpoint {}", path.display()))
+            }
+            HostOperation::MountApfsVolume { mountpoint, .. } => {
+                Some(format!("mount APFS volume at {}", mountpoint.display()))
+            }
+            HostOperation::RunCommand(command) => Some(format!(
+                "run {} {}",
+                command.program(),
+                command.args().join(" ")
+            )),
+            HostOperation::ProvisionApfsVolumes { volumes, .. } => {
+                Some(provision_volumes_action(volumes))
+            }
+            HostOperation::WriteMarkerAtomic { path, .. } => Some(write_marker_action(path)),
+            HostOperation::PinVolumesInFstab { .. } => Some(PIN_FSTAB_ACTION.to_owned()),
+            HostOperation::ReportVolumeIssue { detail, .. } => Some(detail.to_owned()),
+        })
+        .collect()
 }
 
 async fn validate_existing_plan<H, L>(
