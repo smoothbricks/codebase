@@ -4,6 +4,7 @@
 //! Approximate assertions use a 0.001 tolerance. Probe tests assert exact bit
 //! patterns because lane order and NaN/tie behavior are part of the FP profile.
 
+use columine_types::types::AggType;
 use columine_vm::aggregates::{
     AggKind, TypeMask, agg_count, agg_set_count, agg_set_value_f64, agg_set_value_i64,
     agg_slot_byte_size, agg_value_f64, agg_value_i64, batch_agg_max, batch_agg_min, batch_agg_sum,
@@ -75,9 +76,9 @@ fn reduce_col_f64_with_predicate() {
 //  test blocks 7-9: AggSlot layout
 // ---------------------------------------------------------------------------
 
-const AGG_COUNT: u8 = 2;
-const AGG_SUM: u8 = 1;
-const AGG_SUM_I64: u8 = 11;
+const AGG_COUNT: u8 = AggType::Count as u8;
+const AGG_SUM: u8 = AggType::Sum as u8;
+const AGG_SUM_I64: u8 = AggType::SumI64 as u8;
 
 #[test]
 fn agg_slot_count_layout() {
