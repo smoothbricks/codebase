@@ -16,7 +16,7 @@ use crate::gateway_service::{
 use crate::launchd::{
     ExistingPlist, HostStableExecutable, InstallState, LaunchAgentSpec, LaunchdExecutor,
     LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand, SCCACHE_BINARY_NAME,
-    plan_install,
+    kickstart_hint, plan_install,
 };
 use crate::output::Output;
 use cowshed_core::api::{EmptyResult, SccacheStats, SccacheStatus};
@@ -165,7 +165,7 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
         if tokio::time::Instant::now() >= deadline {
             return Err(CowshedError::environment_missing(
                 "sccache daemon did not answer on its socket before the startup deadline",
-                format!("launchctl kickstart -k gui/{uid}/{}", spec.label()),
+                kickstart_hint(uid, spec.label()),
             ));
         }
         tokio::time::sleep(START_POLL_INTERVAL).await;

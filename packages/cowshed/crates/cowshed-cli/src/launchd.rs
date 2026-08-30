@@ -1078,8 +1078,13 @@ fn gui_domain(uid: u32) -> String {
     format!("gui/{uid}")
 }
 
-fn service_target(uid: u32, label: &str) -> String {
+pub fn service_target(uid: u32, label: &str) -> String {
     format!("{}/{label}", gui_domain(uid))
+}
+
+/// User-facing `launchctl kickstart -k` guidance for a per-user agent.
+pub fn kickstart_hint(uid: u32, label: &str) -> String {
+    format!("launchctl kickstart -k {}", service_target(uid, label))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
