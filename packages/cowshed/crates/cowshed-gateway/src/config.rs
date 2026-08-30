@@ -20,6 +20,7 @@ pub const TOKEN_BYTES: usize = 32;
 pub const MACOS_PORT_MIN: u16 = 40_960;
 pub const MACOS_PORT_MAX: u16 = 49_151;
 pub const MACOS_PORT_BLOCK_SIZE: u16 = 16;
+pub const CONTROL_TCP_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_644);
 
 /// Host-side endpoint that selects a workspace before bearer authentication.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,7 +229,7 @@ pub struct ControlTcpConfig {
 impl ControlTcpConfig {
     pub fn new(credential_file: PathBuf) -> Self {
         Self {
-            address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_644),
+            address: CONTROL_TCP_ADDR,
             credential_file,
         }
     }
@@ -240,7 +241,7 @@ impl ControlTcpConfig {
     ) -> Result<(), ConfigError> {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-        if self.address != SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_644) {
+        if self.address != CONTROL_TCP_ADDR {
             return Err(ConfigError::InvalidControlTcpAddress);
         }
         let root = host_root.ok_or(ConfigError::MissingProductionControlSocket)?;
