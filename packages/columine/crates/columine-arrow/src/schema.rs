@@ -15,7 +15,9 @@ pub const MAX_SCHEMA_FIELDS: usize = 256;
 #[repr(u8)]
 pub enum ArrowType {
     Null = 0,
-    /// One 32-bit value per row. The logical schema may be Int32 or UInt32.
+    /// One signed 32-bit value per row. The logical schema must be Int32:
+    /// every writer of this plane narrows through `i32`, so admitting UInt32
+    /// would declare a domain no producer can fill and no reader can name.
     Int32 = 1,
     Float64 = 2,
     Binary = 3,
@@ -221,7 +223,7 @@ fn decode_schema_message(bytes: &[u8]) -> Result<arrow_schema::Schema, SchemaErr
 fn logical_type_matches(physical: ArrowType, logical: &DataType) -> bool {
     match physical {
         ArrowType::Null => matches!(logical, DataType::Null),
-        ArrowType::Int32 => matches!(logical, DataType::Int32 | DataType::UInt32),
+        ArrowType::Int32 => matches!(logical, DataType::Int32),
         ArrowType::Float64 => matches!(logical, DataType::Float64),
         ArrowType::Binary => matches!(logical, DataType::Binary),
         ArrowType::Utf8 => matches!(logical, DataType::Utf8),
