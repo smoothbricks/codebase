@@ -35,11 +35,6 @@
   "nx": {
     "name": "cowshed",
     "targets": {
-      "build": {
-        "outputs": [
-          "{projectRoot}/dist/ts"
-        ]
-      },
       "refresh-harnesses": {
         "executor": "nx:run-commands",
         "cache": false,
