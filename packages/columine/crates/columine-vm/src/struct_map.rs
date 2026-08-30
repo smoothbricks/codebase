@@ -10,18 +10,12 @@
 //! tombstones are not expected in a well-formed state.
 
 use crate::bytes;
+use crate::hash_table::{Probe, ProbeCell, probe_linear};
 use crate::meta::slot_meta_base;
 use columine_types::types::{
     EMPTY_KEY, SlotMetaOffset, StructFieldType, TOMBSTONE, align8, hash_key, hash_key_pair,
     struct_field_size,
 };
-
-/// Result of a `find_insert` probe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Probe {
-    pub pos: u32,
-    pub found: bool,
-}
 
 /// Result of an `upsert` operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,55 +122,38 @@ impl StructMapSlot {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
         }
-        debug_assert!(
-            self.capacity.is_power_of_two(),
-            "probe mask requires pow2 cap"
-        );
-        let mut pos = hash_key(key, self.capacity);
-        for _ in 0..self.capacity {
-            let k = self.key_at(state, pos);
-            if k == key {
-                return Some(pos);
-            }
-            if k == EMPTY_KEY {
-                return None;
-            }
-            pos = (pos + 1) & (self.capacity - 1);
-        }
-        None
+        probe_linear(
+            self.capacity,
+            hash_key(key, self.capacity),
+            false,
+            |pos| match self.key_at(state, pos) {
+                current if current == key => ProbeCell::Match,
+                EMPTY_KEY => ProbeCell::Empty,
+                TOMBSTONE => ProbeCell::Tombstone,
+                _ => ProbeCell::Occupied,
+            },
+        )
+        .filter(|probe| probe.found)
+        .map(|probe| probe.pos)
     }
 
     /// Insert-or-update probe: find an existing key before reusing the first
-    /// tombstone, then return `None` for sentinel keys, probe exhaustion, or
-    /// exceeded load factor.
+    /// tombstone.
     pub fn find_insert(&self, state: &[u8], key: u32) -> Option<Probe> {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
         }
-        debug_assert!(
-            self.capacity.is_power_of_two(),
-            "probe mask requires pow2 cap"
-        );
-        let mut pos = hash_key(key, self.capacity);
-        let mut first_tombstone: Option<u32> = None;
-        for _ in 0..self.capacity {
-            let k = self.key_at(state, pos);
-            if k == key {
-                return Some(Probe { pos, found: true });
-            }
-            if k == TOMBSTONE {
-                if first_tombstone.is_none() {
-                    first_tombstone = Some(pos);
-                }
-            } else if k == EMPTY_KEY {
-                return Some(Probe {
-                    pos: first_tombstone.unwrap_or(pos),
-                    found: false,
-                });
-            }
-            pos = (pos + 1) & (self.capacity - 1);
-        }
-        first_tombstone.map(|pos| Probe { pos, found: false })
+        probe_linear(
+            self.capacity,
+            hash_key(key, self.capacity),
+            true,
+            |pos| match self.key_at(state, pos) {
+                current if current == key => ProbeCell::Match,
+                EMPTY_KEY => ProbeCell::Empty,
+                TOMBSTONE => ProbeCell::Tombstone,
+                _ => ProbeCell::Occupied,
+            },
+        )
     }
 
     /// Absolute byte offset of row `pos`.
@@ -394,46 +371,48 @@ impl StructMap2Slot {
         if key1 == EMPTY_KEY || key1 == TOMBSTONE {
             return None;
         }
-        debug_assert!(self.capacity.is_power_of_two());
-        let mut pos = hash_key_pair(key1, key2, self.capacity);
-        for _ in 0..self.capacity {
-            let first = self.key1_at(state, pos);
-            if first == key1 && self.key2_at(state, pos) == key2 {
-                return Some(pos);
-            }
-            if first == EMPTY_KEY {
-                return None;
-            }
-            pos = (pos + 1) & (self.capacity - 1);
-        }
-        None
+        probe_linear(
+            self.capacity,
+            hash_key_pair(key1, key2, self.capacity),
+            false,
+            |pos| {
+                let first = self.key1_at(state, pos);
+                if first == key1 && self.key2_at(state, pos) == key2 {
+                    ProbeCell::Match
+                } else {
+                    match first {
+                        EMPTY_KEY => ProbeCell::Empty,
+                        TOMBSTONE => ProbeCell::Tombstone,
+                        _ => ProbeCell::Occupied,
+                    }
+                }
+            },
+        )
+        .filter(|probe| probe.found)
+        .map(|probe| probe.pos)
     }
 
     pub fn find_insert(&self, state: &[u8], key1: u32, key2: u32) -> Option<Probe> {
         if key1 == EMPTY_KEY || key1 == TOMBSTONE {
             return None;
         }
-        debug_assert!(self.capacity.is_power_of_two());
-        let mut pos = hash_key_pair(key1, key2, self.capacity);
-        let mut first_tombstone = None;
-        for _ in 0..self.capacity {
-            let first = self.key1_at(state, pos);
-            if first == key1 && self.key2_at(state, pos) == key2 {
-                return Some(Probe { pos, found: true });
-            }
-            if first == TOMBSTONE {
-                if first_tombstone.is_none() {
-                    first_tombstone = Some(pos);
+        probe_linear(
+            self.capacity,
+            hash_key_pair(key1, key2, self.capacity),
+            true,
+            |pos| {
+                let first = self.key1_at(state, pos);
+                if first == key1 && self.key2_at(state, pos) == key2 {
+                    ProbeCell::Match
+                } else {
+                    match first {
+                        EMPTY_KEY => ProbeCell::Empty,
+                        TOMBSTONE => ProbeCell::Tombstone,
+                        _ => ProbeCell::Occupied,
+                    }
                 }
-            } else if first == EMPTY_KEY {
-                return Some(Probe {
-                    pos: first_tombstone.unwrap_or(pos),
-                    found: false,
-                });
-            }
-            pos = (pos + 1) & (self.capacity - 1);
-        }
-        first_tombstone.map(|pos| Probe { pos, found: false })
+            },
+        )
     }
 
     pub fn upsert(&self, state: &mut [u8], key1: u32, key2: u32) -> Option<Upsert> {
