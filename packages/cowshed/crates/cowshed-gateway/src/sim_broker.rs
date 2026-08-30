@@ -9,10 +9,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::{Duration, timeout},
-};
+use tokio::sync::{mpsc, oneshot};
+// Only `XcrunSimRunner` bounds a simulator subprocess, and that impl is macOS-only, so an
+// ungated import breaks the Linux cross-lint that CI runs.
+#[cfg(target_os = "macos")]
+use tokio::time::{Duration, timeout};
 use url::Url;
 
 use crate::{
@@ -25,6 +26,7 @@ const MAX_SESSIONS: usize = 4096;
 const MAX_APPROVALS: usize = 4096;
 const MAX_SCHEMES: usize = 64;
 const MAX_APP_ENTRIES: usize = 100_000;
+#[cfg(target_os = "macos")]
 const MAX_DEVICE_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
