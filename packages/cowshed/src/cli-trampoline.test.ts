@@ -6,7 +6,8 @@ import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { packageRootFromModule, runCli } from './cli-trampoline.js';
+import { packageRootFromModule, resolveCliBackend, runCli } from './cli-trampoline.js';
+import { CowshedError } from './types.js';
 
 const fixtureRoots: string[] = [];
 
@@ -30,9 +31,6 @@ describe('cowshed CLI trampoline', () => {
         spawns.push({ executable, argv });
         return 17;
       },
-      async runNapi() {
-        throw new Error('Node-API fallback must not run');
-      },
     });
 
     expect(exitCode).toBe(17);
@@ -53,34 +51,64 @@ describe('cowshed CLI trampoline', () => {
         spawns.push(executable);
         return 0;
       },
-      async runNapi() {
-        throw new Error('Node-API fallback must not run');
-      },
     });
 
     expect(exitCode).toBe(0);
     expect(spawns).toEqual([workspace]);
   });
 
-  it('uses the Node-API runner only when neither native binary exists', async () => {
+  it('reports every path it searched when no binary exists', async () => {
+    // There is no in-process fallback any more: the addon does not link the CLI, so the only
+    // honest outcome is a typed failure naming the candidates rather than a silent one.
     const root = await fixtureRoot();
-    const napiCalls: string[][] = [];
 
-    const exitCode = await runCli(['path', 'main'], {
+    const backend = resolveCliBackend({ packageRoot: root, platform: 'darwin', arch: 'x64' });
+
+    expect(backend.kind).toBe('missing');
+    if (backend.kind !== 'missing') {
+      // invariant throw: the assertion above proves this branch unreachable.
+      throw new Error('expected a missing backend');
+    }
+    expect(backend.searched).toEqual([
+      join(root, 'dist', 'bin', 'darwin-x64', 'cowshed'),
+      join(root, 'target', 'release', 'cowshed'),
+    ]);
+
+    const outcome = await runCli(['path', 'main'], {
       packageRoot: root,
       platform: 'darwin',
       arch: 'x64',
       async spawnBinary() {
         throw new Error('native spawn must not run');
       },
-      async runNapi(argv) {
-        napiCalls.push([...argv]);
-        return 9;
-      },
-    });
+    }).then(
+      (exitCode) => exitCode,
+      (error: unknown) => error,
+    );
 
-    expect(exitCode).toBe(9);
-    expect(napiCalls).toEqual([['path', 'main']]);
+    expect(outcome).toBeInstanceOf(CowshedError);
+    if (!(outcome instanceof CowshedError)) {
+      // invariant throw: the assertion above proves this branch unreachable.
+      throw new Error('expected a CowshedError');
+    }
+    expect(outcome.code).toBe('environment-missing');
+    for (const candidate of backend.searched) {
+      expect(outcome.message).toContain(candidate);
+    }
+  });
+
+  it('refuses a host it ships no binary for without searching a dist directory', async () => {
+    const root = await fixtureRoot();
+
+    const backend = resolveCliBackend({ packageRoot: root, platform: 'win32', arch: 'x64' });
+
+    expect(backend.kind).toBe('missing');
+    if (backend.kind !== 'missing') {
+      // invariant throw: the assertion above proves this branch unreachable.
+      throw new Error('expected a missing backend');
+    }
+    expect(backend.searched).toEqual([join(root, 'target', 'release', 'cowshed')]);
+    expect(backend.reason).toContain('win32-x64');
   });
 
   it('finds the package root from source and compiled module locations', async () => {

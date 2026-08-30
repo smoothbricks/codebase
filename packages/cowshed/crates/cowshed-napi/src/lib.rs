@@ -79,21 +79,22 @@ fn to_napi_error(env: Env, failure: AddonFailure) -> napi::Error {
         message,
         hint,
     } = failure;
-    match hinted_error(env, code, message.clone(), &hint) {
-        Ok(error) => error,
-        // Building the JS object is the only fallible step. If the environment refuses it, the
-        // code and message still have to reach the caller rather than being swallowed.
-        Err(_) => napi::Error::new(code, message),
+    if let Ok(hinted) = hinted_error(env, code, &message, &hint) {
+        return hinted;
     }
+    // Setting the property is the only fallible step, and only the environment can refuse it. The
+    // code and message still have to reach JavaScript when it does; `index.ts` then declines to
+    // recognise a hintless error as ours rather than inventing a hint for it.
+    napi::Error::from(JsError::from(napi::Error::new(code, message)).into_unknown(env))
 }
 
 fn hinted_error(
     env: Env,
     code: &'static str,
-    message: String,
+    message: &str,
     hint: &str,
 ) -> napi::Result<napi::Error> {
-    let mut error = JsError::from(napi::Error::new(code, message))
+    let mut error = JsError::from(napi::Error::new(code, message.to_owned()))
         .into_unknown(env)
         .coerce_to_object()?;
     error.set_named_property("hint", hint)?;
