@@ -1989,7 +1989,13 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
             )
         });
     if let Err(primary) = prepared {
-        let cleanup = detach_and_reclaim_adopt(host, attachment, &created.path, created.format);
+        let cleanup = detach_and_reclaim(
+            host,
+            attachment,
+            &created.path,
+            created.format,
+            "adopt staging detach",
+        );
         return combine_cleanup("adopt preparation", primary, cleanup);
     }
 
@@ -2012,25 +2018,27 @@ fn abort_prepared_adopt<H: ApfsExecutionHost>(
     host: &H,
     prepared: PreparedAdopt<H::Attachment>,
 ) -> Result<(), ApfsStorageError> {
-    detach_and_reclaim_adopt(
+    detach_and_reclaim(
         host,
         prepared.attachment,
         &prepared.staged_image,
         prepared.stage.workspace.format(),
+        "adopt staging detach",
     )
 }
 
-fn detach_and_reclaim_adopt<H: ApfsExecutionHost>(
+fn detach_and_reclaim<H: ApfsExecutionHost>(
     host: &H,
     attachment: H::Attachment,
     staged_image: &Path,
     format: ImageFormat,
+    operation: &'static str,
 ) -> Result<(), ApfsStorageError> {
     let detached = host.detach(attachment, DetachIntent::Release);
     let reclaimed = host.reclaim_image(staged_image, format);
     match detached {
         Ok(()) => reclaimed,
-        Err(primary) => combine_cleanup("adopt staging detach", primary, reclaimed),
+        Err(primary) => combine_cleanup(operation, primary, reclaimed),
     }
 }
 
@@ -2057,8 +2065,13 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
             )
         })
     {
-        let cleanup =
-            detach_and_reclaim_adopt(host, attachment, &staged_image, stage.workspace.format());
+        let cleanup = detach_and_reclaim(
+            host,
+            attachment,
+            &staged_image,
+            stage.workspace.format(),
+            "adopt staging detach",
+        );
         return combine_cleanup("adopt post-initialization validation", primary, cleanup);
     }
     if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
@@ -2210,7 +2223,13 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         return combine_cleanup(
             "clone preparation",
             primary,
-            detach_and_reclaim_clone(host, attachment, &staged_image, format),
+            detach_and_reclaim(
+                host,
+                attachment,
+                &staged_image,
+                format,
+                "clone staging detach",
+            ),
         );
     }
     Ok(PreparedClone {
@@ -2230,26 +2249,13 @@ fn abort_prepared_clone<H: ApfsExecutionHost>(
     host: &H,
     prepared: PreparedClone<H::Attachment>,
 ) -> Result<(), ApfsStorageError> {
-    detach_and_reclaim_clone(
+    detach_and_reclaim(
         host,
         prepared.attachment,
         &prepared.staged_image,
         prepared.stage.workspace.format(),
+        "clone staging detach",
     )
-}
-
-fn detach_and_reclaim_clone<H: ApfsExecutionHost>(
-    host: &H,
-    attachment: H::Attachment,
-    staged_image: &Path,
-    format: ImageFormat,
-) -> Result<(), ApfsStorageError> {
-    let detached = host.detach(attachment, DetachIntent::Release);
-    let reclaimed = host.reclaim_image(staged_image, format);
-    match detached {
-        Ok(()) => reclaimed,
-        Err(primary) => combine_cleanup("clone staging detach", primary, reclaimed),
-    }
 }
 
 fn commit_prepared_clone<H: ApfsExecutionHost>(
@@ -2276,7 +2282,13 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
         return combine_cleanup(
             "clone post-callback validation",
             primary,
-            detach_and_reclaim_clone(host, attachment, &staged_image, stage.workspace.format()),
+            detach_and_reclaim(
+                host,
+                attachment,
+                &staged_image,
+                stage.workspace.format(),
+                "clone staging detach",
+            ),
         );
     }
     if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
@@ -2500,7 +2512,13 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         return combine_cleanup(
             "restore preparation",
             primary,
-            detach_and_reclaim_restore(host, attachment, &staged_image, format),
+            detach_and_reclaim(
+                host,
+                attachment,
+                &staged_image,
+                format,
+                "restore staging detach",
+            ),
         );
     }
     Ok(PreparedRestore::Replace(PreparedReplaceRestore {
@@ -2529,26 +2547,13 @@ fn abort_prepared_restore<H: ApfsExecutionHost>(
         PreparedRestore::Verify(prepared) => {
             host.detach(prepared.attachment, DetachIntent::Release)
         }
-        PreparedRestore::Replace(prepared) => detach_and_reclaim_restore(
+        PreparedRestore::Replace(prepared) => detach_and_reclaim(
             host,
             prepared.attachment,
             &prepared.staged_image,
             prepared.stage.workspace.format(),
+            "restore staging detach",
         ),
-    }
-}
-
-fn detach_and_reclaim_restore<H: ApfsExecutionHost>(
-    host: &H,
-    attachment: H::Attachment,
-    staged_image: &Path,
-    format: ImageFormat,
-) -> Result<(), ApfsStorageError> {
-    let detached = host.detach(attachment, DetachIntent::Release);
-    let reclaimed = host.reclaim_image(staged_image, format);
-    match detached {
-        Ok(()) => reclaimed,
-        Err(primary) => combine_cleanup("restore staging detach", primary, reclaimed),
     }
 }
 
@@ -2588,7 +2593,13 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
         return combine_cleanup(
             "restore post-callback validation",
             primary,
-            detach_and_reclaim_restore(host, attachment, &staged_image, stage.workspace.format()),
+            detach_and_reclaim(
+                host,
+                attachment,
+                &staged_image,
+                stage.workspace.format(),
+                "restore staging detach",
+            ),
         );
     }
     if let Err(primary) = host.detach(attachment, DetachIntent::Release) {
