@@ -1,5 +1,13 @@
 //! Packed native row headers: low 8 bits are [`EntryType`], high 24 bits are a
-//! manifest-global vocabulary ID.
+//! manifest-global [`VocabularyId`].
+//!
+//! This is the native encoding. The TypeScript packed layout uses the same 8+24
+//! word with a different high-24 payload: `denseIndex + 1` into a buffer-local
+//! dictionary (`types.ts`, `physicalLayoutPlan.ts`). Zero is the dynamic/null
+//! sentinel on both sides; the nonzero payload is not interchangeable. Arrow
+//! flush unpacks with [`entry_type_from_header`] / [`vocabulary_id_from_header`]
+//! and therefore follows this native ID space. The JS arena layout deviation
+//! (bundled null-bitmap + values) is documented in `columns.rs`.
 
 use crate::EntryType;
 use core::fmt;
