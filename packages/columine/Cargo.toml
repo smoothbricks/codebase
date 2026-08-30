@@ -31,18 +31,6 @@ inherits = "release"
 opt-level = "z"
 panic = "abort"
 
-# Perf-attribution side profile: same as wasm-release but speed-optimized.
-# Not the shipping profile — used to separate opt-level cost from structural cost.
-[profile.wasm-perf]
-inherits = "release"
-opt-level = 3
-panic = "abort"
-
-[profile.wasm-s]
-inherits = "release"
-opt-level = "s"
-panic = "abort"
-
 [profile.wasm-release.package.columine-vm]
 opt-level = 3
 
