@@ -858,7 +858,9 @@ impl CacheActor {
     }
 
     async fn run(mut self) {
-        let _ = self.evict_if_needed().await;
+        if self.evict_if_needed().await.is_err() {
+            return;
+        }
         while let Some(command) = self.receiver.recv().await {
             match command {
                 Command::Acquire {
@@ -875,7 +877,9 @@ impl CacheActor {
                     {
                         entry.active_readers = entry.active_readers.saturating_sub(1);
                     }
-                    let _ = self.evict_if_needed().await;
+                    if self.evict_if_needed().await.is_err() {
+                        return;
+                    }
                 }
                 Command::Corrupt {
                     digest,
@@ -1127,9 +1131,13 @@ impl CacheActor {
             if self.total_bytes <= self.config.low_water_bytes {
                 break;
             }
-            if let Some(entry) = self.entries.remove(&digest) {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.stored_bytes);
+            if let Some(entry) = self.entries.get(&digest) {
                 remove_generated_file(&entry.path).await?;
+                let entry = self
+                    .entries
+                    .remove(&digest)
+                    .expect("entry exists until successful eviction");
+                self.total_bytes = self.total_bytes.saturating_sub(entry.stored_bytes);
             }
         }
         Ok(())
@@ -1529,5 +1537,57 @@ mod tests {
         assert_eq!(&body, b"tampered");
         drop(opened);
         fs::remove_file(path).await.expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn failed_eviction_preserves_accounting_for_retry() {
+        let root = std::env::temp_dir().join(format!("cowshed-cache-evict-{}", Uuid::new_v4()));
+        fs::create_dir(&root).await.expect("create fixture root");
+        let undeletable = root.join("obj-directory");
+        fs::create_dir(&undeletable)
+            .await
+            .expect("create undeletable entry");
+        let digest = [9; 32];
+        let response = CachedResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            content_length: 0,
+            content_sha256: Sha256::digest([]).into(),
+            expected: None,
+            stored_unix_ms: 0,
+        };
+        let entries = HashMap::from([(
+            digest,
+            Entry {
+                generation: 1,
+                path: undeletable,
+                response,
+                stored_bytes: 2,
+                active_readers: 0,
+                last_access: 0,
+            },
+        )]);
+        let (commands, receiver) = mpsc::channel(1);
+        let mut actor = CacheActor::new(
+            Arc::new(CacheConfig {
+                root: root.clone(),
+                high_water_bytes: 1,
+                low_water_bytes: 0,
+                metadata_ttl: Duration::from_secs(1),
+                fill_wait_timeout: Duration::from_secs(1),
+            }),
+            entries,
+            commands.downgrade(),
+            receiver,
+        );
+
+        actor
+            .evict_if_needed()
+            .await
+            .expect_err("directory cannot be removed as a cache file");
+        assert!(actor.entries.contains_key(&digest));
+        assert_eq!(actor.total_bytes, 2);
+        drop(commands);
+        fs::remove_dir_all(root).await.expect("remove fixture");
     }
 }
