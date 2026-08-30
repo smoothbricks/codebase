@@ -8,6 +8,7 @@ use columine_arrow::{
     ArrowType, DynamicColumn, DynamicSchemaConfig, IpcError, MAX_EVENTS_PER_BATCH,
     MAX_SCHEMA_FIELDS, MAX_VALUE_BYTES,
 };
+use columine_parsing::json_extractor::diagnostic_stage;
 
 use crate::{ResultCode, ResultDiagnostic};
 
@@ -15,22 +16,9 @@ pub const COMPACT_BATCH_MAGIC: u32 = 0x3142_5043; // "CPB1"
 pub const COMPACT_ABI_VERSION: u16 = 1;
 pub const COMPACT_HEADER_SIZE: usize = 16;
 pub const COMPACT_DESCRIPTOR_SIZE: usize = 32;
-pub const COMPACT_DIAGNOSTIC_STAGE: u8 = 4;
+pub const COMPACT_DIAGNOSTIC_STAGE: u8 = diagnostic_stage::COMPACT;
 
-pub mod compact_detail {
-    pub const BAD_HEADER: u8 = 1;
-    pub const BAD_DESCRIPTOR: u8 = 2;
-    pub const BAD_ROW_COUNT: u8 = 3;
-    pub const BAD_VALIDITY: u8 = 4;
-    pub const BAD_FIXED_DATA: u8 = 5;
-    pub const BAD_OFFSETS: u8 = 6;
-    pub const BAD_UTF8: u8 = 7;
-    pub const OUTPUT_OVERLAP: u8 = 8;
-    pub const FIELD_COUNT_MISMATCH: u8 = 9;
-    pub const TYPE_MISMATCH: u8 = 10;
-    pub const NULLABILITY_MISMATCH: u8 = 11;
-    pub const SCHEMA_MESSAGE_MISMATCH: u8 = 12;
-}
+pub use columine_parsing::json_extractor::compact_detail;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompactValidationError {

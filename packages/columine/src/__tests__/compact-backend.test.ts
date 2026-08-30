@@ -110,7 +110,7 @@ function createCompactMock(options: CompactMockOptions = {}) {
       view.setUint32(outputPtr + 12, headerStatus === 0 ? view.getUint32(batchPtr + 8, true) : 0, true);
       view.setUint32(outputPtr + 16, 0, true);
       view.setUint8(outputPtr + 20, diagnostic.version ?? 1);
-      view.setUint8(outputPtr + 21, diagnostic.stage ?? 4);
+      view.setUint8(outputPtr + 21, diagnostic.stage ?? 6);
       view.setUint8(outputPtr + 22, diagnostic.detail ?? 0);
       view.setUint8(outputPtr + 23, diagnostic.expectedType ?? 0);
       view.setUint8(outputPtr + 24, diagnostic.actualType ?? 0);
@@ -443,7 +443,7 @@ describe('Compact native results and lifecycle', () => {
     expect(compactError.status).toBe(6);
     expect(compactError.diagnostic).toEqual({
       version: 1,
-      stage: 4,
+      stage: 6,
       detail: 7,
       expectedType: 4,
       actualType: 3,

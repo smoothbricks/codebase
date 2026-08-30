@@ -30,10 +30,14 @@ pub mod diagnostic_stage {
     pub const MSGPACK: u8 = 3;
     pub const COLUMN: u8 = 4;
     pub const SCHEMA: u8 = 5;
+    /// Compact CPB1 validation. Distinct from [`COLUMN`] so a compact
+    /// `BAD_HEADER` (detail 1) cannot be read as `INVALID_JSON`.
+    pub const COMPACT: u8 = 6;
 }
 
 /// Diagnostic detail bytes (`ExtractionDiagnostic.Detail` — order is ABI,
-/// decoded by lib.ts `DIAGNOSTIC_DETAILS`).
+/// decoded by lib.ts `DIAGNOSTIC_DETAILS`). Compact details are a separate
+/// module, namespaced by [`diagnostic_stage::COMPACT`].
 pub mod diagnostic_detail {
     pub const NONE: u8 = 0;
     pub const INVALID_JSON: u8 = 1;
@@ -43,6 +47,21 @@ pub mod diagnostic_detail {
     pub const TOO_MANY_FIELDS: u8 = 5;
     pub const TOO_MANY_EVENTS: u8 = 6;
     pub const OUT_OF_MEMORY: u8 = 7;
+}
+
+/// Compact validation details, namespaced by [`diagnostic_stage::COMPACT`].
+pub mod compact_detail {
+    pub const BAD_HEADER: u8 = 1;
+    pub const BAD_DESCRIPTOR: u8 = 2;
+    pub const BAD_ROW_COUNT: u8 = 3;
+    pub const BAD_VALIDITY: u8 = 4;
+    pub const BAD_FIXED_DATA: u8 = 5;
+    pub const BAD_OFFSETS: u8 = 6;
+    pub const BAD_UTF8: u8 = 7;
+    pub const OUTPUT_OVERLAP: u8 = 8;
+    pub const FIELD_COUNT_MISMATCH: u8 = 9;
+    pub const TYPE_MISMATCH: u8 = 10;
+    pub const NULLABILITY_MISMATCH: u8 = 11;
 }
 
 /// JSON value-kind bytes (`JsonValueType` — order is ABI, decoded by lib.ts
