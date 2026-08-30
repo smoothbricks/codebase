@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { platformDirectory } from './platform.js';
+import { CowshedError } from './types.js';
 
 const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
 
@@ -22,11 +23,11 @@ export interface CliResolutionOptions {
 
 export type CliBackend =
   | { kind: 'native'; path: string; source: 'stable' | 'package' | 'workspace' }
-  | { kind: 'napi' };
+  /** Every candidate path that was checked, so the failure can name what is missing. */
+  | { kind: 'missing'; searched: readonly string[]; reason: string };
 
 export interface RunCliOptions extends CliResolutionOptions {
   spawnBinary?: (executable: string, argv: readonly string[]) => Promise<number>;
-  runNapi?: (argv: readonly string[]) => Promise<number>;
 }
 
 export function packageRootFromModule(moduleUrl: string): string {
@@ -54,6 +55,7 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
   const arch = options.arch ?? process.arch;
   const fileExists = options.exists ?? existsSync;
   const binaryDirectory = platformDirectory(platform, arch);
+  const searched: string[] = [];
 
   if (isServiceVerb(options.argv)) {
     // launchd keeps running the installed copy, so for daemon verbs it is authoritative even when
@@ -69,6 +71,7 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
       'bin',
       'cowshed',
     );
+    searched.push(stableBinary);
     if (fileExists(stableBinary)) {
       return { kind: 'native', path: stableBinary, source: 'stable' };
     }
@@ -76,31 +79,41 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
 
   if (binaryDirectory !== null) {
     const packagedBinary = join(options.packageRoot, 'dist', 'bin', binaryDirectory, 'cowshed');
+    searched.push(packagedBinary);
     if (fileExists(packagedBinary)) {
       return { kind: 'native', path: packagedBinary, source: 'package' };
     }
   }
 
   const workspaceBinary = join(options.packageRoot, 'target', 'release', 'cowshed');
+  searched.push(workspaceBinary);
   if (fileExists(workspaceBinary)) {
     return { kind: 'native', path: workspaceBinary, source: 'workspace' };
   }
 
-  return { kind: 'napi' };
+  // There is no in-process fallback to reach for: the Node addon deliberately does not link the
+  // CLI, so nothing else implements these verbs. Reporting the paths that were searched is the
+  // difference between a diagnosable failure and "cowshed did nothing".
+  return {
+    kind: 'missing',
+    searched,
+    reason:
+      binaryDirectory === null
+        ? `cowshed ships no CLI binary for ${platform}-${arch}`
+        : `no cowshed CLI binary found; looked in ${searched.join(', ')}`,
+  };
 }
 
 export async function runCli(argv: readonly string[], options: RunCliOptions): Promise<number> {
   const backend = resolveCliBackend({ ...options, argv });
-  if (backend.kind === 'native') {
-    return (options.spawnBinary ?? spawnBinary)(backend.path, argv);
+  if (backend.kind === 'missing') {
+    throw new CowshedError(
+      'environment-missing',
+      backend.reason,
+      'build this platform with `nx build cowshed`, or install a published @smoothbricks/cowshed',
+    );
   }
-  return (options.runNapi ?? runNapiFallback)(argv);
-}
-
-async function runNapiFallback(argv: readonly string[]): Promise<number> {
-  // Loading the known module lazily is load-bearing: native binaries must bypass Node-API and typia startup entirely.
-  const { loadNativeModule } = await import('./native.js');
-  return loadNativeModule().runCli(argv);
+  return (options.spawnBinary ?? spawnBinary)(backend.path, argv);
 }
 
 function spawnBinary(executable: string, argv: readonly string[]): Promise<number> {

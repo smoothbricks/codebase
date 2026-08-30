@@ -1,4 +1,5 @@
 import typia from 'typia';
+import { packageRootFromModule, runCli as runTrampolineCli } from './cli-trampoline.js';
 import {
   loadNativeModule,
   type NativeCoordinatorHandle,
@@ -475,10 +476,17 @@ export async function connectCoordinator(endpoint: CoordinatorEndpoint, path: st
 }
 
 /**
- * Runs any CLI verb in-process with the exact argv, stdout/stderr, and exit-code contract of the
- * standalone binary. This is the parity escape hatch for host-management verbs such as gateway,
- * sccache, skill, setup, version, and help that do not belong to a project capability.
+ * Runs any CLI verb with the exact argv, stdout/stderr, and exit-code contract of the standalone
+ * binary, because it *is* the standalone binary: this resolves and spawns the same packaged
+ * `cowshed` that the `cowshed` bin script runs.
+ *
+ * This is the escape hatch for host-management verbs — gateway, sccache, skill, setup, version,
+ * help — that do not belong to a project capability. It is not an in-process runtime: the addon
+ * does not link the CLI, so there is exactly one implementation of these verbs and exactly one
+ * place a missing binary is reported from.
  */
 export async function runCli(argv: readonly string[]): Promise<number> {
-  return callNativeAsync(() => native.runCli(typia.assert<readonly string[]>(argv)));
+  return runTrampolineCli(typia.assert<readonly string[]>(argv), {
+    packageRoot: packageRootFromModule(import.meta.url),
+  });
 }
