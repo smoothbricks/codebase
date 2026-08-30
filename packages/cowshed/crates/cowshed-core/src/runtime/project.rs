@@ -3480,54 +3480,17 @@ impl NativeProjectRuntimeHost {
         crate::git::GitRepository::from_root(&mount)
             .ensure_cowshed_excludes()
             .await?;
-        let port_block = current.metadata.grants.port_block.ok_or_else(|| {
-            CowshedError::integrity(
-                "macOS workspace metadata has no port block",
-                "cowshed doctor --json",
-            )
-        })?;
-        let sandbox = crate::sandbox::SandboxConfig {
-            home: self.home.clone(),
-            mount_root: self.layout.project().host_mount_root.clone(),
-            workspace_mount: mount.clone(),
-            exec_temp_dir: self
-                .layout
-                .project()
-                .quarantine
-                .join(current.derived.workspace.incarnation().as_str()),
-            port_block,
-            mode: crate::sandbox::RunSandboxMode::ReadWrite,
-            grants: crate::sandbox::SandboxGrants {
-                read: current.metadata.grants.read.clone(),
-                write: current.metadata.grants.write.clone(),
-                egress: current
-                    .metadata
-                    .grants
-                    .egress
-                    .iter()
-                    .map(|rule| crate::sandbox::EgressGrant {
-                        host: rule.host.clone(),
-                        ports: rule.ports.clone(),
-                    })
-                    .collect(),
-            },
-            // Multi-user Nix is a requirement, and evaluation inside a workspace is the point of
-            // a workspace: without the daemon the client cannot build or substitute at all. The
-            // sccache server socket rides along so rustc-wrapper clients reach the host-owned
-            // daemon instead of spawning a wrong-boundary server in-sandbox.
-            allowed_unix_sockets: crate::sandbox::nix_daemon_socket()
-                .into_iter()
-                .chain([crate::sandbox::sccache_server_socket()])
-                .collect(),
-            additional_denies: vec![
-                self.layout.project().project_root.clone(),
-                self.telemetry_root.clone(),
-            ],
-            git_worktree_repository: git_worktree_repository(
-                &current.metadata,
-                self.workspace_mount_path(&main_name())?,
-            ),
-        };
+        // One builder, so a grant advance cannot hand the supervisor a different policy than
+        // its first start did. A deny, socket, or grant field added to only one of two inline
+        // copies is a silent sandbox-policy fork.
+        let sandbox = supervisor_sandbox(
+            &self.home,
+            &self.layout,
+            &self.telemetry_root,
+            &current,
+            mount.clone(),
+            self.workspace_mount_path(&main_name())?,
+        )?;
         let historical_incarnations = workspace_lineage(
             &mount,
             current.derived.workspace.incarnation(),
@@ -6217,24 +6180,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 error,
             ));
         }
-        let gateway_socket = crate::gateway_sessions::control_socket_path();
-        let gateway_status =
-            match cowshed_gateway::GatewayControlClient::new(gateway_socket.clone()) {
-                Ok(client) => client.status().await.map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-        if let Err(error) = gateway_status {
-            findings.push(crate::api::dto::Finding {
-                code: "gateway-down".into(),
-                severity: crate::api::dto::FindingSeverity::Error,
-                message: format!(
-                    "gateway control socket does not answer at {}: {error}",
-                    gateway_socket.display()
-                ),
-                hint: "cowshed gateway start".into(),
-                path: Some(gateway_socket),
-            });
-        }
+        // Gateway reachability is host-scoped, not project-scoped, and is diagnosed once by the
+        // CLI's host diagnosis with a launchd-aware message and hint. A second `gateway-down`
+        // author here produced two Error rows with the same code and contradictory recovery
+        // steps; a project cannot answer a host question, so it no longer tries.
         match self.commitments.health().await {
             Ok(health) if health.failed > 0 => findings.push(crate::api::dto::Finding {
                 code: "audit-sink".into(),
