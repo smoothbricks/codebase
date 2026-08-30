@@ -1561,7 +1561,11 @@ fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result<()> {
-    for name in [".staging", "checkpoints", "sessions"] {
+    for name in [
+        crate::storage::recovery::STAGING_NAMESPACE,
+        "checkpoints",
+        "sessions",
+    ] {
         remove_terminal_storage_tree(&project_root.join(name))?;
     }
     for entry in std::fs::read_dir(project_root).map_err(|error| {
@@ -2168,17 +2172,10 @@ impl NativeProjectRuntimeHost {
             derived
                 .into_iter()
                 .map(|derived| {
-                    let image = if derived.workspace.name().is_main() {
-                        layout
-                            .main_image(derived.workspace.format())?
-                            .image()
-                            .to_path_buf()
-                    } else {
-                        layout
-                            .session_image(derived.workspace.name(), derived.workspace.format())?
-                            .image()
-                            .to_path_buf()
-                    };
+                    let image = layout
+                        .canonical_image(derived.workspace.name(), derived.workspace.format())?
+                        .image()
+                        .to_path_buf();
                     let metadata =
                         crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
                             .map_err(|error| {
@@ -2292,13 +2289,12 @@ impl NativeProjectRuntimeHost {
     }
 
     fn workspace_mount_path(&self, workspace: &WorkspaceName) -> Result<PathBuf> {
-        // Main's mount follows the project's checkout layout; every other workspace mounts under
-        // `mnt/` in both layouts.
-        if workspace.is_main() && self.substrate_config.checkout_layout.mounts_at_checkout() {
-            return Ok(self.substrate_config.checkout_path.clone());
-        }
         self.layout
-            .workspace_mount(workspace)
+            .main_aware_workspace_mount(
+                self.substrate_config.checkout_layout,
+                &self.substrate_config.checkout_path,
+                workspace,
+            )
             .map_err(native_integrity_error)
     }
 
@@ -8316,7 +8312,9 @@ fn native_retired_refs(
     };
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
 
-    let trash = project_root.join("sessions").join(".trash");
+    let trash = project_root
+        .join("sessions")
+        .join(crate::storage::recovery::TRASH_NAMESPACE);
     let entries = match std::fs::read_dir(&trash) {
         Ok(entries) => entries
             .collect::<std::result::Result<Vec<_>, _>>()

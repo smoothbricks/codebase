@@ -29,8 +29,7 @@ use super::lifecycle::{
 use super::{CheckpointLabel, StorageLayout, StorageLayoutError};
 
 pub const DEFAULT_IMAGE_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(100);
-const STAGING_NAMESPACE: &str = ".staging";
-const TRASH_NAMESPACE: &str = ".trash";
+use super::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
 const PRE_RESTORE_PREFIX: &str = "pre-restore-";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2829,9 +2828,7 @@ fn active_expected_with_format(
 }
 
 fn companion_path(image: &Path) -> PathBuf {
-    let mut path = image.as_os_str().to_owned();
-    path.push(".ca.key");
-    PathBuf::from(path)
+    crate::metadata::append_suffix(image, ".ca.key")
 }
 
 fn absent_expected(expected: &[ExpectedState]) -> Result<Revision, ApfsStorageError> {
@@ -2894,14 +2891,10 @@ fn canonical_image_path(
     workspace: &LifecycleWorkspace,
 ) -> Result<PathBuf, ApfsStorageError> {
     let layout = layout(config, workspace.repo())?;
-    if workspace.name().is_main() {
-        Ok(layout.main_image(workspace.format())?.image().to_owned())
-    } else {
-        Ok(layout
-            .session_image(workspace.name(), workspace.format())?
-            .image()
-            .to_owned())
-    }
+    Ok(layout
+        .canonical_image(workspace.name(), workspace.format())?
+        .image()
+        .to_owned())
 }
 
 fn staging_stem(
@@ -3005,11 +2998,8 @@ fn main_aware_mount_point(
     repo: &RepoId,
     workspace: &WorkspaceName,
 ) -> Result<PathBuf, ApfsStorageError> {
-    if workspace.is_main() && config.checkout_layout.mounts_at_checkout() {
-        return Ok(config.checkout_path.clone());
-    }
     layout(config, repo)?
-        .workspace_mount(workspace)
+        .main_aware_workspace_mount(config.checkout_layout, &config.checkout_path, workspace)
         .map_err(Into::into)
 }
 

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::metadata::{
     CheckoutLayout, CheckoutLayoutRecord, ImageFormat, MetadataError, SlotBindings,
-    SlotBindingsRecord, WorkspaceName,
+    SlotBindingsRecord, WorkspaceName, append_suffix, sidecar_path,
 };
 use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 
@@ -25,7 +25,7 @@ pub mod lifecycle;
 pub mod recovery;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
-const STAGING_DIRECTORY: &str = ".staging";
+use recovery::STAGING_NAMESPACE;
 
 /// A validated, path-safe checkpoint label.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -118,7 +118,7 @@ pub struct ImagePaths {
 impl ImagePaths {
     fn new(image: PathBuf) -> Self {
         Self {
-            sidecar: append_suffix(&image, ".grants.json"),
+            sidecar: sidecar_path(&image),
             lock: append_suffix(&image, ".lock"),
             ca_private_key: append_suffix(&image, ".ca.key"),
             image,
@@ -186,7 +186,7 @@ impl StorageLayout {
     }
 
     pub fn staged_main_image(&self, format: ImageFormat) -> Result<ImagePaths, StorageLayoutError> {
-        let staging = checked_child(&self.project.project_root, STAGING_DIRECTORY)?;
+        let staging = checked_child(&self.project.project_root, STAGING_NAMESPACE)?;
         self.image_below(&staging, "main", format)
     }
 
@@ -199,6 +199,20 @@ impl StorageLayout {
             return Err(StorageLayoutError::MainIsNotSession);
         }
         self.image_below(&self.project.sessions, workspace.as_str(), format)
+    }
+
+    /// The canonical image for a workspace: main lives at the project root, every session under
+    /// `sessions/`. The one statement of that rule.
+    pub fn canonical_image(
+        &self,
+        workspace: &WorkspaceName,
+        format: ImageFormat,
+    ) -> Result<ImagePaths, StorageLayoutError> {
+        if workspace.is_main() {
+            self.main_image(format)
+        } else {
+            self.session_image(workspace, format)
+        }
     }
 
     pub fn checkpoint_image(
@@ -227,6 +241,25 @@ impl StorageLayout {
             Some(slot) => checked_child(&self.project.mount_root, &slot.mount_name()),
             None => checked_child(&self.project.mount_root, workspace.as_str()),
         }
+    }
+
+    /// Where one workspace of one project mounts, checkout layout included.
+    ///
+    /// Main's path follows the project's checkout layout — the adopted checkout itself under
+    /// direct mount, the uniform `mnt/` path under the symlink layout. Every other workspace
+    /// mounts under `mnt/` either way. One rule, because every fact pass, mount, and reverse
+    /// lookup goes through it, and a project whose two answers disagreed would be reported as
+    /// broken by whichever derivation ran second.
+    pub fn main_aware_workspace_mount(
+        &self,
+        checkout_layout: CheckoutLayout,
+        checkout_path: &Path,
+        workspace: &WorkspaceName,
+    ) -> Result<PathBuf, StorageLayoutError> {
+        if workspace.is_main() && checkout_layout.mounts_at_checkout() {
+            return Ok(checkout_path.to_owned());
+        }
+        self.workspace_mount(workspace)
     }
 
     /// Every slot occupancy for this project. An absent record is no occupancies.
@@ -388,12 +421,6 @@ const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     };
     let year = year_of_era + era * 400 + (month <= 2) as u64;
     (year, month, day)
-}
-
-fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut value: OsString = path.as_os_str().to_owned();
-    value.push(suffix);
-    PathBuf::from(value)
 }
 
 fn checked_child(root: &Path, component: &str) -> Result<PathBuf, StorageLayoutError> {

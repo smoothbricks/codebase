@@ -1110,17 +1110,26 @@ impl DetachedWorkspaceMetadata {
     }
 }
 
+/// The one spelling of the grants-sidecar suffix; every recognizer and both path derivations
+/// below go through it.
+pub const GRANTS_SIDECAR_SUFFIX: &str = ".grants.json";
+
+/// Append a suffix to a path's final component without touching its extension handling.
+pub(crate) fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value: OsString = path.as_os_str().to_owned();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
 pub fn sidecar_path(image_path: &Path) -> PathBuf {
-    let mut path: OsString = image_path.as_os_str().to_owned();
-    path.push(".grants.json");
-    PathBuf::from(path)
+    append_suffix(image_path, GRANTS_SIDECAR_SUFFIX)
 }
 
 /// The image a sidecar belongs to, or `None` for a path that is not a sidecar. Exact inverse of
 /// [`sidecar_path`], so a walk of the store can recognise sidecars without re-deriving image names.
 pub fn image_from_sidecar_path(sidecar: &Path) -> Option<PathBuf> {
     let name = sidecar.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".grants.json")?;
+    let stem = name.strip_suffix(GRANTS_SIDECAR_SUFFIX)?;
     if stem.is_empty() {
         return None;
     }
