@@ -38,7 +38,7 @@ pub async fn run(arguments: Vec<OsString>) -> i32 {
     let json = option_before_child_argv(&arguments, "--json");
     let quiet = option_before_child_argv(&arguments, "--quiet")
         || option_before_child_argv(&arguments, "-q");
-    match parse_then_invoke_service(arguments, |parsed| run_parsed(parsed, json)).await {
+    match parse_then_invoke_service(arguments, run_parsed).await {
         Ok(exit_code) => exit_code,
         Err(error) => {
             let command_map = error.command_map();
@@ -60,7 +60,8 @@ where
     Ok(invoke(parsed).await)
 }
 
-async fn run_parsed(parsed: args::Cli, json: bool) -> i32 {
+async fn run_parsed(parsed: args::Cli) -> i32 {
+    let json = parsed.global.json;
     let stdout = io::stdout();
     let stderr = io::stderr();
     let mut output = output::Output::new(stdout, stderr, parsed.global.quiet);
