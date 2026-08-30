@@ -517,18 +517,6 @@ fn remove_checkout_staging_link(staging: &Path) -> Result<(), ApfsStorageError> 
     sync_parent_path(staging)
 }
 
-macro_rules! sync_parent {
-    ($path:expr) => {{
-        let path: &Path = $path;
-        let parent = path
-            .parent()
-            .ok_or(ApfsStorageError::InvalidPlan("image path has no parent"))?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| io_error("sync image directory", parent, error))
-    }};
-}
-
 fn sync_parent_path(path: &Path) -> Result<(), ApfsStorageError> {
     let parent = path
         .parent()
@@ -836,7 +824,10 @@ fn read_dir_paths(
     }
 }
 
-fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+fn typed_children(
+    directory: &Path,
+    keep: impl Fn(fs::FileType) -> bool,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
@@ -854,7 +845,7 @@ fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError
     entries
         .filter_map(|entry| match entry {
             Ok(entry) => match fs::symlink_metadata(entry.path()) {
-                Ok(metadata) if metadata.file_type().is_dir() => Some(Ok(entry.path())),
+                Ok(metadata) if keep(metadata.file_type()) => Some(Ok(entry.path())),
                 Ok(_) => None,
                 Err(error) => Some(Err(io_error(
                     "inspect recovery directory",
@@ -871,39 +862,12 @@ fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError
         .collect()
 }
 
+fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    typed_children(directory, |file_type| file_type.is_dir())
+}
+
 fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Vec::new()),
-        Ok(_) => {
-            return Err(ApfsStorageError::Host(format!(
-                "recovery path is not a directory: {}",
-                directory.display()
-            )));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(io_error("inspect recovery directory", directory, error)),
-    }
-    let entries = fs::read_dir(directory)
-        .map_err(|error| io_error("enumerate recovery directory", directory, error))?;
-    entries
-        .filter_map(|entry| match entry {
-            Ok(entry) => match fs::symlink_metadata(entry.path()) {
-                Ok(metadata) if metadata.file_type().is_file() => Some(Ok(entry.path())),
-                Ok(_) => None,
-                Err(error) => Some(Err(io_error(
-                    "inspect recovery directory",
-                    &entry.path(),
-                    error,
-                ))),
-            },
-            Err(error) => Some(Err(io_error(
-                "read recovery directory entry",
-                directory,
-                error,
-            ))),
-        })
-        .collect()
+    typed_children(directory, |file_type| file_type.is_file())
 }
 
 fn staged_image_format(path: &Path) -> Option<ImageFormat> {
@@ -1267,7 +1231,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 canonical.display()
             )));
         }
-        sync_parent!(canonical)
+        sync_parent_path(canonical)
     }
 
     pub fn backend(&self) -> &MacOsApfsBackend<R> {
@@ -1375,7 +1339,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     fn remove_sidecar(image: &Path) -> Result<(), ApfsStorageError> {
         let sidecar = sidecar_path(image);
         match fs::remove_file(&sidecar) {
-            Ok(()) => sync_parent!(&sidecar),
+            Ok(()) => sync_parent_path(&sidecar),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error("remove detached metadata", &sidecar, error)),
         }
@@ -1399,7 +1363,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         fs::rename(&source, &destination)
             .map_err(|error| io_error("rename detached metadata", &source, error))?;
-        sync_parent!(&destination)
+        sync_parent_path(&destination)
     }
 
     fn recovery_companion(
@@ -1444,7 +1408,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     fn remove_companion(image: &Path) -> Result<(), ApfsStorageError> {
         let companion = companion_path(image);
         match fs::remove_file(&companion) {
-            Ok(()) => sync_parent!(&companion),
+            Ok(()) => sync_parent_path(&companion),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error("remove CA companion", &companion, error)),
         }
@@ -1495,7 +1459,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         fs::File::open(mount_point)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| io_error("sync adopt mountpoint", mount_point, error))?;
-        sync_parent!(mount_point)
+        sync_parent_path(mount_point)
     }
 
     fn published_facts(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
@@ -2358,7 +2322,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     fs::remove_file(candidate.path()).map_err(|error| {
                         io_error("remove orphan staging metadata", candidate.path(), error)
                     })?;
-                    sync_parent!(candidate.path())?;
+                    sync_parent_path(candidate.path())?;
                     report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                         ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                     )?;
@@ -3130,7 +3094,7 @@ where
                 ));
             }
             self.trip_restore_failpoint(RestoreFailpoint::AfterCanonicalSidecarRename)?;
-            sync_parent!(&canonical_sidecar)?;
+            sync_parent_path(&canonical_sidecar)?;
             self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
             fs::rename(&staged_companion, &canonical_companion).map_err(|error| {
                 io_error("publish canonical CA key", &canonical_companion, error)
@@ -3201,7 +3165,7 @@ where
                                 error,
                             )
                         })
-                        .and_then(|()| sync_parent!(&staged_sidecar))
+                        .and_then(|()| sync_parent_path(&staged_sidecar))
                 })()
             };
             return match rollback {
@@ -3588,7 +3552,7 @@ where
         let path = checkpoint_fact_path(image);
         crate::metadata::write_json(&path, &fact)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        sync_parent!(&path)
+        sync_parent_path(&path)
     }
 
     fn restore_swap(
@@ -3650,9 +3614,9 @@ where
         fs::remove_file(&staged_companion)
             .map_err(|error| io_error("remove displaced CA key", &staged_companion, error))?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterUndoRename)?;
-        sync_parent!(canonical)?;
+        sync_parent_path(canonical)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreCanonicalParentFsync)?;
-        sync_parent!(undo)?;
+        sync_parent_path(undo)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreUndoParentFsync)
     }
 
@@ -3668,16 +3632,16 @@ where
                 metadata
                     .write_for_image(canonical)
                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                sync_parent!(canonical)?;
+                sync_parent_path(canonical)?;
             }
             PublicationState::Active if fact_path.exists() => {
                 restore_recovery_fact(&self.config, canonical, &metadata)?;
             }
-            PublicationState::Active => return sync_parent!(canonical),
+            PublicationState::Active => return sync_parent_path(canonical),
         }
         match fs::remove_file(&fact_path) {
-            Ok(()) => sync_parent!(canonical),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => sync_parent!(canonical),
+            Ok(()) => sync_parent_path(canonical),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => sync_parent_path(canonical),
             Err(error) => Err(io_error(
                 "remove completed restore recovery fact",
                 &fact_path,
@@ -3734,7 +3698,7 @@ where
         let recovery_path = restore_recovery_fact_path(canonical);
         crate::metadata::write_json(&recovery_path, &recovery_fact)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        sync_parent!(&recovery_path)?;
+        sync_parent_path(&recovery_path)?;
         self.publish_metadata(
             canonical,
             workspace,
@@ -3744,11 +3708,11 @@ where
             Some(source_image),
         )?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataPublish)?;
-        sync_parent!(canonical)?;
+        sync_parent_path(canonical)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterMetadataFsync)?;
         Self::remove_sidecar(staged)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterStagedMetadataRemoval)?;
-        sync_parent!(canonical)?;
+        sync_parent_path(canonical)?;
         self.trip_restore_failpoint(RestoreFailpoint::AfterRestoreMetadataParentFsync)?;
         let metadata = DetachedWorkspaceMetadata::read_for_image(canonical)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -3833,7 +3797,7 @@ where
                 ));
             }
         }
-        sync_parent!(canonical)
+        sync_parent_path(canonical)
     }
 
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError> {
@@ -3866,7 +3830,7 @@ where
             });
             return super::combine_cleanup("retire image", primary, cleanup);
         }
-        sync_parent!(trash)
+        sync_parent_path(trash)
     }
 
     fn reclaim_image(&self, image: &Path, format: ImageFormat) -> Result<(), ApfsStorageError> {
@@ -4168,7 +4132,7 @@ where
                                         )
                                     },
                                 )?;
-                                sync_parent!(&canonical_companion)?;
+                                sync_parent_path(&canonical_companion)?;
                             }
                             (false, true) => {
                                 self.recovery_companion(
@@ -4209,7 +4173,7 @@ where
                                 error,
                             )
                         })?;
-                        sync_parent!(&canonical)?;
+                        sync_parent_path(&canonical)?;
                     } else if canonical_companion.exists() {
                         return Err(ApfsStorageError::MarkerMismatch(format!(
                             "canonical metadata and CA companion have no publication image: canonical_image={}, canonical_sidecar={}, canonical_companion={}, staged_image={}",
@@ -4226,7 +4190,7 @@ where
                                 error,
                             )
                         })?;
-                        sync_parent!(&canonical_sidecar)?;
+                        sync_parent_path(&canonical_sidecar)?;
                     }
                 }
             }
@@ -4330,7 +4294,7 @@ where
                                 error,
                             )
                         })?;
-                        sync_parent!(&canonical)?;
+                        sync_parent_path(&canonical)?;
                     }
                 }
             }
@@ -4497,7 +4461,7 @@ where
                     }
                     Self::remove_sidecar(&staged)?;
                     Self::remove_companion(&staged)?;
-                    sync_parent!(&canonical)?;
+                    sync_parent_path(&canonical)?;
                     continue;
                 }
                 if canonical_metadata.as_ref().is_some_and(|metadata| {
@@ -4650,7 +4614,7 @@ where
                 fs::remove_file(&undo_companion).map_err(|error| {
                     io_error("remove redundant restore CA key", &undo_companion, error)
                 })?;
-                sync_parent!(&canonical)?;
+                sync_parent_path(&canonical)?;
             }
         }
         Ok(())
