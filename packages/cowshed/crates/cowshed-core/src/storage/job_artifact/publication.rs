@@ -8,10 +8,9 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sha2::{Digest, Sha256};
-
 use super::{
-    ArtifactError, PROTECTED_DIRECTORY, PublicationStage, reject_hardlink, verify_private_file_mode,
+    ArtifactError, PROTECTED_DIRECTORY, PublicationStage, hash_reader, reject_hardlink,
+    verify_private_file_mode,
 };
 use crate::api::dto::{
     OutputPublication, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
@@ -32,7 +31,6 @@ use macos::try_fast_clone;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use unsupported::try_fast_clone;
 
-const COPY_BUFFER_BYTES: usize = 64 * 1024;
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn publish(
@@ -420,29 +418,20 @@ fn copy_file_descriptor(
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| publication_error(source_path, PublicationStage::Copy, error))?;
-    let mut hasher = Sha256::new();
-    let mut bytes = 0_u64;
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|error| publication_error(source_path, PublicationStage::Copy, error))?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes.checked_add(read as u64).ok_or_else(|| {
-            publication_error(
-                source_path,
-                PublicationStage::Copy,
-                "publication byte count overflow",
-            )
-        })?;
-        hasher.update(&buffer[..read]);
-        destination
-            .write_all(&buffer[..read])
-            .map_err(|error| publication_error(destination_path, PublicationStage::Copy, error))?;
-    }
-    Ok((bytes, Sha256Digest::from_bytes(hasher.finalize().into())))
+    hash_reader(
+        &mut source,
+        |chunk, _| {
+            destination
+                .write_all(chunk)
+                .map_err(|error| publication_error(destination_path, PublicationStage::Copy, error))
+        },
+        |error| publication_error(source_path, PublicationStage::Copy, error),
+        publication_error(
+            source_path,
+            PublicationStage::Copy,
+            "publication byte count overflow",
+        ),
+    )
 }
 
 fn verify_observed(
@@ -474,26 +463,17 @@ fn verify_content(
         .map_err(|error| publication_error(path, PublicationStage::Sync, error))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| publication_error(path, PublicationStage::Sync, error))?;
-    let mut hasher = Sha256::new();
-    let mut bytes = 0_u64;
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| publication_error(path, PublicationStage::Sync, error))?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes.saturating_add(read as u64);
-        hasher.update(&buffer[..read]);
-    }
-    verify_observed(
-        path,
-        bytes,
-        Sha256Digest::from_bytes(hasher.finalize().into()),
-        expected_bytes,
-        expected_sha256,
-    )
+    let (bytes, digest) = hash_reader(
+        &mut file,
+        |_, _| Ok(()),
+        |error| publication_error(path, PublicationStage::Sync, error),
+        publication_error(
+            path,
+            PublicationStage::Sync,
+            "publication byte count overflow",
+        ),
+    )?;
+    verify_observed(path, bytes, digest, expected_bytes, expected_sha256)
 }
 
 fn publish_relative(
