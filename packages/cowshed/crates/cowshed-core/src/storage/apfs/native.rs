@@ -72,6 +72,10 @@ fn fd_failed(fd: libc::c_int) -> bool {
 /// Darwin `getmntinfo` returns the mount count, or `-1` on error with `errno` set.
 /// Treating a negative count as a slice length would be memory-unsafe; `0` is
 /// not a legitimate Darwin mount table either (at least `/` is mounted).
+///
+/// Only `system_kernel_mounts`' Darwin arm calls this, so the non-macOS lib must
+/// not compile it; `test` keeps the predicate's own unit test on every platform.
+#[cfg(any(target_os = "macos", test))]
 fn getmntinfo_failed(count: libc::c_int) -> bool {
     count <= 0
 }
