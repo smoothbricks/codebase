@@ -27,14 +27,21 @@ struct IntegrationRoot {
     path: PathBuf,
 }
 
+/// Every integration root lives directly under this prefix and spells out the pid of the run
+/// that owns it. The pid is the whole cleanup protocol: a later run can tell a live root from an
+/// abandoned one without any lock file or shared state of its own.
+const ROOT_PREFIX: &str = "/private/tmp/cowshed-itest-";
+
 impl IntegrationRoot {
     fn new(format: ImageFormat) -> Result<Self, Box<dyn Error>> {
+        sweep_dead_runs();
         let path = PathBuf::from(format!(
-            "/private/tmp/cowshed-itest-{}-{}",
+            "{ROOT_PREFIX}{}-{}",
             std::process::id(),
             format.extension()
         ));
         if path.exists() {
+            detach_images(|image| image.starts_with(&*path.to_string_lossy()));
             fs::remove_dir_all(&path)?;
         }
         fs::create_dir_all(&path)?;
@@ -44,7 +51,80 @@ impl IntegrationRoot {
 
 impl Drop for IntegrationRoot {
     fn drop(&mut self) {
+        // A failed test unwinds with its volumes still attached; removing the tree without
+        // detaching first strands kernel attachments pointing into a half-deleted root, and
+        // leaves their volumes showing up in Finder and `mount` until the machine reboots.
+        detach_images(|image| image.starts_with(&*self.path.to_string_lossy()));
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Reclaim what runs that can no longer clean up after themselves left behind. Nothing runs after
+/// a SIGKILL — a harness timeout, a bounded-exec force-kill, a `cargo test` killed mid-mount — so
+/// the only protocol that always converges is that every run sweeps its dead predecessors.
+///
+/// The sweep is driven off the attachment table rather than the directory listing, because the
+/// two residues outlive each other independently: a root directory can be deleted (by hand, or by
+/// a tmp reaper) while its images stay attached, and an attached image keeps working from a
+/// deleted backing file. Detaching therefore selects on the image path `hdiutil` still reports,
+/// not on what is on disk now.
+fn sweep_dead_runs() {
+    detach_images(|image| owner_pid(image).is_some_and(process_is_gone));
+    let Ok(entries) = fs::read_dir("/private/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if owner_pid(&path.to_string_lossy()).is_some_and(process_is_gone) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// The pid of the run that owns an integration root, given the root itself or any path below it.
+fn owner_pid(path: &str) -> Option<i32> {
+    path.strip_prefix(ROOT_PREFIX)?
+        .split(['-', '/'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether no process holds `pid` any more. Signal 0 runs the existence and permission checks
+/// without delivering anything, and `ESRCH` is the single answer that proves the owner is gone —
+/// `EPERM` means it is alive under another user, so a run must not reclaim its root.
+fn process_is_gone(pid: i32) -> bool {
+    // SAFETY: `kill` with signal 0 only probes; it delivers nothing and touches no memory.
+    let probe = unsafe { libc::kill(pid, 0) };
+    probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Detach every attached disk image whose backing path `select` accepts, using each image's first
+/// (whole-device) `/dev/diskN` line — detaching the whole device takes its synthesized APFS
+/// container and every mounted volume down with it. Text parsing is deliberate: this is
+/// best-effort hygiene, and a parse miss only means the residue waits for the next sweep.
+fn detach_images(select: impl Fn(&str) -> bool) {
+    let Ok(output) = std::process::Command::new("hdiutil").arg("info").output() else {
+        return;
+    };
+    let info = String::from_utf8_lossy(&output.stdout);
+    let mut in_matching_image = false;
+    for line in info.lines() {
+        if let Some(image_path) = line.strip_prefix("image-path") {
+            in_matching_image = select(image_path.trim_start_matches([' ', ':']));
+            continue;
+        }
+        if !in_matching_image {
+            continue;
+        }
+        if let Some(device) = line.split_whitespace().next().filter(|token| {
+            token.starts_with("/dev/disk") && !token.trim_start_matches("/dev/disk").contains('s')
+        }) {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", device, "-force"])
+                .output();
+            in_matching_image = false;
+        }
     }
 }
 
