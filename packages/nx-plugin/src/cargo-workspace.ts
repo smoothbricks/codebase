@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, normalize, posix, relative, sep } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
@@ -8,9 +8,12 @@ export interface CargoWorkspacePackage {
   dir: string;
 }
 
-export async function listCargoWorkspacePackages(absoluteProjectRoot: string): Promise<CargoWorkspacePackage[]> {
-  const workspaceToml = await readFile(join(absoluteProjectRoot, 'Cargo.toml'), 'utf-8');
-  const parsed: unknown = parseToml(workspaceToml);
+export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWorkspacePackage[] {
+  const workspaceTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
+  if (!existsSync(workspaceTomlPath)) {
+    return [];
+  }
+  const parsed: unknown = parseToml(readFileSync(workspaceTomlPath, 'utf-8'));
   if (!isRecord(parsed) || !isRecord(parsed.workspace) || !Array.isArray(parsed.workspace.members)) {
     return [];
   }
@@ -23,7 +26,7 @@ export async function listCargoWorkspacePackages(absoluteProjectRoot: string): P
     if (!existsSync(crateTomlPath)) {
       continue;
     }
-    const crateParsed: unknown = parseToml(await readFile(crateTomlPath, 'utf-8'));
+    const crateParsed: unknown = parseToml(readFileSync(crateTomlPath, 'utf-8'));
     if (!isRecord(crateParsed) || !isRecord(crateParsed.package) || typeof crateParsed.package.name !== 'string') {
       continue;
     }
@@ -112,8 +115,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export const CARGO_TEST_TARGET = 'cargo-test';
 
+/** Prerequisite that compiles the workspace; not a per-crate runner. */
+export const CARGO_TEST_COMPILE_TARGET = 'cargo-test-compile';
+
 export function cargoTestPackageTargetName(packageName: string): string {
   return `cargo-test-${packageName}`;
+}
+
+export function packageNameFromCargoTestTarget(targetName: string): string | null {
+  if (!targetName.startsWith('cargo-test-') || targetName === CARGO_TEST_COMPILE_TARGET) {
+    return null;
+  }
+  const name = targetName.slice('cargo-test-'.length);
+  return name.length === 0 ? null : name;
 }
 
 export function nextestConfigRelPath(workspaceRoot: string, projectRoot: string, configAbs: string): string {

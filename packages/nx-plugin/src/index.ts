@@ -14,6 +14,7 @@ import { parse as parseToml } from 'smol-toml';
 
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import {
+  CARGO_TEST_COMPILE_TARGET,
   CARGO_TEST_TARGET,
   cargoPackageTestInputs,
   cargoTestPackageTargetName,
@@ -27,6 +28,8 @@ import {
   cargoFrozen,
 } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
+
+export { CARGO_TEST_COMPILE_TARGET };
 
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
 const TYPESCRIPT_TOOLCHAIN_INPUTS = [
@@ -168,8 +171,6 @@ function createCargoWasmTarget(projectRoot: string, config: ResolvedCargoWasmCon
  * (`napi-debug` after compile, `cargo-test` after `napi-debug`). Clippy uses
  * its own `--target-dir` so lint can overlap tests.
  */
-export const CARGO_TEST_COMPILE_TARGET = 'cargo-test-compile';
-
 function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
   return {
     executor: 'nx:run-commands',
@@ -211,7 +212,7 @@ async function addPerPackageCargoTestTargets(
   workspaceRoot: string,
   absoluteProjectRoot: string,
 ): Promise<string[]> {
-  const packages = await listCargoWorkspacePackages(absoluteProjectRoot);
+  const packages = listCargoWorkspacePackages(absoluteProjectRoot);
   if (packages.length === 0) {
     return [];
   }
@@ -227,9 +228,7 @@ async function addPerPackageCargoTestTargets(
       inputs: await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir),
       dependsOn: [previous],
       options: {
-        command: cargoFrozen(
-          `nextest run --workspace --package ${pkg.name} --user-config-file none --config-file ${configFile}`,
-        ),
+        command: cargoFrozen(`nextest run --package ${pkg.name} --user-config-file none --config-file ${configFile}`),
         cwd: projectRoot,
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
