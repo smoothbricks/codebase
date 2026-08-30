@@ -2018,11 +2018,11 @@ const DOCTOR: CommandSpec = CommandSpec {
     summary: "check invariants",
     about: &[
         "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh. Exit 0 when healthy, otherwise 5.",
-        "With `--repair`, first validates every mounted workspace artifact frame and non-destructively resequences only logs whose payloads are intact but whose physical sequence order raced. Every changed log keeps a byte-for-byte pre-repair backup beside it.",
+        "With `--repair`, first validates every mounted workspace artifact frame. Duplicate or regressed sequences are refused because resequencing would change store identity and make the rewritten log attest to itself; create a fresh store instead.",
     ],
     options: &[Opt {
         spelling: "--repair",
-        meaning: "repair raced artifact sequence ordering before running the health checks",
+        meaning: "validate artifact ordering and refuse identity-changing sequence rewrites",
     }],
 };
 

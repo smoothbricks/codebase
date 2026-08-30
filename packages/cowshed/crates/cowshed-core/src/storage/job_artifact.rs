@@ -43,6 +43,9 @@ const IO_BUFFER_BYTES: usize = 65_536;
 pub(super) const PROTECTED_DIRECTORY: &str = ".cowshed";
 const JOB_DIRECTORY: &str = "job";
 const RECORDS_FILE: &str = "records.arrow";
+const RECORD_SEQUENCE_FILE: &str = "records.sequence";
+const RECORD_SEQUENCE_MAGIC: &[u8; 8] = b"CSSEQ001";
+const RECORD_SEQUENCE_BYTES: usize = 24;
 const RECORD_SCHEMA_VERSION: u64 = 2;
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
@@ -72,9 +75,17 @@ pub enum ArtifactError {
     #[error("artifact integrity failure at byte {offset}: {message}")]
     Integrity { offset: u64, message: String },
     #[error(
-        "artifact ordering failure at byte {offset}: record sequence {current} does not follow {previous}; concurrent appends raced; run `cowshed doctor --repair`"
+        "artifact ordering failure at byte {offset}: duplicate or regressed record sequence {current} follows {previous}; a concurrent or stale-recovery append reused an allocation; run `cowshed doctor --repair`"
     )]
     SequenceOrdering {
+        offset: u64,
+        previous: u64,
+        current: u64,
+    },
+    #[error(
+        "artifact sequence repair refused at byte {offset}: duplicate or regressed record sequence {current} follows {previous}; resequencing would change store identity and make the rewritten log attest to itself; create a fresh store"
+    )]
+    SequenceRepairRefused {
         offset: u64,
         previous: u64,
         current: u64,
@@ -480,23 +491,6 @@ pub struct RecoveryReport {
     pub next_job_id: JobId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecordSequenceViolation {
-    pub offset: u64,
-    pub previous_offset: u64,
-    pub previous: JobArtifactRecord,
-    pub current: JobArtifactRecord,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArtifactRepairReport {
-    pub records_path: PathBuf,
-    pub backup_path: Option<PathBuf>,
-    pub frame_count: usize,
-    pub resequenced_records: usize,
-    pub violations: Vec<RecordSequenceViolation>,
-}
-
 pub struct ArtifactStore {
     workspace_root: PathBuf,
     token_namespace: Sha256Digest,
@@ -562,8 +556,9 @@ impl ArtifactStore {
         config.validate()?;
         let workspace_root = workspace_root.into();
         let records_path = records_path(&workspace_root);
+        let lock = RecordsLock::acquire(&records_path)?;
         let mut recovery =
-            recover_records_with_budget(&records_path, config.retained_recovery_budget_bytes)?;
+            recover_records_with_budget_under_lock(&lock, config.retained_recovery_budget_bytes)?;
         for frame in &recovery.frames {
             if !owned_repo_ids.accepts(frame.record.repo_id()) {
                 return Err(ArtifactError::Integrity {
@@ -621,6 +616,8 @@ impl ArtifactStore {
                 ));
             }
         }
+        ensure_record_sequence_counter(&lock, &recovery)?;
+        drop(lock);
         let token_namespace = Sha256Digest::compute(workspace_root.as_os_str().as_encoded_bytes());
         Ok(Self {
             workspace_root,
@@ -722,21 +719,7 @@ impl ArtifactStore {
         let recovery = recover_records_with_budget_under_lock(
             &lock,
             self.config.retained_recovery_budget_bytes,
-            SequencePolicy::Strict,
         )?;
-        let sequence = recovery
-            .frames
-            .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::Job(record) => Some(record.sequence),
-                ProtectedRecord::CheckpointManifest(_) => None,
-            })
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(ArtifactError::InvalidConfig(
-                "record sequence allocation exhausted",
-            ))?;
         if !matches!(record.state, JobState::Queued | JobState::Running)
             && recovery.frames.iter().any(|frame| {
                 matches!(
@@ -753,6 +736,7 @@ impl ArtifactStore {
                 "duplicate terminal artifact record for job id",
             ));
         }
+        let sequence = allocate_record_sequence(&lock)?;
         let mut record = record;
         record.sequence = sequence;
         record.validate()?;
@@ -790,7 +774,6 @@ impl ArtifactStore {
         let recovery = recover_records_with_budget_under_lock(
             &lock,
             self.config.retained_recovery_budget_bytes,
-            SequencePolicy::Strict,
         )?;
         let barrier_id = recovery
             .frames
@@ -2005,6 +1988,119 @@ impl<'path> RecordsLock<'path> {
         })
     }
 }
+fn record_sequence_path(lock: &RecordsLock<'_>) -> Result<PathBuf, ArtifactError> {
+    let job_root = lock
+        .records
+        .parent()
+        .ok_or_else(|| integrity(0, "records path has no job parent"))?;
+    Ok(job_root.join(RECORD_SEQUENCE_FILE))
+}
+
+fn highest_record_sequence(recovery: &RecoveryReport) -> u64 {
+    recovery
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.record {
+            ProtectedRecord::Job(record) => Some(record.sequence),
+            ProtectedRecord::CheckpointManifest(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn read_record_sequence_counter(lock: &RecordsLock<'_>) -> Result<Option<u64>, ArtifactError> {
+    let path = record_sequence_path(lock)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(&path, error)),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(integrity(
+            0,
+            "record sequence counter is not a regular protected file",
+        ));
+    }
+    reject_hardlink(&path, &metadata)?;
+    verify_private_file_mode(&path, &metadata, false)?;
+    let bytes = fs::read(&path).map_err(|error| io_error(&path, error))?;
+    if bytes.len() != RECORD_SEQUENCE_BYTES || &bytes[..8] != RECORD_SEQUENCE_MAGIC {
+        return Err(integrity(0, "record sequence counter encoding is invalid"));
+    }
+    let current = u64::from_le_bytes(
+        bytes[8..16]
+            .try_into()
+            .expect("validated record sequence counter has eight value bytes"),
+    );
+    let complement = u64::from_le_bytes(
+        bytes[16..24]
+            .try_into()
+            .expect("validated record sequence counter has eight complement bytes"),
+    );
+    if complement != !current {
+        return Err(integrity(
+            0,
+            "record sequence counter complement is invalid",
+        ));
+    }
+    Ok(Some(current))
+}
+
+fn publish_record_sequence_counter(
+    lock: &RecordsLock<'_>,
+    current: u64,
+) -> Result<(), ArtifactError> {
+    let path = record_sequence_path(lock)?;
+    let mut bytes = [0_u8; RECORD_SEQUENCE_BYTES];
+    bytes[..8].copy_from_slice(RECORD_SEQUENCE_MAGIC);
+    bytes[8..16].copy_from_slice(&current.to_le_bytes());
+    bytes[16..24].copy_from_slice(&(!current).to_le_bytes());
+    crate::fsio::publish_private_file::<io::Error>(&path, |writer| writer.write_all(&bytes))
+        .map_err(|error| match error {
+            crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
+            crate::fsio::PublishError::Write(source) => io_error(&path, source),
+        })
+}
+
+fn ensure_record_sequence_counter(
+    lock: &RecordsLock<'_>,
+    recovery: &RecoveryReport,
+) -> Result<(), ArtifactError> {
+    let observed = highest_record_sequence(recovery);
+    match read_record_sequence_counter(lock)? {
+        Some(durable) if durable < observed => Err(integrity(
+            0,
+            &format!("record sequence counter {durable} trails durable record sequence {observed}"),
+        )),
+        Some(_) => Ok(()),
+        None if recovery.truncated_bytes != 0 => Err(integrity(
+            0,
+            "cannot initialize record sequence counter after an incomplete tail; create a fresh store",
+        )),
+        None => {
+            // A pre-counter store is migrated once while holding the append lock. Appends never
+            // derive from recovered frames again; after this publication, tail loss can only leave
+            // the counter ahead of the log, which preserves monotonic allocation.
+            publish_record_sequence_counter(lock, observed)
+        }
+    }
+}
+
+fn allocate_record_sequence(lock: &RecordsLock<'_>) -> Result<u64, ArtifactError> {
+    let durable = read_record_sequence_counter(lock)?.ok_or_else(|| {
+        integrity(
+            0,
+            "record sequence counter is missing after store initialization",
+        )
+    })?;
+    let next = durable.checked_add(1).ok_or(ArtifactError::InvalidConfig(
+        "record sequence allocation exhausted",
+    ))?;
+    // Publish before appending: a crash may leave a gap, but can never hand the allocation out
+    // twice. Both writes remain under the same cross-process lock.
+    publish_record_sequence_counter(lock, next)?;
+    Ok(next)
+}
 
 /// Every incarnation other than `current` that wrote a frame into this workspace's records.
 ///
@@ -2328,18 +2424,12 @@ pub fn recover_records_with_budget(
     retained_budget_bytes: usize,
 ) -> Result<RecoveryReport, ArtifactError> {
     let lock = RecordsLock::acquire(path)?;
-    recover_records_with_budget_under_lock(&lock, retained_budget_bytes, SequencePolicy::Strict)
-}
-
-enum SequencePolicy<'a> {
-    Strict,
-    Collect(&'a mut Vec<RecordSequenceViolation>),
+    recover_records_with_budget_under_lock(&lock, retained_budget_bytes)
 }
 
 fn recover_records_with_budget_under_lock(
     lock: &RecordsLock<'_>,
     retained_budget_bytes: usize,
-    mut sequence_policy: SequencePolicy<'_>,
 ) -> Result<RecoveryReport, ArtifactError> {
     let path = lock.records;
     if retained_budget_bytes == 0 {
@@ -2405,7 +2495,7 @@ fn recover_records_with_budget_under_lock(
     let mut records = Vec::new();
     let mut prefix_hasher = Sha256::new();
     prefix_hasher.update(RECORD_MAGIC);
-    let mut previous_job: Option<(usize, JobArtifactRecord)> = None;
+    let mut previous_job: Option<JobArtifactRecord> = None;
     let mut terminal_jobs = BTreeSet::new();
     while (offset as u64) < original_len {
         let frame_start = offset;
@@ -2492,28 +2582,16 @@ fn recover_records_with_budget_under_lock(
             .map_err(|error| integrity(frame_start, &error.to_string()))?;
         match &record {
             ProtectedRecord::Job(current) => {
-                if let Some((previous_offset, previous)) = previous_job.as_ref()
+                if let Some(previous) = previous_job.as_ref()
                     && current.sequence <= previous.sequence
                 {
-                    match &mut sequence_policy {
-                        SequencePolicy::Strict => {
-                            return Err(ArtifactError::SequenceOrdering {
-                                offset: frame_start as u64,
-                                previous: previous.sequence,
-                                current: current.sequence,
-                            });
-                        }
-                        SequencePolicy::Collect(violations) => {
-                            violations.push(RecordSequenceViolation {
-                                offset: frame_start as u64,
-                                previous_offset: *previous_offset as u64,
-                                previous: previous.clone(),
-                                current: current.clone(),
-                            });
-                        }
-                    }
+                    return Err(ArtifactError::SequenceOrdering {
+                        offset: frame_start as u64,
+                        previous: previous.sequence,
+                        current: current.sequence,
+                    });
                 }
-                previous_job = Some((frame_start, current.clone()));
+                previous_job = Some(current.clone());
                 if !matches!(current.state, JobState::Queued | JobState::Running)
                     && !terminal_jobs
                         .insert((current.workspace_incarnation.clone(), current.job_id))
@@ -3025,6 +3103,7 @@ fn checkpoint_manifest_to_batch(
     RecordBatch::try_new(schema, columns).map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
+#[cfg(test)]
 fn protected_record_to_batch(record: &ProtectedRecord) -> Result<RecordBatch, ArtifactError> {
     match record {
         ProtectedRecord::Job(value) => job_record_to_batch(value),
@@ -3828,128 +3907,25 @@ fn require_protected_columns(
 pub fn repair_workspace_record_sequences(
     workspace_root: &Path,
     retained_budget_bytes: usize,
-) -> Result<ArtifactRepairReport, ArtifactError> {
+) -> Result<(), ArtifactError> {
     let path = records_path(workspace_root);
     let lock = RecordsLock::acquire(&path)?;
-    let mut violations = Vec::new();
-    let recovery = recover_records_with_budget_under_lock(
-        &lock,
-        retained_budget_bytes,
-        SequencePolicy::Collect(&mut violations),
-    )?;
-    let frame_count = recovery.frames.len();
-    if violations.is_empty() {
-        return Ok(ArtifactRepairReport {
-            records_path: path,
-            backup_path: None,
-            frame_count,
-            resequenced_records: 0,
-            violations,
-        });
+    // The manifest authenticates the exact serialized prefix. Rewriting sequences changes that
+    // identity, while recomputing the in-file digest would let the rewrite attest to itself.
+    // Holding the append lock makes the diagnosis stable; preserving identity requires refusal.
+    match recover_records_with_budget_under_lock(&lock, retained_budget_bytes) {
+        Ok(_) => Ok(()),
+        Err(ArtifactError::SequenceOrdering {
+            offset,
+            previous,
+            current,
+        }) => Err(ArtifactError::SequenceRepairRefused {
+            offset,
+            previous,
+            current,
+        }),
+        Err(error) => Err(error),
     }
-
-    let original = fs::read(&path).map_err(|error| io_error(&path, error))?;
-    let original_digest = Sha256Digest::compute(&original).to_string();
-    let backup = path.with_file_name(format!(
-        "records.arrow.pre-repair-{}",
-        &original_digest[..16]
-    ));
-    let mut backup_options = OpenOptions::new();
-    backup_options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        backup_options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    match backup_options.open(&backup) {
-        Ok(mut file) => {
-            if let Err(error) = file.write_all(&original).and_then(|_| file.sync_data()) {
-                drop(file);
-                let _ = fs::remove_file(&backup);
-                return Err(io_error(&backup, error));
-            }
-            sync_parent_directory(&backup)?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let existing = fs::read(&backup).map_err(|error| io_error(&backup, error))?;
-            if existing != original {
-                return Err(ArtifactError::WriteIntegrity(format!(
-                    "repair backup {} already exists with different bytes",
-                    backup.display()
-                )));
-            }
-        }
-        Err(error) => return Err(io_error(&backup, error)),
-    }
-
-    let mut bytes = Vec::with_capacity(original.len());
-    bytes.extend_from_slice(RECORD_MAGIC);
-    let mut next_sequence = 1_u64;
-    let mut resequenced_records = 0_usize;
-    for frame in recovery.frames {
-        let mut record = frame.record;
-        match &mut record {
-            ProtectedRecord::Job(job) => {
-                if job.sequence != next_sequence {
-                    resequenced_records += 1;
-                }
-                job.sequence = next_sequence;
-                next_sequence =
-                    next_sequence
-                        .checked_add(1)
-                        .ok_or(ArtifactError::InvalidConfig(
-                            "record sequence allocation exhausted",
-                        ))?;
-            }
-            ProtectedRecord::CheckpointManifest(manifest) => {
-                manifest.records_sha256 = Sha256Digest::compute(&bytes);
-            }
-        }
-        record.validate()?;
-        let batch = protected_record_to_batch(&record)?;
-        let payload = encode_batch(&batch)?;
-        let payload_len = u64::try_from(payload.len())
-            .map_err(|_| ArtifactError::Arrow("record batch is too large".into()))?;
-        bytes.extend_from_slice(BATCH_MAGIC);
-        bytes.extend_from_slice(&payload_len.to_le_bytes());
-        bytes.extend_from_slice(&(!payload_len).to_le_bytes());
-        bytes.extend_from_slice(&payload);
-        bytes.extend_from_slice(Sha256Digest::compute(&payload).as_bytes());
-        bytes.extend_from_slice(BATCH_TRAILER);
-    }
-
-    let temporary = path.with_file_name(format!("records.arrow.repair-{original_digest}.tmp"));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|error| io_error(&temporary, error))?;
-    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_data()) {
-        drop(file);
-        let _ = fs::remove_file(&temporary);
-        return Err(io_error(&temporary, error));
-    }
-    drop(file);
-    fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
-    sync_parent_directory(&path)?;
-    recover_records_with_budget_under_lock(&lock, retained_budget_bytes, SequencePolicy::Strict)?;
-
-    Ok(ArtifactRepairReport {
-        records_path: path,
-        backup_path: Some(backup),
-        frame_count,
-        resequenced_records,
-        violations,
-    })
 }
 
 #[cfg(test)]
@@ -4841,6 +4817,42 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn opening_a_pre_counter_store_migrates_its_durable_watermark_once() {
+        let root = temp_root("migrate-record-sequence");
+        let mut existing = valid_job_record(1);
+        existing.sequence = 7;
+        append_protected_record(&root, ProtectedRecord::Job(existing));
+        let counter = root
+            .join(PROTECTED_DIRECTORY)
+            .join(JOB_DIRECTORY)
+            .join(RECORD_SEQUENCE_FILE);
+        assert!(!counter.exists());
+
+        let mut migrated = store_at(&root, ArtifactConfig::default());
+        assert!(counter.is_file());
+        assert_eq!(
+            migrated
+                .append_record(valid_job_record(2))
+                .unwrap()
+                .0
+                .sequence,
+            8,
+        );
+        drop(migrated);
+
+        let mut reopened = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            reopened
+                .append_record(valid_job_record(3))
+                .unwrap()
+                .0
+                .sequence,
+            9,
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn serialized_append_preserves_sequence_after_a_truncated_tail() {
         let root = temp_root("serialized-truncated-tail-sequence");
         let mut store = store_at(&root, ArtifactConfig::default());
@@ -4878,12 +4890,11 @@ mod tests {
         file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
             .unwrap();
         file.sync_data().unwrap();
-        let repair = repair_workspace_record_sequences(
+        repair_workspace_record_sequences(
             &root,
             ArtifactConfig::default().retained_recovery_budget_bytes,
         )
         .unwrap();
-        assert!(repair.violations.is_empty());
 
         let after_repair = store.append_record(valid_job_record(3)).unwrap().0;
         assert!(
@@ -4913,23 +4924,33 @@ mod tests {
         }
         let path = records_path(&root);
         let original = fs::read(&path).unwrap();
+        let ordering = recover_records(&path).unwrap_err();
         assert!(matches!(
-            recover_records(&path),
-            Err(ArtifactError::SequenceOrdering {
+            ordering,
+            ArtifactError::SequenceOrdering {
                 offset,
                 previous: 2,
                 current: 2,
-            }) if offset > 0
+            } if offset > 0
         ));
+        let refusal = ordering.to_string();
+        assert!(refusal.contains("concurrent or stale-recovery append"));
+        assert!(refusal.contains("cowshed doctor --repair"));
 
-        assert!(
-            repair_workspace_record_sequences(
-                &root,
-                ArtifactConfig::default().retained_recovery_budget_bytes,
-            )
-            .is_err(),
-            "repair must refuse rather than rewrite bytes and let the new manifest attest to them",
-        );
+        let repair = repair_workspace_record_sequences(
+            &root,
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            repair,
+            ArtifactError::SequenceRepairRefused {
+                offset,
+                previous: 2,
+                current: 2,
+            } if offset > 0
+        ));
+        assert!(repair.to_string().contains("create a fresh store"));
         assert_eq!(
             fs::read(&path).unwrap(),
             original,
