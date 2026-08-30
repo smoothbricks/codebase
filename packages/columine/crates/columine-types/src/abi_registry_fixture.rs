@@ -4,9 +4,9 @@
 //! fixture in the same commit as the registry; an audit failure means the two
 //! moved apart unintentionally.
 //!
-//! Each audit compares a Rust registry against the corresponding frozen
-//! declaration set below. Intentional ABI changes update the set together
-//! with its registry and `cargo test -p columine-types`.
+//! [`TYPES_OPCODE_REGISTRY`] is the snapshot of the one `Opcode` registry in
+//! `types.rs`. Intentional ABI changes update it together with the registry
+//! and `cargo test -p columine-types`.
 
 pub const TYPES_OPCODE_REGISTRY: &[(&str, u8)] = &[
     ("batchaggcount", 0x41),
@@ -72,65 +72,70 @@ pub const TYPES_OPCODE_REGISTRY: &[(&str, u8)] = &[
     ("slotstructmap", 0x18),
     ("slotstructmap2", 0x1b),
 ];
-pub const OPCODES_OPCODE_REGISTRY: &[(&str, u8)] = &[
-    ("batchaggcount", 0x41),
-    ("batchaggcountif", 0x45),
-    ("batchaggmax", 0x43),
-    ("batchaggmaxi64", 0x4b),
-    ("batchaggmaxif", 0x47),
-    ("batchaggmin", 0x42),
-    ("batchaggmini64", 0x4a),
-    ("batchaggminif", 0x46),
-    ("batchaggsum", 0x40),
-    ("batchaggsumi64", 0x49),
-    ("batchaggsumif", 0x44),
-    ("batchbitmapadd", 0x34),
-    ("batchbitmapand", 0x36),
-    ("batchbitmapandnot", 0x38),
-    ("batchbitmapandnotscratch", 0x3c),
-    ("batchbitmapandscratch", 0x3a),
-    ("batchbitmapor", 0x37),
-    ("batchbitmaporscratch", 0x3b),
-    ("batchbitmapremove", 0x35),
-    ("batchbitmapxor", 0x39),
-    ("batchbitmapxorscratch", 0x3d),
-    ("batchmapremove", 0x23),
-    ("batchmapremoveif", 0x2b),
-    ("batchmapupsertfirst", 0x21),
-    ("batchmapupsertfirstif", 0x29),
-    ("batchmapupsertlast", 0x22),
-    ("batchmapupsertlastif", 0x2a),
-    ("batchmapupsertlastttl", 0x25),
-    ("batchmapupsertlatest", 0x20),
-    ("batchmapupsertlatestif", 0x28),
-    ("batchmapupsertlatestttl", 0x24),
-    ("batchmapupsertmax", 0x26),
-    ("batchmapupsertmaxif", 0x2c),
-    ("batchmapupsertmin", 0x27),
-    ("batchmapupsertminif", 0x2d),
-    ("batchscalarlatest", 0x48),
-    ("batchsetinsert", 0x30),
-    ("batchsetinsertif", 0x33),
-    ("batchsetinsertttl", 0x32),
-    ("batchsetremove", 0x31),
-    ("batchstructmapprobe", 0x2e),
-    ("batchstructmapprobescatter", 0x2f),
-    ("batchstructmap2remove", 0x86),
-    ("batchstructmap2upsertlast", 0x83),
-    ("batchstructmap2upsertmaxi64x2", 0x87),
-    ("batchstructmapupsertfirst", 0x81),
-    ("batchstructmapupsertlast", 0x80),
-    ("batchstructmapupsertmax", 0x82),
-    ("flatmap", 0xe1),
-    ("foreach", 0xe0),
-    ("halt", 0x00),
-    ("listappend", 0x84),
-    ("listappendstruct", 0x85),
-    ("slotarray", 0x14),
-    ("slotdef", 0x10),
-    ("slotorderedlist", 0x19),
-    ("slotstructmap", 0x18),
-    ("slotstructmap2", 0x1b),
+
+/// Complete frozen tag sets for the remaining ABI registries. `registry_audit`
+/// asserts set equality against what each `from_u8`/`from_u32` decodes over
+/// its whole input domain, so adding, removing, or renumbering a variant
+/// fails the audit — which a pasted partial list inside a unit test cannot.
+pub const SLOT_TYPES: &[(&str, u8)] = &[
+    ("aggregate", 2),
+    ("array", 3),
+    ("bitmap", 8),
+    ("conditiontree", 4),
+    ("hashmap", 0),
+    ("hashset", 1),
+    ("nested", 9),
+    ("orderedlist", 7),
+    ("scalar", 5),
+    ("structmap", 6),
+    ("structmap2", 10),
+];
+pub const AGG_TYPES: &[(&str, u8)] = &[
+    ("avg", 5),
+    ("count", 2),
+    ("max", 4),
+    ("maxi64", 13),
+    ("min", 3),
+    ("mini64", 12),
+    ("scalarf64", 9),
+    ("scalari64", 10),
+    ("scalaru32", 8),
+    ("sum", 1),
+    ("sumi64", 11),
+];
+pub const STRUCT_FIELD_TYPES: &[(&str, u8)] = &[
+    ("arraybool", 9),
+    ("arrayf64", 7),
+    ("arrayi64", 6),
+    ("arraystring", 8),
+    ("arrayu32", 5),
+    ("bool", 3),
+    ("float64", 2),
+    ("int64", 1),
+    ("string", 4),
+    ("uint32", 0),
+];
+pub const DURATION_UNITS: &[(&str, u8)] = &[
+    ("day", 4),
+    ("hour", 3),
+    ("minute", 2),
+    ("month", 6),
+    ("none", 0),
+    ("quarter", 7),
+    ("second", 1),
+    ("week", 5),
+    ("year", 8),
+];
+pub const ERROR_CODES: &[(&str, u32)] = &[
+    ("arenaoverflow", 6),
+    ("capacityexceeded", 1),
+    ("columnunderrun", 8),
+    ("invalidkey", 7),
+    ("invalidprogram", 2),
+    ("invalidslot", 3),
+    ("invalidstate", 4),
+    ("needsgrowth", 5),
+    ("ok", 0),
 ];
 pub const DISPATCHED_OPCODE_BYTES: &[u8] = &[
     0x00, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e,

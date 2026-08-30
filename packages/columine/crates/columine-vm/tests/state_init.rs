@@ -1,7 +1,7 @@
 //! Acceptance coverage for state sizing, initialization, reset, growth, and
 //! their property invariants.
 
-use columine_types::opcodes::PROGRAM_MAGIC;
+use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
     Opcode, PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotType,

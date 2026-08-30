@@ -1,4 +1,4 @@
-use columine_types::opcodes::PROGRAM_MAGIC;
+use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
     EMPTY_KEY, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
     TOMBSTONE, hash_key_pair,

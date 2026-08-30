@@ -1,4 +1,4 @@
-use columine_types::opcodes::PROGRAM_MAGIC;
+use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_vm::bytes;
 use columine_vm::state_init::{calculate_state_size, init_state};

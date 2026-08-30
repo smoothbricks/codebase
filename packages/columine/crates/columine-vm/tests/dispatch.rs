@@ -1,7 +1,7 @@
 //! Dispatch tests cover batch execution, undo/rollback, TTL eviction, and
 //! growth signaling. Scenarios and expected values are pinned as ABI behavior.
 
-use columine_types::opcodes::PROGRAM_MAGIC;
+use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
     ChangeFlag, EMPTY_KEY, ErrorCode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset,
 };
