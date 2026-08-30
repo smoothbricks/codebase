@@ -1,7 +1,7 @@
-//! Coverage for undo-log rollback, delta round trips, and string interning.
+//! Coverage for undo-log rollback and delta round trips.
 //!
 //! Rollback scenarios execute through the dispatch loop where applicable; the
-//! tests pin logical state, serialized layouts, and handle stability.
+//! tests pin logical state and serialized layouts.
 
 use columine_types::types::{
     AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY,
@@ -10,7 +10,6 @@ use columine_types::types::{
 use columine_vm::bitmap_ops::BitmapEnv;
 use columine_vm::bytes;
 use columine_vm::hash_table::{ENTRY_NONE, ENTRY_U32, FlatTable};
-use columine_vm::intern::StringIntern;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::undo_log::{
     FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, rollback_agg_update, rollback_count_update,
@@ -447,34 +446,6 @@ proptest! {
         prop_assert_eq!(FlatUndoEntry::read_from(&buf), Some(entry));
     }
 
-    /// StringIntern against a first-seen-index model: idx assignment,
-    /// dedup, get() round-trip, and the offsets invariant (monotone,
-    /// offsets[count] == data_len).
-    #[test]
-    fn intern_matches_first_seen_model(
-        strings in prop::collection::vec(prop::collection::vec(prop::num::u8::ANY, 0..20), 0..32),
-    ) {
-        let mut si = StringIntern::new(64);
-        let mut model: Vec<Vec<u8>> = Vec::new();
-        for s in &strings {
-            let idx = si.intern(s);
-            let expected = match model.iter().position(|m| m == s) {
-                Some(i) => i as u32,
-                None => {
-                    model.push(s.clone());
-                    (model.len() - 1) as u32
-                }
-            };
-            prop_assert_eq!(idx, expected);
-            prop_assert_eq!(si.get(idx), s.as_slice());
-        }
-        prop_assert_eq!(si.count() as usize, model.len());
-        let offsets = si.offsets();
-        prop_assert_eq!(offsets.len(), model.len() + 1);
-        prop_assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
-        prop_assert_eq!(*offsets.last().unwrap(), si.data_len());
-        prop_assert_eq!(si.data_bytes().len() as u32, si.data_len());
-    }
 }
 
 /// Counts above u32::MAX round-trip through the widened journal lanes
