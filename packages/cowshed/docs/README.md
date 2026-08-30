@@ -201,14 +201,14 @@ Ask three questions of any build cache before sharing it between workspaces:
 2. Is a reused artifact still correct at a different path?
 3. Does one process own the store and its size cap?
 
-| Toolchain           | How it lands                                                                                                                                                |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries.                                   |
-| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries; keep it outside `node_modules` so installs stay lean.                                                 |
-| Bun                 | The install cache stays inside each workspace image on purpose: `bun install` clones out of it, and clones cannot cross volumes.                            |
-| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                           |
-| Zig, Gradle         | Named roots under `/private/cowshed/caches`; the same three questions apply.                                                                                |
-| C and C++ via cc-rs | Absolute include or SDK paths reach the compiler the same way a Rust linker path does — keep them below the build directory or resolve them through `PATH`. |
+| Toolchain           | How it lands                                                                                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Go                  | `GOCACHE` and `GOMODCACHE` are content-addressed, so they share safely. Build with `-trimpath` for path-neutral binaries.                                     |
+| TypeScript via ttsc | `TTSC_CACHE_DIR` holds content-keyed plugin binaries; keep it outside `node_modules` so installs stay lean.                                                   |
+| Bun                 | The install cache stays inside each workspace image on purpose: `bun install` clones out of it, and clones cannot cross volumes.                              |
+| Nix                 | Content-addressed by definition; the store is shared and read-only to workspaces.                                                                             |
+| Zig, Gradle         | Named roots under `/private/cowshed/caches`; the same three questions apply.                                                                                  |
+| C and C++ via cc-rs | `HOST_CC`/`HOST_CXX` are `sccache cc` (never `CC`/`CXX` — xcodebuild reads those). Absolute include or SDK paths still have to sit below the build directory. |
 
 ## Documentation
 
