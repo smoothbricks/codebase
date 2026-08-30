@@ -389,6 +389,21 @@ on different files when possible, coordinate on shared files
 IMMEDIATELY notify other agents what you changed They may need to reapply their work Use this as a lesson to check git
 status first next time
 
+### Fleet rules (each paid for with lost work)
+
+**Relative paths in `read`/`edit`/`write` resolve against the SESSION cwd, not a `cd` you did in `bash`.** One relative
+edit silently lands in the host checkout while your workspace shows the file unchanged. Use absolute workspace paths.
+
+**Commit verified work immediately, however small.** A commit survives a failed rebase; a dirty tree does not. WIP-mark
+and reword later.
+
+**Verify a dependency FEATURE cut with a build, not by reading call sites.** The contract is in the dependency's
+`#[cfg]` attributes: `toml::Table`/`Value` are themselves `#[cfg(feature = "serde")]`, so "nothing serializes" is the
+wrong evidence.
+
+**A partial override of an inferred Nx target REPLACES it.** Declaring only `dependsOn` on `cargo-test` collapses it to
+`nx:noop` — a target that passes having run nothing. Change inference in `@smoothbricks/nx-plugin`.
+
 --
 
 --
