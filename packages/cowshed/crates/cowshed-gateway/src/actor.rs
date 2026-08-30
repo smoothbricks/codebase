@@ -27,7 +27,7 @@ use crate::{
     mirror::{MirrorCacheStatus, MirrorService},
     policy::{
         CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, PolicyDenial, TargetScheme,
-        normalize_path,
+        mirror_scope_matches, normalize_path,
     },
     proxy,
     repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
@@ -1756,7 +1756,7 @@ fn build_seed(
             .map_err(|_| ("mirror redirect path is ambiguous", None))?;
             if resolved.protocol != *protocol
                 || resolved.target != *target
-                || !path_prefix_matches(&normalized, &resolved.admitted_prefix)
+                || !mirror_scope_matches(&normalized, &resolved.admitted_prefix)
             {
                 return Err(("mirror redirect escaped its admitted origin or scope", None));
             }
@@ -1825,14 +1825,6 @@ fn build_seed(
         upstream_path,
         trace_id: intent.trace_id.clone(),
     })
-}
-
-fn path_prefix_matches(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || prefix == "/"
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| prefix.ends_with('/') || suffix.starts_with('/'))
 }
 
 fn pending_audit_draft(

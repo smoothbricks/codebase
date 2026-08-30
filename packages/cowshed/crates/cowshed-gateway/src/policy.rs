@@ -436,7 +436,7 @@ impl WorkspacePolicy {
     }
 }
 
-fn mirror_scope_matches(path: &str, prefix: &str) -> bool {
+pub(crate) fn mirror_scope_matches(path: &str, prefix: &str) -> bool {
     path == prefix
         || prefix == "/"
         || path
