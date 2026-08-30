@@ -876,16 +876,15 @@ that would not apply under the mount root). Exit 0 when healthy; otherwise the c
 Stdout is `healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:` commands those findings carry —
 findings first, hints after, never interleaved.
 
-If a selected project's checks cannot run, doctor records an error finding named
-`project-checks-skipped`; it never turns missing evidence into `healthy: true`.
+If a selected project's checks cannot run, doctor records an error finding named `project-checks-skipped`; it never
+turns missing evidence into `healthy: true`.
 
-`cowshed doctor --repair` handles one narrow, mechanically provable failure: valid artifact frames
-whose job sequence numbers are not strictly increasing because concurrent writers raced. It first
-validates every frame header, length complement, SHA-256 digest, trailer, Arrow payload, record
-invariant, and checkpoint prefix. If anything except sequence ordering is invalid, it refuses
-without replacing the log. Otherwise it writes a byte-for-byte `records.arrow.pre-repair-<digest>`
-backup beside the log, resequences the records in physical append order, recomputes checkpoint
-prefix digests, atomically replaces the log, verifies it again, and then runs the ordinary checks.
+`cowshed doctor --repair` handles one narrow, mechanically provable failure: valid artifact frames whose job sequence
+numbers are not strictly increasing because concurrent writers raced. It first validates every frame header, length
+complement, SHA-256 digest, trailer, Arrow payload, record invariant, and checkpoint prefix. If anything except sequence
+ordering is invalid, it refuses without replacing the log. Otherwise it writes a byte-for-byte
+`records.arrow.pre-repair-<digest>` backup beside the log, resequences the records in physical append order, recomputes
+checkpoint prefix digests, atomically replaces the log, verifies it again, and then runs the ordinary checks.
 
 ```
 $ cowshed doctor
