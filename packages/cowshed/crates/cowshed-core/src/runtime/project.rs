@@ -8436,8 +8436,10 @@ mod retired_recovery_tests {
         let incarnation = WorkspaceIncarnation::new("2198f2c0b7e34dc795f17b238b331c80").unwrap();
         let image = trash.join(format!("main-{}.sparseimage", incarnation.as_str()));
         std::fs::write(&image, b"retired main image").unwrap();
-        let mut grants =
-            GrantSet::closed_baseline(Some(PortBlock::new(49_168, 16).unwrap())).unwrap();
+        let mut grants = GrantSet::closed_baseline(Some(
+            PortBlock::new(crate::metadata::MACOS_PORT_BLOCK_LAST_BASE, 16).unwrap(),
+        ))
+        .unwrap();
         grants.revision = 8;
         DetachedWorkspaceMetadata {
             version: METADATA_VERSION,
