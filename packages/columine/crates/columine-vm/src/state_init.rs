@@ -1113,7 +1113,6 @@ pub fn reset_state(
 struct OldSlotMeta {
     offset: u32,
     capacity: u32,
-    type_flags_byte: u8,
     slot_type: SlotType,
     has_ttl: bool,
     has_evict_trigger: bool,
@@ -1130,7 +1129,6 @@ fn read_old_slot_meta(old_state: &[u8], slot_i: u32) -> OldSlotMeta {
     OldSlotMeta {
         offset: view.offset,
         capacity: view.capacity,
-        type_flags_byte: view.type_flags.to_byte(),
         slot_type: view.slot_type(),
         has_ttl: view.has_ttl(),
         has_evict_trigger: view.type_flags.has_evict_trigger(),
