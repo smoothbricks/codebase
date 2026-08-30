@@ -7,6 +7,7 @@ import {
   CARGO_LINUX_TRIPLE,
   CROSS_CHECK_SCRIPT_COMMAND,
   CROSS_CHECK_SCRIPT_NAME,
+  cargoFrozen,
   DEVENV_CROSS_PROFILE,
   withProjectCargoHome,
 } from './cross-check-policy.js';
@@ -78,6 +79,12 @@ describe('Linux cross-check policy', () => {
     expect(CARGO_CROSS_LINT_COMMAND).toContain('ln -sfn "$host_cargo_home/registry"');
     expect(CARGO_LINT_CLIPPY_COMMAND).toContain('CARGO_HOME="$PWD/target/cargo-lint-home"');
     expect(withProjectCargoHome('target/h', 'cargo clippy')).toContain('CARGO_HOME="$PWD/target/h" cargo clippy');
+  });
+
+  it('pins clippy to the committed lockfile and local cache', () => {
+    expect(cargoFrozen('clippy --workspace')).toBe('cargo --frozen clippy --workspace');
+    expect(CARGO_CROSS_LINT_COMMAND).toContain('cargo --frozen clippy');
+    expect(CARGO_LINT_CLIPPY_COMMAND).toContain('cargo --frozen clippy');
   });
 
   it('drives the Nx target through the cross profile from the root script', () => {
