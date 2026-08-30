@@ -7,7 +7,7 @@
 //! arbitrary bump-allocated neighbors.
 
 use lmao_arena::raw::{self};
-use lmao_arena::{Arena, Mem, SizeClass};
+use lmao_arena::{Arena, MAX_CAPACITY, Mem, SizeClass};
 use proptest::prelude::*;
 
 fn size_class_strategy() -> impl Strategy<Value = SizeClass> {
@@ -419,6 +419,90 @@ fn packed_root_span_allocates_and_initializes_in_one_operation() {
     assert_eq!(arena.free_count(), 1);
     let recycled = raw::create_overflow_span(arena.mem_mut(), SUPERBLOCK_BYTES);
     assert_eq!(recycled, span);
+}
+
+/// The layout planner derives capacity from the runtime hint's initial-capacity
+/// field, which is any row count >= 2 — not a power-of-two buddy tier. A span
+/// allocated at such a capacity must run its whole lifecycle, otherwise every log
+/// entry silently restamps row 0 and the span is emitted as a crashed span.
+#[test]
+fn non_tier_capacity_spans_complete_their_lifecycle() {
+    const CAPACITY: u32 = 6;
+    const SUPERBLOCK_BYTES: u32 = 256;
+    const SYSTEM_OFFSET: u32 = 128;
+    const ENTRY_TYPE_OFFSET: u32 = CAPACITY * 8;
+
+    assert_eq!(
+        lmao_arena::capacity_to_tier(CAPACITY),
+        None,
+        "test must exercise a capacity no buddy tier serves"
+    );
+
+    let mut arena = Arena::new(1 << 20);
+    let trace_root = raw::alloc_exact(arena.mem_mut(), 32, 8);
+    raw::init_trace_root(arena.mem_mut(), trace_root, 3_000.0, 30.0);
+
+    let span = raw::create_and_start_span(
+        arena.mem_mut(),
+        raw::SPAN_IDENTITY_ROOT,
+        16,
+        raw::SpanLayout {
+            superblock_byte_len: SUPERBLOCK_BYTES,
+            system_offset: SYSTEM_OFFSET,
+            entry_type_offset: ENTRY_TYPE_OFFSET,
+            row_header_offset: raw::NO_LAYOUT_OFFSET,
+        },
+        trace_root,
+        31.0,
+    );
+    assert_ne!(span, 0);
+    let system = span + SYSTEM_OFFSET;
+    assert_eq!(raw::read_write_index(arena.mem(), span), 2);
+
+    // Rows 2..CAPACITY are the log rows; each write lands on its own row.
+    for expected_row in 2..CAPACITY {
+        let row = raw::write_log_entry(
+            arena.mem_mut(),
+            system,
+            span,
+            trace_root,
+            8, // info
+            CAPACITY,
+            32.0,
+        );
+        assert_eq!(row, expected_row);
+        assert_eq!(raw::read_entry_type(arena.mem(), system, row, CAPACITY), 8);
+        assert_eq!(raw::read_timestamp(arena.mem(), system, row), 3_002_000_000);
+    }
+
+    // Full buffer still fails closed without advancing write_index.
+    assert_eq!(
+        raw::write_log_entry(arena.mem_mut(), system, span, trace_root, 8, CAPACITY, 32.0),
+        0
+    );
+    assert_eq!(raw::read_write_index(arena.mem(), span), CAPACITY);
+
+    // Row 0 was never restamped by a log entry.
+    assert_eq!(raw::read_entry_type(arena.mem(), system, 0, CAPACITY), 1);
+    assert_eq!(raw::read_timestamp(arena.mem(), system, 0), 3_001_000_000);
+
+    raw::span_end_ok(arena.mem_mut(), system, trace_root, CAPACITY, 33.0);
+    assert_eq!(raw::read_entry_type(arena.mem(), system, 1, CAPACITY), 2);
+    assert_eq!(raw::read_timestamp(arena.mem(), system, 1), 3_003_000_000);
+
+    // Above the arena's row-addressing ceiling the writers still refuse.
+    assert_eq!(
+        raw::write_log_entry(
+            arena.mem_mut(),
+            system,
+            span,
+            trace_root,
+            8,
+            MAX_CAPACITY + 1,
+            34.0
+        ),
+        0
+    );
 }
 
 #[test]

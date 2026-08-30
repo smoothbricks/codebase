@@ -115,6 +115,20 @@ pub fn tier_to_capacity(tier: usize) -> u32 {
     MIN_CAPACITY << tier
 }
 
+/// Capacities whose rows the arena can address: any row count the layout planner
+/// may choose, up to [`MAX_CAPACITY`].
+///
+/// This is deliberately *not* [`capacity_to_tier`]. Tiers describe the power-of-two
+/// buddy freelists behind `alloc_with_capacity`/`free_with_capacity` and nothing
+/// else. Span superblocks are served by the exact-extent allocator, and lifecycle
+/// and column row writes index `capacity` directly, so gating them on tier
+/// membership would refuse every planned non-power-of-two capacity — which the
+/// runtime hint's initial-capacity field routinely produces.
+#[inline]
+pub const fn capacity_addresses_rows(capacity: u32) -> bool {
+    capacity != 0 && capacity <= MAX_CAPACITY
+}
+
 /// Bytes in a column validity bitmap for `capacity` rows.
 #[inline]
 pub const fn null_bitmap_bytes(capacity: u32) -> u32 {
@@ -288,6 +302,18 @@ mod tests {
         for tier in 0..NUM_TIERS {
             assert_eq!(capacity_to_tier(tier_to_capacity(tier)), Some(tier));
         }
+    }
+
+    #[test]
+    fn row_addressing_domain_is_wider_than_the_tier_domain() {
+        // Non-power-of-two capacities are addressable rows even though no buddy
+        // freelist tier serves them; only the arena ceiling is out of domain.
+        for capacity in [1, 2, 6, 17, 24, 100, MAX_CAPACITY] {
+            assert!(capacity_addresses_rows(capacity), "capacity {capacity}");
+        }
+        assert!(!capacity_addresses_rows(0));
+        assert!(!capacity_addresses_rows(MAX_CAPACITY + 1));
+        assert!(!capacity_addresses_rows(1024));
     }
 
     #[test]

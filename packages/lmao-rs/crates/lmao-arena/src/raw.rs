@@ -12,7 +12,8 @@ use core::mem::{offset_of, size_of};
 
 use crate::{
     FREE_BLOCK_SIZE, FreeBlock, HEADER_SIZE, Header, IDENTITY_SIZE, Identity, NUM_TIERS, SizeClass,
-    TraceRoot, block_size, capacity_to_tier, null_bitmap_bytes, tier_to_capacity,
+    TraceRoot, block_size, capacity_addresses_rows, capacity_to_tier, null_bitmap_bytes,
+    tier_to_capacity,
 };
 
 /// Linear memory backend. Offsets are absolute byte offsets; offset 0 holds the
@@ -788,7 +789,9 @@ pub fn span_start<M: Mem>(
     capacity: u32,
     current_ms: f64,
 ) {
-    if capacity_to_tier(capacity).is_none() || capacity < 2 {
+    // Rows 0 and 1 are the lifecycle pair, so two rows is the floor. Tier
+    // membership is irrelevant here: nothing is allocated.
+    if !capacity_addresses_rows(capacity) || capacity < 2 {
         return;
     }
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
@@ -808,7 +811,7 @@ pub fn span_end<M: Mem>(
     entry_type: u8,
     current_ms: f64,
 ) {
-    if capacity_to_tier(capacity).is_none() || capacity < 2 {
+    if !capacity_addresses_rows(capacity) || capacity < 2 {
         return;
     }
     m.write_u8(system_ptr + capacity * 8 + 1, entry_type);
@@ -861,7 +864,7 @@ pub fn write_log_entry<M: Mem>(
     current_ms: f64,
 ) -> u32 {
     let idx = m.read_u32(identity_ptr + ID_WRITE_INDEX);
-    if capacity_to_tier(capacity).is_none() || idx >= capacity {
+    if !capacity_addresses_rows(capacity) || idx >= capacity {
         return 0;
     }
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
@@ -880,7 +883,9 @@ fn admit_col_write<M: Mem>(
     capacity: u32,
     sc: SizeClass,
 ) -> u32 {
-    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
+    // Row addressing admits every planned capacity; the lazy-allocation branch
+    // below fails closed on its own when no buddy tier can serve `capacity`.
+    if !capacity_addresses_rows(capacity) || row_idx >= capacity {
         return 0;
     }
     if col_offset == 0 {
