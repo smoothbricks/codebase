@@ -76,7 +76,7 @@ pub fn write_workspace_environment(
         contents.push_str("export ");
         contents.push_str(PORT_BASE_ENV);
         contents.push('=');
-        write!(&mut *contents, "{}\n", block.base())
+        writeln!(&mut *contents, "{}", block.base())
             .expect("writing to a preallocated String cannot fail");
     }
 
