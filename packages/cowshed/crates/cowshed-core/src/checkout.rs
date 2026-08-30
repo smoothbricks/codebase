@@ -233,8 +233,8 @@ pub fn load_checkout_layout(layout: &StorageLayout) -> Result<CheckoutLayout, St
 mod tests {
     use super::*;
     use crate::metadata::{
-        ImageFormat, METADATA_VERSION, Platform, PublicationState, WorkspaceIncarnation,
-        WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
+        ImageFormat, MARKER_VERSION, Platform, PublicationState, SIDECAR_VERSION,
+        WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
     };
     use crate::repository::RepoId;
     use crate::storage::StorageLayout;
@@ -291,7 +291,7 @@ mod tests {
         write_json(
             &marker_path,
             &WorkspaceMarker {
-                version: METADATA_VERSION,
+                version: MARKER_VERSION,
                 repo_id: repo_id.clone(),
                 project_root: project_root.to_owned(),
                 workspace: workspace.clone(),
@@ -310,7 +310,7 @@ mod tests {
         write_json(
             &sidecar_path(&image),
             &DetachedWorkspaceMetadata {
-                version: METADATA_VERSION,
+                version: SIDECAR_VERSION,
                 repo_id,
                 workspace,
                 workspace_incarnation: incarnation(),

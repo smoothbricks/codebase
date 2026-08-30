@@ -16,7 +16,7 @@ use cowshed_core::apfs::{
 };
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_BLOCK_MIN,
-    METADATA_VERSION, PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, WorkspaceIncarnation,
+    PORT_BLOCK_SIZE, Platform, PortBlock, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation,
     WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
@@ -288,7 +288,7 @@ where
 
 fn metadata(format: ImageFormat) -> DetachedWorkspaceMetadata {
     DetachedWorkspaceMetadata {
-        version: METADATA_VERSION,
+        version: SIDECAR_VERSION,
         repo_id: repo(),
         workspace: WorkspaceName::new("main").expect("main"),
         workspace_incarnation: WorkspaceIncarnation::new("00000000000000000000000000000001")

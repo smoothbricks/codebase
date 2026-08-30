@@ -23,9 +23,9 @@ use crate::apfs::{
 };
 use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, ImageCapacity, ImageFormat, METADATA_VERSION,
-    Platform, PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker,
-    WorkspaceName, WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, ImageCapacity, ImageFormat, MARKER_VERSION,
+    Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
+    WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use crate::repository::{CHECKPOINTS_DIRECTORY, RepoId, SESSIONS_DIRECTORY};
 use crate::workspace_credentials::{
@@ -2735,7 +2735,7 @@ where
         // lineage. A fresh image (adopt) has none and starts a lineage of its own.
         let lineage = clone_lineage_from(&marker_path, workspace.repo());
         let marker = WorkspaceMarker {
-            version: METADATA_VERSION,
+            version: MARKER_VERSION,
             repo_id: workspace.repo().clone(),
             project_root: identity.project_root.clone(),
             workspace: workspace.name().clone(),
@@ -3537,7 +3537,7 @@ where
             }
         };
         let metadata = DetachedWorkspaceMetadata {
-            version: METADATA_VERSION,
+            version: SIDECAR_VERSION,
             repo_id: workspace.repo().clone(),
             workspace: workspace.name().clone(),
             workspace_incarnation: workspace.incarnation().clone(),
@@ -4905,7 +4905,7 @@ mod tests {
             "no marker: a lineage of its own"
         );
         let marker = WorkspaceMarker {
-            version: crate::metadata::METADATA_VERSION,
+            version: crate::metadata::MARKER_VERSION,
             repo_id: repo.clone(),
             project_root: root.clone(),
             workspace: WorkspaceName::new("raven").unwrap(),
