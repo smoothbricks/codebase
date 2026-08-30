@@ -264,7 +264,7 @@ impl FakeHost {
             topology_revision: next,
             grants: GrantSet::closed_baseline(Some(
                 PortBlock::new(
-                    49_152 + u16::try_from((next - 1) * 16).expect("test port"),
+                    40_960 + u16::try_from((next - 1) * 16).expect("test port"),
                     16,
                 )
                 .expect("test block"),

@@ -11,18 +11,18 @@
 //! runs it first — the CLI before a gateway-requiring verb, a supervising runtime before an exec.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use cowshed_gateway::{
-    EgressGrant, GatewayControlClient, GatewayHandle, GatewayStatus, MirrorProtocol, MirrorRoute,
-    WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    ControlError, EgressGrant, GatewayControlClient, GatewayHandle, GatewayStatus, MirrorProtocol,
+    MirrorRoute, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 use sha2::{Digest as _, Sha256};
 
+use crate::api::dto::hex_lower;
 use crate::error::{CowshedError, Result};
 use crate::gateway_inventory::{GatewaySessionFact, NativeGatewayInventory};
 use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
@@ -50,9 +50,15 @@ pub struct ReconcileReport {
     pub removed: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GatewayStatusError {
+    Absent,
+    Control(String),
+}
+
 #[async_trait]
 pub trait GatewayControl: Send + Sync {
-    async fn status(&self) -> std::result::Result<GatewayStatus, String>;
+    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError>;
     async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String>;
     async fn remove(
         &self,
@@ -63,10 +69,15 @@ pub trait GatewayControl: Send + Sync {
 
 #[async_trait]
 impl GatewayControl for GatewayControlClient {
-    async fn status(&self) -> std::result::Result<GatewayStatus, String> {
+    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
         GatewayControlClient::status(self)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| match error {
+                ControlError::Io(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    GatewayStatusError::Absent
+                }
+                error => GatewayStatusError::Control(error.to_string()),
+            })
     }
 
     async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String> {
@@ -154,7 +165,7 @@ where
 
 pub fn project_session_prefix(repo_id: &RepoId) -> String {
     let digest = Sha256::digest(repo_id.as_str().as_bytes());
-    format!("p{}.", hex_prefix(&digest, 16))
+    format!("p{}.", hex_lower(&digest[..16]))
 }
 
 /// Stable for one workspace incarnation. Restore and re-adopt rotate the identity so the gateway's
@@ -172,15 +183,7 @@ pub fn stable_workspace_id(
     hasher.update([0]);
     hasher.update(incarnation.as_str().as_bytes());
     let digest = hasher.finalize();
-    format!("{prefix}w{}", hex_prefix(&digest, 16))
-}
-
-fn hex_prefix(bytes: &[u8], count: usize) -> String {
-    let mut encoded = String::with_capacity(count * 2);
-    for byte in &bytes[..count] {
-        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
+    format!("{prefix}w{}", hex_lower(&digest[..16]))
 }
 
 pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
@@ -189,12 +192,7 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
         mirrors: baseline_mirror_routes(),
     };
     for rule in &grants.egress {
-        let ports: Vec<u16> = if rule.ports.is_empty() {
-            vec![443, 80]
-        } else {
-            rule.ports.clone()
-        };
-        for port in ports {
+        for &port in rule.effective_ports() {
             let mut grant = match rule.mode {
                 CoreEgressMode::Intercept => EgressGrant::intercept(&rule.host, port),
                 CoreEgressMode::Opaque => EgressGrant::opaque(&rule.host, port),
@@ -301,7 +299,12 @@ where
     C: GatewayControl + ?Sized,
     I: SessionInventory + ?Sized,
 {
-    let status = control.status().await.map_err(|_| gateway_absent(uid))?;
+    let status = control.status().await.map_err(|error| match error {
+        GatewayStatusError::Absent => gateway_absent(uid),
+        GatewayStatusError::Control(message) => {
+            CowshedError::internal(format!("gateway status failed: {message}"))
+        }
+    })?;
     reconcile_against_status(control, host, project_prefix, desired, status).await
 }
 
@@ -485,6 +488,7 @@ pub fn canonical_home() -> Result<PathBuf> {
 }
 
 pub fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
     unsafe { libc::geteuid() }
 }
 

@@ -1,9 +1,10 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+use crate::repository::is_lexically_canonical;
 use crate::sandbox::{SandboxConfig, SandboxError, SandboxProfileRole, seatbelt_profile};
 #[cfg(target_os = "linux")]
 mod linux;
@@ -136,12 +137,16 @@ where
     if get_limit(limit.as_mut_ptr()) == -1 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: a non-negative callback result is the contract that it initialized `limit`.
     Ok(unsafe { limit.assume_init() }.rlim_cur)
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn descriptor_limit() -> io::Result<libc::rlim_t> {
-    descriptor_limit_with(|limit| unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit) })
+    descriptor_limit_with(|limit| {
+        // SAFETY: `limit` points to writable storage for one `rlimit`; getrlimit initializes it on success.
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit) }
+    })
 }
 
 fn mark_descriptor_close_on_exec_with<Fcntl, LastError>(
@@ -173,9 +178,30 @@ where
 fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
     mark_descriptor_close_on_exec_with(
         descriptor,
-        |descriptor, command, argument| unsafe { libc::fcntl(descriptor, command, argument) },
+        |descriptor, command, argument| {
+            // SAFETY: fcntl accepts any integer descriptor; invalid descriptors report EBADF.
+            unsafe { libc::fcntl(descriptor, command, argument) }
+        },
         io::Error::last_os_error,
     )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_cloexec_pre_exec(
+    command: &mut Command,
+    descriptor_limit: libc::rlim_t,
+    mark: fn(libc::rlim_t) -> io::Result<()>,
+) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: the closure captures only the numeric limit and function pointer; `mark` performs
+    // only async-signal-safe descriptor syscalls and every failure becomes a fixed errno.
+    unsafe {
+        command.pre_exec(move || {
+            mark(descriptor_limit)
+                .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
+        });
+    }
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
@@ -335,17 +361,7 @@ fn contains_nul(value: &OsStr) -> bool {
 }
 
 fn contained_cwd(workspace_mount: &Path, requested: &Path) -> Result<PathBuf, ExecError> {
-    if !workspace_mount.is_absolute() {
-        return Err(ExecError::WrapperFailure {
-            stage: WrapperStage::ValidateProfile,
-            message: format!(
-                "workspace mount is not absolute: {}",
-                workspace_mount.display()
-            ),
-            source: None,
-        });
-    }
-    if has_traversal(workspace_mount) {
+    if !is_lexically_canonical(workspace_mount) {
         return Err(ExecError::WrapperFailure {
             stage: WrapperStage::ValidateProfile,
             message: format!(
@@ -355,7 +371,12 @@ fn contained_cwd(workspace_mount: &Path, requested: &Path) -> Result<PathBuf, Ex
             source: None,
         });
     }
-    if has_traversal(requested) {
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace_mount.join(requested)
+    };
+    if !is_lexically_canonical(&candidate) {
         return Err(ExecError::SandboxDenied {
             message: format!("cwd traversal is not allowed: {}", requested.display()),
         });
@@ -382,11 +403,6 @@ fn contained_cwd(workspace_mount: &Path, requested: &Path) -> Result<PathBuf, Ex
         });
     }
 
-    let candidate = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        workspace.join(requested)
-    };
     let cwd = std::fs::canonicalize(&candidate).map_err(|source| ExecError::InvalidRequest {
         message: format!("could not resolve cwd {}: {source}", candidate.display()),
     })?;
@@ -400,11 +416,6 @@ fn contained_cwd(workspace_mount: &Path, requested: &Path) -> Result<PathBuf, Ex
         });
     }
     Ok(cwd)
-}
-
-fn has_traversal(path: &Path) -> bool {
-    path.components()
-        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
 }
 
 fn map_sandbox_error(error: SandboxError) -> ExecError {

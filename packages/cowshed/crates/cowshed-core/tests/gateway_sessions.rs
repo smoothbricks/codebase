@@ -5,8 +5,9 @@
 
 use async_trait::async_trait;
 use cowshed_core::gateway_sessions::{
-    GatewayControl, GatewayInstaller, SessionInventory, install_all_sessions, policy_from_grants,
-    project_session_prefix, reconcile_against_status, reconcile_project, stable_workspace_id,
+    GatewayControl, GatewayInstaller, GatewayStatusError, SessionInventory, install_all_sessions,
+    policy_from_grants, project_session_prefix, reconcile_against_status, reconcile_project,
+    stable_workspace_id,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnation};
 use cowshed_core::repository::RepoId;
@@ -84,7 +85,7 @@ fn host_with(live: Vec<WorkspaceSession>) -> FakeInventory {
 
 #[derive(Default)]
 struct FakeControl {
-    status: Mutex<Option<std::result::Result<GatewayStatus, String>>>,
+    status: Mutex<Option<std::result::Result<GatewayStatus, GatewayStatusError>>>,
     installs: Mutex<Vec<(String, u64)>>,
     removes: Mutex<Vec<(String, u64)>>,
     refuse_installs: Mutex<Vec<String>>,
@@ -92,12 +93,16 @@ struct FakeControl {
 
 #[async_trait]
 impl GatewayControl for FakeControl {
-    async fn status(&self) -> std::result::Result<GatewayStatus, String> {
+    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
         self.status
             .lock()
             .expect("status lock")
             .take()
-            .unwrap_or_else(|| Err("status called more than once".to_owned()))
+            .unwrap_or_else(|| {
+                Err(GatewayStatusError::Control(
+                    "status called more than once".to_owned(),
+                ))
+            })
     }
 
     async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String> {
@@ -213,7 +218,7 @@ async fn unchanged_revision_is_idempotent() {
 async fn absent_gateway_is_exit_five_and_guides_the_install() {
     let repo = RepoId::parse("acme/widget").expect("repo");
     let control = FakeControl {
-        status: Mutex::new(Some(Err("not found".to_owned()))),
+        status: Mutex::new(Some(Err(GatewayStatusError::Absent))),
         ..FakeControl::default()
     };
     let error = reconcile_project(
@@ -231,6 +236,36 @@ async fn absent_gateway_is_exit_five_and_guides_the_install() {
     // where this error is reached from first. `launchctl kickstart` fails there
     // with "service not found".
     assert_eq!(error.hint, "cowshed gateway start");
+}
+
+#[tokio::test]
+async fn status_protocol_failures_are_not_reported_as_gateway_absence() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let control = FakeControl {
+        status: Mutex::new(Some(Err(GatewayStatusError::Control(
+            "gateway control response is invalid".to_owned(),
+        )))),
+        ..FakeControl::default()
+    };
+
+    let error = reconcile_project(
+        &control,
+        &untouched_host(),
+        &project_session_prefix(&repo),
+        Vec::new(),
+        501,
+    )
+    .await
+    .expect_err("a malformed response must remain distinguishable from an absent socket");
+
+    assert_eq!(error.exit_code(), 1);
+    assert!(
+        error
+            .message
+            .contains("gateway control response is invalid"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]

@@ -22,6 +22,7 @@ pub(super) fn mark_macos_non_stdio_close_on_exec(
     descriptors: &mut [std::mem::MaybeUninit<libc::proc_fdinfo>],
 ) -> io::Result<()> {
     let capacity = std::mem::size_of_val(descriptors);
+    // SAFETY: a null output buffer with size zero is the documented size-query form.
     let required = unsafe {
         libc::proc_pidinfo(
             libc::getpid(),
@@ -32,6 +33,8 @@ pub(super) fn mark_macos_non_stdio_close_on_exec(
         )
     };
     validate_fd_listing_size(required, capacity)?;
+    // SAFETY: `descriptors` provides `capacity` writable bytes and proc_pidinfo cannot exceed the
+    // supplied byte count; the returned initialized prefix is validated below.
     let bytes = unsafe {
         libc::proc_pidinfo(
             libc::getpid(),
@@ -43,6 +46,7 @@ pub(super) fn mark_macos_non_stdio_close_on_exec(
     };
     let count = validate_fd_listing_size(bytes, capacity)?;
     for descriptor in &descriptors[..count] {
+        // SAFETY: `validate_fd_listing_size` proved this entry lies in the initialized byte prefix.
         let descriptor = unsafe { descriptor.assume_init_ref() }.proc_fd;
         if descriptor > libc::STDERR_FILENO {
             super::mark_descriptor_close_on_exec(descriptor)?;
@@ -54,6 +58,8 @@ pub(super) fn mark_macos_non_stdio_close_on_exec(
 pub(super) fn prepare_child_descriptors(command: &mut Command) -> Result<(), SpawnFailure> {
     let mut descriptors = Box::<[libc::proc_fdinfo]>::new_uninit_slice(SUPERVISOR_FD_CEILING);
 
+    // SAFETY: the closure owns its preallocated buffer and invokes only libc descriptor operations
+    // between fork and exec; every failure is returned as a fixed errno.
     unsafe {
         command.pre_exec(move || {
             mark_macos_non_stdio_close_on_exec(&mut descriptors)

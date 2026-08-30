@@ -14,15 +14,14 @@
 //! are moved by the functions here rather than open-coded at each call site.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::metadata::{
-    CheckoutLayout, CheckoutLayoutRecord, DetachedWorkspaceMetadata, MetadataError,
-    WorkspaceMarker, read_json, sidecar_path, write_json,
+    CheckoutLayout, CheckoutLayoutRecord, DetachedWorkspaceMetadata, ImageFormat, MetadataError,
+    WorkspaceMarker, WorkspaceName, read_json, sidecar_path, write_json,
 };
 use crate::repository::RepoId;
-use crate::storage::WORKSPACE_MARKER_PATH;
+use crate::storage::{StorageLayout, StorageLayoutError, WORKSPACE_MARKER_PATH};
 
 /// Where one project's recorded checkout path is durably held.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,7 +44,10 @@ impl CheckoutRecord {
     /// leave the authoritative-on-open record naming a path that is about to stop existing.
     pub fn rewrite_project_root(&self, project_root: &Path) -> Result<bool, MetadataError> {
         if !project_root.is_absolute() {
-            return Err(MetadataError::InvalidPath(project_root.to_owned()));
+            return Err(MetadataError::InvalidPath {
+                path: project_root.to_owned(),
+                reason: "path is not absolute",
+            });
         }
         let marker_path = self.mount_point.join(WORKSPACE_MARKER_PATH);
         let mut marker = WorkspaceMarker::read_from(&marker_path)?;
@@ -114,7 +116,10 @@ impl CheckoutRecord {
         project_root: &Path,
     ) -> Result<bool, MetadataError> {
         if !project_root.is_absolute() {
-            return Err(MetadataError::InvalidPath(project_root.to_owned()));
+            return Err(MetadataError::InvalidPath {
+                path: project_root.to_owned(),
+                reason: "path is not absolute",
+            });
         }
         let sidecar = sidecar_path(&self.image);
         let mut metadata = DetachedWorkspaceMetadata::read_for_image(&self.image)?;
@@ -189,25 +194,39 @@ pub fn observed_layout(checkout: &Path) -> CheckoutLayout {
         _ => CheckoutLayout::DirectMount,
     }
 }
-/// Read an adopted project's layout, upgrading the pre-record layout in place.
+/// Read an adopted project's layout, materializing only an inference backed by durable evidence.
 ///
-/// Direct mount is the only supported layout for newly adopted projects and was also the physical
-/// layout used by projects adopted before this record existed. Only absence is migratable:
-/// malformed or unsupported records are evidence we cannot safely reinterpret and remain errors.
-/// [`write_json`] publishes the version-one record atomically; a later observation only reads it.
-pub fn load_checkout_layout(path: &Path) -> Result<CheckoutLayout, MetadataError> {
+/// A present record is authoritative and malformed data fails closed. Without a record, the main
+/// mountpoint proves the symlink layout; an existing main image without that mountpoint is
+/// ambiguous and refused; a project with neither is the pre-adoption direct-mount default.
+pub fn load_checkout_layout(layout: &StorageLayout) -> Result<CheckoutLayout, StorageLayoutError> {
+    let path = &layout.project().checkout_layout;
     match read_json::<CheckoutLayoutRecord>(path) {
-        Ok(record) => {
-            record.validate()?;
-            Ok(record.checkout_layout)
-        }
-        Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            let layout = CheckoutLayout::DirectMount;
-            write_json(path, &CheckoutLayoutRecord::new(layout))?;
-            Ok(layout)
-        }
-        Err(error) => Err(error),
+        Ok(record) => return Ok(record.checkout_layout),
+        Err(MetadataError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+
+    let main = WorkspaceName::new("main").expect("fixed main workspace");
+    let inferred = if layout.workspace_mount(&main)?.is_dir() {
+        CheckoutLayout::Symlink
+    } else {
+        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
+            let image = layout.main_image(format)?.image().to_owned();
+            if image
+                .try_exists()
+                .map_err(|source| StorageLayoutError::Io {
+                    path: image.clone(),
+                    source,
+                })?
+            {
+                return Err(StorageLayoutError::UnrecordedCheckoutLayout);
+            }
+        }
+        CheckoutLayout::DirectMount
+    };
+    write_json(path, &CheckoutLayoutRecord::new(inferred))?;
+    Ok(inferred)
 }
 
 #[cfg(test)]
@@ -218,6 +237,7 @@ mod tests {
         WorkspaceInfoSnapshot, WorkspaceName, WorkspaceRole,
     };
     use crate::repository::RepoId;
+    use crate::storage::StorageLayout;
 
     struct TempDirectory(PathBuf);
 
@@ -244,6 +264,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn storage_layout(temp: &TempDirectory) -> StorageLayout {
+        let layout = StorageLayout::with_mount_root(
+            temp.path().join("store"),
+            temp.path().join("mnt"),
+            &RepoId::parse("acme/widget").expect("repo"),
+        )
+        .expect("layout");
+        fs::create_dir_all(&layout.project().project_root).expect("project root");
+        layout
     }
 
     fn incarnation() -> WorkspaceIncarnation {
@@ -288,7 +319,7 @@ mod tests {
                 publication_state: PublicationState::Active,
                 updated_at: "2026-07-13T00:00:00Z".to_owned(),
                 grants: crate::metadata::GrantSet::closed_baseline(Some(
-                    crate::metadata::PortBlock::new(49152, 16).expect("port block"),
+                    crate::metadata::PortBlock::new(49_136, 16).expect("port block"),
                 ))
                 .expect("grants"),
                 info_snapshot: Some(WorkspaceInfoSnapshot {
@@ -366,10 +397,13 @@ mod tests {
         let temp = TempDirectory::new("refuse-relative");
         let record = fixture(temp.path(), Path::new("/old/checkout"));
 
-        assert!(matches!(
-            record.rewrite_project_root(Path::new("relative/checkout")),
-            Err(MetadataError::InvalidPath(_))
-        ));
+        let error = record
+            .rewrite_project_root(Path::new("relative/checkout"))
+            .expect_err("relative project root");
+        assert_eq!(
+            error.to_string(),
+            "invalid metadata path relative/checkout: path is not absolute"
+        );
         assert_eq!(
             record.recorded_project_root().expect("recorded"),
             Path::new("/old/checkout")
@@ -434,10 +468,11 @@ mod tests {
     #[test]
     fn an_absent_layout_materializes_version_one_direct_mount() {
         let temp = TempDirectory::new("legacy-layout");
-        let path = temp.path().join("checkout-layout.json");
+        let layout = storage_layout(&temp);
+        let path = layout.project().checkout_layout.clone();
 
         assert_eq!(
-            load_checkout_layout(&path).expect("legacy layout"),
+            load_checkout_layout(&layout).expect("legacy layout"),
             CheckoutLayout::DirectMount
         );
         let record = crate::metadata::read_json::<crate::metadata::CheckoutLayoutRecord>(&path)
@@ -447,14 +482,35 @@ mod tests {
     }
 
     #[test]
+    fn an_absent_layout_infers_and_records_the_existing_symlink_mount() {
+        let temp = TempDirectory::new("legacy-symlink-layout");
+        let layout = storage_layout(&temp);
+        let main_mount = layout
+            .workspace_mount(&WorkspaceName::new("main").expect("main"))
+            .expect("main mount");
+        fs::create_dir_all(&main_mount).expect("symlink-layout main mount");
+
+        assert_eq!(
+            load_checkout_layout(&layout).expect("inferred layout"),
+            CheckoutLayout::Symlink
+        );
+        let record = crate::metadata::read_json::<crate::metadata::CheckoutLayoutRecord>(
+            &layout.project().checkout_layout,
+        )
+        .expect("materialized record");
+        assert_eq!(record.checkout_layout, CheckoutLayout::Symlink);
+    }
+
+    #[test]
     fn a_malformed_present_layout_fails_closed() {
         let temp = TempDirectory::new("malformed-layout");
-        let path = temp.path().join("checkout-layout.json");
+        let layout = storage_layout(&temp);
+        let path = layout.project().checkout_layout.clone();
         fs::write(&path, b"{not json").expect("malformed record");
 
         assert!(matches!(
-            load_checkout_layout(&path),
-            Err(MetadataError::Json { .. })
+            load_checkout_layout(&layout),
+            Err(StorageLayoutError::Metadata(MetadataError::Json { .. }))
         ));
         assert_eq!(
             fs::read(&path).expect("malformed record remains"),
@@ -467,12 +523,13 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
 
         let temp = TempDirectory::new("idempotent-layout");
-        let path = temp.path().join("checkout-layout.json");
-        load_checkout_layout(&path).expect("first observation");
+        let layout = storage_layout(&temp);
+        let path = layout.project().checkout_layout.clone();
+        load_checkout_layout(&layout).expect("first observation");
         let inode = fs::metadata(&path).expect("first record").ino();
 
         assert_eq!(
-            load_checkout_layout(&path).expect("second observation"),
+            load_checkout_layout(&layout).expect("second observation"),
             CheckoutLayout::DirectMount
         );
         assert_eq!(

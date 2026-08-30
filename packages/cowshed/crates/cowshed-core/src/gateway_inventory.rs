@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
-use crate::api::dto::{
-    CheckpointInfo, GitOid, ProjectWorkspaces, UtcTimestamp, WorkspaceInfo, WorkspaceState,
-};
+#[cfg(test)]
+use crate::api::dto::WorkspaceState;
+use crate::api::dto::{ProjectWorkspaces, WorkspaceInfo};
 use crate::checkout::load_checkout_layout;
 use crate::metadata::{
     CheckoutLayout, DetachedWorkspaceMetadata, GrantSet, ImageFormat, PortBlock, PublicationState,
@@ -476,9 +476,10 @@ impl NativeGatewayInventory {
                     repo_id,
                     project_root,
                 }),
-                Ok(None) | Err(_) => {
+                Ok(None) => {
                     eprintln!("cowshed: skipping {repo_id}: it records no adopted checkout path");
                 }
+                Err(error) => return Err(error),
             }
         }
         Ok(projects)
@@ -807,9 +808,19 @@ impl NativeGatewayInventory {
     fn all_attached_blocking(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
         let repositories = discover_repositories(self.storage.store())?;
         let mut facts = Vec::new();
+        let mut port_bases = BTreeSet::new();
         for repo in repositories {
             match self.load_project(&repo) {
-                Ok(project) => facts.extend(project),
+                Ok(project) => {
+                    for fact in &project {
+                        if !port_bases.insert(fact.port_block.base()) {
+                            return Err(GatewayInventoryError::DuplicatePortBlock(
+                                fact.port_block.base(),
+                            ));
+                        }
+                    }
+                    facts.extend(project);
+                }
                 Err(error) => {
                     // Store-wide identity collisions stay fatal. A single project's
                     // mount/metadata mismatch is a doctor finding and must not take
@@ -879,47 +890,12 @@ impl NativeGatewayInventory {
                 image_paths.image(),
                 &workspace.workspace,
             )?;
-            let info = metadata.info_snapshot.as_ref();
-            let base_commit = info
-                .map(|snapshot| GitOid::new(snapshot.base_commit.clone()))
-                .transpose()
+            let info = WorkspaceInfo::from_current_metadata(&workspace, mount.clone(), &metadata)
                 .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: sidecar_path(image_paths.image()),
-                    message: error.to_string(),
-                })?;
-            let created_at = info
-                .map(|snapshot| UtcTimestamp::new(snapshot.created_at.clone()))
-                .transpose()
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: sidecar_path(image_paths.image()),
-                    message: error.to_string(),
-                })?;
-            workspaces.push(WorkspaceInfo {
-                repo_id: repo_id.clone(),
-                workspace: workspace.workspace.name().clone(),
-                workspace_incarnation: workspace.workspace.incarnation().clone(),
-                role: workspace.workspace.role(),
-                image_format: workspace.workspace.format(),
-                mount: mount.clone(),
-                state: match workspace.mount_state {
-                    MountState::Detached => WorkspaceState::Detached,
-                    MountState::Mounted { .. } => WorkspaceState::Attached,
-                },
-                branch: info.and_then(|snapshot| snapshot.branch.clone()),
-                base_commit,
-                created_at,
-                checkpoints: workspace
-                    .checkpoints
-                    .iter()
-                    .map(|checkpoint| CheckpointInfo {
-                        label: checkpoint.label.to_string(),
-                        revision: checkpoint.revision.get(),
-                        pinned: matches!(checkpoint.pin, crate::storage::lifecycle::Pin::Pinned),
-                    })
-                    .collect(),
-                snapshot_stale: info.is_some_and(|snapshot| snapshot.stale),
-                landing: None,
-            });
+                path: sidecar_path(image_paths.image()),
+                message: error.to_string(),
+            })?;
+            workspaces.push(info);
         }
         workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
         Ok(ProjectWorkspaces {
@@ -1200,12 +1176,13 @@ fn load_binding_candidate(
                 message: error.to_string(),
             })?;
     let actual = owned.current().clone();
-    let expected_paths = StorageLayout::new(store_root, &actual)
-        .map(|layout| layout.project().clone())
-        .map_err(|error| GatewayInventoryError::InvalidBinding {
+    let expected_layout = StorageLayout::new(store_root, &actual).map_err(|error| {
+        GatewayInventoryError::InvalidBinding {
             path: binding_path.to_owned(),
             message: error.to_string(),
-        })?;
+        }
+    })?;
+    let expected_paths = expected_layout.project();
     if expected_paths.project_root != project_root {
         let expected = project_root_identity(project_root).unwrap_or_else(|| actual.clone());
         return Err(GatewayInventoryError::ForeignBinding {
@@ -1214,9 +1191,9 @@ fn load_binding_candidate(
             actual,
         });
     }
-    load_checkout_layout(&expected_paths.checkout_layout).map_err(|error| {
+    load_checkout_layout(&expected_layout).map_err(|error| {
         GatewayInventoryError::InvalidMetadata {
-            path: expected_paths.checkout_layout,
+            path: expected_paths.checkout_layout.clone(),
             message: error.to_string(),
         }
     })?;
@@ -1260,7 +1237,7 @@ fn read_typed_json_nofollow<T: serde::de::DeserializeOwned>(
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if metadata.uid() != unsafe { libc::geteuid() }
+        if metadata.uid() != crate::gateway_sessions::effective_uid()
             || metadata.permissions().mode() & 0o077 != 0
         {
             return Err("typed JSON file is not controller-owned mode 0600".to_owned());
@@ -1477,7 +1454,11 @@ fn canonical_image_paths(
     })
 }
 
-fn read_current_metadata(
+/// Read one sidecar without following links and prove it describes the exact active lifecycle fact.
+///
+/// This is the only admission path for projecting store metadata into `WorkspaceInfo`; callers
+/// outside inventory use it rather than weakening the identity or publication-state checks.
+pub fn read_current_metadata(
     store_root: &Path,
     image: &Path,
     workspace: &crate::storage::lifecycle::LifecycleWorkspace,
@@ -2539,6 +2520,37 @@ mod tests {
             Err(GatewayInventoryError::MissingMainWorkspace(named)) if *named == repo
         ));
         assert!(outcomes[0].sessions[0].mount.is_ok());
+    }
+
+    #[tokio::test]
+    async fn adopted_projects_propagates_corrupt_checkout_evidence() {
+        let fixture = Fixture::new("adopted-corrupt-checkout");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let _ = fixture.workspace(
+            &repo,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000001",
+            3,
+            false,
+            true,
+        );
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let duplicate = layout.main_image(ImageFormat::Asif).expect("asif paths");
+        fs::create_dir_all(duplicate.image().parent().expect("image parent"))
+            .expect("image parent");
+        fs::write(duplicate.image(), b"corrupt duplicate").expect("duplicate image");
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+
+        let error = inventory
+            .adopted_projects()
+            .await
+            .expect_err("corrupt checkout evidence must not become an absent checkout");
+
+        assert!(matches!(
+            error,
+            GatewayInventoryError::InvalidMetadata { .. }
+        ));
     }
 
     /// The always-mounted check names main's image and its mountpoint, so a finding can point at
