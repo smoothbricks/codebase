@@ -1,5 +1,4 @@
-//! In-process backend: hand-rolled scan over flushed RecordBatches (zero heavy deps;
-//! the `datafusion` feature adds a SQL engine over the same batches).
+//! In-process backend: hand-rolled scan over flushed RecordBatches.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt8Type, UInt32Type, UInt64Type};

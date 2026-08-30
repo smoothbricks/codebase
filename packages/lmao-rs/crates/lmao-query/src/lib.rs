@@ -3,9 +3,7 @@
 //! Trace assertion/query layer per the trace-testing specification:
 //!
 //! - "The query layer must not care which tracer produced the table" — the same
-//!   [`Selector`] runs against in-process Arrow RecordBatches ([`ArrowTraceQuery`],
-//!   always available; DataFusion SQL under the `datafusion` feature) and SQLite
-//!   (`.cache/trace-results.db` / `SQLiteTracer` parity, `sqlite` feature).
+//!   [`Selector`] runs against in-process Arrow RecordBatches ([`ArrowTraceQuery`]).
 //! - Assertions select by TEMPLATE/name + typed columns, never rendered text.
 //! - Negative assertions ("this event never appears") are first-class.
 //! - Ordering asserts use span parentage, not wall-clock across threads:
@@ -14,10 +12,6 @@
 //!   compiling to the same predicate — thin layer, not built yet.
 
 mod arrow_backend;
-#[cfg(feature = "datafusion")]
-pub mod datafusion_backend;
-#[cfg(feature = "sqlite")]
-pub mod sqlite_backend;
 
 pub use arrow_backend::ArrowTraceQuery;
 
