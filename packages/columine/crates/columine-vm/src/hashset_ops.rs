@@ -128,10 +128,9 @@ pub fn batch_set_remove(
     slot_idx: u8,
     elems: &[u32],
     hooks: &mut impl VmHooks,
-) {
+) -> ErrorCode {
     if meta.slot_type() == SlotType::Bitmap {
-        hooks.batch_bitmap_remove(delta_mode, state, meta, slot_idx, elems);
-        return;
+        return hooks.batch_bitmap_remove(delta_mode, state, meta, slot_idx, elems);
     }
 
     let tbl = bind_slot_set(meta);
@@ -185,6 +184,7 @@ pub fn batch_set_remove(
     if had_remove {
         meta.set_change_flag(state, ChangeFlag::REMOVED);
     }
+    ErrorCode::Ok
 }
 
 /// Insert one element for per-element dispatch.
@@ -211,6 +211,6 @@ pub fn single_set_remove(
     slot_idx: u8,
     elem: u32,
     hooks: &mut impl VmHooks,
-) {
-    batch_set_remove(delta_mode, state, meta, slot_idx, &[elem], hooks);
+) -> ErrorCode {
+    batch_set_remove(delta_mode, state, meta, slot_idx, &[elem], hooks)
 }
