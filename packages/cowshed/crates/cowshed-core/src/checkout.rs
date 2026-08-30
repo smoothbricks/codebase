@@ -518,6 +518,33 @@ mod tests {
         );
     }
 
+    /// An adopted project — it holds a main image — with no record and no main mountpoint is
+    /// refused, because the two candidate answers put main in different directories.
+    ///
+    /// Legacy direct mount says main is at the checkout; a detached symlink-layout project whose
+    /// mountpoint `gc` removed says main is under `mnt/`. Nothing on disk distinguishes them once
+    /// the record is gone, and materializing a guess here is worse than refusing: the next reader
+    /// trusts the record as authoritative.
+    #[test]
+    fn an_adopted_project_with_no_record_and_no_mountpoint_is_refused() {
+        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
+            let temp = TempDirectory::new("ambiguous-layout");
+            let layout = storage_layout(&temp);
+            let image = layout.main_image(format).expect("main image paths");
+            fs::create_dir_all(image.image().parent().expect("image parent")).expect("parent");
+            fs::write(image.image(), b"adopted main").expect("main image");
+
+            assert!(matches!(
+                load_checkout_layout(&layout),
+                Err(StorageLayoutError::UnrecordedCheckoutLayout)
+            ));
+            assert!(
+                !layout.project().checkout_layout.exists(),
+                "a refusal must not leave a guess behind for the next reader to trust"
+            );
+        }
+    }
+
     #[test]
     fn materializing_a_legacy_layout_is_idempotent() {
         use std::os::unix::fs::MetadataExt as _;
