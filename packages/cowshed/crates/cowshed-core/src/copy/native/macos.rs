@@ -1,3 +1,4 @@
+use super::LeafMaterialization;
 use std::ffi::CString;
 use std::io;
 use std::path::Path;
@@ -38,14 +39,14 @@ fn copyfile(source: &Path, destination: &Path, flags: libc::copyfile_flags_t) ->
 /// Ask APFS for a metadata-only clone first. Adoption usually crosses from the checkout's
 /// volume into the staged image, where clonefile is unsupported; that is a per-entry fallback,
 /// not a reason to abort the whole tree after earlier subtrees have completed.
-pub fn copy_leaf(source: &Path, destination: &Path) -> io::Result<()> {
+pub fn copy_leaf(source: &Path, destination: &Path) -> io::Result<LeafMaterialization> {
     let clone = copyfile(
         source,
         destination,
         COPYFILE_ALL | libc::COPYFILE_CLONE_FORCE | libc::COPYFILE_NOFOLLOW,
     );
     match clone {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(LeafMaterialization::Cloned),
         Err(error)
             if matches!(
                 error.raw_os_error(),
@@ -58,6 +59,7 @@ pub fn copy_leaf(source: &Path, destination: &Path) -> io::Result<()> {
                 Err(remove) => return Err(remove),
             }
             copyfile(source, destination, COPYFILE_ALL | libc::COPYFILE_NOFOLLOW)
+                .map(|()| LeafMaterialization::Copied)
         }
         Err(error) => Err(error),
     }
