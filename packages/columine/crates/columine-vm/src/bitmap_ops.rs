@@ -495,9 +495,10 @@ pub fn contains_serialized(data: &[u8], value: u32) -> bool {
     if data.is_empty() {
         return false;
     }
-    RoaringBitmap::deserialize_from(data)
-        .map(|bm| bm.contains(value))
-        .unwrap_or(false)
+    match RoaringBitmap::contains_bytes(data, value) {
+        Ok(contains) => contains,
+        Err(_) => false,
+    }
 }
 
 /// Return serialized bitmap cardinality, saturating at `u32::MAX`.
@@ -505,17 +506,16 @@ pub fn cardinality_serialized(data: &[u8]) -> u32 {
     if data.is_empty() {
         return 0;
     }
-    RoaringBitmap::deserialize_from(data)
-        .map(|bm| u32::try_from(bm.len()).unwrap_or(u32::MAX))
-        .unwrap_or(0)
+    match RoaringBitmap::len_bytes(data) {
+        Ok(cardinality) => cardinality,
+        Err(_) => 0,
+    }
 }
 
 /// Validate a serialized bitmap and return its cardinality. A `None` result
 /// distinguishes malformed bytes from an empty bitmap.
 pub fn cardinality_validated(data: &[u8]) -> Option<u32> {
-    RoaringBitmap::deserialize_from(data)
-        .ok()
-        .map(|bm| u32::try_from(bm.len()).unwrap_or(u32::MAX))
+    RoaringBitmap::len_bytes(data).ok()
 }
 
 /// Extract ascending values into `out`, capped at its length; return the count.
