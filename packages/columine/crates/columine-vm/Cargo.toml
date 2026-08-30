@@ -17,3 +17,6 @@ columine-types = { workspace = true }
 # shipped artifact (it costs 35K of the reducer_vm.wasm size budget).
 roaring = { workspace = true }
 proptest = { workspace = true }
+# tests/opcode_audit.rs harvests the frozen ABI snapshot and the dispatch
+# source; the fixture strings must not enter the shipped artifact.
+columine-types = { workspace = true, features = ["audit"] }

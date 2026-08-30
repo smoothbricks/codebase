@@ -1,102 +1,70 @@
-//! Pins the Rust wasm export surface against the five-function baseline plus
-//! Columine's CPB1 Compact extension.
+//! Audits the `event_processor.wasm` export surface against
+//! `columine_types::wasm_abi::COLUMINE_EP_EXPORTS`.
+//!
+//! There used to be two lists here — a five-name "baseline" and the real
+//! six-name surface — plus a third in the TypeScript host. A list that omits a
+//! shipped export (`ep_compact`) cannot audit anything, so there is now one
+//! table and both sides are checked against it.
+//!
+//! `built_wasm_matches_the_export_table` needs the compiled artifact and says
+//! so out loud when it is missing rather than reporting success: the nx
+//! `cargo-test` target builds it first (`dependsOn: cargo-wasm`), and `just
+//! wasm-ep` runs this file directly after linking.
 
-/// Expected function exports of the Columine event-processor wasm artifact.
-pub const EXPECTED_COLUMINE_EP_EXPORTS: [&str; 5] = [
-    "ep_version",
-    "ep_create_with_schema",
-    "ep_create_with_schema_and_names",
-    "ep_destroy",
-    "ep_create_log_entry",
-];
+use columine_types::wasm_abi::{COLUMINE_EP_EXPORTS, EXPORTED_MEMORY, parse_exports};
+use std::collections::BTreeSet;
 
-pub const COLUMINE_EP_EXPORTS: [&str; 6] = [
-    "ep_version",
-    "ep_create_with_schema",
-    "ep_create_with_schema_and_names",
-    "ep_destroy",
-    "ep_create_log_entry",
-    "ep_compact",
-];
+const ARTIFACT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
+);
 
-/// Minimal wasm export-section reader (section id 7): (name, kind) pairs.
-fn wasm_exports(bytes: &[u8]) -> Vec<(String, u8)> {
-    assert_eq!(&bytes[..4], b"\0asm", "not a wasm module");
-    let mut i = 8;
-    let uleb = |i: &mut usize| -> u64 {
-        let mut r = 0u64;
-        let mut s = 0;
-        loop {
-            let b = bytes[*i];
-            *i += 1;
-            r |= u64::from(b & 0x7f) << s;
-            if b & 0x80 == 0 {
-                return r;
-            }
-            s += 7;
-        }
-    };
-    let mut out = Vec::new();
-    while i < bytes.len() {
-        let sid = bytes[i];
-        i += 1;
-        let size = uleb(&mut i) as usize;
-        let end = i + size;
-        if sid == 7 {
-            let n = uleb(&mut i);
-            for _ in 0..n {
-                let len = uleb(&mut i) as usize;
-                let name = String::from_utf8(bytes[i..i + len].to_vec()).unwrap();
-                i += len;
-                let kind = bytes[i];
-                i += 1;
-                let _idx = uleb(&mut i);
-                out.push((name, kind));
-            }
-        }
-        i = end;
-    }
-    out
-}
+const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");
 
+/// The host declares these as members of `EventProcessorWasmExports` rather
+/// than as a name array, so the audit looks for each member declaration.
 #[test]
-fn export_lists_are_complete_and_deduped() {
-    assert_eq!(
-        &COLUMINE_EP_EXPORTS[..EXPECTED_COLUMINE_EP_EXPORTS.len()],
-        &EXPECTED_COLUMINE_EP_EXPORTS
-    );
-    let mut names: Vec<&str> = COLUMINE_EP_EXPORTS.to_vec();
-    names.sort_unstable();
-    names.dedup();
-    assert_eq!(names.len(), 6, "duplicate names in the checklist");
-}
-
-/// `just wasm-ep` (columine justfile) runs this against the built artifact.
-#[test]
-#[ignore = "needs target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm (run `just wasm-ep`)"]
-fn built_wasm_exports_expected_symbols_and_memory() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
-    );
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("read {path}: {e} — run `just wasm-ep` first"));
-    let exports = wasm_exports(&bytes);
-    let fn_names: std::collections::HashSet<&str> = exports
+fn typescript_host_declares_every_ep_export() {
+    let source = std::fs::read_to_string(PARSE_BACKEND_TS)
+        .unwrap_or_else(|error| panic!("read {PARSE_BACKEND_TS}: {error}"));
+    let missing: Vec<&str> = COLUMINE_EP_EXPORTS
         .iter()
-        .filter(|(_, k)| *k == 0)
-        .map(|(n, _)| n.as_str())
-        .collect();
-    let missing: Vec<&&str> = COLUMINE_EP_EXPORTS
-        .iter()
-        .filter(|name| !fn_names.contains(**name))
+        .copied()
+        .filter(|name| !source.contains(&format!("{name}:")))
         .collect();
     assert!(
         missing.is_empty(),
-        "exports missing from Columine event processor ABI: {missing:?}"
+        "exports in columine_types::wasm_abi::COLUMINE_EP_EXPORTS with no \
+         EventProcessorWasmExports member: {missing:?}"
+    );
+}
+
+#[test]
+fn built_wasm_matches_the_export_table() {
+    let bytes = std::fs::read(ARTIFACT).unwrap_or_else(|error| {
+        panic!(
+            "read {ARTIFACT}: {error}\n\
+             This test audits the compiled artifact, so it cannot pass without \
+             one. Build it with `just wasm-ep` (or run this through \
+             `nx run columine:cargo-test`, which depends on cargo-wasm)."
+        )
+    });
+    let exports = parse_exports(&bytes).expect("built artifact is a readable wasm module");
+    let functions: BTreeSet<&str> = exports
+        .iter()
+        .filter(|export| export.kind == 0 && !export.name.starts_with("__"))
+        .map(|export| export.name.as_str())
+        .collect();
+    let expected: BTreeSet<&str> = COLUMINE_EP_EXPORTS.iter().copied().collect();
+    assert_eq!(
+        expected, functions,
+        "built event_processor.wasm function exports diverged from \
+         columine_types::wasm_abi::COLUMINE_EP_EXPORTS"
     );
     assert!(
-        exports.iter().any(|(n, k)| n == "memory" && *k == 2),
-        "memory must be exported (columine's TS reads instance.exports.memory)"
+        exports
+            .iter()
+            .any(|export| export.name == EXPORTED_MEMORY && export.kind == 2),
+        "{EXPORTED_MEMORY} must be exported (the TS host reads instance.exports.memory)"
     );
 }

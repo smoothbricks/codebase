@@ -196,6 +196,7 @@ dependencies = [
  "arrow-schema",
  "columine-arrow",
  "columine-event-processor",
+ "columine-types",
 ]
 
 [[package]]
@@ -222,6 +223,9 @@ dependencies = [
 [[package]]
 name = "columine-types"
 version = "0.0.1"
+dependencies = [
+ "columine-types",
+]
 
 [[package]]
 name = "columine-vm"

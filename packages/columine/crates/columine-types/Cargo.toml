@@ -8,3 +8,17 @@ repository.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# Test-support surface for the ABI audits: the frozen registry snapshots, the
+# source scraper they harvest with, and the wasm export-section reader. Off by
+# default, because `pub mod` always compiles: with these ungated, ~200 opcode
+# name strings and `std::fs` entered the link set of every artifact that
+# depends on this crate, including the two shipped wasm binaries.
+audit = []
+
+[dev-dependencies]
+# The audits live in `tests/`, which links this crate as an external
+# dependency, so `cfg(test)` cannot reach a gated module. A self dev-dependency
+# turns the feature on for this crate's own test build only.
+columine-types = { path = ".", features = ["audit"] }
