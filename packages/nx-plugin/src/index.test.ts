@@ -495,13 +495,29 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(platformBuildDependencies).toEqual([]);
       }
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+      // The test suite runs against the dev-profile addon, never a release
+      // platform build: napi-debug shares target/debug with cargo-test, keeps
+      // the release binaries off the test critical path, and lives outside
+      // dist/ so the wholesale-packaged dist/ tree can never ship it.
+      expect(targets['napi-debug']).toMatchObject({
+        executor: 'nx:run-commands',
+        cache: true,
+        dependsOn: ['^build'],
+        outputs: ['{projectRoot}/.cache/native-debug'],
+        options: {
+          cwd: 'packages/cowshed',
+          command:
+            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir .cache/native-debug',
+        },
+      });
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
         cache: true,
-        dependsOn: ['cargo-test', hostProvider, 'tsc-js', '^build', 'build'],
+        dependsOn: ['cargo-test', 'napi-debug', 'tsc-js', '^build'],
         options: {
           command: 'bun test --config=../bunfig.toml --timeout=30000 native.test.ts',
           cwd: 'packages/cowshed/src',
+          env: { NAPI_DEBUG_ADDON: '1' },
           timeoutMs: 120000,
           killAfterMs: 10000,
         },
