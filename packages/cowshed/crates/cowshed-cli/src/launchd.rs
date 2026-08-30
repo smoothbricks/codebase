@@ -22,9 +22,10 @@ pub const STABLE_BINARY_MODE: u32 = 0o755;
 pub const COWSHED_BINARY_NAME: &str = "cowshed";
 pub const SCCACHE_BINARY_NAME: &str = "sccache";
 
-const APPLICATION_SUPPORT: &str = "Application Support";
-const STABLE_SUPPORT_DIRECTORY: &str = "dev.cowshed";
-const STABLE_BINARY_DIRECTORY: &str = "bin";
+pub const LIBRARY_DIRECTORY: &str = "Library";
+pub const APPLICATION_SUPPORT: &str = "Application Support";
+pub const STABLE_SUPPORT_DIRECTORY: &str = "dev.cowshed";
+pub const STABLE_BINARY_DIRECTORY: &str = "bin";
 
 /// A binary path launchd can still reach after a reboot.
 ///
@@ -51,7 +52,7 @@ impl HostStableExecutable {
         validate_canonical_absolute_path("home", home)?;
         validate_binary_name(name)?;
         let path = home
-            .join("Library")
+            .join(LIBRARY_DIRECTORY)
             .join(APPLICATION_SUPPORT)
             .join(STABLE_SUPPORT_DIRECTORY)
             .join(STABLE_BINARY_DIRECTORY)
@@ -1095,13 +1096,13 @@ pub enum CommandStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandOutput {
+pub struct LaunchctlOutput {
     pub status: CommandStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
-impl CommandOutput {
+impl LaunchctlOutput {
     pub fn success() -> Self {
         Self {
             status: CommandStatus::Success,
@@ -1112,14 +1113,14 @@ impl CommandOutput {
 }
 
 pub trait LaunchctlCommand {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<CommandOutput>;
+    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeLaunchctlCommand;
 
 impl LaunchctlCommand for NativeLaunchctlCommand {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<CommandOutput> {
+    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput> {
         let output = Command::new(executable).args(arguments).output()?;
         let status = if output.status.success() {
             CommandStatus::Success
@@ -1128,7 +1129,7 @@ impl LaunchctlCommand for NativeLaunchctlCommand {
         } else {
             CommandStatus::Terminated
         };
-        Ok(CommandOutput {
+        Ok(LaunchctlOutput {
             status,
             stdout: output.stdout,
             stderr: output.stderr,
