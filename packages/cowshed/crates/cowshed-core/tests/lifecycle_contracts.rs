@@ -49,46 +49,6 @@ fn workspace(name: &str, revision: u64, topology: u64) -> LifecycleWorkspace {
     )
     .unwrap()
 }
-fn observed(expected: &ExpectedState) -> ObservedState {
-    match expected {
-        ExpectedState::Exists {
-            repo,
-            name,
-            incarnation,
-            revision,
-            topology_revision,
-            retired,
-        } => ObservedState::Exists {
-            repo: repo.clone(),
-            name: name.clone(),
-            incarnation: incarnation.clone(),
-            revision: *revision,
-            topology_revision: *topology_revision,
-            retired: *retired,
-        },
-        ExpectedState::Absent {
-            repo,
-            name,
-            topology_revision,
-        } => ObservedState::Absent {
-            repo: repo.clone(),
-            name: name.clone(),
-            topology_revision: *topology_revision,
-        },
-        ExpectedState::Checkpoint {
-            repo,
-            workspace,
-            label,
-            revision,
-        } => ObservedState::Checkpoint {
-            repo: repo.clone(),
-            workspace: workspace.clone(),
-            label: label.clone(),
-            revision: *revision,
-        },
-    }
-}
-
 #[test]
 fn planning_is_deterministic_capability_free_and_has_no_effects() {
     let planner = PurePlanner;
@@ -110,7 +70,7 @@ fn planning_is_deterministic_capability_free_and_has_no_effects() {
 }
 
 struct SpyBackend {
-    actual: Vec<ObservedState>,
+    actual: Vec<LifecycleFact>,
     acquired: AtomicUsize,
     reread: AtomicUsize,
     command_effects: AtomicUsize,
@@ -135,8 +95,8 @@ impl LifecycleBackend for SpyBackend {
     async fn read_authoritative(
         &self,
         guard: &mut Self::Guard,
-        _: &[ExpectedState],
-    ) -> Result<Vec<ObservedState>, Self::Error> {
+        _: &[LifecycleFact],
+    ) -> Result<Vec<LifecycleFact>, Self::Error> {
         assert_eq!(self.acquired.load(Ordering::SeqCst), 1);
         self.reread.fetch_add(1, Ordering::SeqCst);
         guard.reread_complete = true;
@@ -154,7 +114,7 @@ impl LifecycleBackend for SpyBackend {
     }
 }
 
-fn backend(actual: Vec<ObservedState>) -> SpyBackend {
+fn backend(actual: Vec<LifecycleFact>) -> SpyBackend {
     SpyBackend {
         actual,
         acquired: AtomicUsize::new(0),
@@ -395,29 +355,29 @@ fn value_accessors_and_every_fact_field_are_observable() {
         identity: identity(),
     };
     let create = PurePlanner.plan_create(&ws, destination).unwrap();
-    let create_actual: Vec<_> = create.expected().iter().map(observed).collect();
+    let create_actual = create.expected().to_vec();
     assert_eq!(revalidate(create.expected(), &create_actual), Ok(()));
 
     let restore = PurePlanner
         .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
         .unwrap();
-    let restore_actual: Vec<_> = restore.expected().iter().map(observed).collect();
+    let restore_actual = restore.expected().to_vec();
     assert_eq!(revalidate(restore.expected(), &restore_actual), Ok(()));
 
     for actual in [
-        ObservedState::Checkpoint {
+        LifecycleFact::Checkpoint {
             repo: RepoId::parse("other/project").unwrap(),
             workspace: ws.name().clone(),
             label: checkpoint.label().clone(),
             revision: checkpoint.revision(),
         },
-        ObservedState::Checkpoint {
+        LifecycleFact::Checkpoint {
             repo: repo(),
             workspace: WorkspaceName::session("other").unwrap(),
             label: checkpoint.label().clone(),
             revision: checkpoint.revision(),
         },
-        ObservedState::Checkpoint {
+        LifecycleFact::Checkpoint {
             repo: repo(),
             workspace: ws.name().clone(),
             label: CheckpointLabel::new("other").unwrap(),
@@ -429,17 +389,17 @@ fn value_accessors_and_every_fact_field_are_observable() {
 
     let absent = &create.expected()[1..];
     for actual in [
-        ObservedState::Absent {
+        LifecycleFact::Absent {
             repo: RepoId::parse("other/project").unwrap(),
             name: WorkspaceName::session("destination").unwrap(),
             topology_revision: Revision::new(5),
         },
-        ObservedState::Absent {
+        LifecycleFact::Absent {
             repo: repo(),
             name: WorkspaceName::session("other").unwrap(),
             topology_revision: Revision::new(5),
         },
-        ObservedState::Absent {
+        LifecycleFact::Absent {
             repo: repo(),
             name: WorkspaceName::session("destination").unwrap(),
             topology_revision: Revision::new(6),
@@ -492,7 +452,7 @@ fn restore_rejects_each_checkpoint_identity_mismatch() {
 #[tokio::test]
 async fn execute_acquires_rereads_revalidates_then_mutates() {
     let plan = PurePlanner.plan_retire(&workspace("topic", 3, 5)).unwrap();
-    let spy = backend(plan.expected().iter().map(observed).collect());
+    let spy = backend(plan.expected().to_vec());
     execute_checked(&spy, &plan).await.unwrap();
     assert_eq!(spy.acquired.load(Ordering::SeqCst), 1);
     assert_eq!(spy.reread.load(Ordering::SeqCst), 1);
@@ -512,21 +472,21 @@ async fn every_stale_precondition_conflicts_with_zero_effects() {
     let plan = PurePlanner
         .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
         .unwrap();
-    let canonical: Vec<_> = plan.expected().iter().map(observed).collect();
+    let canonical = plan.expected().to_vec();
     let mut stale_matrix = Vec::new();
 
     let mut stale = canonical.clone();
-    if let ObservedState::Exists { incarnation, .. } = &mut stale[0] {
+    if let LifecycleFact::Exists { incarnation, .. } = &mut stale[0] {
         *incarnation = make_incarnation('b');
     }
     stale_matrix.push(stale);
     let mut stale = canonical.clone();
-    if let ObservedState::Exists { revision, .. } = &mut stale[0] {
+    if let LifecycleFact::Exists { revision, .. } = &mut stale[0] {
         *revision = Revision::new(4);
     }
     stale_matrix.push(stale);
     let mut stale = canonical.clone();
-    if let ObservedState::Exists {
+    if let LifecycleFact::Exists {
         topology_revision, ..
     } = &mut stale[0]
     {
@@ -534,12 +494,12 @@ async fn every_stale_precondition_conflicts_with_zero_effects() {
     }
     stale_matrix.push(stale);
     let mut stale = canonical.clone();
-    if let ObservedState::Exists { retired, .. } = &mut stale[0] {
+    if let LifecycleFact::Exists { retired, .. } = &mut stale[0] {
         *retired = true;
     }
     stale_matrix.push(stale);
     let mut stale = canonical;
-    if let ObservedState::Checkpoint { revision, .. } = &mut stale[1] {
+    if let LifecycleFact::Checkpoint { revision, .. } = &mut stale[1] {
         *revision = Revision::new(9);
     }
     stale_matrix.push(stale);
@@ -553,6 +513,77 @@ async fn every_stale_precondition_conflicts_with_zero_effects() {
         assert_eq!(spy.command_effects.load(Ordering::SeqCst), 0);
         assert_eq!(spy.filesystem_effects.load(Ordering::SeqCst), 0);
     }
+}
+
+/// Arity and variant are refusals in their own right, not consequences of comparing fields.
+///
+/// A plan that expected two facts must never be admitted by one observation, and an observed
+/// `Exists` must never satisfy an expected `Absent` for the same workspace — that is the
+/// difference between "this session name is free" and "this session is already live", and
+/// admitting it would let create publish over a workspace someone is using.
+#[test]
+fn revalidate_refuses_short_observations_and_substituted_variants() {
+    let ws = workspace("topic", 3, 5);
+    let checkpoint = CheckpointRef::new(
+        ws.clone(),
+        CheckpointLabel::new("safe").unwrap(),
+        Revision::new(8),
+        false,
+    );
+    let restore = PurePlanner
+        .plan_restore(&ws, &checkpoint, RestoreMode::Replace, identity())
+        .unwrap();
+    let canonical = restore.expected().to_vec();
+
+    assert_eq!(
+        revalidate(restore.expected(), &canonical[..1]),
+        Err(Conflict::FactCount {
+            expected: 2,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        revalidate(&restore.expected()[..1], &canonical),
+        Err(Conflict::FactCount {
+            expected: 1,
+            actual: 2,
+        })
+    );
+
+    let destination = Destination {
+        repo: repo(),
+        name: WorkspaceName::session("destination").unwrap(),
+        topology_revision: Revision::new(5),
+        identity: identity(),
+    };
+    let create = PurePlanner.plan_create(&ws, destination).unwrap();
+    let taken = LifecycleFact::Exists {
+        repo: repo(),
+        name: WorkspaceName::session("destination").unwrap(),
+        incarnation: make_incarnation('a'),
+        revision: Revision::new(0),
+        topology_revision: Revision::new(5),
+        retired: false,
+    };
+    assert!(matches!(
+        revalidate(&create.expected()[1..], &[taken]),
+        Err(Conflict::Stale { index: 0, .. })
+    ));
+}
+
+/// An observation is an expectation: the same value the substrate reads back is the value a plan
+/// carries, so a single `LifecycleFact` is revalidatable against itself. Two structurally
+/// identical types made that unwriteable and made "add a field to one, forget the other" a silent
+/// stale-plan miss.
+#[test]
+fn expected_and_observed_use_the_same_fact_type() {
+    let facts = vec![LifecycleFact::Absent {
+        repo: repo(),
+        name: WorkspaceName::session("destination").unwrap(),
+        topology_revision: Revision::new(5),
+    }];
+
+    assert_eq!(revalidate(&facts, &facts), Ok(()));
 }
 
 #[tokio::test(flavor = "current_thread")]

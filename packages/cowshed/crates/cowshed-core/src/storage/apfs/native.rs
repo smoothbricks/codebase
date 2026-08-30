@@ -34,10 +34,11 @@ use crate::workspace_credentials::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::super::bootstrap::is_reserved_store_namespace;
 use super::super::lifecycle::{
-    CheckpointFact, ExpectedState, KernelMountFact, LifecycleWorkspace, ObservedState,
-    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate,
-    StorageGcPlan, StorageGcReason, StorageGcReport, SubstrateStats,
+    CheckpointFact, KernelMountFact, LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin,
+    ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
+    StorageGcReason, StorageGcReport, SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -852,10 +853,7 @@ fn staged_image_format(path: &Path) -> Option<ImageFormat> {
 fn is_project_owner_directory(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            !name.starts_with('.')
-                && !matches!(name, "mnt" | "caches" | "gateway" | "telemetry" | "run")
-        })
+        .is_some_and(|name| !is_reserved_store_namespace(name))
 }
 
 fn collect_project_directories(store_root: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
@@ -1277,8 +1275,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         metadata: &DetachedWorkspaceMetadata,
         topology_revision: Revision,
         retired: bool,
-    ) -> ObservedState {
-        ObservedState::Exists {
+    ) -> LifecycleFact {
+        LifecycleFact::Exists {
             repo: metadata.repo_id.clone(),
             name: metadata.workspace.clone(),
             incarnation: metadata.workspace_incarnation.clone(),
@@ -1439,7 +1437,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     fn published_facts(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError> {
         let layout = layout(&self.config, repo)?;
         let mut facts = Vec::new();
-        let main = WorkspaceName::new("main").expect("fixed main name is valid");
+        let main = WorkspaceName::main();
         if let Some((_, metadata)) = self.find_canonical_image(repo, &main)?
             && metadata.publication_state == PublicationState::Active
         {
@@ -1449,9 +1447,19 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             });
         }
         let entries = match fs::read_dir(&layout.project().sessions) {
+            // An entry that cannot be read is a shorter workspace list, and the callers of this
+            // enumeration decide what exists from it. `entry.ok()` would report a workspace whose
+            // directory entry failed as absent, which is a wrong-success answer to a probe.
             Ok(entries) => entries
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .collect::<Vec<_>>(),
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()
+                .map_err(|error| {
+                    io_error(
+                        "enumerate session image entry",
+                        &layout.project().sessions,
+                        error,
+                    )
+                })?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 return Err(io_error(
@@ -2401,11 +2409,11 @@ where
 
     type Attachment = AttachedImage;
 
-    fn observe(&self, expected: &[ExpectedState]) -> Result<Vec<ObservedState>, ApfsStorageError> {
+    fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError> {
         expected
             .iter()
             .map(|fact| match fact {
-                ExpectedState::Exists {
+                LifecycleFact::Exists {
                     repo,
                     name,
                     topology_revision,
@@ -2418,7 +2426,7 @@ where
                     .ok_or(ApfsStorageError::Host(format!(
                         "published workspace is missing: {repo}/{name}"
                     ))),
-                ExpectedState::Absent {
+                LifecycleFact::Absent {
                     repo,
                     name,
                     topology_revision,
@@ -2426,20 +2434,20 @@ where
                     Some((_, metadata)) => {
                         Ok(self.observed_workspace(&metadata, *topology_revision, false))
                     }
-                    None => Ok(ObservedState::Absent {
+                    None => Ok(LifecycleFact::Absent {
                         repo: repo.clone(),
                         name: name.clone(),
                         topology_revision: *topology_revision,
                     }),
                 },
-                ExpectedState::Checkpoint {
+                LifecycleFact::Checkpoint {
                     repo,
                     workspace,
                     label,
                     revision,
                 } => self
                     .find_checkpoint(repo, workspace, label)?
-                    .map(|metadata| ObservedState::Checkpoint {
+                    .map(|metadata| LifecycleFact::Checkpoint {
                         repo: metadata.repo_id,
                         workspace: metadata.workspace,
                         label: label.clone(),
@@ -3898,7 +3906,7 @@ where
     ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError> {
         let storage = layout(&self.config, repo)?;
         let mut pending = Vec::new();
-        let main = WorkspaceName::new("main").expect("fixed main name is valid");
+        let main = WorkspaceName::main();
         if let Some((image, metadata)) = self.find_canonical_image(repo, &main)?
             && metadata.publication_state == PublicationState::PendingFence
         {
@@ -3915,8 +3923,15 @@ where
         }
         let entries = match fs::read_dir(&storage.project().sessions) {
             Ok(entries) => entries
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .collect::<Vec<_>>(),
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()
+                .map_err(|error| {
+                    io_error(
+                        "enumerate pending session image entry",
+                        &storage.project().sessions,
+                        error,
+                    )
+                })?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 return Err(io_error(

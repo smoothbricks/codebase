@@ -19,18 +19,17 @@ use crate::repository::{OwnedRepoIds, RepoId};
 
 use super::lifecycle::{
     AdoptPlan, AdoptRequest, CheckpointFact, CheckpointPlan, CheckpointRef, CreatePlan,
-    DerivedWorkspace, Destination, ExecuteError, ExpectedState, ForkPlan, ImmutablePlan,
-    KernelMountFact, LifecycleBackend, LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace,
-    MountIntent, MountState, ObservedState, Operation, OperationIdentity, Pin, PlanError,
-    PurePlanner, ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef,
-    Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
-    execute_checked, revalidate,
+    DerivedWorkspace, Destination, ExecuteError, ForkPlan, ImmutablePlan, KernelMountFact,
+    LifecycleBackend, LifecycleFact, LifecyclePlanner, LifecycleReceipt, LifecycleWorkspace,
+    MountIntent, MountState, Operation, OperationIdentity, Pin, PlanError, PurePlanner,
+    ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt, RetirePlan, RetiredRef, Revision,
+    StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats, execute_checked,
+    revalidate,
 };
-use super::{CheckpointLabel, StorageLayout, StorageLayoutError};
+use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutError};
 
 pub const DEFAULT_IMAGE_CAPACITY: ImageCapacity = ImageCapacity::from_gibibytes(100);
 use super::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
-const PRE_RESTORE_PREFIX: &str = "pre-restore-";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApfsSubstrateConfig {
@@ -374,7 +373,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<Option<Self::LockGuard>, ApfsStorageError>;
     type Attachment: Send + 'static;
 
-    fn observe(&self, expected: &[ExpectedState]) -> Result<Vec<ObservedState>, ApfsStorageError>;
+    fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError>;
     fn resolve_format(
         &self,
         repo: &RepoId,
@@ -1606,7 +1605,7 @@ struct CheckedApfsBackend<H, L> {
     lane: Arc<L>,
     config: Arc<ApfsSubstrateConfig>,
     incarnations: Arc<dyn IncarnationSource>,
-    expected: Vec<ExpectedState>,
+    expected: Vec<LifecycleFact>,
 }
 
 #[async_trait]
@@ -1635,8 +1634,8 @@ where
     async fn read_authoritative(
         &self,
         guard: &mut Self::Guard,
-        expected: &[ExpectedState],
-    ) -> Result<Vec<ObservedState>, Self::Error> {
+        expected: &[LifecycleFact],
+    ) -> Result<Vec<LifecycleFact>, Self::Error> {
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
         let held_locks = guard.paths.clone();
@@ -1764,7 +1763,7 @@ fn workspace_lock_path(
 
 fn operation_lock_paths(
     config: &ApfsSubstrateConfig,
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     operation: &Operation,
 ) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let repo = match operation {
@@ -1834,7 +1833,7 @@ struct RestoreExecution<'a> {
 fn apply_operation<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     operation: &Operation,
     _incarnations: &dyn IncarnationSource,
 ) -> Result<Applied, ApfsStorageError> {
@@ -1858,7 +1857,7 @@ fn apply_operation<H: ApfsExecutionHost>(
 fn prepare_adopt_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     execution: AdoptExecution<'_>,
     incarnations: &dyn IncarnationSource,
 ) -> Result<PreparedAdopt<H::Attachment>, ApfsStorageError> {
@@ -2123,7 +2122,7 @@ fn commit_prepared_adopt<H: ApfsExecutionHost>(
 fn prepare_clone_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     execution: CloneExecution<'_>,
     incarnations: &dyn IncarnationSource,
 ) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
@@ -2307,7 +2306,7 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
 
 fn plan_checkpoint_stage(
     config: &ApfsSubstrateConfig,
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     workspace_name: &WorkspaceName,
     label: &CheckpointLabel,
     pin: Pin,
@@ -2389,7 +2388,7 @@ fn commit_prepared_checkpoint<H: ApfsExecutionHost>(
 fn prepare_restore_stage<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     execution: RestoreExecution<'_>,
     incarnations: &dyn IncarnationSource,
 ) -> Result<PreparedRestore<H::Attachment>, ApfsStorageError> {
@@ -2702,7 +2701,7 @@ fn commit_prepared_restore<H: ApfsExecutionHost>(
 fn apply_retire<H: ApfsExecutionHost>(
     host: &H,
     config: &ApfsSubstrateConfig,
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     workspace_name: &WorkspaceName,
 ) -> Result<Applied, ApfsStorageError> {
     let format =
@@ -2769,11 +2768,11 @@ fn combine_cleanup<T>(
     }
 }
 
-fn expected_repo(expected: &[ExpectedState]) -> Result<&RepoId, ApfsStorageError> {
+fn expected_repo(expected: &[LifecycleFact]) -> Result<&RepoId, ApfsStorageError> {
     expected
         .iter()
         .find_map(|fact| match fact {
-            ExpectedState::Exists {
+            LifecycleFact::Exists {
                 repo,
                 retired: false,
                 ..
@@ -2786,7 +2785,7 @@ fn expected_repo(expected: &[ExpectedState]) -> Result<&RepoId, ApfsStorageError
 }
 
 fn active_expected(
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     name: &WorkspaceName,
     format: ImageFormat,
 ) -> Result<LifecycleWorkspace, ApfsStorageError> {
@@ -2795,11 +2794,11 @@ fn active_expected(
 }
 
 fn active_expected_with_format(
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     name: &WorkspaceName,
     format: ImageFormat,
 ) -> Result<LifecycleWorkspace, ApfsStorageError> {
-    let Some(ExpectedState::Exists {
+    let Some(LifecycleFact::Exists {
         repo,
         name: expected_name,
         incarnation,
@@ -2807,7 +2806,7 @@ fn active_expected_with_format(
         topology_revision,
         retired: false,
     }) = expected.iter().find(
-        |fact| matches!(fact, ExpectedState::Exists { name: candidate, .. } if candidate == name),
+        |fact| matches!(fact, LifecycleFact::Exists { name: candidate, .. } if candidate == name),
     )
     else {
         return Err(ApfsStorageError::InvalidPlan(
@@ -2831,11 +2830,11 @@ fn companion_path(image: &Path) -> PathBuf {
     crate::metadata::append_suffix(image, ".ca.key")
 }
 
-fn absent_expected(expected: &[ExpectedState]) -> Result<Revision, ApfsStorageError> {
+fn absent_expected(expected: &[LifecycleFact]) -> Result<Revision, ApfsStorageError> {
     expected
         .iter()
         .find_map(|fact| match fact {
-            ExpectedState::Absent {
+            LifecycleFact::Absent {
                 topology_revision, ..
             } => Some(*topology_revision),
             _ => None,
@@ -2845,11 +2844,11 @@ fn absent_expected(expected: &[ExpectedState]) -> Result<Revision, ApfsStorageEr
         ))
 }
 
-fn expected_revision(expected: &[ExpectedState]) -> Result<u64, ApfsStorageError> {
+fn expected_revision(expected: &[LifecycleFact]) -> Result<u64, ApfsStorageError> {
     expected
         .iter()
         .find_map(|fact| match fact {
-            ExpectedState::Exists { revision, .. } => Some(revision.get()),
+            LifecycleFact::Exists { revision, .. } => Some(revision.get()),
             _ => None,
         })
         .ok_or(ApfsStorageError::InvalidPlan(
@@ -2858,14 +2857,14 @@ fn expected_revision(expected: &[ExpectedState]) -> Result<u64, ApfsStorageError
 }
 
 fn checkpoint_expected_revision(
-    expected: &[ExpectedState],
+    expected: &[LifecycleFact],
     workspace: &WorkspaceName,
     label: &CheckpointLabel,
 ) -> Result<Revision, ApfsStorageError> {
     expected
         .iter()
         .find_map(|fact| match fact {
-            ExpectedState::Checkpoint {
+            LifecycleFact::Checkpoint {
                 workspace: expected_workspace,
                 label: expected_label,
                 revision,
@@ -3116,7 +3115,7 @@ mod tests {
         let main = main_name();
         let source = WorkspaceName::session("source").expect("source");
         let destination = WorkspaceName::session("destination").expect("destination");
-        let expected = vec![ExpectedState::Exists {
+        let expected = vec![LifecycleFact::Exists {
             repo: repo.clone(),
             name: source.clone(),
             incarnation: WorkspaceIncarnation::new("00000000000000000000000000000001")
