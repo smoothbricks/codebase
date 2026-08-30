@@ -56,6 +56,14 @@ describe('Linux cross-check policy', () => {
     expect(CARGO_CROSS_LINT_COMMAND).toContain(`--target ${CARGO_LINUX_TRIPLE}`);
   });
 
+  it('fails closed on Darwin without the linux-cross compiler instead of compiling', () => {
+    // Without this guard a Darwin cache miss sits in ring's cc-rs looking for
+    // x86_64-linux-gnu-gcc. The linux-cross profile exports
+    // CC_x86_64_unknown_linux_gnu; Linux CI is already the target.
+    expect(CARGO_CROSS_LINT_COMMAND).toContain('CC_x86_64_unknown_linux_gnu');
+    expect(CARGO_CROSS_LINT_COMMAND).toContain('uname -s');
+  });
+
   it('carries the triple explicitly so a host lint cannot pass for a cross one', () => {
     // The devenv profile deliberately exports no CARGO_BUILD_TARGET. Were the
     // triple ambient instead, running this target outside the cross shell would

@@ -348,9 +348,10 @@ wraps prose body paragraphs through `fmt -w 72` while preserving fenced code blo
 bullets, trailers, URLs, and comment lines.
 
 The generated pre-push hook runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin
-does not. The hook runs `nx run-many -t cargo-lint-cross` with a stub `cargo` on `PATH` so a warm Nx cache (which never
-executes cargo) succeeds in well under a second, and a miss fails immediately instead of compiling. Populate the cache
-with `bun run check:linux`. `git push --no-verify` skips the hook.
+does not. The hook runs `nx run-many -t cargo-lint-cross`. Nx caches that target on the Cargo inputs, so a hit is a
+prior real Linux clippy and never enters linux-cross. A miss falls through to `bun run check:linux`, which is
+`tooling/devenv --quiet -P linux-cross shell --` around that same Nx target and writes the cache. `git push --no-verify`
+skips the hook.
 
 Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
 requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects
