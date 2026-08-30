@@ -15,7 +15,10 @@ use tokio::{
 };
 use url::Url;
 
-use crate::actor::{BrokerAuditEvent, BrokerAuditKind, BrokerAuditStatus, BrokerAuditor};
+use crate::{
+    actor::{BrokerAuditEvent, BrokerAuditor},
+    interfaces::{AuditKind, AuditStatus},
+};
 
 const MAX_PROJECTS: usize = 4096;
 const MAX_SESSIONS: usize = 4096;
@@ -483,7 +486,7 @@ async fn execute_request(
                     workspace_id,
                     "openurl",
                     None,
-                    BrokerAuditStatus::Denied,
+                    AuditStatus::Denied,
                     Some(error.classification()),
                 )
                 .await?;
@@ -516,7 +519,7 @@ async fn execute_request(
                     workspace_id,
                     "install",
                     None,
-                    BrokerAuditStatus::Denied,
+                    AuditStatus::Denied,
                     Some(error.classification()),
                 )
                 .await?;
@@ -528,7 +531,7 @@ async fn execute_request(
                     workspace_id,
                     "install",
                     None,
-                    BrokerAuditStatus::Denied,
+                    AuditStatus::Denied,
                     Some("sim-install-not-granted"),
                 )
                 .await?;
@@ -544,7 +547,7 @@ async fn execute_request(
                     workspace_id,
                     "install",
                     None,
-                    BrokerAuditStatus::Denied,
+                    AuditStatus::Denied,
                     Some("sim-human-approval-required"),
                 )
                 .await?;
@@ -559,7 +562,7 @@ async fn execute_request(
                     workspace_id,
                     "install",
                     None,
-                    BrokerAuditStatus::Denied,
+                    AuditStatus::Denied,
                     Some("sim-install-source-denied"),
                 )
                 .await?;
@@ -578,7 +581,7 @@ async fn execute_request(
                             workspace_id,
                             "install",
                             None,
-                            BrokerAuditStatus::Denied,
+                            AuditStatus::Denied,
                             Some(error.classification()),
                         )
                         .await?;
@@ -590,7 +593,7 @@ async fn execute_request(
                             workspace_id,
                             "install",
                             None,
-                            BrokerAuditStatus::Failed,
+                            AuditStatus::Failed,
                             Some("sim-install-source-denied"),
                         )
                         .await?;
@@ -649,7 +652,7 @@ async fn run_audited(
         workspace_id,
         method,
         path,
-        BrokerAuditStatus::Allowed,
+        AuditStatus::Allowed,
         Some("sim-admitted"),
     )
     .await?;
@@ -660,16 +663,16 @@ async fn run_audited(
                 workspace_id,
                 method,
                 path,
-                BrokerAuditStatus::Completed,
+                AuditStatus::Completed,
                 None,
             )
             .await
         }
         Err(error) => {
             let status = if matches!(error, SimBrokerError::RunnerTimeout) {
-                BrokerAuditStatus::TimedOut
+                AuditStatus::TimedOut
             } else {
-                BrokerAuditStatus::Failed
+                AuditStatus::Failed
             };
             audit(
                 auditor,
@@ -690,13 +693,13 @@ async fn audit(
     workspace_id: &str,
     method: &str,
     path: Option<&str>,
-    status: BrokerAuditStatus,
+    status: AuditStatus,
     classification: Option<&str>,
 ) -> Result<(), SimBrokerError> {
     auditor
         .record_broker(BrokerAuditEvent {
             workspace_id: workspace_id.to_owned(),
-            kind: BrokerAuditKind::Sim,
+            kind: AuditKind::Sim,
             method: Some(method.to_owned()),
             path: path.map(str::to_owned),
             status,
@@ -1141,7 +1144,7 @@ mod tests {
             assert_eq!(
                 events
                     .iter()
-                    .filter(|event| event.status == BrokerAuditStatus::Completed)
+                    .filter(|event| event.status == AuditStatus::Completed)
                     .count(),
                 2
             );
@@ -1190,10 +1193,7 @@ mod tests {
 
     #[tokio::test]
     async fn runner_failure_and_timeout_emit_one_terminal_outcome() {
-        for (timeout, terminal) in [
-            (false, BrokerAuditStatus::Failed),
-            (true, BrokerAuditStatus::TimedOut),
-        ] {
+        for (timeout, terminal) in [(false, AuditStatus::Failed), (true, AuditStatus::TimedOut)] {
             let root = fixture_root(if timeout { "timeout" } else { "failure" });
             let runner = Arc::new(FailingRunner { timeout });
             let auditor = Arc::new(RecordingAuditor::default());
@@ -1225,7 +1225,7 @@ mod tests {
             {
                 let events = auditor.events.lock().expect("events");
                 let statuses = events.iter().map(|event| event.status).collect::<Vec<_>>();
-                assert_eq!(statuses, vec![BrokerAuditStatus::Allowed, terminal]);
+                assert_eq!(statuses, vec![AuditStatus::Allowed, terminal]);
             }
             handle.shutdown().await;
             task.await.expect("join");

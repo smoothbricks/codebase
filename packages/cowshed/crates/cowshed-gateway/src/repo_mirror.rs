@@ -29,10 +29,10 @@ use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
-    actor::{BrokerAuditEvent, BrokerAuditKind, BrokerAuditStatus, BrokerAuditor},
+    actor::{BrokerAuditEvent, BrokerAuditor},
     interfaces::{
-        AuthorizedTarget, CredentialProtocol, CredentialProvider, CredentialQuery,
-        NegotiatedTransport, UpstreamConnector, UpstreamPurpose,
+        AuditKind, AuditStatus, AuthorizedTarget, CredentialProtocol, CredentialProvider,
+        CredentialQuery, NegotiatedTransport, UpstreamConnector, UpstreamPurpose,
     },
     policy::{
         CanonicalHost, CanonicalTarget, EgressMode, HostPattern, TargetScheme, WorkspacePolicy,
@@ -901,7 +901,7 @@ async fn mirror(
             auditor,
             &scoped,
             None,
-            BrokerAuditStatus::Denied,
+            AuditStatus::Denied,
             Some("repo-scope-mismatch"),
             0,
         )
@@ -915,7 +915,7 @@ async fn mirror(
                 auditor,
                 &request,
                 None,
-                BrokerAuditStatus::Denied,
+                AuditStatus::Denied,
                 Some(error.classification()),
                 0,
             )
@@ -928,7 +928,7 @@ async fn mirror(
             auditor,
             &request,
             Some(&original.canonical),
-            BrokerAuditStatus::Denied,
+            AuditStatus::Denied,
             Some(error.classification()),
             0,
         )
@@ -939,7 +939,7 @@ async fn mirror(
         auditor,
         &request,
         Some(&original.canonical),
-        BrokerAuditStatus::Allowed,
+        AuditStatus::Allowed,
         None,
         0,
     )
@@ -977,7 +977,7 @@ async fn mirror(
                 auditor,
                 &request,
                 None,
-                BrokerAuditStatus::Failed,
+                AuditStatus::Failed,
                 Some(error.classification()),
                 0,
             )
@@ -1006,7 +1006,7 @@ async fn mirror(
         auditor,
         &request,
         Some(&info.canonical_remote),
-        BrokerAuditStatus::Completed,
+        AuditStatus::Completed,
         None,
         bytes,
     )
@@ -1173,14 +1173,14 @@ async fn audit(
     auditor: &dyn BrokerAuditor,
     request: &RepoMirrorRequest,
     remote: Option<&str>,
-    status: BrokerAuditStatus,
+    status: AuditStatus,
     classification: Option<&str>,
     bytes: u64,
 ) -> Result<(), RepoMirrorError> {
     auditor
         .record_broker(BrokerAuditEvent {
             workspace_id: request.workspace_id.clone(),
-            kind: BrokerAuditKind::RepoMirror,
+            kind: AuditKind::RepoMirror,
             method: Some("GET".to_owned()),
             path: remote.map(str::to_owned),
             status,

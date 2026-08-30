@@ -53,28 +53,13 @@ impl fmt::Debug for GatewayHandle {
             .finish_non_exhaustive()
     }
 }
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum BrokerAuditKind {
-    RepoMirror,
-    Sim,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BrokerAuditStatus {
-    Allowed,
-    Denied,
-    Failed,
-    TimedOut,
-    Completed,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct BrokerAuditEvent {
     pub workspace_id: String,
-    pub kind: BrokerAuditKind,
+    pub kind: AuditKind,
     pub method: Option<String>,
     pub path: Option<String>,
-    pub status: BrokerAuditStatus,
+    pub status: AuditStatus,
     pub classification: Option<String>,
     pub bytes: u64,
 }
@@ -1510,27 +1495,16 @@ impl Actor {
             session.revision,
             session.endpoint_label.clone(),
         );
-        let kind = match event.kind {
-            BrokerAuditKind::RepoMirror => AuditKind::RepoMirror,
-            BrokerAuditKind::Sim => AuditKind::Sim,
-        };
-        let status = match event.status {
-            BrokerAuditStatus::Allowed => AuditStatus::Allowed,
-            BrokerAuditStatus::Denied => AuditStatus::Denied,
-            BrokerAuditStatus::Failed => AuditStatus::Failed,
-            BrokerAuditStatus::TimedOut => AuditStatus::TimedOut,
-            BrokerAuditStatus::Completed => AuditStatus::Completed,
-        };
         let draft = AuditDraft {
             workspace_id: event.workspace_id,
             repo_id,
             revision,
             endpoint,
-            kind,
+            kind: event.kind,
             host: None,
             method: event.method,
             path: event.path,
-            status,
+            status: event.status,
             http_status: None,
             bytes: event.bytes,
             trace_id: None,
