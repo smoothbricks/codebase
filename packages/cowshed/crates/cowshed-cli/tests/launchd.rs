@@ -6,10 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use cowshed_cli::launchd::{
-    COWSHED_BINARY_NAME, CommandOutput, CommandStatus, ControlAction, ControlExecutionError,
-    ControlPlan, ExecutableInstallState, ExecutableSource, ExistingPlist, FilesystemOperation,
-    GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
-    LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand, LaunchdError, LaunchdExecutor,
+    COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError, ControlPlan,
+    ExecutableInstallState, ExecutableSource, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
+    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LAUNCHCTL_EXECUTABLE,
+    LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdError, LaunchdExecutor,
     LaunchdFilesystem, LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE,
     PRIVATE_PLIST_MODE, ProcessType, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE,
     ServiceLifecycle, UnstableExecutableSource, classify_executable_source, containing_mount_point,
@@ -539,11 +539,11 @@ struct CommandInvocation {
 #[derive(Debug, Default)]
 struct FakeCommand {
     invocations: Vec<CommandInvocation>,
-    outputs: VecDeque<io::Result<CommandOutput>>,
+    outputs: VecDeque<io::Result<LaunchctlOutput>>,
 }
 
 impl FakeCommand {
-    fn with_outputs(outputs: impl IntoIterator<Item = io::Result<CommandOutput>>) -> Self {
+    fn with_outputs(outputs: impl IntoIterator<Item = io::Result<LaunchctlOutput>>) -> Self {
         Self {
             outputs: outputs.into_iter().collect(),
             ..Self::default()
@@ -552,7 +552,7 @@ impl FakeCommand {
 }
 
 impl LaunchctlCommand for FakeCommand {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<CommandOutput> {
+    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput> {
         self.invocations.push(CommandInvocation {
             executable: executable.to_path_buf(),
             arguments: arguments.to_vec(),
@@ -736,13 +736,13 @@ fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
         ControlPlan::kickstart(501, &spec),
     ];
     let outputs = [
-        Ok(CommandOutput {
+        Ok(LaunchctlOutput {
             status: CommandStatus::Success,
             stdout: b"bootstrapped".to_vec(),
             stderr: Vec::new(),
         }),
-        Ok(CommandOutput::success()),
-        Ok(CommandOutput::success()),
+        Ok(LaunchctlOutput::success()),
+        Ok(LaunchctlOutput::success()),
     ];
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
@@ -810,7 +810,7 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
     let plan = ControlPlan::kickstart(502, &spec);
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
-        FakeCommand::with_outputs([Ok(CommandOutput {
+        FakeCommand::with_outputs([Ok(LaunchctlOutput {
             status: CommandStatus::ExitCode(37),
             stdout: b"partial".to_vec(),
             stderr: b"service rejected".to_vec(),
@@ -845,7 +845,7 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
 
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
-        FakeCommand::with_outputs([Ok(CommandOutput {
+        FakeCommand::with_outputs([Ok(LaunchctlOutput {
             status: CommandStatus::Terminated,
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -868,12 +868,12 @@ fn print_status_uses_fixed_target_and_maps_loaded_and_absent_idempotently() {
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
         FakeCommand::with_outputs([
-            Ok(CommandOutput {
+            Ok(LaunchctlOutput {
                 status: CommandStatus::Success,
                 stdout: b"service = dev.cowshed.gateway".to_vec(),
                 stderr: Vec::new(),
             }),
-            Ok(CommandOutput {
+            Ok(LaunchctlOutput {
                 status: CommandStatus::ExitCode(113),
                 stdout: Vec::new(),
                 stderr: b"Could not find service".to_vec(),
@@ -920,7 +920,7 @@ fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
     let plan = ControlPlan::print(504, &spec);
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
-        FakeCommand::with_outputs([Ok(CommandOutput {
+        FakeCommand::with_outputs([Ok(LaunchctlOutput {
             status: CommandStatus::Terminated,
             stdout: Vec::new(),
             stderr: b"terminated".to_vec(),
