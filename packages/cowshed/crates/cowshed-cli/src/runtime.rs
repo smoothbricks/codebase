@@ -300,28 +300,34 @@ impl ActorBridge {
     }
 }
 
-async fn adopted_projects() -> Result<Vec<AdoptedProject>> {
+async fn host_storage() -> Result<ValidatedHostStorage> {
     let home = gateway_service::canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
-    NativeGatewayInventory::new(storage)
+    validate_existing_host_storage(&home).await
+}
+
+async fn host_inventory() -> Result<NativeGatewayInventory> {
+    Ok(NativeGatewayInventory::new(host_storage().await?))
+}
+
+async fn adopted_projects() -> Result<Vec<AdoptedProject>> {
+    host_inventory()
+        .await?
         .adopted_projects()
         .await
         .map_err(project_inventory_error)
 }
 
 async fn doctor_projects() -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>)> {
-    let home = gateway_service::canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
-    NativeGatewayInventory::new(storage)
+    host_inventory()
+        .await?
         .doctor_projects()
         .await
         .map_err(project_inventory_error)
 }
 
 async fn list_all_adopted_projects() -> Result<Vec<ProjectWorkspaces>> {
-    let home = gateway_service::canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
-    NativeGatewayInventory::new(storage)
+    host_inventory()
+        .await?
         .all_projects()
         .await
         .map_err(project_inventory_error)
@@ -809,16 +815,11 @@ where
         Command::List(args) => {
             if args.all {
                 let mut projects = service.list_all().await?;
-                projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
-                for project in &mut projects {
-                    project
-                        .workspaces
-                        .sort_by(|left, right| left.workspace.cmp(&right.workspace));
-                }
+                sort_project_listing(&mut projects);
                 emit_project_listing(output, json, args, projects).await?;
             } else {
                 let mut workspaces = service.list().await?;
-                workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+                sort_workspace_listing(&mut workspaces);
                 let empty = workspaces.is_empty();
                 emit_workspace_listing(output, json, args, None, workspaces).await?;
                 if empty {
@@ -1496,8 +1497,7 @@ async fn attach_scoped_sessions(
 }
 
 async fn attach_store_wide(browse: bool) -> Result<Vec<WorkspaceInfo>> {
-    let home = gateway_service::canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
+    let storage = host_storage().await?;
     let projects = NativeGatewayInventory::new(storage.clone())
         .adopted_projects()
         .await
@@ -1642,8 +1642,7 @@ async fn detach_scoped_sessions(service: &mut dyn CliService) -> Result<()> {
 }
 
 async fn detach_store_wide() -> Result<()> {
-    let home = gateway_service::canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
+    let storage = host_storage().await?;
     let projects = NativeGatewayInventory::new(storage.clone())
         .adopted_projects()
         .await
@@ -1907,8 +1906,7 @@ async fn resolve_detach_root(cli: &Cli) -> Result<PathBuf> {
             "cowshed detach <ws>; cowshed detach --all",
         )
     })?;
-    let home = gateway_service::canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
+    let storage = host_storage().await?;
     resolve_session_project_root(storage.store(), workspace)
 }
 
@@ -1974,6 +1972,17 @@ const LANDING_TARGET_BRANCH: &str = cowshed_core::runtime::project::DEFAULT_LAND
 /// nobody measured would filter on nothing.
 const fn landing_requested(args: crate::args::ListArgs) -> bool {
     args.landing || args.landed
+}
+
+fn sort_workspace_listing(workspaces: &mut [WorkspaceInfo]) {
+    workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+}
+
+fn sort_project_listing(projects: &mut [ProjectWorkspaces]) {
+    projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+    for project in projects {
+        sort_workspace_listing(&mut project.workspaces);
+    }
 }
 
 async fn emit_project_listing<W: Write, E: Write>(
@@ -2910,12 +2919,7 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
 }
 
 fn doctor_report(findings: Vec<Finding>) -> DoctorReport {
-    DoctorReport {
-        healthy: !findings
-            .iter()
-            .any(|finding| finding.severity == FindingSeverity::Error),
-        findings,
-    }
+    DoctorReport::from_findings(findings)
 }
 
 fn record_project_checks_skipped<W: Write, E: Write>(
@@ -3205,12 +3209,7 @@ where
         }
         Command::List(args) => {
             let mut projects = list_all_adopted_projects().await?;
-            projects.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
-            for project in &mut projects {
-                project
-                    .workspaces
-                    .sort_by(|left, right| left.workspace.cmp(&right.workspace));
-            }
+            sort_project_listing(&mut projects);
             emit_project_listing(output, cli.global.json, args, projects).await?;
             Ok(success())
         }
