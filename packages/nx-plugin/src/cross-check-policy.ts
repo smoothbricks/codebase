@@ -49,6 +49,15 @@ export function withProjectCargoHome(homeRel: string, command: string): string {
 }
 
 /**
+ * `--frozen` is cargo's `--locked` + `--offline`. Cargo.lock and the registry
+ * cache are inputs: inferred cargo must not rewrite the lockfile or fetch.
+ * The flag sits on `cargo` so nextest sees a cargo-level option, not its own.
+ */
+export function cargoFrozen(args: string): string {
+  return `cargo --frozen ${args}`;
+}
+
+/**
  * Clippy rather than `cargo check`, and `-D warnings`, because that is exactly
  * what CI's `lint` runs; a weaker local command would pass where CI fails.
  *
@@ -69,16 +78,19 @@ export function withProjectCargoHome(homeRel: string, command: string): string {
  * `CARGO_HOME` is per-project (`$PWD/target/cargo-lint-cross-home`). Cargo's
  * package-cache flock lives in CARGO_HOME; three workspaces otherwise serialize
  * on `~/.cargo/.package-cache` even with distinct `--target-dir`. Registry and
- * git are linked to the host home so crates are not re-fetched.
+ * git are linked to the host home so crates are not re-fetched. `--frozen`
+ * keeps that shared registry read-only: lockfile and cache are inputs.
  */
 export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${withProjectCargoHome(
   'target/cargo-lint-cross-home',
-  `cargo clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`,
+  cargoFrozen(
+    `clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`,
+  ),
 )}`;
 
 export const CARGO_LINT_CLIPPY_COMMAND = withProjectCargoHome(
   'target/cargo-lint-home',
-  'cargo clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
+  cargoFrozen('clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings'),
 );
 
 /** Root `package.json` script name, in the repo's `verb:qualifier` style. */
