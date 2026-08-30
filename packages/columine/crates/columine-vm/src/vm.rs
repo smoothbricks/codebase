@@ -31,9 +31,9 @@ use crate::undo_log::{
 };
 use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
-    ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
-    PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC,
-    SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
+    AggType, ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
+    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE,
+    STATE_MAGIC, SlotMetaOffset, SlotType, StateHeaderOffset, StructFieldType, TOMBSTONE, align8,
     struct_field_size,
 };
 use core::sync::atomic::Ordering;
@@ -2352,7 +2352,15 @@ fn exec_scalar_latest(
     let meta = SlotMetaView::read(state, slot);
     let data = meta.offset;
     let scalar_type = meta.agg_type_byte(state);
-    if meta.slot_type() != SlotType::Scalar || !matches!(scalar_type, 8..=10) {
+    let Some(kind) = AggType::from_u8(scalar_type) else {
+        return ErrorCode::InvalidProgram;
+    };
+    if meta.slot_type() != SlotType::Scalar
+        || !matches!(
+            kind,
+            AggType::ScalarU32 | AggType::ScalarF64 | AggType::ScalarI64
+        )
+    {
         return ErrorCode::InvalidProgram;
     }
     // Every arm indexes val/cmp/type data with row indices up to batch_len;
@@ -2369,11 +2377,9 @@ fn exec_scalar_latest(
     let prev_value = bytes::read_u64(state, data);
     let prev_ts = bytes::read_f64(state, data + 8);
 
-    // Scalar discriminants are SCALAR_U32 = 8, SCALAR_F64 = 9, and
-    // SCALAR_I64 = 10; 6–7 are reserved.
     let matches = |i: usize| type_mask.is_none_or(|(td, id)| td[i] == id);
-    match scalar_type {
-        8 => {
+    match kind {
+        AggType::ScalarU32 => {
             let Some(vals) = col_u32_exact(val_col, batch_len) else {
                 return ErrorCode::ColumnUnderrun;
             };
@@ -2386,7 +2392,7 @@ fn exec_scalar_latest(
                 }
             }
         }
-        9 => {
+        AggType::ScalarF64 => {
             let Some(vals) = col_f64_exact(val_col, batch_len) else {
                 return ErrorCode::ColumnUnderrun;
             };
@@ -2399,7 +2405,7 @@ fn exec_scalar_latest(
                 }
             }
         }
-        10 => {
+        AggType::ScalarI64 => {
             let Some(vals) = col_i64_exact(val_col, batch_len) else {
                 return ErrorCode::ColumnUnderrun;
             };
@@ -2412,7 +2418,7 @@ fn exec_scalar_latest(
                 }
             }
         }
-        _ => unreachable!("scalar subtype validated before execution"),
+        _ => return ErrorCode::InvalidProgram,
     }
 
     if undo.enabled {
@@ -2579,7 +2585,15 @@ fn validate_body(state: &[u8], body: &[u8]) -> bool {
             }
             let meta = SlotMetaView::read(state, slot);
             let scalar_type = meta.agg_type_byte(state);
-            if meta.slot_type() != SlotType::Scalar || !matches!(scalar_type, 8..=10) {
+            let Some(kind) = AggType::from_u8(scalar_type) else {
+                return false;
+            };
+            if meta.slot_type() != SlotType::Scalar
+                || !matches!(
+                    kind,
+                    AggType::ScalarU32 | AggType::ScalarF64 | AggType::ScalarI64
+                )
+            {
                 return false;
             }
         }
