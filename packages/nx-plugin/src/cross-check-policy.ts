@@ -56,7 +56,7 @@ export const CARGO_CROSS_LINT_TARGET = 'cargo-lint-cross';
  * `cargo fmt` is absent on purpose: formatting is target-independent and already
  * covered by `cargo-lint`, so repeating it here would only cost time.
  */
-export const CARGO_CROSS_LINT_COMMAND = `cargo clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} -- -D warnings`;
+export const CARGO_CROSS_LINT_COMMAND = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ "$(uname -s)" = Linux ] || { echo 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux' >&2; exit 2; }; cargo clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} -- -D warnings`;
 
 /** Root `package.json` script name, in the repo's `verb:qualifier` style. */
 export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';
