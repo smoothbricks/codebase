@@ -39,6 +39,28 @@ pub const ZFS_STORE_CHILD: &str = "store";
 pub const ZFS_CACHES_CHILD: &str = "caches";
 pub const ZFS_PROJECTS_CHILD: &str = "projects";
 
+/// The store-root names cowshed owns, so no walker mistakes one for a repository owner.
+///
+/// The store root is a mount point whose children are `<owner>/` project namespaces plus the
+/// controller's own directories. Every enumeration has to skip the same set, and a walker holding
+/// a shorter list reports a controller directory as an owner and then invents repositories under
+/// it. Dotted names are reserved wholesale rather than listed: that covers the volume marker,
+/// macOS's per-volume system directories (`.fseventsd`, `.Spotlight-V100`, `.Trashes`), and the
+/// `.staging`/`.trash` object namespaces, none of which a name list could keep up with.
+pub const RESERVED_STORE_NAMESPACES: &[&str] = &[
+    "caches",
+    "gateway",
+    "mnt",
+    "quarantine",
+    "run",
+    "telemetry",
+    "tmp",
+];
+
+pub fn is_reserved_store_namespace(name: &str) -> bool {
+    name.starts_with('.') || RESERVED_STORE_NAMESPACES.contains(&name)
+}
+
 pub(crate) use crate::device::DISKUTIL;
 const ZFS: &str = "/usr/sbin/zfs";
 const MARKER_VERSION: u32 = 1;
@@ -1791,4 +1813,32 @@ pub enum BootstrapExecutionError {
     CreatedVolumeOutput(String),
     #[error("new APFS volume failed exact diskutil info attestation: {0}")]
     CreatedVolumeAttestation(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VOLUME_MARKER_FILE, is_reserved_store_namespace};
+
+    /// One grammar for every store-root walker. `cache` and `temp` are the near-misses that have
+    /// to stay usable as repository owners, and the empty name is not a namespace at all.
+    #[test]
+    fn reserved_store_namespaces_share_one_complete_grammar() {
+        for name in [
+            "caches",
+            "telemetry",
+            "gateway",
+            "mnt",
+            "run",
+            "tmp",
+            "quarantine",
+            VOLUME_MARKER_FILE,
+            ".staging",
+            ".trash",
+        ] {
+            assert!(is_reserved_store_namespace(name), "{name}");
+        }
+        for name in ["acme", "widget", "cache", "temp", ""] {
+            assert!(!is_reserved_store_namespace(name), "{name}");
+        }
+    }
 }

@@ -986,20 +986,6 @@ impl NativeGatewayInventory {
     }
 }
 
-const RESERVED_STORE_NAMESPACES: &[&str] = &[
-    "caches",
-    "telemetry",
-    "gateway",
-    "mnt",
-    "run",
-    "tmp",
-    "quarantine",
-];
-
-fn is_reserved_store_namespace(name: &str) -> bool {
-    name.starts_with('.') || RESERVED_STORE_NAMESPACES.contains(&name)
-}
-
 /// Is this store entry something other than a project namespace?
 ///
 /// Three kinds of neighbour share the store root with `<owner>/<repo>` projects and none of them is
@@ -1010,7 +996,7 @@ fn is_reserved_store_namespace(name: &str) -> bool {
 /// it *is* rather than by what it is called — a name list cannot keep up with a mountpoint the user
 /// relocates, and being wrong here costs the whole inventory.
 fn is_not_a_project_namespace(path: &Path, name: &str) -> bool {
-    is_reserved_store_namespace(name)
+    crate::storage::bootstrap::is_reserved_store_namespace(name)
         || fs::symlink_metadata(path.join(crate::storage::bootstrap::VOLUME_MARKER_FILE)).is_ok()
 }
 
@@ -1904,7 +1890,7 @@ mod tests {
                 },
             );
         }
-        for namespace in RESERVED_STORE_NAMESPACES {
+        for namespace in crate::storage::bootstrap::RESERVED_STORE_NAMESPACES {
             let collision = fixture.storage.store().join(namespace).join("system-owned");
             fs::create_dir_all(&collision).expect("reserved namespace fixture");
             fs::write(
