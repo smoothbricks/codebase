@@ -27,7 +27,7 @@ use crate::metadata::{
     Platform, PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker,
     WorkspaceName, WorkspaceRole, sidecar_path,
 };
-use crate::repository::RepoId;
+use crate::repository::{CHECKPOINTS_DIRECTORY, RepoId, SESSIONS_DIRECTORY};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
@@ -924,7 +924,7 @@ fn collect_restore_sidecars(
     project: &Path,
     sidecars: &mut Vec<PathBuf>,
 ) -> Result<(), ApfsStorageError> {
-    for workspace in directory_children(&project.join("checkpoints"))? {
+    for workspace in directory_children(&project.join(CHECKPOINTS_DIRECTORY))? {
         for entry in fs::read_dir(&workspace)
             .map_err(|error| io_error("enumerate restore sidecars", &workspace, error))?
         {
@@ -1687,7 +1687,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             project.join(format!("main.{}", format.extension()))
         } else {
             project
-                .join("sessions")
+                .join(SESSIONS_DIRECTORY)
                 .join(format!("{workspace}.{}", format.extension()))
         };
         let mut lock: OsString = image.as_os_str().to_owned();
@@ -1736,8 +1736,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let workspace = metadata_workspace_ref(&metadata)?;
         // `format` is the enumeration's observed on-disk format, deliberately not the metadata's:
         // the check is that the found file sits exactly where its own format says it should.
-        let expected_trash =
-            retired_image_below(project, workspace.name(), workspace.incarnation(), format);
+        let expected_trash = retired_image_below(
+            &project.join(SESSIONS_DIRECTORY),
+            workspace.name(),
+            workspace.incarnation(),
+            format,
+        );
         if trash_image != expected_trash {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "retired metadata disagrees with trash path {}",
@@ -1776,7 +1780,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         retired: &RetiredRef,
     ) -> Result<RetiredCheckpointArtifacts, ApfsStorageError> {
         let directory = project
-            .join("checkpoints")
+            .join(CHECKPOINTS_DIRECTORY)
             .join(retired.workspace().name().as_str());
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries
@@ -1970,7 +1974,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         // Recomputed per entry instead of carried in the plan, because `reclaim_retired` runs this
         // with no plan at all. A scope only ever widens as siblings are collected, so an entry that
         // runs after its name's owner converges on the same already-removed shared paths.
-        let trash = project.join("sessions").join(super::TRASH_NAMESPACE);
+        let trash = project
+            .join(SESSIONS_DIRECTORY)
+            .join(super::TRASH_NAMESPACE);
         let owners = retired_name_owners(&self.retired_trash_images(&trash)?);
         let scope = self.retired_name_scope(
             authority.workspace(),
@@ -1982,7 +1988,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         if scope == NameScope::Owned {
             let checkpoint_directory = project
-                .join("checkpoints")
+                .join(CHECKPOINTS_DIRECTORY)
                 .join(authority.workspace().name().as_str());
             match fs::remove_dir(&checkpoint_directory) {
                 Ok(()) => sync_parent_path(&checkpoint_directory)?,
@@ -2041,7 +2047,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     where
         R: CommandRunner + Send + Sync + 'static,
     {
-        let sessions = project.join("sessions");
+        let sessions = project.join(SESSIONS_DIRECTORY);
         let session_entries = match fs::read_dir(&sessions) {
             Ok(entries) => entries
                 .map(|entry| {
@@ -2148,7 +2154,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             )?);
         }
 
-        let checkpoint_root = project.join("checkpoints");
+        let checkpoint_root = project.join(CHECKPOINTS_DIRECTORY);
         for workspace_directory in directory_children(&checkpoint_root)? {
             let workspace_name = workspace_directory
                 .file_name()
@@ -3900,7 +3906,7 @@ where
             .project_root
             .clone();
         let trash = retired_image_below(
-            &project,
+            &project.join(SESSIONS_DIRECTORY),
             retired.workspace().name(),
             retired.workspace().incarnation(),
             retired.workspace().format(),
@@ -4077,7 +4083,8 @@ where
         held_locks: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
         for project in collect_project_directories(&config.store_root)? {
-            for directory in [project.as_path(), project.join("sessions").as_path()] {
+            let sessions = project.join(SESSIONS_DIRECTORY);
+            for directory in [project.as_path(), sessions.as_path()] {
                 for canonical_sidecar in regular_file_children(directory)? {
                     if !canonical_sidecar
                         .file_name()
