@@ -417,7 +417,9 @@ fn startup_conflict_exhausted(conflict: &crate::storage::lifecycle::Conflict) ->
 
     let changing_fact = match conflict {
         Conflict::FactCount { expected, actual } => {
-            format!("authoritative fact count kept changing (last expected {expected}, actual {actual})")
+            format!(
+                "authoritative fact count kept changing (last expected {expected}, actual {actual})"
+            )
         }
         Conflict::Stale { index, .. } => format!("authoritative fact {index} kept changing"),
     };
