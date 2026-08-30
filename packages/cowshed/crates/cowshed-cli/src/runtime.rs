@@ -1420,6 +1420,27 @@ fn emit_mount<W: Write, E: Write>(
     }
 }
 
+/// Say out loud which projects the gateway was not told about, without failing the command.
+///
+/// The mounts happened; the daemon's view of them did not. A caller who does not hear this
+/// believes the gateway can see workspaces it cannot, which is the failure mode that made this
+/// worth reporting rather than swallowing.
+fn report_stale_gateway_views<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    stale: &[(RepoId, CowshedError)],
+) -> Result<()> {
+    for (repo_id, error) in stale {
+        output
+            .guidance(&format!(
+                "{repo_id}: mounts changed, but the gateway was not told: {}",
+                error.message
+            ))
+            .map_err(output_error)?;
+        output.hint(&error.hint).map_err(output_error)?;
+    }
+    Ok(())
+}
+
 fn emit_attached<W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
@@ -1496,20 +1517,53 @@ async fn attach_scoped_sessions(
     Ok(attached)
 }
 
-async fn attach_store_wide(browse: bool) -> Result<Vec<WorkspaceInfo>> {
+/// What a store-wide mount change did, and which projects the gateway was not told about.
+///
+/// The mounts have already happened by the time this is built, so a gateway that does not answer
+/// cannot turn the command into a failure — reporting one for work that completed teaches the
+/// caller to retry an idempotent operation forever. It cannot be silence either: the daemon's view
+/// of those sessions is stale until something reconciles it, and this is the only place that knows.
+struct StoreWideMounts<T> {
+    result: T,
+    stale: Vec<(RepoId, CowshedError)>,
+}
+
+/// Tell the gateway that a project's session mounts changed, keeping any refusal as a value.
+///
+/// Project-scoped attach reaches this through `ActorBridge::reconcile_gateway`; the store-wide
+/// arms never enter that path, which is why they call it here. Without it a host-wide attach
+/// mounts volumes the daemon does not know exist until the next project-scoped exec.
+async fn reconcile_after_mount_change(repo_id: &RepoId) -> Option<CowshedError> {
+    gateway_service::reconcile_native_project(repo_id)
+        .await
+        .err()
+}
+
+async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<WorkspaceInfo>>> {
     let storage = host_storage().await?;
     let projects = NativeGatewayInventory::new(storage.clone())
         .adopted_projects()
         .await
         .map_err(project_inventory_error)?;
     let mut attached = Vec::new();
+    let mut stale = Vec::new();
     for project in &projects {
-        attached.extend(attach_project_sessions_from_store(&storage, project, browse).await?);
+        let mounted = attach_project_sessions_from_store(&storage, project, browse).await?;
+        if mounted.is_empty() {
+            continue;
+        }
+        attached.extend(mounted);
+        if let Some(error) = reconcile_after_mount_change(&project.repo_id).await {
+            stale.push((project.repo_id.clone(), error));
+        }
     }
     if attached.is_empty() {
         return Err(no_detached_sessions());
     }
-    Ok(attached)
+    Ok(StoreWideMounts {
+        result: attached,
+        stale,
+    })
 }
 
 /// Attach a project's detached sessions from store metadata and APFS facts alone.
@@ -1641,20 +1695,28 @@ async fn detach_scoped_sessions(service: &mut dyn CliService) -> Result<()> {
     Ok(())
 }
 
-async fn detach_store_wide() -> Result<()> {
+async fn detach_store_wide() -> Result<StoreWideMounts<()>> {
     let storage = host_storage().await?;
     let projects = NativeGatewayInventory::new(storage.clone())
         .adopted_projects()
         .await
         .map_err(project_inventory_error)?;
     let mut detached = 0usize;
+    let mut stale = Vec::new();
     for project in &projects {
-        detached += detach_project_sessions_from_store(&storage, project).await?;
+        let unmounted = detach_project_sessions_from_store(&storage, project).await?;
+        if unmounted == 0 {
+            continue;
+        }
+        detached += unmounted;
+        if let Some(error) = reconcile_after_mount_change(&project.repo_id).await {
+            stale.push((project.repo_id.clone(), error));
+        }
     }
     if detached == 0 {
         return Err(no_attached_sessions());
     }
-    Ok(())
+    Ok(StoreWideMounts { result: (), stale })
 }
 
 /// Detach a project's mounted sessions from store metadata and kernel mount facts alone.
@@ -3196,15 +3258,17 @@ where
 {
     match cli.command {
         Command::Attach(args) if args.all && args.workspace.is_none() => {
-            let infos = attach_store_wide(args.browse).await?;
-            emit_attached(output, cli.global.json, &infos)?;
+            let mounts = attach_store_wide(args.browse).await?;
+            emit_attached(output, cli.global.json, &mounts.result)?;
+            report_stale_gateway_views(output, &mounts.stale)?;
             Ok(success())
         }
         Command::Detach(args) if args.all && args.workspace.is_none() => {
-            detach_store_wide().await?;
+            let mounts = detach_store_wide().await?;
             if cli.global.json {
                 output.success(EmptyResult {}).map_err(output_error)?;
             }
+            report_stale_gateway_views(output, &mounts.stale)?;
             Ok(success())
         }
         Command::List(args) => {
@@ -3274,6 +3338,48 @@ mod tests {
             cli_stdin_spelling(&CoreStdinSource::Inline(bytes::Bytes::new())),
             "--stdin-base64"
         );
+    }
+
+    /// A store-wide mount change that could not reach the gateway is said out loud, on stderr,
+    /// naming the project and carrying the recovery — and it does not fail the command, because
+    /// the mounts happened.
+    ///
+    /// Silence here is the bug the audit found: `attach --all` and `detach --all` never called
+    /// `reconcile_native_project` at all, so the daemon's view stayed stale until the next
+    /// project-scoped exec and nobody was told.
+    #[test]
+    fn a_gateway_that_could_not_be_told_is_named_without_failing_the_mount() {
+        let repo_id = RepoId::parse("acme/widget").expect("repo identity");
+        let refusal = CowshedError::environment_missing(
+            "gateway control socket does not answer",
+            "cowshed gateway start",
+        );
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+
+        report_stale_gateway_views(&mut output, &[(repo_id, refusal)])
+            .expect("reporting a stale view is not itself a failure");
+
+        let (stdout, stderr) = output.into_inner();
+        assert!(stdout.is_empty(), "the JSON channel stays clean");
+        let stderr = String::from_utf8(stderr).expect("utf-8 guidance");
+        assert!(
+            stderr.contains("acme/widget"),
+            "the project whose mounts moved has to be named: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("the gateway was not told"),
+            "the operator has to learn the daemon's view is stale: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("cowshed gateway start"),
+            "and what to run about it: {stderr:?}"
+        );
+
+        // Nothing to report is nothing written.
+        let mut quiet = Output::new(Vec::new(), Vec::new(), false);
+        report_stale_gateway_views(&mut quiet, &[]).expect("no stale views");
+        let (stdout, stderr) = quiet.into_inner();
+        assert!(stdout.is_empty() && stderr.is_empty());
     }
 
     #[derive(Clone, Default)]
