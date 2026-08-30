@@ -791,6 +791,8 @@ impl SlotMeta {
 pub unsafe fn get_slot_meta(state_base: *mut u8, slot: u8) -> SlotMeta {
     let meta_offset = STATE_HEADER_SIZE as usize + usize::from(slot) * SLOT_META_SIZE as usize;
     let meta_bytes = unsafe { state_base.add(meta_offset) };
+    let read_u32 =
+        |off: u32| unsafe { meta_bytes.add(off as usize).cast::<u32>().read_unaligned() };
     let type_flags =
         SlotTypeFlags::from_byte(unsafe { *meta_bytes.add(SlotMetaOffset::TYPE_FLAGS as usize) });
     let slot_type = type_flags
@@ -798,7 +800,8 @@ pub unsafe fn get_slot_meta(state_base: *mut u8, slot: u8) -> SlotMeta {
         .unwrap_or_else(|| crate::die!("invariant: slot metadata contains an invalid slot type"));
     let agg_byte = unsafe { *meta_bytes.add(SlotMetaOffset::AGG_TYPE as usize) };
     let agg_type = if matches!(slot_type, SlotType::Aggregate | SlotType::Scalar) {
-        AggType::from_u8(agg_byte).unwrap_or(AggType::Sum)
+        AggType::from_u8(agg_byte)
+            .unwrap_or_else(|| crate::die!("invariant: slot metadata contains an invalid agg type"))
     } else {
         AggType::Sum
     };
@@ -809,8 +812,8 @@ pub unsafe fn get_slot_meta(state_base: *mut u8, slot: u8) -> SlotMeta {
             });
 
     SlotMeta {
-        offset: unsafe { meta_bytes.cast::<u32>().read_unaligned() },
-        capacity: unsafe { meta_bytes.add(4).cast::<u32>().read_unaligned() },
+        offset: read_u32(SlotMetaOffset::OFFSET),
+        capacity: read_u32(SlotMetaOffset::CAPACITY),
         size_ptr: unsafe { meta_bytes.add(SlotMetaOffset::SIZE as usize).cast() },
         type_flags,
         agg_type,
@@ -831,14 +834,14 @@ pub unsafe fn get_slot_meta(state_base: *mut u8, slot: u8) -> SlotMeta {
                 .read_unaligned()
         },
         start_of,
-        eviction_index_offset: unsafe { meta_bytes.add(24).cast::<u32>().read_unaligned() },
-        eviction_index_capacity: unsafe { meta_bytes.add(28).cast::<u32>().read_unaligned() },
+        eviction_index_offset: read_u32(SlotMetaOffset::EVICTION_INDEX_OFFSET),
+        eviction_index_capacity: read_u32(SlotMetaOffset::EVICTION_INDEX_CAPACITY),
         eviction_index_size_ptr: unsafe {
             meta_bytes
                 .add(SlotMetaOffset::EVICTION_INDEX_SIZE as usize)
                 .cast()
         },
-        evicted_buffer_offset: unsafe { meta_bytes.add(36).cast::<u32>().read_unaligned() },
+        evicted_buffer_offset: read_u32(SlotMetaOffset::EVICTED_BUFFER_OFFSET),
         evicted_count_ptr: unsafe {
             meta_bytes
                 .add(SlotMetaOffset::EVICTED_COUNT as usize)
@@ -1035,6 +1038,32 @@ mod tests {
         assert_eq!(offset_of!(EvictionEntry, timestamp), 0);
         assert_eq!(offset_of!(EvictionEntry, key_or_idx), 8);
         assert_eq!(offset_of!(EvictionEntry, value), 12);
+    }
+
+    #[test]
+    fn get_slot_meta_reads_through_named_offsets() {
+        let mut state = vec![0u8; (STATE_HEADER_SIZE + SLOT_META_SIZE) as usize];
+        let meta = STATE_HEADER_SIZE as usize;
+        let write_u32 = |buf: &mut [u8], off: u32, value: u32| {
+            let start = meta + off as usize;
+            buf[start..start + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        state[meta + SlotMetaOffset::TYPE_FLAGS as usize] = SlotType::HashMap as u8;
+        state[meta + SlotMetaOffset::START_OF as usize] = DurationUnit::None as u8;
+        write_u32(&mut state, SlotMetaOffset::OFFSET, 7);
+        write_u32(&mut state, SlotMetaOffset::CAPACITY, 42);
+        write_u32(&mut state, SlotMetaOffset::EVICTION_INDEX_OFFSET, 100);
+        write_u32(&mut state, SlotMetaOffset::EVICTION_INDEX_CAPACITY, 200);
+        write_u32(&mut state, SlotMetaOffset::EVICTED_BUFFER_OFFSET, 300);
+        let slot = unsafe { get_slot_meta(state.as_mut_ptr(), 0) };
+        assert_eq!(slot.offset, 7);
+        assert_eq!(slot.capacity, 42);
+        assert_eq!(slot.eviction_index_offset, 100);
+        assert_eq!(slot.eviction_index_capacity, 200);
+        assert_eq!(slot.evicted_buffer_offset, 300);
+        assert_eq!(slot.slot_type(), SlotType::HashMap);
+        assert_eq!(slot.agg_type, AggType::Sum);
+        assert_eq!(slot.start_of, DurationUnit::None);
     }
 
     #[test]
