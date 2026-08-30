@@ -32,8 +32,8 @@ use cowshed_core::sandbox::sccache_cache_directory;
 use cowshed_core::storage::bootstrap::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
     HostUninstallPlan, UninstallFstabOutcome, UninstallReport, UninstallServiceOutcome,
-    VolumeOutcome, VolumeRole, VolumeState, execute_host_setup, execute_host_uninstall,
-    plan_host_setup, plan_host_uninstall,
+    VolumeOutcome, VolumeState, execute_host_setup, execute_host_uninstall, plan_host_setup,
+    plan_host_uninstall,
 };
 use cowshed_core::storage::host_config::{
     AttachedWorkspace, HostConfigError, execute_mount_root_change, plan_mount_root_change,
@@ -979,18 +979,10 @@ fn volume_row(volume: &VolumeOutcome) -> String {
     format!(
         "{} ({}): {} -> {}",
         volume.name,
-        role_word(volume.role),
+        volume.role,
         state_phrase(&volume.state_before),
         volume.action
     )
-}
-
-const fn role_word(role: VolumeRole) -> &'static str {
-    match role {
-        VolumeRole::Store => "store",
-        VolumeRole::Caches => "caches",
-        VolumeRole::Projects => "projects",
-    }
 }
 
 /// The observed state, in words, with no default branch: a state core adds is a state that stops

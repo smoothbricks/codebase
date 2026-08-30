@@ -392,7 +392,7 @@ impl UsageError {
     }
 
     pub const fn exit_code(&self) -> i32 {
-        2
+        cowshed_core::ErrorCode::Usage.exit_code() as i32
     }
 
     pub fn command_map(&self) -> Option<&'static str> {

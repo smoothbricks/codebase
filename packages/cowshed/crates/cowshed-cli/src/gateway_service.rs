@@ -1,6 +1,6 @@
 use crate::args::GatewayCommand;
 use crate::launchd::{
-    COWSHED_BINARY_NAME, ExecutableInstallState, ExecutableSource, ExistingPlist,
+    COWSHED_BINARY_NAME, ExecutableInstallState, ExecutableSource, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
     NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE, classify_executable_source,
@@ -926,7 +926,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 /// Restarting an already-installed agent, for guidance that follows a
 /// successful install.
 fn kickstart_hint(uid: u32) -> String {
-    format!("launchctl kickstart -k gui/{uid}/dev.cowshed.gateway")
+    format!("launchctl kickstart -k gui/{uid}/{GATEWAY_LABEL}")
 }
 
 pub(crate) fn launchd_error(error: impl std::fmt::Display) -> CowshedError {
