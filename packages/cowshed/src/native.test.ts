@@ -15,6 +15,11 @@ import {
   openProject,
 } from '../dist/ts/index.js';
 
+/**
+ * The oracle is the `ErrorCode` plus a non-empty hint, not the rendered English. `code` is core's
+ * taxonomy and `hint` is a real property the addon sets, so both are contract; message copy is
+ * not, and asserting substrings of it only pins wording.
+ */
 function requireCowshedError(error: unknown, code: ErrorCode): CowshedError {
   expect(error).toBeInstanceOf(CowshedError);
   if (!(error instanceof CowshedError)) {
@@ -47,16 +52,14 @@ describe('Cowshed Node-API bindings', () => {
         await openProject(endpoint, root);
         throw new Error('expected a regular-file endpoint to fail the controller handshake');
       } catch (error) {
-        const handshake = requireCowshedError(error, 'environment-missing');
-        expect(handshake.message).toContain('not a stream socket');
+        requireCowshedError(error, 'environment-missing');
       }
 
       try {
         await openProject(endpoint, root);
         throw new Error('expected a consumed endpoint to reject reuse');
       } catch (error) {
-        const consumed = requireCowshedError(error, 'conflict');
-        expect(consumed.message).toContain('already been consumed');
+        requireCowshedError(error, 'conflict');
       }
 
       const coordinatorEndpointValue = coordinatorEndpoint(openSync(path, 'r'));
@@ -64,8 +67,7 @@ describe('Cowshed Node-API bindings', () => {
         await connectCoordinator(coordinatorEndpointValue, root);
         throw new Error('expected a regular-file endpoint to fail the coordinator handshake');
       } catch (error) {
-        const handshake = requireCowshedError(error, 'environment-missing');
-        expect(handshake.message).toContain('not a stream socket');
+        requireCowshedError(error, 'environment-missing');
       }
     } finally {
       await rm(root, { recursive: true, force: true });

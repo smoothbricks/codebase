@@ -119,17 +119,14 @@ describe('napi wire contract', () => {
 
       for (const [caseName, document] of Object.entries(cases)) {
         it(`accepts the ${caseName} document and nothing wider`, () => {
-          if (caseName === LIST_CASE) {
-            const assertMany = seam.assertMany;
-            const parseMany = seam.parseMany;
-            expect(assertMany).toBeDefined();
-            expect(parseMany).toBeDefined();
-            expect(assertMany?.(document)).toEqual(document);
-            expect(parseMany?.(JSON.stringify(document))).toEqual(document);
-            return;
+          const assertValue = caseName === LIST_CASE ? seam.assertMany : seam.assertOne;
+          const parseValue = caseName === LIST_CASE ? seam.parseMany : seam.parseOne;
+          if (assertValue === undefined || parseValue === undefined) {
+            throw new Error(`${name} has a ${caseName} document but no matching validator`);
           }
-          expect(seam.assertOne(document)).toEqual(document);
-          expect(seam.parseOne(JSON.stringify(document))).toEqual(document);
+
+          expect(assertValue(document)).toEqual(document);
+          expect(parseValue(JSON.stringify(document))).toEqual(document);
         });
       }
     });
