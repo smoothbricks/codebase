@@ -419,22 +419,42 @@ pub enum Mutation {
     },
 }
 
+fn plan_private_directory(path: &Path, mode: Option<u32>) -> Option<Mutation> {
+    match mode {
+        None => Some(Mutation::EnsureDirectory {
+            path: path.to_path_buf(),
+            mode: PRIVATE_DIRECTORY_MODE,
+        }),
+        Some(mode) if mode != PRIVATE_DIRECTORY_MODE => Some(Mutation::SetPermissions {
+            path: path.to_path_buf(),
+            mode: PRIVATE_DIRECTORY_MODE,
+        }),
+        Some(_) => None,
+    }
+}
+
+fn plan_remove_file(path: &Path, directory: &Path, installed: bool) -> Vec<Mutation> {
+    if installed {
+        vec![
+            Mutation::RemoveFile {
+                path: path.to_path_buf(),
+            },
+            Mutation::SyncDirectory {
+                path: directory.to_path_buf(),
+            },
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn plan_install(spec: &LaunchAgentSpec, state: InstallState<'_>) -> InstallPlan {
     let directory = spec.launch_agents_directory().to_path_buf();
     let mut operations = Vec::new();
 
-    match state.launch_agents_directory_mode {
-        None => operations.push(Mutation::EnsureDirectory {
-            path: directory.clone(),
-            mode: PRIVATE_DIRECTORY_MODE,
-        }),
-        Some(mode) if mode != PRIVATE_DIRECTORY_MODE => {
-            operations.push(Mutation::SetPermissions {
-                path: directory.clone(),
-                mode: PRIVATE_DIRECTORY_MODE,
-            });
-        }
-        Some(_) => {}
+    if let Some(operation) = plan_private_directory(&directory, state.launch_agents_directory_mode)
+    {
+        operations.push(operation);
     }
 
     let desired = spec.plist_bytes();
@@ -463,18 +483,7 @@ pub fn plan_install(spec: &LaunchAgentSpec, state: InstallState<'_>) -> InstallP
 }
 
 pub fn plan_remove(spec: &LaunchAgentSpec, installed: bool) -> InstallPlan {
-    let operations = if installed {
-        vec![
-            Mutation::RemoveFile {
-                path: spec.plist_path().to_path_buf(),
-            },
-            Mutation::SyncDirectory {
-                path: spec.launch_agents_directory().to_path_buf(),
-            },
-        ]
-    } else {
-        Vec::new()
-    };
+    let operations = plan_remove_file(spec.plist_path(), spec.launch_agents_directory(), installed);
 
     InstallPlan { operations }
 }
@@ -488,6 +497,15 @@ pub struct ExecutableInstallState {
     pub binary_directory_mode: Option<u32>,
     /// The binary already at the path, when a regular file is there.
     pub installed: Option<InstalledExecutable>,
+}
+
+impl ExecutableInstallState {
+    /// The installed binary is the source at [`STABLE_BINARY_MODE`].
+    pub fn is_current(&self) -> bool {
+        self.installed.is_some_and(|installed| {
+            installed.mode == STABLE_BINARY_MODE && installed.matches_source
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -513,26 +531,12 @@ pub fn plan_executable_install(
         (executable.support_directory(), state.support_directory_mode),
         (executable.directory(), state.binary_directory_mode),
     ] {
-        match mode {
-            None => operations.push(Mutation::EnsureDirectory {
-                path: directory.to_path_buf(),
-                mode: PRIVATE_DIRECTORY_MODE,
-            }),
-            Some(mode) if mode != PRIVATE_DIRECTORY_MODE => {
-                operations.push(Mutation::SetPermissions {
-                    path: directory.to_path_buf(),
-                    mode: PRIVATE_DIRECTORY_MODE,
-                });
-            }
-            Some(_) => {}
+        if let Some(operation) = plan_private_directory(directory, mode) {
+            operations.push(operation);
         }
     }
 
-    let binary_is_current = state
-        .installed
-        .is_some_and(|installed| installed.mode == STABLE_BINARY_MODE && installed.matches_source);
-
-    if !binary_is_current {
+    if !state.is_current() {
         operations.push(Mutation::CopyToTemporaryFile {
             directory: executable.directory().to_path_buf(),
             name_prefix: format!(".{}.", executable.name()),
@@ -561,18 +565,7 @@ pub fn plan_executable_install(
 /// costs nothing. A binary that is not there plans nothing, which is what makes a second
 /// uninstall a no-op rather than a failure.
 pub fn plan_executable_remove(executable: &HostStableExecutable, installed: bool) -> InstallPlan {
-    let operations = if installed {
-        vec![
-            Mutation::RemoveFile {
-                path: executable.path().to_path_buf(),
-            },
-            Mutation::SyncDirectory {
-                path: executable.directory().to_path_buf(),
-            },
-        ]
-    } else {
-        Vec::new()
-    };
+    let operations = plan_remove_file(executable.path(), executable.directory(), installed);
 
     InstallPlan { operations }
 }

@@ -3,8 +3,8 @@ use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, STABLE_BINARY_MODE,
-    plan_executable_install, plan_executable_remove, plan_install, plan_remove,
+    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, plan_executable_install,
+    plan_executable_remove, plan_install, plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
@@ -619,9 +619,7 @@ pub enum ServiceBinaryRefresh {
 
 /// Whether the observed installed binary needs refreshing from the invoking build.
 pub fn installed_binary_is_stale(state: &ExecutableInstallState) -> bool {
-    !state
-        .installed
-        .is_some_and(|installed| installed.mode == STABLE_BINARY_MODE && installed.matches_source)
+    !state.is_current()
 }
 
 /// Reconcile the gateway's installed stable binary with the build running this command.
@@ -883,6 +881,7 @@ pub(crate) fn output_error(error: io::Error) -> CowshedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launchd::STABLE_BINARY_MODE;
 
     /// The Aug drift in one test: a binary installed days earlier, byte-different from the build
     /// running setup, observed as exactly that — stale — while identical bytes are current. This
