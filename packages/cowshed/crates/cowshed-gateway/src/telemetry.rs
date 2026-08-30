@@ -9,7 +9,10 @@ use std::{
 };
 
 use arrow_array::{
-    ArrayRef, RecordBatch, StringArray, TimestampNanosecondArray, UInt16Array, UInt64Array,
+    ArrayRef, DictionaryArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+    builder::StringDictionaryBuilder,
+    types::{UInt8Type, UInt32Type},
 };
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -603,6 +606,8 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
     let mut entry_type = Vec::with_capacity(row_capacity);
     let mut message = Vec::with_capacity(row_capacity);
     let mut sequence = Vec::with_capacity(row_capacity);
+    let mut w3c_span_id = Vec::with_capacity(row_capacity);
+    let mut w3c_parent_span_id = Vec::with_capacity(row_capacity);
     let mut workspace_id = Vec::with_capacity(row_capacity);
     let mut repo_id = Vec::with_capacity(row_capacity);
     let mut revision = Vec::with_capacity(row_capacity);
@@ -619,15 +624,26 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
     let mut mirror_cache_status = Vec::with_capacity(row_capacity);
     let mut tracestate = Vec::with_capacity(row_capacity);
 
-    for event in events {
+    for (event_index, event) in events.iter().enumerate() {
         let trace = event
             .trace_id
             .clone()
             .unwrap_or_else(|| format!("{:032x}", event.sequence.max(1)));
-        let request_span = event.span_id;
-        let upstream_span = event.upstream_span_id;
+        let local_request_span = u32::try_from(
+            event_index
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| AuditError("audit batch span identity overflow".to_owned()))?,
+        )
+        .map_err(|_| AuditError("audit batch span identity overflow".to_owned()))?;
+        let local_upstream_span = local_request_span
+            .checked_add(1)
+            .ok_or_else(|| AuditError("audit batch span identity overflow".to_owned()))?;
         let thread = event.sequence.max(1);
-        let completed_ns = event.timestamp_unix_ms.saturating_mul(1_000_000);
+        let completed_ns = event
+            .timestamp_unix_ms
+            .checked_mul(1_000_000)
+            .ok_or_else(|| AuditError("audit timestamp is outside nanosecond range".to_owned()))?;
         let request_start_ns = completed_ns.saturating_sub(3);
         let request_end = end_entry_type(event.status);
         let kind_value = enum_name(&event.kind)?;
@@ -638,83 +654,121 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
             .map(enum_name)
             .transpose()?;
 
-        let mut push_row = |at: u64,
-                            current_span: u64,
-                            current_parent: Option<u64>,
-                            entry: &'static str,
-                            span_name: &'static str| {
-            timestamp.push(i64::try_from(at).unwrap_or(i64::MAX));
-            trace_id.push(trace.clone());
-            thread_id.push(thread);
-            span_id.push(current_span);
-            parent_thread_id.push(current_parent.map(|_| thread));
-            parent_span_id.push(current_parent);
-            entry_type.push(entry.to_owned());
-            message.push(span_name.to_owned());
-            sequence.push(event.sequence);
-            workspace_id.push(event.workspace_id.clone());
-            repo_id.push(event.repo_id.clone());
-            revision.push(event.revision);
-            endpoint.push(event.endpoint.clone());
-            kind.push(kind_value.clone());
-            host.push(event.host.clone());
-            method.push(event.method.clone());
-            path.push(event.path.clone());
-            decision.push(decision_value.clone());
-            http_status.push(event.http_status);
-            bytes.push(event.bytes);
-            grant_hint.push(event.grant_hint.clone());
-            classification.push(event.classification.clone());
-            mirror_cache_status.push(cache_value.clone());
-            tracestate.push(event.tracestate.clone());
-        };
+        let mut push_row =
+            |at: u64,
+             local_span: u32,
+             local_parent: Option<u32>,
+             wire_span: u64,
+             wire_parent: Option<u64>,
+             entry: &'static str,
+             span_name: &'static str|
+             -> Result<(), AuditError> {
+                timestamp.push(i64::try_from(at).map_err(|_| {
+                    AuditError("audit timestamp exceeds i64 nanoseconds".to_owned())
+                })?);
+                trace_id.push(trace.clone());
+                thread_id.push(thread);
+                span_id.push(local_span);
+                parent_thread_id.push(local_parent.map(|_| thread));
+                parent_span_id.push(local_parent);
+                entry_type.push(entry_type_key(entry)?);
+                message.push(Some(span_name.to_owned()));
+                sequence.push(event.sequence);
+                w3c_span_id.push(wire_span);
+                w3c_parent_span_id.push(wire_parent);
+                workspace_id.push(event.workspace_id.clone());
+                repo_id.push(event.repo_id.clone());
+                revision.push(event.revision);
+                endpoint.push(event.endpoint.clone());
+                kind.push(kind_value.clone());
+                host.push(event.host.clone());
+                method.push(event.method.clone());
+                path.push(event.path.clone());
+                decision.push(decision_value.clone());
+                http_status.push(event.http_status);
+                bytes.push(event.bytes);
+                grant_hint.push(event.grant_hint.clone());
+                classification.push(event.classification.clone());
+                mirror_cache_status.push(cache_value.clone());
+                tracestate.push(event.tracestate.clone());
+                Ok(())
+            };
 
         push_row(
             request_start_ns,
-            request_span,
+            local_request_span,
+            None,
+            event.span_id,
             event.parent_span_id,
             "span-start",
             "gateway.request",
-        );
-        if let Some(upstream_span) = upstream_span {
+        )?;
+        if let Some(upstream_span) = event.upstream_span_id {
             push_row(
                 request_start_ns.saturating_add(1),
+                local_upstream_span,
+                Some(local_request_span),
                 upstream_span,
-                Some(request_span),
+                Some(event.span_id),
                 "span-start",
                 "gateway.upstream",
-            );
+            )?;
             push_row(
                 request_start_ns.saturating_add(2),
+                local_upstream_span,
+                Some(local_request_span),
                 upstream_span,
-                Some(request_span),
+                Some(event.span_id),
                 request_end,
                 "gateway.upstream",
-            );
+            )?;
         }
         push_row(
             request_start_ns.saturating_add(3),
-            request_span,
+            local_request_span,
+            None,
+            event.span_id,
             event.parent_span_id,
             request_end,
             "gateway.request",
-        );
+        )?;
     }
 
+    let trace_id = dictionary_u32(trace_id.into_iter().map(Some))?;
+    let message = dictionary_u32(message)?;
+    let entry_type = DictionaryArray::<UInt8Type>::try_new(
+        UInt8Array::from(entry_type),
+        Arc::new(StringArray::from_iter_values(ENTRY_TYPE_NAMES)) as ArrayRef,
+    )
+    .map_err(|error| AuditError(format!("building audit entry dictionary: {error}")))?;
+    let row_count = timestamp.len();
+    let package_name = dictionary_u32(vec![None::<String>; row_count])?;
+    let package_file = dictionary_u32(vec![None::<String>; row_count])?;
+    let git_sha = dictionary_u32(vec![None::<String>; row_count])?;
+
+    // `lmao-arrow::trace_schema` cannot be imported alone: that crate also links its sibling
+    // `lmao-core` runtime. Keep this prefix byte-for-byte aligned until the schema is extracted
+    // into a dependency-free crate shared by the two Cargo workspaces.
     let schema = Arc::new(Schema::new(vec![
         Field::new(
             "timestamp",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         ),
-        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("trace_id", dict_type(DataType::UInt32), false),
         Field::new("thread_id", DataType::UInt64, false),
-        Field::new("span_id", DataType::UInt64, false),
+        Field::new("span_id", DataType::UInt32, false),
         Field::new("parent_thread_id", DataType::UInt64, true),
-        Field::new("parent_span_id", DataType::UInt64, true),
-        Field::new("entry_type", DataType::Utf8, false),
-        Field::new("message", DataType::Utf8, false),
+        Field::new("parent_span_id", DataType::UInt32, true),
+        Field::new("entry_type", dict_type(DataType::UInt8), false),
+        Field::new("message", dict_type(DataType::UInt32), true),
+        Field::new("package_name", dict_type(DataType::UInt32), true),
+        Field::new("package_file", dict_type(DataType::UInt32), true),
+        Field::new("git_sha", dict_type(DataType::UInt32), true),
+        Field::new("line", DataType::UInt32, false),
         Field::new("sequence", DataType::UInt64, false),
+        Field::new("w3c_span_id", DataType::UInt64, false),
+        Field::new("w3c_parent_span_id", DataType::UInt64, true),
         Field::new("workspace_id", DataType::Utf8, false),
         Field::new("repo_id", DataType::Utf8, false),
         Field::new("revision", DataType::UInt64, false),
@@ -733,14 +787,20 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
     ]));
     let columns: Vec<ArrayRef> = vec![
         Arc::new(TimestampNanosecondArray::from(timestamp)),
-        Arc::new(StringArray::from(trace_id)),
+        Arc::new(trace_id),
         Arc::new(UInt64Array::from(thread_id)),
-        Arc::new(UInt64Array::from(span_id)),
+        Arc::new(UInt32Array::from(span_id)),
         Arc::new(UInt64Array::from(parent_thread_id)),
-        Arc::new(UInt64Array::from(parent_span_id)),
-        Arc::new(StringArray::from(entry_type)),
-        Arc::new(StringArray::from(message)),
+        Arc::new(UInt32Array::from(parent_span_id)),
+        Arc::new(entry_type),
+        Arc::new(message),
+        Arc::new(package_name),
+        Arc::new(package_file),
+        Arc::new(git_sha),
+        Arc::new(UInt32Array::from(vec![0; row_count])),
         Arc::new(UInt64Array::from(sequence)),
+        Arc::new(UInt64Array::from(w3c_span_id)),
+        Arc::new(UInt64Array::from(w3c_parent_span_id)),
         Arc::new(StringArray::from(workspace_id)),
         Arc::new(StringArray::from(repo_id)),
         Arc::new(UInt64Array::from(revision)),
@@ -759,6 +819,65 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
     ];
     RecordBatch::try_new(schema, columns)
         .map_err(|error| AuditError(format!("building audit batch: {error}")))
+}
+
+const ENTRY_TYPE_NAMES: [&str; 25] = [
+    "",
+    "span-start",
+    "span-ok",
+    "span-err",
+    "span-exception",
+    "span-retry",
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "ff-access",
+    "ff-usage",
+    "period-start",
+    "op-invocations",
+    "op-errors",
+    "op-exceptions",
+    "op-duration-total",
+    "op-duration-ok",
+    "op-duration-err",
+    "op-duration-min",
+    "op-duration-max",
+    "buffer-writes",
+    "buffer-spans",
+    "buffer-capacity",
+];
+
+fn dict_type(key: DataType) -> DataType {
+    DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8))
+}
+
+fn dictionary_u32(
+    values: impl IntoIterator<Item = Option<String>>,
+) -> Result<DictionaryArray<UInt32Type>, AuditError> {
+    let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
+    for value in values {
+        match value {
+            Some(value) => {
+                builder
+                    .append(value)
+                    .map_err(|error| AuditError(format!("building audit dictionary: {error}")))?;
+            }
+            None => builder.append_null(),
+        }
+    }
+    Ok(builder.finish())
+}
+
+fn entry_type_key(value: &str) -> Result<u8, AuditError> {
+    match value {
+        "span-start" => Ok(1),
+        "span-ok" => Ok(2),
+        "span-err" => Ok(3),
+        "span-exception" => Ok(4),
+        _ => Err(AuditError(format!("unsupported audit entry type: {value}"))),
+    }
 }
 
 fn enum_name<T: serde::Serialize>(value: &T) -> Result<String, AuditError> {
@@ -921,7 +1040,7 @@ mod tests {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            &fields[..8],
+            &fields[..12],
             [
                 "timestamp",
                 "trace_id",
@@ -931,8 +1050,20 @@ mod tests {
                 "parent_span_id",
                 "entry_type",
                 "message",
+                "package_name",
+                "package_file",
+                "git_sha",
+                "line",
             ]
         );
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(schema.field(1).data_type(), &dict_type(DataType::UInt32));
+        assert_eq!(schema.field(3).data_type(), &DataType::UInt32);
+        assert_eq!(schema.field(6).data_type(), &dict_type(DataType::UInt8));
+        assert_eq!(schema.field(7).data_type(), &dict_type(DataType::UInt32));
         let sequences = batch
             .column_by_name("sequence")
             .expect("sequence column")
@@ -949,12 +1080,22 @@ mod tests {
             .column_by_name("entry_type")
             .expect("entry type column")
             .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .expect("dictionary entry type");
+        assert_eq!(
+            (0..4)
+                .map(|row| entries.keys().value(row))
+                .collect::<Vec<_>>(),
+            [1, 1, 2, 2]
+        );
+        let entry_names = entries
+            .values()
+            .as_any()
             .downcast_ref::<StringArray>()
-            .expect("string entry type");
-        assert_eq!(entries.value(0), "span-start");
-        assert_eq!(entries.value(1), "span-start");
-        assert_eq!(entries.value(2), "span-ok");
-        assert_eq!(entries.value(3), "span-ok");
+            .expect("entry type values");
+        assert_eq!(entry_names.value(0), "");
+        assert_eq!(entry_names.value(1), "span-start");
+        assert_eq!(entry_names.value(2), "span-ok");
 
         let first_tail = subscription
             .recv()
