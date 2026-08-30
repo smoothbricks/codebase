@@ -20,7 +20,11 @@ export enum ValueType {
   FLOAT64 = 10,
 }
 
-/** Must match Zig AggType enum in vm.zig */
+/**
+ * Aggregate/scalar slot subtype, stored in slot metadata byte 13.
+ * Audited against `columine_types::AggType` by
+ * `crates/columine-types/tests/typescript_abi.rs`.
+ */
 export enum AggType {
   SUM = 1,
   COUNT = 2,
@@ -38,7 +42,10 @@ export enum AggType {
   MAX_I64 = 13,
 }
 
-/** Must match Zig SlotType enum in vm.zig */
+/**
+ * VM slot category, the low four bits of a slot-definition flag byte.
+ * Audited against `columine_types::SlotType`.
+ */
 export enum SlotType {
   HASHMAP = 0,
   HASHSET = 1,
@@ -49,6 +56,8 @@ export enum SlotType {
   STRUCT_MAP = 6,
   ORDERED_LIST = 7,
   BITMAP = 8,
+  /** Outer container whose values are themselves containers. */
+  NESTED = 9,
   /** Exact two-u32-key struct map. Separate kind preserves STRUCT_MAP layout. */
   STRUCT_MAP2 = 10,
 }
@@ -68,6 +77,7 @@ export enum SlotTypeFlag {
   NO_HASHMAP_TIMESTAMPS = 0x40,
 }
 
+/** Audited against `columine_types::StructFieldType`. */
 export enum StructFieldType {
   UINT32 = 0, // 4 bytes
   INT64 = 1, // 8 bytes
@@ -85,7 +95,8 @@ export enum StructFieldType {
 /**
  * Comparison type for HashMap pick strategies (latest/max/min).
  * Determines how the 8-byte comparison column is interpreted in the VM.
- * Must match Zig CmpType enum in hashmap_ops.zig.
+ * Trailing `cmp_type:u8` operand of the comparing map upserts; the executable
+ * type lives in `columine-vm` `hashmap_ops::CmpType`.
  */
 export enum ComparisonType {
   /** Compare as unsigned 32-bit integers (string intern IDs, ordinals) */
@@ -96,6 +107,10 @@ export enum ComparisonType {
   I64 = 2,
 }
 
+/**
+ * TTL `startOf` truncation unit. Audited against
+ * `columine_types::DurationUnit`, which is the same wire byte.
+ */
 export enum TtlStartOf {
   NONE = 0,
   SECOND = 1,
@@ -200,7 +215,8 @@ export type EvictionResult =
   | { readonly ok: false; readonly error: ErrorCode };
 
 // =============================================================================
-// Error Codes — must match columine-types ErrorCode (`types.rs` / `opcodes.rs`)
+// Error Codes — audited against `columine_types::ErrorCode` by
+// `crates/columine-types/tests/typescript_abi.rs`
 // =============================================================================
 
 export enum ErrorCode {
@@ -228,7 +244,8 @@ export const PROGRAM_HASH_PREFIX = 32;
 export enum Opcode {
   HALT = 0x00,
 
-  // Slot creation (init section) - must match columine-types Opcode
+  // Slot creation (init section). The whole enum is audited against
+  // `columine_types::Opcode`.
   SLOT_DEF = 0x10, // slot, type_flags, cap_lo, cap_hi [aggType in cap_lo when type=AGGREGATE]
   SLOT_ARRAY = 0x14, // For `.within()` without keyBy — stores array of events
 
