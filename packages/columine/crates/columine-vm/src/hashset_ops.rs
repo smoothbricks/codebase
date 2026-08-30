@@ -143,12 +143,13 @@ pub fn batch_set_remove(
         };
 
         if hooks.undo_enabled() {
-            // Capture the key's latest TTL timestamp for undo.
-            let prev_ts_bits: u64 = if meta.has_ttl() {
+            let prev_ts_bits = if meta.has_ttl() {
                 hooks
                     .latest_eviction_ts(state, meta, elem)
-                    .map(f64::to_bits)
-                    .unwrap_or(0)
+                    .unwrap_or_else(|| {
+                        columine_types::die!("live TTL set key is missing its eviction entry")
+                    })
+                    .to_bits()
             } else {
                 0
             };
@@ -170,6 +171,9 @@ pub fn batch_set_remove(
                     aux: 0,
                 },
             );
+        }
+        if meta.has_ttl() {
+            hooks.remove_ttl_entries_for_key(state, meta, elem);
         }
 
         tbl.set_key_at(state, pos, TOMBSTONE);
@@ -193,66 +197,10 @@ pub fn single_set_insert(
     ts: f64,
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
-    if meta.slot_type() == SlotType::Bitmap {
-        let elems = [elem];
-        let ts_arr = [ts];
-        let ts_col: Option<&[f64]> = if meta.has_ttl() { Some(&ts_arr) } else { None };
-        return hooks.batch_bitmap_add(delta_mode, state, meta, slot_idx, &elems, ts_col);
-    }
-
-    let tbl = bind_slot_set(meta);
-    let Some(probe) = tbl.find_insert(state, elem) else {
-        return ErrorCode::Ok;
-    };
-
-    if !probe.found {
-        if tbl.size(state) >= tbl.max_load() {
-            return ErrorCode::CapacityExceeded;
-        }
-
-        if hooks.undo_enabled() {
-            hooks.append_mutation(
-                delta_mode,
-                state,
-                MutationRecord {
-                    op: MutationOp::SetInsert,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: 0,
-                },
-                MutationRecord {
-                    op: MutationOp::SetDelete,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: 0,
-                },
-            );
-        }
-
-        tbl.set_key_at(state, probe.pos, elem);
-        let size = tbl.size(state);
-        tbl.set_size(state, size + 1);
-        meta.set_change_flag(state, ChangeFlag::INSERTED);
-
-        if meta.has_ttl() {
-            let ttl_result = hooks.insert_with_ttl(state, meta, elem, ts);
-            if ttl_result != ErrorCode::Ok {
-                return ttl_result;
-            }
-        }
-        return ErrorCode::Ok;
-    }
-
-    // Already present — refresh TTL.
-    if meta.has_ttl() {
-        let ttl_result = hooks.insert_with_ttl(state, meta, elem, ts);
-        if ttl_result != ErrorCode::Ok {
-            return ttl_result;
-        }
-    }
-    ErrorCode::Ok
+    let elems = [elem];
+    let timestamps = [ts];
+    let ts_col = meta.has_ttl().then_some(timestamps.as_slice());
+    batch_set_insert(delta_mode, state, meta, slot_idx, &elems, ts_col, hooks)
 }
 
 /// Remove one element for per-element dispatch.
@@ -264,40 +212,5 @@ pub fn single_set_remove(
     elem: u32,
     hooks: &mut impl VmHooks,
 ) {
-    if meta.slot_type() == SlotType::Bitmap {
-        let elems = [elem];
-        hooks.batch_bitmap_remove(delta_mode, state, meta, slot_idx, &elems);
-        return;
-    }
-
-    let tbl = bind_slot_set(meta);
-    let Some(pos) = tbl.find(state, elem) else {
-        return;
-    };
-
-    if hooks.undo_enabled() {
-        hooks.append_mutation(
-            delta_mode,
-            state,
-            MutationRecord {
-                op: MutationOp::SetDelete,
-                slot: slot_idx,
-                key: elem,
-                prev_value: 0,
-                aux: 0,
-            },
-            MutationRecord {
-                op: MutationOp::SetInsert,
-                slot: slot_idx,
-                key: elem,
-                prev_value: 0,
-                aux: 0,
-            },
-        );
-    }
-
-    tbl.set_key_at(state, pos, TOMBSTONE);
-    let size = tbl.size(state);
-    tbl.set_size(state, size - 1);
-    meta.set_change_flag(state, ChangeFlag::REMOVED);
+    batch_set_remove(delta_mode, state, meta, slot_idx, &[elem], hooks);
 }
