@@ -2815,11 +2815,7 @@ fn active_expected_with_format(
             "active workspace expectation is missing",
         ));
     };
-    let role = if expected_name.is_main() {
-        WorkspaceRole::Main
-    } else {
-        WorkspaceRole::Workspace
-    };
+    let role = WorkspaceRole::for_name(expected_name);
     LifecycleWorkspace::new(
         repo.clone(),
         expected_name.clone(),
@@ -2886,7 +2882,7 @@ fn checkpoint_expected_revision(
 }
 
 fn main_name() -> WorkspaceName {
-    WorkspaceName::new("main").expect("fixed main workspace name is valid")
+    WorkspaceName::main()
 }
 
 fn layout(config: &ApfsSubstrateConfig, repo: &RepoId) -> Result<StorageLayout, ApfsStorageError> {
