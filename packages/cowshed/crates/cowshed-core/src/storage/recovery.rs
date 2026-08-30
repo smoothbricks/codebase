@@ -469,8 +469,7 @@ mod prepared_retirement_diagnostic_tests {
     }
 }
 
-static MAIN_NAME: LazyLock<WorkspaceName> =
-    LazyLock::new(|| WorkspaceName::new("main").expect("fixed main workspace name"));
+static MAIN_NAME: LazyLock<WorkspaceName> = LazyLock::new(WorkspaceName::main);
 
 fn main_name() -> &'static WorkspaceName {
     &MAIN_NAME

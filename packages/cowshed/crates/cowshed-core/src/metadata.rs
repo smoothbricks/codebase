@@ -358,6 +358,11 @@ impl WorkspaceName {
         }
     }
 
+    /// The fixed name of the always-mounted main workspace.
+    pub fn main() -> Self {
+        Self("main".to_owned())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -660,6 +665,18 @@ impl SlotBindings {
 pub enum WorkspaceRole {
     Main,
     Workspace,
+}
+
+impl WorkspaceRole {
+    /// Role is a function of the name: `main` is the main workspace, everything else a session.
+    /// [`validate_role_name`] enforces the same invariant on deserialized metadata.
+    pub fn for_name(name: &WorkspaceName) -> Self {
+        if name.is_main() {
+            Self::Main
+        } else {
+            Self::Workspace
+        }
+    }
 }
 
 fn validate_role_name(role: WorkspaceRole, name: &WorkspaceName) -> Result<(), MetadataError> {
@@ -1056,11 +1073,7 @@ impl DetachedWorkspaceMetadata {
             if !info.project_root.is_absolute() {
                 return Err(MetadataError::InvalidPath(info.project_root.clone()));
             }
-            let expected_role = if self.workspace.is_main() {
-                WorkspaceRole::Main
-            } else {
-                WorkspaceRole::Workspace
-            };
+            let expected_role = WorkspaceRole::for_name(&self.workspace);
             if info.role != expected_role {
                 return Err(MetadataError::WorkspaceRoleMismatch {
                     workspace: self.workspace.to_string(),

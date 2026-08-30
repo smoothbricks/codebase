@@ -1,5 +1,6 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
+use cowshed_core::metadata::{MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -2044,23 +2045,21 @@ fn workspace_name(
     let Some(value) = value.to_str() else {
         return Err(UsageError::new("workspace names must be UTF-8", usage));
     };
-    let valid = !value.is_empty()
-        && value.len() <= 64
-        && (value.as_bytes()[0].is_ascii_lowercase() || value.as_bytes()[0].is_ascii_digit())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    if !valid || (reserve_main && value == "main") {
-        return Err(UsageError::new(
-            if reserve_main && value == "main" {
-                "workspace name `main` is reserved"
-            } else {
-                "workspace names must match [a-z0-9][a-z0-9-]{0,63}"
-            },
+    let parsed = if reserve_main {
+        WorkspaceName::session(value)
+    } else {
+        WorkspaceName::new(value)
+    };
+    match parsed {
+        Ok(name) => Ok(name.as_str().to_owned()),
+        Err(MetadataError::ReservedSessionName) => {
+            Err(UsageError::new("workspace name `main` is reserved", usage))
+        }
+        Err(_) => Err(UsageError::new(
+            "workspace names must match [a-z0-9][a-z0-9-]{0,63}",
             usage,
-        ));
+        )),
     }
-    Ok(value.to_owned())
 }
 
 fn unknown_flag(flag: &str, usage: &'static CommandSpec) -> UsageError {
