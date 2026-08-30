@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cowshed_core::apfs::{ApfsCaseSensitivity, SystemCommandRunner};
-use cowshed_core::metadata::{GrantSet, ImageCapacity, ImageFormat, PortBlock, WorkspaceName};
+use cowshed_core::metadata::{
+    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE, PortBlock,
+    WorkspaceName,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{
@@ -238,7 +241,10 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
             forked_from: None,
             created_trace: format!("apfs-integration-{}", format.extension()),
             git_worktree: false,
-            grants: GrantSet::closed_baseline(Some(PortBlock::new(30000, 16)?))?,
+            grants: GrantSet::closed_baseline(Some(PortBlock::new(
+                MACOS_PORT_BLOCK_MIN,
+                PORT_BLOCK_SIZE,
+            )?))?,
         })
     };
     let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone())?;

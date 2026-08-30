@@ -1497,15 +1497,19 @@ mod tests {
             prop_assert_eq!(serde_json::to_value(marker).unwrap(), expected);
         }
 
+        /// A macOS sidecar's `portBlock.base` is drawn as a block index rather than a raw `u16`,
+        /// because the durable grammar is "an aligned block inside 40960-49151" — a raw base is
+        /// not a valid sidecar and belongs to the refusal proptest below.
         #[test]
         fn valid_sidecar_schemas_round_trip_across_platforms(
             macos in any::<bool>(),
             sparse in any::<bool>(),
-            base in 0_u16..=(u16::MAX - PORT_BLOCK_SIZE + 1),
+            block in 0_u16..=(MACOS_PORT_BLOCK_LAST_BASE - MACOS_PORT_BLOCK_MIN) / PORT_BLOCK_SIZE,
         ) {
             let mut expected = frozen_sidecar_json();
             expected["imageFormat"] = json!(if sparse { "sparse" } else { "asif" });
             if macos {
+                let base = MACOS_PORT_BLOCK_MIN + block * PORT_BLOCK_SIZE;
                 expected["platform"] = json!("macos");
                 expected["portBlock"] = json!({ "base": base, "size": PORT_BLOCK_SIZE });
             } else {
@@ -1516,6 +1520,26 @@ mod tests {
             let metadata: DetachedWorkspaceMetadata =
                 serde_json::from_value(expected.clone()).unwrap();
             prop_assert_eq!(serde_json::to_value(metadata).unwrap(), expected);
+        }
+
+        /// Every base outside the aligned macOS block grid is refused at the parse edge, so no
+        /// reader downstream has to re-derive the range. This is the pair to the round-trip above:
+        /// together they say the grammar is exactly the grid and nothing else.
+        #[test]
+        fn macos_sidecars_reject_every_unaligned_or_out_of_range_port_base(
+            base in any::<u16>().prop_filter("aligned in-range bases are valid", |base| {
+                !((MACOS_PORT_BLOCK_MIN..=MACOS_PORT_BLOCK_LAST_BASE).contains(base)
+                    && base.is_multiple_of(PORT_BLOCK_SIZE))
+            }),
+        ) {
+            let mut sidecar = frozen_sidecar_json();
+            sidecar["platform"] = json!("macos");
+            sidecar["portBlock"] = json!({ "base": base, "size": PORT_BLOCK_SIZE });
+            prop_assert!(
+                serde_json::from_value::<DetachedWorkspaceMetadata>(sidecar).is_err(),
+                "macOS base {} is off the block grid and must not parse",
+                base
+            );
         }
 
         #[test]
