@@ -241,103 +241,88 @@ impl OuterTable {
         if outer_key == EMPTY_KEY || outer_key == TOMBSTONE {
             return None;
         }
-        debug_assert!(self.cap.is_power_of_two(), "probe mask requires pow2 cap");
-        let mut pos = hash_key(outer_key, self.cap);
-        let mut first_tombstone: Option<u32> = None;
-        let mut insert_pos: Option<u32> = None;
-        for _ in 0..self.cap {
-            let k = self.key_at(state, pos);
-            if k == outer_key {
-                return Some(Resolved {
-                    offset: self.ptr_at(state, pos),
-                    is_new: false,
-                });
-            }
-            if k == TOMBSTONE {
-                if first_tombstone.is_none() {
-                    first_tombstone = Some(pos);
-                }
-            } else if k == EMPTY_KEY {
-                insert_pos = Some(first_tombstone.unwrap_or(pos));
-            }
-            if let Some(pos) = insert_pos {
-                // Insert new outer key + allocate inner container.
-                if self.size(state) >= self.cap * 7 / 10 {
-                    return None;
-                }
-
-                let inner_cap = next_power_of_2(u32::from(prefix.inner_initial_cap));
-                let inner_size =
-                    inner_container_size(prefix.inner_type, inner_cap, prefix.inner_agg_type_byte);
-                let inner_off = self.arena.alloc(state, inner_size)?;
-
-                // Initialize the inner container.
-                match prefix.inner_type {
-                    SlotType::HashSet => {
-                        hash_table::FlatTable::init(
-                            state,
-                            inner_off,
-                            inner_cap,
-                            hash_table::ENTRY_NONE,
-                        );
-                    }
-                    SlotType::HashMap => {
-                        hash_table::FlatTable::init(
-                            state,
-                            inner_off,
-                            inner_cap,
-                            hash_table::ENTRY_U32,
-                        );
-                    }
-                    SlotType::Aggregate => bytes::zero(state, inner_off, inner_size),
-                    _ => {}
-                }
-
-                bytes::write_u32(state, self.keys_off + pos * 4, outer_key);
-                bytes::write_u32(state, self.ptrs_off + pos * 4, inner_off);
-                let size = self.size(state);
-                bytes::write_u32(state, self.size_off, size + 1);
-                return Some(Resolved {
-                    offset: inner_off,
-                    is_new: true,
-                });
-            }
-            pos = (pos + 1) & (self.cap - 1);
+        let probe = hash_table::probe_linear(
+            self.cap,
+            hash_key(outer_key, self.cap),
+            true,
+            |pos| match self.key_at(state, pos) {
+                current if current == outer_key => hash_table::ProbeCell::Match,
+                EMPTY_KEY => hash_table::ProbeCell::Empty,
+                TOMBSTONE => hash_table::ProbeCell::Tombstone,
+                _ => hash_table::ProbeCell::Occupied,
+            },
+        )?;
+        if probe.found {
+            return Some(Resolved {
+                offset: self.ptr_at(state, probe.pos),
+                is_new: false,
+            });
         }
-        // No EMPTY cell found (table saturated with keys + tombstones):
-        // the load-factor gate above refuses long before this in practice.
-        None
+        if self.size(state) >= self.cap * 7 / 10 {
+            return None;
+        }
+
+        let inner_cap = next_power_of_2(u32::from(prefix.inner_initial_cap));
+        let inner_size =
+            inner_container_size(prefix.inner_type, inner_cap, prefix.inner_agg_type_byte);
+        let inner_off = self.arena.alloc(state, inner_size)?;
+        match prefix.inner_type {
+            SlotType::HashSet => {
+                hash_table::FlatTable::init(state, inner_off, inner_cap, hash_table::ENTRY_NONE);
+            }
+            SlotType::HashMap => {
+                hash_table::FlatTable::init(state, inner_off, inner_cap, hash_table::ENTRY_U32);
+            }
+            SlotType::Aggregate => bytes::zero(state, inner_off, inner_size),
+            _ => {}
+        }
+
+        bytes::write_u32(state, self.keys_off + probe.pos * 4, outer_key);
+        bytes::write_u32(state, self.ptrs_off + probe.pos * 4, inner_off);
+        let size = self.size(state);
+        bytes::write_u32(state, self.size_off, size + 1);
+        Some(Resolved {
+            offset: inner_off,
+            is_new: true,
+        })
     }
 
     /// Look up an outer key's inner-container offset, or return zero when
     /// absent. Only `EMPTY_KEY` terminates the probe; tombstones are skipped.
     pub fn lookup(&self, state: &[u8], outer_key: u32) -> u32 {
-        let mut pos = hash_key(outer_key, self.cap);
-        for _ in 0..self.cap {
-            let k = self.key_at(state, pos);
-            if k == outer_key {
-                return self.ptr_at(state, pos);
-            }
-            if k == EMPTY_KEY {
-                return 0;
-            }
-            pos = (pos + 1) & (self.cap - 1);
+        if outer_key == EMPTY_KEY || outer_key == TOMBSTONE {
+            return 0;
         }
-        0
+        hash_table::probe_linear(
+            self.cap,
+            hash_key(outer_key, self.cap),
+            false,
+            |pos| match self.key_at(state, pos) {
+                current if current == outer_key => hash_table::ProbeCell::Match,
+                EMPTY_KEY => hash_table::ProbeCell::Empty,
+                TOMBSTONE => hash_table::ProbeCell::Tombstone,
+                _ => hash_table::ProbeCell::Occupied,
+            },
+        )
+        .filter(|probe| probe.found)
+        .map_or(0, |probe| self.ptr_at(state, probe.pos))
     }
 
     /// Repoint an existing outer key at a grown inner container. The probe is
     /// bounded by `cap`; absence is a programmer error.
     pub fn update_ptr(&self, state: &mut [u8], outer_key: u32, new_offset: u32) {
-        let mut pos = hash_key(outer_key, self.cap);
-        for _ in 0..self.cap {
-            if self.key_at(state, pos) == outer_key {
-                bytes::write_u32(state, self.ptrs_off + pos * 4, new_offset);
-                return;
-            }
-            pos = (pos + 1) & (self.cap - 1);
-        }
-        columine_types::die!("update_ptr: outer key {outer_key} absent — resolve() must precede");
+        let probe =
+            hash_table::probe_linear(self.cap, hash_key(outer_key, self.cap), false, |pos| {
+                match self.key_at(state, pos) {
+                    current if current == outer_key => hash_table::ProbeCell::Match,
+                    EMPTY_KEY => hash_table::ProbeCell::Empty,
+                    TOMBSTONE => hash_table::ProbeCell::Tombstone,
+                    _ => hash_table::ProbeCell::Occupied,
+                }
+            })
+            .filter(|probe| probe.found)
+            .unwrap_or_else(|| columine_types::die!("outer key vanished during inner growth"));
+        bytes::write_u32(state, self.ptrs_off + probe.pos * 4, new_offset);
     }
 }
 

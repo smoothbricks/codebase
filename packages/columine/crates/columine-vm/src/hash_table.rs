@@ -65,6 +65,51 @@ pub struct Probe {
     pub found: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProbeCell {
+    Match,
+    Empty,
+    Tombstone,
+    Occupied,
+}
+
+/// One bounded linear-probe implementation for every VM table layout.
+/// Layout-specific wrappers provide the home position and classify a cell;
+/// tombstone reuse is data so lookup and insertion cannot drift.
+#[inline]
+pub(crate) fn probe_linear(
+    capacity: u32,
+    start: u32,
+    reuse_tombstones: bool,
+    mut classify: impl FnMut(u32) -> ProbeCell,
+) -> Option<Probe> {
+    debug_assert!(capacity.is_power_of_two(), "probe mask requires pow2 cap");
+    let mut position = start;
+    let mut first_tombstone = None;
+    for _ in 0..capacity {
+        match classify(position) {
+            ProbeCell::Match => {
+                return Some(Probe {
+                    pos: position,
+                    found: true,
+                });
+            }
+            ProbeCell::Empty => {
+                return Some(Probe {
+                    pos: first_tombstone.unwrap_or(position),
+                    found: false,
+                });
+            }
+            ProbeCell::Tombstone if reuse_tombstones && first_tombstone.is_none() => {
+                first_tombstone = Some(position);
+            }
+            ProbeCell::Tombstone | ProbeCell::Occupied => {}
+        }
+        position = (position + 1) & (capacity - 1);
+    }
+    first_tombstone.map(|pos| Probe { pos, found: false })
+}
+
 /// Bound table view. Carries offsets into the state buffer, never pointers.
 #[derive(Clone, Copy, Debug)]
 pub struct FlatTable {
@@ -203,51 +248,31 @@ impl FlatTable {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
         }
-        debug_assert!(self.cap.is_power_of_two(), "probe mask requires pow2 cap");
-        let mut pos = hash_key(key, self.cap);
-        for _ in 0..self.cap {
-            let k = self.key_at(state, pos);
-            if k == key {
-                return Some(pos);
+        probe_linear(self.cap, hash_key(key, self.cap), false, |pos| {
+            match self.key_at(state, pos) {
+                current if current == key => ProbeCell::Match,
+                EMPTY_KEY => ProbeCell::Empty,
+                TOMBSTONE => ProbeCell::Tombstone,
+                _ => ProbeCell::Occupied,
             }
-            if k == EMPTY_KEY {
-                return None;
-            }
-            pos = (pos + 1) & (self.cap - 1);
-        }
-        None
+        })
+        .filter(|probe| probe.found)
+        .map(|probe| probe.pos)
     }
 
     /// Insert-or-update probe: scan past tombstones to find a deeper matching
-    /// key, then reuse the first tombstone when the key is absent. Returns
-    /// `None` for sentinel keys or a full tombstone-free table.
+    /// key, then reuse the first tombstone when the key is absent.
     pub fn find_insert(&self, state: &[u8], key: u32) -> Option<Probe> {
         if key == EMPTY_KEY || key == TOMBSTONE {
             return None;
         }
-        debug_assert!(self.cap.is_power_of_two(), "probe mask requires pow2 cap");
-        let mut pos = hash_key(key, self.cap);
-        let mut first_tombstone: Option<u32> = None;
-        for _ in 0..self.cap {
-            let k = self.key_at(state, pos);
-            if k == key {
-                return Some(Probe { pos, found: true });
+        probe_linear(self.cap, hash_key(key, self.cap), true, |pos| {
+            match self.key_at(state, pos) {
+                current if current == key => ProbeCell::Match,
+                EMPTY_KEY => ProbeCell::Empty,
+                TOMBSTONE => ProbeCell::Tombstone,
+                _ => ProbeCell::Occupied,
             }
-            if k == EMPTY_KEY {
-                return Some(Probe {
-                    pos: first_tombstone.unwrap_or(pos),
-                    found: false,
-                });
-            }
-            if k == TOMBSTONE && first_tombstone.is_none() {
-                first_tombstone = Some(pos);
-            }
-            pos = (pos + 1) & (self.cap - 1);
-        }
-        // A full table reuses the first tombstone when one exists.
-        first_tombstone.map(|ft| Probe {
-            pos: ft,
-            found: false,
         })
     }
 

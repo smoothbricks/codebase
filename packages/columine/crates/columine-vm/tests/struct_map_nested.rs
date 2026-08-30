@@ -9,7 +9,7 @@ use columine_types::types::{
     ChangeFlag, EMPTY_KEY, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, StructFieldType,
     hash_key, struct_field_size,
 };
-use columine_vm::hash_table::hashset_byte_size;
+use columine_vm::hash_table::{ENTRY_NONE, FlatTable, hashset_byte_size};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::{
     Arena, NestedPrefix, arena_data_offset, arena_header_offset, get_inner_offset,
@@ -17,7 +17,7 @@ use columine_vm::nested::{
     nested_agg_update, nested_map_upsert_last, nested_set_insert, outer_keys_offset,
     write_nested_prefix,
 };
-use columine_vm::struct_map::StructMapSlot;
+use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
 use proptest::prelude::*;
 
 const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48; // one 48-byte slot-meta record
@@ -54,6 +54,26 @@ fn mk_struct_map_state(
     for j in 0..cap {
         let off = (SLOT_OFFSET + desc + j * 4) as usize;
         state[off..off + 4].copy_from_slice(&EMPTY_KEY.to_le_bytes());
+    }
+    state
+}
+
+fn mk_struct_map2_state(state_len: usize, cap: u32) -> Vec<u8> {
+    let mut state = vec![0u8; state_len];
+    let meta = STATE_HEADER_SIZE as usize;
+    state[meta..meta + 4].copy_from_slice(&SLOT_OFFSET.to_le_bytes());
+    state[meta + 4..meta + 8].copy_from_slice(&cap.to_le_bytes());
+    state[meta + SlotMetaOffset::TYPE_FLAGS as usize] = SlotType::StructMap2 as u8;
+    state[meta + SlotMetaOffset::AGG_TYPE as usize] = 1;
+    state[meta + SlotMetaOffset::TIMESTAMP_FIELD_IDX as usize] = 1;
+    state[meta + SlotMetaOffset::TTL_SECONDS as usize
+        ..meta + SlotMetaOffset::TTL_SECONDS as usize + 2]
+        .copy_from_slice(&5u16.to_le_bytes());
+    state[SLOT_OFFSET as usize] = StructFieldType::UInt32 as u8;
+    let keys1 = SLOT_OFFSET + 8;
+    for pos in 0..cap {
+        let offset = (keys1 + pos * 4) as usize;
+        state[offset..offset + 4].copy_from_slice(&EMPTY_KEY.to_le_bytes());
     }
     state
 }
@@ -601,6 +621,60 @@ proptest! {
                     }
                 }
             }
+        }
+    }
+
+    /// The four layouts share one probe contract: identical insert/duplicate/
+    /// refusal decisions and logical membership under the same workload.
+    #[test]
+    fn prop_table_probe_implementations_agree(
+        keys in prop::collection::vec(1u32..100, 0..100),
+    ) {
+        let capacity = 32;
+        let mut flat_state = vec![0u8; 4096];
+        let flat = FlatTable::init(&mut flat_state, 0, capacity, ENTRY_NONE);
+        let mut struct_state =
+            mk_struct_map_state(8192, capacity, &[StructFieldType::UInt32 as u8], 1, 5);
+        let struct_map = StructMapSlot::bind(&struct_state, 0);
+        let mut struct2_state = mk_struct_map2_state(8192, capacity);
+        let struct_map2 = StructMap2Slot::bind(&struct2_state, 0);
+        let mut nested_state =
+            mk_nested_state(1 << 20, capacity, SlotType::HashSet, 4, 1);
+        let nested_meta = meta_of(&nested_state);
+
+        for key in keys {
+            let flat_result = flat.insert_key(&mut flat_state, key);
+            let struct_result = struct_map.upsert(&mut struct_state, key);
+            let struct2_result = struct_map2.upsert(&mut struct2_state, key, 7);
+            let nested_was_present =
+                get_inner_offset(&nested_state, &nested_meta, key) != 0;
+            let nested_result =
+                nested_set_insert(&mut nested_state, &nested_meta, key, key);
+
+            let expected = flat_result.map(|is_new| (true, is_new));
+            prop_assert_eq!(
+                struct_result.map(|result| (true, result.is_new)),
+                expected
+            );
+            prop_assert_eq!(
+                struct2_result.map(|result| (true, result.is_new)),
+                expected
+            );
+            prop_assert_eq!(
+                (nested_result == ErrorCode::Ok)
+                    .then_some((true, !nested_was_present)),
+                expected
+            );
+        }
+
+        for key in 1..100 {
+            let present = flat.contains(&flat_state, key);
+            prop_assert_eq!(struct_map.find(&struct_state, key).is_some(), present);
+            prop_assert_eq!(struct_map2.find(&struct2_state, key, 7).is_some(), present);
+            prop_assert_eq!(
+                get_inner_offset(&nested_state, &nested_meta, key) != 0,
+                present
+            );
         }
     }
 
