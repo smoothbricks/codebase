@@ -304,6 +304,23 @@ describe('managed raw files', () => {
     expect(generated).toBe(source);
   });
 
+  it('manages the macOS pre-push linux compile gate as an executable copy', async () => {
+    expect(managedFileTargetsForTest).toContainEqual({
+      target: 'tooling/git-hooks/pre-push.sh',
+      executable: true,
+    });
+
+    const [source, generated] = await Promise.all([
+      readFile(join(REPO_ROOT, 'packages', 'cli', 'managed', 'raw', 'tooling', 'git-hooks', 'pre-push.sh'), 'utf8'),
+      readFile(join(REPO_ROOT, 'tooling', 'git-hooks', 'pre-push.sh'), 'utf8'),
+    ]);
+
+    expect(generated).toBe(source);
+    expect(generated).toContain('uname -s');
+    expect(generated).toContain('cargo-lint-cross');
+    expect(generated).toContain('bun run check:linux');
+  });
+
   it('exports the restored ttsc cache path while preserving host cache overrides', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'smoo-github-bootstrap-'));
     const bin = join(temp, 'bin');
