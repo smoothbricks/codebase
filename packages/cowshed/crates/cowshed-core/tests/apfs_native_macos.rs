@@ -29,7 +29,7 @@ use cowshed_core::storage::apfs::{
     MarkerExpectation, MetadataPolicy, PublicationDisposition,
 };
 use cowshed_core::storage::lifecycle::{
-    ExpectedState, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
+    LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
     StorageGcReason, derive_workspaces,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
@@ -1149,7 +1149,7 @@ fn checkpoint_observation_reads_authoritative_detached_metadata() {
     let host = native_host(&fixture, RecordingRunner::default());
 
     let observed = host
-        .observe(&[ExpectedState::Checkpoint {
+        .observe(&[LifecycleFact::Checkpoint {
             repo: repo(),
             workspace: WorkspaceName::new("main").expect("main"),
             label: label.clone(),
@@ -1159,7 +1159,7 @@ fn checkpoint_observation_reads_authoritative_detached_metadata() {
 
     assert!(matches!(
         observed.as_slice(),
-        [cowshed_core::storage::lifecycle::ObservedState::Checkpoint {
+        [cowshed_core::storage::lifecycle::LifecycleFact::Checkpoint {
             repo: observed_repo,
             workspace,
             label: observed_label,
