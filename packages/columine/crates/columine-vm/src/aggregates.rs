@@ -151,7 +151,7 @@ pub struct TypeMask<'a> {
 // batch-fold form of the same per-aggregate algebra.
 /// Min profile: NaN yields the other operand and ties yield the second.
 #[inline]
-fn min_profile(a: f64, b: f64) -> f64 {
+pub(crate) fn min_profile(a: f64, b: f64) -> f64 {
     if a.is_nan() {
         return b;
     }
@@ -163,7 +163,7 @@ fn min_profile(a: f64, b: f64) -> f64 {
 
 /// Max profile: NaN yields the other operand and ties yield the second.
 #[inline]
-fn max_profile(a: f64, b: f64) -> f64 {
+pub(crate) fn max_profile(a: f64, b: f64) -> f64 {
     if a.is_nan() {
         return b;
     }

@@ -296,6 +296,25 @@ fn nested_aggregate_sum_f64_per_outer_key() {
     assert!((sum2 - 50.0).abs() < 0.001);
 }
 
+#[test]
+fn nested_min_max_skip_leading_nan() {
+    for (agg_type, finite) in [(3, -7.5f64), (4, 9.25)] {
+        let mut state = mk_nested_state(4096, 16, SlotType::Aggregate, 0, agg_type);
+        let meta = meta_of(&state);
+        assert_eq!(
+            nested_agg_update(&mut state, &meta, 1, f64::NAN.to_bits()),
+            ErrorCode::Ok
+        );
+        assert_eq!(
+            nested_agg_update(&mut state, &meta, 1, finite.to_bits()),
+            ErrorCode::Ok
+        );
+        let inner = get_inner_offset(&state, &meta, 1);
+        assert_eq!(inner_agg_get_f64(&state, inner).to_bits(), finite.to_bits());
+        assert_eq!(inner_agg_get_count(&state, inner, agg_type), 2);
+    }
+}
+
 ///  `test "nested set — inner growth on load factor exceeded"`
 #[test]
 fn nested_set_inner_growth_on_load_factor() {
