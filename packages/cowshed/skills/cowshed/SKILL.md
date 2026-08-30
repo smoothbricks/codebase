@@ -84,8 +84,7 @@ direnv users need nothing extra.
 
 - stdout is the result; stderr is progress and guidance. Use `--json` for machine output and follow each `next:` command
   literally instead of scraping stderr.
-- Stable exits are `0` success, `1` internal error, `2` usage, `3` not found, `4` conflict/busy, `5` missing host
-  environment or storage, `6` denied, and `7` integrity failure. Under `exec`, the child's status passes through;
-  cowshed wrapper failures use `100`–`106`.
-- Exit `5` means the host volume is absent or unmounted: run `cowshed doctor`, then its `next:` command. `doctor`
-  mutates nothing.
+- Failures: `--json` names `code` (the taxonomy) and `hint` (the next command). Do not scrape stderr or memorize process
+  exits; `cowshed --help` documents the mapping. Under `exec`, the child's status passes through.
+- A missing host volume is `environment-missing`: run `cowshed doctor`, then its `next:` command. `doctor` mutates
+  nothing.
