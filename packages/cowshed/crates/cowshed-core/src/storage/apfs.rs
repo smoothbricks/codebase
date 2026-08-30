@@ -1898,7 +1898,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
             let request = CreateImageRequest {
                 staged_stem,
                 capacity,
-                volume_name: volume_label(repo, &main_name()),
+                volume_name: volume_key(repo, &main_name()),
                 case_sensitivity: config.case_sensitivity,
                 owner_uid: unsafe { libc::getuid() },
                 owner_gid: unsafe { libc::getgid() },
@@ -2184,7 +2184,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         .and_then(|()| {
             host.rename_volume(
                 &staging_mount,
-                &volume_label(workspace.repo(), workspace.name()),
+                &volume_key(workspace.repo(), workspace.name()),
             )?;
             host.mint_workspace_credentials(
                 &workspace,
@@ -2479,7 +2479,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
         .and_then(|()| {
             host.rename_volume(
                 &staging_mount,
-                &volume_label(replacement.repo(), replacement.name()),
+                &volume_key(replacement.repo(), replacement.name()),
             )?;
             host.mint_workspace_credentials(
                 &replacement,
@@ -3017,9 +3017,18 @@ fn main_aware_mount_point(
         .map_err(Into::into)
 }
 
-/// Internal join key for a workspace's volume, derived from metadata and never read back off a
-/// volume. Enumeration is keyed by image location and mount identity by the in-image marker, so
-/// this key exists only to pair a `StorageFact` with a `KernelMountFact` inside one project.
+/// The one canonical name for a workspace's volume: the internal join key AND the APFS volume
+/// label are this same string, so there is exactly one naming implementation.
+///
+/// As a join key it is derived from metadata and never read back off a volume — enumeration is
+/// keyed by image location and mount identity by the in-image marker, so the key exists only to
+/// pair a `StorageFact` with a `KernelMountFact` inside one project.
+///
+/// As the APFS label (what Finder shows for a mounted volume's directory) it is purely
+/// human-facing: nothing parses it and nothing classifies a volume by it, so renaming a volume
+/// by hand changes nothing but the label. An identity change still relabels every volume — but
+/// because the label is not an authority, a relabel interrupted partway leaves nothing but a
+/// cosmetic disagreement, which is why recovery does not have to redo it.
 pub fn volume_key(repo: &RepoId, workspace: &WorkspaceName) -> String {
     format!(
         "cowshed.{}--{}.{}",
@@ -3027,22 +3036,6 @@ pub fn volume_key(repo: &RepoId, workspace: &WorkspaceName) -> String {
         repo.repo(),
         workspace.as_str()
     )
-}
-
-/// The APFS volume name, which Finder shows for a mounted volume's directory in place of the
-/// directory's own name. It is therefore purely human-facing: it carries no identity, nothing
-/// parses it, and nothing classifies a volume by it. Renaming a volume by hand changes nothing
-/// but the label.
-///
-/// It still names the repository, so an identity change relabels every volume — but because the
-/// label is not an authority, a relabel interrupted partway leaves nothing but a cosmetic
-/// disagreement, which is why recovery does not have to redo it.
-pub fn volume_label(repo: &RepoId, workspace: &WorkspaceName) -> String {
-    if workspace.is_main() {
-        repo.repo().to_owned()
-    } else {
-        format!("{} — {}", repo.repo(), workspace.as_str())
-    }
 }
 
 #[cfg(test)]
