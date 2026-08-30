@@ -506,7 +506,6 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
          cowshed: /etc/fstab already pins the boot mounts\n\
          cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
          cowshed: everything already set up\n\
-         next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
     assert_eq!(
@@ -729,7 +728,6 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
          cowshed: pinned the boot mounts in /etc/fstab\n\
          cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
-         next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
     let announcement = streams
@@ -806,7 +804,6 @@ async fn an_existing_volume_announces_its_identity_size_and_destination() {
          cowshed: pinned the boot mounts in /etc/fstab\n\
          cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
          cowshed: host storage is set up (one administrator authorization was used)\n\
-         next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
     assert!(!streams.stderr.contains("provision"));
@@ -983,7 +980,6 @@ async fn a_run_that_cannot_escalate_never_mentions_authorization() {
          cowshed: /etc/fstab already pins the boot mounts\n\
          cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
          cowshed: host storage is set up\n\
-         next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
 }
@@ -1035,7 +1031,6 @@ async fn a_volume_in_another_container_is_reported_and_left_alone() {
          cowshed: /etc/fstab not pinned: no cowshed volume in the home container\n\
          cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
          cowshed: host storage is partially set up: 2 volumes live outside this host's container and left untouched\n\
-         next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
     assert!(!streams.stderr.contains("absent"));
@@ -1092,7 +1087,6 @@ async fn json_emits_one_frozen_envelope_and_no_prose_on_stdout() {
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
          cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
-         next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
 }
@@ -1130,7 +1124,6 @@ async fn quiet_suppresses_rows_but_never_the_prompt_announcement_or_the_hint() {
         streams.stderr,
         "cowshed: setup will request administrator authorization once, for the actions below\n\
          cowshed: cowshed.store does not exist yet and will be created in container disk3, then mounted at /private/cowshed/store\n\
-         next: cowshed doctor\n\
          next: cowshed adopt\n"
     );
     assert_eq!(streams.stdout, "");
@@ -1255,8 +1248,7 @@ async fn uninstall_removes_host_presence_and_names_what_survives() {
          cowshed: dev.cowshed.sccache agent: already absent\n\
          cowshed: installed cowshed binary: removed\n\
          cowshed: removed cowshed's /etc/fstab pins\n\
-         cowshed: cowshed's host presence is removed; no workspaces existed and no volume was touched\n\
-         next: cowshed doctor\n"
+         cowshed: cowshed's host presence is removed; no workspaces existed and no volume was touched\n"
     );
     // The census is taken before anything is removed: a refusal must cost the host nothing.
     assert_eq!(
@@ -1383,7 +1375,7 @@ async fn uninstall_json_reports_the_services_the_adapter_removed() {
          {\"what\":\"installed sccache binary\",\"outcome\":\"already-absent\"}\
          ]}}\n"
     );
-    assert_eq!(streams.stderr, "next: cowshed doctor\n");
+    assert_eq!(streams.stderr, "");
 }
 
 /// A teardown that found nothing installed still reports the empty list rather than omitting it,
@@ -1540,7 +1532,6 @@ async fn setup_mount_root_prints_the_configured_path() {
             .stderr
             .contains("workspace mount root is /Users/dev/.cowshed/mnt")
     );
-    assert!(streams.stderr.contains("next: cowshed doctor"));
     assert_eq!(
         host.events,
         ["configure-mount-root:/Users/dev/.cowshed/mnt"]
@@ -1610,7 +1601,7 @@ async fn an_unmounted_main_downgrades_both_healthy_status_lines() {
 
     let streams = run(&mut host, REPAIR, false, false).await;
 
-    // Exit stays 0: setup reports what it found, and `doctor` owns the verdict (06_cli.md).
+    // Exit stays 0: setup reports what it found; gateway start remounts mains.
     assert_eq!(streams.exit, 0);
     assert_eq!(
         streams.stderr,
@@ -1618,7 +1609,6 @@ async fn an_unmounted_main_downgrades_both_healthy_status_lines() {
          cowshed: /etc/fstab already pins the boot mounts\n\
          cowshed: /Users/dev/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache\n\
          cowshed: everything already set up, but 1 main workspace is not mounted: acme/api\n\
-         next: cowshed doctor\n\
          next: cowshed gateway start\n"
     );
 
