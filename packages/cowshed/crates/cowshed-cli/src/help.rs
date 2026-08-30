@@ -32,6 +32,8 @@ impl Opt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     pub name: &'static str,
+    /// Sentence clap's missing-argument path and `require_*` share.
+    pub missing: &'static str,
     /// Positional grammar between the verb and its options; empty when the verb takes none.
     pub args: &'static str,
     /// Positional grammar that has to follow the options, like `exec`'s child argv.
@@ -136,6 +138,17 @@ pub const GLOBALS: &[Opt] = &[
         meaning: "name the adopted repository instead of discovering it from the cwd",
     },
 ];
+
+/// Coordinator preconditions shared by `push`, `rebase`, and `land`.
+pub const EXPECTED_WORKSPACE_INCARNATION: Opt = Opt {
+    spelling: "--expected-workspace-incarnation <id>",
+    meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
+};
+
+pub const EXPECTED_SOURCE_HEAD: Opt = Opt {
+    spelling: "--expected-source-head <oid>",
+    meaning: "refuse unless the workspace HEAD is still this commit",
+};
 
 /// A command's flags are named in the map while their bracket group stays this narrow; past it the
 /// map says `[options]`, because a group wider than the grammar column beside it stops being an

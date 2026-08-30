@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use crate::help::{self, CommandSpec, Opt};
+use crate::help::{self, CommandSpec, EXPECTED_SOURCE_HEAD, EXPECTED_WORKSPACE_INCARNATION, Opt};
 
 /// Every command, in the order the command map lists them.
 ///
@@ -826,7 +826,7 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
         | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         | ErrorKind::MissingSubcommand => match spec {
             None => UsageError::missing_command(),
-            Some(spec) => UsageError::new(missing_required_message(spec), spec),
+            Some(spec) => UsageError::new(spec.missing, spec),
         },
         ErrorKind::InvalidSubcommand => {
             let name = context_string(&error, ContextKind::InvalidSubcommand)
@@ -887,25 +887,6 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                 UsageError::with_hint(message, "cowshed --help")
             }
         }
-    }
-}
-
-/// Clap's missing-argument fallback must say the same thing as the hand-written
-/// `require_*` checks, so `cowshed new` never answers with two different sentences
-/// depending on which path noticed the gap.
-fn missing_required_message(spec: &CommandSpec) -> String {
-    match spec.name {
-        "gateway" | "sccache" | "skill" => format!("{} action is required", spec.name),
-        "new" => String::from("new requires a workspace name"),
-        "fork" => String::from("fork requires a source workspace"),
-        "mv" => String::from("mv requires a workspace"),
-        "restore" => String::from("restore requires a workspace"),
-        "exec" => String::from("exec requires a workspace"),
-        "rm" => String::from("rm requires a workspace"),
-        "detach" => String::from("detach requires a workspace"),
-        "resize" => String::from("resize requires a workspace"),
-        "land" => String::from("land requires a workspace"),
-        _ => format!("{} requires an argument", spec.name),
     }
 }
 
@@ -1029,6 +1010,7 @@ fn reject_project(
 
 const GATEWAY: CommandSpec = CommandSpec {
     name: "gateway",
+    missing: "gateway action is required",
     args: "<start|stop|status|run>",
     trailing: "",
     summary: "manage the host gateway",
@@ -1048,7 +1030,7 @@ fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
     reject_project(global, USAGE, "--project is not valid for gateway commands")?;
     let (action, child) = matches
         .subcommand()
-        .ok_or_else(|| UsageError::new("gateway action is required", USAGE))?;
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
     let command = match action {
         "start" => GatewayCommand::Start,
         "stop" => GatewayCommand::Stop {
@@ -1068,6 +1050,7 @@ fn parse_gateway(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
 
 const SCCACHE: CommandSpec = CommandSpec {
     name: "sccache",
+    missing: "sccache action is required",
     args: "<start|stop|status>",
     trailing: "",
     summary: "manage the host sccache daemon",
@@ -1086,7 +1069,7 @@ fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
     reject_project(global, USAGE, "--project is not valid for sccache commands")?;
     let (action, child) = matches
         .subcommand()
-        .ok_or_else(|| UsageError::new("sccache action is required", USAGE))?;
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
     let command = match action {
         "start" => SccacheCommand::Start {
             capacity: os(child, "capacity"),
@@ -1105,6 +1088,7 @@ fn parse_sccache(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command
 
 const SKILL: CommandSpec = CommandSpec {
     name: "skill",
+    missing: "skill action is required",
     args: "install",
     trailing: "",
     summary: "install the agent skill",
@@ -1122,7 +1106,7 @@ fn parse_skill(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     const USAGE: &CommandSpec = &SKILL;
     let (action, child) = matches
         .subcommand()
-        .ok_or_else(|| UsageError::new("skill action is required", USAGE))?;
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
     if action != "install" {
         return Err(UsageError::new(
             format!("unknown skill action `{action}`"),
@@ -1179,6 +1163,7 @@ fn parse_adopt(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const ADOPT: CommandSpec = CommandSpec {
     name: "adopt",
+    missing: "adopt requires an argument",
     args: "[path]",
     trailing: "",
     summary: "adopt a checkout",
@@ -1205,6 +1190,7 @@ const ADOPT: CommandSpec = CommandSpec {
 
 const SETUP: CommandSpec = CommandSpec {
     name: "setup",
+    missing: "setup requires an argument",
     args: "",
     trailing: "",
     summary: "create or repair host storage",
@@ -1265,6 +1251,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
 
 const NEW: CommandSpec = CommandSpec {
     name: "new",
+    missing: "new requires a workspace name",
     args: "<name>",
     trailing: "",
     summary: "create a workspace",
@@ -1308,13 +1295,7 @@ fn parse_new(matches: &ArgMatches) -> Result<Command, UsageError> {
         return Err(UsageError::new("--ref conflicts with --from", USAGE));
     }
     Ok(Command::New(NewArgs {
-        name: require_workspace(
-            matches,
-            "name",
-            true,
-            USAGE,
-            "new requires a workspace name",
-        )?,
+        name: require_workspace(matches, "name", true, USAGE, USAGE.missing)?,
         reference,
         from,
         browse: flagged(matches, "browse"),
@@ -1326,6 +1307,7 @@ fn parse_new(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const FORK: CommandSpec = CommandSpec {
     name: "fork",
+    missing: "fork requires a source workspace",
     args: "<src> <dst>",
     trailing: "",
     summary: "fork a workspace",
@@ -1338,13 +1320,7 @@ const FORK: CommandSpec = CommandSpec {
 fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &FORK;
     Ok(Command::Fork(ForkArgs {
-        source: require_workspace(
-            matches,
-            "src",
-            false,
-            USAGE,
-            "fork requires a source workspace",
-        )?,
+        source: require_workspace(matches, "src", false, USAGE, USAGE.missing)?,
         destination: require_workspace(
             matches,
             "dst",
@@ -1357,6 +1333,7 @@ fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const MOVE: CommandSpec = CommandSpec {
     name: "mv",
+    missing: "mv requires a workspace",
     args: "<ws> <new-name> | main <path>",
     trailing: "",
     summary: "rename a workspace, move/re-identify main",
@@ -1373,7 +1350,7 @@ const MOVE: CommandSpec = CommandSpec {
 
 fn parse_move(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &MOVE;
-    let source = require_workspace(matches, "src", false, USAGE, "mv requires a workspace")?;
+    let source = require_workspace(matches, "src", false, USAGE, USAGE.missing)?;
     let repo_id = os(matches, "repo-id");
     let destination = os(matches, "dst");
     let destination = match (source.as_str(), repo_id, destination) {
@@ -1440,6 +1417,7 @@ fn checkout_destination(value: &OsStr, usage: &'static CommandSpec) -> Result<Pa
 
 const CHECKPOINT: CommandSpec = CommandSpec {
     name: "checkpoint",
+    missing: "checkpoint requires an argument",
     args: "[<ws>] [label]",
     trailing: "",
     summary: "create a checkpoint",
@@ -1463,6 +1441,7 @@ fn parse_checkpoint(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const RESTORE: CommandSpec = CommandSpec {
     name: "restore",
+    missing: "restore requires a workspace",
     args: "<ws> <label>",
     trailing: "",
     summary: "restore a checkpoint",
@@ -1475,13 +1454,7 @@ const RESTORE: CommandSpec = CommandSpec {
 fn parse_restore(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &RESTORE;
     Ok(Command::Restore(RestoreArgs {
-        workspace: require_workspace(
-            matches,
-            "workspace",
-            false,
-            USAGE,
-            "restore requires a workspace",
-        )?,
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
         label: os(matches, "label")
             .ok_or_else(|| UsageError::new("restore requires a label", USAGE))?,
     }))
@@ -1489,6 +1462,7 @@ fn parse_restore(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const LIST: CommandSpec = CommandSpec {
     name: "ls",
+    missing: "ls requires an argument",
     args: "",
     trailing: "",
     summary: "list workspaces",
@@ -1523,6 +1497,7 @@ fn parse_list(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const PATH: CommandSpec = CommandSpec {
     name: "path",
+    missing: "path requires an argument",
     args: "[<ws>]",
     trailing: "",
     summary: "print a workspace mount",
@@ -1560,6 +1535,7 @@ fn parse_path(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const EXEC: CommandSpec = CommandSpec {
     name: "exec",
+    missing: "exec requires a workspace",
     args: "<ws>",
     trailing: "-- <cmd...>",
     summary: "run an argv command",
@@ -1658,13 +1634,7 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
         .map(|value| workspace_name(&value, false, USAGE))
         .transpose()?;
     Ok(Command::Exec(ExecArgs {
-        workspace: require_workspace(
-            matches,
-            "workspace",
-            false,
-            USAGE,
-            "exec requires a workspace",
-        )?,
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
         argv,
         stdin,
         read_only: flagged(matches, "ro"),
@@ -1683,6 +1653,7 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
 /// is why no refusal names the flag that would override it.
 const REMOVE: CommandSpec = CommandSpec {
     name: "rm",
+    missing: "rm requires a workspace",
     args: "<ws>",
     trailing: "",
     summary: "remove a workspace",
@@ -1709,13 +1680,7 @@ const REMOVE: CommandSpec = CommandSpec {
 
 fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &REMOVE;
-    let workspace = require_workspace(
-        matches,
-        "workspace",
-        false,
-        USAGE,
-        "rm requires a workspace",
-    )?;
+    let workspace = require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?;
     let restore = flagged(matches, "restore");
     let abandon = flagged(matches, "abandon");
     if restore && workspace != "main" {
@@ -1740,6 +1705,7 @@ fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const ATTACH: CommandSpec = CommandSpec {
     name: "attach",
+    missing: "attach requires an argument",
     args: "[ws]",
     trailing: "",
     summary: "attach session workspace(s)",
@@ -1783,6 +1749,7 @@ fn parse_attach(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const DETACH: CommandSpec = CommandSpec {
     name: "detach",
+    missing: "detach requires a workspace",
     args: "[ws]",
     trailing: "",
     summary: "detach session workspace(s)",
@@ -1812,13 +1779,14 @@ fn parse_detach(matches: &ArgMatches) -> Result<Command, UsageError> {
         ));
     }
     if !all && workspace.is_none() {
-        return Err(UsageError::new("detach requires a workspace", USAGE));
+        return Err(UsageError::new(USAGE.missing, USAGE));
     }
     Ok(Command::Detach(DetachArgs { workspace, all }))
 }
 
 const RESIZE: CommandSpec = CommandSpec {
     name: "resize",
+    missing: "resize requires a workspace",
     args: "<ws|main> <size>",
     trailing: "",
     summary: "grow a workspace image",
@@ -1831,13 +1799,7 @@ const RESIZE: CommandSpec = CommandSpec {
 fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &RESIZE;
     Ok(Command::Resize(ResizeArgs {
-        workspace: require_workspace(
-            matches,
-            "workspace",
-            false,
-            USAGE,
-            "resize requires a workspace",
-        )?,
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
         capacity: os(matches, "size")
             .ok_or_else(|| UsageError::new("resize requires a size", USAGE))?,
     }))
@@ -1845,6 +1807,7 @@ fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const GC: CommandSpec = CommandSpec {
     name: "gc",
+    missing: "gc requires an argument",
     args: "",
     trailing: "",
     summary: "free storage",
@@ -1869,6 +1832,7 @@ fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const PUSH: CommandSpec = CommandSpec {
     name: "push",
+    missing: "push requires an argument",
     args: "[<ws>]",
     trailing: "",
     summary: "preserve a workspace ref",
@@ -1881,14 +1845,8 @@ const PUSH: CommandSpec = CommandSpec {
             spelling: "--branch <name>",
             meaning: "destination branch in main's repository instead of the workspace's own",
         },
-        Opt {
-            spelling: "--expected-workspace-incarnation <id>",
-            meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
-        },
-        Opt {
-            spelling: "--expected-source-head <oid>",
-            meaning: "refuse unless the workspace HEAD is still this commit",
-        },
+        EXPECTED_WORKSPACE_INCARNATION,
+        EXPECTED_SOURCE_HEAD,
         Opt {
             spelling: "--expected-destination-head <oid|missing>",
             meaning: "refuse unless the destination branch is still this commit, or `missing` for one that must not exist yet",
@@ -1909,6 +1867,7 @@ fn parse_push(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const REBASE: CommandSpec = CommandSpec {
     name: "rebase",
+    missing: "rebase requires an argument",
     args: "[<ws>]",
     trailing: "",
     summary: "rebase a workspace",
@@ -1920,14 +1879,8 @@ const REBASE: CommandSpec = CommandSpec {
             spelling: "--onto <rev>",
             meaning: "rebase onto this revision instead of main",
         },
-        Opt {
-            spelling: "--expected-workspace-incarnation <id>",
-            meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
-        },
-        Opt {
-            spelling: "--expected-source-head <oid>",
-            meaning: "refuse unless the workspace HEAD is still this commit",
-        },
+        EXPECTED_WORKSPACE_INCARNATION,
+        EXPECTED_SOURCE_HEAD,
         Opt {
             spelling: "--expected-onto-head <oid>",
             meaning: "refuse unless the revision being rebased onto is still this commit",
@@ -1948,6 +1901,7 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const LAND: CommandSpec = CommandSpec {
     name: "land",
+    missing: "land requires a workspace",
     args: "<ws>",
     trailing: "",
     summary: "land a workspace",
@@ -1972,14 +1926,8 @@ const LAND: CommandSpec = CommandSpec {
             spelling: "--push-only",
             meaning: "stop after validation and delivery, for review-gated flows",
         },
-        Opt {
-            spelling: "--expected-workspace-incarnation <id>",
-            meaning: "refuse unless the workspace is still this incarnation; read workspaceIncarnation from `cowshed ls --json`",
-        },
-        Opt {
-            spelling: "--expected-source-head <oid>",
-            meaning: "refuse unless the workspace HEAD is still this commit",
-        },
+        EXPECTED_WORKSPACE_INCARNATION,
+        EXPECTED_SOURCE_HEAD,
         Opt {
             spelling: "--expected-target-head <oid|missing>",
             meaning: "refuse unless the target branch is still this commit, or `missing` for one that must not exist yet",
@@ -1994,13 +1942,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
         .map(|values| values.cloned().collect())
         .unwrap_or_default();
     Ok(Command::Land(LandArgs {
-        workspace: require_workspace(
-            matches,
-            "workspace",
-            false,
-            USAGE,
-            "land requires a workspace",
-        )?,
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
         target: os(matches, "target"),
         checks,
         retire: !flagged(matches, "no-retire"),
@@ -2013,6 +1955,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
 
 const DOCTOR: CommandSpec = CommandSpec {
     name: "doctor",
+    missing: "doctor requires an argument",
     args: "",
     trailing: "",
     summary: "check invariants",
@@ -2065,10 +2008,10 @@ fn workspace_name(
         Err(MetadataError::ReservedSessionName) => {
             Err(UsageError::new("workspace name `main` is reserved", usage))
         }
-        Err(_) => Err(UsageError::new(
-            "workspace names must match [a-z0-9][a-z0-9-]{0,63}",
-            usage,
-        )),
+        Err(MetadataError::InvalidWorkspaceName(_)) => {
+            Err(UsageError::new(WorkspaceName::USAGE, usage))
+        }
+        Err(error) => Err(UsageError::new(error.to_string(), usage)),
     }
 }
 
@@ -2885,7 +2828,7 @@ mod tests {
             let error = parse_args(arguments.iter().copied()).unwrap_err();
             assert_eq!(error.message, message, "{arguments:?}");
             assert_eq!(
-                missing_required_message(help::command_named(arguments[0]).unwrap()),
+                help::command_named(arguments[0]).unwrap().missing,
                 message,
                 "{arguments:?} clap fallback drifted"
             );
