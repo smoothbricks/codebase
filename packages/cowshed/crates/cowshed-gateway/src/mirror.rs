@@ -13,7 +13,7 @@ use url::Url;
 use crate::{
     cache::{
         Cache, CacheAcquire, CacheBodyError, CacheError, CacheKey, CacheNamespace, CachedResponse,
-        ObjectDigest, ObjectExpectation,
+        ObjectDigest, ObjectExpectation, hex_decode,
     },
     interfaces::UpstreamHealth,
     policy::{CanonicalTarget, MirrorProtocol, normalize_path},
@@ -618,7 +618,7 @@ fn validate_cargo_index(bytes: &[u8]) -> Result<(), MirrorError> {
             .get("cksum")
             .and_then(Value::as_str)
             .ok_or(MirrorError::MissingIntegrity)?;
-        if name.is_empty() || version.is_empty() || decode_hex_32(checksum).is_none() {
+        if name.is_empty() || version.is_empty() || hex_decode::<32>(checksum).is_err() {
             return Err(MirrorError::InvalidMetadata);
         }
         entries += 1;
@@ -922,22 +922,11 @@ fn parse_protocol_expectation(
     };
     let digest = integrity
         .strip_prefix("sha256-")
-        .and_then(decode_hex_32)
+        .and_then(|hex| hex_decode::<32>(hex).ok())
         .map(ObjectDigest::Sha256)
         .or_else(|| parse_sri(&integrity))
         .ok_or(MirrorError::MissingIntegrity)?;
     Ok(Some(ObjectExpectation { length, digest }))
-}
-
-fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64 {
-        return None;
-    }
-    let mut decoded = [0; 32];
-    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        decoded[index] = (hex(pair[0]).ok()? << 4) | hex(pair[1]).ok()?;
-    }
-    Some(decoded)
 }
 
 fn classify_npm(path: &str) -> Result<(MirrorResourceKind, String), MirrorError> {
