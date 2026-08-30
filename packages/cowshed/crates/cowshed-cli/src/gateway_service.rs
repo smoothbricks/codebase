@@ -922,6 +922,67 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    fn scratch_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("cowshed-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&root).expect("scratch root");
+        root
+    }
+
+    /// A gateway-owned directory is created through an `O_NOFOLLOW` open at exactly 0700, and a
+    /// symlink planted where one belongs is refused rather than written through.
+    ///
+    /// The second half is why the ancestor case is here too: the check this replaced was
+    /// `create_dir_all` and then `canonicalize(path) == path`, which refuses every legitimate
+    /// directory reached through a symlinked ancestor — a home on a linked volume, or any path
+    /// under macOS's own `/var` link — while still writing the tree before it noticed.
+    #[test]
+    fn a_gateway_directory_is_private_under_a_linked_ancestor_and_never_written_through_a_plant() {
+        let root = scratch_root("private-dir");
+        let real = root.join("real");
+        fs::create_dir_all(&real).expect("real parent");
+        let ancestor = root.join("linked");
+        std::os::unix::fs::symlink(&real, &ancestor).expect("link the ancestor");
+
+        let telemetry = ancestor.join("telemetry");
+        ensure_private_directory(&telemetry).expect("a linked ancestor is not a plant");
+        assert_eq!(
+            fs::symlink_metadata(real.join("telemetry"))
+                .expect("created")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_DIRECTORY_MODE
+        );
+
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("target of the plant");
+        let planted = root.join("planted");
+        std::os::unix::fs::symlink(&elsewhere, &planted).expect("plant the symlink");
+
+        ensure_private_directory(&planted).expect_err("a planted symlink is refused");
+        assert!(
+            fs::read_dir(&elsewhere)
+                .expect("target still readable")
+                .next()
+                .is_none(),
+            "nothing may be created through the link"
+        );
+        assert!(
+            fs::symlink_metadata(&planted)
+                .expect("plant survives")
+                .file_type()
+                .is_symlink(),
+            "the plant is left for the operator to look at"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The guidance for an unavailable gateway has to work on a host where the
     /// launch agent was never installed, which is where it is reached from
     /// first. `launchctl kickstart` fails there with "service not found".
