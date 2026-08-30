@@ -51,6 +51,26 @@ export interface WorkspaceInfo {
   readonly createdAt?: string;
   readonly checkpoints: readonly CheckpointInfo[];
   readonly snapshotStale: boolean;
+  /** Present only when the caller asked to pay for the landing measurement. */
+  readonly landing?: WorkspaceLanding;
+}
+
+/** Where a workspace's commits stand relative to the branch that outlives it. */
+export type LandingCommits =
+  | {
+      readonly state: 'measured';
+      readonly targetBranch: string;
+      readonly targetHead: string;
+      readonly unlanded: number;
+      readonly landed: number;
+      readonly behind: number;
+    }
+  | { readonly state: 'indeterminate'; readonly reason: string };
+
+export interface WorkspaceLanding {
+  /** Dirty working-tree paths; absent when the tree could not be read (a different fact from clean). */
+  readonly dirtyFiles?: number;
+  readonly commits: LandingCommits;
 }
 
 export interface PortBlock {
