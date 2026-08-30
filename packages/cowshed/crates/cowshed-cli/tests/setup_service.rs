@@ -57,6 +57,7 @@ fn setup_plan(actions: Vec<HostAction>, requires_authorization: bool) -> HostSet
         .any(|action| matches!(action, HostAction::CreateVolume { .. }));
     HostSetupPlan {
         actions,
+        volumes: Vec::new(),
         non_destructive,
         requires_authorization,
     }

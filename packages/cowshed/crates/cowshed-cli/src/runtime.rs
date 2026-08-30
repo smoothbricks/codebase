@@ -31,9 +31,8 @@ use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
-    APFS_CACHES_VOLUME, APFS_STORE_VOLUME, CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan,
-    HostSetupReport, MOUNT_SERVICE_PLIST, STORE_ROOT, ValidatedHostStorage, execute_host_setup,
-    plan_host_setup,
+    CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
+    STORE_ROOT, ValidatedHostStorage, VolumeRole, VolumeState, execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
@@ -2496,29 +2495,47 @@ fn host_action_evidence(action: &HostAction) -> String {
 /// `mounted_at`, the place the volume actually is, and `path` carries the canonical root, which is
 /// what a repair works towards.
 ///
+/// Classification comes from the planner's own [`VolumeState`] on the plan, never from the action
+/// list: an action-derived guess collapses states the planner distinguishes (a volume in a
+/// foreign container plans the same `MountExisting` as a merely detached one, and doctor must
+/// name the foreign container the way `setup` does). Actions are consulted only to enrich a
+/// message with the uuid and size the state does not carry.
+///
 /// The expected roots come from [`STORE_ROOT`] and [`CACHES_ROOT`] rather than from literals here:
-/// the actions in the plan carry core's canonical mountpoint, and a second copy of it in the CLI
-/// is a copy that can disagree with the volume the planner actually looked at.
+/// a second copy of them in the CLI is a copy that can disagree with the volume the planner
+/// actually looked at.
 fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
     let mut findings = Vec::new();
-    for (name, expected) in [
-        (APFS_STORE_VOLUME, Path::new(STORE_ROOT)),
-        (APFS_CACHES_VOLUME, Path::new(CACHES_ROOT)),
-    ] {
-        let action = plan.actions.iter().find(|action| {
-            matches!(
-                action,
-                HostAction::CreateVolume { name: action_name, .. }
-                    | HostAction::MountExisting { name: action_name, .. }
-                    | HostAction::RepairMounted { name: action_name, .. }
-                    if action_name == name
-            )
-        });
-        let finding = match action {
-            // No action for this volume means `MountedValid`, which is only reached for a volume
-            // mounted at its canonical root — so here, and only here, observed and expected are
-            // the same path by construction rather than by assumption.
-            None => Finding {
+    for volume in &plan.volumes {
+        let name = volume.name.as_str();
+        let expected = match volume.role {
+            VolumeRole::Store => Path::new(STORE_ROOT),
+            VolumeRole::Caches => Path::new(CACHES_ROOT),
+            // No canonical root to compare against on this doctor surface.
+            VolumeRole::Projects => continue,
+        };
+        // uuid/size ride on the planned mount/repair action, not on the state.
+        let identity = plan
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                HostAction::MountExisting {
+                    name: action_name,
+                    uuid,
+                    size_bytes,
+                    ..
+                }
+                | HostAction::RepairMounted {
+                    name: action_name,
+                    uuid,
+                    size_bytes,
+                    ..
+                } if action_name == name => Some(format!(" ({uuid}, {size_bytes} bytes)")),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let finding = match &volume.state_before {
+            VolumeState::MountedValid => Finding {
                 code: "host-volume".into(),
                 severity: FindingSeverity::Info,
                 message: format!(
@@ -2528,76 +2545,87 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
                 hint: String::new(),
                 path: Some(expected.to_owned()),
             },
-            Some(HostAction::CreateVolume {
-                container,
-                mount_at,
-                ..
-            }) => Finding {
-                code: "host-volume-absent".into(),
-                severity: FindingSeverity::Error,
-                message: format!(
-                    "{name}: absent from APFS container {container}; expected mount {}; marker absent",
-                    mount_at.display()
-                ),
-                hint: "cowshed setup".into(),
-                path: Some(mount_at.clone()),
-            },
-            Some(HostAction::MountExisting {
-                uuid,
-                size_bytes,
-                mount_at,
-                ..
-            }) => Finding {
+            VolumeState::Absent => {
+                let container = plan.actions.iter().find_map(|action| match action {
+                    HostAction::CreateVolume {
+                        name: action_name,
+                        container,
+                        ..
+                    } if action_name == name => Some(container.as_str()),
+                    _ => None,
+                });
+                Finding {
+                    code: "host-volume-absent".into(),
+                    severity: FindingSeverity::Error,
+                    message: match container {
+                        Some(container) => format!(
+                            "{name}: absent from APFS container {container}; expected mount {}; marker absent",
+                            expected.display()
+                        ),
+                        None => format!(
+                            "{name}: absent; expected mount {}; marker absent",
+                            expected.display()
+                        ),
+                    },
+                    hint: "cowshed setup".into(),
+                    path: Some(expected.to_owned()),
+                }
+            }
+            VolumeState::Detached => Finding {
                 code: "mount".into(),
                 severity: FindingSeverity::Error,
                 message: format!(
-                    "{name}: present ({uuid}, {size_bytes} bytes), not mounted; expected {}; marker unavailable while detached",
-                    mount_at.display()
+                    "{name}: present{identity}, not mounted; expected {}; marker unavailable while detached",
+                    expected.display()
                 ),
                 hint: "cowshed setup".into(),
-                path: Some(mount_at.clone()),
+                path: Some(expected.to_owned()),
             },
-            Some(HostAction::RepairMounted {
-                uuid,
-                size_bytes,
-                mounted_at,
-                mount_at,
-                ..
-            }) if mounted_at == mount_at => Finding {
+            VolumeState::MountedIncomplete => Finding {
                 code: "marker".into(),
                 severity: FindingSeverity::Error,
                 message: format!(
-                    "{name}: present ({uuid}, {size_bytes} bytes), mounted at {}; marker missing or invalid",
-                    mounted_at.display()
+                    "{name}: present{identity}, mounted at {}; marker missing or invalid",
+                    expected.display()
                 ),
                 hint: "cowshed setup".into(),
-                path: Some(mount_at.clone()),
+                path: Some(expected.to_owned()),
             },
-            Some(HostAction::RepairMounted {
-                uuid,
-                size_bytes,
-                mounted_at,
-                mount_at,
-                ..
-            }) => Finding {
+            VolumeState::MisMounted { mounted_at } => Finding {
                 code: "mount".into(),
                 severity: FindingSeverity::Error,
                 message: format!(
-                    "{name}: present ({uuid}, {size_bytes} bytes), mounted at {}; expected {}; marker will be validated after remount",
+                    "{name}: present{identity}, mounted at {}; expected {}; marker will be validated after remount",
                     mounted_at.display(),
-                    mount_at.display()
+                    expected.display()
                 ),
                 hint: "cowshed setup".into(),
-                path: Some(mount_at.clone()),
+                path: Some(expected.to_owned()),
             },
-            Some(
-                HostAction::EncryptVolume { .. }
-                | HostAction::PinFstab { .. }
-                | HostAction::ReclaimStubs { .. }
-                | HostAction::InstallMountService { .. },
-            ) => {
-                unreachable!("volume lookup only selects volume mount actions")
-            }
+            // The same vocabulary `setup` uses for this state: the container and device identify
+            // where the bytes actually are, and the trailing clause is the reassurance that
+            // nothing will touch them.
+            VolumeState::FoundElsewhere {
+                container,
+                device,
+                mounted_at,
+            } => Finding {
+                code: "mount".into(),
+                severity: FindingSeverity::Error,
+                message: match mounted_at {
+                    Some(mounted_at) => format!(
+                        "{name}: found outside this host's container (container {container}, device {device}), mounted at {}; expected {}; data is safe on {device}",
+                        mounted_at.display(),
+                        expected.display()
+                    ),
+                    None => format!(
+                        "{name}: found outside this host's container (container {container}, device {device}), not mounted; expected {}; data is safe on {device}",
+                        expected.display()
+                    ),
+                },
+                hint: "cowshed setup".into(),
+                path: Some(expected.to_owned()),
+            },
         };
         findings.push(finding);
     }
@@ -3126,8 +3154,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_core::storage::bootstrap::VolumeOutcome;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    fn planned_volume(name: &str, role: VolumeRole, state_before: VolumeState) -> VolumeOutcome {
+        VolumeOutcome {
+            name: name.to_owned(),
+            role,
+            state_before,
+            action: "planned".to_owned(),
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -3181,6 +3219,7 @@ mod tests {
                     uuid: "1111-2222".into(),
                     mount_at: PathBuf::from("/private/cowshed/store"),
                 }],
+                volumes: Vec::new(),
                 requires_authorization: true,
                 non_destructive: true,
             },
@@ -3223,6 +3262,16 @@ mod tests {
                 HostAction::InstallMountService {
                     label: "dev.cowshed.storage".into(),
                 },
+            ],
+            volumes: vec![
+                planned_volume(
+                    "cowshed.store",
+                    VolumeRole::Store,
+                    VolumeState::MisMounted {
+                        mounted_at: PathBuf::from("/Volumes/cowshed.store"),
+                    },
+                ),
+                planned_volume("cowshed.caches", VolumeRole::Caches, VolumeState::Detached),
             ],
             requires_authorization: true,
             non_destructive: true,
@@ -3272,6 +3321,13 @@ mod tests {
                 mounted_at: observed.clone(),
                 mount_at: PathBuf::from(STORE_ROOT),
             }],
+            volumes: vec![planned_volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::MisMounted {
+                    mounted_at: observed.clone(),
+                },
+            )],
             requires_authorization: true,
             non_destructive: true,
         };
@@ -3298,12 +3354,80 @@ mod tests {
         );
     }
 
+    /// A store found in a foreign container is the state the planner-classification hand-off
+    /// exists for: planned actions render it identically to a merely detached volume, so a doctor
+    /// reading actions would hide the one fact — whose container holds the bytes — that decides
+    /// whether `cowshed setup` is safe to run blind.
+    #[test]
+    fn a_volume_in_a_foreign_container_is_named_with_its_container_and_device() {
+        let plan = HostSetupPlan {
+            actions: vec![HostAction::MountExisting {
+                name: "cowshed.store".into(),
+                uuid: "STORE-UUID".into(),
+                size_bytes: 4096,
+                mount_at: PathBuf::from(STORE_ROOT),
+            }],
+            volumes: vec![planned_volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::FoundElsewhere {
+                    container: "disk4".into(),
+                    device: "disk4s7".into(),
+                    mounted_at: None,
+                },
+            )],
+            requires_authorization: true,
+            non_destructive: true,
+        };
+
+        let findings = host_storage_findings(&plan);
+        let store = findings
+            .iter()
+            .find(|finding| finding.message.starts_with("cowshed.store:"))
+            .expect("a finding for the store");
+
+        assert_eq!(store.code, "mount");
+        assert_eq!(store.severity, FindingSeverity::Error);
+        assert!(
+            store.message.contains("container disk4"),
+            "{}",
+            store.message
+        );
+        assert!(
+            store.message.contains("device disk4s7"),
+            "{}",
+            store.message
+        );
+        assert!(
+            store.message.contains("data is safe on disk4s7"),
+            "{}",
+            store.message
+        );
+        assert!(
+            store.message.contains(&format!("expected {STORE_ROOT}")),
+            "{}",
+            store.message
+        );
+    }
+
     /// The expected roots are core's, not a second copy in the CLI: a copy can disagree with the
     /// volume the planner actually looked at, and then the finding describes a host nobody has.
     #[test]
     fn expected_volume_roots_come_from_the_canonical_constants() {
         let findings = host_storage_findings(&HostSetupPlan {
             actions: Vec::new(),
+            volumes: vec![
+                planned_volume(
+                    "cowshed.store",
+                    VolumeRole::Store,
+                    VolumeState::MountedValid,
+                ),
+                planned_volume(
+                    "cowshed.caches",
+                    VolumeRole::Caches,
+                    VolumeState::MountedValid,
+                ),
+            ],
             requires_authorization: false,
             non_destructive: true,
         });
@@ -3341,6 +3465,11 @@ mod tests {
                 container: "disk3".into(),
                 mount_at: PathBuf::from("/private/cowshed/store"),
             }],
+            volumes: vec![planned_volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::Absent,
+            )],
             requires_authorization: true,
             non_destructive: false,
         };

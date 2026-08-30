@@ -26,15 +26,26 @@ pub enum NativeBootstrapMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostSetupPlan {
     pub actions: Vec<HostAction>,
+    /// The planner's own per-volume classification at planning time. Carried on the plan so a
+    /// consumer (the doctor) renders the state the planner observed instead of
+    /// reverse-engineering it from the action list — an action-derived guess collapses states
+    /// the planner distinguishes (a volume in a foreign container plans the same `MountExisting`
+    /// as a merely detached one).
+    pub volumes: Vec<VolumeOutcome>,
     pub requires_authorization: bool,
     pub non_destructive: bool,
 }
 
 impl HostSetupPlan {
-    pub fn new(actions: Vec<HostAction>, requires_authorization: bool) -> Self {
+    pub fn new(
+        actions: Vec<HostAction>,
+        volumes: Vec<VolumeOutcome>,
+        requires_authorization: bool,
+    ) -> Self {
         let non_destructive = actions.iter().all(HostAction::is_non_destructive);
         Self {
             actions,
+            volumes,
             requires_authorization,
             non_destructive,
         }

@@ -1301,6 +1301,7 @@ pub async fn plan_host_setup(home: &Path) -> crate::Result<HostSetupPlan> {
             .map_err(existing_host_storage_error)?;
         Ok(HostSetupPlan::new(
             host_setup_actions(&snapshot),
+            snapshot.volumes.clone(),
             setup_requires_authorization(&snapshot),
         ))
     }
@@ -4500,7 +4501,7 @@ mod tests {
                 .any(|action| matches!(action, HostAction::CreateVolume { .. }))
         );
         assert!(
-            HostSetupPlan::new(snapshot.actions, true).non_destructive,
+            HostSetupPlan::new(snapshot.actions, snapshot.volumes, true).non_destructive,
             "mounting existing volumes and reclaiming known stubs is non-destructive"
         );
     }
@@ -5544,6 +5545,7 @@ mod tests {
         )));
         let public_plan = HostSetupPlan::new(
             snapshot.actions.clone(),
+            snapshot.volumes.clone(),
             setup_requires_authorization(&snapshot),
         );
         assert!(!public_plan.non_destructive);
@@ -5584,7 +5586,8 @@ mod tests {
             ]
         );
         assert!(
-            HostSetupPlan::new(snapshot.actions.clone(), true).non_destructive,
+            HostSetupPlan::new(snapshot.actions.clone(), snapshot.volumes.clone(), true)
+                .non_destructive,
             "pinning existing volumes is non-destructive"
         );
 
