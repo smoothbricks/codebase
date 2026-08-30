@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a7518690553314b6f7a662450231b05b33c23e80e53a9c65d7acd495481d81da # shrinks to specs = [SpanSpec { trace: "trace-a", thread_id: 2, span_id: 2, parent: None, name: "handle-request", logs: [] }, SpanSpec { trace: "trace-a", thread_id: 1, span_id: 2, parent: Some((2, 2)), name: "render", logs: ["user {id} loaded"] }], child = Selector { template: Some("render"), constraints: [] }, parent = Selector { template: None, constraints: [("entry_type", Str("info"))] }
