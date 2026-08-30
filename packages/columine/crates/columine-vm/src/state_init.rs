@@ -20,6 +20,7 @@
 //! Malformed-but-length-valid bytecode with invalid slot-type nibbles returns
 //! `InvalidProgram`/0 rather than invoking undefined behavior.
 
+use crate::meta::SlotMetaView;
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
@@ -44,13 +45,56 @@ pub fn needs_growth_slot() -> u32 {
 pub const EVICTION_ENTRY_SIZE: u32 = size_of::<EvictionEntry>() as u32;
 /// Closed-form capacity of the optional evicted-row side buffer.
 pub const EVICTED_BUFFER_CAP: u32 = 1024;
-
-// =============================================================================
-// Struct layout helpers — initialization-specific formulas
-// =============================================================================
-
 /// Arena header: `[arena_capacity:u32][arena_used:u32]`.
 pub const ARENA_HEADER_SIZE: u32 = nested::ARENA_HDR_SIZE;
+
+/// Struct-map / ordered-list overlays of the TTL/grace metadata fields.
+const STRUCT_NUM_FIELDS: u32 = SlotMetaOffset::AGG_TYPE;
+const STRUCT_BITSET_BYTES: u32 = SlotMetaOffset::TIMESTAMP_FIELD_IDX;
+const STRUCT_ROW_SIZE: u32 = SlotMetaOffset::TTL_SECONDS;
+const STRUCT_KIND_BYTE: u32 = SlotMetaOffset::TTL_SECONDS + 2;
+const STRUCT_ARENA_HDR: u32 = SlotMetaOffset::GRACE_SECONDS;
+
+fn write_overlay_meta(
+    state: &mut [u8],
+    meta_base: u32,
+    data_offset: u32,
+    capacity: u32,
+    type_flags_byte: u8,
+    num_fields: u8,
+    bitset_bytes: u8,
+    row_size: u16,
+    kind_byte: u8,
+) {
+    bytes::write_u32(state, meta_base + SlotMetaOffset::OFFSET, data_offset);
+    bytes::write_u32(state, meta_base + SlotMetaOffset::CAPACITY, capacity);
+    bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, 0);
+    state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = type_flags_byte;
+    state[(meta_base + STRUCT_NUM_FIELDS) as usize] = num_fields;
+    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
+    state[(meta_base + STRUCT_BITSET_BYTES) as usize] = bitset_bytes;
+    bytes::write_u16(state, meta_base + STRUCT_ROW_SIZE, row_size);
+    state[(meta_base + STRUCT_KIND_BYTE) as usize] = kind_byte;
+    let pad_from = (meta_base + STRUCT_KIND_BYTE + 1) as usize;
+    let pad_to = (meta_base + SLOT_META_SIZE) as usize;
+    state[pad_from..pad_to].fill(0);
+}
+
+fn overlay_num_fields(state: &[u8], meta_base: u32) -> u32 {
+    u32::from(state[(meta_base + STRUCT_NUM_FIELDS) as usize])
+}
+
+fn overlay_row_size(state: &[u8], meta_base: u32) -> u32 {
+    u32::from(bytes::read_u16(state, meta_base + STRUCT_ROW_SIZE))
+}
+
+fn overlay_kind_byte(state: &[u8], meta_base: u32) -> u8 {
+    state[(meta_base + STRUCT_KIND_BYTE) as usize]
+}
+
+fn overlay_arena_hdr(state: &[u8], meta_base: u32) -> u32 {
+    bytes::read_u32(state, meta_base + STRUCT_ARENA_HDR)
+}
 
 /// Initial arena capacity: 64 bytes per hash entry.
 /// This helper is deliberately distinct from the general type sizing helper.
@@ -574,9 +618,9 @@ fn write_slot_meta(
 ) {
     let meta = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
 
-    bytes::write_u32(state, meta, data_offset);
-    bytes::write_u32(state, meta + 4, capacity);
-    bytes::write_u32(state, meta + 8, 0); // size
+    bytes::write_u32(state, meta + SlotMetaOffset::OFFSET, data_offset);
+    bytes::write_u32(state, meta + SlotMetaOffset::CAPACITY, capacity);
+    bytes::write_u32(state, meta + SlotMetaOffset::SIZE, 0);
 
     state[(meta + SlotMetaOffset::TYPE_FLAGS) as usize] = type_flags.to_byte();
     state[(meta + SlotMetaOffset::AGG_TYPE) as usize] = agg_type_byte;
@@ -586,16 +630,27 @@ fn write_slot_meta(
     bytes::write_f32(state, meta + SlotMetaOffset::TTL_SECONDS, ttl_seconds);
     bytes::write_f32(state, meta + SlotMetaOffset::GRACE_SECONDS, grace_seconds);
 
-    bytes::write_u32(state, meta + 24, eviction_index_offset);
-    bytes::write_u32(state, meta + 28, eviction_index_capacity);
-    bytes::write_u32(state, meta + 32, 0); // eviction_index_size
-    bytes::write_u32(state, meta + 36, evicted_buffer_offset);
-    bytes::write_u32(state, meta + 40, 0); // evicted_count
+    bytes::write_u32(
+        state,
+        meta + SlotMetaOffset::EVICTION_INDEX_OFFSET,
+        eviction_index_offset,
+    );
+    bytes::write_u32(
+        state,
+        meta + SlotMetaOffset::EVICTION_INDEX_CAPACITY,
+        eviction_index_capacity,
+    );
+    bytes::write_u32(state, meta + SlotMetaOffset::EVICTION_INDEX_SIZE, 0);
+    bytes::write_u32(
+        state,
+        meta + SlotMetaOffset::EVICTED_BUFFER_OFFSET,
+        evicted_buffer_offset,
+    );
+    bytes::write_u32(state, meta + SlotMetaOffset::EVICTED_COUNT, 0);
 
     state[(meta + SlotMetaOffset::START_OF) as usize] = start_of;
-    state[(meta + 45) as usize] = 0;
-    state[(meta + 46) as usize] = 0;
-    state[(meta + 47) as usize] = 0;
+    state[(meta + SlotMetaOffset::START_OF + 1) as usize..meta as usize + SLOT_META_SIZE as usize]
+        .fill(0);
 }
 
 /// Initialize a state buffer. `state` must be at least
@@ -852,21 +907,17 @@ pub fn init_state(
             let layout = compute_struct_row_layout_padded(num_fields, &field_types);
             let meta_base = STATE_HEADER_SIZE + u32::from(slot) * SLOT_META_SIZE;
 
-            bytes::write_u32(state, meta_base, data_offset);
-            bytes::write_u32(state, meta_base + 4, capacity);
-            bytes::write_u32(state, meta_base + 8, 0); // size
-            state[(meta_base + 12) as usize] = type_flags.to_byte();
-            // Byte 13 (AGG_TYPE) is reused for num_fields; byte 15
-            // (TIMESTAMP_FIELD_IDX) for bitset_bytes; bytes 16-17
-            // (TTL_SECONDS low half) for row_size; byte 18 for has_timestamps.
-            state[(meta_base + 13) as usize] = num_fields;
-            state[(meta_base + 14) as usize] = 0; // change_flags
-            state[(meta_base + 15) as usize] = layout.bitset_bytes as u8;
-            bytes::write_u16(state, meta_base + 16, layout.row_size as u16);
-            state[(meta_base + 18) as usize] = 0; // has_timestamps (0 for UPSERT_LAST)
-            for off in 19..SLOT_META_SIZE {
-                state[(meta_base + off) as usize] = 0;
-            }
+            write_overlay_meta(
+                state,
+                meta_base,
+                data_offset,
+                capacity,
+                type_flags.to_byte(),
+                num_fields,
+                layout.bitset_bytes as u8,
+                layout.row_size as u16,
+                0,
+            );
 
             // Field descriptor, exact key lane(s), then zeroed rows.
             bytes::copy(state, data_offset, &field_types, 0, u32::from(num_fields));
@@ -889,8 +940,8 @@ pub fn init_state(
 
             if has_array_fields(num_fields, &field_types) {
                 let arena_cap = arena_initial_capacity_64(capacity);
-                // Arena header offset lives in metadata bytes 20-23.
-                bytes::write_u32(state, meta_base + 20, data_offset);
+                // Arena header offset overlays GRACE_SECONDS.
+                bytes::write_u32(state, meta_base + STRUCT_ARENA_HDR, data_offset);
                 bytes::write_u32(state, data_offset, arena_cap);
                 bytes::write_u32(state, data_offset + 4, 0); // used
                 bytes::zero(state, data_offset + ARENA_HEADER_SIZE, arena_cap);
@@ -921,18 +972,17 @@ pub fn init_state(
 
                 let layout = compute_struct_row_layout_padded(num_fields, &field_types);
 
-                bytes::write_u32(state, meta_base, data_offset);
-                bytes::write_u32(state, meta_base + 4, capacity);
-                bytes::write_u32(state, meta_base + 8, 0); // count
-                state[(meta_base + 12) as usize] = type_flags_byte;
-                state[(meta_base + 13) as usize] = num_fields;
-                state[(meta_base + 14) as usize] = 0;
-                state[(meta_base + 15) as usize] = layout.bitset_bytes as u8;
-                bytes::write_u16(state, meta_base + 16, layout.row_size as u16);
-                state[(meta_base + 18) as usize] = elem_type; // 0xFF = struct
-                for off in 19..SLOT_META_SIZE {
-                    state[(meta_base + off) as usize] = 0;
-                }
+                write_overlay_meta(
+                    state,
+                    meta_base,
+                    data_offset,
+                    capacity,
+                    type_flags_byte,
+                    num_fields,
+                    layout.bitset_bytes as u8,
+                    layout.row_size as u16,
+                    elem_type,
+                );
 
                 bytes::copy(state, data_offset, &field_types, 0, u32::from(num_fields));
                 let rows_offset = data_offset + layout.descriptor_size;
@@ -947,18 +997,17 @@ pub fn init_state(
                     ),
                 );
 
-                bytes::write_u32(state, meta_base, data_offset);
-                bytes::write_u32(state, meta_base + 4, capacity);
-                bytes::write_u32(state, meta_base + 8, 0); // count
-                state[(meta_base + 12) as usize] = type_flags_byte;
-                state[(meta_base + 13) as usize] = 0;
-                state[(meta_base + 14) as usize] = 0;
-                state[(meta_base + 15) as usize] = 0;
-                bytes::write_u16(state, meta_base + 16, elem_size as u16);
-                state[(meta_base + 18) as usize] = elem_type;
-                for off in 19..SLOT_META_SIZE {
-                    state[(meta_base + off) as usize] = 0;
-                }
+                write_overlay_meta(
+                    state,
+                    meta_base,
+                    data_offset,
+                    capacity,
+                    type_flags_byte,
+                    0,
+                    0,
+                    elem_size as u16,
+                    elem_type,
+                );
 
                 bytes::zero(state, data_offset, capacity * elem_size);
                 data_offset += capacity * elem_size;
@@ -996,9 +1045,9 @@ pub fn init_state(
             };
 
             let meta_base = STATE_HEADER_SIZE + u32::from(slot_idx) * SLOT_META_SIZE;
-            bytes::write_u32(state, meta_base, data_offset);
-            bytes::write_u32(state, meta_base + 4, outer_cap);
-            bytes::write_u32(state, meta_base + 8, 0); // size
+            bytes::write_u32(state, meta_base + SlotMetaOffset::OFFSET, data_offset);
+            bytes::write_u32(state, meta_base + SlotMetaOffset::CAPACITY, outer_cap);
+            bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, 0);
             state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = outer_type_flags_byte;
             state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize] = inner_agg;
             state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
@@ -1075,20 +1124,18 @@ struct OldSlotMeta {
 }
 
 fn read_old_slot_meta(old_state: &[u8], slot_i: u32) -> OldSlotMeta {
-    let meta_base = STATE_HEADER_SIZE + slot_i * SLOT_META_SIZE;
-    let type_flags_byte = old_state[(meta_base + 12) as usize];
-    let slot_type = SlotType::from_u8(type_flags_byte & 0x0f).unwrap_or_else(|| {
-        columine_types::die!("invariant: state metadata contains an invalid slot type")
-    });
+    let slot = u8::try_from(slot_i)
+        .unwrap_or_else(|_| columine_types::die!("invariant: grown-state slot index exceeds u8"));
+    let view = SlotMetaView::read(old_state, slot);
     OldSlotMeta {
-        offset: bytes::read_u32(old_state, meta_base),
-        capacity: bytes::read_u32(old_state, meta_base + 4),
-        type_flags_byte,
-        slot_type,
-        has_ttl: type_flags_byte & 0x10 != 0,
-        has_evict_trigger: type_flags_byte & 0x20 != 0,
-        has_hashmap_timestamps: slot_type != SlotType::HashMap || (type_flags_byte & 0x40 == 0),
-        agg_type_byte: old_state[(meta_base + 13) as usize],
+        offset: view.offset,
+        capacity: view.capacity,
+        type_flags_byte: view.type_flags.to_byte(),
+        slot_type: view.slot_type(),
+        has_ttl: view.has_ttl(),
+        has_evict_trigger: view.type_flags.has_evict_trigger(),
+        has_hashmap_timestamps: view.has_hashmap_timestamp_storage(),
+        agg_type_byte: view.agg_type_byte(old_state),
     }
 }
 
@@ -1100,22 +1147,22 @@ fn struct_map_primary_size_from_meta(
     cap: u32,
     slot_type: SlotType,
 ) -> u32 {
-    let nf = u32::from(old_state[(meta_base + 13) as usize]);
-    let rs = u32::from(bytes::read_u16(old_state, meta_base + 16));
+    let nf = overlay_num_fields(old_state, meta_base);
+    let rs = overlay_row_size(old_state, meta_base);
     if slot_type == SlotType::StructMap2 {
         struct_map2_slot_data_size(align8(nf), cap, rs)
     } else {
-        let has_ts = old_state[(meta_base + 18) as usize] != 0;
+        let has_ts = overlay_kind_byte(old_state, meta_base) != 0;
         struct_map_slot_data_size(align8(nf), cap, rs, has_ts)
     }
 }
 
 /// ORDERED_LIST metadata-driven primary size.
 fn ordered_list_primary_size_from_meta(old_state: &[u8], meta_base: u32, cap: u32) -> u32 {
-    let elem_type_byte = old_state[(meta_base + 18) as usize];
-    let rs = u32::from(bytes::read_u16(old_state, meta_base + 16));
+    let elem_type_byte = overlay_kind_byte(old_state, meta_base);
+    let rs = overlay_row_size(old_state, meta_base);
     if elem_type_byte == 0xff {
-        let nf = u32::from(old_state[(meta_base + 13) as usize]);
+        let nf = overlay_num_fields(old_state, meta_base);
         align8(nf) + cap * rs
     } else {
         cap * rs
@@ -1157,7 +1204,7 @@ pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 
                 let mut sz =
                     struct_map_primary_size_from_meta(old_state, meta_base, cap, m.slot_type);
                 // Arena: doubled on growth, kept on non-growth.
-                let arena_hdr_off = bytes::read_u32(old_state, meta_base + 20);
+                let arena_hdr_off = overlay_arena_hdr(old_state, meta_base);
                 if arena_hdr_off != 0 {
                     let old_arena_cap = bytes::read_u32(old_state, arena_hdr_off);
                     let new_arena_cap = if slot_i == grown_slot_idx {
@@ -1244,14 +1291,14 @@ pub fn grow_state(
         };
 
         // Metadata: new offset + capacity, copy the rest, then fix TTL offsets.
-        bytes::write_u32(new_state, meta_base, new_offset);
-        bytes::write_u32(new_state, meta_base + 4, new_cap);
+        bytes::write_u32(new_state, meta_base + SlotMetaOffset::OFFSET, new_offset);
+        bytes::write_u32(new_state, meta_base + SlotMetaOffset::CAPACITY, new_cap);
         bytes::copy(
             new_state,
-            meta_base + 8,
+            meta_base + SlotMetaOffset::SIZE,
             old_state,
-            meta_base + 8,
-            SLOT_META_SIZE - 8,
+            meta_base + SlotMetaOffset::SIZE,
+            SLOT_META_SIZE - SlotMetaOffset::SIZE,
         );
         bytes::write_u32(
             new_state,
@@ -1272,17 +1319,22 @@ pub fn grow_state(
         if slot_i == grown_slot_idx {
             match m.slot_type {
                 SlotType::HashMap => {
-                    let has_ts = m.type_flags_byte & 0x40 == 0;
                     let rehashed = slot_growth::grow_hash_map(
-                        old_state, new_state, old_offset, new_offset, old_cap, new_cap, has_ts,
+                        old_state,
+                        new_state,
+                        old_offset,
+                        new_offset,
+                        old_cap,
+                        new_cap,
+                        m.has_hashmap_timestamps,
                     );
-                    bytes::write_u32(new_state, meta_base + 8, rehashed);
+                    bytes::write_u32(new_state, meta_base + SlotMetaOffset::SIZE, rehashed);
                 }
                 SlotType::HashSet => {
                     let rehashed = slot_growth::grow_hash_set(
                         old_state, new_state, old_offset, new_offset, old_cap, new_cap,
                     );
-                    bytes::write_u32(new_state, meta_base + 8, rehashed);
+                    bytes::write_u32(new_state, meta_base + SlotMetaOffset::SIZE, rehashed);
                 }
                 SlotType::Bitmap => {
                     // Recompute storage bounds from the canonical bitmap
@@ -1297,8 +1349,8 @@ pub fn grow_state(
                     bytes::copy(new_state, new_offset, old_state, old_offset, copy_len);
                 }
                 SlotType::StructMap | SlotType::StructMap2 => {
-                    let nf = u32::from(old_state[(meta_base + 13) as usize]);
-                    let rs = u32::from(bytes::read_u16(old_state, meta_base + 16));
+                    let nf = overlay_num_fields(old_state, meta_base);
+                    let rs = overlay_row_size(old_state, meta_base);
                     let desc_size = align8(nf);
                     let new_keys_off = new_offset + desc_size;
                     let key_lane_bytes = if m.slot_type == SlotType::StructMap2 {
@@ -1317,10 +1369,10 @@ pub fn grow_state(
                             old_state, new_state, old_offset, new_offset, old_cap, new_cap, nf, rs,
                         )
                     };
-                    bytes::write_u32(new_state, meta_base + 8, rehashed);
+                    bytes::write_u32(new_state, meta_base + SlotMetaOffset::SIZE, rehashed);
 
                     // Arena compaction: copy live array data into the new arena.
-                    let old_arena_hdr_off = bytes::read_u32(old_state, meta_base + 20);
+                    let old_arena_hdr_off = overlay_arena_hdr(old_state, meta_base);
                     if old_arena_hdr_off != 0 {
                         let old_arena_cap = bytes::read_u32(old_state, old_arena_hdr_off);
                         let new_arena_cap = old_arena_cap * 2;
@@ -1333,7 +1385,11 @@ pub fn grow_state(
                         let new_arena_hdr_off = new_offset + struct_data_size;
 
                         bytes::write_u32(new_state, new_arena_hdr_off, new_arena_cap);
-                        bytes::write_u32(new_state, meta_base + 20, new_arena_hdr_off);
+                        bytes::write_u32(
+                            new_state,
+                            meta_base + STRUCT_ARENA_HDR,
+                            new_arena_hdr_off,
+                        );
 
                         let old_arena_data_base = old_arena_hdr_off + ARENA_HEADER_SIZE;
                         let new_arena_data_base = new_arena_hdr_off + ARENA_HEADER_SIZE;
@@ -1396,12 +1452,12 @@ pub fn grow_state(
                 }
                 SlotType::OrderedList => {
                     // memcpy existing entries — no rehash.
-                    let elem_type_byte = old_state[(meta_base + 18) as usize];
-                    let rs = u32::from(bytes::read_u16(old_state, meta_base + 16));
-                    let count = bytes::read_u32(old_state, meta_base + 8);
+                    let elem_type_byte = overlay_kind_byte(old_state, meta_base);
+                    let rs = overlay_row_size(old_state, meta_base);
+                    let count = bytes::read_u32(old_state, meta_base + SlotMetaOffset::SIZE);
 
                     if elem_type_byte == 0xff {
-                        let nf = u32::from(old_state[(meta_base + 13) as usize]);
+                        let nf = overlay_num_fields(old_state, meta_base);
                         let desc_size = align8(nf);
                         bytes::copy(new_state, new_offset, old_state, old_offset, nf);
                         let copy_bytes = count * rs;
@@ -1453,7 +1509,7 @@ pub fn grow_state(
                         old_cap,
                         m.slot_type,
                     );
-                    let arena_hdr = bytes::read_u32(old_state, meta_base + 20);
+                    let arena_hdr = overlay_arena_hdr(old_state, meta_base);
                     if arena_hdr != 0 {
                         let arena_cap = bytes::read_u32(old_state, arena_hdr);
                         sz += ARENA_HEADER_SIZE + arena_cap;
@@ -1476,7 +1532,7 @@ pub fn grow_state(
             }
             // Arena header offset shifts with the slot data.
             if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
-                let old_arena_hdr = bytes::read_u32(old_state, meta_base + 20);
+                let old_arena_hdr = overlay_arena_hdr(old_state, meta_base);
                 if old_arena_hdr != 0 {
                     let struct_sz = struct_map_primary_size_from_meta(
                         old_state,
@@ -1484,7 +1540,11 @@ pub fn grow_state(
                         old_cap,
                         m.slot_type,
                     );
-                    bytes::write_u32(new_state, meta_base + 20, new_offset + struct_sz);
+                    bytes::write_u32(
+                        new_state,
+                        meta_base + STRUCT_ARENA_HDR,
+                        new_offset + struct_sz,
+                    );
                 }
             }
         }
@@ -1545,7 +1605,7 @@ pub fn grow_state(
 
         let mut slot_total_size = new_primary_size;
         if matches!(m.slot_type, SlotType::StructMap | SlotType::StructMap2) {
-            let arena_hdr_off = bytes::read_u32(old_state, meta_base + 20);
+            let arena_hdr_off = overlay_arena_hdr(old_state, meta_base);
             if arena_hdr_off != 0 {
                 let old_arena_cap = bytes::read_u32(old_state, arena_hdr_off);
                 let new_arena_cap = if slot_i == grown_slot_idx {
