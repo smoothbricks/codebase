@@ -286,39 +286,11 @@ impl StorageLayout {
 
     /// Where this project's `main` mounts.
     ///
-    /// The record adopt wrote is the authority. Without one there is exactly one inference worth
-    /// making and it is conclusive in the direction it fires: only the symlink layout ever creates
-    /// `<mount-root>/<owner>/<repo>/main`, because under direct mount main mounts at the checkout
-    /// path and that directory is never made. A project with no record and no configured main
-    /// mountpoint is either not adopted yet — in which case the answer is whatever adopt is about
-    /// to choose — or it is a detached symlink-layout project whose mountpoint `gc` has since
-    /// removed, and guessing between those would silently point every resolver at the wrong path.
-    /// That case is an error, not a default. Callers record whatever they resolve, so the
-    /// inference runs at most once.
-    ///
-    /// Only absence is migratable. A record that is present but unreadable — truncated write,
-    /// corrupt bytes, a version this build does not understand — is evidence that a writer was
-    /// interrupted, and inference is not entitled to overrule it: the same bytes would be
-    /// answered `DirectMount` for a symlink-layout project. It fails closed, exactly as
-    /// [`Self::slot_bindings`] does with the sibling record next to it.
+    /// One reader: [`crate::checkout::load_checkout_layout`]. A present record is
+    /// authoritative and malformed data fails closed. A missing record is inferred only
+    /// where the inference is conclusive, then written so a later reader cannot disagree.
     pub fn checkout_layout(&self) -> Result<CheckoutLayout, StorageLayoutError> {
-        match crate::metadata::read_json::<CheckoutLayoutRecord>(&self.project.checkout_layout) {
-            Ok(record) => {
-                record.validate()?;
-                return Ok(record.checkout_layout);
-            }
-            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        if self.workspace_mount(&WorkspaceName::main())?.is_dir() {
-            return Ok(CheckoutLayout::Symlink);
-        }
-        for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-            if self.main_image(format)?.image().exists() {
-                return Err(StorageLayoutError::UnrecordedCheckoutLayout);
-            }
-        }
-        Ok(CheckoutLayout::default())
+        crate::checkout::load_checkout_layout(self)
     }
 
     pub fn record_checkout_layout(&self, layout: CheckoutLayout) -> Result<(), MetadataError> {
@@ -654,19 +626,21 @@ mod tests {
 
     #[test]
     fn an_unrecorded_layout_is_inferred_only_where_the_inference_is_conclusive() {
-        let root = temp_store("inferred");
+        // Each case needs its own store: the single reader materializes a conclusive
+        // inference, and chaining cases against one record would assert the old
+        // swallow-and-infer reader this collapse deleted.
+        let root = temp_store("inferred-unadopted");
         let layout = layout_under(&root);
         fs::create_dir_all(&layout.project().project_root).unwrap();
-
-        // Not adopted at all: no image, no mountpoint. Adopt is about to choose and record.
         assert_eq!(
             layout.checkout_layout().unwrap(),
             CheckoutLayout::default(),
             "an unadopted project has no layout to get wrong"
         );
 
-        // Adopted, but nothing says where main mounts. Guessing here would silently point every
-        // resolver at the wrong path, so it is an error.
+        let root = temp_store("inferred-adopted-no-mount");
+        let layout = layout_under(&root);
+        fs::create_dir_all(&layout.project().project_root).unwrap();
         let image = layout.main_image(ImageFormat::Sparse).unwrap();
         fs::create_dir_all(image.image().parent().unwrap()).unwrap();
         fs::write(image.image(), b"image").unwrap();
@@ -675,7 +649,9 @@ mod tests {
             Err(StorageLayoutError::UnrecordedCheckoutLayout)
         ));
 
-        // Only the symlink layout ever creates this directory, so its presence is conclusive.
+        let root = temp_store("inferred-symlink-mount");
+        let layout = layout_under(&root);
+        fs::create_dir_all(&layout.project().project_root).unwrap();
         fs::create_dir_all(layout.workspace_mount(&WorkspaceName::main()).unwrap()).unwrap();
         assert_eq!(layout.checkout_layout().unwrap(), CheckoutLayout::Symlink);
     }
