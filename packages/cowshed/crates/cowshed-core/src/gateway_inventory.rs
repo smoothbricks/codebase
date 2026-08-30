@@ -858,10 +858,17 @@ impl NativeGatewayInventory {
         Ok(facts)
     }
 
-    fn load_project_workspaces(
+    fn load_derived(
         &self,
         repo_id: &RepoId,
-    ) -> Result<ProjectWorkspaces, GatewayInventoryError> {
+    ) -> Result<
+        (
+            crate::storage::StorageLayout,
+            BTreeMap<String, PathBuf>,
+            Vec<crate::storage::lifecycle::DerivedWorkspace>,
+        ),
+        GatewayInventoryError,
+    > {
         let authoritative = self.source.project_facts(&self.storage, repo_id)?;
         reject_duplicate_mount_facts(&authoritative.mounts)?;
         let derived = derive_workspaces(
@@ -875,15 +882,24 @@ impl NativeGatewayInventory {
                 message: error.to_string(),
             }
         })?;
+        Ok((layout, authoritative.mount_paths, derived))
+    }
+
+    fn load_project_workspaces(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<ProjectWorkspaces, GatewayInventoryError> {
+        let (layout, mount_paths, derived) = self.load_derived(repo_id)?;
         let mut workspaces = Vec::with_capacity(derived.len());
         for workspace in derived {
             let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
-            let mount = authoritative.mount_paths.get(&volume).ok_or_else(|| {
-                GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().project_root.clone(),
-                    message: format!("missing canonical mount path for {volume}"),
-                }
-            })?;
+            let mount =
+                mount_paths
+                    .get(&volume)
+                    .ok_or_else(|| GatewayInventoryError::InvalidMetadata {
+                        path: layout.project().project_root.clone(),
+                        message: format!("missing canonical mount path for {volume}"),
+                    })?;
             let image_paths = canonical_image_paths(&layout, &workspace.workspace)?;
             let metadata = read_current_metadata(
                 self.storage.store(),
@@ -907,19 +923,7 @@ impl NativeGatewayInventory {
         &self,
         repo_id: &RepoId,
     ) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
-        let authoritative = self.source.project_facts(&self.storage, repo_id)?;
-        reject_duplicate_mount_facts(&authoritative.mounts)?;
-        let derived = derive_workspaces(
-            authoritative.storage,
-            authoritative.mounts,
-            authoritative.checkpoints,
-        )?;
-        let layout = StorageLayout::new(self.storage.store(), repo_id).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: self.storage.store().to_owned(),
-                message: error.to_string(),
-            }
-        })?;
+        let (layout, mount_paths, derived) = self.load_derived(repo_id)?;
         // Read once per project: the certificate subject inside a workspace image names whichever
         // identity was current when the image was minted, which after an identity change is one of
         // the project's former identities.
@@ -934,12 +938,13 @@ impl NativeGatewayInventory {
                 continue;
             };
             let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
-            let mount = authoritative.mount_paths.get(&volume).ok_or_else(|| {
-                GatewayInventoryError::InvalidMetadata {
-                    path: layout.project().project_root.clone(),
-                    message: format!("missing canonical mount path for {volume}"),
-                }
-            })?;
+            let mount =
+                mount_paths
+                    .get(&volume)
+                    .ok_or_else(|| GatewayInventoryError::InvalidMetadata {
+                        path: layout.project().project_root.clone(),
+                        message: format!("missing canonical mount path for {volume}"),
+                    })?;
             let image_paths = canonical_image_paths(&layout, &workspace.workspace)?;
             let metadata = read_current_metadata(
                 self.storage.store(),
