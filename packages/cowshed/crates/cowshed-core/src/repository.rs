@@ -716,14 +716,21 @@ impl ProjectPaths {
     }
 }
 
+/// True when a path is absolute and lexically normalized (no `.`/`..` components). The one
+/// definition of "canonical" every path validator narrows from; callers that need to report
+/// *which* half failed keep their own two-step checks but must agree with this predicate.
+pub fn is_lexically_canonical(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+}
+
 fn validate_store_root(root: &Path) -> Result<&Path, PathLayoutError> {
     if !root.is_absolute() {
         return Err(PathLayoutError::StoreRootNotAbsolute);
     }
-    if root
-        .components()
-        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
+    if !is_lexically_canonical(root) {
         return Err(PathLayoutError::StoreRootNotNormalized);
     }
     Ok(root)
@@ -733,10 +740,7 @@ fn validate_mount_root(root: &Path) -> Result<&Path, PathLayoutError> {
     if !root.is_absolute() {
         return Err(PathLayoutError::MountRootNotAbsolute);
     }
-    if root
-        .components()
-        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
+    if !is_lexically_canonical(root) {
         return Err(PathLayoutError::MountRootNotNormalized);
     }
     Ok(root)

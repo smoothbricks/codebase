@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub use crate::metadata::PortBlock;
 use crate::storage::bootstrap::{CACHES_ROOT, STORE_ROOT};
@@ -482,10 +482,7 @@ fn validate_path(path: &Path) -> Result<(), SandboxError> {
             reason: "path is not absolute",
         });
     }
-    if path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
-    {
+    if !crate::repository::is_lexically_canonical(path) {
         return Err(SandboxError::InvalidPath {
             path: path.to_path_buf(),
             reason: "path is not canonical",

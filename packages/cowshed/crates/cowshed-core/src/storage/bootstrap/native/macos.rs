@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::FromRawFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1955,11 +1955,7 @@ fn guard_absent_volume_globally(
 }
 
 fn require_canonical(path: &Path) -> Result<(), NativeBootstrapError> {
-    if path.is_absolute()
-        && !path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
+    if crate::repository::is_lexically_canonical(path) {
         Ok(())
     } else {
         Err(NativeBootstrapError::NonCanonicalPath(path.to_owned()))
@@ -6325,11 +6321,7 @@ fn read_only_validation_actions(plan: &BootstrapPlan) -> Vec<String> {
 }
 
 fn require_host_canonical(path: &Path) -> Result<(), HostError> {
-    if path.is_absolute()
-        && !path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
+    if crate::repository::is_lexically_canonical(path) {
         Ok(())
     } else {
         Err(HostError::new(format!(
