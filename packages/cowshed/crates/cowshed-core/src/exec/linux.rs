@@ -1,16 +1,16 @@
 use std::io;
-use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use super::{
-    DESCRIPTOR_PREPARATION_ERRNO, SpawnFailure, WrapperStage, close_range_result_with,
-    descriptor_limit, mark_descriptor_close_on_exec, mark_non_stdio_close_on_exec_with,
+    SpawnFailure, WrapperStage, close_range_result_with, descriptor_limit,
+    install_cloexec_pre_exec, mark_descriptor_close_on_exec, mark_non_stdio_close_on_exec_with,
 };
 
 pub(super) fn mark_non_stdio_close_on_exec(limit: libc::rlim_t) -> io::Result<()> {
     mark_non_stdio_close_on_exec_with(
         limit,
         |first, last, flags| {
+            // SAFETY: close_range takes integer bounds and flags only; invalid values return errno.
             let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags) };
             close_range_result_with(result, io::Error::last_os_error)
         },
@@ -24,11 +24,6 @@ pub(super) fn prepare_child_descriptors(command: &mut Command) -> Result<(), Spa
         source,
     })?;
 
-    unsafe {
-        command.pre_exec(move || {
-            mark_non_stdio_close_on_exec(descriptor_limit)
-                .map_err(|_| io::Error::from_raw_os_error(DESCRIPTOR_PREPARATION_ERRNO))
-        });
-    }
+    install_cloexec_pre_exec(command, descriptor_limit, mark_non_stdio_close_on_exec);
     Ok(())
 }

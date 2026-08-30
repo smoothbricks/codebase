@@ -13,7 +13,7 @@ use crate::error::{CowshedError, Result};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteUrl {
     pub name: String,
-    pub url: String,
+    pub url: PathBuf,
 }
 
 /// The name a workspace's upstream carries: the main workspace, so `main`.
@@ -415,26 +415,56 @@ impl GitRepository {
     }
 
     pub async fn remotes(&self) -> Result<Vec<RemoteUrl>> {
-        let names_output = self.run(["remote"]).await?;
-        if !names_output.status.success() {
-            return Err(git_internal("list git remotes", &names_output));
+        let output = self
+            .run([
+                "config",
+                "--local",
+                "-z",
+                "--get-regexp",
+                r"^remote\..*\.url$",
+            ])
+            .await?;
+        if output.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+        if !output.status.success() {
+            return Err(git_internal("list git remotes", &output));
         }
 
-        let names = parse_lines(&names_output.stdout, "remote name")?;
         let mut remotes = Vec::new();
-        for name in names {
-            let output = self
-                .run(["remote", "get-url", "--all", name.as_str()])
-                .await?;
-            if !output.status.success() {
-                return Err(git_internal("read git remote", &output));
-            }
-            for url in parse_lines(&output.stdout, "remote URL")? {
-                remotes.push(RemoteUrl {
-                    name: name.clone(),
-                    url,
-                });
-            }
+        for record in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|r| !r.is_empty())
+        {
+            let separator = record
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .ok_or_else(|| {
+                    CowshedError::integrity(
+                        "git reported a remote URL with no value",
+                        "repair the git configuration",
+                    )
+                })?;
+            let key = std::str::from_utf8(&record[..separator]).map_err(|_| {
+                CowshedError::integrity(
+                    "git reported a non-UTF-8 remote name",
+                    "repair the git configuration",
+                )
+            })?;
+            let name = key
+                .strip_prefix("remote.")
+                .and_then(|key| key.strip_suffix(".url"))
+                .ok_or_else(|| {
+                    CowshedError::integrity(
+                        format!("git reported an unexpected remote URL key: {key}"),
+                        "repair the git configuration",
+                    )
+                })?;
+            remotes.push(RemoteUrl {
+                name: name.to_owned(),
+                url: PathBuf::from(OsString::from_vec(record[separator + 1..].to_vec())),
+            });
         }
         remotes.sort_by(|left, right| (&left.name, &left.url).cmp(&(&right.name, &right.url)));
         remotes.dedup();
@@ -459,12 +489,7 @@ impl GitRepository {
     }
 
     pub async fn is_dirty(&self) -> Result<bool> {
-        let output = self
-            .run(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
-            .await?;
-        if !output.status.success() {
-            return Err(git_internal("read repository status", &output));
-        }
+        let output = self.porcelain_status("read repository status").await?;
         Ok(!output.stdout.is_empty())
     }
 
@@ -710,23 +735,12 @@ impl GitRepository {
 
     /// Whether `commit` is contained by a host branch or a Cowshed preservation ref.
     pub async fn commit_is_preserved(&self, commit: &str) -> Result<bool> {
-        if !self.has_commit(commit).await? {
-            return Ok(false);
-        }
-        let output = self
-            .run([
-                "for-each-ref",
-                "--format=%(refname)",
-                "--contains",
-                commit,
-                "refs/heads",
-                "refs/cowshed",
-            ])
-            .await?;
-        if !output.status.success() {
-            return Err(git_internal("check host commit preservation refs", &output));
-        }
-        Ok(!output.stdout.is_empty())
+        self.commit_contained_in(
+            commit,
+            &["refs/heads", "refs/cowshed"],
+            "check host commit preservation refs",
+        )
+        .await
     }
 
     /// Whether `commit` is contained by a remote-tracking ref in this repository.
@@ -735,23 +749,33 @@ impl GitRepository {
     /// local heads disappear with that image, while a remote-tracking ref records a push/fetch
     /// boundary whose remote retains the commit.
     pub async fn commit_is_remote_preserved(&self, commit: &str) -> Result<bool> {
+        self.commit_contained_in(
+            commit,
+            &["refs/remotes"],
+            "check remote commit preservation refs",
+        )
+        .await
+    }
+
+    async fn commit_contained_in(
+        &self,
+        commit: &str,
+        refs: &[&str],
+        operation: &str,
+    ) -> Result<bool> {
         if !self.has_commit(commit).await? {
             return Ok(false);
         }
-        let output = self
-            .run([
-                "for-each-ref",
-                "--format=%(refname)",
-                "--contains",
-                commit,
-                "refs/remotes",
-            ])
-            .await?;
+        let mut args = vec![
+            OsString::from("for-each-ref"),
+            OsString::from("--format=%(refname)"),
+            OsString::from("--contains"),
+            OsString::from(commit),
+        ];
+        args.extend(refs.iter().map(OsString::from));
+        let output = self.run(args).await?;
         if !output.status.success() {
-            return Err(git_internal(
-                "check remote commit preservation refs",
-                &output,
-            ));
+            return Err(git_internal(operation, &output));
         }
         Ok(!output.stdout.is_empty())
     }
@@ -980,12 +1004,7 @@ impl GitRepository {
     /// Counted by record rather than by NUL, because a rename or copy record carries two paths in
     /// two NUL-separated fields and would otherwise be reported as two changes.
     pub async fn dirty_file_count(&self) -> Result<u64> {
-        let output = self
-            .run(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
-            .await?;
-        if !output.status.success() {
-            return Err(git_internal("count working tree changes", &output));
-        }
+        let output = self.porcelain_status("count working tree changes").await?;
         let mut fields = output
             .stdout
             .split(|byte| *byte == 0)
@@ -1008,6 +1027,16 @@ impl GitRepository {
             }
         }
         Ok(count)
+    }
+
+    async fn porcelain_status(&self, operation: &str) -> Result<Output> {
+        let output = self
+            .run(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal(operation, &output));
+        }
+        Ok(output)
     }
 
     /// The absolute path of this repository's own object store.
@@ -1879,8 +1908,18 @@ where
 /// bare, submodule pointer file — where a `.git` existence check covers one. A path that is not a
 /// directory at all fails the same way, which is the answer we want.
 async fn is_git_repository(path: &Path) -> Result<bool> {
-    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return Ok(false);
+    match tokio::fs::try_exists(path).await {
+        Ok(false) => return Ok(false),
+        Ok(true) => {}
+        Err(error) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "could not inspect remote repository path {}: {error}",
+                    path.display()
+                ),
+                "repair the remote path or its parent permissions, then retry",
+            ));
+        }
     }
     Ok(run_git_at(path, ["rev-parse", "--git-dir"])
         .await?
@@ -2001,6 +2040,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::symlink;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Output};
@@ -2008,8 +2048,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository, MAIN_REMOTE, MainRemote,
-        ensure_git_success, git_message, parse_lines, workspace_remote_name,
+        CowshedUpstream, FALLBACK_MAIN_REMOTE, GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl,
+        ensure_git_success, git_message, is_git_repository, parse_lines, workspace_remote_name,
     };
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2762,6 +2802,13 @@ mod tests {
                 .expect("git output newline"),
             main_mount.as_os_str().as_bytes()
         );
+        assert_eq!(
+            repo.remotes().await.expect("list non-UTF-8 remote"),
+            vec![RemoteUrl {
+                name: MAIN_REMOTE.to_owned(),
+                url: main_mount.clone(),
+            }]
+        );
         // The idempotent path compares the stored URL against the mount, so it has to survive the
         // round trip through git config as bytes rather than as lossy UTF-8.
         assert_eq!(
@@ -2770,6 +2817,24 @@ mod tests {
                 .expect("idempotent re-run over a non-UTF-8 mount"),
             MainRemote::Canonical
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn repository_probe_propagates_filesystem_query_errors() {
+        let root = repository();
+        let loop_path = root.join("filesystem-loop");
+        symlink(&loop_path, &loop_path).expect("create symlink loop");
+
+        let error = is_git_repository(&loop_path)
+            .await
+            .expect_err("an undetermined path is not an absent repository");
+        assert!(
+            error.to_string().contains("filesystem-loop"),
+            "error must identify the path whose state could not be read: {error}"
+        );
+
+        fs::remove_file(&loop_path).expect("remove symlink loop");
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

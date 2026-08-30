@@ -197,8 +197,6 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
             socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
             cli_version: "1.4.0".into(),
             daemon_version: Some("1.3.0".into()),
-            cache_entries: 0,
-            cache_bytes: 0,
             active_workspaces: 2,
         },
     )
@@ -206,7 +204,7 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
     let (stdout, stderr) = output.into_inner();
     assert_eq!(
         stdout,
-        b"{\"ok\":true,\"result\":{\"installed\":true,\"running\":true,\"socket\":\"/private/cowshed/store/gateway.sock\",\"cliVersion\":\"1.4.0\",\"daemonVersion\":\"1.3.0\",\"cacheEntries\":0,\"cacheBytes\":0,\"activeWorkspaces\":2}}\n"
+        b"{\"ok\":true,\"result\":{\"installed\":true,\"running\":true,\"socket\":\"/private/cowshed/store/gateway.sock\",\"cliVersion\":\"1.4.0\",\"daemonVersion\":\"1.3.0\",\"activeWorkspaces\":2}}\n"
     );
     assert!(stderr.is_empty());
 }
@@ -244,8 +242,6 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
                 socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
                 cli_version: "1.4.0".into(),
                 daemon_version: daemon_version.map(str::to_owned),
-                cache_entries: 0,
-                cache_bytes: 0,
                 active_workspaces: 0,
             },
         )

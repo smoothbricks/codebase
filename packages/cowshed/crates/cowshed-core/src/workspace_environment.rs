@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -6,6 +7,8 @@ use zeroize::Zeroizing;
 use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 
 pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
+pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
+pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
 const GO_ENV_RELATIVE_PATH: &str = ".cowshed/cache/go/env";
 
 #[derive(Debug, Error)]
@@ -61,18 +64,20 @@ pub fn write_workspace_environment(
     // `shell_word` would `to_owned()`/`format!` it into a plain String that is
     // never zeroized; push the borrowed token into a Zeroizing buffer instead.
     // Capacity is sized so the buffer cannot reallocate after the token is copied.
-    let mut contents = Zeroizing::new(String::with_capacity(
-        "export GOENV=\nexport COWSHED_WORKSPACE_TOKEN=\nexport COWSHED_PORT_BASE=65535\n".len()
-            + go_env_word.len()
-            + token.len(),
-    ));
+    let mut contents = Zeroizing::new(String::with_capacity(96 + go_env_word.len() + token.len()));
     contents.push_str("export GOENV=");
     contents.push_str(&go_env_word);
-    contents.push_str("\nexport COWSHED_WORKSPACE_TOKEN=");
+    contents.push_str("\nexport ");
+    contents.push_str(WORKSPACE_TOKEN_ENV);
+    contents.push('=');
     contents.push_str(token);
     contents.push('\n');
     if let Some(block) = port_block {
-        contents.push_str(&format!("export COWSHED_PORT_BASE={}\n", block.base()));
+        contents.push_str("export ");
+        contents.push_str(PORT_BASE_ENV);
+        contents.push('=');
+        write!(&mut *contents, "{}\n", block.base())
+            .expect("writing to a preallocated String cannot fail");
     }
 
     write_atomic_bytes(

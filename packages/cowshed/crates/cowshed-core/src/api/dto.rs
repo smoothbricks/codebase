@@ -1,10 +1,12 @@
 use crate::error::CowshedError;
+use crate::metadata::DetachedWorkspaceMetadata;
 pub use crate::metadata::{
     EgressMode, EgressRule, GrantSet, ImageFormat, Platform, PortBlock, RepoRule, SimVerb,
     WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use crate::repository::RepoId;
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
+use crate::storage::lifecycle::{DerivedWorkspace, MountState, Pin as LifecyclePin};
 use base64::Engine;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -117,11 +119,7 @@ pub struct GitOid(String);
 impl GitOid {
     pub fn new(value: impl Into<String>) -> Result<Self, DtoError> {
         let value = value.into();
-        if matches!(value.len(), 40 | 64)
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if matches!(value.len(), 40 | 64) && is_lowercase_hex(&value) {
             Ok(Self(value))
         } else {
             Err(DtoError::InvalidGitOid(value))
@@ -398,9 +396,7 @@ macro_rules! hex_identifier {
                 let value = value.into();
                 if value.len() == $bytes * 2
                     && value.bytes().any(|byte| byte != b'0')
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && is_lowercase_hex(&value)
                 {
                     Ok(Self(value))
                 } else {
@@ -482,6 +478,51 @@ pub struct WorkspaceInfo {
     pub landing: Option<WorkspaceLanding>,
 }
 
+impl WorkspaceInfo {
+    /// Project one exact, validated sidecar and its authoritative lifecycle facts into the API DTO.
+    ///
+    /// Callers must obtain `metadata` through `gateway_inventory::read_current_metadata`; that
+    /// reader proves the sidecar is active, no-follow, and names this exact workspace incarnation.
+    pub fn from_current_metadata(
+        derived: &DerivedWorkspace,
+        mount: PathBuf,
+        metadata: &DetachedWorkspaceMetadata,
+    ) -> Result<Self, DtoError> {
+        let snapshot = metadata.info_snapshot.as_ref();
+        let base_commit = snapshot
+            .map(|info| GitOid::new(info.base_commit.clone()))
+            .transpose()?;
+        let created_at = snapshot
+            .map(|info| UtcTimestamp::new(info.created_at.clone()))
+            .transpose()?;
+        Ok(Self {
+            repo_id: derived.workspace.repo().clone(),
+            workspace: derived.workspace.name().clone(),
+            workspace_incarnation: derived.workspace.incarnation().clone(),
+            role: derived.workspace.role(),
+            image_format: derived.workspace.format(),
+            mount,
+            state: match derived.mount_state {
+                MountState::Detached => WorkspaceState::Detached,
+                MountState::Mounted { .. } => WorkspaceState::Attached,
+            },
+            branch: snapshot.and_then(|info| info.branch.clone()),
+            base_commit,
+            created_at,
+            checkpoints: derived
+                .checkpoints
+                .iter()
+                .map(|checkpoint| CheckpointInfo {
+                    label: checkpoint.label.to_string(),
+                    revision: checkpoint.revision.get(),
+                    pinned: checkpoint.pin == LifecyclePin::Pinned,
+                })
+                .collect(),
+            snapshot_stale: snapshot.is_some_and(|info| info.stale),
+            landing: None,
+        })
+    }
+}
 /// What a landing measurement found for one workspace.
 ///
 /// Present only when a caller asked for it: reading it costs one process per workspace, which a
@@ -759,22 +800,88 @@ fn command_arg_bytes(value: &OsStr) -> Result<&[u8], DtoError> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum CommandArgEncoding {
+enum TaggedBytesEncoding {
     Utf8,
     Base64,
 }
 
 #[derive(Serialize)]
-struct CommandArgRef<'a> {
-    encoding: CommandArgEncoding,
+struct TaggedBytesRef<'a> {
+    encoding: TaggedBytesEncoding,
     data: &'a str,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CommandArgWire {
-    encoding: CommandArgEncoding,
+struct TaggedBytesWire {
+    encoding: TaggedBytesEncoding,
     data: String,
+}
+
+enum TaggedBytesError {
+    TooLarge,
+    InvalidEncoding,
+}
+
+fn serialize_tagged_bytes<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match std::str::from_utf8(bytes) {
+        Ok(data) => TaggedBytesRef {
+            encoding: TaggedBytesEncoding::Utf8,
+            data,
+        }
+        .serialize(serializer),
+        Err(_) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            TaggedBytesRef {
+                encoding: TaggedBytesEncoding::Base64,
+                data: &encoded,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+fn decode_tagged_bytes(wire: TaggedBytesWire, maximum: usize) -> Result<Vec<u8>, TaggedBytesError> {
+    match wire.encoding {
+        TaggedBytesEncoding::Utf8 => {
+            if wire.data.len() > maximum {
+                return Err(TaggedBytesError::TooLarge);
+            }
+            Ok(wire.data.into_bytes())
+        }
+        TaggedBytesEncoding::Base64 => {
+            let maximum_encoded = maximum.div_ceil(3) * 4;
+            if wire.data.len() > maximum_encoded {
+                return Err(TaggedBytesError::TooLarge);
+            }
+            let padding = wire
+                .data
+                .as_bytes()
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'=')
+                .count();
+            if wire.data.len() % 4 != 0 || padding > 2 {
+                return Err(TaggedBytesError::InvalidEncoding);
+            }
+            let decoded_len = wire.data.len() / 4 * 3 - padding;
+            if decoded_len > maximum {
+                return Err(TaggedBytesError::TooLarge);
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(wire.data.as_bytes())
+                .map_err(|_| TaggedBytesError::InvalidEncoding)?;
+            if base64::engine::general_purpose::STANDARD.encode(&bytes) != wire.data
+                || std::str::from_utf8(&bytes).is_ok()
+            {
+                return Err(TaggedBytesError::InvalidEncoding);
+            }
+            Ok(bytes)
+        }
+    }
 }
 
 impl Serialize for CommandArg {
@@ -784,21 +891,7 @@ impl Serialize for CommandArg {
     {
         self.validate().map_err(serde::ser::Error::custom)?;
         let bytes = command_arg_bytes(self.as_os_str()).map_err(serde::ser::Error::custom)?;
-        match std::str::from_utf8(bytes) {
-            Ok(data) => CommandArgRef {
-                encoding: CommandArgEncoding::Utf8,
-                data,
-            }
-            .serialize(serializer),
-            Err(_) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-                CommandArgRef {
-                    encoding: CommandArgEncoding::Base64,
-                    data: &encoded,
-                }
-                .serialize(serializer)
-            }
-        }
+        serialize_tagged_bytes(bytes, serializer)
     }
 }
 
@@ -807,46 +900,19 @@ impl<'de> Deserialize<'de> for CommandArg {
     where
         D: Deserializer<'de>,
     {
-        let wire = CommandArgWire::deserialize(deserializer)?;
-        match wire.encoding {
-            CommandArgEncoding::Utf8 => command_arg_from_decoded_bytes(wire.data.into_bytes()),
-            CommandArgEncoding::Base64 => {
-                const MAX_BASE64_BYTES: usize = MAX_COMMAND_ARG_BYTES.div_ceil(3) * 4;
-                if wire.data.len() > MAX_BASE64_BYTES {
-                    return Err(serde::de::Error::custom(DtoError::CommandArgumentTooLarge));
-                }
-                let padding = wire
-                    .data
-                    .as_bytes()
-                    .iter()
-                    .rev()
-                    .take_while(|&&byte| byte == b'=')
-                    .count();
-                if wire.data.len() % 4 != 0 || padding > 2 {
-                    return Err(serde::de::Error::custom(
-                        DtoError::InvalidCommandArgumentEncoding,
-                    ));
-                }
-                let decoded_len = wire.data.len() / 4 * 3 - padding;
-                if decoded_len > MAX_COMMAND_ARG_BYTES {
-                    return Err(serde::de::Error::custom(DtoError::CommandArgumentTooLarge));
-                }
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(wire.data.as_bytes())
-                    .map_err(|_| {
-                        serde::de::Error::custom(DtoError::InvalidCommandArgumentEncoding)
-                    })?;
-                if base64::engine::general_purpose::STANDARD.encode(&bytes) != wire.data
-                    || std::str::from_utf8(&bytes).is_ok()
-                {
-                    return Err(serde::de::Error::custom(
-                        DtoError::InvalidCommandArgumentEncoding,
-                    ));
-                }
-                command_arg_from_decoded_bytes(bytes)
+        let bytes = decode_tagged_bytes(
+            TaggedBytesWire::deserialize(deserializer)?,
+            MAX_COMMAND_ARG_BYTES,
+        )
+        .map_err(|error| match error {
+            TaggedBytesError::TooLarge => {
+                serde::de::Error::custom(DtoError::CommandArgumentTooLarge)
             }
-        }
-        .map_err(serde::de::Error::custom)
+            TaggedBytesError::InvalidEncoding => {
+                serde::de::Error::custom(DtoError::InvalidCommandArgumentEncoding)
+            }
+        })?;
+        command_arg_from_decoded_bytes(bytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -892,47 +958,12 @@ impl BinaryData {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum BinaryEncoding {
-    Utf8,
-    Base64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BinaryDataRef<'a> {
-    encoding: BinaryEncoding,
-    data: &'a str,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BinaryDataWire {
-    encoding: BinaryEncoding,
-    data: String,
-}
-
 impl Serialize for BinaryData {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        match std::str::from_utf8(&self.0) {
-            Ok(data) => BinaryDataRef {
-                encoding: BinaryEncoding::Utf8,
-                data,
-            }
-            .serialize(serializer),
-            Err(_) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&self.0);
-                BinaryDataRef {
-                    encoding: BinaryEncoding::Base64,
-                    data: &encoded,
-                }
-                .serialize(serializer)
-            }
-        }
+        serialize_tagged_bytes(&self.0, serializer)
     }
 }
 
@@ -941,13 +972,16 @@ impl<'de> Deserialize<'de> for BinaryData {
     where
         D: Deserializer<'de>,
     {
-        let wire = BinaryDataWire::deserialize(deserializer)?;
-        let bytes = match wire.encoding {
-            BinaryEncoding::Utf8 => wire.data.into_bytes(),
-            BinaryEncoding::Base64 => base64::engine::general_purpose::STANDARD
-                .decode(wire.data)
-                .map_err(|_| serde::de::Error::custom(DtoError::InvalidBinaryEncoding))?,
-        };
+        let bytes = decode_tagged_bytes(
+            TaggedBytesWire::deserialize(deserializer)?,
+            MAX_INLINE_OUTPUT_BYTES,
+        )
+        .map_err(|error| match error {
+            TaggedBytesError::TooLarge => serde::de::Error::custom(DtoError::InlineOutputTooLarge),
+            TaggedBytesError::InvalidEncoding => {
+                serde::de::Error::custom(DtoError::InvalidBinaryEncoding)
+            }
+        })?;
         Self::new(bytes).map_err(serde::de::Error::custom)
     }
 }
@@ -970,20 +1004,11 @@ impl Sha256Digest {
     }
 
     pub fn to_hex(self) -> String {
-        let mut output = String::with_capacity(64);
-        for byte in self.0 {
-            use std::fmt::Write as _;
-            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-        }
-        output
+        hex_lower(&self.0)
     }
 
     pub fn from_hex(value: &str) -> Result<Self, DtoError> {
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if value.len() != 64 || !is_lowercase_hex(value) {
             return Err(DtoError::InvalidSha256Digest(value.to_owned()));
         }
         let mut bytes = [0_u8; 32];
@@ -994,6 +1019,22 @@ impl Sha256Digest {
         }
         Ok(Self(bytes))
     }
+}
+
+pub(crate) fn is_lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn hex_nibble(byte: u8) -> u8 {
@@ -1382,7 +1423,7 @@ impl ControllerCommitment {
     }
 }
 
-fn valid_commitment_id(value: &str) -> bool {
+pub(crate) fn valid_commitment_id(value: &str) -> bool {
     (1..=128).contains(&value.len())
         && value
             .bytes()
@@ -1641,7 +1682,7 @@ pub struct ExecRecord {
     pub workspace_incarnation: WorkspaceIncarnation,
     pub job_id: JobId,
     pub state: JobState,
-    pub argv: Vec<String>,
+    pub argv: Vec<CommandArg>,
     pub cwd: WorkspacePath,
     pub env_hash: u64,
     pub grant_revision: u64,
@@ -1657,6 +1698,7 @@ pub struct ExecRecord {
 
 impl ExecRecord {
     pub fn validate(&self) -> Result<(), DtoError> {
+        validate_command_argv(&self.argv)?;
         if matches!(self.state, JobState::Queued | JobState::Running) {
             return Err(DtoError::InvalidJobProjection(
                 "ExecRecord must contain a terminal job state",
@@ -1689,7 +1731,7 @@ struct ExecRecordRef<'a> {
     workspace_incarnation: &'a WorkspaceIncarnation,
     job_id: JobId,
     state: JobState,
-    argv: &'a [String],
+    argv: &'a [CommandArg],
     cwd: &'a WorkspacePath,
     env_hash: u64,
     grant_revision: u64,
@@ -1712,7 +1754,7 @@ struct ExecRecordWire {
     workspace_incarnation: WorkspaceIncarnation,
     job_id: JobId,
     state: JobState,
-    argv: Vec<String>,
+    argv: Vec<CommandArg>,
     cwd: WorkspacePath,
     env_hash: u64,
     grant_revision: u64,
@@ -1942,11 +1984,7 @@ impl RevisionTarget {
     /// Parses the exact CLI revision grammar without accepting git rev expressions.
     pub fn parse_cli(value: impl Into<String>) -> Result<Self, DtoError> {
         let value = value.into();
-        if matches!(value.len(), 40 | 64)
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if matches!(value.len(), 40 | 64) && is_lowercase_hex(&value) {
             GitOid::new(value).map(Self::Oid)
         } else if value.starts_with("refs/") {
             GitRef::new(value).map(Self::Ref)
@@ -2283,8 +2321,6 @@ pub struct GatewayStatus {
     pub cli_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
-    pub cache_entries: u64,
-    pub cache_bytes: u64,
     pub active_workspaces: u64,
 }
 

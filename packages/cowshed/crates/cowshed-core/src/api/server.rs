@@ -798,11 +798,7 @@ fn validate_hello(version: u32, nonce: &str) -> Result<()> {
             "controller handshake protocol version did not match",
         ));
     }
-    if nonce.len() != 64
-        || !nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if nonce.len() != 64 || !super::dto::is_lowercase_hex(nonce) {
         return Err(protocol_error("controller handshake nonce is invalid"));
     }
     Ok(())
@@ -1098,6 +1094,7 @@ fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
             connection_error("controller descriptor peer does not match the current uid")
         }
     })?;
+    // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
     let current_uid = unsafe { libc::geteuid() };
     if peer_uid != current_uid {
         return Err(connection_error(

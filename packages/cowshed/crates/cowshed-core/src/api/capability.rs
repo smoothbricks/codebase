@@ -895,6 +895,7 @@ fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
             handshake_error("coordinator descriptor peer does not match the current uid")
         }
     })?;
+    // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
     let current_uid = unsafe { libc::geteuid() };
     if peer_uid != current_uid {
         return Err(handshake_error(
@@ -1756,10 +1757,6 @@ impl Session {
         .await
     }
 
-    pub async fn background(&self, request: ExecRequest) -> Result<JobHandle> {
-        self.run(request).await
-    }
-
     pub fn is_named(&self) -> bool {
         self.name.is_some()
     }
@@ -1794,7 +1791,6 @@ impl fmt::Debug for Session {
 mod tests {
     use super::*;
     use std::future;
-    use std::mem::{needs_drop, size_of};
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -1974,14 +1970,6 @@ mod tests {
         object.remove("durationMs");
         object.remove("exit");
         value
-    }
-
-    #[test]
-    fn authority_tokens_and_handles_are_affine_owned_values() {
-        assert!(needs_drop::<CoordinatorToken>());
-        assert!(needs_drop::<Coordinator>());
-        assert!(needs_drop::<WorkspaceHandle>());
-        assert!(size_of::<CoordinatorToken>() > 0);
     }
 
     #[cfg(unix)]
@@ -2343,7 +2331,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn named_session_run_and_background_preserve_exact_session_identity() {
+    async fn named_session_runs_preserve_exact_session_identity() {
         let (runtime, mut server) = actor_pair();
         let server_task = tokio::spawn(async move {
             let (_, shell) = read_rpc_request(&mut server).await;
@@ -2415,7 +2403,7 @@ mod tests {
         );
         assert_eq!(
             session
-                .background(exec_request(StdinSource::Empty))
+                .run(exec_request(StdinSource::Empty))
                 .await
                 .unwrap()
                 .id(),

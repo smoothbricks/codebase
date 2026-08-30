@@ -182,6 +182,17 @@ fn command_args_are_canonical_lossless_and_strictly_bounded() {
         );
     }
 
+    for invalid in [
+        json!({"encoding":"base64","data":"YQ=="}),
+        json!({"encoding":"base64","data":"/x=="}),
+        json!({"encoding":"base64","data":"%%%"}),
+    ] {
+        assert!(
+            serde_json::from_value::<BinaryData>(invalid).is_err(),
+            "accepted non-canonical binary data"
+        );
+    }
+
     let oversize = json!({
         "encoding": "utf8",
         "data": "x".repeat(MAX_COMMAND_ARG_BYTES + 1),
@@ -497,6 +508,7 @@ fn output_limit_is_an_explicit_terminal_projection() {
     assert!(serde_json::from_value::<JobInfo>(value).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn exec_record_enforces_terminal_invariants_both_directions() {
     let value = json!({
@@ -504,7 +516,7 @@ fn exec_record_enforces_terminal_invariants_both_directions() {
         "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
         "jobId": 9,
         "state": "exited",
-        "argv": ["true"],
+        "argv": [{"encoding":"base64","data":"/w=="}],
         "cwd": "packages/app",
         "envHash": 17,
         "grantRevision": 9,
@@ -518,6 +530,7 @@ fn exec_record_enforces_terminal_invariants_both_directions() {
     });
     let record: ExecRecord = serde_json::from_value(value.clone()).unwrap();
     record.validate().unwrap();
+    assert_eq!(record.argv[0].as_os_str().as_bytes(), &[0xff]);
     assert_eq!(serde_json::to_value(&record).unwrap(), value);
 
     let mut invalid_record = record;
@@ -791,13 +804,23 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         socket: PathBuf::from("/store/gateway.sock"),
         cli_version: "1.4.0".into(),
         daemon_version: Some("1.3.0".into()),
-        cache_entries: 7,
-        cache_bytes: 8192,
         active_workspaces: 2,
     };
     assert_eq!(
         serde_json::to_value(status).unwrap(),
-        json!({"installed":true,"running":true,"socket":"/store/gateway.sock","cliVersion":"1.4.0","daemonVersion":"1.3.0","cacheEntries":7,"cacheBytes":8192,"activeWorkspaces":2})
+        json!({"installed":true,"running":true,"socket":"/store/gateway.sock","cliVersion":"1.4.0","daemonVersion":"1.3.0","activeWorkspaces":2})
+    );
+    let unmeasured: GatewayStatus = serde_json::from_value(json!({
+        "installed":false,
+        "running":false,
+        "socket":"/store/gateway.sock",
+        "cliVersion":"1.4.0",
+        "activeWorkspaces":0
+    }))
+    .expect("status without invented cache counters");
+    assert_eq!(
+        serde_json::to_value(unmeasured).unwrap(),
+        json!({"installed":false,"running":false,"socket":"/store/gateway.sock","cliVersion":"1.4.0","activeWorkspaces":0})
     );
 
     let audit = AuditEvent {

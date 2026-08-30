@@ -2790,47 +2790,14 @@ impl NativeProjectRuntimeHost {
     }
 
     fn snapshot(&self, workspace: &NativeWorkspace) -> Result<WorkspaceSnapshot> {
-        let info_snapshot = workspace.metadata.info_snapshot.as_ref();
-        let base_commit = info_snapshot
-            .map(|info| GitOid::new(info.base_commit.clone()))
-            .transpose()
-            .map_err(native_integrity_error)?;
-        let created_at = info_snapshot
-            .map(|info| crate::api::dto::UtcTimestamp::new(info.created_at.clone()))
-            .transpose()
-            .map_err(native_integrity_error)?;
+        let info = WorkspaceInfo::from_current_metadata(
+            &workspace.derived,
+            self.workspace_mount_path(workspace.derived.workspace.name())?,
+            &workspace.metadata,
+        )
+        .map_err(native_integrity_error)?;
         Ok(WorkspaceSnapshot {
-            info: WorkspaceInfo {
-                repo_id: self.descriptor.repo_id.clone(),
-                workspace: workspace.derived.workspace.name().clone(),
-                workspace_incarnation: workspace.derived.workspace.incarnation().clone(),
-                role: workspace.derived.workspace.role(),
-                image_format: workspace.derived.workspace.format(),
-                mount: self.workspace_mount_path(workspace.derived.workspace.name())?,
-                state: match workspace.derived.mount_state {
-                    crate::storage::lifecycle::MountState::Detached => {
-                        crate::api::dto::WorkspaceState::Detached
-                    }
-                    crate::storage::lifecycle::MountState::Mounted { .. } => {
-                        crate::api::dto::WorkspaceState::Attached
-                    }
-                },
-                branch: info_snapshot.and_then(|info| info.branch.clone()),
-                base_commit,
-                created_at,
-                checkpoints: workspace
-                    .derived
-                    .checkpoints
-                    .iter()
-                    .map(|checkpoint| crate::api::dto::CheckpointInfo {
-                        label: checkpoint.label.to_string(),
-                        revision: checkpoint.revision.get(),
-                        pinned: matches!(checkpoint.pin, crate::storage::lifecycle::Pin::Pinned),
-                    })
-                    .collect(),
-                snapshot_stale: info_snapshot.is_some_and(|info| info.stale),
-                landing: None,
-            },
+            info,
             grants: workspace.metadata.grants.clone(),
             lifecycle_revision: workspace.derived.workspace.revision().get(),
             topology_revision: workspace.derived.workspace.topology_revision().get(),
@@ -6685,9 +6652,14 @@ fn binding_from_remotes(
     let mut candidates = Vec::with_capacity(remotes.len());
     let mut unusable = Vec::new();
     for remote in remotes {
-        match crate::repository::normalize_remote_url(&remote.url) {
-            Ok(repo_id) => candidates.push((remote, repo_id)),
-            Err(error) => unusable.push(format!("{} ({error})", remote.name)),
+        match remote
+            .url
+            .to_str()
+            .map(crate::repository::normalize_remote_url)
+        {
+            Some(Ok(repo_id)) => candidates.push((remote, repo_id)),
+            Some(Err(error)) => unusable.push(format!("{} ({error})", remote.name)),
+            None => unusable.push(format!("{} (remote URL is not UTF-8)", remote.name)),
         }
     }
 
@@ -6776,7 +6748,8 @@ fn binding_from_remotes(
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn persistable_remote_url(value: &str) -> Option<String> {
+fn persistable_remote_url(value: &Path) -> Option<String> {
+    let value = value.to_str()?;
     let suffix = value
         .char_indices()
         .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index));
@@ -7120,15 +7093,19 @@ fn reconcile_binding_with_remotes(
         if current.as_deref() == Some(url.as_str()) {
             continue;
         }
-        match crate::repository::normalize_remote_url(&remote.url) {
-            Ok(derived) if derived == identity.repo_id => {
+        match remote
+            .url
+            .to_str()
+            .map(crate::repository::normalize_remote_url)
+        {
+            Some(Ok(derived)) if derived == identity.repo_id => {
                 // Same identity, new transport: follow the move. The persistable form is what
                 // comparisons above use, so it is what gets recorded; a URL it cannot express
                 // was already refused by the parse succeeding only on supported transports.
-                identity.remote_url = current.or(Some(remote.url.clone()));
+                identity.remote_url = current.or_else(|| remote.url.to_str().map(str::to_owned));
                 healed = true;
             }
-            Ok(derived) => {
+            Some(Ok(derived)) => {
                 return Err(CowshedError::conflict(
                     format!(
                         "repository binding names {} for remote {name}, but Git configuration now names {derived}",
@@ -7143,7 +7120,7 @@ fn reconcile_binding_with_remotes(
                     ),
                 ));
             }
-            Err(_) => {
+            Some(Err(_)) | None => {
                 return Err(CowshedError::conflict(
                     format!("repository binding remote {name} does not match Git configuration"),
                     "restore the recorded remote before opening cowshed",
@@ -8419,7 +8396,7 @@ mod retired_recovery_tests {
         let image = trash.join(format!("raven-{}.asif", incarnation.as_str()));
         std::fs::write(&image, b"retired image").unwrap();
         let mut grants =
-            GrantSet::closed_baseline(Some(PortBlock::new(49_152, 16).unwrap())).unwrap();
+            GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).unwrap())).unwrap();
         grants.revision = 4;
         DetachedWorkspaceMetadata {
             version: METADATA_VERSION,
@@ -9377,7 +9354,7 @@ mod workspace_origin_tests {
             publication_state: PublicationState::Active,
             updated_at: "2026-07-13T00:00:00Z".to_owned(),
             grants: GrantSet::closed_baseline(Some(
-                PortBlock::new(49_152, 16).expect("port block"),
+                PortBlock::new(49_136, 16).expect("port block"),
             ))
             .expect("grants"),
             info_snapshot: Some(WorkspaceInfoSnapshot {
@@ -9991,7 +9968,7 @@ mod binding_heal_persistence_tests {
 
         let remotes = [crate::git::RemoteUrl {
             name: "origin".to_owned(),
-            url: "ssh://git@forge.example.test:2223/acme/widget.git".to_owned(),
+            url: "ssh://git@forge.example.test:2223/acme/widget.git".into(),
         }];
         let healed = reconcile_binding_with_remotes(
             &recorded,
@@ -10030,7 +10007,7 @@ mod binding_tests {
     fn remote(name: &str, url: &str) -> crate::git::RemoteUrl {
         crate::git::RemoteUrl {
             name: name.to_owned(),
-            url: url.to_owned(),
+            url: url.into(),
         }
     }
 

@@ -8,6 +8,8 @@ pub(super) fn peer_uid(fd: libc::c_int) -> Result<libc::uid_t, PeerCredentialsEr
     };
     let mut credentials_len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
         .map_err(|_| PeerCredentialsError::PeerCredentialQueryFailed)?;
+    // SAFETY: the caller supplies a live stream-socket fd and the output pointer/length describe
+    // one fully initialized `ucred`.
     let result = unsafe {
         libc::getsockopt(
             fd,
@@ -18,6 +20,9 @@ pub(super) fn peer_uid(fd: libc::c_int) -> Result<libc::uid_t, PeerCredentialsEr
         )
     };
     if result != 0 {
+        return Err(PeerCredentialsError::PeerCredentialQueryFailed);
+    }
+    if credentials_len as usize != std::mem::size_of::<libc::ucred>() {
         return Err(PeerCredentialsError::PeerCredentialQueryFailed);
     }
     // SO_PEERCRED includes gid, but uid is the authorization boundary for this socket.

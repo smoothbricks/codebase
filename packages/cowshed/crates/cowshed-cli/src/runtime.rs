@@ -3653,8 +3653,6 @@ mod tests {
             socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
             cli_version: "2.0.0".into(),
             daemon_version: Some("1.9.0".into()),
-            cache_entries: 0,
-            cache_bytes: 0,
             active_workspaces: 0,
         };
 
@@ -3677,8 +3675,6 @@ mod tests {
             socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
             cli_version: "2.0.0".into(),
             daemon_version: None,
-            cache_entries: 0,
-            cache_bytes: 0,
             active_workspaces: 0,
         });
         assert_eq!(gateway[0].code, "gateway-down");
