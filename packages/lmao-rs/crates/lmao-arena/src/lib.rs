@@ -13,7 +13,7 @@
 //! - Tiers: 8,16,32,64,128,256,512 (7); size classes: span_system(9B/row),
 //!   col_1b, col_4b, col_8b (null-bitmap + values sharing one block); identity is
 //!   a separate fixed-size class.
-//! - Alloc: freelist pop → recursive buddy split from tier+1 → bump (8-byte aligned).
+//! - Alloc: freelist pop → recursive buddy split from tier+1 → bump (64-byte aligned).
 //! - Free: push + address-based buddy-merge cascade (right buddy = offset + size).
 //! - Sentinel conventions: offset 0 = null/none; OOM returns 0.
 
@@ -56,7 +56,9 @@ pub struct Header {
     pub thread_id: u64,
     pub freelists: [u32; NUM_FREELISTS],
     pub thread_id_set: u8,
-    _reserved: [u8; 47],
+    _pad1: [u8; 3],
+    pub freelist_exact: u32,
+    _reserved: [u8; 40],
 }
 
 /// Per-span identity block in the linear-memory ABI.
@@ -95,9 +97,17 @@ const _: () = assert!(size_of::<FreeBlock>() == FREE_BLOCK_SIZE);
 
 /// Capacity (power of 2, 8..=512) → tier index 0..=6.
 #[inline]
-pub fn capacity_to_tier(capacity: u32) -> usize {
-    debug_assert!(capacity.is_power_of_two() && (MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity));
-    (capacity.trailing_zeros() - MIN_CAPACITY.trailing_zeros()) as usize
+pub const fn capacity_to_tier(capacity: u32) -> Option<usize> {
+    match capacity {
+        8 => Some(0),
+        16 => Some(1),
+        32 => Some(2),
+        64 => Some(3),
+        128 => Some(4),
+        256 => Some(5),
+        512 => Some(6),
+        _ => None,
+    }
 }
 
 #[inline]
@@ -105,11 +115,17 @@ pub fn tier_to_capacity(tier: usize) -> u32 {
     MIN_CAPACITY << tier
 }
 
+/// Bytes in a column validity bitmap for `capacity` rows.
+#[inline]
+pub const fn null_bitmap_bytes(capacity: u32) -> u32 {
+    capacity.div_ceil(8)
+}
+
 /// Block byte size for a size class at a capacity (null bitmap + values share the
 /// block for column classes; span_system is 9 bytes/row: i64 timestamp + u8 entry_type).
 #[inline]
 pub fn block_size(sc: SizeClass, capacity: u32) -> u32 {
-    let null_bitmap = (capacity + 7) >> 3;
+    let null_bitmap = null_bitmap_bytes(capacity);
     match sc {
         SizeClass::SpanSystem => capacity * 9,
         SizeClass::Col1B => null_bitmap + capacity,
@@ -125,9 +141,9 @@ pub type Offset = u32;
 pub mod raw;
 pub use raw::Mem;
 
-/// `Vec<u8>`-backed [`raw::Mem`] — the native linear-memory backend. Growth is
-/// Vec doubling (bounded below by the requested size); the wasm backend in
-/// `lmao-wasm` implements the same trait over `memory.grow` pages.
+/// `Vec<u8>`-backed [`raw::Mem`] — the native linear-memory backend. The
+/// constructor reserves the complete admitted region; allocations return the
+/// offset-0 OOM sentinel rather than reallocating the arena under load.
 #[derive(Debug)]
 pub struct VecMem(Vec<u8>);
 
@@ -148,9 +164,11 @@ impl raw::Mem for VecMem {
         self.0.len() as u32
     }
     fn grow_to(&mut self, new_size: u32) -> bool {
-        let target = (new_size as usize).max(self.0.len().saturating_mul(2));
-        self.0.resize(target, 0);
-        true
+        new_size <= self.size()
+    }
+    #[inline]
+    fn fill(&mut self, off: u32, len: u32, value: u8) {
+        self.0[off as usize..(off + len) as usize].fill(value);
     }
     #[inline]
     fn read_u8(&self, off: u32) -> u8 {
@@ -258,13 +276,17 @@ impl Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::offset_of;
 
     #[test]
-    fn tier_math_matches_zig() {
-        assert_eq!(capacity_to_tier(8), 0);
-        assert_eq!(capacity_to_tier(512), 6);
-        for t in 0..NUM_TIERS {
-            assert_eq!(capacity_to_tier(tier_to_capacity(t)), t);
+    fn tier_mapping_rejects_out_of_domain_capacities() {
+        assert_eq!(capacity_to_tier(8), Some(0));
+        assert_eq!(capacity_to_tier(512), Some(6));
+        assert_eq!(capacity_to_tier(0), None);
+        assert_eq!(capacity_to_tier(24), None);
+        assert_eq!(capacity_to_tier(1024), None);
+        for tier in 0..NUM_TIERS {
+            assert_eq!(capacity_to_tier(tier_to_capacity(tier)), Some(tier));
         }
     }
 
@@ -274,6 +296,37 @@ mod tests {
         assert_eq!(block_size(SizeClass::Col1B, 8), 1 + 8);
         assert_eq!(block_size(SizeClass::Col4B, 8), 1 + 32);
         assert_eq!(block_size(SizeClass::Col8B, 8), 1 + 64);
+    }
+
+    #[test]
+    fn abi_field_offsets_are_frozen() {
+        assert_eq!(offset_of!(Header, bump_ptr), 0);
+        assert_eq!(offset_of!(Header, span_id_counter), 4);
+        assert_eq!(offset_of!(Header, alloc_count), 8);
+        assert_eq!(offset_of!(Header, free_count), 12);
+        assert_eq!(offset_of!(Header, freelist_identity), 16);
+        assert_eq!(offset_of!(Header, thread_id), 24);
+        assert_eq!(offset_of!(Header, freelists), 32);
+        assert_eq!(offset_of!(Header, thread_id_set), 144);
+        assert_eq!(offset_of!(Header, freelist_exact), 148);
+        assert_eq!(offset_of!(Identity, write_index), 0);
+        assert_eq!(offset_of!(Identity, span_id), 4);
+        assert_eq!(offset_of!(Identity, trace_id_len), 8);
+        assert_eq!(offset_of!(Identity, trace_id), 9);
+        assert_eq!(offset_of!(TraceRoot, wall_clock_nanos), 0);
+        assert_eq!(offset_of!(TraceRoot, monotonic_ms), 8);
+        assert_eq!(offset_of!(FreeBlock, next_ptr), 0);
+        assert_eq!(offset_of!(FreeBlock, freelist_len), 4);
+        assert_eq!(offset_of!(FreeBlock, reuse_count), 8);
+        assert_eq!(offset_of!(FreeBlock, split_count), 12);
+        assert_eq!(offset_of!(FreeBlock, merge_count), 16);
+    }
+
+    #[test]
+    fn admitted_native_region_returns_oom_without_growth() {
+        let mut arena = Arena::new(256);
+        assert_eq!(arena.alloc(SizeClass::SpanSystem, 64), 0);
+        assert_eq!(arena.mem().size(), 256);
     }
 
     #[test]
