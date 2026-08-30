@@ -18,7 +18,7 @@
 //!
 //! ## Field DSL (from `01a`)
 //!
-//! ```ignore
+//! ```text
 //! define_log_schema!(pub HttpSchema {
 //!     status: number,               // f64 column
 //!     retries: uint64,              // u64 column
@@ -29,11 +29,9 @@
 //! });
 //! ```
 //!
-//! Generates `HttpSchema` (buffer wrapper: core `SpanBuffer` + one lazy column per
-//! field), `tag_*` writers (row 0, last-write-wins per `01b`), `set_*(row, v)`
-//! row-targeted writers for log values, a `*_VALUES` const dictionary per enum
-//! field, and a per-schema `ratchet()` (`OnceLock<Mutex<CapacityRatchet>>` — all
-//! buffers of one schema share capacity learning, `01b2`).
+//! Generates a typed wrapper over one core `SpanBuffer`, `tag_*` writers (row 0,
+//! last-write-wins per `01b`), `set_*(row, v)` row-targeted writers, scoped enum
+//! dictionaries, and `FIELD_META` retaining every DSL strategy for Arrow flush.
 //!
 //! Not yet implemented from `01a` (deliberate, documented): `binary`/`unknown`
 //! (msgpack columns) and `.mask(preset)` — both are flush-side concerns blocked
@@ -153,6 +151,7 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
     let mut writers = Vec::new();
     let mut dict_consts = Vec::new();
     let mut bytes_terms = Vec::new();
+    let mut field_meta = Vec::new();
 
     for f in &fields {
         let fname = &f.name;
@@ -170,24 +169,45 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
             let n = values.len() as u16;
             dict_consts.push(quote! {
                 /// Compile-time enum dictionary (`01a`: zero flush work).
-                #vis const #dict_name: &[&str] = &[#(#lits),*];
+                #vis const #dict_name: &'static [&'static str] = &[#(#lits),*];
+            });
+            field_meta.push(quote! {
+                ::lmao_core::FieldMeta::new(
+                    stringify!(#fname),
+                    ::lmao_core::FieldStrategy::Enum(Self::#dict_name),
+                )
             });
             writers.push(quote! {
                 #[doc = concat!("Row-0 tag write for enum field `", stringify!(#fname), "` (index into the const dictionary).")]
                 #[inline]
-                #vis fn #tag_fn(&mut self, index: u16) -> &mut Self {
+                #vis fn #tag_fn(
+                    &mut self,
+                    index: u16,
+                ) -> ::core::result::Result<&mut Self, ::lmao_core::EnumIndexError> {
                     self.#set_fn(0, index)
                 }
                 #[inline]
-                #vis fn #set_fn(&mut self, row: usize, index: u16) -> &mut Self {
-                    debug_assert!(index < #n);
+                #vis fn #set_fn(
+                    &mut self,
+                    row: usize,
+                    index: u16,
+                ) -> ::core::result::Result<&mut Self, ::lmao_core::EnumIndexError> {
+                    if index >= #n {
+                        return ::core::result::Result::Err(::lmao_core::EnumIndexError {
+                            field: stringify!(#fname),
+                            index,
+                            variants: #n,
+                        });
+                    }
                     let cap = self.span.capacity();
                     self.#fname.set(row, cap, index);
-                    self
+                    ::core::result::Result::Ok(self)
                 }
                 #[inline]
                 #vis fn #get_fn(&self, row: usize) -> Option<&'static str> {
-                    self.#fname.get(row).map(|i| #dict_name[i as usize])
+                    self.#fname
+                        .get(row)
+                        .and_then(|index| Self::#dict_name.get(index as usize).copied())
                 }
             });
             col_fields.push(quote! { #fname: ::lmao_core::EnumColumn });
@@ -225,6 +245,17 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
                 ),
                 FieldKind::Enum(_) => unreachable!(),
             };
+        let strategy = match &f.kind {
+            FieldKind::Number => quote!(::lmao_core::FieldStrategy::Number),
+            FieldKind::Uint64 => quote!(::lmao_core::FieldStrategy::Uint64),
+            FieldKind::Boolean => quote!(::lmao_core::FieldStrategy::Boolean),
+            FieldKind::Category => quote!(::lmao_core::FieldStrategy::Category),
+            FieldKind::Text => quote!(::lmao_core::FieldStrategy::Text),
+            FieldKind::Enum(_) => unreachable!(),
+        };
+        field_meta.push(quote! {
+            ::lmao_core::FieldMeta::new(stringify!(#fname), #strategy)
+        });
 
         writers.push(quote! {
             #[doc = concat!("Row-0 tag write (last-write-wins, `01b`) — ", #doc, ".")]
@@ -260,60 +291,31 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
     }
 
     let expanded = quote! {
-        #(#dict_consts)*
-
-        /// Schema-generated span buffer: core system columns + one lazy column per
-        /// schema field. Generated by `lmao_macros::define_log_schema!`.
+        /// Schema-generated typed columns over one already-started core span.
         #vis struct #name {
-            /// The underlying system-column buffer.
+            /// The single system-column buffer owned by the tracing lifecycle.
             #vis span: ::lmao_core::SpanBuffer,
             #(#col_fields,)*
         }
 
         impl #name {
-            /// Per-schema capacity ratchet: ALL buffers of this schema share
-            /// capacity learning (`01b2`).
-            #vis fn ratchet() -> &'static ::std::sync::Mutex<::lmao_core::CapacityRatchet> {
-                static RATCHET: ::std::sync::OnceLock<::std::sync::Mutex<::lmao_core::CapacityRatchet>> =
-                    ::std::sync::OnceLock::new();
-                RATCHET.get_or_init(|| {
-                    ::std::sync::Mutex::new(::lmao_core::CapacityRatchet::new(64))
-                })
-            }
+            #(#dict_consts)*
 
-            /// Start a dynamically named span buffer at the ratchet-recommended capacity.
-            #vis fn start(
-                identity: ::std::sync::Arc<::lmao_core::SpanIdentity>,
-                name: impl Into<::lmao_core::SharedStr>,
-                anchor: &::lmao_core::TraceAnchor,
-                clock: &dyn ::lmao_core::Clock,
-            ) -> Self {
-                let capacity = Self::ratchet().lock().unwrap().capacity();
+            /// Field strategies retained from the DSL for the Arrow flush planner.
+            #vis const FIELD_META: &'static [::lmao_core::FieldMeta] = &[
+                #(#field_meta,)*
+            ];
+
+            /// Attach typed columns to the span buffer created by `TraceContext`.
+            #vis fn from_span(span: ::lmao_core::SpanBuffer) -> Self {
                 Self {
-                    span: ::lmao_core::SpanBuffer::start_dynamic(
-                        identity,
-                        capacity,
-                        name.into(),
-                        anchor,
-                        clock,
-                    ),
+                    span,
                     #(#col_inits,)*
                 }
             }
 
-            /// Complete the span and feed the ratchet (`01b2`: stats recorded per
-            /// finished span).
-            #vis fn finish_ok(
-                mut self,
-                anchor: &::lmao_core::TraceAnchor,
-                clock: &dyn ::lmao_core::Clock,
-            ) -> Self {
-                self.span.end_ok(anchor, clock);
-                Self::ratchet()
-                    .lock()
-                    .unwrap()
-                    .record_span(self.span.write_index().saturating_sub(2) as u64);
-                self
+            #vis fn into_span(self) -> ::lmao_core::SpanBuffer {
+                self.span
             }
 
             /// Total heap bytes held by lazy attribute columns (0 when untouched).
@@ -330,16 +332,16 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
 /// Span invocation with callsite capture — the Rust equivalent of the TS AST
 /// transformer's line-number injection (`01o`).
 ///
-/// ```ignore
+/// ```text
 /// let (out, buf) = span!(trace, "fetch-user", |ctx| -> Result<_, ()> {
 ///     ctx.log(EntryType::Info, "looking up {id}", line!());
 ///     Ok(42)
 /// });
 /// ```
 ///
-/// Expands to `trace.span(name, parent, 64, ...)` with `set_callsite(file!(),
-/// line!())` applied before the body runs. Use `span!(trace, parent_expr,
-/// "name", |ctx| ...)` to nest under a parent identity.
+/// Expands to `trace.span(name, parent, DEFAULT_CAPACITY, ...)` with
+/// `set_callsite(file!(), line!())` applied before the body runs. Use
+/// `span!(trace, parent_expr, "name", |ctx| ...)` to nest under a parent identity.
 #[proc_macro]
 pub fn span(input: TokenStream) -> TokenStream {
     // span! only forwards these fragments (`#trace` / `#p` / `#body`); it never
@@ -402,7 +404,7 @@ pub fn span(input: TokenStream) -> TokenStream {
         None => quote!(::core::option::Option::None),
     };
     quote! {
-        (#trace).span(#name, #parent_expr, 64, |__lmao_ctx| {
+        (#trace).span(#name, #parent_expr, ::lmao_core::DEFAULT_CAPACITY, |__lmao_ctx| {
             __lmao_ctx.set_callsite(file!(), line!());
             (#body)(__lmao_ctx)
         })

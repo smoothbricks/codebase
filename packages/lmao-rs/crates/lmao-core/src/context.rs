@@ -73,7 +73,7 @@ impl TraceContext {
     /// attaches the buffer to its parent or hands it to the flush pipeline.
     pub fn span<T, E>(
         &self,
-        name: &str,
+        name: impl Into<SharedStr>,
         parent: Option<Arc<SpanIdentity>>,
         capacity: usize,
         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
@@ -94,16 +94,17 @@ impl TraceContext {
     /// in a deterministic simulation.
     pub fn span_with_retry<T, E>(
         &self,
-        name: &str,
+        name: impl Into<SharedStr>,
         parent: Option<Arc<SpanIdentity>>,
         capacity: usize,
         mut sleep: impl FnMut(u64),
         mut f: impl FnMut(&mut SpanContext<'_>) -> Result<T, Transient<E>>,
     ) -> (Result<T, Transient<E>>, Vec<SpanBuffer>) {
+        let name = name.into();
         let mut attempts = Vec::new();
         let mut attempt = 0u32;
         loop {
-            let (out, buf) = self.span(name, parent.clone(), capacity, &mut f);
+            let (out, buf) = self.span(name.clone(), parent.clone(), capacity, &mut f);
             attempts.push(buf);
             match out {
                 Ok(v) => return (Ok(v), attempts),
@@ -133,12 +134,12 @@ impl<'t> SpanContext<'t> {
         trace: &'t TraceContext,
         identity: Arc<SpanIdentity>,
         capacity: usize,
-        name: &str,
+        name: impl Into<SharedStr>,
     ) -> Self {
         let buf = SpanBuffer::start_dynamic(
             identity,
             capacity,
-            SharedStr::Owned(name.into()),
+            name.into(),
             &trace.anchor,
             trace.clock(),
         );
@@ -191,7 +192,7 @@ impl<'t> SpanContext<'t> {
     /// Nest a child span (buffer attached to this span's children).
     pub fn child<T, E>(
         &mut self,
-        name: &str,
+        name: impl Into<SharedStr>,
         capacity: usize,
         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
     ) -> Result<T, E> {

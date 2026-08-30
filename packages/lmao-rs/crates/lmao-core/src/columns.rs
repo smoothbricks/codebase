@@ -38,6 +38,48 @@ impl SharedStr {
     }
 }
 
+/// Flush strategy preserved by schema code generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldStrategy {
+    Number,
+    Uint64,
+    Boolean,
+    Category,
+    Text,
+    Enum(&'static [&'static str]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldMeta {
+    pub name: &'static str,
+    pub strategy: FieldStrategy,
+}
+
+impl FieldMeta {
+    pub const fn new(name: &'static str, strategy: FieldStrategy) -> Self {
+        Self { name, strategy }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumIndexError {
+    pub field: &'static str,
+    pub index: u16,
+    pub variants: u16,
+}
+
+impl std::fmt::Display for EnumIndexError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "enum field {} index {} is outside 0..{}",
+            self.field, self.index, self.variants
+        )
+    }
+}
+
+impl std::error::Error for EnumIndexError {}
+
 impl From<&'static str> for SharedStr {
     #[inline]
     fn from(s: &'static str) -> Self {

@@ -54,20 +54,6 @@ async fn main() {
                 clock,
             );
             for call in 0..25 {
-                // Typed schema buffer for attribute columns; core span context
-                // for system columns. (The full ergonomic fusion — SpanContext
-                // parameterized by schema — is the next macro iteration.)
-                let mut attrs = ToolCallSchema::start(
-                    trace.identity(None),
-                    "tool-call-attributes",
-                    &trace.anchor,
-                    trace.clock(),
-                );
-                attrs
-                    .tag_tool_name(format!("tool-{}", call % 5))
-                    .tag_cache_hit(call % 3 == 0)
-                    .tag_outcome(0);
-
                 let (out, buf) = trace.span_with_retry(
                     "tool-call",
                     None,
@@ -83,14 +69,18 @@ async fn main() {
                         }
                     },
                 );
-                attrs
-                    .tag_duration_ms(1.5 * (call as f64 + 1.0))
-                    .tag_tokens(128 * call);
-                let attrs = attrs.finish_ok(&trace.anchor, trace.clock());
                 let _ = out; // jcode: surface Err to the turn loop
-                drop(attrs); // jcode: attrs buffer flushes alongside `buf`
-                for b in buf {
-                    tx.send(b).await.expect("flush channel open");
+                for span in buf {
+                    let mut traced = ToolCallSchema::from_span(span);
+                    traced
+                        .tag_tool_name(format!("tool-{}", call % 5))
+                        .tag_cache_hit(call % 3 == 0)
+                        .tag_duration_ms(1.5 * (call as f64 + 1.0))
+                        .tag_tokens(128 * call);
+                    traced.tag_outcome(0).expect("known outcome variant");
+                    tx.send(traced.into_span())
+                        .await
+                        .expect("flush channel open");
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -138,6 +128,6 @@ async fn main() {
     assert!(spans >= 100, "every tool call produced at least one span");
     println!(
         "enum dictionary (compile-time, zero flush work): {:?}",
-        OUTCOME_VALUES
+        ToolCallSchema::OUTCOME_VALUES
     );
 }
