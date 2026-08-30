@@ -470,6 +470,8 @@ fn invalid(kind: &'static str, path: &Path) -> WorkspaceCredentialError {
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    use crate::workspace_environment::{GO_ENV, PORT_BASE_ENV, WORKSPACE_TOKEN_ENV};
+
     use super::*;
     use crate::metadata::{ImageFormat, WorkspaceRole};
     use crate::storage::lifecycle::Revision;
@@ -542,7 +544,7 @@ mod tests {
         assert_eq!(
             first_environment,
             format!(
-                "export GOENV=/Users/test/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env\nexport COWSHED_WORKSPACE_TOKEN={first_token}\nexport COWSHED_PORT_BASE=40960\n"
+                "export {GO_ENV}=/Users/test/.cowshed/mnt/acme/widget/raven/.cowshed/cache/go/env\nexport {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\n"
             )
         );
 
