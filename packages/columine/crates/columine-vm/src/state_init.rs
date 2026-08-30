@@ -23,12 +23,13 @@
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
-    AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
-    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE, STATE_FORMAT_VERSION,
-    STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags,
-    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size, has_array_fields,
-    next_power_of_2,
+    AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode,
+    EvictionEntry, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE,
+    STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags,
+    StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
+    has_array_fields, next_power_of_2,
 };
+use core::mem::size_of;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Slot that triggered `NEEDS_GROWTH`, or `0xFF` when none is pending.
@@ -40,7 +41,9 @@ pub fn needs_growth_slot() -> u32 {
     u32::from(NEEDS_GROWTH_SLOT.load(Ordering::Relaxed))
 }
 
-pub const EVICTION_ENTRY_SIZE: u32 = 16;
+pub const EVICTION_ENTRY_SIZE: u32 = size_of::<EvictionEntry>() as u32;
+/// Closed-form capacity of the optional evicted-row side buffer.
+pub const EVICTED_BUFFER_CAP: u32 = 1024;
 
 // =============================================================================
 // Struct layout helpers — initialization-specific formulas
@@ -111,7 +114,7 @@ pub const fn ttl_side_buffer_size(has_ttl: bool, has_evict_trigger: bool, capaci
     }
     let mut size = align8(capacity * EVICTION_ENTRY_SIZE);
     if has_evict_trigger {
-        size += align8(1024 * EVICTION_ENTRY_SIZE);
+        size += align8(EVICTED_BUFFER_CAP * EVICTION_ENTRY_SIZE);
     }
     size
 }
@@ -467,15 +470,11 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 size += ARENA_HEADER_SIZE + arena_initial_capacity_64(capacity);
             }
             size = align8(size);
-
-            if type_flags.has_ttl() {
-                size += capacity * EVICTION_ENTRY_SIZE;
-                size = align8(size);
-                if type_flags.has_evict_trigger() {
-                    size += 1024 * EVICTION_ENTRY_SIZE;
-                    size = align8(size);
-                }
-            }
+            size += ttl_side_buffer_size(
+                type_flags.has_ttl(),
+                type_flags.has_evict_trigger(),
+                capacity,
+            );
         } else if op == Opcode::SlotOrderedList as u8 {
             let cap_lo = init_code[pc + 2];
             let cap_hi = init_code[pc + 3];
@@ -773,7 +772,7 @@ pub fn init_state(
 
                 if type_flags.has_evict_trigger() {
                     evicted_buffer_offset = data_offset;
-                    let evicted_size = 1024 * EVICTION_ENTRY_SIZE;
+                    let evicted_size = EVICTED_BUFFER_CAP * EVICTION_ENTRY_SIZE;
                     bytes::zero(state, data_offset, evicted_size);
                     data_offset = align8(data_offset + evicted_size);
                 }
@@ -1524,7 +1523,7 @@ pub fn grow_state(
                     bytes::read_u32(old_state, meta_base + SlotMetaOffset::EVICTED_COUNT);
                 let mut copied_evicted_count = 0u32;
                 if old_evicted_offset != 0 && evicted_buffer_offset != 0 && old_evicted_count > 0 {
-                    copied_evicted_count = old_evicted_count.min(1024);
+                    copied_evicted_count = old_evicted_count.min(EVICTED_BUFFER_CAP);
                     let copy_bytes = copied_evicted_count * EVICTION_ENTRY_SIZE;
                     bytes::copy(
                         new_state,

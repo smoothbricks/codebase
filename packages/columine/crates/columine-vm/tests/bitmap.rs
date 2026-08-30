@@ -10,8 +10,10 @@ use columine_vm::bitmap_ops::{
 use columine_vm::hooks::{MutationOp, MutationRecord, NoVm, VmHooks};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::minroar::MiniRoaring as RoaringBitmap;
-use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
-use columine_vm::vm::{EVICTION_ENTRY_SIZE, Vm, find_latest_eviction_timestamp_for_key};
+use columine_vm::state_init::{
+    DEFAULT_ACCEPTED_PROGRAM_MAGICS, EVICTION_ENTRY_SIZE, calculate_state_size, init_state,
+};
+use columine_vm::vm::{Vm, find_latest_eviction_timestamp_for_key};
 use proptest::prelude::*;
 
 use columine_types::types::{
