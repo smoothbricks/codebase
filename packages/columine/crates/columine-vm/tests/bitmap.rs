@@ -14,11 +14,10 @@ use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_s
 use columine_vm::vm::{EVICTION_ENTRY_SIZE, Vm, find_latest_eviction_timestamp_for_key};
 use proptest::prelude::*;
 
-use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
     BITMAP_BASE_BYTES, BITMAP_BYTES_PER_CAPACITY, BITMAP_SERIALIZED_LEN_BYTES, ErrorCode, Opcode,
-    SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
-    StateHeaderOffset,
+    PROGRAM_MAGIC, SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC,
+    SlotMetaOffset, SlotType, StateHeaderOffset,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
