@@ -96,7 +96,9 @@ function nativeBinary(): NativeBinary {
 
 export function loadNativeModule(): NativeModule {
   const { directory, fileName } = nativeBinary();
-  const override = process.env.COWSHED_NODE_PATH;
+  // napi-rs loaders honour NAPI_RS_NATIVE_LIBRARY_PATH first; this is that same hook, not a
+  // bespoke cowshed name. The override stays — only the spelling is the ecosystem one.
+  const override = process.env.NAPI_RS_NATIVE_LIBRARY_PATH;
   // NAPI_DEBUG_ADDON is set only by the inferred napi-test target: the test suite loads the
   // dev-profile addon from .cache/native-debug (never packaged; `files` ships dist/ wholesale)
   // instead of the release artifacts. Both URL depths cover running from src/ and dist/ts/.
