@@ -26,7 +26,8 @@ use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
     PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, SLOT_META_SIZE, STATE_FORMAT_VERSION,
     STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags,
-    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, next_power_of_2,
+    StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size, has_array_fields,
+    next_power_of_2,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -83,29 +84,6 @@ pub fn compute_struct_row_layout_padded(
 /// the same offsets.
 pub fn struct_field_offset(num_fields: u8, field_types: &[u8], target_field: u8) -> u32 {
     columine_types::types::struct_field_offset(num_fields, field_types, target_field)
-}
-
-/// Detect array fields from raw descriptor bytes (`byte >= 5`), not enum
-/// values; bytes above 9 also count as arrays for this layout check.
-pub fn has_array_fields_raw(num_fields: u8, field_types: &[u8]) -> bool {
-    field_types
-        .iter()
-        .take(usize::from(num_fields))
-        .any(|&b| b >= 5)
-}
-
-/// Return the element size for an array field. A non-array field is a
-/// programmer error and panics.
-pub fn arena_elem_size_strict(field_type_byte: u8) -> u32 {
-    match field_type_byte {
-        // ARRAY_U32, ARRAY_STRING
-        5 | 8 => 4,
-        // ARRAY_I64, ARRAY_F64
-        6 | 7 => 8,
-        // ARRAY_BOOL
-        9 => 1,
-        _ => columine_types::die!("invariant: arenaElemSize called on a non-array field type"),
-    }
 }
 
 /// STRUCT_MAP slot data: descriptor + keys + rows + optional timestamps.
@@ -485,7 +463,7 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
             };
 
-            if has_array_fields_raw(num_fields, field_types) {
+            if has_array_fields(num_fields, field_types) {
                 size += ARENA_HEADER_SIZE + arena_initial_capacity_64(capacity);
             }
             size = align8(size);
@@ -910,7 +888,7 @@ pub fn init_state(
                 struct_map_slot_data_size(layout.descriptor_size, capacity, layout.row_size, false)
             };
 
-            if has_array_fields_raw(num_fields, &field_types) {
+            if has_array_fields(num_fields, &field_types) {
                 let arena_cap = arena_initial_capacity_64(capacity);
                 // Arena header offset lives in metadata bytes 20-23.
                 bytes::write_u32(state, meta_base + 20, data_offset);
@@ -1393,7 +1371,13 @@ pub fn grow_state(
                                     continue;
                                 }
 
-                                let elem_sz = arena_elem_size_strict(ft_byte);
+                                let elem_sz = arena_elem_size(
+                                    StructFieldType::from_u8(ft_byte).unwrap_or_else(|| {
+                                        columine_types::die!(
+                                            "validated array field type vanished during growth"
+                                        )
+                                    }),
+                                );
                                 let byte_len = arr_len * elem_sz;
 
                                 bytes::copy(
