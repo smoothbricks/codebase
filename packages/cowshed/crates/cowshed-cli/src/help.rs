@@ -151,10 +151,18 @@ pub fn command_map() -> &'static str {
     MAP.as_str()
 }
 
+/// The one onboarding sentence a first-time caller sees, period included.
+const ONBOARDING_SENTENCE: &str =
+    "first time here? run cowshed setup, then cowshed adopt in your checkout.";
+
 /// Two-line onboarding a first-time caller sees above the command map.
 pub fn onboarding_preamble() -> &'static str {
-    "warm git workspaces — a copy-on-write checkout for each agent.\n\
-     first time here? run cowshed setup, then cowshed adopt in your checkout.\n"
+    static PREAMBLE: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "warm git workspaces — a copy-on-write checkout for each agent.\n{ONBOARDING_SENTENCE}\n"
+        )
+    });
+    PREAMBLE.as_str()
 }
 
 /// Bare `cowshed` prints the preamble, then the command map.
@@ -180,7 +188,9 @@ pub fn overview() -> String {
     );
     page.push_str("\nglobal options:\n");
     render_options(&mut page, GLOBALS);
-    page.push_str("\nfirst time here? run cowshed setup, then cowshed adopt in your checkout\n");
+    page.push('\n');
+    page.push_str(ONBOARDING_SENTENCE);
+    page.push('\n');
     page.push_str("run `cowshed <command> --help` for one command's flags and what they mean\n");
     page
 }
@@ -405,11 +415,8 @@ mod tests {
         assert!(overview.contains(command_map()));
         assert!(overview.contains("--project <git-root>"));
         assert!(overview.contains("cowshed <command> --help"));
-        assert!(
-            overview.contains(
-                "first time here? run cowshed setup, then cowshed adopt in your checkout"
-            )
-        );
+        assert!(overview.contains(ONBOARDING_SENTENCE));
+        assert!(onboarding_preamble().contains(ONBOARDING_SENTENCE));
 
         let page = command_named("rm").unwrap().page();
         assert!(page.lines().all(|line| line.len() <= WIDTH), "{page}");
