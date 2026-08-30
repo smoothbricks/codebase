@@ -69,6 +69,13 @@ fn fd_failed(fd: libc::c_int) -> bool {
     fd == -1
 }
 
+/// Darwin `getmntinfo` returns the mount count, or `-1` on error with `errno` set.
+/// Treating a negative count as a slice length would be memory-unsafe; `0` is
+/// not a legitimate Darwin mount table either (at least `/` is mounted).
+fn getmntinfo_failed(count: libc::c_int) -> bool {
+    count <= 0
+}
+
 fn flock_succeeded(result: libc::c_int) -> bool {
     result == 0
 }
@@ -112,6 +119,9 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
     }
     let root_name = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| ApfsStorageError::Host("store root contains NUL".to_owned()))?;
+    // SAFETY: `root_name` is a `CString`, so the pointer is NUL-terminated and
+    // lives for the call. `ROOT_OPEN_FLAGS` includes `O_CLOEXEC | O_NOFOLLOW |
+    // O_DIRECTORY`, so this never follows a symlink at the store root.
     let root_fd = unsafe { libc::open(root_name.as_ptr(), ROOT_OPEN_FLAGS) };
     if fd_failed(root_fd) {
         return Err(io_error(
@@ -120,6 +130,8 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
             io::Error::last_os_error(),
         ));
     }
+    // SAFETY: `root_fd` is a live descriptor we exclusively own from a successful
+    // `open`; `File` takes ownership and will close it.
     let mut directory = unsafe { File::from_raw_fd(root_fd) };
     while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
@@ -129,6 +141,9 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
         };
         let name = path_component(name, path)?;
         if components.peek().is_none() {
+            // SAFETY: `directory` owns a live directory fd; `name` is a `CString`
+            // that outlives the call. `LOCK_FILE_OPEN_FLAGS` includes `O_NOFOLLOW |
+            // O_CLOEXEC` so the lock file cannot be a symlink and the fd cannot leak.
             let fd = unsafe {
                 libc::openat(
                     directory.as_raw_fd(),
@@ -144,11 +159,17 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
                     io::Error::last_os_error(),
                 ));
             }
+            // SAFETY: `fd` is a live descriptor we exclusively own from a successful
+            // `openat`; `File` takes ownership and will close it.
             return Ok(unsafe { File::from_raw_fd(fd) });
         }
+        // SAFETY: `directory` owns a live directory fd; `name` is a `CString` that
+        // outlives the call. `DIRECTORY_OPEN_FLAGS` includes `O_NOFOLLOW | O_DIRECTORY`.
         let mut fd =
             unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
         if should_create_directory(fd, io::Error::last_os_error().kind()) {
+            // SAFETY: `directory` owns a live directory fd; `name` is a `CString`
+            // that outlives the call. Mode `0o700` is the controller-directory policy.
             let created = unsafe {
                 libc::mkdirat(
                     directory.as_raw_fd(),
@@ -163,6 +184,8 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
                     io::Error::last_os_error(),
                 ));
             }
+            // SAFETY: same as the `openat` above; retry after `mkdirat` raced with another
+            // creator. `name` still lives.
             fd =
                 unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), DIRECTORY_OPEN_FLAGS) };
         }
@@ -173,6 +196,9 @@ fn open_lock_file(root: &Path, path: &Path) -> Result<File, ApfsStorageError> {
                 io::Error::last_os_error(),
             ));
         }
+        // SAFETY: `fd` is a live directory descriptor we exclusively own from a
+        // successful `openat`; `File` takes ownership and will close it. Dropping
+        // `directory` closes the previous component fd.
         directory = unsafe { File::from_raw_fd(fd) };
     }
     Err(ApfsStorageError::InvalidPlan(
@@ -196,6 +222,8 @@ fn acquire_image_locks(
             LockMode::Try => TRY_LOCK_OPERATION,
         };
         loop {
+            // SAFETY: `file` owns the fd for the duration of the call; `flock` does
+            // not consume it. `operation` is `LOCK_EX` or `LOCK_EX|LOCK_NB`.
             let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
             if flock_succeeded(result) {
                 files.push(file);
@@ -716,18 +744,28 @@ fn system_kernel_mounts() -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> 
         use std::hash::{Hash, Hasher};
 
         let mut mounts = std::ptr::null_mut();
+        // SAFETY: `getmntinfo(MNT_NOWAIT)` writes a process-static `statfs` array
+        // and returns the count, or `-1` on error. The buffer is valid until the
+        // next `getmntinfo`/`getfsstat` in this process; we copy mount-point and
+        // device strings out before returning so we never retain it.
         let count = unsafe { libc::getmntinfo(&mut mounts, libc::MNT_NOWAIT) };
-        if count == 0 {
+        if getmntinfo_failed(count) {
             return Err(ApfsStorageError::Host(format!(
                 "getmntinfo failed: {}",
                 io::Error::last_os_error()
             )));
         }
+        // SAFETY: `getmntinfo_failed` rejected a non-positive count, so `mounts`
+        // points at `count` initialized `statfs` records in the process-static buffer.
         let entries = unsafe { std::slice::from_raw_parts(mounts, count as usize) };
         entries
             .iter()
             .map(|entry| {
+                // SAFETY: Darwin NUL-terminates `f_mntonname`/`f_mntfromname`
+                // (`char[MAXPATHLEN]`). The pointers are into the `statfs` we
+                // borrowed for this iteration; we copy the bytes out immediately.
                 let bytes = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) }.to_bytes();
+                // SAFETY: same NUL-termination and buffer-lifetime invariant as `f_mntonname`.
                 let source_device = unsafe { CStr::from_ptr(entry.f_mntfromname.as_ptr()) }
                     .to_string_lossy()
                     .into_owned();
@@ -2624,6 +2662,9 @@ where
         {
             let path = CString::new(mount_point.as_os_str().as_bytes())
                 .map_err(|_| ApfsStorageError::Host("mount point contains NUL".to_owned()))?;
+            // SAFETY: `path` is a `CString`, so the pointer is NUL-terminated and
+            // lives for the call. `getuid`/`getgid` read this process's credentials;
+            // they take no pointers and cannot fail.
             let result = unsafe { libc::chown(path.as_ptr(), libc::getuid(), libc::getgid()) };
             if result == 0 {
                 Ok(())
@@ -4826,18 +4867,22 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStor
 fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
     #[cfg(target_os = "macos")]
     {
-        let left = CString::new(left.as_os_str().as_bytes())
+        let left_name = CString::new(left.as_os_str().as_bytes())
             .map_err(|_| ApfsStorageError::Host("canonical image path contains NUL".to_owned()))?;
-        let right = CString::new(right.as_os_str().as_bytes())
+        let right_name = CString::new(right.as_os_str().as_bytes())
             .map_err(|_| ApfsStorageError::Host("staged image path contains NUL".to_owned()))?;
-        const RENAME_SWAP: u32 = 0x0000_0002;
+        const _: () = assert!(libc::RENAME_SWAP == 0x0000_0002);
+        // SAFETY: both paths are `CString`s, so the pointers are NUL-terminated
+        // and not mutated for the call. `AT_FDCWD` is the process cwd.
+        // `RENAME_SWAP` (Darwin 0x2) exchanges two directory entries atomically
+        // or fails; the two buffers do not alias.
         let result = unsafe {
             libc::renameatx_np(
                 libc::AT_FDCWD,
-                left.as_ptr(),
+                left_name.as_ptr(),
                 libc::AT_FDCWD,
-                right.as_ptr(),
-                RENAME_SWAP,
+                right_name.as_ptr(),
+                libc::RENAME_SWAP,
             )
         };
         if result == 0 {
@@ -4845,7 +4890,7 @@ fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
         } else {
             Err(io_error(
                 "atomically swap restore images",
-                Path::new(left.to_str().unwrap_or("<invalid>")),
+                left,
                 io::Error::last_os_error(),
             ))
         }
@@ -4948,6 +4993,9 @@ mod tests {
         for (fd, failed) in [(-1, true), (0, false), (1, false)] {
             assert_eq!(fd_failed(fd), failed, "fd={fd}");
             assert_eq!(flock_succeeded(fd), fd == 0, "result={fd}");
+        }
+        for (count, failed) in [(-1, true), (0, true), (1, false)] {
+            assert_eq!(getmntinfo_failed(count), failed, "getmntinfo count={count}");
         }
         for (mode, kind, busy) in [
             (LockMode::Try, io::ErrorKind::WouldBlock, true),

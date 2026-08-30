@@ -2026,6 +2026,10 @@ fn clonefile_native(source: &Path, destination: &Path) -> Result<(), CloneFileEr
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
+        // SAFETY: `clonefile(2)` is Darwin libc; the signature matches
+        // `<sys/clonefile.h>` (`src`, `dst` as NUL-terminated paths, `flags` as
+        // `uint32_t`). We only call it with `CString` pointers that outlive the
+        // invocation.
         unsafe extern "C" {
             fn clonefile(
                 src: *const std::ffi::c_char,
@@ -2047,6 +2051,9 @@ fn clonefile_native(source: &Path, destination: &Path) -> Result<(), CloneFileEr
                     "destination path contains NUL",
                 ),
             })?;
+        // SAFETY: `src`/`dst` are `CString`s, so both pointers are valid
+        // NUL-terminated paths for the duration of the call. flags `0` is
+        // Darwin's default clonefile (follow symlinks, copy ownership).
         let result = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
         if result == 0 {
             return Ok(());
@@ -4559,7 +4566,11 @@ mod tests {
                 volume_name: "cowshed-apfs-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Sparse),
+                // SAFETY: `getuid`/`getgid` read this process's credentials;
+                // they take no pointers and cannot fail.
                 owner_uid: unsafe { libc::getuid() },
+                // SAFETY: `getgid` reads this process's credentials; it takes no
+                // pointers and cannot fail.
                 owner_gid: unsafe { libc::getgid() },
             })?;
             let attachment = backend.attach_verified(&created.path, created.format)?;
@@ -4585,7 +4596,11 @@ mod tests {
                 volume_name: "cowshed-asif-resolution".into(),
                 case_sensitivity: ApfsCaseSensitivity::Insensitive,
                 image_format: ImageFormatSelection::Exact(ImageFormat::Asif),
+                // SAFETY: `getuid`/`getgid` read this process's credentials;
+                // they take no pointers and cannot fail.
                 owner_uid: unsafe { libc::getuid() },
+                // SAFETY: `getgid` reads this process's credentials; it takes no
+                // pointers and cannot fail.
                 owner_gid: unsafe { libc::getgid() },
             })?;
             let attachment = backend.attach_verified(&created.path, created.format)?;

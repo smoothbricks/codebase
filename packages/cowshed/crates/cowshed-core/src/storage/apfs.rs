@@ -1898,7 +1898,11 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                 capacity,
                 volume_name: volume_label(repo, &main_name()),
                 case_sensitivity: config.case_sensitivity,
+                // SAFETY: `getuid`/`getgid` read this process's credentials;
+                // they take no pointers and cannot fail.
                 owner_uid: unsafe { libc::getuid() },
+                // SAFETY: `getgid` reads this process's credentials; it takes no
+                // pointers and cannot fail.
                 owner_gid: unsafe { libc::getgid() },
                 image_format: match requested_format {
                     ImageFormat::Asif => ImageFormatSelection::Auto,
