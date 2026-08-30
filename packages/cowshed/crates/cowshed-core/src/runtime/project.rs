@@ -591,7 +591,7 @@ impl ProjectActor {
         require_coordinator(request.authority())?;
         let params: WorkspaceOptionsParams<AttachOptions> =
             decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         self.host.attach(params.workspace, params.options).await?;
         json_response(EmptyResult {})
@@ -797,7 +797,7 @@ impl ProjectActor {
 
     async fn worker_exec(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let (scope, session, exec) = decode_exec_request(&request)?;
-        self.require_scoped_workspace(request.authority(), &scope.workspace_params())
+        self.require_scoped_workspace(request.authority(), &scope.repo_id, &scope.workspace)
             .await?;
         let id = self
             .host
@@ -808,7 +808,7 @@ impl ProjectActor {
 
     async fn worker_stdin_chunk(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         let bytes = request.upload().cloned().ok_or_else(|| {
             CowshedError::usage(
@@ -829,7 +829,7 @@ impl ProjectActor {
 
     async fn worker_stdin_close(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         self.host
             .stdin_close(
@@ -843,7 +843,7 @@ impl ProjectActor {
 
     async fn worker_shell(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: SessionParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         self.host
             .open_session(
@@ -857,7 +857,7 @@ impl ProjectActor {
 
     async fn worker_list_jobs(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: WorkerScope = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         json_response(
             self.host
@@ -868,7 +868,7 @@ impl ProjectActor {
 
     async fn worker_job_info(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         json_response(
             self.host
@@ -883,7 +883,7 @@ impl ProjectActor {
 
     async fn worker_checkpoint(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: WorkerCheckpointParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         json_response(
             self.host
@@ -898,7 +898,7 @@ impl ProjectActor {
 
     async fn worker_push(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: WorkerPushParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         json_response(
             self.host
@@ -913,7 +913,7 @@ impl ProjectActor {
 
     async fn job_logs(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: LogsParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         let chunk = self
             .host
@@ -939,7 +939,7 @@ impl ProjectActor {
 
     async fn job_detach(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         self.host
             .detach_job(
@@ -953,7 +953,7 @@ impl ProjectActor {
 
     async fn job_wait(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         json_response(
             self.host
@@ -968,7 +968,7 @@ impl ProjectActor {
 
     async fn job_kill(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: JobParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         self.host
             .kill_job(
@@ -982,7 +982,7 @@ impl ProjectActor {
 
     async fn session_close(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         let params: SessionParams = decode_params(request.params(), request.method())?;
-        self.require_scoped_workspace(request.authority(), &params.workspace_params())
+        self.require_scoped_workspace(request.authority(), &params.repo_id, &params.workspace)
             .await?;
         self.host
             .close_session(
@@ -1007,11 +1007,12 @@ impl ProjectActor {
     async fn require_scoped_workspace(
         &mut self,
         authority: &ConnectionAuthority,
-        params: &WorkspaceParams,
+        repo_id: &RepoId,
+        workspace: &WorkspaceName,
     ) -> Result<()> {
-        self.require_repo(&params.repo_id)?;
+        self.require_repo(repo_id)?;
         let snapshots = self.host.snapshots().await?;
-        let snapshot = find_workspace(&snapshots, &params.workspace)?;
+        let snapshot = find_workspace(&snapshots, workspace)?;
         self.validate_worker_snapshot(authority, snapshot)
     }
 
@@ -1150,15 +1151,6 @@ struct WorkspaceOptionsParams<T> {
     options: T,
 }
 
-impl<T> WorkspaceOptionsParams<T> {
-    fn workspace_params(&self) -> WorkspaceParams {
-        WorkspaceParams {
-            repo_id: self.repo_id.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SourceDestinationParams {
@@ -1236,15 +1228,6 @@ struct WorkerScope {
     workspace_incarnation: WorkspaceIncarnation,
 }
 
-impl WorkerScope {
-    fn workspace_params(&self) -> WorkspaceParams {
-        WorkspaceParams {
-            repo_id: self.repo_id.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionParams {
@@ -1252,15 +1235,6 @@ struct SessionParams {
     workspace: WorkspaceName,
     workspace_incarnation: WorkspaceIncarnation,
     session: Option<String>,
-}
-
-impl SessionParams {
-    fn workspace_params(&self) -> WorkspaceParams {
-        WorkspaceParams {
-            repo_id: self.repo_id.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -1272,15 +1246,6 @@ struct JobParams {
     job_id: JobId,
 }
 
-impl JobParams {
-    fn workspace_params(&self) -> WorkspaceParams {
-        WorkspaceParams {
-            repo_id: self.repo_id.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkerCheckpointParams {
@@ -1290,15 +1255,6 @@ struct WorkerCheckpointParams {
     options: CheckpointOptions,
 }
 
-impl WorkerCheckpointParams {
-    fn workspace_params(&self) -> WorkspaceParams {
-        WorkspaceParams {
-            repo_id: self.repo_id.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkerPushParams {
@@ -1306,15 +1262,6 @@ struct WorkerPushParams {
     workspace: WorkspaceName,
     workspace_incarnation: WorkspaceIncarnation,
     options: PushOptions,
-}
-
-impl WorkerPushParams {
-    fn workspace_params(&self) -> WorkspaceParams {
-        WorkspaceParams {
-            repo_id: self.repo_id.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -1327,15 +1274,6 @@ struct LogsParams {
     stream: RuntimeJobStream,
     follow: bool,
     offset: u64,
-}
-
-impl LogsParams {
-    fn workspace_params(&self) -> WorkspaceParams {
-        WorkspaceParams {
-            repo_id: self.repo_id.clone(),
-            workspace: self.workspace.clone(),
-        }
-    }
 }
 
 #[derive(Deserialize)]
