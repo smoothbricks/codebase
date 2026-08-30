@@ -263,12 +263,18 @@ mod tests {
     fn classification_turns_on_where_the_climb_lands_not_on_how_it_is_spelled() {
         // Deep enough that the climb stays inside: the link keeps its meaning anywhere.
         assert_eq!(
-            classify(Path::new("packages/app/node_modules"), Path::new("../../../vendor/lib")),
+            classify(
+                Path::new("packages/app/node_modules"),
+                Path::new("../../../vendor/lib")
+            ),
             Targeting::InTree
         );
         // One more level of climb leaves the tree.
         assert_eq!(
-            classify(Path::new("packages/app/node_modules"), Path::new("../../../../vendor/lib")),
+            classify(
+                Path::new("packages/app/node_modules"),
+                Path::new("../../../../vendor/lib")
+            ),
             Targeting::Escapes
         );
         // A `..` that a later name re-enters is arithmetic, not an escape.
@@ -282,8 +288,14 @@ mod tests {
             Targeting::Absolute
         );
         // A link at the tree root has no depth to spend.
-        assert_eq!(classify(Path::new(""), Path::new("../sibling")), Targeting::Escapes);
-        assert_eq!(classify(Path::new(""), Path::new("./inside")), Targeting::InTree);
+        assert_eq!(
+            classify(Path::new(""), Path::new("../sibling")),
+            Targeting::Escapes
+        );
+        assert_eq!(
+            classify(Path::new(""), Path::new("./inside")),
+            Targeting::InTree
+        );
     }
 
     #[test]
@@ -302,7 +314,11 @@ mod tests {
         let clone = base.join("deeper/clone");
         let clone_nested = clone.join("packages/app/node_modules");
         fs::create_dir_all(&clone_nested).expect("clone tree");
-        symlink("../../../../global/node_modules/pkg", clone_nested.join("pkg")).expect("clone link");
+        symlink(
+            "../../../../global/node_modules/pkg",
+            clone_nested.join("pkg"),
+        )
+        .expect("clone link");
         assert!(
             !clone_nested.join("pkg").exists(),
             "the inherited link must be broken in the clone, or this test proves nothing"
@@ -315,7 +331,10 @@ mod tests {
             fs::read_link(clone_nested.join("pkg")).expect("link"),
             global
         );
-        assert!(clone_nested.join("pkg").exists(), "restored link must resolve");
+        assert!(
+            clone_nested.join("pkg").exists(),
+            "restored link must resolve"
+        );
     }
 
     #[test]
@@ -343,8 +362,15 @@ mod tests {
         );
 
         let plan = restore(&clone, &source).expect("restore");
-        assert_eq!(plan.rewrites.len(), 1, "an accidental resolution is still an escape");
-        assert_eq!(fs::read_link(clone_nested.join("pkg")).expect("link"), intended);
+        assert_eq!(
+            plan.rewrites.len(),
+            1,
+            "an accidental resolution is still an escape"
+        );
+        assert_eq!(
+            fs::read_link(clone_nested.join("pkg")).expect("link"),
+            intended
+        );
         assert!(clone_nested.join("pkg").join("real").exists());
     }
 
@@ -385,7 +411,10 @@ mod tests {
         symlink("../../../gone/pkg", clone_nested.join("pkg")).expect("clone link");
 
         let plan = restore(&clone, &source).expect("restore");
-        assert!(plan.rewrites.is_empty(), "nothing correct can be derived, so nothing is written");
+        assert!(
+            plan.rewrites.is_empty(),
+            "nothing correct can be derived, so nothing is written"
+        );
         assert_eq!(plan.refusals.len(), 1);
         let refusal = &plan.refusals[0];
         assert_eq!(refusal.at, Path::new("packages/app/pkg"));
@@ -396,8 +425,14 @@ mod tests {
             "a refused link is left exactly as inherited"
         );
         let report = plan.refusal_report();
-        assert!(report.contains("packages/app/pkg"), "the report must name the link: {report}");
-        assert!(report.contains("gone/pkg"), "the report must name what was probed: {report}");
+        assert!(
+            report.contains("packages/app/pkg"),
+            "the report must name the link: {report}"
+        );
+        assert!(
+            report.contains("gone/pkg"),
+            "the report must name what was probed: {report}"
+        );
     }
 
     #[test]
