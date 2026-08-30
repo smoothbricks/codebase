@@ -731,13 +731,13 @@ next: cowshed exec raven -- git status
 control socket is healthy. The generated mode-0600 plist names `~/Library/Application Support/dev.cowshed/bin/cowshed`,
 `RunAtLoad`, `KeepAlive`, and stable pre-tracer stderr at `~/Library/Logs/cowshed/daemon-stderr.log`. That path is on
 the volume carrying `~/Library/LaunchAgents` itself, so launchd can still reach the program after a reboot: `start`
-copies the running executable there when the bytes differ, and refuses a running executable inside cowshed's own storage
-rather than baking in a path that only exists once cowshed has mounted it. `stop` boots out the agent and removes the
-plist, leaving the installed binary — that copy is host state rather than agent state, and keeping it makes the next
-`start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too, for a host that is done
-with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user
-agents, and both installed binaries at once. All of these are idempotent, and a `--purge` with nothing installed says so
-rather than failing.
+copies the running executable there when the bytes differ, whatever volume that executable came from. A build inside a
+workspace or the nix store is copied rather than refused — the copy is precisely what makes the agent independent of a
+path that only exists once cowshed has mounted it. `stop` boots out the agent and removes the plist, leaving the
+installed binary — that copy is host state rather than agent state, and keeping it makes the next `start` a plist write
+instead of a fresh multi-megabyte copy. `stop --purge` deletes it too, for a host that is done with the gateway rather
+than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user agents, and both installed
+binaries at once. All of these are idempotent, and a `--purge` with nothing installed says so rather than failing.
 
 `status` reports health without starting the service. Its JSON result is the standard frozen envelope:
 

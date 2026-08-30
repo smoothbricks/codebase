@@ -7,13 +7,12 @@ use std::path::{Path, PathBuf};
 
 use cowshed_cli::launchd::{
     COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError, ControlPlan,
-    ExecutableInstallState, ExecutableSource, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
+    ExecutableInstallState, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LAUNCHCTL_EXECUTABLE,
     LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdError, LaunchdExecutor,
     LaunchdFilesystem, LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE,
     PRIVATE_PLIST_MODE, ProcessType, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE,
-    ServiceLifecycle, UnstableExecutableSource, classify_executable_source, containing_mount_point,
-    plan_executable_install, plan_install, plan_remove,
+    ServiceLifecycle, plan_executable_install, plan_install, plan_remove,
 };
 use cowshed_core::metadata::ImageCapacity;
 
@@ -1090,89 +1089,6 @@ fn stable_binary_install_plan_copies_atomically_and_repairs_modes() {
     );
 }
 
-/// The refusal the incident calls for: a binary on storage cowshed mounts itself cannot be the
-/// thing that mounts it. Everything a host mounts before login is copied instead, because the
-/// copy is what makes the agent independent of it.
-#[test]
-fn binary_sources_inside_cowshed_storage_are_refused_and_host_volumes_are_not() {
-    let home = Path::new(HOME);
-
-    assert_eq!(
-        classify_executable_source(
-            home,
-            ExecutableSource {
-                path: Path::new(
-                    "/Users/cowshed-test/.cowshed/mnt/acme/widget/main/target/release/cowshed"
-                ),
-                mount_point: Path::new("/Users/cowshed-test/.cowshed/mnt/acme/widget/main"),
-                mount_is_workspace: true,
-            }
-        ),
-        Err(UnstableExecutableSource::Store {
-            store: PathBuf::from("/Users/cowshed-test/.cowshed"),
-        })
-    );
-
-    // A project mount outside the store, recognised by the marker every workspace root carries.
-    assert_eq!(
-        classify_executable_source(
-            home,
-            ExecutableSource {
-                path: Path::new("/private/tmp/checkout/packages/cowshed/dist/native/cowshed"),
-                mount_point: Path::new("/private/tmp/checkout"),
-                mount_is_workspace: true,
-            }
-        ),
-        Err(UnstableExecutableSource::Workspace {
-            mount_point: PathBuf::from("/private/tmp/checkout"),
-        })
-    );
-
-    // A volume mounted inside the home directory, marker or not: cowshed is the only thing that
-    // mounts there, and launchd sees none of it at boot.
-    assert_eq!(
-        classify_executable_source(
-            home,
-            ExecutableSource {
-                path: Path::new("/Users/cowshed-test/Dev/project/packages/cowshed/dist/cowshed"),
-                mount_point: Path::new("/Users/cowshed-test/Dev/project"),
-                mount_is_workspace: false,
-            }
-        ),
-        Err(UnstableExecutableSource::HomeVolume {
-            mount_point: PathBuf::from("/Users/cowshed-test/Dev/project"),
-        })
-    );
-
-    for source in [
-        // The nix store: its own volume, mounted before any user agent runs.
-        ExecutableSource {
-            path: Path::new("/nix/store/abc-cowshed/bin/cowshed"),
-            mount_point: Path::new("/nix"),
-            mount_is_workspace: false,
-        },
-        ExecutableSource {
-            path: Path::new("/usr/local/bin/cowshed"),
-            mount_point: Path::new("/"),
-            mount_is_workspace: false,
-        },
-        // A global npm prefix in the home directory, on the home volume itself.
-        ExecutableSource {
-            path: Path::new("/Users/cowshed-test/.bun/install/global/node_modules/cowshed/cowshed"),
-            mount_point: Path::new("/"),
-            mount_is_workspace: false,
-        },
-        // The installed copy itself.
-        ExecutableSource {
-            path: Path::new(EXECUTABLE),
-            mount_point: Path::new("/"),
-            mount_is_workspace: false,
-        },
-    ] {
-        assert_eq!(classify_executable_source(home, source), Ok(()));
-    }
-}
-
 /// Binary installs ride the same temporary-file discipline as plists: launchd polls a KeepAlive
 /// service hard enough that it must never observe a half-written binary at the path it runs.
 #[test]
@@ -1238,29 +1154,6 @@ fn scratch(label: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
     path.canonicalize().unwrap()
-}
-
-/// The device walk is how a workspace image is recognised without parsing `mount(8)`: every
-/// cowshed image is its own volume, so the walk stops exactly at its root.
-#[test]
-fn containing_mount_point_reports_the_volume_root_of_a_real_file() {
-    let root = scratch("mount-point");
-    let file = root.join("cowshed");
-    fs::write(&file, b"binary").unwrap();
-
-    let mount_point = containing_mount_point(&file).unwrap();
-    assert!(mount_point.is_absolute());
-    assert!(
-        file.starts_with(&mount_point),
-        "{} is not under {}",
-        file.display(),
-        mount_point.display()
-    );
-    // A file and the directory holding it are always on one volume.
-    assert_eq!(mount_point, containing_mount_point(&root).unwrap());
-    assert!(containing_mount_point(&root.join("absent")).is_err());
-
-    fs::remove_dir_all(&root).unwrap();
 }
 
 /// The native adapter streams the copy into an exclusive temporary file carrying the exec bit,
