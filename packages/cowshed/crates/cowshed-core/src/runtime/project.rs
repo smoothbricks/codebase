@@ -5249,7 +5249,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .host()
             .rename_volume(
                 &main_mount,
-                &crate::storage::apfs::volume_label(&self.descriptor.repo_id, &main_name()),
+                &crate::storage::apfs::volume_key(&self.descriptor.repo_id, &main_name()),
             )
             .map_err(native_storage_error)?;
         self.ensure_supervisor(&main_name()).await?;

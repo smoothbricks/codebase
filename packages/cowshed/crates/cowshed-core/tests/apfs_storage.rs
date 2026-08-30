@@ -1572,9 +1572,9 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
     assert_eq!(
         relabels,
         [
-            "rename-volume:widget — created",
-            "rename-volume:widget — forked",
-            "rename-volume:widget",
+            "rename-volume:cowshed.acme--widget.created",
+            "rename-volume:cowshed.acme--widget.forked",
+            "rename-volume:cowshed.acme--widget.main",
         ],
         "each cloned staging volume is relabeled before publication, and the label a clone \
          inherits from its source is human-facing only"
