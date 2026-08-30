@@ -608,12 +608,18 @@ fn the_committed_wire_corpus_is_what_core_serializes() {
         std::fs::write(&path, &rendered).expect("the corpus path is writable");
     }
 
+    // Compare parsed values, not bytes. The committed file is formatted by biome, which disagrees
+    // with serde_json's pretty printer about short arrays; byte-comparing it would force one
+    // formatter to yield and neither does. The contract being pinned here is the DOCUMENT — every
+    // key, every value, every shape core serializes — and that survives either layout.
+    let committed: Value = serde_json::from_str(GOLDEN).expect("the committed corpus is JSON");
     assert_eq!(
-        rendered, GOLDEN,
+        actual, committed,
         "{GOLDEN_PATH} is not what cowshed-core serializes today. A DTO on the napi seam changed \
          shape. Regenerate with `{WRITE_ENV}=write cargo test -p cowshed-napi \
          the_committed_wire_corpus_is_what_core_serializes`, then run \
-         `nx run cowshed:wire-test` so packages/cowshed/src/types.ts moves with it."
+         `nx run cowshed:wire-test` so packages/cowshed/src/types.ts moves with it, and \
+         `bunx biome check --write` on the regenerated file."
     );
 }
 

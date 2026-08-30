@@ -95,30 +95,18 @@
           "host": "github.com",
           "impersonate": "fixture-bot",
           "mode": "opaque",
-          "ports": [
-            22,
-            443
-          ]
+          "ports": [22, 443]
         }
       ],
       "portBlock": {
         "base": 51200,
         "size": 16
       },
-      "read": [
-        "/Users/fixture/.cargo/registry"
-      ],
-      "repos": [
-        "smoothbricks/*"
-      ],
+      "read": ["/Users/fixture/.cargo/registry"],
+      "repos": ["smoothbricks/*"],
       "revision": 12,
-      "sim": [
-        "openurl",
-        "install"
-      ],
-      "write": [
-        "/Users/fixture/Library/Caches/sccache"
-      ]
+      "sim": ["openurl", "install"],
+      "write": ["/Users/fixture/Library/Caches/sccache"]
     }
   },
   "JobInfo": {
