@@ -23,8 +23,9 @@ const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources
 const SYNC: &str = "/bin/sync";
 const SW_VERS: &str = "/usr/bin/sw_vers";
 
-/// The unit `hdiutil` reports and accepts image extents in.
-const SECTOR_BYTES: u64 = 512;
+/// Unix `st_blocks` units and the unit `hdiutil` reports and accepts image extents in.
+/// Both are 512 on Darwin; GC allocated-byte accounting and image capacity share this.
+pub(crate) const SECTOR_BYTES: u64 = 512;
 
 /// `diskutil apfs resizeContainer <ref> 0` asks for grow-to-fit, and macOS reports "there is
 /// nothing to grow into" as a failure rather than a no-op: -69743 when the computed size equals
@@ -1673,25 +1674,21 @@ fn is_kernel_device_path(device: &str) -> bool {
 }
 
 fn validate_image_path(path: &Path, format: ImageFormat) -> Result<(), ApfsError> {
-    if path.extension() == Some(OsStr::new(format.extension())) {
-        Ok(())
-    } else {
-        Err(ApfsError::InvalidImagePath {
+    format
+        .validate_path(path)
+        .map_err(|_| ApfsError::InvalidImagePath {
             path: path.to_owned(),
             format,
         })
-    }
 }
 
 fn validate_clone_path(path: &Path, format: ImageFormat) -> Result<(), CloneFileError> {
-    if path.extension() == Some(OsStr::new(format.extension())) {
-        Ok(())
-    } else {
-        Err(CloneFileError::InvalidImagePath {
+    format
+        .validate_path(path)
+        .map_err(|_| CloneFileError::InvalidImagePath {
             path: path.to_owned(),
             format,
         })
-    }
 }
 
 fn asif_is_unsupported(output: &CommandOutput) -> bool {
