@@ -20,7 +20,7 @@ use columine_types::types::{
     SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
     StateHeaderOffset,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct RecordingHooks {
@@ -731,8 +731,6 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(48))]
-
     /// Apply-then-undo is the identity on a TTL BITMAP slot, driven through the
     /// real `Vm` undo log and the real in-state eviction index rather than a
     /// hand replay — and including operations refused for payload capacity,
@@ -780,49 +778,74 @@ proptest! {
         let checkpoint = vm.undo_checkpoint();
         let initial = state.clone();
 
-        // Every distinct high word: more containers than the payload can hold.
+        // Every distinct high word: more sparse containers than the payload can
+        // hold, so this batch is refused whatever the randomized prefix did.
         let flood: Vec<u32> = (1u16..240).map(sparse_key).collect();
         let flood_ts: Vec<f64> = flood.iter().copied().map(sparse_ts).collect();
-        let flood_at = flood_at.index(batches.len() + 1);
 
+        // The generated batches with the flood (`None`) spliced in at a
+        // randomized point.
+        let mut ops: Vec<Option<&(BTreeSet<u16>, bool)>> = batches.iter().map(Some).collect();
+        ops.insert(flood_at.index(batches.len() + 1), None);
+
+        // A generated add batch can reach the payload ceiling too, so refusal is
+        // checked identically wherever it happens and the flood only guarantees
+        // at least one. `state` carries the slot bytes and the eviction index;
+        // the undo log lives in `Vm`, so the checkpoint is compared beside it.
         let mut saw_payload_refusal = false;
-        for step in 0..=batches.len() {
-            if step == flood_at {
-                let before = state.clone();
-                let undo_before = vm.undo_checkpoint();
-                prop_assert_eq!(
-                    vm.ctx().batch_bitmap_add(
-                        false, &mut state, &meta, 0, &flood, Some(&flood_ts)
-                    ),
-                    ErrorCode::CapacityExceeded
-                );
-                saw_payload_refusal = true;
-                prop_assert_ne!(
-                    vm.bitmap_env.last_error, 0,
-                    "a payload refusal must leave a diagnostic behind"
-                );
-                prop_assert_eq!(
-                    &state, &before,
-                    "refused add wrote slot bytes or the eviction index"
-                );
-                prop_assert_eq!(
-                    vm.undo_checkpoint(), undo_before,
-                    "refused add appended undo records"
-                );
+        for op in ops {
+            let before = state.clone();
+            let undo_before = vm.undo_checkpoint();
+            let result = match op {
+                None => vm.ctx().batch_bitmap_add(
+                    false,
+                    &mut state,
+                    &meta,
+                    0,
+                    &flood,
+                    Some(&flood_ts),
+                ),
+                Some((highs, is_remove)) => {
+                    let elems: Vec<u32> = highs.iter().copied().map(sparse_key).collect();
+                    if *is_remove {
+                        vm.ctx()
+                            .batch_bitmap_remove(false, &mut state, &meta, 0, &elems)
+                    } else {
+                        let ts: Vec<f64> = elems.iter().copied().map(sparse_ts).collect();
+                        vm.ctx()
+                            .batch_bitmap_add(false, &mut state, &meta, 0, &elems, Some(&ts))
+                    }
+                }
+            };
+            match result {
+                ErrorCode::Ok => prop_assert!(
+                    op.is_some(),
+                    "the flood asks for more containers than the payload holds"
+                ),
+                ErrorCode::CapacityExceeded => {
+                    saw_payload_refusal = true;
+                    // Distinct keys stay under `meta.capacity`, so the element-cap
+                    // branch that deliberately commits what fits is unreachable.
+                    // If it were not, it would leave `last_error` at zero and fail
+                    // the byte comparison below rather than pass unnoticed.
+                    prop_assert_ne!(
+                        vm.bitmap_env.last_error,
+                        0,
+                        "a payload refusal must leave a diagnostic behind"
+                    );
+                    prop_assert_eq!(
+                        &state,
+                        &before,
+                        "refused op wrote slot bytes or the eviction index"
+                    );
+                    prop_assert_eq!(
+                        vm.undo_checkpoint(),
+                        undo_before,
+                        "refused op appended undo records"
+                    );
+                }
+                other => prop_assert!(false, "unexpected bitmap result {other:?}"),
             }
-            let Some((highs, is_remove)) = batches.get(step) else {
-                continue;
-            };
-            let elems: Vec<u32> = highs.iter().copied().map(sparse_key).collect();
-            let result = if *is_remove {
-                vm.ctx()
-                    .batch_bitmap_remove(false, &mut state, &meta, 0, &elems)
-            } else {
-                let ts: Vec<f64> = elems.iter().copied().map(sparse_ts).collect();
-                vm.ctx()
-                    .batch_bitmap_add(false, &mut state, &meta, 0, &elems, Some(&ts))
-            };
-            prop_assert_eq!(result, ErrorCode::Ok, "accepted workload stays under both ceilings");
         }
         prop_assert!(saw_payload_refusal);
 
