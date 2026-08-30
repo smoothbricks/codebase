@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{Finding, FindingSeverity};
@@ -203,18 +202,14 @@ fn git_at<const N: usize>(
     extra_env: &[(&str, &OsStr)],
     args: [&str; N],
 ) -> Result<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(root).args(args);
-    command.env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = cowshed_core::git::git_command_at(root);
+    command.args(args);
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let output = command.output().map_err(|error| {
-        CowshedError::environment_missing(
-            format!("cannot execute git: {error}"),
-            "install git, then retry",
-        )
-    })?;
+    let output = command
+        .output()
+        .map_err(|error| cowshed_core::git::git_spawn_error(&error))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();

@@ -7923,28 +7923,24 @@ fn current_snapshot_mount(
 
 #[cfg(target_os = "macos")]
 async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
-        })?;
+    let output = invoke_git(root, &args).await?;
     require_git_success("git operation", &output)
 }
+
+/// The runtime's one git spawner, built on [`crate::git::git_command_at`] so every invocation
+/// carries the same `-C` targeting and disabled terminal prompt — a runtime git call that blocks
+/// on a credential prompt would hang the controller.
+#[cfg(target_os = "macos")]
+async fn invoke_git(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut command = tokio::process::Command::from(crate::git::git_command_at(root));
+    command.args(args).output().await.map_err(|error| {
+        CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
+    })
+}
+
 #[cfg(target_os = "macos")]
 async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid) -> Result<()> {
-    async fn invoke(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-        tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .await
-            .map_err(|error| {
-                CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
-            })
-    }
+    use self::invoke_git as invoke;
 
     let source_ref_output = invoke(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
     require_git_success("resolve workspace branch", &source_ref_output)?;
@@ -8040,14 +8036,7 @@ async fn git_oid(root: &Path) -> Result<GitOid> {
 
 #[cfg(target_os = "macos")]
 async fn git_revision_oid(root: &Path, revision: &str) -> Result<GitOid> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "--verify", revision])
-        .current_dir(root)
-        .output()
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
-        })?;
+    let output = invoke_git(root, &["rev-parse", "--verify", revision]).await?;
     require_git_success("resolve git revision", &output)?;
     let value = String::from_utf8(output.stdout)
         .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
@@ -8061,14 +8050,7 @@ async fn git_revision_oid(root: &Path, revision: &str) -> Result<GitOid> {
 /// exist yet" into an internal error instead of the `None` every caller here is written for.
 #[cfg(target_os = "macos")]
 async fn git_optional_ref_oid(root: &Path, reference: &str) -> Result<Option<GitOid>> {
-    let output = tokio::process::Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", reference])
-        .current_dir(root)
-        .output()
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
-        })?;
+    let output = invoke_git(root, &["rev-parse", "--verify", "--quiet", reference]).await?;
     if output.status.code() == Some(1) {
         return Ok(None);
     }
@@ -8082,14 +8064,7 @@ async fn git_optional_ref_oid(root: &Path, reference: &str) -> Result<Option<Git
 
 #[cfg(target_os = "macos")]
 async fn git_remote_ref_oid(root: &Path, remote: &str, reference: &str) -> Result<Option<GitOid>> {
-    let output = tokio::process::Command::new("git")
-        .args(["ls-remote", "--refs", remote, reference])
-        .current_dir(root)
-        .output()
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(error.to_string(), "restore /usr/bin/git")
-        })?;
+    let output = invoke_git(root, &["ls-remote", "--refs", remote, reference]).await?;
     require_git_success("resolve remote git reference", &output)?;
     if output.stdout.is_empty() {
         return Ok(None);

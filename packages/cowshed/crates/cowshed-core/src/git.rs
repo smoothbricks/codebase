@@ -1838,6 +1838,24 @@ async fn is_git_repository(path: &Path) -> Result<bool> {
         .success())
 }
 
+/// The one way to point a `git` invocation at a checkout: `-C <root>` plus a disabled terminal
+/// prompt, as a `std::process::Command` so both the async runners here and the CLI's blocking
+/// probe build on the same argv and environment.
+pub fn git_command_at(root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root).env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+/// The one spelling of "git itself could not run", so the same failure never carries two
+/// different instructions depending on which runner hit it.
+pub fn git_spawn_error(error: &std::io::Error) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("cannot execute git: {error}"),
+        "install the macOS command line developer tools, then retry",
+    )
+}
+
 async fn run_git_at_with_objects<I, S>(
     root: &Path,
     alternate_objects: Option<&Path>,
@@ -1847,21 +1865,15 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    let mut command = Command::from(git_command_at(root));
+    command.args(args);
     if let Some(objects) = alternate_objects {
         command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
     }
-    command.output().await.map_err(|error| {
-        CowshedError::environment_missing(
-            format!("cannot execute git: {error}"),
-            "install the macOS command line developer tools, then retry",
-        )
-    })
+    command
+        .output()
+        .await
+        .map_err(|error| git_spawn_error(&error))
 }
 
 fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
