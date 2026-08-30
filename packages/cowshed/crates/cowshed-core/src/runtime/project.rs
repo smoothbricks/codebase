@@ -8393,11 +8393,7 @@ fn native_retired_refs(
                 "cowshed doctor --json",
             ));
         }
-        let role = if metadata.workspace.is_main() {
-            WorkspaceRole::Main
-        } else {
-            WorkspaceRole::Workspace
-        };
+        let role = WorkspaceRole::for_name(&metadata.workspace);
         let revision = Revision::new(metadata.grants.revision);
         let workspace = LifecycleWorkspace::new(
             metadata.repo_id,
@@ -8677,7 +8673,7 @@ fn native_integrity_error(error: impl std::fmt::Display) -> CowshedError {
 
 #[cfg(target_os = "macos")]
 fn main_name() -> WorkspaceName {
-    WorkspaceName::new("main").expect("fixed main workspace name is valid")
+    WorkspaceName::main()
 }
 
 /// Every refusal the removal path can answer with, in one place.
