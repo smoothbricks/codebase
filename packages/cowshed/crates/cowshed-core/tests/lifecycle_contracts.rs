@@ -4,8 +4,8 @@ use std::thread::ThreadId;
 
 use async_trait::async_trait;
 use cowshed_core::metadata::{
-    GrantSet, ImageCapacity, ImageFormat, PortBlock, WorkspaceIncarnation, WorkspaceName,
-    WorkspaceRole,
+    GrantSet, ImageCapacity, ImageFormat, MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE, PortBlock,
+    WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
@@ -27,8 +27,10 @@ fn identity() -> OperationIdentity {
         forked_from: None,
         created_trace: "lifecycle-contract".to_owned(),
         git_worktree: false,
-        grants: GrantSet::closed_baseline(Some(PortBlock::new(20000, 16).expect("port block")))
-            .expect("grants"),
+        grants: GrantSet::closed_baseline(Some(
+            PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).expect("port block"),
+        ))
+        .expect("grants"),
     }
 }
 fn workspace(name: &str, revision: u64, topology: u64) -> LifecycleWorkspace {
