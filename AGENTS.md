@@ -408,6 +408,12 @@ wrong evidence.
 main is red, because a branch replayed onto main cannot retroactively update a caller that landed after its commits were
 authored. Cheapest sufficient gate: `cargo check -p <crate> --all-targets` after each land.
 
+**`cowshed rm <ws>` immediately after each land, and never `git merge` a shed by hand.** Sheds are attached APFS images:
+leaving them mounted grows a host-wide inventory that every real-APFS test enumerates, so `diskutil`/`hdiutil` slow down
+until those tests miss their timeout — 62 images attached, only 27 this project's. `cowshed rm` also refuses a workspace
+holding commits main lacks by ancestry or patch equivalence, which is the only check that catches a land you _think_
+succeeded. Piping `git merge --ff-only` through `tail` makes the exit status `tail`'s, so a failed merge prints success.
+
 --
 
 --
