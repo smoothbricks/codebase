@@ -19,6 +19,30 @@ mod dict;
 mod ipc;
 mod source;
 
+// Arrow types cross this crate's public API — `RecordBatch` is returned,
+// `ArrayRef` and `DataType` appear in signatures — so a caller must compile
+// against the SAME arrow crates this crate did.
+//
+// A caller reached by `path = "../lmao-arrow"` gets no version negotiation with
+// us. If it declares `arrow-array = "55"` while this crate resolves 56, cargo
+// builds both, and the two `RecordBatch` types are unrelated. Every call then
+// fails with a message that looks like a module-path typo rather than a version
+// split, because both spellings are the same crate at different versions:
+//
+//     error[E0308]: mismatched types
+//       expected `arrow_array::RecordBatch`,
+//          found `arrow_array::record_batch::RecordBatch`
+//
+// Re-exporting removes the choice instead of documenting it: a caller writes
+// `use lmao_arrow::arrow_array::RecordBatch` and declares no arrow dependency
+// at all, so it cannot select a version and the mismatch is unrepresentable.
+// Bumping arrow here moves every caller with no coordination and no pin to
+// update in any downstream Cargo.toml.
+pub use arrow_array;
+pub use arrow_buffer;
+pub use arrow_ipc;
+pub use arrow_schema;
+
 pub use archive::{
     PartitionCardinality, TraceChunkEnvelope, TraceChunkEnvelopeInput, build_trace_chunk_envelope,
     extract_chunk_stats, fnv1a64, inspect_partition_cardinality, split_chunk_by_partition,
