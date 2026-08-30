@@ -40,6 +40,9 @@ const FRAME_HEADER_BYTES: usize = 24;
 const FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + 32 + BATCH_TRAILER.len();
 const MAX_RECORD_BATCH_BYTES: u64 = 8_388_608;
 const IO_BUFFER_BYTES: usize = 65_536;
+pub(super) const PROTECTED_DIRECTORY: &str = ".cowshed";
+const JOB_DIRECTORY: &str = "job";
+const RECORDS_FILE: &str = "records.arrow";
 const RECORD_SCHEMA_VERSION: u64 = 2;
 #[cfg(unix)]
 const SECURE_DIRECTORY_OPEN_FLAGS: libc::c_int =
@@ -250,13 +253,21 @@ impl JobArtifactRecord {
     }
 }
 
+fn protected_stream_path(job_id: JobId, stream: StreamKind) -> String {
+    format!(
+        "{PROTECTED_DIRECTORY}/{JOB_DIRECTORY}/{}/{}",
+        job_id.get(),
+        stream.leaf()
+    )
+}
+
 fn validate_protected_path(
     job_id: JobId,
     stream: StreamKind,
     info: &StreamInfo,
 ) -> Result<(), ArtifactError> {
     if let ProtectedOutput::File { path } = info.storage.artifact() {
-        let expected = format!(".cowshed/job/{}/{}", job_id.get(), stream.leaf());
+        let expected = protected_stream_path(job_id, stream);
         if path.as_path() != Path::new(&expected) {
             return Err(ArtifactError::Integrity {
                 offset: 0,
@@ -279,7 +290,7 @@ fn validate_visible_path(
     let Some(path) = &info.protected_path else {
         return Ok(());
     };
-    let expected = format!(".cowshed/job/{}/{}", job_id.get(), stream.leaf());
+    let expected = protected_stream_path(job_id, stream);
     if path.as_path() != Path::new(&expected) {
         return Err(integrity(
             0,
@@ -745,7 +756,7 @@ impl ArtifactStore {
         let mut record = record;
         record.sequence = sequence;
         record.validate()?;
-        let batch = protected_record_to_batch(&ProtectedRecord::Job(record.clone()))?;
+        let batch = job_record_to_batch(&record)?;
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
         append_framed_batch_under_lock(&lock, &payload, digest, None)?;
@@ -815,8 +826,7 @@ impl ArtifactStore {
             records_sha256,
         };
         record.validate()?;
-        let batch =
-            protected_record_to_batch(&ProtectedRecord::CheckpointManifest(record.clone()))?;
+        let batch = checkpoint_manifest_to_batch(&record)?;
         let payload = encode_batch(&batch)?;
         let manifest_batch_sha256 = Sha256Digest::compute(&payload);
         append_framed_batch_under_lock(&lock, &payload, manifest_batch_sha256, None)?;
@@ -1457,19 +1467,11 @@ impl StreamWriterState {
 }
 
 fn protected_relative(job_id: JobId, stream: StreamKind) -> Result<WorkspacePath, ArtifactError> {
-    Ok(WorkspacePath::new(format!(
-        ".cowshed/job/{}/{}",
-        job_id.get(),
-        stream.leaf()
-    ))?)
+    Ok(WorkspacePath::new(protected_stream_path(job_id, stream))?)
 }
 
 fn protected_absolute(workspace_root: &Path, job_id: JobId, stream: StreamKind) -> PathBuf {
-    workspace_root
-        .join(".cowshed")
-        .join("job")
-        .join(job_id.get().to_string())
-        .join(stream.leaf())
+    workspace_root.join(protected_stream_path(job_id, stream))
 }
 
 fn create_protected_file(
@@ -1939,7 +1941,10 @@ fn reject_hardlink(_path: &Path, _metadata: &fs::Metadata) -> Result<(), Artifac
 }
 
 fn records_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".cowshed/job/records.arrow")
+    workspace_root
+        .join(PROTECTED_DIRECTORY)
+        .join(JOB_DIRECTORY)
+        .join(RECORDS_FILE)
 }
 
 struct RecordsLock<'path> {
@@ -2312,7 +2317,10 @@ fn rollback_append(
 }
 
 pub fn recover_records(path: &Path) -> Result<RecoveryReport, ArtifactError> {
-    recover_records_with_budget(path, 64 * 1024 * 1024)
+    recover_records_with_budget(
+        path,
+        ArtifactConfig::default().retained_recovery_budget_bytes,
+    )
 }
 
 pub fn recover_records_with_budget(
@@ -2628,6 +2636,11 @@ fn decode_single_batch(payload: &[u8]) -> Result<RecordBatch, ArtifactError> {
 }
 
 pub fn protected_record_schema() -> Arc<Schema> {
+    static SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(build_protected_record_schema);
+    Arc::clone(&SCHEMA)
+}
+
+fn build_protected_record_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         field("record_kind", DataType::Utf8, false),
         field("record_version", DataType::UInt64, false),
@@ -2833,9 +2846,9 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
 }
 
 fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, ArtifactError> {
-    if batch.num_rows() != 1 || batch.schema() != protected_record_schema() {
+    if batch.num_rows() != 1 {
         return Err(ArtifactError::Arrow(
-            "protected batch must contain one row with the canonical schema".into(),
+            "protected job batch must contain one row".into(),
         ));
     }
     if string(batch, 0)?.value(0) != "job" {
@@ -3556,29 +3569,14 @@ pub fn controller_commitments_to_batch(
 pub fn encode_controller_commitment(
     commitment: &ControllerCommitment,
 ) -> Result<Vec<u8>, ArtifactError> {
-    let batch = controller_commitments_to_batch(std::slice::from_ref(commitment))?;
-    let mut out = Vec::with_capacity(512);
-    {
-        let mut writer = StreamWriter::try_new(&mut out, batch.schema_ref())
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-        writer
-            .write(&batch)
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-        writer
-            .finish()
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-    }
-    Ok(out)
+    encode_batch(&controller_commitments_to_batch(std::slice::from_ref(
+        commitment,
+    ))?)
 }
 
 /// The inverse of [`encode_controller_commitment`]: exactly one commitment.
 pub fn decode_controller_commitment(bytes: &[u8]) -> Result<ControllerCommitment, ArtifactError> {
-    let mut batches = StreamReader::try_new(std::io::Cursor::new(bytes), None)
-        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-    let batch = batches
-        .next()
-        .ok_or_else(|| ArtifactError::Arrow("commitment bytes hold no Arrow batch".into()))?
-        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    let batch = decode_single_batch(bytes)?;
     let mut commitments = decode_controller_commitments(&batch)?;
     if commitments.len() != 1 {
         return Err(ArtifactError::Arrow(format!(

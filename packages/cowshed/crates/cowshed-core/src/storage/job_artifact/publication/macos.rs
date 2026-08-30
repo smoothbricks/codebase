@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -60,20 +59,4 @@ pub(super) fn try_fast_clone(
         ));
     }
     Ok(Some(unsafe { File::from_raw_fd(fd) }))
-}
-
-pub(super) fn rename_noreplace(
-    directory_fd: libc::c_int,
-    temporary: &CStr,
-    destination: &CStr,
-) -> Result<libc::c_int, ArtifactError> {
-    Ok(unsafe {
-        libc::renameatx_np(
-            directory_fd,
-            temporary.as_ptr(),
-            directory_fd,
-            destination.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    })
 }

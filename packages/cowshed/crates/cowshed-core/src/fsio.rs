@@ -53,6 +53,69 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     options.open(path)?.sync_all()
 }
 
+/// Atomically rename one directory-relative entry without replacing an existing destination.
+#[cfg(target_os = "macos")]
+pub(crate) fn rename_noreplace(
+    directory: std::os::fd::RawFd,
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> io::Result<()> {
+    // SAFETY: both names are NUL-terminated and remain live for the call; `directory` is an open
+    // directory descriptor owned by the caller. RENAME_EXCL makes the destination check atomic.
+    let result = unsafe {
+        libc::renameatx_np(
+            directory,
+            source.as_ptr(),
+            directory,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Atomically rename one directory-relative entry without replacing an existing destination.
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_noreplace(
+    directory: std::os::fd::RawFd,
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> io::Result<()> {
+    // SAFETY: both names are NUL-terminated and remain live for the syscall; `directory` is an
+    // open directory descriptor owned by the caller. libc supplies the kernel ABI flag value.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory,
+            source.as_ptr(),
+            directory,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn rename_noreplace(
+    _directory: std::os::fd::RawFd,
+    _source: &std::ffi::CStr,
+    _destination: &std::ffi::CStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic create-new rename is unsupported",
+    ))
+}
+
 /// How [`publish_private_file`] failed: an I/O step (with the path it was about), or the caller's
 /// own write closure. Typed so callers keep their structured errors instead of flattening
 /// serialization failures into `io::Error`.

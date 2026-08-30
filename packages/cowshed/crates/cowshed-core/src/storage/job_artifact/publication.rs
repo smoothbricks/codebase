@@ -10,10 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
-use super::{ArtifactError, PublicationStage, reject_hardlink, verify_private_file_mode};
+use super::{
+    ArtifactError, PROTECTED_DIRECTORY, PublicationStage, reject_hardlink, verify_private_file_mode,
+};
 use crate::api::dto::{
     OutputPublication, ProtectedOutput, PublicationPolicy, Sha256Digest, StreamInfo,
 };
+use crate::fsio::rename_noreplace;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -23,14 +26,13 @@ mod macos;
 mod unsupported;
 
 #[cfg(target_os = "linux")]
-use linux::{rename_noreplace, try_fast_clone};
+use linux::try_fast_clone;
 #[cfg(target_os = "macos")]
-use macos::{rename_noreplace, try_fast_clone};
+use macos::try_fast_clone;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-use unsupported::{rename_noreplace, try_fast_clone};
+use unsupported::try_fast_clone;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const PROTECTED_DIRECTORY: &[u8] = b".cowshed";
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn publish(
@@ -90,7 +92,7 @@ impl Parent {
                 component
                     .as_os_str()
                     .as_bytes()
-                    .eq_ignore_ascii_case(PROTECTED_DIRECTORY)
+                    .eq_ignore_ascii_case(PROTECTED_DIRECTORY.as_bytes())
             })
         {
             return Err(publication_error(
@@ -177,28 +179,42 @@ impl Parent {
         policy: PublicationPolicy,
     ) -> Result<(), ArtifactError> {
         let temporary_path = self.temporary_path();
-        let temporary = match stream.storage.artifact() {
+        let (temporary, verify_after_materialize) = match stream.storage.artifact() {
             ProtectedOutput::Inline { data } => {
                 let mut file = self.create_temporary()?;
                 file.write_all(data.as_bytes()).map_err(|error| {
                     publication_error(&temporary_path, PublicationStage::Copy, error)
                 })?;
-                file
+                (file, true)
             }
             ProtectedOutput::File { path } => {
                 let source_path = workspace_root.join(path.as_path());
-                let source = open_authority_source(&source_path, stream)?;
+                let source = open_authority_source(&source_path)?;
                 match self.try_fast_clone(&source)? {
-                    Some(file) => file,
+                    Some(file) => (file, true),
                     None => {
                         let mut file = self.create_temporary()?;
-                        copy_file_descriptor(&source, &mut file, &source_path, &temporary_path)?;
-                        file
+                        let (bytes, digest) = copy_file_descriptor(
+                            &source,
+                            &mut file,
+                            &source_path,
+                            &temporary_path,
+                        )?;
+                        verify_observed(
+                            &temporary_path,
+                            bytes,
+                            digest,
+                            stream.bytes,
+                            stream.sha256,
+                        )?;
+                        (file, false)
                     }
                 }
             }
         };
-        verify_content(&temporary, &temporary_path, stream.bytes, stream.sha256)?;
+        if verify_after_materialize {
+            verify_content(&temporary, &temporary_path, stream.bytes, stream.sha256)?;
+        }
         temporary
             .sync_all()
             .map_err(|error| publication_error(&temporary_path, PublicationStage::Sync, error))?;
@@ -375,7 +391,7 @@ fn metadata_at(directory: &File, leaf: &CStr) -> io::Result<libc::stat> {
     Ok(unsafe { metadata.assume_init() })
 }
 
-fn open_authority_source(path: &Path, stream: &StreamInfo) -> Result<File, ArtifactError> {
+fn open_authority_source(path: &Path) -> Result<File, ArtifactError> {
     let mut options = OpenOptions::new();
     options.read(true);
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
@@ -389,7 +405,6 @@ fn open_authority_source(path: &Path, stream: &StreamInfo) -> Result<File, Artif
     })?;
     reject_hardlink(path, &metadata)?;
     verify_private_file_mode(path, &metadata, true)?;
-    verify_content(&file, path, stream.bytes, stream.sha256)?;
     Ok(file)
 }
 
@@ -398,13 +413,15 @@ fn copy_file_descriptor(
     destination: &mut File,
     source_path: &Path,
     destination_path: &Path,
-) -> Result<(), ArtifactError> {
+) -> Result<(u64, Sha256Digest), ArtifactError> {
     let mut source = source
         .try_clone()
         .map_err(|error| publication_error(source_path, PublicationStage::Copy, error))?;
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| publication_error(source_path, PublicationStage::Copy, error))?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     loop {
         let read = source
@@ -413,11 +430,37 @@ fn copy_file_descriptor(
         if read == 0 {
             break;
         }
+        bytes = bytes.checked_add(read as u64).ok_or_else(|| {
+            publication_error(
+                source_path,
+                PublicationStage::Copy,
+                "publication byte count overflow",
+            )
+        })?;
+        hasher.update(&buffer[..read]);
         destination
             .write_all(&buffer[..read])
             .map_err(|error| publication_error(destination_path, PublicationStage::Copy, error))?;
     }
-    Ok(())
+    Ok((bytes, Sha256Digest::from_bytes(hasher.finalize().into())))
+}
+
+fn verify_observed(
+    path: &Path,
+    bytes: u64,
+    digest: Sha256Digest,
+    expected_bytes: u64,
+    expected_digest: Sha256Digest,
+) -> Result<(), ArtifactError> {
+    if bytes == expected_bytes && digest == expected_digest {
+        Ok(())
+    } else {
+        Err(publication_error(
+            path,
+            PublicationStage::Sync,
+            "materialized publication does not match sealed stream",
+        ))
+    }
 }
 
 fn verify_content(
@@ -444,16 +487,13 @@ fn verify_content(
         bytes = bytes.saturating_add(read as u64);
         hasher.update(&buffer[..read]);
     }
-    if bytes != expected_bytes
-        || Sha256Digest::from_bytes(hasher.finalize().into()) != expected_sha256
-    {
-        return Err(publication_error(
-            path,
-            PublicationStage::Sync,
-            "materialized publication does not match sealed stream",
-        ));
-    }
-    Ok(())
+    verify_observed(
+        path,
+        bytes,
+        Sha256Digest::from_bytes(hasher.finalize().into()),
+        expected_bytes,
+        expected_sha256,
+    )
 }
 
 fn publish_relative(
@@ -464,23 +504,31 @@ fn publish_relative(
     destination_path: &Path,
 ) -> Result<(), ArtifactError> {
     let directory_fd = directory.as_raw_fd();
-    let result = match policy {
-        PublicationPolicy::Replace => unsafe {
-            libc::renameat(
-                directory_fd,
-                temporary.as_ptr(),
-                directory_fd,
-                destination.as_ptr(),
-            )
-        },
-        PublicationPolicy::CreateNew => rename_noreplace(directory_fd, temporary, destination)?,
-    };
-    if result != 0 {
-        return Err(publication_error(
-            destination_path,
-            PublicationStage::Publish,
-            io::Error::last_os_error(),
-        ));
+    match policy {
+        PublicationPolicy::Replace => {
+            // SAFETY: both names are NUL-terminated and live for the call; the descriptor is the
+            // open parent directory. renameat atomically replaces only the final component.
+            if unsafe {
+                libc::renameat(
+                    directory_fd,
+                    temporary.as_ptr(),
+                    directory_fd,
+                    destination.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(publication_error(
+                    destination_path,
+                    PublicationStage::Publish,
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        PublicationPolicy::CreateNew => {
+            rename_noreplace(directory_fd, temporary, destination).map_err(|error| {
+                publication_error(destination_path, PublicationStage::Publish, error)
+            })?;
+        }
     }
     Ok(())
 }
@@ -783,13 +831,16 @@ mod tests {
         source.seek(SeekFrom::End(0)).expect("move source cursor");
         let mut destination = create_file(&destination_path, b"");
 
-        copy_file_descriptor(&source, &mut destination, &source_path, &destination_path)
-            .expect("copy file descriptor");
+        let (bytes, digest) =
+            copy_file_descriptor(&source, &mut destination, &source_path, &destination_path)
+                .expect("copy file descriptor");
         drop(destination);
         assert_eq!(
             fs::read(&destination_path).expect("read copied file"),
             b"copy me exactly"
         );
+        assert_eq!(bytes, b"copy me exactly".len() as u64);
+        assert_eq!(digest, Sha256Digest::compute(b"copy me exactly"));
     }
 
     #[cfg(target_os = "macos")]
