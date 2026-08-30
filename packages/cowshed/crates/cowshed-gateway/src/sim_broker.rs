@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{
-    process::Command,
     sync::{mpsc, oneshot},
     time::{Duration, timeout},
 };
@@ -95,10 +94,11 @@ pub trait SimRunner: Send + Sync + 'static {
 #[derive(Clone, Debug, Default)]
 pub struct XcrunSimRunner;
 
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl SimRunner for XcrunSimRunner {
     async fn run(&self, command: SimCommand) -> Result<SimCommandOutput, SimBrokerError> {
-        let mut process = Command::new("/usr/bin/xcrun");
+        let mut process = tokio::process::Command::new("/usr/bin/xcrun");
         process.env_clear().arg("simctl");
         match command {
             SimCommand::OpenUrl { device, url } => {
@@ -125,6 +125,14 @@ impl SimRunner for XcrunSimRunner {
         Ok(SimCommandOutput {
             stdout: output.stdout,
         })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[async_trait]
+impl SimRunner for XcrunSimRunner {
+    async fn run(&self, _command: SimCommand) -> Result<SimCommandOutput, SimBrokerError> {
+        Err(SimBrokerError::InstallDisabled)
     }
 }
 
