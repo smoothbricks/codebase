@@ -432,48 +432,24 @@ pub fn calculate_state_size(program: &[u8], accepted_program_magics: &[u32]) -> 
                 pc += 10;
             }
 
-            match slot_type {
-                SlotType::HashMap => {
-                    size += capacity * 4 + capacity * 4;
-                    if !type_flags.no_hashmap_timestamps() {
-                        size += capacity * 8;
-                    }
-                }
-                SlotType::HashSet => size += capacity * 4,
-                SlotType::Bitmap => {
-                    size += columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
-                        + bitmap_ops::bitmap_payload_capacity(capacity);
-                }
-                SlotType::Aggregate => {
-                    // COUNT: u64 only. cap_lo holds AggType for AGGREGATE/SCALAR.
-                    size += if cap_lo == 2 { 8 } else { 16 };
-                }
-                SlotType::Scalar => size += 16,
-                SlotType::Array => size += capacity * 4 + capacity * 8,
-                SlotType::ConditionTree => {
-                    size += CONDITION_TREE_STATE_BYTES;
-                    // Derived facts: interleaved u64 identities, then u32 low/high values.
-                    if capacity > 0 {
-                        size = align8(size);
-                        size += capacity * 16;
-                    }
-                }
-                // These use their own opcodes, not SLOT_DEF.
-                SlotType::StructMap
-                | SlotType::StructMap2
-                | SlotType::OrderedList
-                | SlotType::Nested => {}
-            }
+            let agg_type_byte =
+                if matches!(slot_type, SlotType::Aggregate | SlotType::Scalar) && cap_lo > 0 {
+                    cap_lo
+                } else {
+                    AggType::Sum as u8
+                };
+            size += slot_growth::slot_data_size(
+                slot_type,
+                capacity,
+                !type_flags.no_hashmap_timestamps(),
+                agg_type_byte,
+            );
             size = align8(size);
-
-            if type_flags.has_ttl() {
-                size += capacity * EVICTION_ENTRY_SIZE;
-                size = align8(size);
-                if type_flags.has_evict_trigger() {
-                    size += 1024 * EVICTION_ENTRY_SIZE;
-                    size = align8(size);
-                }
-            }
+            size += ttl_side_buffer_size(
+                type_flags.has_ttl(),
+                type_flags.has_evict_trigger(),
+                capacity,
+            );
         } else if op == Opcode::SlotArray as u8 {
             let cap_lo = init_code[pc + 1];
             let cap_hi = init_code[pc + 2];
@@ -726,37 +702,29 @@ pub fn init_state(
 
             match slot_type {
                 SlotType::HashMap => {
-                    // Keys to EMPTY_KEY; values stay zero-init.
-                    hash_table::init_external_keys(state, data_offset, capacity);
-                    data_offset += capacity * 4 + capacity * 4;
+                    hash_table::init_external_keys(state, primary_data_offset, capacity);
                     if !type_flags.no_hashmap_timestamps() {
-                        bytes::fill_f64(state, data_offset, capacity, f64::NEG_INFINITY);
-                        data_offset += capacity * 8;
+                        bytes::fill_f64(
+                            state,
+                            primary_data_offset + capacity * 8,
+                            capacity,
+                            f64::NEG_INFINITY,
+                        );
                     }
                 }
                 SlotType::ConditionTree => {
-                    // ConditionTreeState { lifecycle_generation: 1, last_removed_key: EMPTY_KEY }
-                    bytes::write_u32(state, data_offset, 1);
-                    bytes::write_u32(state, data_offset + 4, EMPTY_KEY);
-                    data_offset += CONDITION_TREE_STATE_BYTES;
-
+                    bytes::write_u32(state, primary_data_offset, 1);
+                    bytes::write_u32(state, primary_data_offset + 4, EMPTY_KEY);
                     if capacity > 0 {
-                        data_offset = align8(data_offset);
-                        let derived_facts_offset = data_offset;
-
+                        let derived_facts_offset = primary_data_offset + CONDITION_TREE_STATE_BYTES;
                         for pos in 0..capacity {
                             bytes::write_u64(
                                 state,
-                                data_offset + pos * 8,
+                                derived_facts_offset + pos * 8,
                                 DERIVED_FACT_EMPTY_IDENTITY,
                             );
                         }
-                        data_offset += capacity * 8;
-                        bytes::zero(state, data_offset, capacity * 4);
-                        data_offset += capacity * 4;
-                        bytes::zero(state, data_offset, capacity * 4);
-                        data_offset += capacity * 4;
-
+                        bytes::zero(state, derived_facts_offset + capacity * 8, capacity * 8);
                         bytes::write_u32(
                             state,
                             StateHeaderOffset::DERIVED_FACTS_OFFSET,
@@ -773,40 +741,45 @@ pub fn init_state(
                     }
                 }
                 SlotType::HashSet => {
-                    hash_table::init_external_keys(state, data_offset, capacity);
-                    data_offset += capacity * 4;
+                    hash_table::init_external_keys(state, primary_data_offset, capacity);
                 }
                 SlotType::Bitmap => {
-                    let storage_size = columine_types::types::BITMAP_SERIALIZED_LEN_BYTES
-                        + bitmap_ops::bitmap_payload_capacity(capacity);
-                    bytes::zero(state, data_offset, storage_size);
-                    data_offset += storage_size;
+                    bytes::zero(
+                        state,
+                        primary_data_offset,
+                        slot_growth::slot_data_size(slot_type, capacity, false, agg_type_byte),
+                    );
                 }
                 SlotType::Aggregate => {
-                    data_offset += aggregates::init_agg_slot(state, data_offset, agg_type_byte);
+                    aggregates::init_agg_slot(state, primary_data_offset, agg_type_byte);
                 }
                 SlotType::Scalar => {
-                    // value ([8]u8) + cmp_ts (f64) = 16 bytes
-                    bytes::zero(state, data_offset, 8);
-                    bytes::write_f64(state, data_offset + 8, f64::NEG_INFINITY);
-                    data_offset += 16;
+                    bytes::zero(state, primary_data_offset, 8);
+                    bytes::write_f64(state, primary_data_offset + 8, f64::NEG_INFINITY);
                 }
                 SlotType::Array => {
-                    bytes::fill_u32(state, data_offset, capacity, EMPTY_KEY);
+                    bytes::fill_u32(state, primary_data_offset, capacity, EMPTY_KEY);
                     bytes::fill_f64(
                         state,
-                        data_offset + capacity * 4,
+                        primary_data_offset + capacity * 4,
                         capacity,
                         f64::NEG_INFINITY,
                     );
-                    data_offset += capacity * 4 + capacity * 8;
                 }
                 SlotType::StructMap
                 | SlotType::StructMap2
                 | SlotType::OrderedList
                 | SlotType::Nested => {}
             }
-            data_offset = align8(data_offset);
+            data_offset = align8(
+                primary_data_offset
+                    + slot_growth::slot_data_size(
+                        slot_type,
+                        capacity,
+                        !type_flags.no_hashmap_timestamps(),
+                        agg_type_byte,
+                    ),
+            );
 
             let mut eviction_index_offset = 0u32;
             let mut eviction_index_capacity = 0u32;

@@ -5,8 +5,11 @@ use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, DERIVED_FACT_EMPTY_IDENTITY, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode,
     Opcode, PROGRAM_HASH_PREFIX, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotType,
-    StateHeaderOffset, StructFieldType, align8, hash_key,
+    StateHeaderOffset, StructFieldType, align8, hash_key, next_power_of_2,
 };
+use columine_vm::meta::SlotMetaView;
+use columine_vm::nested::nested_slot_data_size;
+use columine_vm::slot_growth::slot_data_size;
 use columine_vm::state_init::{
     EVICTION_ENTRY_SIZE, arena_initial_capacity_64, calculate_grown_state_size,
     calculate_state_size, compute_struct_row_layout_padded, grow_state, init_state, reset_state,
@@ -37,6 +40,29 @@ fn build_single_slot_program(type_flags_byte: u8, cap_lo: u8, cap_hi: u8) -> [u8
     content[18] = cap_hi;
     content[19] = 0x00; // HALT
     prog
+}
+
+fn build_nested_slot_program(
+    outer_capacity: u16,
+    inner_type: SlotType,
+    inner_capacity: u16,
+    inner_agg: AggType,
+) -> [u8; 64] {
+    let mut program = [0u8; 64];
+    let content = &mut program[HASH_PREFIX..];
+    content[..4].copy_from_slice(&PROGRAM_MAGIC.to_le_bytes());
+    content[4] = 1;
+    content[6] = 1;
+    content[10..12].copy_from_slice(&10u16.to_le_bytes());
+    content[14] = Opcode::SlotNested as u8;
+    content[15] = 0;
+    content[16] = SlotType::Nested as u8;
+    content[17..19].copy_from_slice(&outer_capacity.to_le_bytes());
+    content[19] = inner_type as u8;
+    content[20..22].copy_from_slice(&inner_capacity.to_le_bytes());
+    content[22] = inner_agg as u8;
+    content[23] = Opcode::Halt as u8;
+    program
 }
 
 /// A single-slot program with TTL params (flags must have 0x10 set).
@@ -953,6 +979,141 @@ proptest! {
         prop_assert!(size_lo > 0 && size_hi > 0);
         prop_assert_eq!(size_lo % 8, 0);
         prop_assert!(size_lo <= size_hi);
+    }
+
+    /// SLOT_DEF allocation, initialization metadata, and growth-copy sizing all
+    /// consume the same primary-byte formula for every supported slot type.
+    #[test]
+    fn slot_def_size_paths_share_one_formula(kind in 0u8..8, requested in 1u16..1024) {
+        let aggregate_types = [
+            AggType::Sum,
+            AggType::Count,
+            AggType::Min,
+            AggType::Max,
+            AggType::Avg,
+            AggType::SumI64,
+            AggType::MinI64,
+            AggType::MaxI64,
+        ];
+        let scalar_types = [AggType::ScalarU32, AggType::ScalarF64, AggType::ScalarI64];
+        let (type_flags, cap_lo, cap_hi) = match kind {
+            0 => (
+                SlotType::HashMap as u8,
+                requested as u8,
+                (requested >> 8) as u8,
+            ),
+            1 => (
+                SlotType::HashMap as u8 | 0x40,
+                requested as u8,
+                (requested >> 8) as u8,
+            ),
+            2 => (
+                SlotType::HashSet as u8,
+                requested as u8,
+                (requested >> 8) as u8,
+            ),
+            3 => (
+                SlotType::Bitmap as u8,
+                requested as u8,
+                (requested >> 8) as u8,
+            ),
+            4 => (
+                SlotType::Array as u8,
+                requested as u8,
+                (requested >> 8) as u8,
+            ),
+            5 => (
+                SlotType::ConditionTree as u8,
+                requested as u8,
+                (requested >> 8) as u8,
+            ),
+            6 => (
+                SlotType::Aggregate as u8,
+                aggregate_types[usize::from(requested) % aggregate_types.len()] as u8,
+                0,
+            ),
+            _ => (
+                SlotType::Scalar as u8,
+                scalar_types[usize::from(requested) % scalar_types.len()] as u8,
+                0,
+            ),
+        };
+        let program = build_single_slot_program(type_flags, cap_lo, cap_hi);
+        let calculated = calculate_state_size(
+            &program,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        );
+        prop_assert!(calculated > 0);
+        let mut state = vec![0u8; calculated as usize];
+        init_state(
+            &mut state,
+            &program,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .expect("calculated state must initialize");
+        let meta = SlotMetaView::read(&state, 0);
+        let primary_size = slot_data_size(
+            meta.slot_type(),
+            meta.capacity,
+            meta.has_hashmap_timestamp_storage(),
+            meta.agg_type_byte(&state),
+        );
+        let primary_offset = align8(STATE_HEADER_SIZE + SLOT_META_SIZE);
+        prop_assert_eq!(meta.offset, primary_offset);
+        prop_assert_eq!(calculated, align8(primary_offset + primary_size));
+    }
+
+    /// Nested is metadata-driven, but sizing, initialization, and growth all
+    /// consume the same closed-form arena formula and normalized capacities.
+    #[test]
+    fn nested_size_paths_share_one_formula(
+        outer_requested in 1u16..512,
+        inner_requested in 1u16..128,
+        inner_kind in 0u8..3,
+    ) {
+        let inner_type = match inner_kind {
+            0 => SlotType::HashSet,
+            1 => SlotType::HashMap,
+            _ => SlotType::Aggregate,
+        };
+        let inner_agg = if inner_type == SlotType::Aggregate {
+            AggType::Min
+        } else {
+            AggType::Sum
+        };
+        let program = build_nested_slot_program(
+            outer_requested,
+            inner_type,
+            inner_requested,
+            inner_agg,
+        );
+        let calculated = calculate_state_size(
+            &program,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        );
+        prop_assert!(calculated > 0);
+        let mut state = vec![0u8; calculated as usize];
+        init_state(
+            &mut state,
+            &program,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        )
+        .expect("calculated nested state must initialize");
+
+        let outer_capacity = next_power_of_2(u32::from(outer_requested) * 2);
+        let inner_capacity = next_power_of_2(u32::from(inner_requested));
+        let primary_size = nested_slot_data_size(
+            outer_capacity,
+            inner_capacity,
+            inner_type,
+            inner_agg as u8,
+        );
+        let primary_offset = align8(STATE_HEADER_SIZE + SLOT_META_SIZE);
+        let meta = SlotMetaView::read(&state, 0);
+        prop_assert_eq!(meta.slot_type(), SlotType::Nested);
+        prop_assert_eq!(meta.capacity, outer_capacity);
+        prop_assert_eq!(meta.offset, primary_offset);
+        prop_assert_eq!(calculated, align8(primary_offset + primary_size));
     }
 
     // Requested capacity zero defaults to 1024 for every non-fixed-size slot.
