@@ -18,8 +18,9 @@
 
 use columine_types::audit_parser::{enum_decls, norm};
 use columine_types::types::{
-    AggType, DurationUnit, ErrorCode, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_MAGIC, ProgramHeader,
-    SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, StructFieldType,
+    AggType, DurationUnit, EVICTION_ENTRY_SIZE, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
+    PROGRAM_MAGIC, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
+    StructFieldType,
 };
 use std::collections::BTreeMap;
 
@@ -169,7 +170,10 @@ fn typescript_state_layout_constants_match_rust() {
         ts_const(&source, "STATE_HEADER_SIZE"),
         u64::from(STATE_HEADER_SIZE)
     );
-    assert_eq!(ts_const(&source, "SLOT_META_SIZE"), u64::from(SLOT_META_SIZE));
+    assert_eq!(
+        ts_const(&source, "SLOT_META_SIZE"),
+        u64::from(SLOT_META_SIZE)
+    );
     assert_eq!(
         ts_const(&source, "SLOT_META_TYPE_FLAGS_OFFSET"),
         u64::from(SlotMetaOffset::TYPE_FLAGS)
@@ -184,6 +188,6 @@ fn typescript_state_layout_constants_match_rust() {
     );
     assert_eq!(
         ts_const(&source, "EVICTION_ENTRY_SIZE"),
-        std::mem::size_of::<columine_types::types::EvictionEntry>() as u64
+        u64::from(EVICTION_ENTRY_SIZE)
     );
 }
