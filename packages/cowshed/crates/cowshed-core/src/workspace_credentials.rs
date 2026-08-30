@@ -1,5 +1,5 @@
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
@@ -442,9 +442,7 @@ fn read_bounded_utf8(
 }
 
 fn sync_directory(path: &Path, operation: &'static str) -> Result<(), WorkspaceCredentialError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_failure(operation, path, source))
+    crate::metadata::sync_directory(path).map_err(|source| io_failure(operation, path, source))
 }
 
 fn io_failure(operation: &'static str, path: &Path, source: io::Error) -> WorkspaceCredentialError {
