@@ -10,6 +10,8 @@ use walkdir::WalkDir;
 use crate::metadata::{GRANTS_SIDECAR_SUFFIX, WorkspaceName};
 use crate::repository::RepoId;
 
+use super::bootstrap::STORE_ROOT;
+
 pub const HOST_CONFIG_FILE: &str = "host.json";
 pub const RETIRED_LAYOUT_HINT: &str =
     "cowshed setup --mount-root <dir> after detaching every workspace";
@@ -58,7 +60,7 @@ impl HostConfig {
     /// configuration is always authoritative and does not depend on process environment.
     pub fn load_for_store(store_root: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
-        let default = if store_root == Path::new("/private/cowshed/store") {
+        let default = if store_root == Path::new(STORE_ROOT) {
             let home = std::env::var_os("HOME").ok_or(HostConfigError::HomeUnavailable)?;
             let home = PathBuf::from(home);
             validate_absolute_path(&home)?;
