@@ -12,7 +12,7 @@ use lmao_arrow::{
     PartitionCardinality, StableVocabularyCatalog, convert_span_trees,
     inspect_partition_cardinality, split_chunk_by_partition, write_ipc_stream,
 };
-use lmao_core::{Clock, EntryType, SpanBuffer, SpanIdentity, TraceAnchor, TraceId};
+use lmao_core::{Clock, EntryType, SourceMetadata, SpanBuffer, SpanIdentity, TraceAnchor, TraceId};
 
 struct TickClock(std::sync::atomic::AtomicU64);
 impl Clock for TickClock {
@@ -34,7 +34,12 @@ fn real_root(trace: &str, span_id: u32, logs: usize) -> SpanBuffer {
         parent: None,
     });
     let mut buf = SpanBuffer::start_dynamic(identity.clone(), 8, "root-op".into(), &anchor, &clock);
-    buf.set_callsite("src/fixture.rs", 41);
+    buf.set_source(SourceMetadata {
+        package_name: "lmao-arrow-fixture",
+        package_file: "src/fixture.rs",
+        git_sha: Some("deadbeef"),
+        line: 41,
+    });
     for i in 0..logs {
         buf.append_dynamic(
             EntryType::Info,

@@ -119,7 +119,7 @@ fn stable_serialize(value: &Value) -> String {
         }
         Value::Object(values) => {
             let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(key, _)| *key);
             let entries = entries
                 .into_iter()
                 .map(|(key, value)| {
@@ -204,14 +204,16 @@ mod tests {
             overflow: None,
             children: vec![],
         };
-        convert_span_trees(&[span], &StableVocabularyCatalog::EMPTY).unwrap()
+        let empty_catalog = StableVocabularyCatalog::EMPTY;
+        convert_span_trees(&[span], &empty_catalog).unwrap()
     }
 
     #[test]
     fn chunk_stats_values_are_exact() {
         let batch = fixture();
         assert_eq!(extract_chunk_stats(&batch), (3, 50, 900));
-        let empty = convert_span_trees::<MockSpan>(&[], &StableVocabularyCatalog::EMPTY).unwrap();
+        let empty_catalog = StableVocabularyCatalog::EMPTY;
+        let empty = convert_span_trees::<MockSpan>(&[], &empty_catalog).unwrap();
         assert_eq!(extract_chunk_stats(&empty), (0, 0, 0));
     }
 

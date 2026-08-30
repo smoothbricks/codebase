@@ -10,8 +10,8 @@
 //! - Sentinel returns: offset 0 = null/OOM; no Result marshaling across the boundary.
 //! - Packed u64 convention preserved: `alloc_identity_root_for_js_write` returns
 //!   `(identity_offset << 32) | trace_id_field_offset`.
-//! - Export names match the allocator export list consumed by the TypeScript
-//!   host, including debug exports.
+//! - Export names are the low-level ABI; the TypeScript wrapper validates every
+//!   export it consumes rather than treating a partial probe as compatibility.
 //!
 //! All logic lives in `lmao_arena::raw`, generic over [`lmao_arena::Mem`]; this
 //! crate only supplies the linear-memory backend ([`WasmMem`]: absolute-offset
@@ -486,6 +486,11 @@ mod tests {
     fn export_surface_span_lifecycle() {
         init();
         reset();
+        assert_eq!(
+            get_freelist_len(4, 64),
+            0,
+            "unknown size class fails closed"
+        );
         set_thread_id(0xAABB, 0xCCDD);
         assert_eq!(is_thread_id_set(), 1);
 

@@ -214,44 +214,28 @@ fn bump_counter<M: Mem>(m: &mut M, off: u32) {
     m.write_u32(off, v + 1);
 }
 
-/// `freeAtTier` — address-based neighbor merge (right, then left), else freelist push.
+/// Address-based neighbor merge (right, then left), else freelist push.
 fn free_at_tier<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, tier: usize) {
-    if tier + 1 < NUM_TIERS {
-        let size = block_size(sc, tier_to_capacity(tier));
-        let right = offset + size;
-        if find_and_remove_by_offset(m, sc, tier, right) {
-            free_at_tier_with_merge(m, offset, sc, tier + 1);
-            return;
-        }
-        if offset >= size {
-            let left = offset - size;
-            if find_and_remove_by_offset(m, sc, tier, left) {
-                free_at_tier_with_merge(m, left, sc, tier + 1);
-                return;
-            }
-        }
-    }
-    push_to_freelist(m, offset, sc, tier, false);
+    free_at_tier_inner(m, offset, sc, tier, false);
 }
 
-/// `freeAtTierWithMerge` — cascade merges upward; final push counts the merge.
-fn free_at_tier_with_merge<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, tier: usize) {
+fn free_at_tier_inner<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, tier: usize, is_merge: bool) {
     if tier + 1 < NUM_TIERS {
         let size = block_size(sc, tier_to_capacity(tier));
         let right = offset + size;
         if find_and_remove_by_offset(m, sc, tier, right) {
-            free_at_tier_with_merge(m, offset, sc, tier + 1);
+            free_at_tier_inner(m, offset, sc, tier + 1, true);
             return;
         }
         if offset >= size {
             let left = offset - size;
             if find_and_remove_by_offset(m, sc, tier, left) {
-                free_at_tier_with_merge(m, left, sc, tier + 1);
+                free_at_tier_inner(m, left, sc, tier + 1, true);
                 return;
             }
         }
     }
-    push_to_freelist(m, offset, sc, tier, true);
+    push_to_freelist(m, offset, sc, tier, is_merge);
 }
 
 /// `pushToFreelist` — write a FreeBlock into the freed memory with cascading stats.

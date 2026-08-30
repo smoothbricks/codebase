@@ -19,7 +19,7 @@
 //! work within a single thread of execution", `01b4`) maps to a poll-segment, and
 //! cross-thread parentage is explicitly supported.
 
-use crate::buffer::SpanBuffer;
+use crate::buffer::{SourceMetadata, SpanBuffer};
 use crate::clock::{Clock, TraceAnchor};
 use crate::columns::SharedStr;
 use crate::entry_type::EntryType;
@@ -146,9 +146,9 @@ impl<'t> SpanContext<'t> {
         Self { trace, buf }
     }
 
-    /// Record the `span!` callsite.
-    pub fn set_callsite(&mut self, file: &'static str, line: u32) {
-        self.buf.set_callsite(file, line);
+    /// Record the source attribution injected by `span!`.
+    pub fn set_source(&mut self, source: SourceMetadata) {
+        self.buf.set_source(source);
     }
 
     /// Append a log entry with its format-string template. Returns the row for
