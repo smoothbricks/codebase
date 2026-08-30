@@ -1783,6 +1783,19 @@ impl<'de> Deserialize<'de> for ExecRecord {
     }
 }
 
+/// Where the child's stdin comes from.
+///
+/// Frontends cannot carry this enum on their wire — `Stream` holds a live reader — so each keeps
+/// its own spelling and maps into it here:
+///
+/// - CLI flags (`cowshed-cli/src/runtime.rs`, `exec_command`): no flag → `Empty`,
+///   `--stdin` → `Stream`, `--stdin-file` → `WorkspaceFile`, `--stdin-base64` → `Inline`.
+/// - napi wire (`cowshed-napi/src/lib.rs`, `NapiExecRequest`): `stdin` string → `Inline`,
+///   `stdinWorkspacePath` → `WorkspaceFile`, neither → `Empty`; `Stream` has no wire spelling.
+///
+/// Each frontend pins its mapping with an exhaustive-match seam (`cli_stdin_spelling`,
+/// `wire_stdin_spelling`), so adding a variant here breaks those matches at compile time instead
+/// of silently becoming a mode neither frontend can produce.
 pub enum StdinSource {
     Empty,
     Inline(Bytes),
