@@ -12,7 +12,10 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    cache::{CacheConfig, DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES},
+    cache::{
+        CacheConfig, DEFAULT_FILL_WAIT_TIMEOUT, DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES,
+        DEFAULT_METADATA_TTL,
+    },
     policy::WorkspacePolicy,
 };
 
@@ -380,8 +383,8 @@ impl MirrorCacheConfig {
             cache_root,
             high_water_bytes: DEFAULT_HIGH_WATER_BYTES,
             low_water_bytes: DEFAULT_LOW_WATER_BYTES,
-            metadata_ttl: Duration::from_secs(5 * 60),
-            fill_wait_timeout: Duration::from_secs(15 * 60),
+            metadata_ttl: DEFAULT_METADATA_TTL,
+            fill_wait_timeout: DEFAULT_FILL_WAIT_TIMEOUT,
         }
     }
 

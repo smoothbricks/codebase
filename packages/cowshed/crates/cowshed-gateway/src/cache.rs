@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 pub const DEFAULT_HIGH_WATER_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub const DEFAULT_LOW_WATER_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_FILL_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const CACHE_VERSION: u8 = 2;
 const HEADER_REGION: u64 = 64 * 1024;
 const MAX_HEADER_BYTES: usize = HEADER_REGION as usize - 4;
@@ -48,8 +50,8 @@ impl CacheConfig {
             root,
             high_water_bytes: DEFAULT_HIGH_WATER_BYTES,
             low_water_bytes: DEFAULT_LOW_WATER_BYTES,
-            metadata_ttl: Duration::from_secs(5 * 60),
-            fill_wait_timeout: Duration::from_secs(15 * 60),
+            metadata_ttl: DEFAULT_METADATA_TTL,
+            fill_wait_timeout: DEFAULT_FILL_WAIT_TIMEOUT,
         }
     }
 
