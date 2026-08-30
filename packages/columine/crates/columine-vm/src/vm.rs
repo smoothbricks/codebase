@@ -940,14 +940,14 @@ impl VmHooks for VmCtx<'_> {
         meta: &SlotMetaView,
         slot_idx: u8,
         elems: &[u32],
-    ) {
+    ) -> ErrorCode {
         let mut inner = VmCtx {
             undo: self.undo,
             env: &mut BitmapEnv::default(),
         };
         batch_bitmap_remove(
             self.env, &mut inner, delta_mode, state, meta, slot_idx, elems,
-        );
+        )
     }
 }
 
@@ -2892,7 +2892,7 @@ impl Vm {
                     let (slot, elem_col) = (code[pc], code[pc + 1]);
                     pc += 2;
                     let meta = SlotMetaView::read(state, slot);
-                    hashset_ops::batch_set_remove(
+                    let result = hashset_ops::batch_set_remove(
                         delta_mode,
                         state,
                         &meta,
@@ -2900,6 +2900,9 @@ impl Vm {
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         &mut self.ctx(),
                     );
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
+                    }
                 }
 
                 Opcode::BatchBitmapAdd => {
@@ -2943,7 +2946,7 @@ impl Vm {
                         undo,
                         env: &mut BitmapEnv::default(),
                     };
-                    batch_bitmap_remove(
+                    let result = batch_bitmap_remove(
                         env,
                         &mut hooks,
                         delta_mode,
@@ -2952,6 +2955,9 @@ impl Vm {
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                     );
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
+                    }
                 }
 
                 Opcode::BatchBitmapAnd
@@ -3936,7 +3942,7 @@ impl Vm {
                     let (slot, elem_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
                     let meta = SlotMetaView::read(state, slot);
-                    hashset_ops::single_set_remove(
+                    let result = hashset_ops::single_set_remove(
                         delta_mode,
                         state,
                         &meta,
@@ -3944,6 +3950,9 @@ impl Vm {
                         cell_u32(cols, elem_col, child_idx),
                         &mut self.ctx(),
                     );
+                    if result != ErrorCode::Ok {
+                        return signal_growth(slot, result);
+                    }
                 }
 
                 // STRUCT_MAP_UPSERT_LAST/FIRST/MAX (0x80/0x81/0x82)

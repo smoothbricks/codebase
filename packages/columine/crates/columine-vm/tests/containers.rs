@@ -94,7 +94,7 @@ impl VmHooks for RecordingHooks {
         _meta: &SlotMetaView,
         _slot_idx: u8,
         _elems: &[u32],
-    ) {
+    ) -> ErrorCode {
         unreachable!("the container differential uses flat hash sets")
     }
 }

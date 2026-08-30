@@ -90,7 +90,7 @@ pub trait VmHooks {
         meta: &SlotMetaView,
         slot_idx: u8,
         elems: &[u32],
-    );
+    ) -> ErrorCode;
 }
 
 /// Minimal environment with undo, TTL, and BITMAP services disabled. Calling an
@@ -121,15 +121,21 @@ impl VmHooks for NoVm {
         _key: u32,
         _ts: f64,
     ) -> ErrorCode {
-        panic!("TTL slot reached NoVm — the vm slice's eviction machinery is required")
+        columine_types::die!(
+            "TTL slot reached NoVm — the vm slice's eviction machinery is required"
+        )
     }
 
     fn latest_eviction_ts(&self, _state: &[u8], _meta: &SlotMetaView, _key: u32) -> Option<f64> {
-        panic!("TTL slot reached NoVm — the vm slice's eviction machinery is required")
+        columine_types::die!(
+            "TTL slot reached NoVm — the vm slice's eviction machinery is required"
+        )
     }
 
     fn remove_ttl_entries_for_key(&mut self, _state: &mut [u8], _meta: &SlotMetaView, _key: u32) {
-        panic!("TTL slot reached NoVm — the vm slice's eviction machinery is required")
+        columine_types::die!(
+            "TTL slot reached NoVm — the vm slice's eviction machinery is required"
+        )
     }
 
     fn undo_overflow(&self) -> bool {
@@ -151,7 +157,7 @@ impl VmHooks for NoVm {
         _elems: &[u32],
         _ts_col: Option<&[f64]>,
     ) -> ErrorCode {
-        panic!("BITMAP slot reached NoVm — the bitmap_ops slice is required")
+        columine_types::die!("BITMAP slot reached NoVm — the bitmap_ops slice is required")
     }
 
     fn batch_bitmap_remove(
@@ -161,7 +167,7 @@ impl VmHooks for NoVm {
         _meta: &SlotMetaView,
         _slot_idx: u8,
         _elems: &[u32],
-    ) {
-        panic!("BITMAP slot reached NoVm — the bitmap_ops slice is required")
+    ) -> ErrorCode {
+        columine_types::die!("BITMAP slot reached NoVm — the bitmap_ops slice is required")
     }
 }

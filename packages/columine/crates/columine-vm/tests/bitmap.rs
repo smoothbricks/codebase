@@ -7,7 +7,7 @@ use columine_vm::bitmap_ops::{
     cardinality_serialized, contains_serialized, extract_serialized, get_bitmap_storage,
     intersect_count_serialized, intersects_serialized, set_algebra,
 };
-use columine_vm::hooks::NoVm;
+use columine_vm::hooks::{MutationOp, MutationRecord, NoVm, VmHooks};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::minroar::MiniRoaring as RoaringBitmap;
 use proptest::prelude::*;
@@ -17,6 +17,79 @@ use columine_types::types::{
     SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
     StateHeaderOffset,
 };
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RecordingHooks {
+    ttl_by_key: BTreeMap<u32, u64>,
+    mutations: Vec<(MutationRecord, MutationRecord)>,
+}
+
+impl VmHooks for RecordingHooks {
+    fn undo_enabled(&self) -> bool {
+        true
+    }
+
+    fn append_mutation(
+        &mut self,
+        _delta_mode: bool,
+        _state: &[u8],
+        undo: MutationRecord,
+        redo: MutationRecord,
+    ) {
+        self.mutations.push((undo, redo));
+    }
+
+    fn insert_with_ttl(
+        &mut self,
+        _state: &mut [u8],
+        _meta: &SlotMetaView,
+        key: u32,
+        ts: f64,
+    ) -> ErrorCode {
+        self.ttl_by_key.insert(key, ts.to_bits());
+        ErrorCode::Ok
+    }
+
+    fn latest_eviction_ts(&self, _state: &[u8], _meta: &SlotMetaView, key: u32) -> Option<f64> {
+        self.ttl_by_key.get(&key).copied().map(f64::from_bits)
+    }
+
+    fn remove_ttl_entries_for_key(&mut self, _state: &mut [u8], _meta: &SlotMetaView, key: u32) {
+        self.ttl_by_key.remove(&key);
+    }
+
+    fn undo_overflow(&self) -> bool {
+        false
+    }
+
+    fn force_undo_snapshot(&mut self, _state: &[u8]) {
+        unreachable!("the bitmap transaction property never snapshots")
+    }
+
+    fn batch_bitmap_add(
+        &mut self,
+        _delta_mode: bool,
+        _state: &mut [u8],
+        _meta: &SlotMetaView,
+        _slot_idx: u8,
+        _elems: &[u32],
+        _ts_col: Option<&[f64]>,
+    ) -> ErrorCode {
+        unreachable!("the property invokes bitmap operations directly")
+    }
+
+    fn batch_bitmap_remove(
+        &mut self,
+        _delta_mode: bool,
+        _state: &mut [u8],
+        _meta: &SlotMetaView,
+        _slot_idx: u8,
+        _elems: &[u32],
+    ) -> ErrorCode {
+        unreachable!("the property invokes bitmap operations directly")
+    }
+}
 
 ///  `makeStorage` — a storage view over a local buffer:
 /// `[serialized_len u32][payload…]` at offset 0.
@@ -47,6 +120,12 @@ fn init_bitmap_slot_state(state: &mut [u8], capacity: u32) -> SlotMetaView {
     w32(state, meta_base + SlotMetaOffset::SIZE, 0);
     state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = SlotType::Bitmap as u8;
 
+    SlotMetaView::read(state, 0)
+}
+
+fn init_ttl_bitmap_slot_state(state: &mut [u8], capacity: u32) -> SlotMetaView {
+    let meta = init_bitmap_slot_state(state, capacity);
+    state[(meta.meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = SlotType::Bitmap as u8 | 0x10;
     SlotMetaView::read(state, 0)
 }
 
@@ -504,6 +583,84 @@ fn roaring_format_spec_fixture_parses() {
     assert_eq!(elems, vec![7, 42, 100]);
     // And the write direction round-trips through our own serializer.
     assert_eq!(cardinality_serialized(&serialize(&[7, 42, 100])), 3);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Every accepted mutation has a real inverse, while a payload-capacity
+    /// refusal commits neither primary bytes, TTL state, nor undo records.
+    #[test]
+    fn bitmap_sequence_is_reversible_across_payload_refusal(
+        high_words in prop::collection::btree_set(1u16..60_000, 180..193),
+        timestamp_bits in any::<u64>(),
+    ) {
+        let capacity = 192;
+        let mut env = BitmapEnv::default();
+        let mut state = vec![0u8; 8192];
+        let meta = init_ttl_bitmap_slot_state(&mut state, capacity);
+        let storage = get_bitmap_storage(&meta);
+        let mut empty = RoaringBitmap::new();
+        prop_assert_eq!(
+            bitmap_store(&mut env, &mut state, storage, &mut empty),
+            ErrorCode::Ok
+        );
+        let initial_state = state.clone();
+        let mut hooks = RecordingHooks::default();
+        let timestamp = f64::from_bits(timestamp_bits);
+        let mut saw_payload_refusal = false;
+
+        for high in high_words {
+            let key = u32::from(high) << 16;
+            let state_before = state.clone();
+            let hooks_before = hooks.clone();
+            match batch_bitmap_add(
+                &mut env,
+                &mut hooks,
+                false,
+                &mut state,
+                &meta,
+                0,
+                &[key],
+                Some(&[timestamp]),
+            ) {
+                ErrorCode::Ok => {}
+                ErrorCode::CapacityExceeded => {
+                    saw_payload_refusal = true;
+                    prop_assert_eq!(&state, &state_before);
+                    prop_assert_eq!(&hooks, &hooks_before);
+                }
+                other => prop_assert!(false, "unexpected bitmap result {other:?}"),
+            }
+        }
+        prop_assert!(saw_payload_refusal);
+
+        let mut bitmap = bitmap_load(&mut env, &state, storage).expect("accepted image reloads");
+        for (undo, _) in hooks.mutations.iter().rev() {
+            match undo.op {
+                MutationOp::SetInsert => {
+                    prop_assert!(bitmap.remove(undo.key));
+                    hooks.ttl_by_key.remove(&undo.key);
+                }
+                MutationOp::SetDelete => {
+                    prop_assert!(bitmap.insert(undo.key));
+                    hooks.ttl_by_key.insert(undo.key, undo.aux);
+                }
+                other => prop_assert!(false, "unexpected bitmap undo record {other:?}"),
+            }
+        }
+        let cardinality = bitmap.len() as u32;
+        prop_assert_eq!(
+            bitmap_store(&mut env, &mut state, storage, &mut bitmap),
+            ErrorCode::Ok
+        );
+        meta.set_size(&mut state, cardinality);
+        state[(meta.meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
+        hooks.mutations.clear();
+
+        prop_assert_eq!(state, initial_state);
+        prop_assert_eq!(hooks, RecordingHooks::default());
+    }
 }
 
 proptest! {

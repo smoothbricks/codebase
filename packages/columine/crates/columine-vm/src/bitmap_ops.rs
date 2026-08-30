@@ -68,14 +68,22 @@ pub fn get_bitmap_storage(meta: &SlotMetaView) -> BitmapStorage {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PendingBitmapMutation {
+    Insert { key: u32, timestamp: f64 },
+    RefreshTtl { key: u32, timestamp: f64 },
+    Remove { key: u32, previous_ts_bits: u64 },
+}
+
 /// Observable bitmap operation state. Reusable buffers avoid allocation churn
-/// on store and algebra paths.
+/// on store, algebra, and mutation-commit paths.
 #[derive(Debug, Default)]
 pub struct BitmapEnv {
     /// `g_bitmap_last_error` — diagnostic code readable after a failure.
     pub last_error: u32,
     store_temp: Vec<u8>,
     algebra_result: Vec<u8>,
+    pending_mutations: Vec<PendingBitmapMutation>,
 }
 
 impl BitmapEnv {
@@ -84,6 +92,86 @@ impl BitmapEnv {
     pub fn algebra_result(&self) -> &[u8] {
         &self.algebra_result
     }
+}
+
+fn commit_bitmap_mutations(
+    env: &mut BitmapEnv,
+    hooks: &mut impl VmHooks,
+    delta_mode: bool,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    slot_idx: u8,
+) -> ErrorCode {
+    for idx in 0..env.pending_mutations.len() {
+        match env.pending_mutations[idx] {
+            PendingBitmapMutation::Insert { key, timestamp } => {
+                if hooks.undo_enabled() {
+                    hooks.append_mutation(
+                        delta_mode,
+                        state,
+                        MutationRecord {
+                            op: MutationOp::SetInsert,
+                            slot: slot_idx,
+                            key,
+                            prev_value: 0,
+                            aux: 0,
+                        },
+                        MutationRecord {
+                            op: MutationOp::SetDelete,
+                            slot: slot_idx,
+                            key,
+                            prev_value: 0,
+                            aux: 0,
+                        },
+                    );
+                }
+                if meta.has_ttl() {
+                    let result = hooks.insert_with_ttl(state, meta, key, timestamp);
+                    if result != ErrorCode::Ok {
+                        env.pending_mutations.clear();
+                        return result;
+                    }
+                }
+            }
+            PendingBitmapMutation::RefreshTtl { key, timestamp } => {
+                let result = hooks.insert_with_ttl(state, meta, key, timestamp);
+                if result != ErrorCode::Ok {
+                    env.pending_mutations.clear();
+                    return result;
+                }
+            }
+            PendingBitmapMutation::Remove {
+                key,
+                previous_ts_bits,
+            } => {
+                if hooks.undo_enabled() {
+                    hooks.append_mutation(
+                        delta_mode,
+                        state,
+                        MutationRecord {
+                            op: MutationOp::SetDelete,
+                            slot: slot_idx,
+                            key,
+                            prev_value: 0,
+                            aux: previous_ts_bits,
+                        },
+                        MutationRecord {
+                            op: MutationOp::SetInsert,
+                            slot: slot_idx,
+                            key,
+                            prev_value: 0,
+                            aux: 0,
+                        },
+                    );
+                }
+                if meta.has_ttl() {
+                    hooks.remove_ttl_entries_for_key(state, meta, key);
+                }
+            }
+        }
+    }
+    env.pending_mutations.clear();
+    ErrorCode::Ok
 }
 
 /// Load a serialized bitmap. `None` maps to an error path and
@@ -177,6 +265,8 @@ pub fn batch_bitmap_add(
     ts_col: Option<&[f64]>,
 ) -> ErrorCode {
     env.last_error = 0;
+    env.pending_mutations.clear();
+    env.pending_mutations.reserve(elem_col.len());
     let storage = get_bitmap_storage(meta);
     let Some(mut bitmap) = bitmap_load(env, state, storage) else {
         if env.last_error == 0 {
@@ -185,111 +275,61 @@ pub fn batch_bitmap_add(
         return ErrorCode::InvalidState;
     };
 
-    let original_size = meta.size(state);
     let mut cardinality = bitmap.len() as u32;
-    if cardinality != original_size {
-        meta.set_size(state, cardinality);
-    }
     let mut had_insert = false;
 
     for (i, &elem) in elem_col.iter().enumerate() {
         if elem == EMPTY_KEY || elem == TOMBSTONE {
             continue;
         }
-        let ts = if meta.has_ttl() {
+        let timestamp = if meta.has_ttl() {
             ts_col.unwrap_or_else(|| columine_types::die!("TTL slot requires a timestamp column"))
                 [i]
         } else {
             0.0
         };
 
-        let already_present = bitmap.contains(elem);
-        if !already_present && cardinality >= meta.capacity {
-            if had_insert {
-                let flush_result = bitmap_store(env, state, storage, &mut bitmap);
-                if flush_result != ErrorCode::Ok {
-                    env.last_error = 2;
-                    meta.set_size(state, original_size);
-                    return flush_result;
-                }
-                meta.set_size(state, cardinality);
-                meta.set_change_flag(state, ChangeFlag::INSERTED);
-            } else {
-                meta.set_size(state, original_size);
-            }
-            return ErrorCode::CapacityExceeded;
-        }
-
-        let inserted = !already_present && bitmap.insert(elem);
-
-        if !inserted {
+        if bitmap.contains(elem) {
             if meta.has_ttl() {
-                let ttl_result = hooks.insert_with_ttl(state, meta, elem, ts);
-                if ttl_result != ErrorCode::Ok {
-                    if had_insert {
-                        let flush_result = bitmap_store(env, state, storage, &mut bitmap);
-                        if flush_result != ErrorCode::Ok {
-                            meta.set_size(state, original_size);
-                            return flush_result;
-                        }
-                        meta.set_change_flag(state, ChangeFlag::INSERTED);
-                    }
-                    meta.set_size(state, cardinality);
-                    return ttl_result;
-                }
+                env.pending_mutations
+                    .push(PendingBitmapMutation::RefreshTtl {
+                        key: elem,
+                        timestamp,
+                    });
             }
             continue;
         }
-
-        if hooks.undo_enabled() {
-            meta.set_size(state, cardinality);
-            hooks.append_mutation(
-                delta_mode,
-                state,
-                MutationRecord {
-                    op: MutationOp::SetInsert,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: 0,
-                },
-                MutationRecord {
-                    op: MutationOp::SetDelete,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: 0,
-                },
-            );
-        }
-
-        cardinality += 1;
-        had_insert = true;
-
-        if meta.has_ttl() {
-            let ttl_result = hooks.insert_with_ttl(state, meta, elem, ts);
-            if ttl_result != ErrorCode::Ok {
-                let flush_result = bitmap_store(env, state, storage, &mut bitmap);
-                if flush_result != ErrorCode::Ok {
-                    env.last_error = 5;
-                    meta.set_size(state, original_size);
-                    return flush_result;
-                }
-                meta.set_size(state, cardinality);
-                if had_insert {
-                    meta.set_change_flag(state, ChangeFlag::INSERTED);
-                }
-                return ttl_result;
+        if cardinality >= meta.capacity {
+            let store_result = bitmap_store(env, state, storage, &mut bitmap);
+            if store_result != ErrorCode::Ok {
+                env.pending_mutations.clear();
+                return store_result;
             }
+            meta.set_size(state, cardinality);
+            if had_insert {
+                meta.set_change_flag(state, ChangeFlag::INSERTED);
+            }
+            let commit_result =
+                commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx);
+            return if commit_result == ErrorCode::Ok {
+                ErrorCode::CapacityExceeded
+            } else {
+                commit_result
+            };
+        }
+        if bitmap.insert(elem) {
+            cardinality += 1;
+            had_insert = true;
+            env.pending_mutations.push(PendingBitmapMutation::Insert {
+                key: elem,
+                timestamp,
+            });
         }
     }
 
     let store_result = bitmap_store(env, state, storage, &mut bitmap);
     if store_result != ErrorCode::Ok {
-        if env.last_error == 0 {
-            env.last_error = 6;
-        }
-        meta.set_size(state, original_size);
+        env.pending_mutations.clear();
         return store_result;
     }
 
@@ -297,7 +337,7 @@ pub fn batch_bitmap_add(
     if had_insert {
         meta.set_change_flag(state, ChangeFlag::INSERTED);
     }
-    ErrorCode::Ok
+    commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx)
 }
 
 /// Remove a batch of elements; failures leave slot bytes unchanged.
@@ -309,10 +349,12 @@ pub fn batch_bitmap_remove(
     meta: &SlotMetaView,
     slot_idx: u8,
     elem_col: &[u32],
-) {
+) -> ErrorCode {
+    env.pending_mutations.clear();
+    env.pending_mutations.reserve(elem_col.len());
     let storage = get_bitmap_storage(meta);
     let Some(mut bitmap) = bitmap_load(env, state, storage) else {
-        return;
+        return ErrorCode::InvalidState;
     };
 
     let mut cardinality = bitmap.len() as u32;
@@ -322,57 +364,40 @@ pub fn batch_bitmap_remove(
         if cardinality == 0 {
             break;
         }
-        let removed = bitmap.remove(elem);
-        if !removed {
+        if !bitmap.remove(elem) {
             continue;
         }
-
-        if hooks.undo_enabled() {
-            let mut prev_ts_bits: u64 = 0;
-            if meta.has_ttl()
-                && let Some(prev_ts) = hooks.latest_eviction_ts(state, meta, elem)
-            {
-                prev_ts_bits = prev_ts.to_bits();
-            }
-            meta.set_size(state, cardinality);
-            hooks.append_mutation(
-                delta_mode,
-                state,
-                MutationRecord {
-                    op: MutationOp::SetDelete,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: prev_ts_bits,
-                },
-                MutationRecord {
-                    op: MutationOp::SetInsert,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: 0,
-                },
-            );
-        }
-
+        let previous_ts_bits = if meta.has_ttl() {
+            hooks
+                .latest_eviction_ts(state, meta, elem)
+                .unwrap_or_else(|| {
+                    columine_types::die!("live TTL bitmap key is missing its eviction entry")
+                })
+                .to_bits()
+        } else {
+            0
+        };
+        env.pending_mutations.push(PendingBitmapMutation::Remove {
+            key: elem,
+            previous_ts_bits,
+        });
         cardinality -= 1;
         had_remove = true;
-        if meta.has_ttl() {
-            hooks.remove_ttl_entries_for_key(state, meta, elem);
+    }
+
+    if had_remove {
+        let store_result = bitmap_store(env, state, storage, &mut bitmap);
+        if store_result != ErrorCode::Ok {
+            env.pending_mutations.clear();
+            return store_result;
         }
-    }
-
-    if !had_remove {
         meta.set_size(state, cardinality);
-        return;
+        meta.set_change_flag(state, ChangeFlag::REMOVED);
+    } else {
+        meta.set_size(state, cardinality);
     }
 
-    if bitmap_store(env, state, storage, &mut bitmap) != ErrorCode::Ok {
-        return;
-    }
-
-    meta.set_size(state, cardinality);
-    meta.set_change_flag(state, ChangeFlag::REMOVED);
+    commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx)
 }
 
 /// Set-algebra operation applied to a target bitmap.
