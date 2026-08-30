@@ -404,6 +404,10 @@ wrong evidence.
 **A partial override of an inferred Nx target REPLACES it.** Declaring only `dependsOn` on `cargo-test` collapses it to
 `nx:noop` — a target that passes having run nothing. Change inference in `@smoothbricks/nx-plugin`.
 
+**A `--ff-only` merge verifies nothing; run the gate on the MERGED tree.** Every branch can be green in isolation while
+main is red, because a branch replayed onto main cannot retroactively update a caller that landed after its commits were
+authored. Cheapest sufficient gate: `cargo check -p <crate> --all-targets` after each land.
+
 --
 
 --
