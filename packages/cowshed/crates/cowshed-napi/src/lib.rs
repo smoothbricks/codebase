@@ -1111,6 +1111,10 @@ mod parity_tests {
         let distinct: BTreeSet<&str> = claimed.iter().copied().collect();
         claimed.sort_unstable();
 
-        assert_eq!(claimed.len(), distinct.len(), "duplicate N-API export claim");
+        assert_eq!(
+            claimed.len(),
+            distinct.len(),
+            "duplicate N-API export claim"
+        );
     }
 }
