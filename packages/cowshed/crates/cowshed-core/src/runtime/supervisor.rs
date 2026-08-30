@@ -2848,6 +2848,20 @@ impl SupervisorActor {
             let _ = reply.send(Err(not_found_job(job_id)));
             return;
         };
+        if job.terminal_committed {
+            // The sealed artifact is the authoritative copy of both streams, so the actor keeps
+            // none. Off the actor thread: this may open and read a protected file, and every
+            // other job's output pump waits behind this loop.
+            let sealed = match stream {
+                StreamKind::Stdout => job.info.stdout.clone(),
+                StreamKind::Stderr => job.info.stderr.clone(),
+            };
+            let workspace_root = self.workspace_root.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = reply.send(read_sealed_chunk(&workspace_root, &sealed, offset));
+            });
+            return;
+        }
         match make_log_chunk(job, stream, offset) {
             Ok(Some(chunk)) => {
                 let _ = reply.send(Ok(chunk));
@@ -3190,6 +3204,13 @@ impl SupervisorActor {
             let _ = waiter.send(outcome.clone().map(|_| ()));
         }
         flush_log_waiters(job);
+        // Release the actor's copy of the output. The store already holds every byte, under a
+        // committed digest, and its per-job quota is a gigabyte -- so retaining this second copy
+        // for the supervisor's lifetime is growth with no closed form, and a workspace that
+        // execs often exhausts memory while its disk quota still holds. Ordered after the
+        // waiters so a follower that is mid-stream is served from the live deque first.
+        job.stdout = VecDeque::new();
+        job.stderr = VecDeque::new();
     }
 
     fn finish_lifecycle_waiters(&mut self) {
@@ -3398,6 +3419,70 @@ fn release_exited_process(job: &mut JobStateRecord) {
         let _ = waiter.send(Ok(()));
     }
     job.info.stdin.complete = true;
+}
+
+/// One bounded chunk of a sealed stream, read out of the artifact store.
+///
+/// The store's reader verifies bytes and digest as it goes and cannot seek, so an offset is
+/// reached by reading and discarding. Paging a whole stream is therefore quadratic in chunk
+/// count -- which is the right trade against keeping every terminal job's full output resident
+/// forever, and is bounded anyway by the same `MAX_LOG_READ` frame the live path uses. An inline
+/// stream, which is every output under the store's inline cap, touches no filesystem at all.
+fn read_sealed_chunk(workspace_root: &Path, stream: &StreamInfo, offset: u64) -> Result<LogChunk> {
+    let len = stream.bytes;
+    if offset > len {
+        return Err(CowshedError::conflict(
+            "log offset is beyond the captured stream",
+            "restart the read at the returned stream length",
+        ));
+    }
+    if offset == len {
+        return Ok(LogChunk {
+            bytes: Bytes::new(),
+            next_offset: len,
+            eof: true,
+        });
+    }
+    let mut reader = crate::storage::job_artifact::open_stream_reader(workspace_root, stream)
+        .map_err(map_artifact_error)?;
+    let mut discard = vec![0_u8; PROCESS_IO_CHUNK];
+    let mut skipped = 0_u64;
+    while skipped < offset {
+        let want = usize::try_from(offset - skipped)
+            .unwrap_or(PROCESS_IO_CHUNK)
+            .min(PROCESS_IO_CHUNK);
+        let read = reader
+            .read_chunk(&mut discard[..want])
+            .map_err(map_artifact_error)?;
+        if read == 0 {
+            return Err(CowshedError::integrity(
+                "sealed stream ended before the requested log offset",
+                "cowshed doctor --json",
+            ));
+        }
+        skipped += byte_count(read);
+    }
+    let want = usize::try_from(len - offset)
+        .unwrap_or(MAX_LOG_READ)
+        .min(MAX_LOG_READ);
+    let mut output = vec![0_u8; want];
+    let mut filled = 0;
+    while filled < want {
+        let read = reader
+            .read_chunk(&mut output[filled..])
+            .map_err(map_artifact_error)?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    output.truncate(filled);
+    let next_offset = offset + byte_count(filled);
+    Ok(LogChunk {
+        bytes: Bytes::from(output),
+        next_offset,
+        eof: next_offset == len,
+    })
 }
 
 fn flush_log_waiters(job: &mut JobStateRecord) {
