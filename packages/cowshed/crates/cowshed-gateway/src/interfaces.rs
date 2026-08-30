@@ -30,6 +30,13 @@ pub enum NegotiatedTransport {
     Raw,
 }
 
+pub(crate) const ALPN_H2: &[u8] = b"h2";
+pub(crate) const ALPN_HTTP_1_1: &[u8] = b"http/1.1";
+
+pub(crate) fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![ALPN_H2.to_vec(), ALPN_HTTP_1_1.to_vec()]
+}
+
 pub struct UpstreamConnection {
     pub io: BoxIo,
     pub transport: NegotiatedTransport,
@@ -86,7 +93,7 @@ impl SystemConnector {
     pub fn new(connect_timeout: Duration, tls_timeout: Duration) -> Result<Self, ConnectError> {
         let mut tls = ClientConfig::with_platform_verifier()
             .map_err(|error| ConnectError::TlsConfiguration(error.to_string()))?;
-        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        tls.alpn_protocols = alpn_protocols();
         Ok(Self {
             connect_timeout,
             tls_timeout,
@@ -151,8 +158,8 @@ impl UpstreamConnector for SystemConnector {
         .map_err(|_| ConnectError::TlsTimeout)?
         .map_err(|error| ConnectError::Tls(error.to_string()))?;
         let transport = match tls.get_ref().1.alpn_protocol() {
-            Some(b"h2") => NegotiatedTransport::Http2,
-            Some(b"http/1.1") => NegotiatedTransport::Http1,
+            Some(ALPN_H2) => NegotiatedTransport::Http2,
+            Some(ALPN_HTTP_1_1) => NegotiatedTransport::Http1,
             Some(_) => return Err(ConnectError::UnsupportedAlpn),
             None => return Err(ConnectError::MissingAlpn),
         };
