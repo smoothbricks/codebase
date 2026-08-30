@@ -4,6 +4,7 @@ members = [
   "crates/cowshed-core",
   "crates/cowshed-cli",
   "crates/cowshed-gateway",
+  "crates/cowshed-gateway-types",
   "crates/cowshed-napi",
 ]
 

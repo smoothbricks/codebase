@@ -397,6 +397,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "cowshed-gateway-types",
  "http",
  "http-body",
  "http-body-util",
@@ -421,6 +422,20 @@ dependencies = [
  "tokio-rustls",
  "url",
  "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "cowshed-gateway-types"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "http",
+ "idna",
+ "serde",
+ "subtle",
+ "thiserror",
+ "url",
  "zeroize",
 ]
 

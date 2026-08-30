@@ -11,6 +11,7 @@ arrow-ipc = "56"
 arrow-schema = "56"
 base64 = "0.22"
 bytes = "1"
+cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 http = "1"
 http-body = "=1.0.1"
 http-body-util = "=0.1.3"

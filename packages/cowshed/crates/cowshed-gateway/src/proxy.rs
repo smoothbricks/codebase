@@ -33,6 +33,10 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
+use cowshed_gateway_types::{
+    CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, TargetScheme, normalize_path,
+};
+
 use crate::{
     actor::{
         Admission, AdmissionError, AuditAttempt, AuditDraft, Authentication, BoundListener,
@@ -48,9 +52,6 @@ use crate::{
     mirror::{
         MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
         MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
-    },
-    policy::{
-        CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, TargetScheme, normalize_path,
     },
     repo_mirror::RepoMirrorHandle,
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRequest},

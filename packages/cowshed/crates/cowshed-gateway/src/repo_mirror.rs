@@ -28,17 +28,19 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::{Zeroize as _, Zeroizing};
 
+use cowshed_gateway_types::{
+    CanonicalHost, CanonicalTarget, EgressMode, HostPattern, TargetScheme, WorkspacePolicy,
+    normalize_path,
+};
+
 use crate::{
     actor::{BrokerAuditEvent, BrokerAuditor},
     interfaces::{
         AuditKind, AuditStatus, AuthorizedTarget, CredentialProtocol, CredentialProvider,
         CredentialQuery, NegotiatedTransport, UpstreamConnector, UpstreamPurpose,
     },
-    policy::{
-        CanonicalHost, CanonicalTarget, EgressMode, HostPattern, TargetScheme, WorkspacePolicy,
-        normalize_path,
-    },
 };
+
 pub const GATEWAY_GIT_FETCH_HELPER_ARG: &str = "__cowshed-gateway-git-fetch";
 const MAX_HELPER_FRAME: u64 = 1024 * 1024;
 
