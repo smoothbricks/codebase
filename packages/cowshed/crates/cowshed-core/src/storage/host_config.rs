@@ -384,12 +384,7 @@ fn require_private_file(path: &Path) -> Result<(), HostConfigError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), HostConfigError> {
-    let directory = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|source| io_error("open host configuration directory", path, source))?;
-    directory
-        .sync_all()
+    crate::metadata::sync_directory(path)
         .map_err(|source| io_error("sync host configuration directory", path, source))
 }
 

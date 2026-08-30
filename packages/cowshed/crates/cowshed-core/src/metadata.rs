@@ -1114,6 +1114,21 @@ impl DetachedWorkspaceMetadata {
 /// below go through it.
 pub const GRANTS_SIDECAR_SUFFIX: &str = ".grants.json";
 
+/// Open a directory and fsync it — the one durability barrier for directory entries. Opened with
+/// `O_DIRECTORY` so a path swapped for a file between derivation and sync fails instead of
+/// silently syncing the wrong object, and `O_CLOEXEC` so the descriptor never leaks into an
+/// exec'd child.
+pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
+    }
+    options.open(path)?.sync_all()
+}
+
 /// Append a suffix to a path's final component without touching its extension handling.
 pub(crate) fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value: OsString = path.as_os_str().to_owned();
@@ -1244,9 +1259,7 @@ fn write_atomic_with_nonce(
 
     fs::rename(&temp_path, path).map_err(|source| io_error(path, source))?;
     cleanup.armed = false;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(parent, source))?;
+    sync_directory(parent).map_err(|source| io_error(parent, source))?;
     Ok(())
 }
 

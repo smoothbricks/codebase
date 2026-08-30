@@ -2053,15 +2053,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), ArtifactError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
-    }
-    let directory = options.open(path).map_err(|error| io_error(path, error))?;
-    directory.sync_all().map_err(|error| io_error(path, error))
+    crate::metadata::sync_directory(path).map_err(|error| io_error(path, error))
 }
 
 fn scan_job_directories(workspace_root: &Path) -> Result<u64, ArtifactError> {
