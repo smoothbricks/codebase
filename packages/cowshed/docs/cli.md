@@ -785,6 +785,9 @@ the blanket `CARGO_*` environment values, and the argument bytes relative to the
 across paths. Cargo's own `-C metadata` is path-independent for workspace members from cargo 1.97. An unpatched sccache
 still serves same-path (slot-tenant) reuse, nothing more.
 
+Concurrent misses of one cache key wait for the first compile (`patches/sccache-singleflight.patch`; prove with
+`nm sccache | grep inflight_join`). Without it, parallel `cargo` processes compile the same crate N times.
+
 Two more variables are in that plist because sccache reads them once, at server start, and no client can supply them:
 
 - `SCCACHE_CACHE_SIZE` — the cap. sccache's own default is 10 GiB, which is smaller than one debug graph of a project
