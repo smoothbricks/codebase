@@ -186,6 +186,26 @@ mod tests {
     }
 
     #[test]
+    fn as_str_matches_serde_kebab_case_for_every_variant() {
+        const SPELLINGS: [&str; 7] = [
+            "internal",
+            "usage",
+            "not-found",
+            "conflict",
+            "environment-missing",
+            "sandbox-denied",
+            "integrity",
+        ];
+        assert_eq!(CODES.map(ErrorCode::as_str), SPELLINGS);
+        for (code, spelling) in CODES.into_iter().zip(SPELLINGS) {
+            let json = serde_json::to_value(code).expect("error code serializes");
+            assert_eq!(json, spelling);
+            let back: ErrorCode = serde_json::from_value(json).expect("error code deserializes");
+            assert_eq!(back, code);
+        }
+    }
+
+    #[test]
     fn integrity_is_a_typed_operational_failure() {
         let error = CowshedError::integrity(
             "sealed stdout digest does not match",
