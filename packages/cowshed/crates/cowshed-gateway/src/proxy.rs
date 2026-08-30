@@ -2248,11 +2248,27 @@ fn local_request_kind(path: &str) -> Option<AuditKind> {
     }
 }
 
+/// Display length of `uri` without allocating. Matches `http::Uri`'s `fmt`
+/// byte-for-byte: scheme + "://" + authority + path + optional "?" + query.
+fn uri_display_len(uri: &Uri) -> usize {
+    let mut len = uri.path().len();
+    if let Some(scheme) = uri.scheme() {
+        len += scheme.as_str().len() + "://".len();
+    }
+    if let Some(authority) = uri.authority() {
+        len += authority.as_str().len();
+    }
+    if let Some(query) = uri.query() {
+        len += "?".len() + query.len();
+    }
+    len
+}
+
 fn validate_request<B>(request: &Request<B>) -> Result<(), RequestError>
 where
     B: Body,
 {
-    if request.uri().to_string().len() > MAX_TARGET {
+    if uri_display_len(request.uri()) > MAX_TARGET {
         return Err(RequestError::new(
             StatusCode::URI_TOO_LONG,
             "request target exceeds 8 KiB",
@@ -3032,6 +3048,43 @@ mod tests {
             HeaderValue::from_static("trailers"),
         );
         assert!(validate_request(&trailers).is_ok());
+    }
+
+    #[test]
+    fn request_target_limit_matches_uri_display_without_allocating() {
+        for raw in [
+            "/",
+            "*",
+            "/path?q=1",
+            "http://example.com",
+            "http://example.com/",
+            "https://example.com:443/path",
+            "http://[::1]:8080/x?y=z",
+            "example.com:443",
+            "http://user:pass@example.com/p",
+        ] {
+            let uri: Uri = raw.parse().expect(raw);
+            assert_eq!(uri_display_len(&uri), uri.to_string().len(), "{raw}");
+        }
+
+        let at_limit = format!("/{}", "a".repeat(MAX_TARGET - 1));
+        let allowed = Request::builder()
+            .uri(&at_limit)
+            .body(Empty::<Bytes>::new())
+            .expect("valid test request");
+        assert!(validate_request(&allowed).is_ok());
+
+        let over_limit = format!("/{}", "a".repeat(MAX_TARGET));
+        let rejected = Request::builder()
+            .uri(&over_limit)
+            .body(Empty::<Bytes>::new())
+            .expect("valid test request");
+        assert_eq!(
+            validate_request(&rejected)
+                .expect_err("over-limit target")
+                .status,
+            StatusCode::URI_TOO_LONG
+        );
     }
 
     #[test]
