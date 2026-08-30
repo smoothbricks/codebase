@@ -37,19 +37,7 @@ use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 use crate::storage::job_artifact::controller_commitments_to_batch;
 
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-mod unsupported;
-
-#[cfg(target_os = "linux")]
-use linux::rename_noreplace;
-#[cfg(target_os = "macos")]
-use macos::rename_noreplace;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-use unsupported::rename_noreplace;
+use crate::fsio::rename_noreplace;
 
 const SEGMENT_PREFIX: &str = "commitment-";
 

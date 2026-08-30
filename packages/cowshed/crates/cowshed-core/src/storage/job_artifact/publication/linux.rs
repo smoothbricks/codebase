@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -32,22 +31,4 @@ pub(super) fn try_fast_clone(
         PublicationStage::Clone,
         error,
     ))
-}
-
-pub(super) fn rename_noreplace(
-    directory_fd: libc::c_int,
-    temporary: &CStr,
-    destination: &CStr,
-) -> Result<libc::c_int, ArtifactError> {
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-    Ok(unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            directory_fd,
-            temporary.as_ptr(),
-            directory_fd,
-            destination.as_ptr(),
-            RENAME_NOREPLACE,
-        ) as libc::c_int
-    })
 }
