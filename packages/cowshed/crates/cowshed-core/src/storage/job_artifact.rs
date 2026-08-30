@@ -4841,8 +4841,63 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn repair_resequences_intact_frames_without_losing_records() {
-        let root = temp_root("repair-sequences");
+    fn serialized_append_preserves_sequence_after_a_truncated_tail() {
+        let root = temp_root("serialized-truncated-tail-sequence");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let first = store.append_record(valid_job_record(1)).unwrap().0;
+        let path = records_path(&root);
+        let retained_len = fs::metadata(&path).unwrap().len();
+        let second = store.append_record(valid_job_record(2)).unwrap().0;
+        assert_eq!((first.sequence, second.sequence), (1, 2));
+
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let after_tail_loss = store.append_record(valid_job_record(3)).unwrap().0;
+        assert!(
+            after_tail_loss.sequence > second.sequence,
+            "a serialized append reused handed-out sequence {} after recovering an incomplete tail: {}",
+            second.sequence,
+            after_tail_loss.sequence,
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handed_out_sequence_remains_monotonic_across_repair() {
+        let root = temp_root("repair-sequence-watermark");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        store.append_record(valid_job_record(1)).unwrap();
+        let path = records_path(&root);
+        let retained_len = fs::metadata(&path).unwrap().len();
+        let before_repair = store.append_record(valid_job_record(2)).unwrap().0;
+
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
+            .unwrap();
+        file.sync_data().unwrap();
+        let repair = repair_workspace_record_sequences(
+            &root,
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap();
+        assert!(repair.violations.is_empty());
+
+        let after_repair = store.append_record(valid_job_record(3)).unwrap().0;
+        assert!(
+            after_repair.sequence > before_repair.sequence,
+            "repair lowered the durable sequence watermark from {} to {}",
+            before_repair.sequence,
+            after_repair.sequence,
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_refuses_sequence_collisions_without_rewriting_identity() {
+        let root = temp_root("repair-sequence-refusal");
         let mut first_running = valid_job_record(1);
         first_running.state = JobState::Running;
         first_running.sequence = 1;
@@ -4867,50 +4922,28 @@ mod tests {
             }) if offset > 0
         ));
 
-        let report = repair_workspace_record_sequences(
-            &root,
-            ArtifactConfig::default().retained_recovery_budget_bytes,
-        )
-        .unwrap();
-        assert_eq!(report.frame_count, 4);
-        assert_eq!(report.resequenced_records, 2);
-        assert_eq!(report.violations.len(), 1);
-        let backup = report.backup_path.expect("repair preserves the original");
-        assert_eq!(fs::read(&backup).unwrap(), original);
-
-        let repaired = recover_records(&path).unwrap();
-        let jobs = repaired
-            .frames
-            .into_iter()
-            .filter_map(|frame| match frame.record {
-                ProtectedRecord::Job(job) => Some(job),
-                ProtectedRecord::CheckpointManifest(_) => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            jobs.iter().map(|job| job.sequence).collect::<Vec<_>>(),
-            [1, 2, 3, 4]
+        assert!(
+            repair_workspace_record_sequences(
+                &root,
+                ArtifactConfig::default().retained_recovery_budget_bytes,
+            )
+            .is_err(),
+            "repair must refuse rather than rewrite bytes and let the new manifest attest to them",
         );
         assert_eq!(
-            jobs.iter()
-                .map(|job| (job.job_id.get(), job.state))
-                .collect::<Vec<_>>(),
-            [
-                (1, JobState::Running),
-                (1, JobState::Exited),
-                (2, JobState::Running),
-                (2, JobState::Exited),
-            ]
+            fs::read(&path).unwrap(),
+            original,
+            "a sequence refusal must preserve store identity",
         );
-
-        let repeated = repair_workspace_record_sequences(
-            &root,
-            ArtifactConfig::default().retained_recovery_budget_bytes,
-        )
-        .unwrap();
-        assert_eq!(repeated.frame_count, 4);
-        assert_eq!(repeated.resequenced_records, 0);
-        assert!(repeated.backup_path.is_none());
+        assert!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name
+                    .to_string_lossy()
+                    .starts_with("records.arrow.pre-repair-")),
+            "a refused repair must not publish a rewritten store or backup",
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
