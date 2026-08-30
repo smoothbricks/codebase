@@ -822,6 +822,18 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         serde_json::to_value(unmeasured).unwrap(),
         json!({"installed":false,"running":false,"socket":"/store/gateway.sock","cliVersion":"1.4.0","activeWorkspaces":0})
     );
+    // Nothing in the gateway control protocol reports cache occupancy, so a counter here could
+    // only ever be the constant 0 the CLI used to send — a number that says "empty" when the fact
+    // is "never measured". `deny_unknown_fields` is what keeps it from coming back.
+    for invented in [
+        json!({"installed":false,"running":false,"socket":"/s","cliVersion":"1.4.0","activeWorkspaces":0,"cacheEntries":0}),
+        json!({"installed":false,"running":false,"socket":"/s","cliVersion":"1.4.0","activeWorkspaces":0,"cacheBytes":0}),
+    ] {
+        assert!(
+            serde_json::from_value::<GatewayStatus>(invented).is_err(),
+            "an unmeasured cache counter is not a gateway status field"
+        );
+    }
 
     let audit = AuditEvent {
         timestamp: timestamp(),
