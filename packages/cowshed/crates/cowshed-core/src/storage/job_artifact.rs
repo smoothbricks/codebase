@@ -5097,6 +5097,46 @@ mod tests {
     }
 
     #[test]
+    fn handed_out_barrier_remains_monotonic_across_repair() {
+        let root = temp_root("repair-barrier-watermark");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let path = records_path(&root);
+        store.append_record(valid_job_record(1)).unwrap();
+        let retained_len = fs::metadata(&path).unwrap().len();
+        let before_repair = store.checkpoint().unwrap().record.barrier_id;
+        let counter = root
+            .join(PROTECTED_DIRECTORY)
+            .join(JOB_DIRECTORY)
+            .join(format!(
+                "{CHECKPOINT_BARRIER_FILE_PREFIX}{}",
+                incarnation().as_str()
+            ));
+        let published = fs::read(&counter).unwrap();
+
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
+            .unwrap();
+        file.sync_data().unwrap();
+        repair_workspace_record_sequences(
+            &root,
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&counter).unwrap(),
+            published,
+            "repair rewrote the durable barrier watermark",
+        );
+        let after_repair = store.checkpoint().unwrap().record.barrier_id;
+        assert!(
+            after_repair > before_repair,
+            "repair lowered the durable barrier watermark from {before_repair} to {after_repair}",
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn repair_refuses_sequence_collisions_without_rewriting_identity() {
         let root = temp_root("repair-sequence-refusal");
         let mut first_running = valid_job_record(1);
