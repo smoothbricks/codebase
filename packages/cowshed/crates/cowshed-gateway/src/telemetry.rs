@@ -267,7 +267,7 @@ impl AuditWriter {
             WriterCommand::Record { event, reply } => {
                 if let Err(error) = validate_event(&event, self.next_expected_sequence()) {
                     let _ = reply.send(Err(error));
-                    return false;
+                    return true;
                 }
                 let decision_boundary = is_decision_boundary(event.status);
                 self.pending.push(PendingRecord { event, reply });
@@ -440,6 +440,10 @@ fn validate_event(event: &AuditEvent, expected_sequence: u64) -> Result<(), Audi
             event.sequence
         )));
     }
+    validate_event_shape(event)
+}
+
+pub(crate) fn validate_event_shape(event: &AuditEvent) -> Result<(), AuditError> {
     if event.workspace_id.is_empty() || event.repo_id.is_empty() || event.endpoint.is_empty() {
         return Err(AuditError(
             "audit workspace, repo, and endpoint are required".to_owned(),
@@ -1000,6 +1004,27 @@ mod tests {
             .await
             .expect("record task joined")
             .expect("timer batch committed");
+        assert_eq!(root.segments().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_event_is_rejected_without_stopping_writer() {
+        let root = TestRoot::new("trace-invalid-event");
+        let sink =
+            ArrowAuditSink::start(ArrowAuditConfig::new(root.0.clone()).expect("audit config"))
+                .expect("start trace sink");
+        let mut invalid = event(1, "invalid", AuditStatus::Denied);
+        invalid.tracestate = Some("line\nbreak".to_owned());
+        assert!(
+            sink.record(invalid)
+                .await
+                .expect_err("invalid event must be rejected")
+                .0
+                .contains("tracestate")
+        );
+        sink.record(event(1, "valid", AuditStatus::Denied))
+            .await
+            .expect("writer accepts the next valid event");
         assert_eq!(root.segments().len(), 1);
     }
 

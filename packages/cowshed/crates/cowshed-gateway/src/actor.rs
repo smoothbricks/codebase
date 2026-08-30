@@ -32,7 +32,7 @@ use crate::{
     proxy,
     repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRunner, XcrunSimRunner},
-    telemetry::{ArrowAuditConfig, ArrowAuditSink, AuditTailHandle},
+    telemetry::{ArrowAuditConfig, ArrowAuditSink, AuditTailHandle, validate_event_shape},
     tls::{CaSigner, LeafCache, TlsError},
 };
 
@@ -1572,8 +1572,12 @@ impl Actor {
             return false;
         }
         let sequence = self.next_audit;
+        let event = draft.into_event(sequence);
+        if validate_event_shape(&event).is_err() {
+            return false;
+        }
         self.next_audit = self.next_audit.wrapping_add(1).max(1);
-        match self.audit.record(draft.into_event(sequence)).await {
+        match self.audit.record(event).await {
             Ok(()) => true,
             Err(error) => {
                 self.fail_closed(error);
