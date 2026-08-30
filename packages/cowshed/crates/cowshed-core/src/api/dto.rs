@@ -864,7 +864,7 @@ fn decode_tagged_bytes(wire: TaggedBytesWire, maximum: usize) -> Result<Vec<u8>,
                 .rev()
                 .take_while(|&&byte| byte == b'=')
                 .count();
-            if wire.data.len() % 4 != 0 || padding > 2 {
+            if !wire.data.len().is_multiple_of(4) || padding > 2 {
                 return Err(TaggedBytesError::InvalidEncoding);
             }
             let decoded_len = wire.data.len() / 4 * 3 - padding;
