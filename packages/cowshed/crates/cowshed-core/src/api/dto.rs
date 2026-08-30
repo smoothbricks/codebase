@@ -648,6 +648,20 @@ pub struct DoctorReport {
     pub findings: Vec<Finding>,
 }
 
+impl DoctorReport {
+    /// `healthy` is exactly "no Error-severity finding". CLI and runtime both
+    /// answer that question here so a warning-only report cannot disagree with
+    /// itself across the two authors.
+    pub fn from_findings(findings: Vec<Finding>) -> Self {
+        Self {
+            healthy: !findings
+                .iter()
+                .any(|finding| finding.severity == FindingSeverity::Error),
+            findings,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GcReason {

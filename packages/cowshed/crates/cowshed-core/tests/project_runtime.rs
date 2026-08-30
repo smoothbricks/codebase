@@ -936,13 +936,7 @@ impl ProjectRuntimeHost for FakeHost {
     }
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
-        Ok(DoctorReport {
-            healthy: !self
-                .doctor_findings
-                .iter()
-                .any(|finding| finding.severity == FindingSeverity::Error),
-            findings: self.doctor_findings.clone(),
-        })
+        Ok(DoctorReport::from_findings(self.doctor_findings.clone()))
     }
 
     async fn open_worker(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot> {

@@ -6356,12 +6356,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 native_storage_error(error),
             )),
         }
-        Ok(DoctorReport {
-            healthy: !findings
-                .iter()
-                .any(|finding| finding.severity == crate::api::dto::FindingSeverity::Error),
-            findings,
-        })
+        Ok(DoctorReport::from_findings(findings))
     }
 
     async fn open_worker(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot> {
