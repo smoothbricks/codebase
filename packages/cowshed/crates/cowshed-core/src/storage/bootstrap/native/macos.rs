@@ -42,6 +42,14 @@ const RM: &str = "/bin/rm";
 const RMDIR: &str = "/bin/rmdir";
 const CHOWN: &str = "/usr/sbin/chown";
 const AUTHORIZED_OUTPUT_LIMIT: usize = 1024 * 1024;
+const PRIVILEGED_SHELL: &str = "/bin/sh";
+/// POSIX `sh -c` body. `$0` is the absolute tool, `$@` its argv.
+///
+/// `AuthorizationExecuteWithPrivileges` reports that the tool launched, not
+/// waitpid. The wrapper appends the child exit status onto the communications
+/// pipe so callers' `succeeded()` checks observe the real outcome.
+const PRIVILEGED_STATUS_WRAPPER: &str =
+    r#""$0" "$@"; status=$?; printf '\n--cowshed-aewp-exit:%d--\n' "$status"; exit "$status""#;
 const FSTAB: &str = "/etc/fstab";
 const INSTALL: &str = "/usr/bin/install";
 const LAUNCHCTL: &str = "/bin/launchctl";
@@ -2835,21 +2843,31 @@ impl MacAuthorizationSession {
                 command.program()
             )));
         }
-        let program = CString::new(command.program()).map_err(|_| {
+        // AEWP's OSStatus is "tool launched", not the child wait status. Run a
+        // fixed /bin/sh wrapper so the pipe carries `{stdout, wait_status}` and
+        // a failed security/install/launchctl cannot surface as Exit(0).
+        let program = CString::new(PRIVILEGED_SHELL)
+            .map_err(|_| HostError::new("privileged shell path contains NUL"))?;
+        let mut arguments = Vec::with_capacity(command.args().len() + 3);
+        arguments.push(
+            CString::new("-c")
+                .map_err(|_| HostError::new("authorized argument contains NUL: \"-c\""))?,
+        );
+        arguments.push(
+            CString::new(PRIVILEGED_STATUS_WRAPPER)
+                .map_err(|_| HostError::new("privileged status wrapper contains NUL"))?,
+        );
+        arguments.push(CString::new(command.program()).map_err(|_| {
             HostError::new(format!(
                 "authorized program contains NUL: {:?}",
                 command.program()
             ))
-        })?;
-        let arguments: Vec<CString> = command
-            .args()
-            .iter()
-            .map(|argument| {
-                CString::new(argument.as_bytes()).map_err(|_| {
-                    HostError::new(format!("authorized argument contains NUL: {argument:?}"))
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        })?);
+        for argument in command.args() {
+            arguments.push(CString::new(argument.as_bytes()).map_err(|_| {
+                HostError::new(format!("authorized argument contains NUL: {argument:?}"))
+            })?);
+        }
         let mut argument_pointers: Vec<*mut libc::c_char> = arguments
             .iter()
             .map(|argument| argument.as_ptr().cast_mut())
@@ -2884,7 +2902,7 @@ impl MacAuthorizationSession {
             }
         }
         let stdout = read_authorized_output(pipe)?;
-        Ok(HostCommandOutput::success(stdout))
+        authorized_command_output(stdout)
     }
 }
 
@@ -2944,6 +2962,46 @@ fn read_authorized_output(pipe: *mut libc::FILE) -> Result<Vec<u8>, HostError> {
         }
     }
     Ok(output)
+}
+
+fn authorized_command_output(mut output: Vec<u8>) -> Result<HostCommandOutput, HostError> {
+    let code = strip_authorized_exit(&mut output)?;
+    if code == 0 {
+        Ok(HostCommandOutput::success(output))
+    } else {
+        Ok(HostCommandOutput::failure_with_streams(
+            crate::process::ProcessStatus::Exit(code),
+            output,
+            Vec::new(),
+        ))
+    }
+}
+
+fn strip_authorized_exit(output: &mut Vec<u8>) -> Result<i32, HostError> {
+    const PREFIX: &[u8] = b"\n--cowshed-aewp-exit:";
+    const SUFFIX: &[u8] = b"--\n";
+    let missing = || HostError::new("privileged command finished without reporting an exit status");
+    if !output.ends_with(SUFFIX) {
+        return Err(missing());
+    }
+    let end = output.len() - SUFFIX.len();
+    let body = &output[..end];
+    let Some(prefix_at) = body
+        .windows(PREFIX.len())
+        .rposition(|window| window == PREFIX)
+    else {
+        return Err(missing());
+    };
+    let code_bytes = &body[prefix_at + PREFIX.len()..];
+    if code_bytes.is_empty() || !code_bytes.iter().all(u8::is_ascii_digit) {
+        return Err(missing());
+    }
+    let code = std::str::from_utf8(code_bytes)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(missing)?;
+    output.truncate(prefix_at);
+    Ok(code)
 }
 
 fn authorization_status(operation: &str, status: i32) -> Result<(), HostError> {
@@ -6088,6 +6146,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     struct EncryptCommandHost {
         commands: mpsc::Sender<(HostCommand, Option<Vec<u8>>)>,
         existing_password: Option<&'static str>,
+        persist_output: Option<HostCommandOutput>,
     }
 
     impl BootstrapHost for EncryptCommandHost {
@@ -6128,6 +6187,15 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
                     ),
                 });
             }
+            if command
+                .args()
+                .first()
+                .is_some_and(|argument| argument == "add-generic-password")
+            {
+                if let Some(output) = &self.persist_output {
+                    return Ok(output.clone());
+                }
+            }
             Ok(HostCommandOutput::default())
         }
 
@@ -6165,6 +6233,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         let host = EncryptCommandHost {
             commands,
             existing_password: None,
+            persist_output: None,
         };
         let uuid = "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5";
         encrypt_volume_with(&host, APFS_STORE_VOLUME, uuid).unwrap();
@@ -6224,6 +6293,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         let host = EncryptCommandHost {
             commands,
             existing_password: Some("already-stored-pass"),
+            persist_output: None,
         };
         let uuid = "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5";
         encrypt_volume_with(&host, APFS_STORE_VOLUME, uuid).unwrap();
@@ -6250,6 +6320,7 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         let host = EncryptCommandHost {
             commands,
             existing_password: Some(""),
+            persist_output: None,
         };
         encrypt_volume_with(
             &host,
@@ -6260,6 +6331,60 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         let commands = received.try_iter().collect::<Vec<_>>();
         assert_eq!(commands[1].0.args()[0], "add-generic-password");
         assert_eq!(commands[2].0.args()[0], "apfs");
+    }
+
+    #[test]
+    fn privileged_runner_reports_child_exit_instead_of_fabricating_success() {
+        let output =
+            authorized_command_output(b"secret\n--cowshed-aewp-exit:44--\n".to_vec()).unwrap();
+        assert!(!output.succeeded());
+        assert_eq!(output.status, crate::process::ProcessStatus::Exit(44));
+        assert_eq!(output.stdout, b"secret");
+    }
+
+    #[test]
+    fn privileged_runner_strips_zero_exit_trailer_from_stdout() {
+        let output =
+            authorized_command_output(b"plist-bytes\n--cowshed-aewp-exit:0--\n".to_vec()).unwrap();
+        assert!(output.succeeded());
+        assert_eq!(output.stdout, b"plist-bytes");
+    }
+
+    #[test]
+    fn privileged_runner_without_exit_trailer_is_an_error() {
+        assert!(authorized_command_output(b"launched but no status".to_vec()).is_err());
+    }
+
+    #[test]
+    fn encryption_stops_when_keychain_persist_fails() {
+        let (commands, received) = mpsc::channel();
+        let host = EncryptCommandHost {
+            commands,
+            existing_password: None,
+            persist_output: Some(HostCommandOutput::failure(
+                1,
+                "could not add the generic password",
+            )),
+        };
+        encrypt_volume_with(
+            &host,
+            APFS_STORE_VOLUME,
+            "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5",
+        )
+        .expect_err("failed add-generic-password must not reach encryptVolume");
+        let commands = received.try_iter().collect::<Vec<_>>();
+        assert!(commands.iter().any(|(command, _)| {
+            command
+                .args()
+                .first()
+                .is_some_and(|argument| argument == "add-generic-password")
+        }));
+        assert!(
+            !commands
+                .iter()
+                .any(|(command, _)| command.program() == DISKUTIL),
+            "encryptVolume must not run without a persisted keychain item"
+        );
     }
 
     fn deadline_spawn(
