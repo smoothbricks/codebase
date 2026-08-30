@@ -2071,10 +2071,18 @@ fn ensure_record_sequence_counter(
 ) -> Result<(), ArtifactError> {
     let observed = highest_record_sequence(recovery);
     match read_record_sequence_counter(lock)? {
-        Some(durable) if durable < observed => Err(integrity(
-            0,
-            &format!("record sequence counter {durable} trails durable record sequence {observed}"),
-        )),
+        // A counter behind the log is the mixed-binary case: the store was
+        // migrated while empty, then appended to by a build that still derived
+        // its allocation from recovered frames and never advanced the sidecar.
+        //
+        // Advancing is not the resequencing this module refuses. Resequencing
+        // rewrites `job.sequence` inside framed bytes, which changes the digest
+        // and lets the new manifest attest to bytes it just wrote. Advancing
+        // writes only the sidecar: every frame keeps its bytes and its digest,
+        // and the next allocation is `observed + 1`, so no sequence can be
+        // handed out twice. Refusing instead would strand a store whose records
+        // are all intact.
+        Some(durable) if durable < observed => publish_record_sequence_counter(lock, observed),
         Some(_) => Ok(()),
         None if recovery.truncated_bytes != 0 => Err(integrity(
             0,
