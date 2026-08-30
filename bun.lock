@@ -56,6 +56,7 @@
         "@smoothbricks/validation": "workspace:*",
         "commander": "^14.0.3",
         "make-synchronized": "^0.8.0",
+        "nx": "23.1.1",
         "prettier": "^3.6.1",
         "publint": "^0.3.18",
         "semver": "^7.7.4",
