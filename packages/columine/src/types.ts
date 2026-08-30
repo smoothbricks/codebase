@@ -93,10 +93,9 @@ export enum StructFieldType {
 }
 
 /**
- * Comparison type for HashMap pick strategies (latest/max/min).
- * Determines how the 8-byte comparison column is interpreted in the VM.
- * Trailing `cmp_type:u8` operand of the comparing map upserts; the executable
- * type lives in `columine-vm` `hashmap_ops::CmpType`.
+ * Trailing `cmp_type:u8` operand of the comparing map upserts.
+ * Audited against `columine_types::CmpType` by
+ * `crates/columine-types/tests/typescript_abi.rs`.
  */
 export enum ComparisonType {
   /** Compare as unsigned 32-bit integers (string intern IDs, ordinals) */
