@@ -5,7 +5,7 @@
 //! into its final aligned body position, then the RecordBatch metadata and
 //! EOS marker are emitted around that body.
 
-use crate::columns::{DynamicColumns, EventColumns};
+use crate::columns::DynamicColumns;
 use crate::record_batch::{
     DynamicBodyBuilder, DynamicColumn, MetadataStorage, compute_buffer_count,
     encode_record_batch_dynamic, record_batch_metadata_size,
@@ -329,57 +329,6 @@ pub fn write_arrow_ipc_from_dynamic_columns(
     )
 }
 
-pub fn write_arrow_ipc_from_columns_with_schema(
-    columns: &EventColumns,
-    schema_config: &DynamicSchemaConfig,
-    output: &mut [u8],
-    metadata_storage: &mut MetadataStorage,
-) -> Result<usize, IpcError> {
-    if schema_config.field_metadata.len() != 4 {
-        return Err(IpcError::InvalidColumn);
-    }
-    let value_null_count = (0..columns.count)
-        .filter(|row| !columns.has_value(*row))
-        .count() as i64;
-    write_arrow_ipc_from_borrowed_columns(
-        columns.count,
-        schema_config,
-        output,
-        metadata_storage,
-        |index| match index {
-            0 => Ok(DynamicColumn::utf8(
-                0,
-                false,
-                None,
-                columns.id_offsets_bytes(),
-                columns.id_data_bytes(),
-            )),
-            1 => Ok(DynamicColumn::utf8(
-                1,
-                false,
-                None,
-                columns.type_offsets_bytes(),
-                columns.type_data_bytes(),
-            )),
-            2 => Ok(DynamicColumn::int64(
-                2,
-                false,
-                None,
-                columns.timestamps_bytes(),
-            )),
-            3 => Ok(DynamicColumn::binary(
-                3,
-                true,
-                Some(columns.value_nulls_bytes()),
-                columns.value_offsets_bytes(),
-                columns.value_data_bytes(),
-            )),
-            _ => Err(IpcError::InvalidColumn),
-        },
-        |index| if index == 3 { value_null_count } else { 0 },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,50 +378,90 @@ mod tests {
         bytes
     }
 
-    /// End-to-end: base and dynamic writers produce byte-identical streams
-    /// for the same 4-column content — the unification claim in one test.
+    /// The base event log goes through the one writer, and the schema names
+    /// itself as the base log so the scanner path can be selected on identity
+    /// rather than on a field count.
     #[test]
-    fn base_and_dynamic_streams_are_byte_identical() {
+    fn base_event_log_writes_through_the_dynamic_writer() {
         let fields = base_fields();
         let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
+        assert!(
+            config.is_base_event_log,
+            "utf8/utf8/int64/binary IS the base event log"
+        );
 
-        // Base path.
-        let mut base = EventColumns::new(8);
-        base.add_event(b"id-1", b"click", 100, Some(b"v1")).unwrap();
-        base.add_event(b"id-2", b"view", 200, None).unwrap();
-        let mut base_meta =
-            MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
-        let mut base_out = vec![0u8; 8192];
-        let base_len =
-            write_arrow_ipc_from_columns_with_schema(&base, &config, &mut base_out, &mut base_meta)
-                .unwrap();
+        let mut columns = DynamicColumns::new(&fields, 8);
+        assert!(columns.begin_row());
+        columns.append_utf8(0, b"id-1").unwrap();
+        columns.append_utf8(1, b"click").unwrap();
+        columns.append_int64(2, 100).unwrap();
+        columns.append_binary(3, b"v1").unwrap();
+        columns.end_row();
+        assert!(columns.begin_row());
+        columns.append_utf8(0, b"id-2").unwrap();
+        columns.append_utf8(1, b"view").unwrap();
+        columns.append_int64(2, 200).unwrap();
+        columns.append_null(3).unwrap();
+        columns.end_row();
 
-        // Dynamic path with the same logical content.
-        let mut dynamic = DynamicColumns::new(&fields, 8);
-        assert!(dynamic.begin_row());
-        dynamic.append_utf8(0, b"id-1").unwrap();
-        dynamic.append_utf8(1, b"click").unwrap();
-        dynamic.append_int64(2, 100).unwrap();
-        dynamic.append_binary(3, b"v1").unwrap();
-        dynamic.end_row();
-        assert!(dynamic.begin_row());
-        dynamic.append_utf8(0, b"id-2").unwrap();
-        dynamic.append_utf8(1, b"view").unwrap();
-        dynamic.append_int64(2, 200).unwrap();
-        dynamic.append_null(3).unwrap();
-        dynamic.end_row();
-        let mut dyn_meta = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
-        let mut dyn_out = vec![0u8; 8192];
-        let dyn_len =
-            write_arrow_ipc_from_dynamic_columns(&dynamic, &config, &mut dyn_out, &mut dyn_meta)
-                .unwrap();
+        let mut metadata = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
+        let mut out = vec![0u8; 8192];
+        let len =
+            write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut out, &mut metadata).unwrap();
+        assert!(out[..len].ends_with(&EOS_MARKER));
 
-        // WHY (kept wire behavior): the base path emits empty validity buffers for
-        // the non-nullable id/type/timestamp columns AND the dynamic path
-        // does the same (validity passed only when nullable) — so the two
-        // streams agree byte for byte.
-        assert_eq!(base_out[..base_len], dyn_out[..dyn_len]);
-        assert!(base_out[..base_len].ends_with(&EOS_MARKER));
+        // Read it back through the official reader: the id/type/timestamp
+        // columns are non-nullable and carry no validity buffer, and `value`
+        // is null in row 1.
+        let mut reader = StreamReader::try_new(Cursor::new(&out[..len]), None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), "id-1");
+        assert_eq!(ids.value(1), "id-2");
+        let timestamps = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(timestamps.values(), &[100, 200]);
+        let values = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), b"v1");
+        assert!(values.is_null(1));
+    }
+
+    /// A four-field schema that is NOT the event log must not be classified as
+    /// one: the scanner path writes utf8/utf8/int64/binary by index, so a
+    /// four-field extraction schema routed there produced a stream whose
+    /// Schema message and body disagreed.
+    #[test]
+    fn four_fields_alone_is_not_the_base_event_log() {
+        let fields = [
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Int64, false),
+            SignalSchemaField::new(ArrowType::Int64, true),
+        ];
+        let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
+        assert!(!config.is_base_event_log);
+
+        // Same physical types, wrong names.
+        let base = base_fields();
+        let named = DynamicSchemaConfig::with_field_names(
+            &schema_bytes(&base),
+            &base,
+            b"id\0kind\0timestamp\0value\0",
+        )
+        .unwrap();
+        assert!(!named.is_base_event_log);
     }
 
     #[test]
