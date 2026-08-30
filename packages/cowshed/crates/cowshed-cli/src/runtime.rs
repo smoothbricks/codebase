@@ -3049,18 +3049,19 @@ where
     let repair = matches!(&cli.command, Command::Doctor(args) if args.repair);
     let project_root = resolve_project_root(&cli).await;
     let mut diagnosis = diagnose_host().await?;
-    if repair && diagnosis.storage_ready {
-        if let Ok(root) = project_root.as_ref() {
-            match repair_project_artifacts(root).await {
-                Ok(findings) => diagnosis.findings.extend(findings),
-                Err(error) => diagnosis.findings.push(Finding {
-                    code: "artifact-repair".into(),
-                    severity: FindingSeverity::Error,
-                    message: error.message,
-                    hint: error.hint,
-                    path: Some(root.clone()),
-                }),
-            }
+    if repair
+        && diagnosis.storage_ready
+        && let Ok(root) = project_root.as_ref()
+    {
+        match repair_project_artifacts(root).await {
+            Ok(findings) => diagnosis.findings.extend(findings),
+            Err(error) => diagnosis.findings.push(Finding {
+                code: "artifact-repair".into(),
+                severity: FindingSeverity::Error,
+                message: error.message,
+                hint: error.hint,
+                path: Some(root.clone()),
+            }),
         }
     }
     if diagnosis.storage_ready {
