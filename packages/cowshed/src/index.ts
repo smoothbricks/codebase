@@ -95,9 +95,16 @@ export {
   type WorkspaceState,
 } from './types.js';
 
+/**
+ * The napi rejection shape. `hint` is a real property on the JS `Error`, set by `to_napi_error`
+ * in crates/cowshed-napi/src/lib.rs — not a suffix on `message` behind a delimiter both languages
+ * had to spell identically. An error missing any of the three is not ours and is rethrown as-is
+ * rather than dressed up with an invented hint.
+ */
 interface NativeError {
   readonly code: ErrorCode;
   readonly message: string;
+  readonly hint: string;
 }
 
 const native = loadNativeModule();
@@ -114,26 +121,13 @@ const parseResizeResult = typia.json.createAssertParse<ResizeResult>();
 const parseDoctorReport = typia.json.createAssertParse<DoctorReport>();
 const parseRemoveReport = typia.json.createAssertParse<RemoveReport>();
 const assertAttachOptions = typia.createAssertEquals<AttachOptions>();
-// Wire delimiter written by `to_napi_error` in crates/cowshed-napi/src/lib.rs; the two spellings
-// must stay byte-identical or hints silently merge back into messages.
-const NEXT_HINT_MARKER = '\nnext: ';
 
 function normalizeNativeError(error: unknown): unknown {
   if (!isNativeError(error)) {
     return error;
   }
 
-  const marker = error.message.lastIndexOf(NEXT_HINT_MARKER);
-  if (marker < 0) {
-    return new CowshedError(error.code, error.message, 'cowshed doctor --json', { cause: error });
-  }
-
-  return new CowshedError(
-    error.code,
-    error.message.slice(0, marker),
-    error.message.slice(marker + NEXT_HINT_MARKER.length),
-    { cause: error },
-  );
+  return new CowshedError(error.code, error.message, error.hint, { cause: error });
 }
 
 function callNative<T>(call: () => T): T {
