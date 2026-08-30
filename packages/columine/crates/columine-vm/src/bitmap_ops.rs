@@ -495,10 +495,10 @@ pub fn contains_serialized(data: &[u8], value: u32) -> bool {
     if data.is_empty() {
         return false;
     }
-    match RoaringBitmap::contains_bytes(data, value) {
-        Ok(contains) => contains,
-        Err(_) => false,
-    }
+    let Ok(contains) = RoaringBitmap::contains_bytes(data, value) else {
+        return false;
+    };
+    contains
 }
 
 /// Return serialized bitmap cardinality, saturating at `u32::MAX`.
@@ -506,10 +506,10 @@ pub fn cardinality_serialized(data: &[u8]) -> u32 {
     if data.is_empty() {
         return 0;
     }
-    match RoaringBitmap::len_bytes(data) {
-        Ok(cardinality) => cardinality,
-        Err(_) => 0,
-    }
+    let Ok(cardinality) = RoaringBitmap::len_bytes(data) else {
+        return 0;
+    };
+    cardinality
 }
 
 /// Validate a serialized bitmap and return its cardinality. A `None` result
