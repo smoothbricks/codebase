@@ -3796,9 +3796,19 @@ mod workspace_toolchain_tests {
         )
         .expect("config");
 
+        // The typed field is the contract. Asserting on rendered `message` substrings passes for
+        // any error that happens to mention those words and fails on a reworded message that is
+        // still correct, so it pins neither the identity of the failure nor its recovery.
         let error = resolve_devenv_dir(&mount).unwrap_err();
-        assert!(error.message.contains("tooling/devenv"));
-        assert!(error.message.contains("devenv.nix"));
+        assert_eq!(
+            error.configured_dir.as_deref(),
+            Some(mount.join("tooling/devenv").as_path()),
+            "the refusal must name the configured directory it could not use"
+        );
+        assert_eq!(
+            error.into_cowshed_error().code,
+            crate::error::ErrorCode::EnvironmentMissing
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4186,7 +4196,10 @@ mod lifecycle_commitment_tests {
     }
 
     #[tokio::test]
-    async fn lineage_history_opens_and_restarts_a_replacement_supervisor() {
+    /// Named for what it checks: ancestor incarnations named in the lineage are admitted when a
+    /// replacement supervisor opens the store, and an incarnation that was never introduced is an
+    /// integrity fault. Restart behaviour of the resident job set is asserted, not assumed.
+    async fn lineage_admits_ancestor_records_and_refuses_an_unintroduced_incarnation() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-restored-supervisor-{}",
             Uuid::new_v4().simple()
@@ -4316,13 +4329,38 @@ mod lifecycle_commitment_tests {
             actor_capacity: defaults.actor_capacity,
             event_capacity: defaults.event_capacity,
         };
+        // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
+        // own lifetime and deliberately not the durable history: the artifact store holds every
+        // sealed record, and the actor releases output at seal rather than accumulating it. So a
+        // replacement supervisor starts with an empty resident set even though the store it opened
+        // already contains sealed jobs from `source` and `destination`.
+        //
+        // Asserting only that `list()` is `Ok` could not tell that apart from a supervisor that
+        // reloaded history, or from one that returned an error-free empty vector for the wrong
+        // reason. These assertions can go red in both directions.
+        let sealed_job = JobId::new(1).unwrap();
         let first_supervisor =
             WorkspaceSupervisor::start(config.clone(), publisher.clone()).unwrap();
-        first_supervisor.list().await.unwrap();
+        assert!(
+            first_supervisor.list().await.unwrap().is_empty(),
+            "the resident job set is this supervisor's own, not the store's history"
+        );
+        assert_eq!(
+            first_supervisor.info(sealed_job).await.unwrap_err().code,
+            crate::error::ErrorCode::NotFound,
+            "a job sealed by an ancestor incarnation is not resident in a fresh supervisor"
+        );
         drop(first_supervisor);
         tokio::task::yield_now().await;
+
+        // Restarting over the same store is the case the lineage admission exists for: opening
+        // must succeed with the ancestor records present, and must answer identically.
         let restarted = WorkspaceSupervisor::start(config, publisher.clone()).unwrap();
-        restarted.list().await.unwrap();
+        assert!(restarted.list().await.unwrap().is_empty());
+        assert_eq!(
+            restarted.info(sealed_job).await.unwrap_err().code,
+            crate::error::ErrorCode::NotFound
+        );
         drop(restarted);
 
         let mut unintroduced = ArtifactStore::open(
