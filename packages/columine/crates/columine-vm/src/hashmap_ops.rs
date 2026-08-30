@@ -16,6 +16,8 @@ use crate::meta::SlotMetaView;
 use crate::undo_log::FlatUndoOp;
 use columine_types::types::{ChangeFlag, ErrorCode};
 
+pub use columine_types::CmpType;
+
 /// HashMap upsert strategy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Strategy {
@@ -35,41 +37,6 @@ impl Strategy {
     /// Latest, max, and min strategies require the comparison lane.
     pub const fn needs_timestamps(self) -> bool {
         matches!(self, Self::Latest | Self::Max | Self::Min)
-    }
-}
-
-/// `CmpType` describes the comparison lane and input comparison column.
-/// Discriminants are the opcode `cmp_type` operand byte.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CmpType {
-    /// Unsigned 32-bit (string intern IDs, ordinals); 4-byte input stride,
-    /// stored zero-extended.
-    U32 = 0,
-    /// IEEE 754 f64 (numeric fields, timestamps-as-f64); 8-byte stride.
-    F64 = 1,
-    /// Signed 64-bit (bigint timestamps); 8-byte stride.
-    I64 = 2,
-}
-
-impl CmpType {
-    /// Decode the opcode's `cmp_type` operand byte. Unknown values return
-    /// `None`, allowing dispatch to reject the program explicitly.
-    pub const fn from_u8(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::U32),
-            1 => Some(Self::F64),
-            2 => Some(Self::I64),
-            _ => None,
-        }
-    }
-
-    /// Input-column stride in bytes (`read_cmp_value`'s access pattern).
-    pub const fn stride(self) -> usize {
-        match self {
-            Self::U32 => 4,
-            Self::F64 | Self::I64 => 8,
-        }
     }
 }
 
