@@ -3990,21 +3990,37 @@ mod workspace_toolchain_tests {
     #[cfg_attr(not(target_os = "macos"), ignore)]
     #[test]
     fn an_evaluated_workspace_profile_leads_path_and_runs_inside_the_sandbox() {
-        // Any multi-user Nix host has this profile, and it resolves into the store exactly as a
-        // devenv profile does, so it stands in for one without pinning a generated store path.
-        let Ok(store_profile) = std::fs::canonicalize("/nix/var/nix/profiles/default") else {
-            return;
-        };
-        if !store_profile.starts_with("/nix/store") {
-            return;
-        }
-        let Some(tool) = std::fs::read_dir(store_profile.join("bin"))
+        // A store-resolved profile root, standing in for a devenv-generated one without pinning
+        // a generated store path. The daemon profile is the obvious candidate but is absent on a
+        // single-user Nix install, so any store `bin` already on PATH serves equally: it is the
+        // same immutable-store class, reached through the same canonicalization this test is
+        // about.
+        //
+        // Absence is a FAILURE, not a skip. Nix is a hard requirement of cowshed -- the sandbox
+        // admits the daemon socket as a standing grant, this repository's own dev shell is
+        // devenv, and a host with no store cannot run a workspace at all. The `return`s that used
+        // to sit here made this test report success on exactly the hosts where its subject does
+        // not exist, which is the one outcome worse than failing.
+        let store_profile = std::fs::canonicalize("/nix/var/nix/profiles/default")
             .ok()
-            .and_then(|mut entries| entries.find_map(|entry| entry.ok()))
-            .map(|entry| entry.path())
-        else {
-            return;
-        };
+            .filter(|profile| profile.starts_with("/nix/store"))
+            .or_else(|| {
+                std::env::split_paths(&std::env::var_os("PATH")?)
+                    .filter_map(|entry| std::fs::canonicalize(entry).ok())
+                    .find(|entry| entry.starts_with("/nix/store") && entry.ends_with("bin"))
+                    .and_then(|bin| bin.parent().map(Path::to_path_buf))
+            })
+            .expect(
+                "no /nix/store profile is resolvable on this host; cowshed requires Nix, so this \
+                 is a broken environment rather than a test that does not apply",
+            );
+        let tool = std::fs::read_dir(store_profile.join("bin"))
+            .expect("a store profile has a bin directory")
+            .find_map(|entry| {
+                let path = entry.ok()?.path();
+                path.is_file().then_some(path)
+            })
+            .expect("a store profile's bin directory is not empty");
 
         let root = scratch("profile");
         let mount = root.join("workspace");
@@ -4049,6 +4065,12 @@ mod workspace_toolchain_tests {
             .arg(&tool)
             .status()
             .expect("sandbox-exec");
+        // Asserted here, before the fallback-path mutations below. Deferring it to the end of the
+        // function meant any later panic silently discarded the only runtime check in the file.
+        assert!(
+            status.success(),
+            "a tool on the workspace profile must be executable inside the sandbox"
+        );
 
         // Native devenv bindings anchor `.devenv` at the allowed repository root. Workspace paths
         // have no binding, but accepting this fallback keeps a profile evaluated before mounting
@@ -4063,10 +4085,6 @@ mod workspace_toolchain_tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
-        assert!(
-            status.success(),
-            "a tool on the workspace profile must be executable inside the sandbox"
-        );
     }
 }
 
