@@ -157,15 +157,8 @@ impl<'a> Reader<'a> {
         let marker = self.take()?;
         let len = match marker {
             0xc4 => usize::from(self.take()?),
-            0xc5 => {
-                let hi = self.take()?;
-                let lo = self.take()?;
-                usize::from(u16::from_be_bytes([hi, lo]))
-            }
-            0xc6 => {
-                let b = self.take_slice(4)?;
-                u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize
-            }
+            0xc5 => usize::from(self.read_be_u16()?),
+            0xc6 => usize::try_from(self.read_be_u32()?).ok()?,
             _ => return None,
         };
         self.take_slice(len)
@@ -176,14 +169,35 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Some(slice)
     }
+    fn read_be_u16(&mut self) -> Option<u16> {
+        let b = self.take_slice(2)?;
+        Some(u16::from_be_bytes([b[0], b[1]]))
+    }
+    fn read_be_u32(&mut self) -> Option<u32> {
+        let b = self.take_slice(4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn read_be_u64(&mut self) -> Option<u64> {
+        let b = self.take_slice(8)?;
+        Some(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+    pub(crate) fn is_integer(byte: u8) -> bool {
+        byte & 0x80 == 0 || byte & 0xe0 == 0xe0 || (0xcc..=0xd3).contains(&byte)
+    }
+    pub(crate) fn is_string(byte: u8) -> bool {
+        byte & 0xe0 == 0xa0 || matches!(byte, 0xd9..=0xdb)
+    }
+    pub(crate) fn is_float(byte: u8) -> bool {
+        matches!(byte, 0xca | 0xcb)
+    }
     pub(crate) fn read_map_header(&mut self) -> Option<u32> {
         let byte = self.take()?;
         match byte {
             0x80..=0x8f => Some(u32::from(byte & 0x0f)),
-            0xde => Some(u32::from(u16::from_be_bytes(
-                self.take_slice(2)?.try_into().ok()?,
-            ))),
-            0xdf => Some(u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?)),
+            0xde => Some(u32::from(self.read_be_u16()?)),
+            0xdf => self.read_be_u32(),
             _ => None,
         }
     }
@@ -191,10 +205,8 @@ impl<'a> Reader<'a> {
         let byte = self.take()?;
         match byte {
             0x90..=0x9f => Some(u32::from(byte & 0x0f)),
-            0xdc => Some(u32::from(u16::from_be_bytes(
-                self.take_slice(2)?.try_into().ok()?,
-            ))),
-            0xdd => Some(u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?)),
+            0xdc => Some(u32::from(self.read_be_u16()?)),
+            0xdd => self.read_be_u32(),
             _ => None,
         }
     }
@@ -203,10 +215,8 @@ impl<'a> Reader<'a> {
         let length = match byte {
             0xa0..=0xbf => usize::from(byte & 0x1f),
             0xd9 => usize::from(self.take()?),
-            0xda => usize::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?)),
-            0xdb => {
-                usize::try_from(u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?)).ok()?
-            }
+            0xda => usize::from(self.read_be_u16()?),
+            0xdb => usize::try_from(self.read_be_u32()?).ok()?,
             _ => return None,
         };
         self.take_slice(length)
@@ -217,33 +227,21 @@ impl<'a> Reader<'a> {
             0x00..=0x7f => Some(i64::from(byte)),
             0xe0..=0xff => Some(i64::from(i8::from_ne_bytes([byte]))),
             0xcc => Some(i64::from(self.take()?)),
-            0xcd => Some(i64::from(u16::from_be_bytes(
-                self.take_slice(2)?.try_into().ok()?,
-            ))),
-            0xce => Some(i64::from(u32::from_be_bytes(
-                self.take_slice(4)?.try_into().ok()?,
-            ))),
-            0xcf => i64::try_from(u64::from_be_bytes(self.take_slice(8)?.try_into().ok()?)).ok(),
+            0xcd => Some(i64::from(self.read_be_u16()?)),
+            0xce => Some(i64::from(self.read_be_u32()?)),
+            0xcf => i64::try_from(self.read_be_u64()?).ok(),
             0xd0 => Some(i64::from(i8::from_ne_bytes([self.take()?]))),
-            0xd1 => Some(i64::from(i16::from_be_bytes(
-                self.take_slice(2)?.try_into().ok()?,
-            ))),
-            0xd2 => Some(i64::from(i32::from_be_bytes(
-                self.take_slice(4)?.try_into().ok()?,
-            ))),
-            0xd3 => Some(i64::from_be_bytes(self.take_slice(8)?.try_into().ok()?)),
+            0xd1 => Some(i64::from(self.read_be_u16()? as i16)),
+            0xd2 => Some(i64::from(self.read_be_u32()? as i32)),
+            0xd3 => Some(self.read_be_u64()? as i64),
             _ => None,
         }
     }
     pub(crate) fn read_float(&mut self) -> Option<f64> {
         let byte = self.take()?;
         match byte {
-            0xca => Some(f64::from(f32::from_bits(u32::from_be_bytes(
-                self.take_slice(4)?.try_into().ok()?,
-            )))),
-            0xcb => Some(f64::from_bits(u64::from_be_bytes(
-                self.take_slice(8)?.try_into().ok()?,
-            ))),
+            0xca => Some(f64::from(f32::from_bits(self.read_be_u32()?))),
+            0xcb => Some(f64::from_bits(self.read_be_u64()?)),
             _ => None,
         }
     }
@@ -252,14 +250,14 @@ impl<'a> Reader<'a> {
     /// defined for malformed input.
     pub(crate) fn read_timestamp(&mut self) -> Option<i64> {
         let byte = *self.input.get(self.pos)?;
-        if byte & 0x80 == 0 || byte & 0xe0 == 0xe0 || (0xcc..=0xd3).contains(&byte) {
+        if Self::is_integer(byte) {
             return self.read_integer()?.checked_mul(1_000);
         }
-        if matches!(byte, 0xca | 0xcb) {
+        if Self::is_float(byte) {
             let milliseconds = self.read_float()? as i64;
             return milliseconds.checked_mul(1_000);
         }
-        if byte & 0xe0 == 0xa0 || matches!(byte, 0xd9..=0xdb) {
+        if Self::is_string(byte) {
             let text = std::str::from_utf8(self.read_string()?).ok()?;
             return parse_iso8601_to_micros(text).ok();
         }
@@ -298,13 +296,12 @@ impl<'a> Reader<'a> {
             }
             0xc5 => {
                 self.pos += 1;
-                let n = usize::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
+                let n = usize::from(self.read_be_u16()?);
                 self.pos = self.pos.checked_add(n)?;
             }
             0xc6 => {
                 self.pos += 1;
-                let n = usize::try_from(u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?))
-                    .ok()?;
+                let n = usize::try_from(self.read_be_u32()?).ok()?;
                 self.pos = self.pos.checked_add(n)?;
             }
             0xc7 => {
@@ -314,13 +311,12 @@ impl<'a> Reader<'a> {
             }
             0xc8 => {
                 self.pos += 1;
-                let n = usize::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
+                let n = usize::from(self.read_be_u16()?);
                 self.pos = self.pos.checked_add(n)?.checked_add(1)?;
             }
             0xc9 => {
                 self.pos += 1;
-                let n = usize::try_from(u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?))
-                    .ok()?;
+                let n = usize::try_from(self.read_be_u32()?).ok()?;
                 self.pos = self.pos.checked_add(n)?.checked_add(1)?;
             }
             0xca => self.pos = self.pos.checked_add(5)?,
@@ -341,33 +337,32 @@ impl<'a> Reader<'a> {
             }
             0xda => {
                 self.pos += 1;
-                let n = usize::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
+                let n = usize::from(self.read_be_u16()?);
                 self.pos = self.pos.checked_add(n)?;
             }
             0xdb => {
                 self.pos += 1;
-                let n = usize::try_from(u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?))
-                    .ok()?;
+                let n = usize::try_from(self.read_be_u32()?).ok()?;
                 self.pos = self.pos.checked_add(n)?;
             }
             0xdc => {
                 self.pos += 1;
-                let n = u32::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
+                let n = u32::from(self.read_be_u16()?);
                 self.skip_n(u64::from(n))?;
             }
             0xdd => {
                 self.pos += 1;
-                let n = u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?);
+                let n = self.read_be_u32()?;
                 self.skip_n(u64::from(n))?;
             }
             0xde => {
                 self.pos += 1;
-                let n = u32::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
+                let n = u32::from(self.read_be_u16()?);
                 self.skip_n(u64::from(n).checked_mul(2)?)?;
             }
             0xdf => {
                 self.pos += 1;
-                let n = u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?);
+                let n = self.read_be_u32()?;
                 self.skip_n(u64::from(n).checked_mul(2)?)?;
             }
             _ => return None,
