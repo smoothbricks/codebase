@@ -41,9 +41,9 @@ use crate::{
     cache::CacheBodyError,
     config::GatewayTimeouts,
     interfaces::{
-        AuditKind, AuditStatus, AuthorizedTarget, BoxError, CredentialProtocol, CredentialProvider,
-        CredentialQuery, NegotiatedTransport, UpstreamConnection, UpstreamConnector,
-        UpstreamHealth, UpstreamPurpose,
+        ALPN_H2, ALPN_HTTP_1_1, AuditKind, AuditStatus, AuthorizedTarget, BoxError,
+        CredentialProtocol, CredentialProvider, CredentialQuery, NegotiatedTransport,
+        UpstreamConnection, UpstreamConnector, UpstreamHealth, UpstreamPurpose,
     },
     mirror::{
         MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
@@ -1703,8 +1703,8 @@ fn spawn_intercept(
                 return;
             }
             let negotiated = match tls.get_ref().1.alpn_protocol() {
-                Some(b"h2") => NegotiatedTransport::Http2,
-                Some(b"http/1.1") => NegotiatedTransport::Http1,
+                Some(ALPN_H2) => NegotiatedTransport::Http2,
+                Some(ALPN_HTTP_1_1) => NegotiatedTransport::Http1,
                 Some(_) | None => {
                     complete_now(
                         &context,
