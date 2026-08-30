@@ -141,42 +141,50 @@ function createCargoWasmTarget(projectRoot: string, config: ResolvedCargoWasmCon
 /**
  * Compilation is excluded from the bounded test window: a cold Cargo
  * workspace can take many minutes to compile while still making progress,
- * which is not a property of the tests. `cargo test --no-run` pays that cost
- * in its own unbounded, cacheable target; the bounded runner then re-invokes
- * cargo against a warm target directory, where only the suites' own runtime
- * counts against the standard bound.
+ * which is not a property of the tests.
+ *
+ * Compile stages copies of the test binaries out of `target/` so the run
+ * never takes Cargo's exclusive target lock. That lock is why `cargo test`
+ * cannot overlap `napi-debug` (or any other cargo writer) on the same
+ * directory: the second process sits in `Blocking waiting for file lock`
+ * until the bounded runner kills it, then waits forever for a waiter that
+ * may not be in the process group. Staged binaries run in parallel with a
+ * per-binary timeout; APFS binaries get `--test-threads=1` so hdiutil
+ * attaches in one process do not collide.
  */
 export const CARGO_TEST_COMPILE_TARGET = 'cargo-test-compile';
+const CARGO_TEST_BINS_OUTPUT = '{projectRoot}/.cache/cargo-test-bins';
 
 function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration {
   return {
-    executor: 'nx:run-commands',
+    executor: '@smoothbricks/nx-plugin:cargo-test',
     cache: true,
     inputs: CARGO_INPUTS,
+    outputs: [CARGO_TEST_BINS_OUTPUT],
     options: {
-      command: 'cargo test --workspace --no-run',
+      phase: 'compile',
       cwd: projectRoot,
     },
     configurations: {
-      production: { command: 'cargo test --workspace --release --no-run' },
+      production: { release: true },
     },
   };
 }
 
 function createCargoTestTarget(projectRoot: string): TargetConfiguration {
   return {
-    executor: '@smoothbricks/nx-plugin:bounded-exec',
+    executor: '@smoothbricks/nx-plugin:cargo-test',
     cache: true,
     inputs: CARGO_INPUTS,
     dependsOn: [CARGO_TEST_COMPILE_TARGET],
     options: {
-      command: 'cargo test --workspace',
+      phase: 'run',
       cwd: projectRoot,
       timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
     configurations: {
-      production: { command: 'cargo test --workspace --release' },
+      production: { release: true },
     },
   };
 }
@@ -424,6 +432,18 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         cache: false,
         options: { command: 'cargo sweep --time 7', cwd: projectRoot },
       };
+    }
+  }
+
+  // cargo-test-compile and napi-debug both invoke cargo against the same
+  // target directory. Cargo's lock is exclusive, so they cannot overlap.
+  // The run phase copies binaries out first, so cargo-test may overlap
+  // napi-debug. Compile must finish before either cargo writer starts.
+  const napiDebug = targets['napi-debug'];
+  if (napiDebug && targets[CARGO_TEST_COMPILE_TARGET]) {
+    const dependsOn = napiDebug.dependsOn ?? [];
+    if (!dependsOn.includes(CARGO_TEST_COMPILE_TARGET)) {
+      napiDebug.dependsOn = [...dependsOn, CARGO_TEST_COMPILE_TARGET];
     }
   }
 
