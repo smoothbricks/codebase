@@ -402,7 +402,8 @@ describe('cargo-test reachability policy', () => {
           ['cargo-test', 'nx:noop'],
           ['build', 'nx:run-commands'],
         ]),
-        targetOptions: new Map(),
+        // cargo-test is the runner for a single-crate workspace.
+        targetOptions: new Map([['cargo-test', { command: 'cargo --frozen test --workspace' }]]),
       };
       const issues = checkWorkspaceCargoTestReachabilityPolicy(root, {
         resolvedTargetsByProject: new Map([['rusty', clobbered]]),
@@ -422,6 +423,66 @@ describe('cargo-test reachability policy', () => {
       expect(
         checkWorkspaceCargoTestReachabilityPolicy(root, {
           resolvedTargetsByProject: new Map([['rusty', transitive]]),
+        }),
+      ).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('flags a cargo-test that reaches only compile targets, never a runner', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-noop-'));
+    try {
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      await writeJson(join(root, 'packages/rusty/package.json'), { name: 'rusty', nx: { name: 'rusty' } });
+
+      // The shape a partial package-local override produces: declaring only
+      // dependsOn on cargo-test replaces the WHOLE inferred target, so the
+      // executor becomes nx:noop with empty options. `test` still reaches
+      // cargo-test, and cargo-test still reaches real work — but the only cargo
+      // invocation is `--no-run`, so no test is ever executed and the target is
+      // green. Reachability alone cannot see this.
+      const compileOnly: ResolvedProjectTargets = {
+        root: 'packages/rusty',
+        targets: new Set(['test', 'cargo-test', 'cargo-test-compile', 'cargo-wasm']),
+        targetDependencies: new Map([
+          ['test', ['cargo-test']],
+          ['cargo-test', ['cargo-test-compile', 'cargo-wasm']],
+        ]),
+        targetExecutors: new Map([
+          ['test', 'nx:noop'],
+          ['cargo-test', 'nx:noop'],
+          ['cargo-test-compile', 'nx:run-commands'],
+          ['cargo-wasm', 'nx:run-commands'],
+        ]),
+        targetOptions: new Map([
+          ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
+          ['cargo-wasm', { command: 'just wasm' }],
+        ]),
+      };
+      const issues = checkWorkspaceCargoTestReachabilityPolicy(root, {
+        resolvedTargetsByProject: new Map([['rusty', compileOnly]]),
+      });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.message).toContain('RUNS tests');
+
+      // Restoring a real runner clears it.
+      const withRunner: ResolvedProjectTargets = {
+        ...compileOnly,
+        targets: new Set([...compileOnly.targets, 'cargo-test-rusty-core']),
+        targetDependencies: new Map([
+          ['test', ['cargo-test']],
+          ['cargo-test', ['cargo-test-rusty-core']],
+          ['cargo-test-rusty-core', ['cargo-test-compile']],
+        ]),
+        targetOptions: new Map([
+          ...compileOnly.targetOptions,
+          ['cargo-test-rusty-core', { command: 'cargo --frozen nextest run --workspace --package rusty-core' }],
+        ]),
+      };
+      expect(
+        checkWorkspaceCargoTestReachabilityPolicy(root, {
+          resolvedTargetsByProject: new Map([['rusty', withRunner]]),
         }),
       ).toEqual([]);
     } finally {
