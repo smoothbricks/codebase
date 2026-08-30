@@ -45,7 +45,8 @@ use super::super::{
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
     MetadataPolicy, PendingPublicationFact, PublicationError, ResumableStage, companion_path,
-    layout, main_aware_mount_point, volume_key,
+    layout, main_aware_mount_point, recovery_staging_mount, retired_image_below,
+    split_retired_stem, volume_key,
 };
 
 const CHECKPOINT_FACT_VERSION: u32 = 1;
@@ -956,16 +957,6 @@ fn retired_name_owners(
     owners
 }
 
-/// Splits a `<name>-<incarnation>` trash stem. Incarnations are fixed-width lowercase hex, which is
-/// what keeps the split unambiguous for the many workspace names that contain hyphens themselves.
-fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, WorkspaceIncarnation)> {
-    let (name, incarnation) = stem.rsplit_once('-')?;
-    Some((
-        WorkspaceName::new(name).ok()?,
-        WorkspaceIncarnation::new(incarnation).ok()?,
-    ))
-}
-
 type MountKey = (RepoId, WorkspaceName);
 
 enum RegistryCommand {
@@ -1702,15 +1693,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             )));
         }
         let workspace = metadata_workspace_ref(&metadata)?;
-        let expected_trash = project
-            .join("sessions")
-            .join(super::TRASH_NAMESPACE)
-            .join(format!(
-                "{}-{}.{}",
-                workspace.name().as_str(),
-                workspace.incarnation().as_str(),
-                format.extension()
-            ));
+        // `format` is the enumeration's observed on-disk format, deliberately not the metadata's:
+        // the check is that the found file sits exactly where its own format says it should.
+        let expected_trash =
+            retired_image_below(project, workspace.name(), workspace.incarnation(), format);
         if trash_image != expected_trash {
             return Err(ApfsStorageError::MarkerMismatch(format!(
                 "retired metadata disagrees with trash path {}",
@@ -3875,15 +3861,12 @@ where
             .project()
             .project_root
             .clone();
-        let trash = project
-            .join("sessions")
-            .join(super::TRASH_NAMESPACE)
-            .join(format!(
-                "{}-{}.{}",
-                retired.workspace().name().as_str(),
-                retired.workspace().incarnation().as_str(),
-                retired.workspace().format().extension()
-            ));
+        let trash = retired_image_below(
+            &project,
+            retired.workspace().name(),
+            retired.workspace().incarnation(),
+            retired.workspace().format(),
+        );
         let sidecar = sidecar_path(&trash);
         let trash_exists = trash
             .try_exists()
@@ -4474,15 +4457,11 @@ where
                     )));
                 }
 
-                let recovery_mount = storage
-                    .project()
-                    .mount_root
-                    .join(super::STAGING_NAMESPACE)
-                    .join(format!(
-                        "recover-{}-{}",
-                        old_metadata.workspace.as_str(),
-                        replacement_incarnation
-                    ));
+                let recovery_mount = recovery_staging_mount(
+                    &storage,
+                    &old_metadata.workspace,
+                    replacement_incarnation,
+                );
                 let incarnation = self.detached_image_incarnation(
                     &canonical,
                     old_metadata.image_format,

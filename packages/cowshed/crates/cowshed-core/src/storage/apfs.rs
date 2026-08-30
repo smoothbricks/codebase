@@ -2939,6 +2939,25 @@ fn staging_mount(
         )))
 }
 
+/// The staging mountpoint recovery uses to inspect a detached canonical image.
+///
+/// Deliberately not [`staging_mount`]: recovery runs while the interrupted publication it is
+/// unwinding may still hold the plain `<name>-<incarnation>` staging path, so inspecting the
+/// canonical image under that same stem could collide with or be mistaken for the staged clone.
+/// The `recover-` prefix keeps the mount inside [`STAGING_NAMESPACE`] — an abandoned one is still
+/// reclaimed by the ordinary staging sweep — while guaranteeing it never shadows the live path.
+fn recovery_staging_mount(
+    layout: &StorageLayout,
+    workspace: &WorkspaceName,
+    incarnation: &str,
+) -> PathBuf {
+    layout
+        .project()
+        .mount_root
+        .join(STAGING_NAMESPACE)
+        .join(format!("recover-{}-{}", workspace.as_str(), incarnation))
+}
+
 fn checkpoint_image(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
@@ -2966,6 +2985,39 @@ fn undo_image(
         )))
 }
 
+/// `<project>/sessions/<TRASH_NAMESPACE>/<name>-<incarnation>.<ext>`, from parts, for callers
+/// that hold a project root and (possibly enumeration-derived) format rather than a full config.
+///
+/// The `-` between name and incarnation is the separator [`split_retired_stem`] reverses; the two
+/// live side by side so the pair cannot drift. Incarnations are fixed-width lowercase hex, which
+/// is what keeps `rsplit_once` unambiguous even though workspace names contain hyphens.
+fn retired_image_below(
+    project_root: &Path,
+    workspace: &WorkspaceName,
+    incarnation: &WorkspaceIncarnation,
+    format: ImageFormat,
+) -> PathBuf {
+    project_root
+        .join("sessions")
+        .join(TRASH_NAMESPACE)
+        .join(format!(
+            "{}-{}.{}",
+            workspace.as_str(),
+            incarnation.as_str(),
+            format.extension()
+        ))
+}
+
+/// Splits a `<name>-<incarnation>` trash stem: the exact inverse of the stem written by
+/// [`retired_image_below`], kept adjacent so neither side can change the separator alone.
+fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, WorkspaceIncarnation)> {
+    let (name, incarnation) = stem.rsplit_once('-')?;
+    Some((
+        WorkspaceName::new(name).ok()?,
+        WorkspaceIncarnation::new(incarnation).ok()?,
+    ))
+}
+
 fn retired_image_path(
     config: &ApfsSubstrateConfig,
     workspace: &LifecycleWorkspace,
@@ -2974,12 +3026,12 @@ fn retired_image_path(
         .project()
         .project_root
         .clone();
-    Ok(project.join("sessions").join(TRASH_NAMESPACE).join(format!(
-        "{}-{}.{}",
-        workspace.name().as_str(),
-        workspace.incarnation().as_str(),
-        workspace.format().extension()
-    )))
+    Ok(retired_image_below(
+        &project,
+        workspace.name(),
+        workspace.incarnation(),
+        workspace.format(),
+    ))
 }
 
 /// Main's mountpoint is the one place the checkout layout is visible to the substrate: under
