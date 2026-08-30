@@ -581,12 +581,23 @@ impl DevenvResolutionError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct DevenvEnvSnapshot {
     vars: BTreeMap<String, String>,
+    /// The tracked inputs as they were when these vars were evaluated.
+    ///
+    /// One algorithm answers "are the devenv inputs still the snapshot's inputs?", at startup and
+    /// at every dirty exec. The startup check used to be snapshot-mtime versus source-mtime while
+    /// the runtime check used this fingerprint, and the two disagree by construction: an atomic
+    /// replace changes inode and ctime without moving mtime forward, so each could call fresh
+    /// what the other called stale. A snapshot that cannot say which inputs produced it is not a
+    /// snapshot that can be reused, which is why this is required rather than defaulted.
+    inputs: DevenvInputFingerprint,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Tracked devenv inputs, keyed by path relative to the workspace mount so a snapshot survives
+/// the clone into a differently-named mount that copy-on-write forks produce.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct DevenvInputFingerprint(Vec<(PathBuf, Option<DevenvFileFingerprint>)>);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct DevenvFileFingerprint {
     device: u64,
     inode: u64,
@@ -634,13 +645,17 @@ impl DevenvEnvironment {
         let resolution = resolve_devenv_dir(workspace_mount);
         let resolved = resolution.as_ref().ok().and_then(|value| value.as_deref());
         let tracked_paths = devenv_tracked_paths(workspace_mount, tracked_devenv_dir(&resolution));
-        let snapshot_is_stale =
-            resolved.is_some_and(|dir| initial_devenv_snapshot_is_stale(workspace_mount, dir));
-        let evaluated_inputs = if resolved.is_some() && !snapshot_is_stale {
-            devenv_input_fingerprint(&tracked_paths).ok()
-        } else {
-            None
-        };
+        // Reconcile once against the snapshot's own recorded inputs, covering edits made while
+        // the daemon was down. Identical comparison to the dirty-exec path below, so a snapshot
+        // is never fresh by one rule and stale by the other.
+        let evaluated_inputs = resolved
+            .and_then(|dir| parse_devenv_snapshot(&fs::read(dir.join(DEVENV_SNAPSHOT_FILE)).ok()?))
+            .map(|snapshot| snapshot.inputs)
+            .filter(|persisted| {
+                devenv_input_fingerprint(workspace_mount, &tracked_paths)
+                    .is_ok_and(|current| current == *persisted)
+            });
+        let snapshot_is_stale = resolved.is_some() && evaluated_inputs.is_none();
         let tracked_paths = Arc::new(RwLock::new(tracked_paths));
         let dirty = Arc::new(AtomicBool::new(false));
         let callback_paths = Arc::clone(&tracked_paths);
@@ -726,7 +741,7 @@ impl DevenvEnvironment {
         }
 
         let inputs_before = self.input_fingerprint();
-        match refresh_devenv_snapshot(spawner, sandbox, &devenv_dir).await {
+        match evaluate_devenv_environment(spawner, sandbox, &devenv_dir).await {
             Ok(vars) => {
                 let inputs_after = self.input_fingerprint();
                 self.evaluated_inputs = match (inputs_before, inputs_after) {
@@ -738,6 +753,19 @@ impl DevenvEnvironment {
                         None
                     }
                 };
+                // Persisted only when the inputs held still across the evaluation. Without a
+                // fingerprint the snapshot cannot claim to describe any particular revision, so
+                // the next startup re-evaluates instead of trusting it.
+                if let Some(inputs) = self.evaluated_inputs.clone() {
+                    write_devenv_snapshot(
+                        &devenv_dir,
+                        DevenvEnvSnapshot {
+                            vars: vars.clone(),
+                            inputs,
+                        },
+                    )
+                    .await?;
+                }
                 Ok((
                     Some(devenv_dir),
                     merge_devenv_environment(vars, controller_env),
@@ -763,13 +791,23 @@ impl DevenvEnvironment {
 
     fn input_fingerprint(&self) -> Option<DevenvInputFingerprint> {
         let paths = self.tracked_paths.read().ok()?;
-        devenv_input_fingerprint(&paths).ok()
+        devenv_input_fingerprint(&self.workspace_mount, &paths).ok()
     }
 }
 
-fn devenv_input_fingerprint(paths: &BTreeSet<PathBuf>) -> io::Result<DevenvInputFingerprint> {
+fn devenv_input_fingerprint(
+    workspace_mount: &Path,
+    paths: &BTreeSet<PathBuf>,
+) -> io::Result<DevenvInputFingerprint> {
     let mut fingerprints = Vec::with_capacity(paths.len());
     for path in paths {
+        let relative = path.strip_prefix(workspace_mount).map_err(|_| {
+            io::Error::other(format!(
+                "tracked devenv input {} is outside the workspace mount {}",
+                path.display(),
+                workspace_mount.display()
+            ))
+        })?;
         let fingerprint = match fs::metadata(path) {
             Ok(metadata) => Some(DevenvFileFingerprint {
                 device: metadata.dev(),
@@ -783,7 +821,7 @@ fn devenv_input_fingerprint(paths: &BTreeSet<PathBuf>) -> io::Result<DevenvInput
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        fingerprints.push((path.clone(), fingerprint));
+        fingerprints.push((relative.to_path_buf(), fingerprint));
     }
     Ok(DevenvInputFingerprint(fingerprints))
 }
@@ -858,33 +896,20 @@ fn event_touches_devenv(event: &Event, tracked_paths: &BTreeSet<PathBuf>) -> boo
         && event.paths.iter().any(|path| tracked_paths.contains(path))
 }
 
-fn initial_devenv_snapshot_is_stale(workspace_mount: &Path, devenv_dir: &Path) -> bool {
-    let snapshot = devenv_dir.join(DEVENV_SNAPSHOT_FILE);
-    let Ok(snapshot_mtime) = fs::metadata(&snapshot).and_then(|metadata| metadata.modified())
-    else {
-        return true;
-    };
-    DEVENV_INPUT_FILES
-        .into_iter()
-        .map(|file| devenv_dir.join(file))
-        .chain(std::iter::once(workspace_mount.join(COWSHED_CONFIG_FILE)))
-        .any(
-            |path| match fs::metadata(path).and_then(|metadata| metadata.modified()) {
-                Ok(source_mtime) => source_mtime > snapshot_mtime,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(_) => true,
-            },
-        )
+/// One parser for the snapshot, so the synchronous startup reconciliation and the asynchronous
+/// exec path cannot disagree about what a snapshot file means.
+fn parse_devenv_snapshot(bytes: &[u8]) -> Option<DevenvEnvSnapshot> {
+    serde_json::from_slice(bytes).ok()
 }
 
 async fn read_devenv_snapshot(devenv_dir: &Path) -> Option<DevenvEnvSnapshot> {
     let bytes = tokio::fs::read(devenv_dir.join(DEVENV_SNAPSHOT_FILE))
         .await
         .ok()?;
-    serde_json::from_slice(&bytes).ok()
+    parse_devenv_snapshot(&bytes)
 }
 
-async fn refresh_devenv_snapshot(
+async fn evaluate_devenv_environment(
     spawner: &mut dyn SpawnSink,
     sandbox: &SandboxConfig,
     devenv_dir: &Path,
@@ -912,7 +937,10 @@ async fn refresh_devenv_snapshot(
             ),
         ));
     }
-    let vars = parse_printed_devenv_environment(&output.stdout, devenv_dir)?;
+    parse_printed_devenv_environment(&output.stdout, devenv_dir)
+}
+
+async fn write_devenv_snapshot(devenv_dir: &Path, snapshot: DevenvEnvSnapshot) -> Result<()> {
     let snapshot_path = devenv_dir.join(DEVENV_SNAPSHOT_FILE);
     let parent = snapshot_path
         .parent()
@@ -926,7 +954,6 @@ async fn refresh_devenv_snapshot(
             "repair workspace permissions and retry",
         )
     })?;
-    let snapshot = DevenvEnvSnapshot { vars: vars.clone() };
     let write_path = snapshot_path.clone();
     tokio::task::spawn_blocking(move || crate::metadata::write_json(&write_path, &snapshot))
         .await
@@ -945,7 +972,7 @@ async fn refresh_devenv_snapshot(
                 "repair workspace permissions and retry",
             )
         })?;
-    Ok(vars)
+    Ok(())
 }
 
 fn parse_printed_devenv_environment(
@@ -1315,6 +1342,13 @@ impl SpawnSink for SystemSpawnSink {
             .stderr(Stdio::piped())
             .kill_on_drop(false);
         prepare_child_descriptors(command.as_std_mut()).map_err(map_spawn_failure)?;
+        // SAFETY: `pre_exec` runs in the forked child, between `fork` and `exec`, in a process
+        // that was multithreaded at the fork. Only async-signal-safe calls are legal there, and
+        // POSIX lists `setpgid` as one; it allocates nothing, takes no lock, and touches no
+        // memory this closure captures. Its success is load-bearing rather than decorative:
+        // `kill_process_group` signals `-pid`, which is the child's own group only because the
+        // child made itself a group leader here, so a failure is returned and fails the spawn
+        // instead of leaving a job whose kill would target the wrong processes.
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) == -1 {
@@ -2526,9 +2560,19 @@ impl SupervisorActor {
         }
 
         let stdin_info = stdin_info(&stdin);
-        let started = utc_now().unwrap_or_else(|_| {
-            UtcTimestamp::new("1970-01-01T00:00:00Z").expect("static timestamp")
-        });
+        // A clock fault is not an invariant, and `started` orders job records and commitments.
+        // Stamping the job at the epoch would make every consumer that sorts by it lie, so
+        // admission fails here exactly as it does for a seatbelt-profile failure below.
+        let started = match utc_now() {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = self
+                    .artifacts
+                    .seal(job_id, JobState::Failed, stdout_copy, stderr_copy);
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
         let trace = trace.unwrap_or_else(new_trace_context);
         let info = JobInfo {
             repo_id: self.authority.repo_id.clone(),
@@ -3394,12 +3438,10 @@ fn validate_session_name(name: &str) -> Result<()> {
     }
 }
 
+/// A checkpoint barrier is published as a commitment, so the commitment id grammar is the only
+/// grammar there is. Restating it here let the two drift silently in either direction.
 fn validate_checkpoint_id(value: &str) -> Result<()> {
-    if (1..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
+    if crate::api::dto::valid_commitment_id(value) {
         Ok(())
     } else {
         Err(CowshedError::usage(
@@ -3419,27 +3461,25 @@ fn new_trace_context() -> TraceContext {
     }
 }
 
+/// The current UTC second as the API's timestamp type.
+///
+/// Uses the crate's total civil-date conversion rather than a third `libc::gmtime_r`: that call
+/// needs a `time_t` the seconds may not fit, can return null, and requires `unsafe` twice to read
+/// its out-parameter, all to compute what `SystemTime` already holds. `civil_from_days` is total
+/// over every `u64` second count, which is exactly why it exists. The one remaining failure is a
+/// clock before the epoch, which is a real operational fault, not an invariant.
 fn utc_now() -> Result<UtcTimestamp> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| CowshedError::internal(format!("system clock is before epoch: {error}")))?
         .as_secs();
-    let timestamp = libc::time_t::try_from(seconds)
-        .map_err(|_| CowshedError::internal("system time exceeds platform range"))?;
-    let mut broken = std::mem::MaybeUninit::<libc::tm>::uninit();
-    let result = unsafe { libc::gmtime_r(&timestamp, broken.as_mut_ptr()) };
-    if result.is_null() {
-        return Err(CowshedError::internal("failed to convert UTC timestamp"));
-    }
-    let broken = unsafe { broken.assume_init() };
+    let (year, month, day) = crate::storage::civil_from_days(seconds / 86_400);
+    let clock = seconds % 86_400;
     UtcTimestamp::new(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        broken.tm_year + 1900,
-        broken.tm_mon + 1,
-        broken.tm_mday,
-        broken.tm_hour,
-        broken.tm_min,
-        broken.tm_sec,
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        clock / 3_600,
+        clock % 3_600 / 60,
+        clock % 60,
     ))
     .map_err(|error| CowshedError::internal(error.to_string()))
 }
@@ -3678,30 +3718,88 @@ mod workspace_toolchain_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    fn persist_snapshot(
+        devenv_dir: &Path,
+        vars: BTreeMap<String, String>,
+        inputs: &DevenvInputFingerprint,
+    ) {
+        let path = devenv_dir.join(DEVENV_SNAPSHOT_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("snapshot dir");
+        let snapshot = DevenvEnvSnapshot {
+            vars,
+            inputs: inputs.clone(),
+        };
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).expect("snapshot");
+    }
+
+    /// Startup reconciliation is the fingerprint comparison, not an mtime race. `.cowshed.toml`
+    /// is a tracked input and a missing optional input is a recorded absence, so neither needs a
+    /// sleep to observe: changing the config changes the fingerprint by content, and the absent
+    /// `devenv.lock`/`devenv.yaml`/`devenv.local.nix` stay absent.
     #[test]
     fn startup_staleness_includes_config_and_ignores_missing_optional_inputs() {
         let root = scratch("staleness");
         let mount = root.join("workspace");
         let devenv_root = mount.join("tooling/devenv");
-        let snapshot = devenv_root.join(DEVENV_SNAPSHOT_FILE);
-        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
+        std::fs::create_dir_all(&devenv_root).expect("devenv dir");
         std::fs::write(devenv_root.join("devenv.nix"), "{}").expect("devenv.nix");
         std::fs::write(
             mount.join(COWSHED_CONFIG_FILE),
             "[devenv]\ndir = \"tooling/devenv\"\n",
         )
         .expect("config");
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&snapshot, "{\"vars\":{}}\n").expect("fresh snapshot");
-        assert!(!initial_devenv_snapshot_is_stale(&mount, &devenv_root));
 
-        std::thread::sleep(Duration::from_millis(20));
+        let tracked = devenv_tracked_paths(&mount, Some(&devenv_root));
+        assert_eq!(tracked.len(), DEVENV_INPUT_FILES.len() + 1);
+        let evaluated = devenv_input_fingerprint(&mount, &tracked).expect("fingerprint");
+        persist_snapshot(&devenv_root, BTreeMap::new(), &evaluated);
+        assert_eq!(
+            DevenvEnvironment::new(&mount)
+                .expect("watcher")
+                .evaluated_inputs,
+            Some(evaluated.clone()),
+            "a snapshot whose recorded inputs still hold is reusable at startup"
+        );
+
         std::fs::write(
             mount.join(COWSHED_CONFIG_FILE),
             "[devenv]\ndir = \"tooling/devenv\"\n# changed\n",
         )
         .expect("changed config");
-        assert!(initial_devenv_snapshot_is_stale(&mount, &devenv_root));
+        assert_ne!(
+            devenv_input_fingerprint(&mount, &tracked).expect("fingerprint"),
+            evaluated
+        );
+        assert_eq!(
+            DevenvEnvironment::new(&mount)
+                .expect("watcher")
+                .evaluated_inputs,
+            None,
+            "a changed .cowshed.toml invalidates the snapshot at startup"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A snapshot with no recorded inputs cannot claim to describe any revision of the sources,
+    /// so it is not reusable. This is the case the old mtime rule got wrong in the dangerous
+    /// direction: it called such a file fresh whenever it happened to be the newest.
+    #[test]
+    fn a_snapshot_without_recorded_inputs_is_not_reusable() {
+        let root = scratch("snapshot-no-inputs");
+        let mount = root.join("workspace");
+        let snapshot = mount.join(DEVENV_SNAPSHOT_FILE);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
+        std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
+        std::fs::write(&snapshot, "{\"vars\":{}}\n").expect("snapshot");
+
+        assert_eq!(parse_devenv_snapshot(b"{\"vars\":{}}\n"), None);
+        assert_eq!(
+            DevenvEnvironment::new(&mount)
+                .expect("watcher")
+                .evaluated_inputs,
+            None
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3742,11 +3840,11 @@ mod workspace_toolchain_tests {
     fn watcher_marks_the_workspace_dirty_after_a_devenv_input_changes() {
         let root = scratch("watcher");
         let mount = root.join("workspace");
-        let snapshot = mount.join(DEVENV_SNAPSHOT_FILE);
-        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
+        std::fs::create_dir_all(&mount).expect("mount");
         std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&snapshot, "{\"vars\":{}}\n").expect("fresh snapshot");
+        let tracked = devenv_tracked_paths(&mount, Some(&mount));
+        let evaluated = devenv_input_fingerprint(&mount, &tracked).expect("fingerprint");
+        persist_snapshot(&mount, BTreeMap::new(), &evaluated);
         let environment = DevenvEnvironment::new(&mount).expect("watcher");
         assert!(!environment.dirty.load(Ordering::Acquire));
 
@@ -3770,12 +3868,15 @@ mod workspace_toolchain_tests {
     async fn delayed_watcher_event_does_not_refresh_unchanged_devenv_inputs() {
         let root = scratch("watcher-delayed");
         let mount = root.join("workspace");
-        let snapshot = mount.join(DEVENV_SNAPSHOT_FILE);
-        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
+        std::fs::create_dir_all(&mount).expect("mount");
         std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&snapshot, "{\"vars\":{\"FROM_SNAPSHOT\":\"yes\"}}\n")
-            .expect("fresh snapshot");
+        let tracked = devenv_tracked_paths(&mount, Some(&mount));
+        let evaluated = devenv_input_fingerprint(&mount, &tracked).expect("fingerprint");
+        persist_snapshot(
+            &mount,
+            BTreeMap::from([("FROM_SNAPSHOT".to_owned(), "yes".to_owned())]),
+            &evaluated,
+        );
         let mut environment = DevenvEnvironment::new(&mount).expect("watcher");
 
         // macOS FSEvents can deliver the source write that preceded watcher registration late.
