@@ -1149,3 +1149,54 @@ mod host_stable_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod error_code_ssot {
+    use cowshed_core::ErrorCode;
+
+    const TYPES_TS: &str = include_str!("../../../src/types.ts");
+
+    /// Core's kebab-case spellings, in enum-declaration order. Adding a variant breaks
+    /// `ErrorCode::as_str`; adding it there without this list leaves the TypeScript union
+    /// unverified, so keep the two lists in this test the same length as the enum.
+    fn rust_spellings() -> Vec<&'static str> {
+        [
+            ErrorCode::Internal,
+            ErrorCode::Usage,
+            ErrorCode::NotFound,
+            ErrorCode::Conflict,
+            ErrorCode::EnvironmentMissing,
+            ErrorCode::SandboxDenied,
+            ErrorCode::Integrity,
+        ]
+        .into_iter()
+        .map(ErrorCode::as_str)
+        .collect()
+    }
+
+    fn ts_spellings() -> Vec<&'static str> {
+        let start = TYPES_TS
+            .find("export type ErrorCode =")
+            .expect("types.ts exports ErrorCode");
+        let end = start
+            + TYPES_TS[start..]
+                .find(';')
+                .expect("ErrorCode union is semicolon-terminated");
+        TYPES_TS[start..end]
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim().trim_start_matches('|').trim();
+                trimmed
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .collect()
+    }
+
+    /// The JSON wire corpus covers DTOs; ErrorCode rides on the napi Error object instead, so
+    /// this is the check that `types.ts` still names every `as_str` spelling and nothing else.
+    #[test]
+    fn types_ts_error_code_union_matches_core_taxonomy() {
+        assert_eq!(ts_spellings(), rust_spellings());
+    }
+}
