@@ -821,21 +821,37 @@ pub(crate) fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedIn
     }
 }
 
+/// Create a gateway-owned directory at exactly [`PRIVATE_DIRECTORY_MODE`], then prove it is ours.
+///
+/// `LaunchdFilesystem::ensure_directory` sets the mode through an `O_NOFOLLOW` descriptor on the
+/// named directory, so a symlink planted where one belongs fails the create instead of being
+/// followed and then noticed afterwards. The check this replaced was `create_dir_all` followed by
+/// `canonicalize(path) == path`, which wrote the tree before it looked and then refused every
+/// legitimate directory reached through a symlinked ancestor — a home on a linked volume, or
+/// anything under macOS's own `/var` link.
 fn ensure_private_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).map_err(|error| {
-        CowshedError::internal(format!("could not create {}: {error}", path.display()))
-    })?;
-    let canonical = fs::canonicalize(path).map_err(|error| {
-        CowshedError::internal(format!("could not resolve {}: {error}", path.display()))
-    })?;
-    if canonical != path {
-        return Err(CowshedError::integrity(
-            format!("gateway directory is not canonical: {}", path.display()),
-            "cowshed doctor --json",
-        ));
-    }
+    NativeFilesystem::new()
+        .ensure_directory(path, PRIVATE_DIRECTORY_MODE)
+        .map_err(|error| {
+            // `O_NOFOLLOW` refuses a symlink with `ELOOP`, and refuses it before anything on the
+            // far side is touched. That is a plant, not a host problem, so it is named as one.
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                CowshedError::integrity(
+                    format!(
+                        "gateway path is a symlink rather than a private directory: {}",
+                        path.display()
+                    ),
+                    "cowshed doctor --json",
+                )
+            } else {
+                CowshedError::internal(format!("could not create {}: {error}", path.display()))
+            }
+        })?;
     let metadata = inspect_existing(path)?.ok_or_else(|| {
-        CowshedError::internal(format!("could not inspect {}: not found", path.display()))
+        CowshedError::internal(format!(
+            "{} vanished between being created and being inspected",
+            path.display()
+        ))
     })?;
     if !is_user_owned(&metadata, true) {
         return Err(CowshedError::integrity(
@@ -846,12 +862,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
             "cowshed doctor --json",
         ));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE)).map_err(|error| {
-        CowshedError::internal(format!(
-            "could not secure gateway directory {}: {error}",
-            path.display()
-        ))
-    })
+    Ok(())
 }
 
 pub(crate) fn launchd_error(error: impl std::fmt::Display) -> CowshedError {
