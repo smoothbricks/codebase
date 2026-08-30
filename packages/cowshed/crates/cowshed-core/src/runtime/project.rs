@@ -1727,14 +1727,18 @@ impl NativeProjectRuntimeHost {
                     // everything downstream — the descriptor, the gateway inventory — reads the
                     // URL Git actually uses. An identity move refuses with the rebind verb, and
                     // that verb reaches this arm under `ForIdentityChange` without tripping it.
-                    let binding =
-                        match reconcile_binding_with_remotes(&binding, &remotes, validation)? {
-                            Some(updated) => {
-                                persist_reconciled_binding(&layout, &updated).await?;
-                                updated
-                            }
-                            None => binding,
-                        };
+                    let binding = match reconcile_binding_with_remotes(
+                        &binding,
+                        &remotes,
+                        validation,
+                        git.root(),
+                    )? {
+                        Some(updated) => {
+                            persist_reconciled_binding(&layout, &updated).await?;
+                            updated
+                        }
+                        None => binding,
+                    };
                     (repo_id, layout, binding)
                 }
                 // Nothing adopted under this identity: the remotes are the only source left, and
@@ -2124,6 +2128,7 @@ impl NativeProjectRuntimeHost {
             &self.descriptor.binding,
             &remotes,
             BindingRemoteValidation::Strict,
+            self.git.root(),
         )? {
             persist_reconciled_binding(&self.layout, &updated).await?;
             self.descriptor.binding = updated;
@@ -5193,10 +5198,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .map_err(|error| {
                 let message = error.to_string();
                 if message.to_ascii_lowercase().contains("resource busy") {
+                    // The retry must come from outside the checkout, where cwd discovery cannot
+                    // find the project — so `--project` is part of the command, not an option.
                     CowshedError::conflict(
                         format!("project {old_repo_id} main mount is busy: {message}"),
-                        "leave the checkout and every workspace mount, then retry the identity \
-                         change",
+                        format!(
+                            "leave the checkout and every workspace mount, then retry from \
+                             outside it: cowshed --project {} mv main --repo-id {new_repo_id}",
+                            self.substrate_config.checkout_path.display()
+                        ),
                     )
                 } else {
                     native_storage_error(error)
@@ -7091,6 +7101,7 @@ fn reconcile_binding_with_remotes(
     binding: &RepositoryBinding,
     remotes: &[crate::git::RemoteUrl],
     validation: BindingRemoteValidation,
+    checkout: &Path,
 ) -> Result<Option<RepositoryBinding>> {
     binding.validate().map_err(native_integrity_error)?;
     if validation == BindingRemoteValidation::ForIdentityChange {
@@ -7127,8 +7138,12 @@ fn reconcile_binding_with_remotes(
                         "repository binding names {} for remote {name}, but Git configuration now names {derived}",
                         identity.repo_id
                     ),
+                    // The identity change detaches main's volume, so the retry necessarily runs
+                    // from outside the checkout — where cwd discovery cannot find the project.
+                    // `--project` is therefore part of the command, not an option.
                     format!(
-                        "adopt the new identity with: cowshed mv main --repo-id {derived} (or restore the recorded remote)"
+                        "adopt the new identity from outside the checkout: cowshed --project {} mv main --repo-id {derived} (or restore the recorded remote)",
+                        checkout.display()
                     ),
                 ));
             }
@@ -7341,7 +7356,12 @@ async fn load_or_validate_binding(
     // Re-adoption after a server move lands here with a persisted binding recording the old
     // transport; the same heal that fixes open fixes it, persisted immediately for the same
     // reason: every later reader must see the URL Git actually uses.
-    match reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)? {
+    match reconcile_binding_with_remotes(
+        &binding,
+        &remotes,
+        BindingRemoteValidation::Strict,
+        git.root(),
+    )? {
         Some(updated) => {
             persist_reconciled_binding(layout, &updated).await?;
             Ok(updated)
@@ -10000,10 +10020,14 @@ mod binding_heal_persistence_tests {
             name: "origin".to_owned(),
             url: "ssh://git@forge.example.test:2223/acme/widget.git".to_owned(),
         }];
-        let healed =
-            reconcile_binding_with_remotes(&recorded, &remotes, BindingRemoteValidation::Strict)
-                .expect("transport move reconciles")
-                .expect("recorded transport follows the move");
+        let healed = reconcile_binding_with_remotes(
+            &recorded,
+            &remotes,
+            BindingRemoteValidation::Strict,
+            Path::new("/checkout"),
+        )
+        .expect("transport move reconciles")
+        .expect("recorded transport follows the move");
         persist_reconciled_binding(&layout, &healed)
             .await
             .expect("persist healed binding");
@@ -10051,10 +10075,14 @@ mod binding_tests {
             "origin",
             "ssh://git@forge.example.test:2223/acme/widget.git",
         )];
-        let updated =
-            reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)
-                .expect("transport move reconciles")
-                .expect("recorded transport follows the move");
+        let updated = reconcile_binding_with_remotes(
+            &binding,
+            &remotes,
+            BindingRemoteValidation::Strict,
+            Path::new("/checkout"),
+        )
+        .expect("transport move reconciles")
+        .expect("recorded transport follows the move");
         assert_eq!(
             updated.primary().expect("primary").remote_url.as_deref(),
             Some("ssh://forge.example.test:2223/acme/widget.git"),
@@ -10066,9 +10094,14 @@ mod binding_tests {
 
         // A second reconcile against the healed binding is a no-op.
         assert!(
-            reconcile_binding_with_remotes(&updated, &remotes, BindingRemoteValidation::Strict)
-                .expect("healed binding matches")
-                .is_none()
+            reconcile_binding_with_remotes(
+                &updated,
+                &remotes,
+                BindingRemoteValidation::Strict,
+                Path::new("/checkout")
+            )
+            .expect("healed binding matches")
+            .is_none()
         );
     }
 
@@ -10085,16 +10118,21 @@ mod binding_tests {
             "origin",
             "ssh://git@forge.example.test:2223/other/widget.git",
         )];
-        let error =
-            reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)
-                .expect_err("a different owner/repo is a real divergence");
+        let error = reconcile_binding_with_remotes(
+            &binding,
+            &remotes,
+            BindingRemoteValidation::Strict,
+            Path::new("/checkout"),
+        )
+        .expect_err("a different owner/repo is a real divergence");
         assert_eq!(error.code, ErrorCode::Conflict);
         assert!(error.message.contains("acme/widget"), "{}", error.message);
         assert!(error.message.contains("other/widget"), "{}", error.message);
+        // The retry runs from outside the checkout, so the hint must carry --project.
         assert!(
             error
                 .hint
-                .contains("cowshed mv main --repo-id other/widget"),
+                .contains("cowshed --project /checkout mv main --repo-id other/widget"),
             "{}",
             error.hint
         );
@@ -10118,6 +10156,7 @@ mod binding_tests {
                 &binding,
                 &remotes,
                 BindingRemoteValidation::ForIdentityChange,
+                Path::new("/checkout"),
             )
             .expect("the rebind verb must stay reachable")
             .is_none()
@@ -10153,6 +10192,7 @@ mod binding_tests {
                     &binding,
                     &remotes,
                     BindingRemoteValidation::ForIdentityChange,
+                    Path::new("/checkout"),
                 )
                 .expect("the rebind verb must stay reachable")
                 .is_none()
@@ -10171,16 +10211,25 @@ mod binding_tests {
         .expect("binding");
         let matching = [remote("origin", "https://example.test/acme/widget.git")];
         assert!(
-            reconcile_binding_with_remotes(&binding, &matching, BindingRemoteValidation::Strict)
-                .expect("matching remotes")
-                .is_none()
+            reconcile_binding_with_remotes(
+                &binding,
+                &matching,
+                BindingRemoteValidation::Strict,
+                Path::new("/checkout")
+            )
+            .expect("matching remotes")
+            .is_none()
         );
         // The recorded remote name no longer exists at all: identity cannot be derived from
         // anything, so the original restore guidance stands.
         let renamed = [remote("upstream", "https://example.test/acme/widget.git")];
-        let error =
-            reconcile_binding_with_remotes(&binding, &renamed, BindingRemoteValidation::Strict)
-                .expect_err("a deleted remote pairing still refuses");
+        let error = reconcile_binding_with_remotes(
+            &binding,
+            &renamed,
+            BindingRemoteValidation::Strict,
+            Path::new("/checkout"),
+        )
+        .expect_err("a deleted remote pairing still refuses");
         assert!(
             error.hint.contains("restore the recorded remote"),
             "{}",
@@ -10310,9 +10359,13 @@ mod binding_tests {
             "https://github.com/smoothbricks/codebase.git",
         )];
 
-        let error =
-            reconcile_binding_with_remotes(&binding, &remotes, BindingRemoteValidation::Strict)
-                .expect_err("the recorded remote name is part of the binding");
+        let error = reconcile_binding_with_remotes(
+            &binding,
+            &remotes,
+            BindingRemoteValidation::Strict,
+            Path::new("/checkout"),
+        )
+        .expect_err("the recorded remote name is part of the binding");
 
         assert_eq!(error.code, ErrorCode::Conflict);
         assert_eq!(
