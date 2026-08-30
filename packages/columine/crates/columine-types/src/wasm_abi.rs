@@ -97,7 +97,9 @@ pub fn parse_exports(bytes: &[u8]) -> Result<Vec<WasmExport>, String> {
         let section_end = cursor
             .checked_add(size)
             .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| format!("section at {cursor} declares {size} bytes past end of input"))?;
+            .ok_or_else(|| {
+                format!("section at {cursor} declares {size} bytes past end of input")
+            })?;
         if section_id == 7 {
             let count = uleb(bytes, &mut cursor)?;
             for _ in 0..count {
