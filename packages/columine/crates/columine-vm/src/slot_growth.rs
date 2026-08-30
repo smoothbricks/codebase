@@ -39,32 +39,50 @@ pub fn slot_data_size(
     }
 }
 
-/// Probe live keys into a power-of-two table and invoke `on_place` at each new pos.
-#[allow(clippy::too_many_arguments)]
-fn rehash_occupied(
-    old_state: &[u8],
-    new_state: &mut [u8],
+/// Power-of-two u32 key lane: old/new bases and capacities.
+#[derive(Clone, Copy, Debug)]
+struct KeyLane {
     old_keys: u32,
     new_keys: u32,
     old_cap: u32,
     new_cap: u32,
+}
+
+/// STRUCT_MAP primary table: descriptor bases, capacities, field count, and row stride.
+#[derive(Clone, Copy, Debug)]
+pub struct StructMapTable {
+    pub old_offset: u32,
+    pub new_offset: u32,
+    pub old_cap: u32,
+    pub new_cap: u32,
+    pub num_fields: u32,
+    pub row_size: u32,
+}
+
+/// Probe live keys into a power-of-two table and invoke `on_place` at each new
+/// pos. Callers carry a timestamps side-array through `on_place` when present.
+/// Return the number of entries rehashed.
+fn rehash_occupied(
+    old_state: &[u8],
+    new_state: &mut [u8],
+    keys: &KeyLane,
     hash: impl Fn(&[u8], u32, u32) -> u32,
     mut on_place: impl FnMut(&mut [u8], u32, u32),
 ) -> u32 {
-    debug_assert!(new_cap.is_power_of_two() && new_cap > 0);
-    bytes::fill_u32(new_state, new_keys, new_cap, EMPTY_KEY);
-    let mask = new_cap - 1;
+    debug_assert!(keys.new_cap.is_power_of_two() && keys.new_cap > 0);
+    bytes::fill_u32(new_state, keys.new_keys, keys.new_cap, EMPTY_KEY);
+    let mask = keys.new_cap - 1;
     let mut rehashed = 0u32;
-    for i in 0..old_cap {
-        let k = bytes::read_u32(old_state, old_keys + i * 4);
+    for i in 0..keys.old_cap {
+        let k = bytes::read_u32(old_state, keys.old_keys + i * 4);
         if k == EMPTY_KEY || k == TOMBSTONE {
             continue;
         }
         let mut pos = hash(old_state, i, k);
-        while bytes::read_u32(new_state, new_keys + pos * 4) != EMPTY_KEY {
+        while bytes::read_u32(new_state, keys.new_keys + pos * 4) != EMPTY_KEY {
             pos = (pos + 1) & mask;
         }
-        bytes::write_u32(new_state, new_keys + pos * 4, k);
+        bytes::write_u32(new_state, keys.new_keys + pos * 4, k);
         on_place(new_state, i, pos);
         rehashed += 1;
     }
@@ -89,10 +107,12 @@ pub fn grow_hash_map(
     rehash_occupied(
         old_state,
         new_state,
-        old_offset,
-        new_offset,
-        old_cap,
-        new_cap,
+        &KeyLane {
+            old_keys: old_offset,
+            new_keys: new_offset,
+            old_cap,
+            new_cap,
+        },
         |_, _, k| hash_key(k, new_cap),
         |new_state, i, pos| {
             let value = bytes::read_u32(old_state, old_vals + i * 4);
@@ -117,10 +137,12 @@ pub fn grow_hash_set(
     rehash_occupied(
         old_state,
         new_state,
-        old_offset,
-        new_offset,
-        old_cap,
-        new_cap,
+        &KeyLane {
+            old_keys: old_offset,
+            new_keys: new_offset,
+            old_cap,
+            new_cap,
+        },
         |_, _, k| hash_key(k, new_cap),
         |_, _, _| {},
     )
@@ -128,38 +150,36 @@ pub fn grow_hash_set(
 
 /// Copy a STRUCT_MAP descriptor, rehash keys, and move live rows to their new
 /// probe positions. Return the number of entries rehashed.
-#[allow(clippy::too_many_arguments)]
-pub fn grow_struct_map(
-    old_state: &[u8],
-    new_state: &mut [u8],
-    old_offset: u32,
-    new_offset: u32,
-    old_cap: u32,
-    new_cap: u32,
-    num_fields: u32,
-    row_size: u32,
-) -> u32 {
-    let desc_size = columine_types::types::align8(num_fields);
-    bytes::copy(new_state, new_offset, old_state, old_offset, num_fields);
-    let old_keys_offset = old_offset + desc_size;
-    let new_keys_offset = new_offset + desc_size;
-    let old_rows_base = old_keys_offset + old_cap * 4;
-    let new_rows_base = new_keys_offset + new_cap * 4;
+pub fn grow_struct_map(old_state: &[u8], new_state: &mut [u8], table: &StructMapTable) -> u32 {
+    let desc_size = columine_types::types::align8(table.num_fields);
+    bytes::copy(
+        new_state,
+        table.new_offset,
+        old_state,
+        table.old_offset,
+        table.num_fields,
+    );
+    let old_keys_offset = table.old_offset + desc_size;
+    let new_keys_offset = table.new_offset + desc_size;
+    let old_rows_base = old_keys_offset + table.old_cap * 4;
+    let new_rows_base = new_keys_offset + table.new_cap * 4;
     rehash_occupied(
         old_state,
         new_state,
-        old_keys_offset,
-        new_keys_offset,
-        old_cap,
-        new_cap,
-        |_, _, k| hash_key(k, new_cap),
+        &KeyLane {
+            old_keys: old_keys_offset,
+            new_keys: new_keys_offset,
+            old_cap: table.old_cap,
+            new_cap: table.new_cap,
+        },
+        |_, _, k| hash_key(k, table.new_cap),
         |new_state, i, pos| {
             bytes::copy(
                 new_state,
-                new_rows_base + pos * row_size,
+                new_rows_base + pos * table.row_size,
                 old_state,
-                old_rows_base + i * row_size,
-                row_size,
+                old_rows_base + i * table.row_size,
+                table.row_size,
             );
         },
     )
@@ -167,46 +187,44 @@ pub fn grow_struct_map(
 
 /// Rehash an exact two-lane-key struct map while preserving both key cells
 /// and each row byte-for-byte.
-#[allow(clippy::too_many_arguments)]
-pub fn grow_struct_map2(
-    old_state: &[u8],
-    new_state: &mut [u8],
-    old_offset: u32,
-    new_offset: u32,
-    old_cap: u32,
-    new_cap: u32,
-    num_fields: u32,
-    row_size: u32,
-) -> u32 {
-    let desc_size = columine_types::types::align8(num_fields);
-    bytes::copy(new_state, new_offset, old_state, old_offset, num_fields);
-    let old_keys1 = old_offset + desc_size;
-    let old_keys2 = old_keys1 + old_cap * 4;
-    let old_rows = old_keys2 + old_cap * 4;
-    let new_keys1 = new_offset + desc_size;
-    let new_keys2 = new_keys1 + new_cap * 4;
-    let new_rows = new_keys2 + new_cap * 4;
-    bytes::zero(new_state, new_keys2, new_cap * 4);
+pub fn grow_struct_map2(old_state: &[u8], new_state: &mut [u8], table: &StructMapTable) -> u32 {
+    let desc_size = columine_types::types::align8(table.num_fields);
+    bytes::copy(
+        new_state,
+        table.new_offset,
+        old_state,
+        table.old_offset,
+        table.num_fields,
+    );
+    let old_keys1 = table.old_offset + desc_size;
+    let old_keys2 = old_keys1 + table.old_cap * 4;
+    let old_rows = old_keys2 + table.old_cap * 4;
+    let new_keys1 = table.new_offset + desc_size;
+    let new_keys2 = new_keys1 + table.new_cap * 4;
+    let new_rows = new_keys2 + table.new_cap * 4;
+    bytes::zero(new_state, new_keys2, table.new_cap * 4);
     rehash_occupied(
         old_state,
         new_state,
-        old_keys1,
-        new_keys1,
-        old_cap,
-        new_cap,
+        &KeyLane {
+            old_keys: old_keys1,
+            new_keys: new_keys1,
+            old_cap: table.old_cap,
+            new_cap: table.new_cap,
+        },
         |old_state, i, key1| {
             let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
-            columine_types::types::hash_key_pair(key1, key2, new_cap)
+            columine_types::types::hash_key_pair(key1, key2, table.new_cap)
         },
         |new_state, i, pos| {
             let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
             bytes::write_u32(new_state, new_keys2 + pos * 4, key2);
             bytes::copy(
                 new_state,
-                new_rows + pos * row_size,
+                new_rows + pos * table.row_size,
                 old_state,
-                old_rows + i * row_size,
-                row_size,
+                old_rows + i * table.row_size,
+                table.row_size,
             );
         },
     )
