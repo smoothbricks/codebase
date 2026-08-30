@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 
-use crate::config::{GatewayLimits, GatewayTimeouts, WorkspaceCa};
+use crate::{
+    config::{GatewayLimits, GatewayTimeouts, WorkspaceCa},
+    interfaces::alpn_protocols,
+};
 
 pub(crate) struct CaSigner {
     issuer: Issuer<'static, KeyPair>,
@@ -62,7 +65,7 @@ impl CaSigner {
             .with_no_client_auth()
             .with_single_cert(chain, key_der)
             .map_err(|error| TlsError::Leaf(error.to_string()))?;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = alpn_protocols();
         Ok(Arc::new(config))
     }
 }
