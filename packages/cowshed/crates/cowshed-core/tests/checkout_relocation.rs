@@ -21,8 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cowshed_core::checkout::CheckoutRecord;
 use cowshed_core::git::{GitRepository, MainRemote, MergeDriverState};
 use cowshed_core::metadata::{
-    DetachedWorkspaceMetadata, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-    PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
+    DetachedWorkspaceMetadata, ImageFormat, MARKER_VERSION, Platform, PortBlock, PublicationState,
+    SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
     WorkspaceRole, write_json,
 };
 use cowshed_core::repository::RepoId;
@@ -110,7 +110,7 @@ impl Relocated {
     fn record_stale_state(&self) {
         // 1 and 2: the marker and the detached sidecar, both naming the dead root.
         let marker = WorkspaceMarker {
-            version: METADATA_VERSION,
+            version: MARKER_VERSION,
             repo_id: repo(),
             project_root: self.dead_root.clone(),
             workspace: workspace(),
@@ -169,7 +169,7 @@ impl Relocated {
 
     fn metadata(&self, project_root: &Path) -> DetachedWorkspaceMetadata {
         DetachedWorkspaceMetadata {
-            version: METADATA_VERSION,
+            version: SIDECAR_VERSION,
             repo_id: repo(),
             workspace: workspace(),
             workspace_incarnation: incarnation(),

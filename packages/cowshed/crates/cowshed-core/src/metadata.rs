@@ -9,7 +9,10 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-pub const METADATA_VERSION: u32 = 1;
+pub const MARKER_VERSION: u32 = 1;
+pub const SIDECAR_VERSION: u32 = 1;
+pub const CHECKOUT_LAYOUT_VERSION: u32 = 1;
+pub const SLOT_BINDINGS_VERSION: u32 = 1;
 pub const PORT_BLOCK_SIZE: u16 = 16;
 pub const MACOS_PORT_BLOCK_MIN: u16 = 40_960;
 pub const MACOS_PORT_BLOCK_MAX: u16 = 49_151;
@@ -472,13 +475,13 @@ pub struct CheckoutLayoutRecord {
 impl CheckoutLayoutRecord {
     pub fn new(checkout_layout: CheckoutLayout) -> Self {
         Self {
-            version: METADATA_VERSION,
+            version: CHECKOUT_LAYOUT_VERSION,
             checkout_layout,
         }
     }
 
     pub fn validate(&self) -> Result<(), MetadataError> {
-        if self.version != METADATA_VERSION {
+        if self.version != CHECKOUT_LAYOUT_VERSION {
             return Err(MetadataError::UnsupportedVersion {
                 kind: "checkout layout record",
                 version: self.version,
@@ -590,13 +593,13 @@ pub struct SlotBindingsRecord {
 impl SlotBindingsRecord {
     pub fn new(bindings: &SlotBindings) -> Self {
         Self {
-            version: METADATA_VERSION,
+            version: SLOT_BINDINGS_VERSION,
             bindings: bindings.entries.clone(),
         }
     }
 
     pub fn into_bindings(self) -> Result<SlotBindings, MetadataError> {
-        if self.version != METADATA_VERSION {
+        if self.version != SLOT_BINDINGS_VERSION {
             return Err(MetadataError::UnsupportedVersion {
                 kind: "slot bindings record",
                 version: self.version,
@@ -807,7 +810,7 @@ impl<'de> Deserialize<'de> for WorkspaceMarker {
 
 impl WorkspaceMarker {
     pub fn validate(&self) -> Result<(), MetadataError> {
-        if self.version != METADATA_VERSION {
+        if self.version != MARKER_VERSION {
             return Err(MetadataError::UnsupportedVersion {
                 kind: "workspace marker",
                 version: self.version,
@@ -1127,7 +1130,7 @@ impl<'de> Deserialize<'de> for DetachedWorkspaceMetadata {
 
 impl DetachedWorkspaceMetadata {
     fn validate_deserialized(&self) -> Result<(), MetadataError> {
-        if self.version != METADATA_VERSION {
+        if self.version != SIDECAR_VERSION {
             return Err(MetadataError::UnsupportedVersion {
                 kind: "detached workspace",
                 version: self.version,
@@ -1431,7 +1434,7 @@ mod tests {
     fn marker_deserialization_rejects_inconsistent_invariants_and_unknown_fields() {
         let valid = serde_json::to_value(marker_from_json()).unwrap();
         for (field, value) in [
-            ("version", json!(METADATA_VERSION + 1)),
+            ("version", json!(MARKER_VERSION + 1)),
             ("role", json!("main")),
             ("forkedFrom", json!("main")),
         ] {
@@ -1449,7 +1452,7 @@ mod tests {
     fn detached_deserialization_rejects_inconsistent_invariants_and_unknown_fields() {
         let valid = frozen_sidecar_json();
         for (field, value) in [
-            ("version", json!(METADATA_VERSION + 1)),
+            ("version", json!(SIDECAR_VERSION + 1)),
             ("platform", json!("linux")),
             ("portBlock", json!({ "base": 40976, "size": 15 })),
         ] {
@@ -1483,7 +1486,7 @@ mod tests {
                 (format!("session-{session_suffix}"), "workspace")
             };
             let expected = json!({
-                "version": METADATA_VERSION,
+                "version": 1,
                 "repoId": "acme/widget",
                 "projectRoot": "/project",
                 "workspace": workspace,
@@ -1548,7 +1551,7 @@ mod tests {
         #[test]
         fn public_metadata_deserializers_reject_every_unsupported_version(
             version in any::<u32>().prop_filter("version 1 is supported", |version| {
-                *version != METADATA_VERSION
+                *version != MARKER_VERSION && *version != SIDECAR_VERSION
             }),
         ) {
             let mut marker = serde_json::to_value(marker_from_json()).unwrap();
@@ -1741,7 +1744,7 @@ mod tests {
 
         let mut marker = marker_from_json();
         marker.validate().unwrap();
-        marker.version = METADATA_VERSION + 1;
+        marker.version = MARKER_VERSION + 1;
         assert!(matches!(
             marker.validate(),
             Err(MetadataError::UnsupportedVersion {
@@ -1749,7 +1752,7 @@ mod tests {
                 version: 2
             })
         ));
-        marker.version = METADATA_VERSION;
+        marker.version = MARKER_VERSION;
         marker.role = WorkspaceRole::Main;
         assert!(matches!(
             marker.validate(),
@@ -1936,5 +1939,67 @@ mod tests {
                     && source.kind() == io::ErrorKind::NotFound
         ));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn each_document_version_is_one_and_refuses_any_other() {
+        assert_eq!(MARKER_VERSION, 1);
+        assert_eq!(SIDECAR_VERSION, 1);
+        assert_eq!(CHECKOUT_LAYOUT_VERSION, 1);
+        assert_eq!(SLOT_BINDINGS_VERSION, 1);
+        marker_from_json().validate().unwrap();
+        serde_json::from_value::<DetachedWorkspaceMetadata>(frozen_sidecar_json()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CheckoutLayoutRecord>(json!({
+                "version": 1,
+                "checkoutLayout": "direct-mount"
+            }))
+            .unwrap()
+            .checkout_layout,
+            CheckoutLayout::DirectMount
+        );
+        assert!(
+            serde_json::from_value::<SlotBindingsRecord>(json!({
+                "version": 1,
+                "bindings": []
+            }))
+            .unwrap()
+            .into_bindings()
+            .unwrap()
+            .is_empty()
+        );
+
+        assert!(matches!(
+            CheckoutLayoutRecord {
+                version: 2,
+                checkout_layout: CheckoutLayout::DirectMount,
+            }
+            .validate(),
+            Err(MetadataError::UnsupportedVersion {
+                kind: "checkout layout record",
+                version: 2
+            })
+        ));
+        assert!(matches!(
+            SlotBindingsRecord {
+                version: 2,
+                bindings: Vec::new(),
+            }
+            .into_bindings(),
+            Err(MetadataError::UnsupportedVersion {
+                kind: "slot bindings record",
+                version: 2
+            })
+        ));
+        let mut sidecar: DetachedWorkspaceMetadata =
+            serde_json::from_value(frozen_sidecar_json()).unwrap();
+        sidecar.version = 2;
+        assert!(matches!(
+            sidecar.validate(Path::new("/tmp/image.asif")),
+            Err(MetadataError::UnsupportedVersion {
+                kind: "detached workspace",
+                version: 2
+            })
+        ));
     }
 }

@@ -1531,7 +1531,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::metadata::{
-        CheckoutLayout, MACOS_PORT_BLOCK_MIN, METADATA_VERSION, PORT_BLOCK_SIZE, Platform,
+        CheckoutLayout, MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE, Platform, SIDECAR_VERSION,
         WorkspaceInfoSnapshot, WorkspaceRole, write_json,
     };
     use crate::repository::{BoundIdentity, RepositoryBinding};
@@ -1708,7 +1708,7 @@ mod tests {
                     git_worktree: false,
                 });
             DetachedWorkspaceMetadata {
-                version: METADATA_VERSION,
+                version: SIDECAR_VERSION,
                 repo_id: repo.clone(),
                 workspace: name.clone(),
                 workspace_incarnation: workspace.incarnation().clone(),

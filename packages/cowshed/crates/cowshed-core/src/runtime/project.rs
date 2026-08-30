@@ -8268,8 +8268,8 @@ fn native_retired_refs(
 mod retired_recovery_tests {
     use super::*;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-        PublicationState,
+        DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PortBlock, PublicationState,
+        SIDECAR_VERSION,
     };
 
     #[test]
@@ -8289,7 +8289,7 @@ mod retired_recovery_tests {
             GrantSet::closed_baseline(Some(PortBlock::new(49_136, 16).unwrap())).unwrap();
         grants.revision = 4;
         DetachedWorkspaceMetadata {
-            version: METADATA_VERSION,
+            version: SIDECAR_VERSION,
             repo_id: repo_id.clone(),
             workspace: WorkspaceName::new("raven").unwrap(),
             workspace_incarnation: incarnation.clone(),
@@ -8332,7 +8332,7 @@ mod retired_recovery_tests {
         .unwrap();
         grants.revision = 8;
         DetachedWorkspaceMetadata {
-            version: METADATA_VERSION,
+            version: SIDECAR_VERSION,
             repo_id: repo_id.clone(),
             workspace: WorkspaceName::new("main").unwrap(),
             workspace_incarnation: incarnation.clone(),
@@ -8875,13 +8875,13 @@ mod doctor_hint_tests {
     use super::*;
     use crate::git::{CowshedUpstream, MergeDriver, MergeDriverState};
     use crate::metadata::{
-        ImageFormat, METADATA_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole,
+        ImageFormat, MARKER_VERSION, WorkspaceIncarnation, WorkspaceMarker, WorkspaceRole,
     };
     use std::path::PathBuf;
 
     fn marker(project_root: &str, workspace: &str) -> WorkspaceMarker {
         WorkspaceMarker {
-            version: METADATA_VERSION,
+            version: MARKER_VERSION,
             repo_id: crate::repository::RepoId::parse("acme/widget").expect("repo"),
             project_root: PathBuf::from(project_root),
             workspace: WorkspaceName::new(workspace).expect("workspace"),
@@ -9082,13 +9082,13 @@ mod doctor_hint_tests {
 mod git_worktree_tests {
     use super::*;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-        PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole,
+        DetachedWorkspaceMetadata, GrantSet, ImageFormat, Platform, PortBlock, PublicationState,
+        SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceRole,
     };
 
     fn sidecar(git_worktree: bool) -> DetachedWorkspaceMetadata {
         DetachedWorkspaceMetadata {
-            version: METADATA_VERSION,
+            version: SIDECAR_VERSION,
             repo_id: RepoId::parse("acme/widget").expect("repo identity"),
             workspace: WorkspaceName::new("raven").expect("workspace name"),
             workspace_incarnation: WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c80")
@@ -9207,9 +9207,9 @@ mod workspace_marker_reader_tests {
 mod workspace_origin_tests {
     use super::*;
     use crate::metadata::{
-        DetachedWorkspaceMetadata, GrantSet, ImageFormat, METADATA_VERSION, Platform, PortBlock,
-        PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker,
-        WorkspaceRole,
+        DetachedWorkspaceMetadata, GrantSet, ImageFormat, MARKER_VERSION, Platform, PortBlock,
+        PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
+        WorkspaceMarker, WorkspaceRole,
     };
     use crate::storage::lifecycle::{
         DerivedWorkspace, LifecycleWorkspace, MountState, Revision, StorageFact,
@@ -9234,7 +9234,7 @@ mod workspace_origin_tests {
         crate::metadata::write_json(
             &path,
             &WorkspaceMarker {
-                version: METADATA_VERSION,
+                version: MARKER_VERSION,
                 repo_id: RepoId::parse("acme/widget").expect("repo"),
                 project_root: project_root.to_owned(),
                 workspace: WorkspaceName::new(workspace).expect("workspace"),
@@ -9280,7 +9280,7 @@ mod workspace_origin_tests {
         incarnation: WorkspaceIncarnation,
     ) -> DetachedWorkspaceMetadata {
         DetachedWorkspaceMetadata {
-            version: METADATA_VERSION,
+            version: SIDECAR_VERSION,
             repo_id: RepoId::parse("acme/widget").expect("repo"),
             workspace: WorkspaceName::new("main").expect("main"),
             workspace_incarnation: incarnation,
