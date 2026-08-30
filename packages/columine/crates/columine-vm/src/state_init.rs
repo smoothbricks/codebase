@@ -28,7 +28,7 @@ use columine_types::types::{
     EvictionEntry, Opcode, PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE,
     STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags,
     StateFlags, StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size,
-    has_array_fields, next_power_of_2,
+    has_array_fields, is_array_field_type, next_power_of_2,
 };
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -1405,10 +1405,13 @@ pub fn grow_state(
                             }
                             let row_base = new_rows_base + ki * rs;
                             for fi in 0..nf {
-                                // Array detection is based on the raw field byte;
-                                // values below 5 are scalar fields.
                                 let ft_byte = field_types[fi as usize];
-                                if ft_byte < 5 {
+                                let Some(field_type) = StructFieldType::from_u8(ft_byte) else {
+                                    columine_types::die!(
+                                        "invariant: struct-map descriptor contains an invalid field type"
+                                    );
+                                };
+                                if !is_array_field_type(field_type) {
                                     continue;
                                 }
 
@@ -1426,13 +1429,7 @@ pub fn grow_state(
                                     continue;
                                 }
 
-                                let elem_sz = arena_elem_size(
-                                    StructFieldType::from_u8(ft_byte).unwrap_or_else(|| {
-                                        columine_types::die!(
-                                            "validated array field type vanished during growth"
-                                        )
-                                    }),
-                                );
+                                let elem_sz = arena_elem_size(field_type);
                                 let byte_len = arr_len * elem_sz;
 
                                 bytes::copy(
