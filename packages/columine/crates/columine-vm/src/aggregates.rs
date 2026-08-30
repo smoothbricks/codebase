@@ -16,20 +16,21 @@
 //! profile applies where digests are formed.
 
 use crate::bytes;
+use columine_types::types::AggType;
 
 /// AggType discriminants switched on by this module. Initialization operates
 /// on the raw metadata byte, not the enum: the capacity byte passes through,
 /// and bytes outside the enum (or scalar subtypes) take the zero-fill default.
 /// Converting through `AggType::from_u8` would silently rewrite invalid bytes;
 /// the raw byte is the contract.
-const AGG_SUM: u8 = 1;
-const AGG_COUNT: u8 = 2;
-const AGG_MIN: u8 = 3;
-const AGG_MAX: u8 = 4;
-const AGG_AVG: u8 = 5;
-const AGG_SUM_I64: u8 = 11;
-const AGG_MIN_I64: u8 = 12;
-const AGG_MAX_I64: u8 = 13;
+const AGG_SUM: u8 = AggType::Sum as u8;
+const AGG_COUNT: u8 = AggType::Count as u8;
+const AGG_MIN: u8 = AggType::Min as u8;
+const AGG_MAX: u8 = AggType::Max as u8;
+const AGG_AVG: u8 = AggType::Avg as u8;
+const AGG_SUM_I64: u8 = AggType::SumI64 as u8;
+const AGG_MIN_I64: u8 = AggType::MinI64 as u8;
+const AGG_MAX_I64: u8 = AggType::MaxI64 as u8;
 
 /// `AggSlot(agg).byte_size` — 8 for COUNT, 16 for everything else.
 pub const fn agg_slot_byte_size(agg_type_byte: u8) -> u32 {

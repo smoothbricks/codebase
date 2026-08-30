@@ -3,6 +3,7 @@
 //! The stress tests exercise `FlatTable` rehashing alongside the container
 //! family.
 
+use crate::aggregates;
 use crate::bytes;
 use columine_types::types::{CONDITION_TREE_STATE_BYTES, EMPTY_KEY, SlotType, TOMBSTONE, hash_key};
 
@@ -20,13 +21,7 @@ pub fn slot_data_size(
         }
         SlotType::HashSet => capacity * 4,
         // COUNT=8, others=16
-        SlotType::Aggregate => {
-            if agg_type_byte == 2 {
-                8
-            } else {
-                16
-            }
-        }
+        SlotType::Aggregate => aggregates::agg_slot_byte_size(agg_type_byte),
         // Condition state + interleaved u64 identities + u32 low/high values.
         SlotType::ConditionTree => {
             CONDITION_TREE_STATE_BYTES + if capacity > 0 { capacity * 16 } else { 0 }
@@ -46,6 +41,38 @@ pub fn slot_data_size(
 
 /// Rehash HASHMAP keys and values, carrying the timestamps side-array when
 /// present. Return the number of entries rehashed.
+fn rehash_occupied(
+    old_state: &[u8],
+    new_state: &mut [u8],
+    old_keys: u32,
+    new_keys: u32,
+    old_cap: u32,
+    new_cap: u32,
+    hash: impl Fn(&[u8], u32, u32) -> u32,
+    mut on_place: impl FnMut(&mut [u8], u32, u32),
+) -> u32 {
+    debug_assert!(new_cap.is_power_of_two() && new_cap > 0);
+    bytes::fill_u32(new_state, new_keys, new_cap, EMPTY_KEY);
+    let mask = new_cap - 1;
+    let mut rehashed = 0u32;
+    for i in 0..old_cap {
+        let k = bytes::read_u32(old_state, old_keys + i * 4);
+        if k == EMPTY_KEY || k == TOMBSTONE {
+            continue;
+        }
+        let mut pos = hash(old_state, i, k);
+        while bytes::read_u32(new_state, new_keys + pos * 4) != EMPTY_KEY {
+            pos = (pos + 1) & mask;
+        }
+        bytes::write_u32(new_state, new_keys + pos * 4, k);
+        on_place(new_state, i, pos);
+        rehashed += 1;
+    }
+    rehashed
+}
+
+/// Rehash HASHMAP keys and values, carrying the timestamps side-array when
+/// present. Return the number of entries rehashed.
 pub fn grow_hash_map(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -55,32 +82,27 @@ pub fn grow_hash_map(
     new_cap: u32,
     has_timestamps: bool,
 ) -> u32 {
-    bytes::fill_u32(new_state, new_offset, new_cap, EMPTY_KEY);
-
     let old_vals = old_offset + old_cap * 4;
     let new_vals = new_offset + new_cap * 4;
     let old_ts = old_offset + old_cap * 8;
     let new_ts = new_offset + new_cap * 8;
-
-    let mut rehashed = 0u32;
-    for i in 0..old_cap {
-        let k = bytes::read_u32(old_state, old_offset + i * 4);
-        if k != EMPTY_KEY && k != TOMBSTONE {
-            let mut pos = hash_key(k, new_cap);
-            while bytes::read_u32(new_state, new_offset + pos * 4) != EMPTY_KEY {
-                pos = (pos + 1) & (new_cap - 1);
-            }
-            bytes::write_u32(new_state, new_offset + pos * 4, k);
+    rehash_occupied(
+        old_state,
+        new_state,
+        old_offset,
+        new_offset,
+        old_cap,
+        new_cap,
+        |_, _, k| hash_key(k, new_cap),
+        |new_state, i, pos| {
             let value = bytes::read_u32(old_state, old_vals + i * 4);
             bytes::write_u32(new_state, new_vals + pos * 4, value);
             if has_timestamps {
                 let ts = bytes::read_f64(old_state, old_ts + i * 8);
                 bytes::write_f64(new_state, new_ts + pos * 8, ts);
             }
-            rehashed += 1;
-        }
-    }
-    rehashed
+        },
+    )
 }
 
 /// Rehash HASHSET keys and return the number of entries rehashed.
@@ -92,26 +114,20 @@ pub fn grow_hash_set(
     old_cap: u32,
     new_cap: u32,
 ) -> u32 {
-    bytes::fill_u32(new_state, new_offset, new_cap, EMPTY_KEY);
-
-    let mut rehashed = 0u32;
-    for i in 0..old_cap {
-        let k = bytes::read_u32(old_state, old_offset + i * 4);
-        if k != EMPTY_KEY && k != TOMBSTONE {
-            let mut pos = hash_key(k, new_cap);
-            while bytes::read_u32(new_state, new_offset + pos * 4) != EMPTY_KEY {
-                pos = (pos + 1) & (new_cap - 1);
-            }
-            bytes::write_u32(new_state, new_offset + pos * 4, k);
-            rehashed += 1;
-        }
-    }
-    rehashed
+    rehash_occupied(
+        old_state,
+        new_state,
+        old_offset,
+        new_offset,
+        old_cap,
+        new_cap,
+        |_, _, k| hash_key(k, new_cap),
+        |_, _, _| {},
+    )
 }
 
 /// Copy a STRUCT_MAP descriptor, rehash keys, and move live rows to their new
 /// probe positions. Return the number of entries rehashed.
-#[allow(clippy::too_many_arguments)]
 pub fn grow_struct_map(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -123,25 +139,20 @@ pub fn grow_struct_map(
     row_size: u32,
 ) -> u32 {
     let desc_size = columine_types::types::align8(num_fields);
-
     bytes::copy(new_state, new_offset, old_state, old_offset, num_fields);
-
     let old_keys_offset = old_offset + desc_size;
     let new_keys_offset = new_offset + desc_size;
-    bytes::fill_u32(new_state, new_keys_offset, new_cap, EMPTY_KEY);
-
     let old_rows_base = old_keys_offset + old_cap * 4;
     let new_rows_base = new_keys_offset + new_cap * 4;
-
-    let mut rehashed = 0u32;
-    for i in 0..old_cap {
-        let k = bytes::read_u32(old_state, old_keys_offset + i * 4);
-        if k != EMPTY_KEY && k != TOMBSTONE {
-            let mut pos = hash_key(k, new_cap);
-            while bytes::read_u32(new_state, new_keys_offset + pos * 4) != EMPTY_KEY {
-                pos = (pos + 1) & (new_cap - 1);
-            }
-            bytes::write_u32(new_state, new_keys_offset + pos * 4, k);
+    rehash_occupied(
+        old_state,
+        new_state,
+        old_keys_offset,
+        new_keys_offset,
+        old_cap,
+        new_cap,
+        |_, _, k| hash_key(k, new_cap),
+        |new_state, i, pos| {
             bytes::copy(
                 new_state,
                 new_rows_base + pos * row_size,
@@ -149,15 +160,12 @@ pub fn grow_struct_map(
                 old_rows_base + i * row_size,
                 row_size,
             );
-            rehashed += 1;
-        }
-    }
-    rehashed
+        },
+    )
 }
 
 /// Rehash an exact two-lane-key struct map while preserving both key cells
 /// and each row byte-for-byte.
-#[allow(clippy::too_many_arguments)]
 pub fn grow_struct_map2(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -170,39 +178,36 @@ pub fn grow_struct_map2(
 ) -> u32 {
     let desc_size = columine_types::types::align8(num_fields);
     bytes::copy(new_state, new_offset, old_state, old_offset, num_fields);
-
     let old_keys1 = old_offset + desc_size;
     let old_keys2 = old_keys1 + old_cap * 4;
     let old_rows = old_keys2 + old_cap * 4;
     let new_keys1 = new_offset + desc_size;
     let new_keys2 = new_keys1 + new_cap * 4;
     let new_rows = new_keys2 + new_cap * 4;
-    bytes::fill_u32(new_state, new_keys1, new_cap, EMPTY_KEY);
     bytes::zero(new_state, new_keys2, new_cap * 4);
-
-    let mut rehashed = 0;
-    for i in 0..old_cap {
-        let key1 = bytes::read_u32(old_state, old_keys1 + i * 4);
-        if key1 == EMPTY_KEY || key1 == TOMBSTONE {
-            continue;
-        }
-        let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
-        let mut pos = columine_types::types::hash_key_pair(key1, key2, new_cap);
-        while bytes::read_u32(new_state, new_keys1 + pos * 4) != EMPTY_KEY {
-            pos = (pos + 1) & (new_cap - 1);
-        }
-        bytes::write_u32(new_state, new_keys1 + pos * 4, key1);
-        bytes::write_u32(new_state, new_keys2 + pos * 4, key2);
-        bytes::copy(
-            new_state,
-            new_rows + pos * row_size,
-            old_state,
-            old_rows + i * row_size,
-            row_size,
-        );
-        rehashed += 1;
-    }
-    rehashed
+    rehash_occupied(
+        old_state,
+        new_state,
+        old_keys1,
+        new_keys1,
+        old_cap,
+        new_cap,
+        |old_state, i, key1| {
+            let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
+            columine_types::types::hash_key_pair(key1, key2, new_cap)
+        },
+        |new_state, i, pos| {
+            let key2 = bytes::read_u32(old_state, old_keys2 + i * 4);
+            bytes::write_u32(new_state, new_keys2 + pos * 4, key2);
+            bytes::copy(
+                new_state,
+                new_rows + pos * row_size,
+                old_state,
+                old_rows + i * row_size,
+                row_size,
+            );
+        },
+    )
 }
 
 #[cfg(test)]

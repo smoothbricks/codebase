@@ -49,12 +49,8 @@ pub fn read_nested_prefix(state: &[u8], slot_offset: u32) -> NestedPrefix {
     NestedPrefix {
         inner_type,
         inner_initial_cap: u16::from(state[base + 1]) | (u16::from(state[base + 2]) << 8),
-        // readNestedPrefix normalizes out-of-range bytes to SUM (=1).
-        inner_agg_type_byte: if (1..=13).contains(&agg_byte) {
-            agg_byte
-        } else {
-            1
-        },
+        // Raw byte: `nested_agg_update` fails closed via AggType::from_u8.
+        inner_agg_type_byte: agg_byte,
         depth: state[base + 4],
     }
 }
@@ -258,7 +254,7 @@ impl OuterTable {
                 is_new: false,
             });
         }
-        if self.size(state) >= self.cap * 7 / 10 {
+        if self.size(state) >= hash_table::max_load_for_cap(self.cap) {
             return None;
         }
 
