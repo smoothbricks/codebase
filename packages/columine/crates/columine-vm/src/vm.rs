@@ -23,7 +23,7 @@ use crate::hashset_ops;
 use crate::hooks::{MutationOp, MutationRecord, VmHooks};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
-use crate::state_init::{self, ARENA_HEADER_SIZE, NEEDS_GROWTH_SLOT};
+use crate::state_init::{self, ARENA_HEADER_SIZE, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
 use crate::struct_map::{StructMap2Slot, StructMapSlot};
 use crate::undo_log::{
     self, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, SMF_BIT_SET, SMF_ROW_ABSENT,
@@ -152,9 +152,8 @@ pub fn col_at<'a>(cols: &[&'a [u8]], idx: usize) -> &'a [u8] {
 // Eviction entries — 16-byte little-endian records
 
 /// `EvictionEntry` layout: `timestamp:f64 @0, key_or_idx:u32 @8, value:u32 @12`
-/// (16 bytes; layout pinned in columine-types). Accessors below address entry
-/// `i` of the index/buffer starting at `base`.
-pub const EVICTION_ENTRY_SIZE: u32 = 16;
+/// (layout pinned in columine-types; byte size is `state_init::EVICTION_ENTRY_SIZE`).
+/// Accessors below address entry `i` of the index/buffer starting at `base`.
 
 fn evict_ts(state: &[u8], base: u32, i: u32) -> f64 {
     bytes::read_f64(state, base + i * EVICTION_ENTRY_SIZE)

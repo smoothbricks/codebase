@@ -11,7 +11,7 @@ use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::nested_slot_data_size;
 use columine_vm::slot_growth::slot_data_size;
 use columine_vm::state_init::{
-    EVICTION_ENTRY_SIZE, arena_initial_capacity_64, calculate_grown_state_size,
+    EVICTED_BUFFER_CAP, EVICTION_ENTRY_SIZE, arena_initial_capacity_64, calculate_grown_state_size,
     calculate_state_size, compute_struct_row_layout_padded, grow_state, init_state, reset_state,
     struct_map_slot_data_size, ttl_side_buffer_size,
 };
@@ -337,7 +337,8 @@ fn ttl_side_buffer_size_ttl_only() {
 #[test]
 fn ttl_side_buffer_size_ttl_plus_evict_trigger() {
     let cap = 32;
-    let expected = align8(cap * EVICTION_ENTRY_SIZE) + align8(1024 * EVICTION_ENTRY_SIZE);
+    let expected =
+        align8(cap * EVICTION_ENTRY_SIZE) + align8(EVICTED_BUFFER_CAP * EVICTION_ENTRY_SIZE);
     assert_eq!(ttl_side_buffer_size(true, true, cap), expected);
 }
 
@@ -751,7 +752,9 @@ fn calculate_state_size_ttl_hashset_adds_eviction_buffers() {
             &ttl_evict,
             columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
         ),
-        base_size + align8(cap * EVICTION_ENTRY_SIZE) + align8(1024 * EVICTION_ENTRY_SIZE)
+        base_size
+            + align8(cap * EVICTION_ENTRY_SIZE)
+            + align8(EVICTED_BUFFER_CAP * EVICTION_ENTRY_SIZE)
     );
 }
 
