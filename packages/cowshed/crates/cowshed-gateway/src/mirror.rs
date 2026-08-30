@@ -920,11 +920,12 @@ fn parse_protocol_expectation(
     let Some(integrity) = integrity else {
         return Ok(None);
     };
-    let digest = if let Some(hex) = integrity.strip_prefix("sha256-") {
-        ObjectDigest::Sha256(decode_hex_32(hex).ok_or(MirrorError::MissingIntegrity)?)
-    } else {
-        parse_sri(&integrity).ok_or(MirrorError::MissingIntegrity)?
-    };
+    let digest = integrity
+        .strip_prefix("sha256-")
+        .and_then(decode_hex_32)
+        .map(ObjectDigest::Sha256)
+        .or_else(|| parse_sri(&integrity))
+        .ok_or(MirrorError::MissingIntegrity)?;
     Ok(Some(ObjectExpectation { length, digest }))
 }
 
@@ -1215,5 +1216,31 @@ mod tests {
         crate::proxy::strip_upstream_response_headers(&mut generic_response);
         assert_eq!(mirror_response, generic_response);
         assert!(mirror_response.is_empty());
+    }
+
+    #[test]
+    fn sha256_sri_and_cargo_hex_use_their_own_decoders() {
+        let digest = [7; 32];
+        let sri = format!("sha256-{}", STANDARD.encode(digest));
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("cowshed-integrity", &sri)
+            .finish();
+        let parsed = parse_protocol_expectation(&format!("/package?{query}"))
+            .expect("valid expectation")
+            .expect("integrity present");
+        assert_eq!(parsed.digest, ObjectDigest::Sha256(digest));
+
+        let cargo_hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let cargo = format!("sha256-{cargo_hex}");
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("cowshed-integrity", &cargo)
+            .finish();
+        let parsed = parse_protocol_expectation(&format!("/crate?{query}"))
+            .expect("valid expectation")
+            .expect("integrity present");
+        assert_eq!(parsed.digest, ObjectDigest::Sha256(digest));
     }
 }
