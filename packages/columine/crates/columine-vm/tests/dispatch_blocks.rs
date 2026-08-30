@@ -2,7 +2,7 @@
 //! timestamp inheritance, ORDERED_LIST, struct-map iteration/growth, and array
 //! fields. Scenarios pin the corresponding ABI behavior.
 
-use columine_types::opcodes::PROGRAM_MAGIC;
+use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{
     AggType, ErrorCode, Opcode, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, align8,
 };

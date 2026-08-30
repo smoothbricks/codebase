@@ -21,7 +21,7 @@
 //! `InvalidProgram`/0 rather than invoking undefined behavior.
 
 use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
-pub use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
+pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
     PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, SLOT_META_SIZE, STATE_FORMAT_VERSION,

@@ -6,7 +6,7 @@
 //! `unsafe` throughout is the point: this exercises the exact C ABI calls
 //! the TS backends make.
 
-use columine_types::opcodes::PROGRAM_MAGIC;
+use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_wasm::{
     __register_region, vm_calculate_state_size, vm_delta_export_entry_size,
