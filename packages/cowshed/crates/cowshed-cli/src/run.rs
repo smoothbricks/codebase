@@ -35,21 +35,21 @@ pub async fn run(arguments: Vec<OsString>) -> i32 {
             }
         };
     }
-    let json = option_before_child_argv(&arguments, "--json");
-    let quiet = option_before_child_argv(&arguments, "--quiet")
-        || option_before_child_argv(&arguments, "-q");
-    match parse_then_invoke_service(arguments, run_parsed).await {
+    match parse_then_invoke_service(&arguments, run_parsed).await {
         Ok(exit_code) => exit_code,
         Err(error) => {
             let command_map = error.command_map();
+            // Only a refused line needs the argv walked: an accepted one answers from
+            // `parsed.global`, so scanning it up front was three passes nothing read.
+            let globals = args::globals_before_child_argv(&arguments);
             let error = CowshedError::usage(error.message, error.hint);
-            emit_error(error, command_map, json, quiet)
+            emit_error(error, command_map, globals.json, globals.quiet)
         }
     }
 }
 
 async fn parse_then_invoke_service<F, Fut>(
-    arguments: Vec<OsString>,
+    arguments: &[OsString],
     invoke: F,
 ) -> Result<i32, args::UsageError>
 where
@@ -192,12 +192,6 @@ fn write_error<W: io::Write, E: io::Write>(
     output.hint(&error.hint)
 }
 
-fn option_before_child_argv(args: &[OsString], option: &str) -> bool {
-    args.iter()
-        .take_while(|argument| argument.as_os_str() != OsStr::new("--"))
-        .any(|argument| argument == option)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,13 +215,11 @@ mod tests {
 
         for invocation in invocations {
             let service_invoked = Cell::new(false);
-            let result = parse_then_invoke_service(
-                invocation.into_iter().map(OsString::from).collect(),
-                |_| {
-                    service_invoked.set(true);
-                    async { 0 }
-                },
-            )
+            let argv: Vec<OsString> = invocation.into_iter().map(OsString::from).collect();
+            let result = parse_then_invoke_service(&argv, |_| {
+                service_invoked.set(true);
+                async { 0 }
+            })
             .await;
 
             assert!(result.is_err());

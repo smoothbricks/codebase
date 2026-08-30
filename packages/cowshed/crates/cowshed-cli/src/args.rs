@@ -932,6 +932,47 @@ fn verb_from_argv(args: &[OsString]) -> Option<&str> {
     None
 }
 
+/// The output-shaping globals a refused line asked for.
+///
+/// Only `--json` and `--quiet`, because only they decide how a refusal is written. A walk cannot
+/// answer `--project` honestly — it cannot tell a missing value from an absent flag the way the
+/// parser can — so it does not claim to.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OutputGlobals {
+    pub json: bool,
+    pub quiet: bool,
+}
+
+/// Read the output globals by walking a line instead of parsing it.
+///
+/// A usage error is by definition a line the parser refused, so there is no [`Cli`] to take
+/// `--json` and `--quiet` from, and the refusal still has to be written in the shape the caller
+/// asked for. This is [`verb_from_argv`]'s walk: it stops at `--`, because everything after that
+/// is a child's argv and none of it is addressed to cowshed, and it steps over `--project`'s
+/// value, because a git root spelled `--json` is a path. A scan that reads that path as a flag
+/// answers `cowshed --project --json <bogus>` with a JSON envelope nobody requested.
+#[must_use]
+pub fn globals_before_child_argv(args: &[OsString]) -> OutputGlobals {
+    let mut globals = OutputGlobals::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].to_str() {
+            Some("--") => break,
+            Some("--project") => index += 2,
+            Some("--json") => {
+                globals.json = true;
+                index += 1;
+            }
+            Some("-q" | "--quiet") => {
+                globals.quiet = true;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    globals
+}
+
 fn first_unrecognized(args: &[OsString]) -> Option<&str> {
     args.iter()
         .filter_map(|argument| argument.to_str())
@@ -2030,6 +2071,55 @@ mod tests {
         assert_eq!(short, long);
         assert!(short.global.quiet);
         assert!(short.global.json);
+    }
+
+    /// The pre-parse walk answers about output shape exactly as the parser would, and it does not
+    /// mistake a value for a flag.
+    ///
+    /// `globals_before_child_argv` exists only because a refused line has no parsed `Cli` to read
+    /// `--json` from. Two ways for that to go wrong, both of which put a refusal in a shape nobody
+    /// asked for: disagreeing with the parser on an accepted line, and reading `--project`'s value
+    /// — a git root, which may be spelled anything at all — as a global.
+    #[test]
+    fn the_pre_parse_scan_reads_the_same_output_globals_the_parser_does() {
+        let argv = |words: &[&str]| -> Vec<OsString> {
+            words.iter().copied().map(OsString::from).collect()
+        };
+
+        for words in [
+            vec!["ls"],
+            vec!["--json", "ls"],
+            vec!["ls", "--json"],
+            vec!["-q", "ls", "--json"],
+            vec!["ls", "--quiet"],
+            vec!["--project", "/repo", "--json", "ls"],
+            vec!["gateway", "status", "--json"],
+        ] {
+            let parsed = parse_args(words.iter().copied()).expect("accepted line");
+            let walked = globals_before_child_argv(&argv(&words));
+            assert_eq!(
+                (walked.json, walked.quiet),
+                (parsed.global.json, parsed.global.quiet),
+                "{words:?}"
+            );
+        }
+
+        // A git root spelled like a flag is still a git root.
+        let walked = globals_before_child_argv(&argv(&["--project", "--json", "bogusverb"]));
+        assert!(
+            !walked.json,
+            "--project's value is a path, not a request for JSON"
+        );
+        let walked = globals_before_child_argv(&argv(&["--project", "-q", "bogusverb"]));
+        assert!(
+            !walked.quiet,
+            "--project's value is a path, not a request for silence"
+        );
+
+        // Everything after `--` is the child's argv and is addressed to the child.
+        let walked =
+            globals_before_child_argv(&argv(&["exec", "raven", "--", "printf", "--json", "-q"]));
+        assert_eq!((walked.json, walked.quiet), (false, false));
     }
 
     #[test]
