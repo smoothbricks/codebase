@@ -35,6 +35,9 @@ use cowshed_core::storage::bootstrap::{
     STORE_ROOT, ValidatedHostStorage, VolumeRole, VolumeState, execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
+use cowshed_core::storage::job_artifact::{
+    ArtifactConfig, ArtifactRepairReport, repair_workspace_record_sequences,
+};
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
@@ -158,7 +161,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Skill(_)
         | Command::Version
         | Command::Help(_)
-        | Command::Doctor => RuntimeOpenMode::ExistingOnly,
+        | Command::Doctor(_) => RuntimeOpenMode::ExistingOnly,
     }
 }
 
@@ -308,15 +311,11 @@ async fn adopted_projects() -> Result<Vec<AdoptedProject>> {
         .map_err(project_inventory_error)
 }
 
-/// Which adopted projects have no mounted main, read straight from the host store.
-///
-/// Host-scoped rather than project-scoped on purpose: mains are always-mounted across every
-/// adopted project, so the answer must not depend on where `doctor` was run from.
-async fn unmounted_mains() -> Result<Vec<UnreachableMain>> {
+async fn doctor_projects() -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>)> {
     let home = gateway_service::canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
     NativeGatewayInventory::new(storage)
-        .unmounted_mains()
+        .doctor_projects()
         .await
         .map_err(project_inventory_error)
 }
@@ -1090,7 +1089,7 @@ where
             }
             Ok(success())
         }
-        Command::Doctor => {
+        Command::Doctor(_) => {
             let report = service.doctor().await?;
             let healthy = report.healthy;
             if json {
@@ -2881,34 +2880,27 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         }),
     }
     if diagnosis.storage_ready {
-        match adopted_projects().await {
-            Ok(projects) => diagnosis.findings.push(Finding {
-                code: "workspace-inventory".into(),
-                severity: FindingSeverity::Info,
-                message: format!("{} adopted project(s) recorded", projects.len()),
-                hint: if projects.is_empty() {
-                    "cowshed adopt <git-root>".into()
-                } else {
-                    String::new()
-                },
-                path: None,
-            }),
+        // One registry traversal supplies both findings. Besides avoiding redundant I/O, this
+        // guarantees one diagnostic per skipped registry entry rather than one per derived view.
+        match doctor_projects().await {
+            Ok((projects, mains)) => {
+                diagnosis.findings.push(Finding {
+                    code: "workspace-inventory".into(),
+                    severity: FindingSeverity::Info,
+                    message: format!("{} adopted project(s) recorded", projects.len()),
+                    hint: if projects.is_empty() {
+                        "cowshed adopt <git-root>".into()
+                    } else {
+                        String::new()
+                    },
+                    path: None,
+                });
+                diagnosis
+                    .findings
+                    .extend(mains.iter().map(main_mount_finding));
+            }
             Err(error) => diagnosis.findings.push(Finding {
                 code: "workspace-inventory".into(),
-                severity: FindingSeverity::Error,
-                message: error.message,
-                hint: error.hint,
-                path: None,
-            }),
-        }
-        // Every adopted project, not whichever one the cwd sits in: mains are always-mounted, and
-        // the same host state has to yield the same verdict from any directory (06_cli.md rule 4).
-        match unmounted_mains().await {
-            Ok(mains) => diagnosis
-                .findings
-                .extend(mains.iter().map(main_mount_finding)),
-            Err(error) => diagnosis.findings.push(Finding {
-                code: "main-mounts".into(),
                 severity: FindingSeverity::Error,
                 message: error.message,
                 hint: error.hint,
@@ -2928,14 +2920,26 @@ fn doctor_report(findings: Vec<Finding>) -> DoctorReport {
     }
 }
 
-fn emit_project_checks_skipped<W: Write, E: Write>(
+fn record_project_checks_skipped<W: Write, E: Write>(
     output: &mut Output<W, E>,
+    findings: &mut Vec<Finding>,
     error: Option<&CowshedError>,
+    path: Option<PathBuf>,
 ) -> Result<()> {
     let message = error.map_or_else(
         || "project checks skipped: no adopted checkout at cwd".to_owned(),
         |error| format!("project checks skipped: {}", error.message),
     );
+    findings.push(Finding {
+        code: "project-checks-skipped".into(),
+        severity: FindingSeverity::Error,
+        message: message.clone(),
+        hint: error.map_or_else(
+            || "run from an adopted checkout or pass --project <git-root>".to_owned(),
+            |error| error.hint.clone(),
+        ),
+        path,
+    });
     output.note(&message).map_err(output_error)
 }
 
@@ -2955,13 +2959,110 @@ fn emit_doctor_report<W: Write, E: Write>(
     })
 }
 
+async fn repair_project_artifacts(project_root: &Path) -> Result<Vec<Finding>> {
+    let canonical_root = fs::canonicalize(project_root).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot resolve project root {} for artifact repair: {error}",
+                project_root.display()
+            ),
+            "cowshed --project <git-root> doctor --repair",
+        )
+    })?;
+    let projects = list_all_adopted_projects().await?;
+    let project = projects
+        .into_iter()
+        .find(|project| {
+            project.workspaces.iter().any(|workspace| {
+                workspace.role == WorkspaceRole::Main
+                    && fs::canonicalize(&workspace.mount).is_ok_and(|mount| mount == canonical_root)
+            })
+        })
+        .ok_or_else(|| {
+            CowshedError::not_found(
+                format!(
+                    "{} is not the main mount of an adopted project",
+                    project_root.display()
+                ),
+                "cowshed ls --all --json",
+            )
+        })?;
+    let retained_budget = ArtifactConfig::default().retained_recovery_budget_bytes;
+    let mut findings = Vec::new();
+    for workspace in project
+        .workspaces
+        .into_iter()
+        .filter(|workspace| workspace.state == WorkspaceState::Attached)
+    {
+        let mount = workspace.mount.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            repair_workspace_record_sequences(&mount, retained_budget)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("artifact repair task failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::integrity(
+                error.to_string(),
+                "the log was not replaced; inspect its pre-repair bytes",
+            )
+        })?;
+        if let Some(finding) = artifact_repair_finding(&workspace.workspace, report) {
+            findings.push(finding);
+        }
+    }
+    Ok(findings)
+}
+
+fn artifact_repair_finding(
+    workspace: &WorkspaceName,
+    report: ArtifactRepairReport,
+) -> Option<Finding> {
+    let backup = report.backup_path?;
+    let first = report
+        .violations
+        .first()
+        .expect("a repaired log records its ordering violation");
+    Some(Finding {
+        code: "artifact-sequence-repaired".into(),
+        severity: FindingSeverity::Info,
+        message: format!(
+            "repaired workspace {workspace}: resequenced {} of {} records; byte {} held job {} sequence {} after byte {} job {} sequence {}",
+            report.resequenced_records,
+            report.frame_count,
+            first.offset,
+            first.current.job_id.get(),
+            first.current.sequence,
+            first.previous_offset,
+            first.previous.job_id.get(),
+            first.previous.sequence,
+        ),
+        hint: format!("byte-for-byte original: {}", backup.display()),
+        path: Some(report.records_path),
+    })
+}
+
 async fn run_doctor_command<W, E>(cli: Cli, output: &mut Output<W, E>) -> Result<DispatchExit>
 where
     W: Write + Send,
     E: Write + Send,
 {
+    let repair = matches!(&cli.command, Command::Doctor(args) if args.repair);
     let project_root = resolve_project_root(&cli).await;
     let mut diagnosis = diagnose_host().await?;
+    if repair && diagnosis.storage_ready {
+        if let Ok(root) = project_root.as_ref() {
+            match repair_project_artifacts(root).await {
+                Ok(findings) => diagnosis.findings.extend(findings),
+                Err(error) => diagnosis.findings.push(Finding {
+                    code: "artifact-repair".into(),
+                    severity: FindingSeverity::Error,
+                    message: error.message,
+                    hint: error.hint,
+                    path: Some(root.clone()),
+                }),
+            }
+        }
+    }
     if diagnosis.storage_ready {
         match project_root {
             Ok(root) => match ActorBridge::open_existing(&root).await {
@@ -2999,13 +3100,21 @@ where
                         });
                     }
                 }
-                // Opening cwd is enrichment only: stale identity or remote-name bindings belong to
-                // that checkout, while the host storage, services, and store-wide inventory above
-                // remain authoritative. Reporting an open failure as a host error made the same
-                // machine healthy or unhealthy solely according to which clone invoked doctor.
-                Err(error) => emit_project_checks_skipped(output, Some(&error))?,
+                // A project-open failure means none of its invariants ran. Host findings remain
+                // useful, but an unobserved project is never a healthy project.
+                Err(error) => record_project_checks_skipped(
+                    output,
+                    &mut diagnosis.findings,
+                    Some(&error),
+                    Some(root),
+                )?,
             },
-            Err(_) => emit_project_checks_skipped(output, None)?,
+            Err(error) => record_project_checks_skipped(
+                output,
+                &mut diagnosis.findings,
+                Some(&error),
+                cli.global.project.clone(),
+            )?,
         }
     }
     emit_doctor_report(output, cli.global.json, doctor_report(diagnosis.findings))
@@ -3044,7 +3153,7 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    if matches!(&cli.command, Command::Doctor) {
+    if matches!(&cli.command, Command::Doctor(_)) {
         return run_doctor_command(cli, output).await;
     }
     if let Command::Detach(args) = &cli.command
@@ -3138,10 +3247,15 @@ where
             emit_project_listing(output, cli.global.json, args, projects).await?;
             Ok(success())
         }
-        Command::Doctor => {
-            let diagnosis = diagnose_host().await?;
+        Command::Doctor(_) => {
+            let mut diagnosis = diagnose_host().await?;
             if project_checks_skipped {
-                emit_project_checks_skipped(output, None)?;
+                record_project_checks_skipped(
+                    output,
+                    &mut diagnosis.findings,
+                    None,
+                    cli.global.project.clone(),
+                )?;
             }
             emit_doctor_report(output, cli.global.json, doctor_report(diagnosis.findings))
         }
@@ -3672,24 +3786,27 @@ mod tests {
     }
 
     #[test]
-    fn repository_binding_mismatch_skips_project_checks_without_changing_host_verdict() {
+    fn skipped_project_checks_are_an_explicit_unhealthy_finding() {
         let mismatch = CowshedError::conflict(
             "repository binding remote codebase does not match Git configuration",
             "restore the recorded remote before opening cowshed",
         );
         let mut output = Output::new(Vec::new(), Vec::new(), false);
+        let mut findings = Vec::new();
 
-        emit_project_checks_skipped(&mut output, Some(&mismatch)).expect("skip note");
-        let report = doctor_report(Vec::new());
+        record_project_checks_skipped(
+            &mut output,
+            &mut findings,
+            Some(&mismatch),
+            Some(PathBuf::from("/repo")),
+        )
+        .expect("skip finding");
+        let report = doctor_report(findings);
 
-        assert!(report.healthy);
-        assert!(
-            report
-                .findings
-                .iter()
-                .all(|finding| finding.code != "project-open"),
-            "optional project-open failures do not become host findings"
-        );
+        assert!(!report.healthy);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].code, "project-checks-skipped");
+        assert_eq!(report.findings[0].severity, FindingSeverity::Error);
         let (_, stderr) = output.into_inner();
         assert_eq!(
             stderr,
