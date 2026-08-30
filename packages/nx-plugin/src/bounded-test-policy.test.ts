@@ -478,7 +478,7 @@ describe('cargo-test reachability policy', () => {
         ]),
         targetOptions: new Map([
           ...compileOnlyOptions,
-          ['cargo-test-rusty-core', { command: 'cargo --frozen nextest run --workspace --package rusty-core' }],
+          ['cargo-test-rusty-core', { command: 'cargo --frozen nextest run --package rusty-core' }],
         ]),
       };
       expect(
@@ -508,6 +508,78 @@ describe('cargo-test reachability policy', () => {
           resolvedTargetsByProject: new Map([['tsonly', tsOnly]]),
         }),
       ).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('flags per-crate cargo-test children that do not cover every workspace member', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-union-'));
+    try {
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      await writeJson(join(root, 'packages/rusty/package.json'), { name: 'rusty', nx: { name: 'rusty' } });
+      await mkdir(join(root, 'packages/rusty/crates/core'), { recursive: true });
+      await mkdir(join(root, 'packages/rusty/crates/cli'), { recursive: true });
+      await writeFile(
+        join(root, 'packages/rusty/Cargo.toml'),
+        '[workspace]\nmembers = ["crates/core", "crates/cli"]\n',
+      );
+      await writeFile(join(root, 'packages/rusty/crates/core/Cargo.toml'), '[package]\nname = "rusty-core"\n');
+      await writeFile(join(root, 'packages/rusty/crates/cli/Cargo.toml'), '[package]\nname = "rusty-cli"\n');
+
+      const runnerOptions = new Map<string, Record<string, unknown>>([
+        ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
+        ['cargo-test-rusty-core', { command: 'cargo --frozen nextest run --package rusty-core' }],
+        ['cargo-test-rusty-cli', { command: 'cargo --frozen nextest run --package rusty-cli' }],
+      ]);
+      const missingChild: ResolvedProjectTargets = {
+        root: 'packages/rusty',
+        targets: new Set(['test', 'cargo-test', 'cargo-test-compile', 'cargo-test-rusty-core']),
+        targetDependencies: new Map([
+          ['test', ['cargo-test']],
+          ['cargo-test', ['cargo-test-rusty-core']],
+          ['cargo-test-rusty-core', ['cargo-test-compile']],
+        ]),
+        targetExecutors: new Map([
+          ['test', 'nx:noop'],
+          ['cargo-test', 'nx:noop'],
+          ['cargo-test-compile', 'nx:run-commands'],
+          ['cargo-test-rusty-core', BOUNDED_TEST_EXECUTOR],
+        ]),
+        targetOptions: runnerOptions,
+      };
+      const issues = checkWorkspaceCargoTestReachabilityPolicy(root, {
+        resolvedTargetsByProject: new Map([['rusty', missingChild]]),
+      });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.message).toContain('rusty-cli');
+
+      const covered: ResolvedProjectTargets = {
+        ...missingChild,
+        targets: new Set([...missingChild.targets, 'cargo-test-rusty-cli']),
+        targetDependencies: new Map([
+          ['test', ['cargo-test']],
+          ['cargo-test', ['cargo-test-rusty-core', 'cargo-test-rusty-cli']],
+          ['cargo-test-rusty-core', ['cargo-test-compile']],
+          ['cargo-test-rusty-cli', ['cargo-test-rusty-core']],
+        ]),
+        targetExecutors: new Map([
+          ...(missingChild.targetExecutors ?? []),
+          ['cargo-test-rusty-cli', BOUNDED_TEST_EXECUTOR],
+        ]),
+      };
+      expect(
+        checkWorkspaceCargoTestReachabilityPolicy(root, {
+          resolvedTargetsByProject: new Map([['rusty', covered]]),
+        }),
+      ).toEqual([]);
+
+      await writeFile(join(root, 'packages/rusty/Cargo.toml'), '[workspace]\nmembers = ["crates/core"]\n');
+      const extra = checkWorkspaceCargoTestReachabilityPolicy(root, {
+        resolvedTargetsByProject: new Map([['rusty', covered]]),
+      });
+      expect(extra).toHaveLength(1);
+      expect(extra[0]?.message).toContain('rusty-cli');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
