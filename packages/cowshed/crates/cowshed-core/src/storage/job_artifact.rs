@@ -3025,7 +3025,6 @@ fn checkpoint_manifest_to_batch(
     RecordBatch::try_new(schema, columns).map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
-#[cfg(test)]
 fn protected_record_to_batch(record: &ProtectedRecord) -> Result<RecordBatch, ArtifactError> {
     match record {
         ProtectedRecord::Job(value) => job_record_to_batch(value),
