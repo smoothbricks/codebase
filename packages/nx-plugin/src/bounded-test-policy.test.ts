@@ -15,6 +15,7 @@ import {
   boundedTestScriptAlias,
   checkBoundedTestTargetPolicy,
   checkWorkspaceBoundedTestTargetPolicy,
+  checkWorkspaceCargoTestReachabilityPolicy,
   ensureBunTestTimeoutFlag,
   resolveTestCommand,
 } from './bounded-test-policy.js';
@@ -376,6 +377,75 @@ describe('bounded test target policy', () => {
         },
       });
       expect(checkWorkspaceBoundedTestTargetPolicy(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('cargo-test reachability policy', () => {
+  it('flags a cargo workspace whose test aggregate never reaches cargo-test', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-'));
+    try {
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      await writeJson(join(root, 'packages/rusty/package.json'), { name: 'rusty', nx: { name: 'rusty' } });
+
+      // The shape that shipped: nx.json targetDefaults replaced the inferred
+      // dependsOn: [cargo-test] with [^build, build], so `nx test rusty` was a
+      // no-op that ran nothing and reported success.
+      const clobbered: ResolvedProjectTargets = {
+        root: 'packages/rusty',
+        targets: new Set(['test', 'cargo-test', 'build']),
+        targetDependencies: new Map([['test', ['^build', 'build']]]),
+        targetExecutors: new Map([
+          ['test', 'nx:noop'],
+          ['cargo-test', 'nx:noop'],
+          ['build', 'nx:run-commands'],
+        ]),
+        targetOptions: new Map(),
+      };
+      const issues = checkWorkspaceCargoTestReachabilityPolicy(root, {
+        resolvedTargetsByProject: new Map([['rusty', clobbered]]),
+      });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.message).toContain('cargo-test');
+
+      // Transitive reachability counts: cowshed reaches it through napi-test.
+      const transitive: ResolvedProjectTargets = {
+        ...clobbered,
+        targets: new Set(['test', 'napi-test', 'cargo-test', 'build']),
+        targetDependencies: new Map([
+          ['test', ['napi-test']],
+          ['napi-test', ['cargo-test']],
+        ]),
+      };
+      expect(
+        checkWorkspaceCargoTestReachabilityPolicy(root, {
+          resolvedTargetsByProject: new Map([['rusty', transitive]]),
+        }),
+      ).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores projects with no cargo-test target', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-ts-'));
+    try {
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      await writeJson(join(root, 'packages/tsonly/package.json'), { name: 'tsonly', nx: { name: 'tsonly' } });
+      const tsOnly: ResolvedProjectTargets = {
+        root: 'packages/tsonly',
+        targets: new Set(['test', 'build']),
+        targetDependencies: new Map([['test', ['build']]]),
+        targetExecutors: new Map([['test', BOUNDED_TEST_EXECUTOR]]),
+        targetOptions: new Map(),
+      };
+      expect(
+        checkWorkspaceCargoTestReachabilityPolicy(root, {
+          resolvedTargetsByProject: new Map([['tsonly', tsOnly]]),
+        }),
+      ).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

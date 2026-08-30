@@ -105,6 +105,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * The aggregate that actually runs a cargo workspace's tests. Named here because
+ * both target inference and the policy that verifies `test` reaches it need the
+ * same string, and a drifted copy would make the policy vacuous.
+ */
+export const CARGO_TEST_TARGET = 'cargo-test';
+
 export function cargoTestPackageTargetName(packageName: string): string {
   return `cargo-test-${packageName}`;
 }

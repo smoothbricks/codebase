@@ -14,6 +14,7 @@ import { parse as parseToml } from 'smol-toml';
 
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import {
+  CARGO_TEST_TARGET,
   cargoPackageTestInputs,
   cargoTestPackageTargetName,
   listCargoWorkspacePackages,
@@ -400,7 +401,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     if (!(CARGO_TEST_COMPILE_TARGET in declared)) {
       targets[CARGO_TEST_COMPILE_TARGET] = createCargoTestCompileTarget(projectRoot);
     }
-    if (!('cargo-test' in declared)) {
+    if (!(CARGO_TEST_TARGET in declared)) {
       const packageTargetNames = await addPerPackageCargoTestTargets(
         targets,
         projectRoot,
@@ -408,13 +409,13 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         absoluteProjectRoot,
       );
       if (packageTargetNames.length > 0) {
-        targets['cargo-test'] = {
+        targets[CARGO_TEST_TARGET] = {
           executor: 'nx:noop',
           cache: true,
           dependsOn: packageTargetNames,
         };
       } else {
-        targets['cargo-test'] = createCargoTestTarget(projectRoot);
+        targets[CARGO_TEST_TARGET] = createCargoTestTarget(projectRoot);
       }
     }
     if (!('cargo-lint' in declared)) {
@@ -469,7 +470,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       targets.test = {
         executor: 'nx:noop',
         cache: true,
-        dependsOn: ['cargo-test'],
+        dependsOn: [CARGO_TEST_TARGET],
       };
     }
     if (!('mutation' in declared)) {
@@ -521,7 +522,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         target.dependsOn = dependsOn.map((dep) => (dep === CARGO_TEST_COMPILE_TARGET ? 'napi-debug' : dep));
       }
     }
-    const cargoTest = targets['cargo-test'];
+    const cargoTest = targets[CARGO_TEST_TARGET];
     if (
       cargoTest?.options &&
       typeof cargoTest.options.command === 'string' &&
