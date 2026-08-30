@@ -29,6 +29,34 @@ Scope: `packages/cowshed/crates/cowshed-core/src/storage/mod.rs` (1040), `recove
 
 ### F1 — HIGH — SSOT — Three verb enums and two conflict machines over one on-disk lifecycle
 
+**Resolution — PARTIAL REFUTATION.** Two of the three enums were real duplication; the third pair was not.
+
+`TransactionKind` / `TransactionPhase` / `RecoveryModel` and their `stale_dimensions` checker were reachable only from
+`recovery.rs` itself and `tests/recovery_model.rs`; no production path constructed them. They are deleted, together with
+`CHECKPOINT_NAMESPACE` (which existed only as that model's `StoredObject` prefix, so F5 is resolved by deletion rather
+than by inventing `.checkpoints/` on disk) and `tests/recovery_model.rs`. That removes the third verb list and the
+second conflict machine.
+
+`Operation` and `LifecycleIntent` are NOT collapsed, and the finding is wrong that they should be. They are not two
+spellings of one fact: `LifecycleIntent` persists the caller's _pre-plan API options_ (`AdoptOptions`, `CreateOptions`,
+`RemoveOptions`) so a crashed verb can be replanned against whatever the store looks like on the next open, while
+`Operation` is the _already-resolved, capability-free plan_ that `revalidate` checks against reread facts immediately
+before mutating. Neither payload is substitutable for the other: an intent carries no expected-fact set, so executing
+one would be unrefusable; a plan carries facts already resolved, so persisting one would fence a decision made against
+facts that may no longer hold. The shared verb _names_ are the whole of the overlap. That reasoning is now stated in
+code on `LifecycleIntent` so the next reader does not refile it. A literal one-enum cutover would additionally require a
+`lifecycle-intents.json` schema redesign plus `runtime/project.rs` edits, and is out of scope here.
+
+Coverage check before deletion (the condition on this refutation): the production checker was already guarded
+independently of `RecoveryModel`, by
+`tests/lifecycle_contracts.rs::every_stale_precondition_conflicts_with_zero_effects`, which drives `execute_checked`
+through incarnation, revision, topology-revision, retirement, and checkpoint-revision staleness and asserts zero command
+and zero filesystem effects on each. The two dimensions the deleted model's test exercised that nothing else did are
+arity and variant substitution, so those were ported first and watched pass as
+`revalidate_refuses_short_observations_and_substituted_variants` before anything was removed. `StaleDimension::Format`
+has no counterpart and is not a lost guard: image format lives on `Operation`, never in the observed fact set, so the
+production checker never revalidated it and the deleted model never ran.
+
 Evidence: `packages/cowshed/crates/cowshed-core/src/storage/lifecycle.rs:312-349`
 
 ```
