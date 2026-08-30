@@ -2053,7 +2053,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), ArtifactError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
-    crate::metadata::sync_directory(path).map_err(|error| io_error(path, error))
+    crate::fsio::sync_directory(path).map_err(|error| io_error(path, error))
 }
 
 fn scan_job_directories(workspace_root: &Path) -> Result<u64, ArtifactError> {

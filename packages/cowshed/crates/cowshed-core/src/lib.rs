@@ -6,6 +6,7 @@ pub mod checkout;
 pub mod copy;
 pub mod error;
 pub mod exec;
+mod fsio;
 mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;

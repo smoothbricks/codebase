@@ -400,12 +400,11 @@ impl ArrowAuditSink {
         }
 
         let sealed_name = segment_name(order, self.writer_id);
-        let temporary_name = format!(
-            ".commitment-{order:020}-{}-{}.tmp",
-            self.writer_id.hyphenated(),
-            Uuid::new_v4().hyphenated()
-        );
-        let temporary = CString::new(temporary_name.as_bytes())
+        // The sealed name already carries order and writer id, so the shared temp grammar keeps
+        // crash residue both diagnosable and recognizable by the one sweeper predicate.
+        let temporary_name =
+            crate::fsio::temp_name(std::ffi::OsStr::new(&sealed_name), Uuid::new_v4().simple());
+        let temporary = CString::new(temporary_name.as_encoded_bytes())
             .map_err(|_| integrity("temporary segment name contains NUL"))?;
         let sealed = CString::new(sealed_name.as_bytes())
             .map_err(|_| integrity("sealed segment name contains NUL"))?;
