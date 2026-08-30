@@ -1984,6 +1984,7 @@ version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
 dependencies = [
+ "serde_core",
  "serde_spanned",
  "toml_datetime",
  "toml_parser",
