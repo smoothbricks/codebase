@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { NATIVE_TARGETS, platformDirectory } from './platform.js';
+import { hostStableCowshedBinary, NATIVE_TARGETS, platformDirectory } from './platform.js';
 
 /**
  * `NATIVE_TARGETS` is the runtime owner of the platform → `dist` directory mapping.
@@ -67,5 +67,13 @@ describe('platform target table', () => {
     expect(platformDirectory('darwin', 'ia32')).toBeNull();
     expect(platformDirectory('win32', 'x64')).toBeNull();
     expect(platformDirectory('freebsd', 'arm64')).toBeNull();
+  });
+});
+
+describe('host-stable cowshed binary', () => {
+  it('joins launchd HostStableExecutable segments under home', () => {
+    expect(hostStableCowshedBinary('/Users/test')).toBe(
+      '/Users/test/Library/Application Support/dev.cowshed/bin/cowshed',
+    );
   });
 });

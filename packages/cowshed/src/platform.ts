@@ -1,3 +1,5 @@
+import { join } from 'node:path';
+
 // Every host this package ships a native addon and CLI binary for. `platformDirectory` is
 // derived from this table. Kept free of typia/native imports because the CLI trampoline loads
 // it before deciding whether Node-API startup can be skipped.
@@ -14,4 +16,14 @@ export const NATIVE_TARGETS = [
 
 export function platformDirectory(platform: NodeJS.Platform, arch: string): string | null {
   return NATIVE_TARGETS.find((target) => target.platform === platform && target.arch === arch)?.directory ?? null;
+}
+
+// Path under $HOME that launchd's `HostStableExecutable` derives for the installed cowshed
+// binary. The trampoline must not load napi just to ask for this path, so the segments live
+// here; cowshed-napi's parity test pins them against the rust constructor.
+export const HOST_STABLE_BINARY_SEGMENTS = ['Library', 'Application Support', 'dev.cowshed', 'bin'] as const;
+export const HOST_STABLE_BINARY_NAME = 'cowshed';
+
+export function hostStableCowshedBinary(home: string): string {
+  return join(home, ...HOST_STABLE_BINARY_SEGMENTS, HOST_STABLE_BINARY_NAME);
 }

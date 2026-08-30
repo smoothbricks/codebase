@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { packageRootFromModule, resolveCliBackend, runCli } from './cli-trampoline.js';
+import { hostStableCowshedBinary } from './platform.js';
 import { CowshedError } from './types.js';
 
 const fixtureRoots: string[] = [];
@@ -165,7 +166,7 @@ describe('cowshed CLI trampoline', () => {
   it('routes daemon verbs through the host-stable install ahead of packaged binaries', async () => {
     const root = await fixtureRoot();
     const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
-    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    const stable = hostStableCowshedBinary(join(root, 'home'));
     await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
     const spawns: Array<{ executable: string; argv: readonly string[] }> = [];
 
@@ -187,7 +188,7 @@ describe('cowshed CLI trampoline', () => {
   it('detects daemon verbs after leading flags', async () => {
     const root = await fixtureRoot();
     const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
-    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    const stable = hostStableCowshedBinary(join(root, 'home'));
     await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
     const spawns: string[] = [];
 
@@ -208,7 +209,7 @@ describe('cowshed CLI trampoline', () => {
   it('keeps non-daemon verbs on the packaged binary even when the stable install exists', async () => {
     const root = await fixtureRoot();
     const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
-    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    const stable = hostStableCowshedBinary(join(root, 'home'));
     await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
     const spawns: string[] = [];
 
@@ -229,7 +230,7 @@ describe('cowshed CLI trampoline', () => {
   it('keeps setup and skill on the packaged binary: setup writes the stable install and must never run from it', async () => {
     const root = await fixtureRoot();
     const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
-    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    const stable = hostStableCowshedBinary(join(root, 'home'));
     await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
     const spawns: string[] = [];
 
