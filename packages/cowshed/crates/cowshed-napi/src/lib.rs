@@ -17,7 +17,7 @@ use cowshed_core::{
     WorkspaceHandle as CoreWorkspaceHandle, WorkspaceRef as CoreWorkspaceRef,
     api::{
         AdoptOptions, AttachOptions, CheckpointOptions, CreateOptions, ExecRequest, GcOptions,
-        GrantDelta, JobId, LandOptions, OutputPublication, PushOptions, RebaseOptions,
+        GrantDelta, JobId, LandOptions, MAX_JOB_ID, OutputPublication, PushOptions, RebaseOptions,
         RemoveOptions, RunSandboxMode, StdinSource, TraceContext, WorkspacePath,
     },
 };
@@ -598,7 +598,10 @@ impl WorkspaceHandle {
     pub fn job(&self, env: Env, id: f64) -> napi::Result<JsObject> {
         let worker = Arc::clone(&self.inner);
         spawn_promise(env, async move {
-            if !id.is_finite() || id.fract() != 0.0 || id < 1.0 || id > ((1_u64 << 53) - 1) as f64 {
+            // JS `number` is not a `u64`, so the finite/integral gate is the addon's job; the
+            // bound is not, and is read from core rather than respelled as a shift. `JobId::new`
+            // is the authority on the range and rejects anything this misses.
+            if !id.is_finite() || id.fract() != 0.0 || id < 1.0 || id > MAX_JOB_ID as f64 {
                 return Err(AddonFailure::usage(
                     format!("invalid job id {id}"),
                     "pass a positive safe integer job id",
