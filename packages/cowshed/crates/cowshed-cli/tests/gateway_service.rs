@@ -5,8 +5,8 @@ use cowshed_cli::gateway_service::{
     install_host_stable_executable,
 };
 use cowshed_cli::launchd::{
-    COWSHED_BINARY_NAME, CommandOutput, CommandStatus, HostStableExecutable, InstallOutcome,
-    LaunchAgentSpec, LaunchctlCommand, LaunchdExecutor, NativeFilesystem, NativeLaunchctlCommand,
+    COWSHED_BINARY_NAME, CommandStatus, HostStableExecutable, InstallOutcome, LaunchAgentSpec,
+    LaunchctlCommand, LaunchctlOutput, LaunchdExecutor, NativeFilesystem, NativeLaunchctlCommand,
     STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
@@ -43,12 +43,12 @@ fn gateway_parser_is_strict_and_accepts_status_json_after_action() {
 
 #[derive(Default)]
 struct RecordingLaunchctl {
-    outputs: VecDeque<io::Result<CommandOutput>>,
+    outputs: VecDeque<io::Result<LaunchctlOutput>>,
     argv: Vec<Vec<OsString>>,
 }
 
 impl RecordingLaunchctl {
-    fn new(outputs: impl IntoIterator<Item = io::Result<CommandOutput>>) -> Self {
+    fn new(outputs: impl IntoIterator<Item = io::Result<LaunchctlOutput>>) -> Self {
         Self {
             outputs: outputs.into_iter().collect(),
             argv: Vec::new(),
@@ -57,7 +57,7 @@ impl RecordingLaunchctl {
 }
 
 impl LaunchctlCommand for RecordingLaunchctl {
-    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<CommandOutput> {
+    fn run(&mut self, executable: &Path, arguments: &[OsString]) -> io::Result<LaunchctlOutput> {
         assert_eq!(executable, Path::new("/bin/launchctl"));
         self.argv.push(arguments.to_vec());
         self.outputs
@@ -77,12 +77,12 @@ fn launch_spec() -> LaunchAgentSpec {
 #[test]
 fn launch_agent_activation_bootstraps_only_when_not_loaded() {
     let command = RecordingLaunchctl::new([
-        Ok(CommandOutput {
+        Ok(LaunchctlOutput {
             status: CommandStatus::ExitCode(3),
             stdout: Vec::new(),
             stderr: b"not loaded".to_vec(),
         }),
-        Ok(CommandOutput::success()),
+        Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
     activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
@@ -95,8 +95,10 @@ fn launch_agent_activation_bootstraps_only_when_not_loaded() {
 
 #[test]
 fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
-    let command =
-        RecordingLaunchctl::new([Ok(CommandOutput::success()), Ok(CommandOutput::success())]);
+    let command = RecordingLaunchctl::new([
+        Ok(LaunchctlOutput::success()),
+        Ok(LaunchctlOutput::success()),
+    ]);
     let mut executor = LaunchdExecutor::new((), command);
     activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
         .expect("activation succeeds");
@@ -123,14 +125,14 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
 #[test]
 fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
     let command = RecordingLaunchctl::new([
-        Ok(CommandOutput::success()),
-        Ok(CommandOutput::success()),
-        Ok(CommandOutput {
+        Ok(LaunchctlOutput::success()),
+        Ok(LaunchctlOutput::success()),
+        Ok(LaunchctlOutput {
             status: CommandStatus::ExitCode(3),
             stdout: Vec::new(),
             stderr: b"not loaded".to_vec(),
         }),
-        Ok(CommandOutput::success()),
+        Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
     activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::Changed)
