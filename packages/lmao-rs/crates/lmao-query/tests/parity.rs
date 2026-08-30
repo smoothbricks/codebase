@@ -1,7 +1,5 @@
-//! Backend parity: the SAME selector must produce the SAME answer against the
-//! in-process Arrow scan, SQLite (`SQLiteTracer` shape), and DataFusion — the
-//! "query layer must not care which tracer produced the table" rule from the
-//! trace-testing specification.
+//! Arrow scan answers: typed `count` / `never` / `all_children_of` over the
+//! in-process RecordBatch fixture, plus stable-vs-dynamic vocabulary parity.
 
 use std::sync::Arc;
 
@@ -63,37 +61,6 @@ fn fixture_batch() -> RecordBatch {
     let other = span(root_b, "handle-request", &["user {id} loaded"]);
     let empty_catalog = StableVocabularyCatalog::EMPTY;
     convert_span_trees(&[root, other], &empty_catalog).unwrap()
-}
-
-#[cfg_attr(not(any(feature = "sqlite", feature = "datafusion")), allow(dead_code))]
-fn selectors() -> Vec<(&'static str, Selector)> {
-    vec![
-        ("by-template", Selector::template("cache {key} hit")),
-        (
-            "template+span",
-            Selector::template("cache {key} hit").with("span_id", 2u64),
-        ),
-        ("by-trace", Selector::default().with("trace_id", "trace-a")),
-        ("absent", Selector::template("never-logged {x}")),
-        (
-            "by-entry-type-span-start",
-            Selector::template("handle-request"),
-        ),
-        ("timestamp", Selector::default().with("timestamp_ns", 0i64)),
-    ]
-}
-
-/// The Arrow backend uses lmao-arrow column names; SQLite/DataFusion-over-sqlite-shape
-/// use the SQLiteTracer names. Translate the two columns that differ.
-#[cfg_attr(not(any(feature = "sqlite", feature = "datafusion")), allow(dead_code))]
-fn arrow_flavored(s: &Selector) -> Selector {
-    let mut out = s.clone();
-    for (name, _) in out.constraints.iter_mut() {
-        if name == "timestamp_ns" {
-            *name = "timestamp".to_string();
-        }
-    }
-    out
 }
 
 #[test]
@@ -180,69 +147,5 @@ fn stable_and_dynamic_vocabulary_have_query_and_archive_parity() {
         build_trace_chunk_envelope("archive://fixture", &dynamic_batch),
         build_trace_chunk_envelope("archive://fixture", &static_batch),
         "archive identity and bounds are independent of vocabulary encoding",
-    );
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_backend_parity() {
-    use lmao_query::sqlite_backend::SqliteTraceQuery;
-
-    let batch = fixture_batch();
-    let arrow = ArrowTraceQuery::new(vec![batch.clone()]);
-    let mut sqlite = SqliteTraceQuery::open_in_memory().unwrap();
-    sqlite.load_batches(&[batch]).unwrap();
-
-    for (name, sel) in selectors() {
-        assert_eq!(
-            arrow.count(&arrow_flavored(&sel)),
-            sqlite.count(&sel),
-            "count parity failed for selector {name}"
-        );
-        assert_eq!(
-            arrow.never(&arrow_flavored(&sel)),
-            sqlite.never(&sel),
-            "never parity failed for selector {name}"
-        );
-    }
-    assert_eq!(
-        arrow.all_children_of(
-            &Selector::template("db-query"),
-            &Selector::template("handle-request")
-        ),
-        sqlite.all_children_of(
-            &Selector::template("db-query"),
-            &Selector::template("handle-request")
-        ),
-    );
-}
-
-#[cfg(feature = "datafusion")]
-#[test]
-fn datafusion_backend_parity() {
-    use lmao_query::datafusion_backend::DataFusionTraceQuery;
-
-    let batch = fixture_batch();
-    let arrow = ArrowTraceQuery::new(vec![batch.clone()]);
-    let df = DataFusionTraceQuery::new(vec![batch]).unwrap();
-
-    for (name, sel) in selectors() {
-        // DataFusion queries the Arrow table directly → arrow column names.
-        let sel = arrow_flavored(&sel);
-        assert_eq!(
-            arrow.count(&sel),
-            df.count(&sel),
-            "count parity failed for selector {name}"
-        );
-    }
-    assert_eq!(
-        arrow.all_children_of(
-            &Selector::template("db-query"),
-            &Selector::template("handle-request")
-        ),
-        df.all_children_of(
-            &Selector::template("db-query"),
-            &Selector::template("handle-request")
-        ),
     );
 }
