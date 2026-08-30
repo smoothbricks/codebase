@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use cowshed_gateway::TOKEN_BYTES;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256,
@@ -23,8 +24,9 @@ use crate::workspace_environment::{WorkspaceEnvironmentError, write_workspace_en
 pub const CA_CERTIFICATE_PATH: &str = ".cowshed/ca.pem";
 pub const WORKSPACE_TOKEN_PATH: &str = ".cowshed/token";
 const CREDENTIAL_DIRECTORY: &str = ".cowshed";
-const TOKEN_BYTES: usize = 32;
-const TOKEN_ENCODED_BYTES: usize = 43;
+// base64url without padding: four characters per three bytes, rounded up. Derived rather than
+// restated so the token's on-disk width cannot drift from the byte count the gateway defines.
+const TOKEN_ENCODED_BYTES: usize = (TOKEN_BYTES * 4).div_ceil(3);
 const MAX_CERTIFICATE_PEM_BYTES: u64 = 64 * 1024;
 const MAX_PRIVATE_KEY_PEM_BYTES: u64 = 64 * 1024;
 
