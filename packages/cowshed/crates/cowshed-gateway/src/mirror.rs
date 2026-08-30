@@ -13,7 +13,7 @@ use url::Url;
 use crate::{
     cache::{
         Cache, CacheAcquire, CacheBodyError, CacheError, CacheKey, CacheNamespace, CachedResponse,
-        ObjectDigest, ObjectExpectation, hex_decode,
+        ObjectDigest, ObjectExpectation, hex_decode, unix_ms,
     },
     interfaces::UpstreamHealth,
     policy::{CanonicalTarget, MirrorProtocol, normalize_path},
@@ -353,7 +353,8 @@ impl MirrorService {
                         content_length: 0,
                         content_sha256: [0; 32],
                         expected: request.metadata.expected,
-                        stored_unix_ms: unix_ms(SystemTime::now())?,
+                        stored_unix_ms: unix_ms(SystemTime::now())
+                            .map_err(|_| MirrorError::Clock)?,
                     };
                     let body = self
                         .cache
@@ -741,17 +742,7 @@ fn response_limit(
     request: &MirrorRequest,
     response: &Response<MirrorBody>,
 ) -> Result<u64, MirrorError> {
-    let header_length = response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .map(|value| {
-            value
-                .to_str()
-                .map_err(|_| MirrorError::InvalidContentLength)?
-                .parse::<u64>()
-                .map_err(|_| MirrorError::InvalidContentLength)
-        })
-        .transpose()?;
+    let header_length = response_content_length_optional(response)?;
     if let Some(expected) = request.metadata.expected {
         let length = header_length.ok_or(MirrorError::MissingContentLength)?;
         if length != expected.length {
@@ -1084,13 +1075,6 @@ fn strip_request_secrets(headers: &mut HeaderMap) {
 
 fn strip_response_secrets(headers: &mut HeaderMap) {
     crate::proxy::strip_upstream_response_headers(headers);
-}
-
-fn unix_ms(time: SystemTime) -> Result<u64, MirrorError> {
-    let duration = time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| MirrorError::Clock)?;
-    u64::try_from(duration.as_millis()).map_err(|_| MirrorError::Clock)
 }
 
 trait UrlPathAndQuery {
