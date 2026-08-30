@@ -18,7 +18,7 @@
 
 use columine_types::audit_parser::{enum_decls, norm};
 use columine_types::types::{
-    AggType, DurationUnit, EVICTION_ENTRY_SIZE, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
+    AggType, CmpType, DurationUnit, EVICTION_ENTRY_SIZE, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
     PROGRAM_MAGIC, ProgramHeader, SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
     StructFieldType,
 };
@@ -123,6 +123,17 @@ fn typescript_ttl_start_of_matches_rust_duration_unit() {
         rust_u8_tags(DurationUnit::from_u8),
         harvested,
         "types.ts TtlStartOf diverged from columine_types::DurationUnit"
+    );
+}
+
+/// Host name is `ComparisonType`; the wire byte is [`CmpType`].
+#[test]
+fn typescript_comparison_type_matches_rust_cmp_type() {
+    let harvested = ts_enum(&read(TYPES_TS), "ComparisonType", 3);
+    assert_eq!(
+        rust_u8_tags(CmpType::from_u8),
+        harvested,
+        "types.ts ComparisonType diverged from columine_types::CmpType"
     );
 }
 

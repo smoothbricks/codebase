@@ -390,11 +390,44 @@ pub const CT_NODE_NOT: u8 = 10;
 pub const CT_NODE_DESTINATION: u8 = 11;
 pub const CONDITION_TREE_STATE_BYTES: u32 = size_of::<ConditionTreeState>() as u32;
 
+/// Trailing `cmp_type:u8` operand of comparing map upserts.
+///
+/// Discriminants are the bytecode ABI. Placement: operand 5 for LATEST
+/// forms, after `cmp_col` for MAX/MIN forms, and before `pred_col` for the
+/// conditional forms. The VM re-exports this type rather than restating it.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CmpType {
+    /// Unsigned 32-bit (string intern IDs, ordinals); 4-byte input stride.
+    U32 = 0,
+    /// IEEE 754 f64 (numeric fields, timestamps-as-f64); 8-byte stride.
+    F64 = 1,
+    /// Signed 64-bit (bigint timestamps); 8-byte stride.
+    I64 = 2,
+}
+
+impl CmpType {
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::U32),
+            1 => Some(Self::F64),
+            2 => Some(Self::I64),
+            _ => None,
+        }
+    }
+
+    /// Input-column stride in bytes for this comparison encoding.
+    pub const fn stride(self) -> usize {
+        match self {
+            Self::U32 => 4,
+            Self::F64 | Self::I64 => 8,
+        }
+    }
+}
+
 /// Bytecode opcode registry. Operand encodings are part of the wire ABI.
 ///
-/// Map upserts that compare values carry a trailing `cmp_type:u8`
-/// (0=u32, 1=f64, 2=i64): at operand 5 for LATEST forms, after `cmp_col` for
-/// MAX/MIN forms, and before `pred_col` for the conditional forms.
+/// Map upserts that compare values carry a trailing [`CmpType`] byte.
 #[repr(u8)]
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
