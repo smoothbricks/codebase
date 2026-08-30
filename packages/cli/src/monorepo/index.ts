@@ -28,6 +28,7 @@ import {
 } from './package-policy.js';
 import { resolvedTargetsByProject, runInitPacks, runValidatePacks } from './packs/index.js';
 import { syncRootRuntimeVersions } from './runtime.js';
+import { validateSccachePatches } from './sccache-patches.js';
 import { applyToolConfigDefaults } from './tool-validation.js';
 
 export interface InitOptions {
@@ -127,7 +128,8 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validateTestFileLocations(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +
     validateDevenvModuleImport(root) +
-    validateCargoCachePolicy(root);
+    validateCargoCachePolicy(root) +
+    validateSccachePatches(root);
   if (results.some((result) => result.action === 'drifted') || packageFailures > 0) {
     throw new Error('Managed monorepo files or package conventions are out of date. Run: smoo monorepo update');
   }

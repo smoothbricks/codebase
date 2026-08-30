@@ -10,7 +10,12 @@
         bun = bun.overrideAttrs (finalAttrs: previousAttrs: {
           inherit (bunSource) version src;
         });
-        # sccache patches (same files as packages/cowshed/patches/):
+        # sccache patches — physical copies of packages/cowshed/patches/.
+        # Cowshed is the authoritative source. This overlay is its own nix flake
+        # and cannot reference paths outside its directory, so the copies are
+        # physical: a symlink would not survive `nix flake` source copying.
+        # `smoo monorepo check` asserts both directories hold the same filenames
+        # with byte-identical contents, so divergence cannot land silently.
         # 1. rust-basedir-cwd: SCCACHE_BASEDIRS normalization extended to Rust
         #    cache keys, plus SCCACHE_BASEDIR_CWD=1 so cwd, blanket CARGO_* env,
         #    and argument bytes key relative to the request cwd. cargo >= 1.97
