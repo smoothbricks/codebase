@@ -85,9 +85,7 @@ pub fn parsed_event(columns: &DynamicColumns, row: u32) -> Option<ParsedEvent> {
         return None;
     }
     let text = |column: u32| -> Option<String> {
-        Some(
-            String::from_utf8_lossy(columns.get_column(column)?.read_variable(row)?).into_owned(),
-        )
+        Some(String::from_utf8_lossy(columns.get_column(column)?.read_variable(row)?).into_owned())
     };
     Some(ParsedEvent {
         id: text(base_column::ID)?,
@@ -165,7 +163,7 @@ pub(crate) struct FieldLookup {
 /// `value.$extra` fallback column when declared.
 #[derive(Clone, Debug)]
 pub struct ExtractionConfig {
-    pub(crate) field_entries: Vec<(usize, ArrowType, String)>,
+    pub(crate) field_entries: Vec<(usize, ArrowType)>,
     pub(crate) field_map: HashMap<String, FieldLookup>,
     pub(crate) fallback_column: Option<usize>,
     pub(crate) presence_entries: Vec<(usize, usize)>,
@@ -223,7 +221,7 @@ pub fn build_extraction_config(
                 return Err(ConfigError::InvalidPresenceField);
             }
             unresolved_presence.push((column, source_name));
-            field_entries.push((column, field.arrow_type, (*name).to_owned()));
+            field_entries.push((column, field.arrow_type));
             continue;
         }
         if field_map
@@ -241,7 +239,7 @@ pub fn build_extraction_config(
         if *name == "value.$extra" {
             fallback_column = Some(column);
         }
-        field_entries.push((column, field.arrow_type, (*name).to_owned()));
+        field_entries.push((column, field.arrow_type));
     }
     let mut presence_entries = Vec::with_capacity(unresolved_presence.len());
     for (presence_column, source_name) in unresolved_presence {
