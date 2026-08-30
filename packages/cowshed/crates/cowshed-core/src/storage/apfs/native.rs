@@ -302,7 +302,8 @@ fn validate_restore_recovery_lineage(
         .checkpoints
         .join(fact.workspace.as_str())
         .join(format!(
-            "pre-restore-{}.{}",
+            "{}{}.{}",
+            super::PRE_RESTORE_PREFIX,
             fact.destination_incarnation,
             format.extension()
         ));
@@ -882,7 +883,8 @@ fn collect_restore_sidecars(
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if name.starts_with("pre-restore-") && name.ends_with(GRANTS_SIDECAR_SUFFIX) {
+            if name.starts_with(super::PRE_RESTORE_PREFIX) && name.ends_with(GRANTS_SIDECAR_SUFFIX)
+            {
                 sidecars.push(path);
             }
         }
@@ -4229,7 +4231,8 @@ where
                         .checkpoints
                         .join(metadata.workspace.as_str())
                         .join(format!(
-                            "pre-restore-{}.{}",
+                            "{}{}.{}",
+                            super::PRE_RESTORE_PREFIX,
                             metadata.workspace_incarnation,
                             metadata.image_format.extension()
                         ));
@@ -4288,7 +4291,7 @@ where
                 let Some(replacement_incarnation) = undo
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.strip_prefix("pre-restore-"))
+                    .and_then(|stem| stem.strip_prefix(super::PRE_RESTORE_PREFIX))
                 else {
                     continue;
                 };
