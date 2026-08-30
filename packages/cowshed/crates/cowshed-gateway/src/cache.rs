@@ -1496,7 +1496,7 @@ fn hex_nibble(value: u8) -> Result<u8, CacheError> {
     }
 }
 
-fn unix_ms(time: SystemTime) -> Result<u64, CacheError> {
+pub(crate) fn unix_ms(time: SystemTime) -> Result<u64, CacheError> {
     let duration = time
         .duration_since(UNIX_EPOCH)
         .map_err(|_| CacheError::InvalidMetadata)?;
