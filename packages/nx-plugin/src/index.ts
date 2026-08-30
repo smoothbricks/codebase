@@ -323,8 +323,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   }
 
   if (napiConfig) {
-    const napiTargets = createNapiTargets(projectRoot, napiConfig);
-    Object.assign(targets, napiTargets.targets);
+    Object.assign(targets, createNapiTargets(projectRoot, napiConfig));
     if (
       !('napi-test' in (packageJson.nx?.targets ?? {})) &&
       existsSync(join(absoluteProjectRoot, 'src/native.test.ts'))
@@ -332,7 +331,6 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       targets['napi-test'] = createNapiTestTarget(
         projectRoot,
         existsSync(join(absoluteProjectRoot, 'bunfig.napi-test.toml')),
-        napiTargets.hostProvider,
       );
     }
   }
@@ -648,10 +646,7 @@ function resolveNapiConfig(
   return { binaryName, cargoPackage, manifestPath, targets };
 }
 
-function createNapiTargets(
-  projectRoot: string,
-  config: ResolvedNapiConfig,
-): { targets: Record<string, TargetConfiguration>; hostProvider: string } {
+function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Record<string, TargetConfiguration> {
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage}`;
   const hostPlatformTargetName = HOST_PLATFORM_SUFFIX === null ? null : `napi${HOST_PLATFORM_SUFFIX}`;
   let nativeHostTargetName: string | null = null;
@@ -665,8 +660,26 @@ function createNapiTargets(
       }
     }
   }
-  const hostProvider = nativeHostTargetName ?? 'cargo-napi';
   const targets: Record<string, TargetConfiguration> = {};
+
+  // The addon the test suite loads. A dev-profile build shares target/debug
+  // with cargo-test's dependency graph, so after the tests compile this is
+  // nearly free — where the release platform build it replaces cost minutes
+  // and sat alone on the test critical path. The output lives OUTSIDE dist/
+  // because packages publish `files: ["dist"]` wholesale: a debug addon under
+  // dist/ would ship. native.ts resolves this directory only when the
+  // napi-test target sets NAPI_DEBUG_ADDON=1, so production loads never see it.
+  targets['napi-debug'] = {
+    executor: 'nx:run-commands',
+    cache: true,
+    dependsOn: ['^build'],
+    inputs: NAPI_INPUTS,
+    outputs: ['{projectRoot}/.cache/native-debug'],
+    options: {
+      cwd: projectRoot,
+      command: `napi build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir .cache/native-debug`,
+    },
+  };
 
   if (nativeHostTargetName === null) {
     // The platform target for this host triple is the same compilation, so a
@@ -730,19 +743,19 @@ function createNapiTargets(
       },
     };
   }
-  return { targets, hostProvider };
+  return targets;
 }
 
-function createNapiTestTarget(
-  projectRoot: string,
-  hasDedicatedBunfig: boolean,
-  hostProvider: string,
-): TargetConfiguration {
+function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean): TargetConfiguration {
   const configFlag = hasDedicatedBunfig ? ' --config=../bunfig.napi-test.toml' : ' --config=../bunfig.toml';
   return {
     executor: '@smoothbricks/nx-plugin:bounded-exec',
     cache: true,
-    dependsOn: ['cargo-test', hostProvider, 'tsc-js', '^build', 'build'],
+    // Deliberately NOT `build`: the aggregate drags the host-platform release
+    // binaries onto the test critical path, and the tests assert behavior, not
+    // optimization level. tsc-js supplies dist/ts for the suite's own imports;
+    // napi-debug supplies the addon.
+    dependsOn: ['cargo-test', 'napi-debug', 'tsc-js', '^build'],
     options: {
       // cwd is src/, not the package root: `bun test <arg>` treats the arg as a
       // FILTER and scans the whole cwd tree for test files, and a Rust
@@ -751,6 +764,9 @@ function createNapiTestTarget(
       // config is passed explicitly.
       command: `bun test${configFlag} --timeout=30000 native.test.ts`,
       cwd: `${projectRoot}/src`,
+      // Routes the package's native loader to the napi-debug artifact under
+      // .cache/native-debug instead of the packaged dist/native tree.
+      env: { NAPI_DEBUG_ADDON: '1' },
       timeoutMs: 120000,
       killAfterMs: 10000,
     },

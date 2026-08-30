@@ -98,8 +98,19 @@ function nativeBinary(): NativeBinary {
 export function loadNativeModule(): NativeModule {
   const { directory, fileName } = nativeBinary();
   const override = process.env.COWSHED_NODE_PATH;
+  // NAPI_DEBUG_ADDON is set only by the inferred napi-test target: the test suite loads the
+  // dev-profile addon from .cache/native-debug (never packaged; `files` ships dist/ wholesale)
+  // instead of the release artifacts. Both URL depths cover running from src/ and dist/ts/.
+  const debugCandidates =
+    process.env.NAPI_DEBUG_ADDON === '1'
+      ? [
+          new URL(`../.cache/native-debug/${fileName}`, import.meta.url).pathname,
+          new URL(`../../.cache/native-debug/${fileName}`, import.meta.url).pathname,
+        ]
+      : [];
   const candidates = [
     ...(override ? [override] : []),
+    ...debugCandidates,
     new URL(`../dist/native/host/${fileName}`, import.meta.url).pathname,
     new URL(`../dist/native/${directory}/${fileName}`, import.meta.url).pathname,
     new URL(`../native/host/${fileName}`, import.meta.url).pathname,
