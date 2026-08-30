@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt, time::SystemTime};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, header};
+use http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header};
 use http_body_util::{BodyExt as _, Empty, combinators::BoxBody};
 use serde_json::Value;
 use thiserror::Error;
@@ -1089,39 +1089,11 @@ fn hex(value: u8) -> Result<u8, MirrorError> {
 }
 
 fn strip_request_secrets(headers: &mut HeaderMap) {
-    for name in [
-        header::AUTHORIZATION,
-        header::PROXY_AUTHORIZATION,
-        header::COOKIE,
-        header::SET_COOKIE,
-    ] {
-        headers.remove(name);
-    }
-    for name in ["npm-auth-type", "npm-otp", "x-goog-api-key"] {
-        headers.remove(name);
-    }
+    crate::proxy::strip_upstream_request_headers(headers);
 }
 
 fn strip_response_secrets(headers: &mut HeaderMap) {
-    headers.remove(header::SET_COOKIE);
-    headers.remove(header::PROXY_AUTHENTICATE);
-    headers.remove(header::WWW_AUTHENTICATE);
-    strip_hop_headers(headers);
-}
-
-fn strip_hop_headers(headers: &mut HeaderMap) {
-    for name in [
-        header::CONNECTION,
-        HeaderName::from_static("keep-alive"),
-        header::PROXY_AUTHENTICATE,
-        header::PROXY_AUTHORIZATION,
-        header::TE,
-        header::TRAILER,
-        header::TRANSFER_ENCODING,
-        header::UPGRADE,
-    ] {
-        headers.remove(name);
-    }
+    crate::proxy::strip_upstream_response_headers(headers);
 }
 
 fn unix_ms(time: SystemTime) -> Result<u64, MirrorError> {
@@ -1196,5 +1168,52 @@ pub enum MirrorError {
 impl fmt::Debug for dyn MirrorUpstream {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("MirrorUpstream")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mirror_and_generic_hops_apply_the_same_header_policy() {
+        let mut request = HeaderMap::new();
+        for name in [
+            "authorization",
+            "npm-auth-type",
+            "npm-auth-token",
+            "x-npm-token",
+            "traceparent",
+            "tracestate",
+            "x-hop",
+        ] {
+            request.insert(name, HeaderValue::from_static("secret"));
+        }
+        request.insert(header::CONNECTION, HeaderValue::from_static("x-hop"));
+
+        let mut mirror_request = request.clone();
+        strip_request_secrets(&mut mirror_request);
+        let mut generic_request = request;
+        crate::proxy::strip_upstream_request_headers(&mut generic_request);
+        assert_eq!(mirror_request, generic_request);
+        assert!(mirror_request.is_empty());
+
+        let mut response = HeaderMap::new();
+        for name in [
+            "set-cookie",
+            "proxy-authenticate",
+            "www-authenticate",
+            "x-hop",
+        ] {
+            response.insert(name, HeaderValue::from_static("secret"));
+        }
+        response.insert(header::CONNECTION, HeaderValue::from_static("x-hop"));
+
+        let mut mirror_response = response.clone();
+        strip_response_secrets(&mut mirror_response);
+        let mut generic_response = response;
+        crate::proxy::strip_upstream_response_headers(&mut generic_response);
+        assert_eq!(mirror_response, generic_response);
+        assert!(mirror_response.is_empty());
     }
 }
