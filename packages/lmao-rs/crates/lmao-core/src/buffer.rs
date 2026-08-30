@@ -25,6 +25,7 @@ use crate::packed_header::{
     StaticVocabularyNotAllowed, VocabularyId, entry_type_from_header, pack_dynamic, pack_static,
     vocabulary_id_from_header,
 };
+use crate::tuning::{MAX_CAPACITY, MIN_CAPACITY};
 use std::sync::Arc;
 
 /// Row index reserved for span completion.
@@ -94,7 +95,9 @@ impl SpanBuffer {
         anchor: &TraceAnchor,
         clock: &dyn Clock,
     ) -> Self {
-        debug_assert!(capacity.is_power_of_two() && (8..=1024).contains(&capacity));
+        debug_assert!(
+            capacity.is_power_of_two() && (MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity)
+        );
         let mut timestamps = vec![0i64; capacity];
         let mut headers = vec![0u32; capacity];
         let line_numbers = vec![0u32; capacity];
@@ -166,8 +169,7 @@ impl SpanBuffer {
         anchor: &TraceAnchor,
         clock: &dyn Clock,
     ) -> usize {
-        let row = self.append_header(pack_dynamic(entry_type), anchor, clock);
-        let target = self.append_target();
+        let (target, row) = self.append_header(pack_dynamic(entry_type), anchor, clock);
         if let Some(message) = message {
             target.messages.set(row, target.capacity, message);
         }
@@ -189,15 +191,20 @@ impl SpanBuffer {
         if entry_type == EntryType::SpanStart {
             return Err(StaticVocabularyNotAllowed(entry_type));
         }
-        let row = self.append_header(header, anchor, clock);
-        self.append_target().line_numbers[row] = line;
+        let (target, row) = self.append_header(header, anchor, clock);
+        target.line_numbers[row] = line;
         Ok(row)
     }
 
-    fn append_header(&mut self, header: u32, anchor: &TraceAnchor, clock: &dyn Clock) -> usize {
+    fn append_header(
+        &mut self,
+        header: u32,
+        anchor: &TraceAnchor,
+        clock: &dyn Clock,
+    ) -> (&mut SpanBuffer, usize) {
         let target = self.append_target();
         if target.write_index == target.capacity {
-            let mut next = Box::new(SpanBuffer {
+            target.overflow = Some(Box::new(SpanBuffer {
                 identity: target.identity.clone(),
                 capacity: target.capacity,
                 write_index: 0,
@@ -208,12 +215,16 @@ impl SpanBuffer {
                 callsite: None,
                 overflow: None,
                 children: Vec::new(),
-            });
-            let row = next.write_row(header, anchor, clock);
-            target.overflow = Some(next);
-            return row;
+            }));
+            let target = target
+                .overflow
+                .as_deref_mut()
+                .expect("overflow inserted immediately above");
+            let row = target.write_row(header, anchor, clock);
+            return (target, row);
         }
-        target.write_row(header, anchor, clock)
+        let row = target.write_row(header, anchor, clock);
+        (target, row)
     }
 
     /// Dynamic message for this physical buffer row. Static rows return `None`.

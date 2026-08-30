@@ -2,12 +2,9 @@
 //! `packages/lmao/benchmarks/js-vs-wasm.bench.ts` so the ns/op numbers are
 //! directly comparable against the recorded JS (mitata) results:
 //!
-//! - "Warm: Simple trace"            -> span_lifecycle_*
-//! - "Warm: Multiple log entries(50)"-> span_50_logs (per-event cost = delta/50)
-//! - "Warm: Trace with tags"         -> tag_write_f64_proxy (attribute columns are
-//!   not generated yet; this measures the exact machine work a tag write does:
-//!   null-bitmap set + unaligned f64 store into a preallocated column)
-//! - "Memory reuse (100 traces)"     -> pooled variant (Vec allocations reused)
+//! - "Warm: Simple trace"             -> span_lifecycle_*
+//! - "Warm: Multiple log entries(50)" -> span_50_logs (per-event cost = delta/50)
+//! - "Warm: Trace with tags"          -> schema_tag_write_* (generated real columns)
 //!
 //! Two clock variants isolate what's actually being measured:
 //! - FixedClock: pure buffer machinery, no time syscalls
@@ -79,7 +76,13 @@ fn bench_span_50_logs(c: &mut Criterion) {
             let mut s =
                 SpanBuffer::start_dynamic(id.clone(), 64, "span".into(), &fixed_anchor, &fixed);
             for _ in 0..50 {
-                s.append_dynamic(EntryType::Info, None, 0, &fixed_anchor, &fixed);
+                s.append_dynamic(
+                    EntryType::Info,
+                    Some("log template".into()),
+                    0,
+                    &fixed_anchor,
+                    &fixed,
+                );
             }
             s.end_ok(&fixed_anchor, &fixed);
             black_box(s)
@@ -89,7 +92,13 @@ fn bench_span_50_logs(c: &mut Criterion) {
         b.iter(|| {
             let mut s = SpanBuffer::start_dynamic(id.clone(), 64, "span".into(), &sys_anchor, &sys);
             for _ in 0..50 {
-                s.append_dynamic(EntryType::Info, None, 0, &sys_anchor, &sys);
+                s.append_dynamic(
+                    EntryType::Info,
+                    Some("log template".into()),
+                    0,
+                    &sys_anchor,
+                    &sys,
+                );
             }
             s.end_ok(&sys_anchor, &sys);
             black_box(s)
@@ -110,7 +119,13 @@ fn bench_append_only(c: &mut Criterion) {
             || SpanBuffer::start_dynamic(id.clone(), 1024, "span".into(), &anchor, &fixed),
             |mut s| {
                 for _ in 0..1000 {
-                    s.append_dynamic(EntryType::Info, None, 0, &anchor, &fixed);
+                    s.append_dynamic(
+                        EntryType::Info,
+                        Some("log template".into()),
+                        0,
+                        &anchor,
+                        &fixed,
+                    );
                 }
                 black_box(s)
             },
@@ -119,31 +134,11 @@ fn bench_append_only(c: &mut Criterion) {
     });
 }
 
-/// Tag-write proxy: what `ctx.tag.latency(42.5)` costs once attribute columns are
-/// generated — null-bitmap bit set + f64 store into a preallocated column pair.
-/// This is the exact work the JS TypedArray hot path does (two typed stores).
-fn bench_tag_write_proxy(c: &mut Criterion) {
-    let mut bitmap = [0u8; 8]; // 64 rows
-    let mut values = vec![0f64; 64];
-    let mut row = 0usize;
-    c.bench_function("tag_write_f64_proxy", |b| {
-        b.iter(|| {
-            let r = row & 63;
-            bitmap[r >> 3] |= 1 << (r & 7);
-            values[r] = black_box(42.5);
-            row += 1;
-            black_box(values[r])
-        })
-    });
-}
-
 criterion_group!(
     benches,
     bench_span_lifecycle,
     bench_span_50_logs,
     bench_append_only,
-    bench_tag_write_proxy,
-    bench_dictionary_build,
     bench_clock_variants,
     bench_lazy_first_touch,
     bench_schema_tag_write,
@@ -219,9 +214,11 @@ fn bench_schema_tag_write(c: &mut Criterion) {
 
     let fixed = FixedClock;
     let anchor = TraceAnchor::capture(&fixed);
-    let mut buf = BenchSchema::start(identity(), "benchmark", &anchor, &fixed);
+    let span = SpanBuffer::start_dynamic(identity(), 64, "benchmark".into(), &anchor, &fixed);
+    let mut buf = BenchSchema::from_span(span);
     // warm all three columns
-    buf.tag_latency(0.0).tag_outcome(0).tag_route("warm");
+    buf.tag_latency(0.0).tag_route("warm");
+    buf.tag_outcome(0).unwrap();
     let route: std::sync::Arc<str> = "GET /api/v1/sessions".into();
 
     c.bench_function("schema_tag_write_f64", |b| {
@@ -231,7 +228,7 @@ fn bench_schema_tag_write(c: &mut Criterion) {
     });
     c.bench_function("schema_tag_write_enum", |b| {
         b.iter(|| {
-            buf.tag_outcome(black_box(1));
+            buf.tag_outcome(black_box(1)).unwrap();
         })
     });
     c.bench_function("schema_tag_write_category_arc", |b| {
@@ -250,24 +247,6 @@ fn bench_ratchet(c: &mut Criterion) {
         b.iter(|| {
             r.record_span(black_box(30));
             black_box(r.capacity())
-        })
-    });
-}
-
-/// Flush-path proxy: dictionary count+dedupe of 256 category strings (37/11
-/// cardinality mix), comparable to the JS Map benchmark in
-/// `packages/lmao/benchmarks/wasm-boundary.bench.ts`.
-fn bench_dictionary_build(c: &mut Criterion) {
-    let strings: Vec<String> = (0..256)
-        .map(|k| format!("user-{}-request-{}", k % 37, k % 11))
-        .collect();
-    c.bench_function("dict_build_256_strings_hashmap", |b| {
-        b.iter(|| {
-            let mut dict = std::collections::HashMap::<&str, u32>::with_capacity(64);
-            for s in &strings {
-                *dict.entry(s.as_str()).or_insert(0) += 1;
-            }
-            black_box(dict.len())
         })
     });
 }

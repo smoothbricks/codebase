@@ -4,57 +4,13 @@
 //! flush path as one dense entry-type lane in the packed row header. Discriminants
 //! 1..=4 MUST remain stable for span lifecycle entries consumed by the WASM and
 //! TypeScript ABI.
-/// Dense entry-type discriminant stored in the low byte of the packed row header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum EntryType {
-    SpanStart = 1,
-    SpanOk = 2,
-    SpanErr = 3,
-    SpanException = 4,
-    SpanRetry = 5,
-    Trace = 6,
-    Debug = 7,
-    Info = 8,
-    Warn = 9,
-    Error = 10,
-    FfAccess = 11,
-    FfUsage = 12,
-    PeriodStart = 13,
-    OpInvocations = 14,
-    OpErrors = 15,
-    OpExceptions = 16,
-    OpDurationTotal = 17,
-    OpDurationOk = 18,
-    OpDurationErr = 19,
-    OpDurationMin = 20,
-    OpDurationMax = 21,
-    BufferWrites = 22,
-    BufferSpans = 23,
-    BufferCapacity = 24,
-}
+include!(concat!(env!("OUT_DIR"), "/entry_type.rs"));
 
 impl EntryType {
-    pub const COUNT: usize = 24;
-
     /// A completion entry is what row 1 of every span buffer must always hold.
     #[inline]
     pub const fn is_completion(self) -> bool {
         matches!(self, Self::SpanOk | Self::SpanErr | Self::SpanException)
-    }
-
-    #[inline]
-    pub const fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    pub const fn from_u8(v: u8) -> Option<Self> {
-        if v >= 1 && v <= 24 {
-            // SAFETY: repr(u8), contiguous discriminants 1..=24 asserted above.
-            Some(unsafe { core::mem::transmute::<u8, EntryType>(v) })
-        } else {
-            None
-        }
     }
 }
 
@@ -63,20 +19,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_all_24() {
-        for v in 1u8..=24 {
-            assert_eq!(EntryType::from_u8(v).unwrap().as_u8(), v);
+    fn generated_table_matches_discriminants_and_names() {
+        for (index, entry_type) in EntryType::ALL.into_iter().enumerate() {
+            let discriminant = u8::try_from(index + 1).unwrap();
+            assert_eq!(entry_type.as_u8(), discriminant);
+            assert_eq!(EntryType::from_u8(discriminant), Some(entry_type));
+            assert_eq!(
+                EntryType::NAMES[usize::from(discriminant)],
+                entry_type.name()
+            );
         }
+        assert_eq!(EntryType::NAMES[0], "");
         assert!(EntryType::from_u8(0).is_none());
-        assert!(EntryType::from_u8(25).is_none());
-    }
-
-    #[test]
-    fn span_entry_discriminants_are_stable() {
-        // These values are part of the WASM/TypeScript ABI.
-        assert_eq!(EntryType::SpanStart.as_u8(), 1);
-        assert_eq!(EntryType::SpanOk.as_u8(), 2);
-        assert_eq!(EntryType::SpanErr.as_u8(), 3);
-        assert_eq!(EntryType::SpanException.as_u8(), 4);
+        assert!(EntryType::from_u8(EntryType::COUNT as u8 + 1).is_none());
     }
 }
