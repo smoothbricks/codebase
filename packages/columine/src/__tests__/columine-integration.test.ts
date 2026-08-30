@@ -12,7 +12,6 @@
  */
 
 import { beforeAll, describe, expect, it } from 'bun:test';
-import { existsSync } from 'node:fs';
 
 import {
   AggType,
@@ -33,11 +32,13 @@ import {
 import { loadColumineWasm } from '../wasm-backend.js';
 
 // =============================================================================
-// WASM Binary Detection
+// WASM Binary
 // =============================================================================
 
+// `columine:test` depends on `cargo-wasm`, so this artifact is a prerequisite and
+// never conditional: gating the suite on its presence turned a missing build into
+// a green run of 22 tests that never entered the VM.
 const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
-const WASM_EXISTS = existsSync(WASM_PATH.pathname);
 const TEST_PARSE_BACKEND: ParseCompactBackend = {
   backend: 'test-parse',
   parse: () => ({ arrowIpc: new Uint8Array(0), eventCount: 0 }),
@@ -192,11 +193,10 @@ describe('Program magic admission', () => {
   let backend: ColumineBackend;
 
   beforeAll(async () => {
-    if (!WASM_EXISTS) return;
     backend = await loadColumineWasm(WASM_PATH);
   });
 
-  it.skipIf(!WASM_EXISTS)('rejects foreign magics by default and admits an embedder-provided magic', async () => {
+  it('rejects foreign magics by default and admits an embedder-provided magic', async () => {
     const foreignMagic = 0xdead_beef;
     const bytecode = buildProgram({
       slots: [{ type: 'hashset', capacity: 4 }],
@@ -219,11 +219,10 @@ describe('SC1: Reduce stage for aggregation', () => {
   let backend: ColumineBackend;
 
   beforeAll(async () => {
-    if (!WASM_EXISTS) return;
     backend = await loadColumineWasm(WASM_PATH);
   });
 
-  it.skipIf(!WASM_EXISTS)('executes HashMap upsert-last program', async () => {
+  it('executes HashMap upsert-last program', async () => {
     // Build: 1 HashMap (capacity 64), 2 inputs (key, value)
     // Op: BATCH_MAP_UPSERT_LAST slot=0, keyCol=0, valCol=1
     const bytecode = buildProgram({
@@ -255,7 +254,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.mapGet(state, program, 0, 3)).toBe(30);
   });
 
-  it.skipIf(!WASM_EXISTS)('executes Aggregate SUM program', async () => {
+  it('executes Aggregate SUM program', async () => {
     // Build: 1 Aggregate SUM, 1 input (values)
     // Op: BATCH_AGG_SUM slot=0, valCol=0
     const bytecode = buildProgram({
@@ -277,7 +276,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(100);
   });
 
-  it.skipIf(!WASM_EXISTS)('executes Aggregate COUNT program', async () => {
+  it('executes Aggregate COUNT program', async () => {
     // Build: 1 Aggregate COUNT, 1 input (dummy, COUNT ignores column values)
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.COUNT }],
@@ -298,7 +297,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(7);
   });
 
-  it.skipIf(!WASM_EXISTS)('executes HashMap + Aggregate SUM combined program', async () => {
+  it('executes HashMap + Aggregate SUM combined program', async () => {
     // Build: 1 HashMap (cap 64) + 1 Aggregate SUM, 3 inputs (key, val, amount)
     const bytecode = buildProgram({
       slots: [
@@ -342,7 +341,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getAggregateValue(state, program, 1)).toBe(100);
   });
 
-  it.skipIf(!WASM_EXISTS)('grows HashMap and HashSet without duplicating partial batch mutations', async () => {
+  it('grows HashMap and HashSet without duplicating partial batch mutations', async () => {
     const keys = Uint32Array.from({ length: 12 }, (_, index) => index + 1);
     const values = Uint32Array.from(keys, (key) => key * 10);
     const amounts = Float64Array.from(keys);
@@ -389,7 +388,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     for (const key of keys) expect(backend.setContains(setState, setProgram, 0, key)).toBeTrue();
   });
 
-  it.skipIf(!WASM_EXISTS)('reads U32, F64, and I64 scalar slots losslessly with explicit empty state', async () => {
+  it('reads U32, F64, and I64 scalar slots losslessly with explicit empty state', async () => {
     const scalarProgram = await backend.loadProgram(
       buildProgram({
         slots: [
@@ -438,7 +437,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getScalarValue(state, scalarProgram, 2)).toEqual({ kind: 'i64', value: exactI64 });
   });
 
-  it.skipIf(!WASM_EXISTS)('returns an unambiguous four-row TTL eviction result and copied trigger rows', async () => {
+  it('returns an unambiguous four-row TTL eviction result and copied trigger rows', async () => {
     const program = await backend.loadProgram(
       buildProgram({
         slots: [{ type: 'hashmap', capacity: 8, ttl: { seconds: 10, trigger: true, timestampField: 2 } }],
@@ -479,7 +478,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     for (const key of keys) expect(backend.mapGet(restored, program, 0, key)).toBeUndefined();
   });
 
-  it.skipIf(!WASM_EXISTS)('parses and initializes CONDITION_TREE slots as first-class slot types', async () => {
+  it('parses and initializes CONDITION_TREE slots as first-class slot types', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'condition-tree' }, { type: 'aggregate', aggType: AggType.COUNT }],
       numInputs: 1,
@@ -535,11 +534,10 @@ describe('SC2: Undo stage for event cancellation', () => {
   let backend: ColumineBackend;
 
   beforeAll(async () => {
-    if (!WASM_EXISTS) return;
     backend = await loadColumineWasm(WASM_PATH);
   });
 
-  it.skipIf(!WASM_EXISTS)('checkpoint and rollback restores pre-batch state', async () => {
+  it('checkpoint and rollback restores pre-batch state', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     // Build a simple SUM program (SUM reads Float64 values)
@@ -570,7 +568,7 @@ describe('SC2: Undo stage for event cancellation', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(100);
   });
 
-  it.skipIf(!WASM_EXISTS)('commit makes changes permanent', async () => {
+  it('commit makes changes permanent', async () => {
     const stages = createPipeline({ backend, parseBackend: TEST_PARSE_BACKEND });
 
     const bytecode = buildProgram({
@@ -721,11 +719,10 @@ describe('SC4: Streaming processing', () => {
   let backend: ColumineBackend;
 
   beforeAll(async () => {
-    if (!WASM_EXISTS) return;
     backend = await loadColumineWasm(WASM_PATH);
   });
 
-  it.skipIf(!WASM_EXISTS)('multiple batches accumulate SUM correctly', async () => {
+  it('multiple batches accumulate SUM correctly', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.SUM }],
       numInputs: 1,
@@ -748,7 +745,7 @@ describe('SC4: Streaming processing', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(150);
   });
 
-  it.skipIf(!WASM_EXISTS)('multiple batches accumulate HashMap entries', async () => {
+  it('multiple batches accumulate HashMap entries', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'hashmap', capacity: 64 }],
       numInputs: 2,
@@ -786,7 +783,7 @@ describe('SC4: Streaming processing', () => {
     expect(backend.mapGet(state, program, 0, 3)).toBe(300); // New
   });
 
-  it.skipIf(!WASM_EXISTS)('state serialization and deserialization preserves accumulated state', async () => {
+  it('state serialization and deserialization preserves accumulated state', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.SUM }],
       numInputs: 1,

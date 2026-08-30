@@ -36,6 +36,9 @@
       },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "cargo-wasm"
+        ],
         "options": {
           "command": "bun test --timeout=30000 src/__tests__",
           "cwd": "{projectRoot}",
