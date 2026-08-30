@@ -396,40 +396,72 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
 
   // Member crates get their targets from the workspace-root package.json,
   // never per-crate — one Nx project per Cargo workspace.
+  //
+  // Every cargo tool target below is inferred unconditionally, INCLUDING when
+  // the package already declares that key in `nx.targets`. Nx merges a
+  // package-local declaration over an inference plugin's target one layer
+  // later — the precedence order is specified plugins → target defaults →
+  // default plugins, and the package.json reader is a default plugin — so a
+  // declaration only has to name the fields it changes:
+  //
+  //   - `executor`, `cache`, `inputs`, `outputs`, `dependsOn`: the declared
+  //     value REPLACES the inferred one, and every field the declaration omits
+  //     is inherited from here.
+  //   - `options` and `configurations`: merged key by key with declared keys
+  //     winning, unless the declaration names a different executor — then its
+  //     options mean something else and replace them wholesale.
+  //   - `"dependsOn": ["...", "extra"]` expands the inferred list at the
+  //     token's position. That is how a package ADDS an edge.
+  //
+  // Skipping inference for a declared key — what this used to do — is what made
+  // a one-line addition catastrophic: `nx.targets['cargo-test'] = { dependsOn:
+  // [...] }` left nothing to merge onto, and Nx normalizes a bare `dependsOn`
+  // to `executor: nx:noop` with empty options. That is the worst kind of green:
+  // `cargo-test` reaches its dependencies and runs no test binary.
+  // `checkWorkspaceCargoTestReachabilityPolicy` fails that shape, but the fix is
+  // to leave a base for the declaration to land on.
+  //
+  // The overlay is deliberately NOT re-implemented here. Applying it in this
+  // plugin as well would expand a `"..."` spread twice — once against the
+  // inferred list here, once when Nx merges the same declaration over this
+  // result — duplicating the very edges the spread exists to add.
+  //
+  // `dependsOn` REPLACES rather than unions. These lists are not a bag of
+  // independent wishes; they are the serialization chain that keeps two cargo
+  // writers off one flocked `target/` (see CARGO_TEST_COMPILE_TARGET), and their
+  // ORDER carries the invariant. A package that must re-route the chain — build
+  // its artifact ahead of the test run, or drop `cargo-test-compile` because it
+  // compiles differently — can only say so by replacing the list; a union would
+  // make every inferred edge unremovable and a corrected order unrepresentable.
+  // Additive intent already has a spelling (`"..."` above), so a plugin-local
+  // additive key would be a second convention beside a working one.
+  //
+  // The output families (`cargo-wasm`, `napi-*`) and the `test` aggregate stay
+  // all-or-nothing, because for those the package decides whether the target
+  // EXISTS — a packaging decision for output families, the bounded-test policy's
+  // rewrite for `test` — so there is no inferred base to partially override.
   if (isCargoWorkspace) {
-    const declared = declaredTargets;
-    if (!(CARGO_TEST_COMPILE_TARGET in declared)) {
-      targets[CARGO_TEST_COMPILE_TARGET] = createCargoTestCompileTarget(projectRoot);
-    }
-    if (!(CARGO_TEST_TARGET in declared)) {
-      const packageTargetNames = await addPerPackageCargoTestTargets(
-        targets,
-        projectRoot,
-        workspaceRoot,
-        absoluteProjectRoot,
-      );
-      if (packageTargetNames.length > 0) {
-        targets[CARGO_TEST_TARGET] = {
-          executor: 'nx:noop',
-          cache: true,
-          dependsOn: packageTargetNames,
-        };
-      } else {
-        targets[CARGO_TEST_TARGET] = createCargoTestTarget(projectRoot);
-      }
-    }
-    if (!('cargo-lint' in declared)) {
-      targets['cargo-lint'] = {
-        executor: 'nx:run-commands',
-        cache: true,
-        inputs: CARGO_INPUTS,
-        options: {
-          commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
-          cwd: projectRoot,
-          parallel: false,
-        },
-      };
-    }
+    targets[CARGO_TEST_COMPILE_TARGET] = createCargoTestCompileTarget(projectRoot);
+    const packageTargetNames = await addPerPackageCargoTestTargets(
+      targets,
+      projectRoot,
+      workspaceRoot,
+      absoluteProjectRoot,
+    );
+    targets[CARGO_TEST_TARGET] =
+      packageTargetNames.length > 0
+        ? { executor: 'nx:noop', cache: true, dependsOn: packageTargetNames }
+        : createCargoTestTarget(projectRoot);
+    targets['cargo-lint'] = {
+      executor: 'nx:run-commands',
+      cache: true,
+      inputs: CARGO_INPUTS,
+      options: {
+        commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
+        cwd: projectRoot,
+        parallel: false,
+      },
+    };
     validationTargets.push('cargo-lint');
     // The Linux arm of `cargo-lint`, as its own target. Rationale for the name,
     // the command and the absent cross test leg lives in ./cross-check-policy.ts.
@@ -449,58 +481,51 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     // see, so it would silently skip projects — today's bug in a new costume. An
     // opt-in flag has the same failure mode by construction. Every Rust project is
     // in scope because CI compiles every Rust project on Linux; a project that
-    // genuinely cannot cross-compile overrides the target by declaring it, which is
-    // a visible edit to its package.json rather than a silent absence.
+    // genuinely cannot cross-compile overrides the target by declaring it with
+    // `executor: nx:noop`, which is a visible edit to its package.json rather
+    // than a silent absence.
     //
     // Deliberately NOT pushed to validationTargets: joining the lint aggregate
     // would make `bun run lint` — and CI's own Linux lint, already native — demand
     // the 0.4 GiB cross toolchain that the devenv profile exists to keep opt-in.
-    if (!(CARGO_CROSS_LINT_TARGET in declared)) {
-      targets[CARGO_CROSS_LINT_TARGET] = {
-        executor: 'nx:run-commands',
-        cache: true,
-        inputs: CARGO_INPUTS,
-        options: {
-          command: CARGO_CROSS_LINT_COMMAND,
-          cwd: projectRoot,
-        },
-      };
-    }
-    if (!targets.test && !('test' in declared) && typeof packageJson.scripts?.test !== 'string') {
+    targets[CARGO_CROSS_LINT_TARGET] = {
+      executor: 'nx:run-commands',
+      cache: true,
+      inputs: CARGO_INPUTS,
+      options: {
+        command: CARGO_CROSS_LINT_COMMAND,
+        cwd: projectRoot,
+      },
+    };
+    if (!targets.test && !('test' in declaredTargets) && typeof packageJson.scripts?.test !== 'string') {
       targets.test = {
         executor: 'nx:noop',
         cache: true,
         dependsOn: [CARGO_TEST_TARGET],
       };
     }
-    if (!('mutation' in declared)) {
-      // Mutation runs are minutes-to-hours: never cached, never part of build/lint.
-      // CI runs these per-PR via `cargo mutants --in-diff` (see mutants.toml docs).
-      targets.mutation = {
-        executor: 'nx:run-commands',
-        cache: false,
-        options: { command: cargoFrozen('mutants --workspace'), cwd: projectRoot },
-      };
-    }
-    if (!('bench' in declared)) {
-      targets.bench = {
-        executor: 'nx:run-commands',
-        cache: false,
-        options: { command: cargoFrozen('bench --workspace'), cwd: projectRoot },
-      };
-    }
-    if (!('cargo-sweep' in declared)) {
-      // Target-dir GC. Cargo never removes superseded artifacts, so a busy
-      // workspace grows tens of GB of stale variants no fingerprint references;
-      // sweeping by age prunes exactly that junk while the warm current
-      // surface — the gated asset — survives untouched. Never cached: the
-      // verdict is about this machine's disk, not the commit.
-      targets['cargo-sweep'] = {
-        executor: 'nx:run-commands',
-        cache: false,
-        options: { command: 'cargo sweep --time 7', cwd: projectRoot },
-      };
-    }
+    // Mutation runs are minutes-to-hours: never cached, never part of build/lint.
+    // CI runs these per-PR via `cargo mutants --in-diff` (see mutants.toml docs).
+    targets.mutation = {
+      executor: 'nx:run-commands',
+      cache: false,
+      options: { command: cargoFrozen('mutants --workspace'), cwd: projectRoot },
+    };
+    targets.bench = {
+      executor: 'nx:run-commands',
+      cache: false,
+      options: { command: cargoFrozen('bench --workspace'), cwd: projectRoot },
+    };
+    // Target-dir GC. Cargo never removes superseded artifacts, so a busy
+    // workspace grows tens of GB of stale variants no fingerprint references;
+    // sweeping by age prunes exactly that junk while the warm current
+    // surface — the gated asset — survives untouched. Never cached: the
+    // verdict is about this machine's disk, not the commit.
+    targets['cargo-sweep'] = {
+      executor: 'nx:run-commands',
+      cache: false,
+      options: { command: 'cargo sweep --time 7', cwd: projectRoot },
+    };
   }
 
   // Cargo flocks the package's default `target/`. Writers that share it must

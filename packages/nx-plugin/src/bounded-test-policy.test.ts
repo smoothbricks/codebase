@@ -436,12 +436,16 @@ describe('cargo-test reachability policy', () => {
       await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
       await writeJson(join(root, 'packages/rusty/package.json'), { name: 'rusty', nx: { name: 'rusty' } });
 
-      // The shape a partial package-local override produces: declaring only
-      // dependsOn on cargo-test replaces the WHOLE inferred target, so the
-      // executor becomes nx:noop with empty options. `test` still reaches
-      // cargo-test, and cargo-test still reaches real work — but the only cargo
-      // invocation is `--no-run`, so no test is ever executed and the target is
-      // green. Reachability alone cannot see this.
+      // The shape a `dependsOn` that omits the runner leg produces: `test`
+      // still reaches cargo-test, and cargo-test still reaches real work — but
+      // the only cargo invocation in the closure is `--no-run`, so no test is
+      // ever executed and the target is green. Reachability alone cannot see
+      // this. Hoisted so the runner fixture below extends a total map instead
+      // of spreading an optional one.
+      const compileOnlyOptions = new Map<string, Record<string, unknown>>([
+        ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
+        ['cargo-wasm', { command: 'just wasm' }],
+      ]);
       const compileOnly: ResolvedProjectTargets = {
         root: 'packages/rusty',
         targets: new Set(['test', 'cargo-test', 'cargo-test-compile', 'cargo-wasm']),
@@ -455,10 +459,7 @@ describe('cargo-test reachability policy', () => {
           ['cargo-test-compile', 'nx:run-commands'],
           ['cargo-wasm', 'nx:run-commands'],
         ]),
-        targetOptions: new Map([
-          ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
-          ['cargo-wasm', { command: 'just wasm' }],
-        ]),
+        targetOptions: compileOnlyOptions,
       };
       const issues = checkWorkspaceCargoTestReachabilityPolicy(root, {
         resolvedTargetsByProject: new Map([['rusty', compileOnly]]),
@@ -476,7 +477,7 @@ describe('cargo-test reachability policy', () => {
           ['cargo-test-rusty-core', ['cargo-test-compile']],
         ]),
         targetOptions: new Map([
-          ...compileOnly.targetOptions,
+          ...compileOnlyOptions,
           ['cargo-test-rusty-core', { command: 'cargo --frozen nextest run --workspace --package rusty-core' }],
         ]),
       };

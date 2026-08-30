@@ -47,6 +47,12 @@
           "killAfterMs": 10000
         }
       },
+      "cargo-test": {
+        "dependsOn": [
+          "...",
+          "cargo-wasm"
+        ]
+      },
       "cargo-wasm": {
         "executor": "nx:run-commands",
         "cache": true,

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2 } from './index.js';
 import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
@@ -570,7 +571,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('lets explicit nx.targets suppress cargo inference and skips non-workspace Cargo.toml', async () => {
+  it('lets explicit nx.targets suppress output and aggregate inference, and skips non-workspace Cargo.toml', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write(
@@ -593,6 +594,104 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/member/Cargo.toml', '[package]\nname = "member"\n');
       const memberTargets = await inferProjectTargets(workspace, 'packages/member/package.json');
       expect(memberTargets).toEqual({});
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('keeps inferring a cargo target the package partially declares', async () => {
+    const workspace = await createWorkspace();
+    const declared: Record<string, TargetConfiguration> = {
+      // One added edge per target. Everything that makes each target do its job
+      // — executor, options, inputs, cache, configurations — must survive the
+      // declaration instead of being replaced wholesale by it.
+      'cargo-test': { dependsOn: ['cargo-test-compile', 'cargo-wasm'] },
+      'cargo-test-compile': { dependsOn: ['cargo-wasm'] },
+      'cargo-lint': { inputs: ['{projectRoot}/clippy.toml'] },
+      mutation: { options: { command: 'cargo mutants --in-diff' } },
+      bench: { cache: true },
+    };
+    try {
+      await workspace.write(
+        'packages/ferris/package.json',
+        JSON.stringify({ name: 'ferris', nx: { targets: declared } }),
+      );
+      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = []\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+
+      // Inference must still emit the base. Without one Nx has nothing to merge
+      // the declaration onto and normalizes a bare `dependsOn` to `nx:noop` with
+      // empty options — a cargo-test that passes having run no test binary.
+      expect(targets['cargo-test']?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
+      expect(targets['cargo-lint']?.options).toMatchObject({
+        commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
+      });
+
+      const cargoTest = resolveDeclaredOverInferred(targets, declared, 'cargo-test');
+      expect(cargoTest?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(cargoTest?.cache).toBe(true);
+      expect(cargoTest?.dependsOn).toEqual(['cargo-test-compile', 'cargo-wasm']);
+      expect(cargoTest?.options).toEqual({
+        command: 'cargo --frozen test --workspace',
+        cwd: 'packages/ferris',
+        timeoutMs: 120000,
+        killAfterMs: 10000,
+      });
+      expect(cargoTest?.configurations).toEqual({
+        production: { command: 'cargo --frozen test --workspace --release' },
+      });
+      expect(cargoTest?.inputs).toContain('{projectRoot}/**/*.rs');
+
+      const cargoTestCompile = resolveDeclaredOverInferred(targets, declared, 'cargo-test-compile');
+      expect(cargoTestCompile?.executor).toBe('nx:run-commands');
+      expect(cargoTestCompile?.dependsOn).toEqual(['cargo-wasm']);
+      expect(cargoTestCompile?.options).toMatchObject({
+        command: 'cargo --frozen test --workspace --no-run',
+      });
+
+      // A declared array replaces the inferred one; the command it guards stays.
+      const cargoLint = resolveDeclaredOverInferred(targets, declared, 'cargo-lint');
+      expect(cargoLint?.inputs).toEqual(['{projectRoot}/clippy.toml']);
+      expect(cargoLint?.options).toMatchObject({
+        commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
+      });
+
+      // `options` merges key by key, so a declared command overrides only itself.
+      const mutation = resolveDeclaredOverInferred(targets, declared, 'mutation');
+      expect(mutation?.options).toEqual({ command: 'cargo mutants --in-diff', cwd: 'packages/ferris' });
+      expect(mutation?.cache).toBe(false);
+
+      const bench = resolveDeclaredOverInferred(targets, declared, 'bench');
+      expect(bench?.cache).toBe(true);
+      expect(bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('lets a declared dependsOn spread expand the inferred cargo chain', async () => {
+    const workspace = await createWorkspace();
+    // Additive intent has Nx's own spelling: `'...'` expands the inferred list
+    // at the token, so an added edge keeps the cargo serialization chain.
+    const declared: Record<string, TargetConfiguration> = {
+      'cargo-test': { dependsOn: ['...', 'cargo-wasm'] },
+    };
+    try {
+      await workspace.write(
+        'packages/ferris/package.json',
+        JSON.stringify({ name: 'ferris', nx: { targets: declared } }),
+      );
+      await workspace.write('packages/ferris/Cargo.toml', '[workspace]\nmembers = []\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+
+      // The spread expands exactly once, against the single inferred base this
+      // plugin emits — re-implementing the overlay here would double it.
+      const cargoTest = resolveDeclaredOverInferred(targets, declared, 'cargo-test');
+      expect(cargoTest?.dependsOn).toEqual(['cargo-test-compile', 'cargo-wasm']);
+      expect(cargoTest?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
     } finally {
       await workspace.cleanup();
     }
@@ -635,4 +734,21 @@ async function inferProjectTargets(
   packageJsonPath: string,
 ): Promise<Record<string, TargetConfiguration>> {
   return (await inferProject(workspace, packageJsonPath))?.targets ?? {};
+}
+
+/**
+ * The configuration Nx resolves for a target this plugin infers and the package
+ * also declares. Nx merges a package-local `nx.targets` entry over an inference
+ * plugin's target one layer later — the precedence order is specified plugins →
+ * target defaults → default plugins, and the package.json reader is a default
+ * plugin — so composing with the same merge function the graph uses makes these
+ * assertions the resolved configuration rather than a guess about it.
+ */
+function resolveDeclaredOverInferred(
+  targets: Record<string, TargetConfiguration>,
+  declared: Record<string, TargetConfiguration>,
+  name: string,
+): TargetConfiguration | undefined {
+  const inferred = targets[name];
+  return inferred && mergeTargetConfigurations(declared[name] ?? {}, inferred);
 }
