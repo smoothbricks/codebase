@@ -10,7 +10,7 @@ publish.workspace = true
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", default-features = false, features = ["derive", "parsing", "printing", "proc-macro"] }
 quote = "1"
 proc-macro2 = "1"
 

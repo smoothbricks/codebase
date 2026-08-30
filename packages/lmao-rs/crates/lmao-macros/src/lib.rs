@@ -342,25 +342,40 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
 /// "name", |ctx| ...)` to nest under a parent identity.
 #[proc_macro]
 pub fn span(input: TokenStream) -> TokenStream {
+    // span! only forwards these fragments (`#trace` / `#p` / `#body`); it never
+    // matches on the tree. Parsing `syn::Expr` would pull in syn's `full` AST
+    // just to round-trip tokens. Groups keep nested commas inside one fragment.
+    fn opaque_expr(input: ParseStream) -> syn::Result<proc_macro2::TokenStream> {
+        let mut tokens = proc_macro2::TokenStream::new();
+        while !input.is_empty() && !input.peek(Token![,]) {
+            let tt: proc_macro2::TokenTree = input.parse()?;
+            tokens.extend(std::iter::once(tt));
+        }
+        if tokens.is_empty() {
+            return Err(input.error("expected expression"));
+        }
+        Ok(tokens)
+    }
+
     struct SpanCall {
-        trace: syn::Expr,
-        parent: Option<syn::Expr>,
+        trace: proc_macro2::TokenStream,
+        parent: Option<proc_macro2::TokenStream>,
         name: LitStr,
-        body: syn::Expr,
+        body: proc_macro2::TokenStream,
     }
     impl Parse for SpanCall {
         fn parse(input: ParseStream) -> syn::Result<Self> {
-            let trace: syn::Expr = input.parse()?;
+            let trace = opaque_expr(input)?;
             input.parse::<Token![,]>()?;
             let (parent, name) = if input.peek(LitStr) {
                 (None, input.parse()?)
             } else {
-                let parent: syn::Expr = input.parse()?;
+                let parent = opaque_expr(input)?;
                 input.parse::<Token![,]>()?;
                 (Some(parent), input.parse()?)
             };
             input.parse::<Token![,]>()?;
-            let body: syn::Expr = input.parse()?;
+            let body = opaque_expr(input)?;
             if !input.is_empty() {
                 input.parse::<Token![,]>()?;
             }
