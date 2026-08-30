@@ -24,7 +24,7 @@ use crate::{aggregates, bitmap_ops, bytes, hash_table, nested, slot_growth};
 pub use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     AggType, CONDITION_TREE_STATE_BYTES, DERIVED_FACT_EMPTY_IDENTITY, EMPTY_KEY, ErrorCode, Opcode,
-    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, SLOT_META_SIZE, STATE_FORMAT_VERSION,
+    PROGRAM_HASH_PREFIX, PROGRAM_HEADER_SIZE, ProgramHeader, SLOT_META_SIZE, STATE_FORMAT_VERSION,
     STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType, SlotTypeFlags, StateFlags,
     StateHeaderOffset, StructFieldType, TOMBSTONE, align8, arena_elem_size, has_array_fields,
     next_power_of_2,
@@ -47,7 +47,7 @@ pub const EVICTION_ENTRY_SIZE: u32 = 16;
 // =============================================================================
 
 /// Arena header: `[arena_capacity:u32][arena_used:u32]`.
-pub const ARENA_HEADER_SIZE: u32 = 8;
+pub const ARENA_HEADER_SIZE: u32 = nested::ARENA_HDR_SIZE;
 
 /// Initial arena capacity: 64 bytes per hash entry.
 /// This helper is deliberately distinct from the general type sizing helper.
@@ -143,21 +143,21 @@ fn parse_program<'a>(
         return None;
     }
     let content = &program[PROGRAM_HASH_PREFIX as usize..];
-    let magic = u32::from(content[0])
-        | (u32::from(content[1]) << 8)
-        | (u32::from(content[2]) << 16)
-        | (u32::from(content[3]) << 24);
-    if !accepts_program_magic(magic, accepted_program_magics) {
+    let header_bytes: [u8; ProgramHeader::WIRE_SIZE] =
+        content.get(..ProgramHeader::WIRE_SIZE)?.try_into().ok()?;
+    let header = ProgramHeader::from_wire_bytes(header_bytes);
+    if !accepts_program_magic(header.magic, accepted_program_magics) {
         return None;
     }
-    let num_slots = content[6];
-    let init_len = u16::from(content[10]) | (u16::from(content[11]) << 8);
-    if PROGRAM_HEADER_SIZE + u32::from(init_len) > program.len() as u32 {
+    let init_len = usize::from(header.init_code_len);
+    if PROGRAM_HASH_PREFIX + ProgramHeader::WIRE_SIZE as u32 + u32::from(header.init_code_len)
+        > program.len() as u32
+    {
         return None;
     }
     Some(ProgramView {
-        num_slots,
-        init_code: &content[14..14 + usize::from(init_len)],
+        num_slots: header.num_slots,
+        init_code: content.get(ProgramHeader::WIRE_SIZE..ProgramHeader::WIRE_SIZE + init_len)?,
     })
 }
 
@@ -1140,7 +1140,7 @@ fn nested_primary_size_from_prefix(old_state: &[u8], slot_offset: u32, outer_cap
 /// the slot metadata from the old state so already-grown states grow again
 /// correctly.
 pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 {
-    let num_slots = u32::from(old_state[9]);
+    let num_slots = u32::from(old_state[StateHeaderOffset::NUM_SLOTS as usize]);
     let mut total_size = align8(STATE_HEADER_SIZE + num_slots * SLOT_META_SIZE);
 
     for slot_i in 0..num_slots {
@@ -1195,7 +1195,7 @@ pub fn grow_state(
     new_state: &mut [u8],
     grown_slot_idx: u32,
 ) -> Result<(), ErrorCode> {
-    let num_slots = u32::from(old_state[9]);
+    let num_slots = u32::from(old_state[StateHeaderOffset::NUM_SLOTS as usize]);
 
     // Copy header verbatim.
     bytes::copy(new_state, 0, old_state, 0, STATE_HEADER_SIZE);
