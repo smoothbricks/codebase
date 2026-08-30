@@ -2457,30 +2457,42 @@ fn sni_matches(sni: Option<&str>, host: &CanonicalHost) -> bool {
     }
 }
 
+const UPSTREAM_REQUEST_SECRETS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "npm-auth-type",
+    "npm-auth-token",
+    "x-npm-token",
+    "npm-otp",
+    "x-goog-api-key",
+    "traceparent",
+    "tracestate",
+];
+
+const UPSTREAM_RESPONSE_SECRETS: &[&str] =
+    &["set-cookie", "proxy-authenticate", "www-authenticate"];
+
+pub(crate) fn is_sensitive_header(name: &HeaderName) -> bool {
+    let needle = name.as_str();
+    UPSTREAM_REQUEST_SECRETS
+        .iter()
+        .chain(UPSTREAM_RESPONSE_SECRETS.iter())
+        .any(|secret| needle.eq_ignore_ascii_case(secret))
+}
+
 pub(crate) fn strip_upstream_request_headers(headers: &mut HeaderMap) {
-    const SENSITIVE: &[&str] = &[
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-        "npm-auth-type",
-        "npm-auth-token",
-        "x-npm-token",
-        "npm-otp",
-        "x-goog-api-key",
-        "traceparent",
-        "tracestate",
-    ];
-    for name in SENSITIVE {
+    for name in UPSTREAM_REQUEST_SECRETS {
         headers.remove(*name);
     }
     strip_hop_headers(headers);
 }
 
 pub(crate) fn strip_upstream_response_headers(headers: &mut HeaderMap) {
-    headers.remove(header::SET_COOKIE);
-    headers.remove(header::PROXY_AUTHENTICATE);
-    headers.remove(header::WWW_AUTHENTICATE);
+    for name in UPSTREAM_RESPONSE_SECRETS {
+        headers.remove(*name);
+    }
     strip_hop_headers(headers);
 }
 

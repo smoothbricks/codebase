@@ -1296,12 +1296,7 @@ impl DiskRecord {
 }
 
 fn is_sensitive_header(name: &HeaderName) -> bool {
-    name == http::header::AUTHORIZATION
-        || name == http::header::PROXY_AUTHORIZATION
-        || name == http::header::COOKIE
-        || name == http::header::SET_COOKIE
-        || name.as_str().eq_ignore_ascii_case("npm-auth-type")
-        || name.as_str().eq_ignore_ascii_case("npm-otp")
+    crate::proxy::is_sensitive_header(name)
 }
 
 #[cfg(unix)]
