@@ -5,7 +5,7 @@ import { chmodSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { platformDirectory } from './platform.js';
+import { hostStableCowshedBinary, platformDirectory } from './platform.js';
 import { CowshedError } from './types.js';
 
 const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
@@ -63,14 +63,7 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
     // install falls through so the first-ever start can bootstrap from the invoking binary — the
     // Rust side refuses a workspace copy with exit 5 and the install path, never installing a
     // dangling agent.
-    const stableBinary = join(
-      options.home ?? homedir(),
-      'Library',
-      'Application Support',
-      'dev.cowshed',
-      'bin',
-      'cowshed',
-    );
+    const stableBinary = hostStableCowshedBinary(options.home ?? homedir());
     searched.push(stableBinary);
     if (fileExists(stableBinary)) {
       return { kind: 'native', path: stableBinary, source: 'stable' };
