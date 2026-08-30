@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join, posix } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   type CreateNodesResultV2,
@@ -12,6 +13,12 @@ import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
 
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
+import {
+  cargoPackageTestInputs,
+  cargoTestPackageTargetName,
+  listCargoWorkspacePackages,
+  nextestConfigRelPath,
+} from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
@@ -188,6 +195,41 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
   };
 }
 
+const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.meta.url));
+
+async function addPerPackageCargoTestTargets(
+  targets: Record<string, TargetConfiguration>,
+  projectRoot: string,
+  workspaceRoot: string,
+  absoluteProjectRoot: string,
+): Promise<string[]> {
+  const packages = await listCargoWorkspacePackages(absoluteProjectRoot);
+  if (packages.length === 0) {
+    return [];
+  }
+  const configFile = nextestConfigRelPath(workspaceRoot, projectRoot, PLUGIN_NEXTEST_CONFIG);
+  const packageTargetNames: string[] = [];
+  let previous = CARGO_TEST_COMPILE_TARGET;
+  for (const pkg of packages) {
+    const targetName = cargoTestPackageTargetName(pkg.name);
+    packageTargetNames.push(targetName);
+    targets[targetName] = {
+      executor: '@smoothbricks/nx-plugin:bounded-exec',
+      cache: true,
+      inputs: await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir),
+      dependsOn: [previous],
+      options: {
+        command: `cargo nextest run --workspace --package ${pkg.name} --user-config-file none --config-file ${configFile}`,
+        cwd: projectRoot,
+        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+        killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+      },
+    };
+    previous = targetName;
+  }
+  return packageTargetNames;
+}
+
 export const createNodesV2: CreateNodesV2 = [
   '**/package.json',
   async (projectConfigurationFiles, _options, context) => {
@@ -350,7 +392,21 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       targets[CARGO_TEST_COMPILE_TARGET] = createCargoTestCompileTarget(projectRoot);
     }
     if (!('cargo-test' in declared)) {
-      targets['cargo-test'] = createCargoTestTarget(projectRoot);
+      const packageTargetNames = await addPerPackageCargoTestTargets(
+        targets,
+        projectRoot,
+        workspaceRoot,
+        absoluteProjectRoot,
+      );
+      if (packageTargetNames.length > 0) {
+        targets['cargo-test'] = {
+          executor: 'nx:noop',
+          cache: true,
+          dependsOn: packageTargetNames,
+        };
+      } else {
+        targets['cargo-test'] = createCargoTestTarget(projectRoot);
+      }
     }
     if (!('cargo-lint' in declared)) {
       targets['cargo-lint'] = {
@@ -404,8 +460,11 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       };
     }
     if (!targets.test && !('test' in declared) && typeof packageJson.scripts?.test !== 'string') {
-      // Execute Cargo directly: workspace targetDefaults may replace test.dependsOn.
-      targets.test = createCargoTestTarget(projectRoot);
+      targets.test = {
+        executor: 'nx:noop',
+        cache: true,
+        dependsOn: ['cargo-test'],
+      };
     }
     if (!('mutation' in declared)) {
       // Mutation runs are minutes-to-hours: never cached, never part of build/lint.
@@ -440,17 +499,32 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   // Cargo flocks the package's default `target/`. Writers that share it must
   // not be Nx siblings. Clippy is not in this set: it has its own --target-dir.
   const napiDebug = targets['napi-debug'];
-  const cargoTest = targets['cargo-test'];
   if (napiDebug && targets[CARGO_TEST_COMPILE_TARGET]) {
     const dependsOn = napiDebug.dependsOn ?? [];
     if (!dependsOn.includes(CARGO_TEST_COMPILE_TARGET)) {
       napiDebug.dependsOn = [...dependsOn, CARGO_TEST_COMPILE_TARGET];
     }
   }
-  if (cargoTest && napiDebug) {
-    const dependsOn = cargoTest.dependsOn ?? [];
-    if (!dependsOn.includes('napi-debug')) {
-      cargoTest.dependsOn = [...dependsOn, 'napi-debug'];
+  if (napiDebug) {
+    for (const [name, target] of Object.entries(targets)) {
+      if (!name.startsWith('cargo-test-') || name === CARGO_TEST_COMPILE_TARGET) {
+        continue;
+      }
+      const dependsOn = target.dependsOn ?? [];
+      if (dependsOn.includes(CARGO_TEST_COMPILE_TARGET) && !dependsOn.includes('napi-debug')) {
+        target.dependsOn = dependsOn.map((dep) => (dep === CARGO_TEST_COMPILE_TARGET ? 'napi-debug' : dep));
+      }
+    }
+    const cargoTest = targets['cargo-test'];
+    if (
+      cargoTest?.options &&
+      typeof cargoTest.options.command === 'string' &&
+      cargoTest.options.command.startsWith('cargo ')
+    ) {
+      const dependsOn = cargoTest.dependsOn ?? [];
+      if (!dependsOn.includes('napi-debug')) {
+        cargoTest.dependsOn = [...dependsOn, 'napi-debug'];
+      }
     }
   }
 

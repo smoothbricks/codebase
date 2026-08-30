@@ -82,6 +82,7 @@
   "files": [
     "dist",
     "src",
+    "nextest.toml",
     "README.md",
     "loader.js",
     "generators.json",
