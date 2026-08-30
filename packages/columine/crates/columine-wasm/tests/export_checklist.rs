@@ -1,160 +1,116 @@
-//! Pins the wasm export surface: 62 expected `vm_*` function exports plus
-//! exported memory. The list is the frozen Columine ABI baseline and excludes
-//! the RETE/ax_eval/condition-tree families.
+//! Audits the `columine.wasm` export surface against
+//! `columine_types::wasm_abi::COLUMINE_VM_EXPORTS` — from both sides.
+//!
+//! The rust artifact and the TypeScript host each used to carry their own copy
+//! of this list, and they disagreed by 32 names. Both are now checked against
+//! the one table, so an export added on one side and forgotten on the other
+//! fails here instead of failing a caller.
+//!
+//! `built_wasm_matches_the_export_table` needs the compiled artifact and says
+//! so out loud when it is missing rather than reporting success: the nx
+//! `cargo-test` target builds it first (`dependsOn: cargo-wasm`), and `just
+//! wasm` runs this file directly after linking.
 
-/// Expected function exports of the Columine wasm artifact.
-pub const EXPECTED_COLUMINE_EXPORTS: [&str; 62] = [
-    "vm_calculate_grown_state_size",
-    "vm_calculate_state_size",
-    "vm_delta_apply_rollback_segment",
-    "vm_delta_apply_rollforward_segment",
-    "vm_delta_export_entry_size",
-    "vm_delta_export_len_bytes",
-    "vm_delta_export_overflow",
-    "vm_delta_export_redo_ptr",
-    "vm_delta_export_segment",
-    "vm_delta_export_undo_ptr",
-    "vm_evict_all_expired",
-    "vm_get_evicted_count",
-    "vm_execute_batch",
-    "vm_execute_batch_delta",
-    "vm_get_needs_growth_slot",
-    "vm_get_rbmp_last_error",
-    "vm_get_rbmp_scratch_len",
-    "vm_get_rbmp_scratch_ptr",
-    "vm_grow_state",
-    "vm_init_state",
-    "vm_map_get",
-    "vm_map_iter_get",
-    "vm_map_iter_next",
-    "vm_map_iter_start",
-    "vm_rbmp_algebra_result_len",
-    "vm_rbmp_algebra_result_ptr",
-    "vm_rbmp_and",
-    "vm_rbmp_andnot",
-    "vm_rbmp_cardinality_serialized",
-    "vm_rbmp_contains_serialized",
-    "vm_rbmp_export_copy",
-    "vm_rbmp_export_len",
-    "vm_rbmp_extract_serialized",
-    "vm_rbmp_import_copy",
-    "vm_rbmp_intersect_any_serialized",
-    "vm_rbmp_intersect_any_slots",
-    "vm_rbmp_intersect_count_serialized",
-    "vm_rbmp_intersect_count_slots",
-    "vm_rbmp_or",
-    "vm_rbmp_slot_data_len",
-    "vm_rbmp_slot_data_ptr",
-    "vm_rbmp_xor",
-    "vm_reset_state",
-    "vm_set_contains",
-    "vm_set_iter_get",
-    "vm_set_iter_next",
-    "vm_set_iter_start",
-    "vm_set_rbmp_scratch",
-    "vm_struct_map2_get_row_ptr",
-    "vm_struct_map2_iter_key1",
-    "vm_struct_map2_iter_key2",
-    "vm_struct_map2_iter_next",
-    "vm_struct_map2_iter_start",
-    "vm_struct_map_get_row_ptr",
-    "vm_struct_map_iter_key",
-    "vm_struct_map_iter_next",
-    "vm_struct_map_iter_start",
-    "vm_undo_checkpoint",
-    "vm_undo_commit",
-    "vm_undo_enable",
-    "vm_undo_has_overflow",
-    "vm_undo_rollback",
-];
+use columine_types::wasm_abi::{COLUMINE_VM_EXPORTS, EXPORTED_MEMORY, parse_exports};
+use std::collections::BTreeSet;
 
-/// Minimal wasm export-section reader (section id 7): (name, kind) pairs.
-fn wasm_exports(bytes: &[u8]) -> Vec<(String, u8)> {
-    assert_eq!(&bytes[..4], b"\0asm", "not a wasm module");
-    let mut i = 8;
-    let uleb = |i: &mut usize| -> u64 {
-        let mut r = 0u64;
-        let mut s = 0;
-        loop {
-            let b = bytes[*i];
-            *i += 1;
-            r |= u64::from(b & 0x7f) << s;
-            if b & 0x80 == 0 {
-                return r;
-            }
-            s += 7;
-        }
-    };
-    let mut out = Vec::new();
-    while i < bytes.len() {
-        let sid = bytes[i];
-        i += 1;
-        let size = uleb(&mut i) as usize;
-        let end = i + size;
-        if sid == 7 {
-            let n = uleb(&mut i);
-            for _ in 0..n {
-                let len = uleb(&mut i) as usize;
-                let name = String::from_utf8(bytes[i..i + len].to_vec()).unwrap();
-                i += len;
-                let kind = bytes[i];
-                i += 1;
-                let _idx = uleb(&mut i);
-                out.push((name, kind));
-            }
-        }
-        i = end;
-    }
-    out
+/// Built artifact, relative to this crate. `just wasm` and the nx `cargo-wasm`
+/// target both produce it at this path.
+const ARTIFACT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm"
+);
+
+/// The TypeScript host, read as source. A generator would be a build-order
+/// edge from rust into the TS package for a list that changes when someone
+/// edits an export by hand; harvesting the declaration catches the same drift
+/// in both directions with no build step.
+const WASM_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/wasm-backend.ts");
+
+fn table() -> BTreeSet<&'static str> {
+    COLUMINE_VM_EXPORTS.iter().copied().collect()
+}
+
+/// Harvest the quoted names of a `const <name> = [ ... ] as const;` array.
+fn ts_string_array(source: &str, declaration: &str) -> BTreeSet<String> {
+    let start = source
+        .find(declaration)
+        .unwrap_or_else(|| panic!("{declaration} not found in wasm-backend.ts"));
+    let body = &source[start..];
+    let end = body
+        .find("] as const")
+        .unwrap_or_else(|| panic!("{declaration} is not a `[...] as const` array"));
+    body[..end]
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]
-fn export_list_is_complete_and_deduped() {
-    let mut names: Vec<&str> = EXPECTED_COLUMINE_EXPORTS.to_vec();
-    names.sort_unstable();
-    names.dedup();
-    assert_eq!(
-        names.len(),
-        EXPECTED_COLUMINE_EXPORTS.len(),
-        "duplicate names in the checklist"
-    );
-}
-
-/// `just wasm` (columine justfile) runs this against the built artifact.
-#[test]
-#[ignore = "needs target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm (run `just wasm`)"]
-fn built_wasm_exports_expected_symbols_and_memory() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm"
-    );
-    let bytes =
-        std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e} — run `just wasm` first"));
-    let exports = wasm_exports(&bytes);
-    let fn_names: std::collections::HashSet<&str> = exports
+fn typescript_host_binds_exactly_the_export_table() {
+    let source = std::fs::read_to_string(WASM_BACKEND_TS)
+        .unwrap_or_else(|error| panic!("read {WASM_BACKEND_TS}: {error}"));
+    let bound = ts_string_array(&source, "const VM_EXPORT_NAMES");
+    let expected: BTreeSet<String> = COLUMINE_VM_EXPORTS
         .iter()
-        .filter(|(_, k)| *k == 0)
-        .map(|(n, _)| n.as_str())
+        .map(|name| (*name).to_owned())
         .collect();
-    let missing: Vec<&&str> = EXPECTED_COLUMINE_EXPORTS
+    assert_eq!(
+        expected, bound,
+        "wasm-backend.ts VM_EXPORT_NAMES diverged from \
+         columine_types::wasm_abi::COLUMINE_VM_EXPORTS"
+    );
+}
+
+/// The `VmExports` interface is what the rest of the host calls through, so a
+/// name present in `VM_EXPORT_NAMES` but absent from the type is still an
+/// unbound export. Members are declared as method signatures, so the audit
+/// looks for `name(`.
+#[test]
+fn typescript_vm_exports_type_covers_the_export_table() {
+    let source = std::fs::read_to_string(WASM_BACKEND_TS)
+        .unwrap_or_else(|error| panic!("read {WASM_BACKEND_TS}: {error}"));
+    let missing: Vec<&str> = COLUMINE_VM_EXPORTS
         .iter()
-        .filter(|n| !fn_names.contains(**n))
+        .copied()
+        .filter(|name| !source.contains(&format!("{name}(")))
         .collect();
     assert!(
         missing.is_empty(),
-        "exports missing from the Columine ABI checklist: {missing:?}"
+        "exports in the table with no VmExports member: {missing:?}"
     );
-    let extra: Vec<&str> = fn_names
+}
+
+#[test]
+fn built_wasm_matches_the_export_table() {
+    let bytes = std::fs::read(ARTIFACT).unwrap_or_else(|error| {
+        panic!(
+            "read {ARTIFACT}: {error}\n\
+             This test audits the compiled artifact, so it cannot pass without \
+             one. Build it with `just wasm` (or run this through \
+             `nx run columine:cargo-test`, which depends on cargo-wasm)."
+        )
+    });
+    let exports = parse_exports(&bytes).expect("built artifact is a readable wasm module");
+    // `__`-prefixed symbols are toolchain internals (`__heap_base`,
+    // `__data_end`), not ABI.
+    let functions: BTreeSet<&str> = exports
         .iter()
-        .filter(|n| !EXPECTED_COLUMINE_EXPORTS.contains(*n) && !n.starts_with("__"))
-        .copied()
+        .filter(|export| export.kind == 0 && !export.name.starts_with("__"))
+        .map(|export| export.name.as_str())
         .collect();
-    assert!(
-        extra.is_empty(),
-        "exports beyond the Columine ABI checklist: {extra:?}"
+    assert_eq!(
+        table(),
+        functions,
+        "built columine.wasm function exports diverged from \
+         columine_types::wasm_abi::COLUMINE_VM_EXPORTS"
     );
     assert!(
-        exports.iter().any(|(n, k)| n == "memory" && *k == 2),
-        "memory must be exported (columine TS reads instance.exports.memory)"
+        exports
+            .iter()
+            .any(|export| export.name == EXPORTED_MEMORY && export.kind == 2),
+        "{EXPORTED_MEMORY} must be exported (the TS host reads instance.exports.memory)"
     );
 }

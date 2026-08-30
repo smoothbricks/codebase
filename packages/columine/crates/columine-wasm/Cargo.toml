@@ -1,6 +1,6 @@
 [package]
 name = "columine-wasm"
-description = "columine.wasm: the generic reducer-VM export surface (56 vm_* functions, no RETE) shipped by the @smoothbricks/columine npm package"
+description = "columine.wasm: the generic reducer-VM export surface (no RETE) shipped by the @smoothbricks/columine npm package"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,3 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 columine-types = { workspace = true }
 columine-vm = { workspace = true }
+
+[dev-dependencies]
+# The export audit reads the wasm export section and the frozen ABI table.
+columine-types = { workspace = true, features = ["audit"] }
