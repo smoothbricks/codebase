@@ -33,6 +33,7 @@ use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
 
 const ROUTER_CAPACITY: usize = 64;
+const STARTUP_LIFECYCLE_ATTEMPTS: usize = 8;
 const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The branch a workspace's commits are expected to reach.
@@ -354,7 +355,20 @@ impl ProjectRuntime {
 
     /// Starts a runtime from an injected host after strict recovery completes.
     pub async fn start(mut host: impl ProjectRuntimeHost) -> Result<Self> {
-        host.recover().await?;
+        for attempt in 1..=STARTUP_LIFECYCLE_ATTEMPTS {
+            match host.recover().await {
+                Ok(()) => break,
+                Err(error) => match error.lifecycle_conflict_source() {
+                    Some(_) if attempt < STARTUP_LIFECYCLE_ATTEMPTS => {
+                        // Recovery is the refresh boundary: it reloads the intent journal and
+                        // authoritative workspace inventory before constructing any new plan.
+                        continue;
+                    }
+                    Some(conflict) => return Err(startup_conflict_exhausted(conflict)),
+                    None => return Err(error),
+                },
+            }
+        }
         let descriptor = host.descriptor().clone();
         let capacity = NonZeroUsize::new(ROUTER_CAPACITY)
             .ok_or_else(|| CowshedError::internal("project router capacity is zero"))?;
@@ -381,6 +395,24 @@ impl ProjectRuntime {
             .await
             .map_err(|error| CowshedError::internal(format!("project actor failed: {error}")))
     }
+}
+
+fn startup_conflict_exhausted(conflict: &crate::storage::lifecycle::Conflict) -> CowshedError {
+    use crate::storage::lifecycle::Conflict;
+
+    let changing_fact = match conflict {
+        Conflict::FactCount { expected, actual } => {
+            format!("authoritative fact count kept changing (last expected {expected}, actual {actual})")
+        }
+        Conflict::Stale { index, .. } => format!("authoritative fact {index} kept changing"),
+    };
+    CowshedError::conflict(
+        format!(
+            "controller startup exhausted {STARTUP_LIFECYCLE_ATTEMPTS} lifecycle attempts; \
+             {changing_fact}"
+        ),
+        "retry startup when workspace lifecycle state stabilizes",
+    )
 }
 
 struct ProjectActor {
@@ -8576,7 +8608,7 @@ fn workspace_lineage(
 fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> CowshedError {
     match error {
         crate::storage::apfs::ApfsStorageError::Conflict(error) => {
-            CowshedError::conflict(error.to_string(), "refresh workspace state and retry")
+            CowshedError::lifecycle_conflict(error)
         }
         crate::storage::apfs::ApfsStorageError::GcPlanStale => CowshedError::conflict(
             "garbage-collection plan became stale",
