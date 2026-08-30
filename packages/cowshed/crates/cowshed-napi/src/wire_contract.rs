@@ -649,7 +649,12 @@ fn every_job_state_appears_in_the_corpus() {
             Value::Array(items) => items.clone(),
             single => vec![single.clone()],
         })
-        .filter_map(|value| value.get("state").and_then(Value::as_str).map(str::to_owned))
+        .filter_map(|value| {
+            value
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .collect();
 
     for state in [
@@ -662,7 +667,9 @@ fn every_job_state_appears_in_the_corpus() {
         JobState::Failed,
     ] {
         let spelling = serde_json::to_value(state).expect("a job state is JSON");
-        let spelling = spelling.as_str().expect("a job state serializes as a string");
+        let spelling = spelling
+            .as_str()
+            .expect("a job state serializes as a string");
         assert!(
             states.iter().any(|seen| seen == spelling),
             "job state {spelling:?} has no corpus case, so types.ts is unverified for it"
