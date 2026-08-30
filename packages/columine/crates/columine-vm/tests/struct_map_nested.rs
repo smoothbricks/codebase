@@ -6,10 +6,14 @@
 //! tests use a deterministic LCG because the random stream is not contract.
 
 use columine_types::types::{
-    ChangeFlag, EMPTY_KEY, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset, SlotType, StructFieldType,
-    hash_key, struct_field_size,
+    ChangeFlag, EMPTY_KEY, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
+    StateHeaderOffset, StructFieldType, TOMBSTONE, hash_key, struct_field_size,
 };
+use columine_vm::bitmap_ops::BitmapEnv;
+use columine_vm::bytes;
 use columine_vm::hash_table::{ENTRY_NONE, FlatTable, hashset_byte_size};
+use columine_vm::hashmap_ops::bind_slot_map;
+use columine_vm::hashset_ops::bind_slot_set;
 use columine_vm::meta::SlotMetaView;
 use columine_vm::nested::{
     Arena, NestedPrefix, arena_data_offset, arena_header_offset, get_inner_offset,
@@ -18,9 +22,22 @@ use columine_vm::nested::{
     write_nested_prefix,
 };
 use columine_vm::struct_map::{StructMap2Slot, StructMapSlot};
+use columine_vm::undo_log::{rollback_map_insert, rollback_set_insert};
+use columine_vm::vm::{
+    vm_map_get, vm_map_iter_get, vm_map_iter_next, vm_map_iter_start, vm_set_contains,
+    vm_set_iter_get, vm_set_iter_next, vm_set_iter_start, vm_struct_map_get_row_ptr,
+    vm_struct_map_iter_key, vm_struct_map_iter_next, vm_struct_map_iter_start,
+    vm_struct_map2_get_row_ptr, vm_struct_map2_iter_key1, vm_struct_map2_iter_key2,
+    vm_struct_map2_iter_next, vm_struct_map2_iter_start,
+};
 use proptest::prelude::*;
 
 const SLOT_OFFSET: u32 = STATE_HEADER_SIZE + 48; // one 48-byte slot-meta record
+
+/// Second key lane used by every exact-pair table in the differentials. Lane 2
+/// is held constant so the pair table answers the same membership question as
+/// the unary tables.
+const PAIR_KEY2: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Struct-map scaffolding: manual metadata writes use byte 13 for field count,
@@ -74,6 +91,25 @@ fn mk_struct_map2_state(state_len: usize, cap: u32) -> Vec<u8> {
     for pos in 0..cap {
         let offset = (keys1 + pos * 4) as usize;
         state[offset..offset + 4].copy_from_slice(&EMPTY_KEY.to_le_bytes());
+    }
+    state
+}
+
+/// Metadata-managed flat-table state: one slot whose data region is the
+/// headerless `[keys][entries?]` image that `bind_slot_map`/`bind_slot_set` and
+/// the `vm_map_*`/`vm_set_*` exports address. `NUM_SLOTS` is written so
+/// `find_slot_meta_by_offset` resolves the record and classifies the slot,
+/// rather than reading zero slots and falling through to a raw probe.
+fn mk_flat_slot_state(state_len: usize, cap: u32, slot_type: SlotType) -> Vec<u8> {
+    let mut state = vec![0u8; state_len];
+    state[StateHeaderOffset::NUM_SLOTS as usize] = 1;
+    let meta = STATE_HEADER_SIZE as usize;
+    state[meta..meta + 4].copy_from_slice(&SLOT_OFFSET.to_le_bytes());
+    state[meta + 4..meta + 8].copy_from_slice(&cap.to_le_bytes());
+    state[meta + SlotMetaOffset::TYPE_FLAGS as usize] = slot_type as u8;
+    for pos in 0..cap {
+        let off = (SLOT_OFFSET + pos * 4) as usize;
+        state[off..off + 4].copy_from_slice(&EMPTY_KEY.to_le_bytes());
     }
     state
 }
@@ -706,5 +742,260 @@ proptest! {
                 }
             }
         }
+    }
+
+    /// Flat tables, unary struct maps, and nested outer tables share one home
+    /// position (`hash_key`), one bounded linear probe, and one 70% load
+    /// ceiling, so the same insert workload must place every key in the same
+    /// cell of all three — the cell images are compared, not just membership.
+    /// `StructMap2Slot` homes on `hash_key_pair`, so only its accept/duplicate
+    /// decisions are comparable, never its placement.
+    ///
+    /// Nested outer tables have no removal operation, so this property is
+    /// insert-only; removal parity lives in
+    /// `prop_table_read_exports_match_model`.
+    #[test]
+    fn prop_probe_cell_images_agree(
+        keys in prop::collection::vec(1u32..64, 0..64),
+    ) {
+        let capacity = 32;
+        let mut flat_state = mk_flat_slot_state(8192, capacity, SlotType::HashMap);
+        let flat_meta = meta_of(&flat_state);
+        let flat = bind_slot_map(&flat_meta);
+        let mut struct_state =
+            mk_struct_map_state(8192, capacity, &[StructFieldType::UInt32 as u8], 1, 8);
+        let struct_map = StructMapSlot::bind(&struct_state, 0);
+        let mut struct2_state = mk_struct_map2_state(8192, capacity);
+        let struct_map2 = StructMap2Slot::bind(&struct2_state, 0);
+        let mut nested_state = mk_nested_state(1 << 20, capacity, SlotType::HashSet, 4, 1);
+        let nested_meta = meta_of(&nested_state);
+
+        for key in keys {
+            // Some(true) = inserted, Some(false) = duplicate, None = refused.
+            let flat_result = flat.upsert_u32(&mut flat_state, key, key);
+            let struct_result = struct_map.upsert(&mut struct_state, key);
+            let struct2_result = struct_map2.upsert(&mut struct2_state, key, PAIR_KEY2);
+            let nested_present = get_inner_offset(&nested_state, &nested_meta, key) != 0;
+            let nested_ok =
+                nested_set_insert(&mut nested_state, &nested_meta, key, key) == ErrorCode::Ok;
+
+            prop_assert_eq!(struct_result.map(|up| up.is_new), flat_result);
+            prop_assert_eq!(struct2_result.map(|up| up.is_new), flat_result);
+            prop_assert_eq!(nested_ok.then_some(!nested_present), flat_result);
+        }
+
+        let live = flat.size(&flat_state);
+        prop_assert_eq!(struct_map.size(&struct_state), live);
+        prop_assert_eq!(struct_map2.size(&struct2_state), live);
+        prop_assert_eq!(nested_meta.size(&nested_state), live);
+
+        for pos in 0..capacity {
+            let expected = flat.key_at(&flat_state, pos);
+            prop_assert_eq!(
+                vm_struct_map_iter_key(&struct_state, SLOT_OFFSET, 1, pos),
+                expected,
+                "struct-map cell {} diverged from the flat table", pos
+            );
+            prop_assert_eq!(
+                bytes::read_u32(&nested_state, outer_keys_offset(SLOT_OFFSET) + pos * 4),
+                expected,
+                "nested outer cell {} diverged from the flat table", pos
+            );
+        }
+    }
+
+    /// Exported read helpers, bound table views, and an independent `BTreeMap`
+    /// model must agree on membership, lookup, and iteration after an
+    /// insert/remove workload. Query keys include `EMPTY_KEY` and `TOMBSTONE`:
+    /// both are ordinary u32 values at the exported ABI boundary, and removal
+    /// leaves TOMBSTONE cells behind that a sentinel-blind probe would match.
+    #[test]
+    fn prop_table_read_exports_match_model(
+        ops in prop::collection::vec((any::<bool>(), 1u32..48, 0u32..1000), 0..96),
+    ) {
+        use std::collections::BTreeMap;
+        let capacity = 32;
+        let max_load = capacity * 7 / 10;
+
+        let mut map_state = mk_flat_slot_state(8192, capacity, SlotType::HashMap);
+        let map_meta = meta_of(&map_state);
+        let map = bind_slot_map(&map_meta);
+
+        let mut set_state = mk_flat_slot_state(8192, capacity, SlotType::HashSet);
+        let set_meta = meta_of(&set_state);
+        let set = bind_slot_set(&set_meta);
+
+        let mut struct_state =
+            mk_struct_map_state(8192, capacity, &[StructFieldType::UInt32 as u8], 1, 8);
+        let struct_map = StructMapSlot::bind(&struct_state, 0);
+        let field0 = struct_map.field_offset(&struct_state, 0);
+
+        let mut struct2_state = mk_struct_map2_state(8192, capacity);
+        let struct_map2 = StructMap2Slot::bind(&struct2_state, 0);
+        let pair_field0 = struct_map2.field_offset(&struct2_state, 0);
+
+        let mut model: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut env = BitmapEnv::default();
+
+        for (is_remove, key, value) in ops {
+            let present = model.contains_key(&key);
+            if is_remove {
+                prop_assert_eq!(rollback_map_insert(&mut map_state, &map_meta, key), present);
+                prop_assert_eq!(rollback_set_insert(&mut set_state, &set_meta, key), present);
+                prop_assert_eq!(struct_map.remove(&mut struct_state, key).is_some(), present);
+                prop_assert_eq!(
+                    struct_map2.remove(&mut struct2_state, key, PAIR_KEY2).is_some(),
+                    present
+                );
+                model.remove(&key);
+                continue;
+            }
+
+            // Refusal is exactly "absent and already at the load ceiling":
+            // tombstones never exhaust a bounded probe that reuses them.
+            let refused = !present && model.len() as u32 >= max_load;
+            let expect = (!refused).then_some(!present);
+
+            prop_assert_eq!(map.upsert_u32(&mut map_state, key, value), expect);
+            prop_assert_eq!(set.insert_key(&mut set_state, key), expect);
+            let struct_result = struct_map.upsert(&mut struct_state, key);
+            prop_assert_eq!(struct_result.map(|up| up.is_new), expect);
+            let struct2_result = struct_map2.upsert(&mut struct2_state, key, PAIR_KEY2);
+            prop_assert_eq!(struct2_result.map(|up| up.is_new), expect);
+
+            let cell = value.to_le_bytes();
+            if let Some(up) = struct_result {
+                struct_map.clear_bitset(&mut struct_state, struct_map.row_off(up.pos));
+                struct_map.write_scalar_field(&mut struct_state, up.pos, 0, &[&cell], 0, 0);
+            }
+            if let Some(up) = struct2_result {
+                struct_map2.clear_bitset(&mut struct2_state, struct_map2.row_off(up.pos));
+                struct_map2.write_scalar_field(&mut struct2_state, up.pos, 0, &[&cell], 0, 0);
+            }
+            if !refused {
+                model.insert(key, value);
+            }
+        }
+
+        for key in (1u32..48).chain([EMPTY_KEY, TOMBSTONE]) {
+            let expected = model.get(&key).copied();
+
+            prop_assert_eq!(map.get_u32(&map_state, key), expected);
+            prop_assert_eq!(
+                vm_map_get(&map_state, map_meta.offset, capacity, key),
+                expected.unwrap_or(EMPTY_KEY),
+                "vm_map_get disagrees for key {}", key
+            );
+
+            prop_assert_eq!(set.contains(&set_state, key), expected.is_some());
+            prop_assert_eq!(
+                vm_set_contains(&mut env, &set_state, set_meta.offset, capacity, key),
+                expected.is_some(),
+                "vm_set_contains disagrees for key {}", key
+            );
+
+            let row = vm_struct_map_get_row_ptr(
+                &struct_state,
+                SLOT_OFFSET,
+                capacity,
+                1,
+                struct_map.row_size,
+                key,
+            );
+            prop_assert_eq!(
+                struct_map.get_row_ptr_by_key(&struct_state, key),
+                row,
+                "vm_struct_map_get_row_ptr disagrees with the bound view for key {}", key
+            );
+            match expected {
+                None => prop_assert_eq!(row, u32::MAX, "absent key {} resolved a row", key),
+                Some(v) => {
+                    prop_assert_ne!(row, u32::MAX);
+                    prop_assert!(StructMapSlot::is_field_set(&struct_state, row, 0));
+                    prop_assert_eq!(bytes::read_u32(&struct_state, row + field0), v);
+                }
+            }
+
+            let pair_row = vm_struct_map2_get_row_ptr(
+                &struct2_state,
+                SLOT_OFFSET,
+                capacity,
+                1,
+                struct_map2.row_size,
+                key,
+                PAIR_KEY2,
+            );
+            prop_assert_eq!(
+                struct_map2.get_row_ptr_by_key(&struct2_state, key, PAIR_KEY2),
+                pair_row,
+                "vm_struct_map2_get_row_ptr disagrees with the bound view for key {}", key
+            );
+            match expected {
+                None => prop_assert_eq!(pair_row, u32::MAX),
+                Some(v) => {
+                    prop_assert_ne!(pair_row, u32::MAX);
+                    prop_assert_eq!(bytes::read_u32(&struct2_state, pair_row + pair_field0), v);
+                }
+            }
+        }
+
+        // Iteration: the exported walk, the bound view, and the model must all
+        // agree. Flat and unary struct tables share the home position, so their
+        // cell sequences are identical, not merely equivalent as sets.
+        let bound: Vec<(u32, u32, u32)> = map
+            .iter_live(&map_state)
+            .map(|(pos, key)| (pos, key, map.entry_u32_at(&map_state, pos)))
+            .collect();
+        let live_cells: Vec<(u32, u32)> = bound.iter().map(|&(pos, k, _)| (pos, k)).collect();
+
+        let mut exported = Vec::new();
+        let mut pos = vm_map_iter_start(&map_state, map_meta.offset, capacity);
+        while pos < capacity {
+            let packed = vm_map_iter_get(&map_state, map_meta.offset, capacity, pos);
+            exported.push((pos, packed as u32, (packed >> 32) as u32));
+            pos = vm_map_iter_next(&map_state, map_meta.offset, capacity, pos);
+        }
+        prop_assert_eq!(&exported, &bound);
+        prop_assert_eq!(
+            exported
+                .iter()
+                .map(|&(_, key, value)| (key, value))
+                .collect::<BTreeMap<u32, u32>>(),
+            model.clone()
+        );
+
+        let mut set_cells = Vec::new();
+        let mut pos = vm_set_iter_start(&set_state, set_meta.offset, capacity);
+        while pos < capacity {
+            set_cells.push((pos, vm_set_iter_get(&set_state, set_meta.offset, pos)));
+            pos = vm_set_iter_next(&set_state, set_meta.offset, capacity, pos);
+        }
+        prop_assert_eq!(&set_cells, &live_cells);
+
+        let mut struct_cells = Vec::new();
+        let mut pos = vm_struct_map_iter_start(&struct_state, SLOT_OFFSET, capacity, 1);
+        while pos < capacity {
+            struct_cells
+                .push((pos, vm_struct_map_iter_key(&struct_state, SLOT_OFFSET, 1, pos)));
+            pos = vm_struct_map_iter_next(&struct_state, SLOT_OFFSET, capacity, 1, pos);
+        }
+        prop_assert_eq!(&struct_cells, &live_cells);
+
+        // Exact-pair tables home on `hash_key_pair`, so only the key set is
+        // comparable across layouts, never the cell order.
+        let mut pair_rows = BTreeMap::new();
+        let mut pos = vm_struct_map2_iter_start(&struct2_state, SLOT_OFFSET, capacity, 1);
+        while pos < capacity {
+            pair_rows.insert(
+                vm_struct_map2_iter_key1(&struct2_state, SLOT_OFFSET, 1, pos),
+                vm_struct_map2_iter_key2(&struct2_state, SLOT_OFFSET, capacity, 1, pos),
+            );
+            pos = vm_struct_map2_iter_next(&struct2_state, SLOT_OFFSET, capacity, 1, pos);
+        }
+        prop_assert_eq!(
+            pair_rows.keys().copied().collect::<Vec<u32>>(),
+            model.keys().copied().collect::<Vec<u32>>()
+        );
+        prop_assert!(pair_rows.values().all(|&key2| key2 == PAIR_KEY2));
     }
 }
