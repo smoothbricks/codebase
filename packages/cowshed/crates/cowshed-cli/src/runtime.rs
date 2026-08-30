@@ -35,9 +35,7 @@ use cowshed_core::storage::bootstrap::{
     STORE_ROOT, ValidatedHostStorage, VolumeRole, VolumeState, execute_host_setup, plan_host_setup,
 };
 use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
-use cowshed_core::storage::job_artifact::{
-    ArtifactConfig, ArtifactRepairReport, repair_workspace_record_sequences,
-};
+use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_record_sequences};
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
@@ -2988,14 +2986,13 @@ async fn repair_project_artifacts(project_root: &Path) -> Result<Vec<Finding>> {
             )
         })?;
     let retained_budget = ArtifactConfig::default().retained_recovery_budget_bytes;
-    let mut findings = Vec::new();
     for workspace in project
         .workspaces
         .into_iter()
         .filter(|workspace| workspace.state == WorkspaceState::Attached)
     {
         let mount = workspace.mount.clone();
-        let report = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             repair_workspace_record_sequences(&mount, retained_budget)
         })
         .await
@@ -3003,42 +3000,11 @@ async fn repair_project_artifacts(project_root: &Path) -> Result<Vec<Finding>> {
         .map_err(|error| {
             CowshedError::integrity(
                 error.to_string(),
-                "the log was not replaced; inspect its pre-repair bytes",
+                "the log was not replaced; create a fresh store if record ordering failed",
             )
         })?;
-        if let Some(finding) = artifact_repair_finding(&workspace.workspace, report) {
-            findings.push(finding);
-        }
     }
-    Ok(findings)
-}
-
-fn artifact_repair_finding(
-    workspace: &WorkspaceName,
-    report: ArtifactRepairReport,
-) -> Option<Finding> {
-    let backup = report.backup_path?;
-    let first = report
-        .violations
-        .first()
-        .expect("a repaired log records its ordering violation");
-    Some(Finding {
-        code: "artifact-sequence-repaired".into(),
-        severity: FindingSeverity::Info,
-        message: format!(
-            "repaired workspace {workspace}: resequenced {} of {} records; byte {} held job {} sequence {} after byte {} job {} sequence {}",
-            report.resequenced_records,
-            report.frame_count,
-            first.offset,
-            first.current.job_id.get(),
-            first.current.sequence,
-            first.previous_offset,
-            first.previous.job_id.get(),
-            first.previous.sequence,
-        ),
-        hint: format!("byte-for-byte original: {}", backup.display()),
-        path: Some(report.records_path),
-    })
+    Ok(Vec::new())
 }
 
 async fn run_doctor_command<W, E>(cli: Cli, output: &mut Output<W, E>) -> Result<DispatchExit>
