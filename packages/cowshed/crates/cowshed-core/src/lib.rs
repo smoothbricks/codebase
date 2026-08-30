@@ -4,6 +4,7 @@ pub mod apfs;
 pub mod api;
 pub mod checkout;
 pub mod copy;
+mod device;
 pub mod error;
 pub mod exec;
 mod fsio;

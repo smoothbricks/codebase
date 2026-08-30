@@ -1789,7 +1789,8 @@ fn gather_existing_apfs_evidence(
     }
     let mount_device = exact_device_identifier(&snapshot.mount_source)?;
     // Ask for the home container first: the global inventory is only needed before a create.
-    let container_reference = container_reference_of(&mount_device);
+    let container_reference = container_reference_of(&mount_device)
+        .ok_or_else(|| NativeBootstrapError::InvalidMountSource(snapshot.mount_source.clone()))?;
     let inventory = run_apfs_inventory_command(
         source,
         HostCommand::new(
@@ -1964,46 +1965,38 @@ fn require_canonical(path: &Path) -> Result<(), NativeBootstrapError> {
 }
 
 fn exact_device_identifier(path: &Path) -> Result<String, NativeBootstrapError> {
-    let bytes = path.as_os_str().as_encoded_bytes();
-    let Some(identifier) = bytes.strip_prefix(b"/dev/") else {
-        return Err(NativeBootstrapError::InvalidMountSource(path.to_owned()));
-    };
-    if valid_volume_identifier(identifier) {
-        Ok(String::from_utf8(identifier.to_vec()).expect("validated ASCII identifier"))
+    let invalid = || NativeBootstrapError::InvalidMountSource(path.to_owned());
+    let identifier = path
+        .to_str()
+        .and_then(|value| value.strip_prefix("/dev/"))
+        .ok_or_else(invalid)?;
+    if valid_volume_identifier(identifier.as_bytes()) {
+        Ok(identifier.to_owned())
     } else {
-        Err(NativeBootstrapError::InvalidMountSource(path.to_owned()))
+        Err(invalid())
     }
 }
 
-/// The synthesized APFS container (`diskN`) that a validated volume identifier (`diskNs…`) lives
-/// in.
-fn container_reference_of(volume_identifier: &str) -> String {
-    let digits = volume_identifier["disk".len()..]
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .count();
-    volume_identifier[.."disk".len() + digits].to_owned()
+/// The synthesized APFS container (`diskN`) that a device identifier of any depth lives in —
+/// a sealed snapshot's `<volume>s<snapshot>` included — or `None` for a malformed identifier.
+fn container_reference_of(volume_identifier: &str) -> Option<String> {
+    crate::device::container_of(volume_identifier).map(str::to_owned)
 }
 
 fn valid_container_identifier(value: &[u8]) -> bool {
-    value
-        .strip_prefix(b"disk")
-        .is_some_and(|digits| !digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+    str::from_utf8(value)
+        .ok()
+        .and_then(crate::device::identifier_depth)
+        == Some(0)
 }
 
+/// A synthesized APFS volume always publishes as exactly `diskNsM`; anything deeper is a snapshot
+/// and anything shallower a container, and neither is a mount source this bootstrap accepts.
 fn valid_volume_identifier(value: &[u8]) -> bool {
-    let Some(rest) = value.strip_prefix(b"disk") else {
-        return false;
-    };
-    let Some(separator) = rest.iter().position(|byte| *byte == b's') else {
-        return false;
-    };
-    let (disk, slice_with_separator) = rest.split_at(separator);
-    let slice = &slice_with_separator[1..];
-    !disk.is_empty()
-        && disk.iter().all(u8::is_ascii_digit)
-        && !slice.is_empty()
-        && slice.iter().all(u8::is_ascii_digit)
+    str::from_utf8(value)
+        .ok()
+        .and_then(crate::device::identifier_depth)
+        == Some(1)
 }
 
 #[derive(Clone, Debug)]
@@ -5353,10 +5346,20 @@ mod tests {
 
     #[test]
     fn container_reference_is_the_synthesized_disk_of_the_volume_identifier() {
-        assert_eq!(container_reference_of("disk3s5"), "disk3");
-        assert_eq!(container_reference_of("disk13s1"), "disk13");
+        assert_eq!(container_reference_of("disk3s5").as_deref(), Some("disk3"));
+        assert_eq!(
+            container_reference_of("disk13s1").as_deref(),
+            Some("disk13")
+        );
         // A sealed system snapshot mounts as `<volume>s<snapshot>`; the container is unchanged.
-        assert_eq!(container_reference_of("disk3s1s1"), "disk3");
+        assert_eq!(
+            container_reference_of("disk3s1s1").as_deref(),
+            Some("disk3")
+        );
+        // Input that never named a device is refused, not sliced: the old byte-indexing here
+        // panicked on anything that did not start with `disk`.
+        assert_eq!(container_reference_of("not-a-disk"), None);
+        assert_eq!(container_reference_of("disk01s1"), None);
     }
 
     #[tokio::test]

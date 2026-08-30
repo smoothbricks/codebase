@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const DISKUTIL: &str = "/usr/sbin/diskutil";
+use crate::device::{DISKUTIL, container_of, identifier_depth};
+
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
 const NEWFS_APFS: &str = "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
@@ -1700,15 +1701,10 @@ fn is_valid_apfs_volume_name(name: &str) -> bool {
 }
 
 fn is_kernel_device_path(device: &str) -> bool {
-    let Some(relative) = device.strip_prefix("/dev/disk") else {
-        return false;
-    };
-    let mut components = relative.split('s');
-    components.all(|component| {
-        !component.is_empty()
-            && component.bytes().all(|byte| byte.is_ascii_digit())
-            && (component == "0" || !component.starts_with('0'))
-    })
+    device
+        .strip_prefix("/dev/")
+        .and_then(identifier_depth)
+        .is_some()
 }
 
 fn validate_image_path(path: &Path, format: ImageFormat) -> Result<(), ApfsError> {
@@ -1988,17 +1984,7 @@ fn parse_volume_list_plist(candidate: &str, bytes: &[u8]) -> Result<String, Apfs
 
 fn device_path(identifier: &str) -> Option<String> {
     let relative = identifier.strip_prefix("/dev/").unwrap_or(identifier);
-    let tail = relative.strip_prefix("disk")?;
-    let mut parts = tail.split('s');
-    let disk = parts.next()?;
-    if disk.is_empty() || !disk.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    for partition in parts {
-        if partition.is_empty() || !partition.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-    }
+    identifier_depth(relative)?;
     Some(format!("/dev/{relative}"))
 }
 
@@ -2007,11 +1993,13 @@ fn volume_device_path(identifier: &str) -> Option<String> {
     (device_depth(&device) > 0).then_some(device)
 }
 
+/// Slice depth of a `/dev/` device path; a string that is not a valid device path reads as depth
+/// zero so plist scans that rank candidates by depth simply never prefer it.
 fn device_depth(device: &str) -> usize {
-    let Some(tail) = device.strip_prefix("/dev/disk") else {
-        return 0;
-    };
-    tail.bytes().filter(|byte| *byte == b's').count()
+    device
+        .strip_prefix("/dev/")
+        .and_then(identifier_depth)
+        .unwrap_or(0)
 }
 
 fn device_is_descendant_of(device: &str, whole: &str) -> bool {
@@ -2021,9 +2009,8 @@ fn device_is_descendant_of(device: &str, whole: &str) -> bool {
 }
 
 fn whole_device_from(device: &str) -> Option<String> {
-    let tail = device.strip_prefix("/dev/disk")?;
-    let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
-    (digits > 0).then(|| format!("/dev/disk{}", &tail[..digits]))
+    let container = device.strip_prefix("/dev/").and_then(container_of)?;
+    Some(format!("/dev/{container}"))
 }
 
 fn raw_device_from(device: &str) -> String {
@@ -5028,7 +5015,17 @@ mod tests {
             Some("/dev/disk12s3s1".into())
         );
         assert_eq!(volume_device_path("disk12"), None);
-        for invalid in ["disks1", "disk12s", "disk12sx", "/dev/not-a-disk"] {
+        // Leading zeros never appear in kernel device names; a second spelling of the same
+        // device would defeat the textual identity comparisons, so it is rejected here exactly
+        // as it always was in `is_kernel_device_path`.
+        for invalid in [
+            "disks1",
+            "disk12s",
+            "disk12sx",
+            "/dev/not-a-disk",
+            "disk01",
+            "disk12s03",
+        ] {
             assert_eq!(device_path(invalid), None);
             assert_eq!(volume_device_path(invalid), None);
         }
@@ -5080,6 +5077,10 @@ mod tests {
         );
         assert_eq!(whole_device_from("/dev/disk"), None);
         assert_eq!(whole_device_from("/dev/not-a-disk"), None);
+        // The whole identifier must be well-formed, not just its unit prefix: a malformed tail
+        // used to be silently truncated into a plausible container.
+        assert_eq!(whole_device_from("/dev/disk12sx"), None);
+        assert_eq!(whole_device_from("/dev/disk01s1"), None);
 
         let invalid = br#"<plist><dict><key>system-entities</key><array>
             <dict><key>dev-entry</key><string>/dev/not-a-disk</string>
