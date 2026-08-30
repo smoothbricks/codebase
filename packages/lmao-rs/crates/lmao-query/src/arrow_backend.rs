@@ -8,7 +8,9 @@
 //! its PASS value (minigraf PERFORMANCE-HANDBOOK §7.10f).
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int64Type, UInt8Type, UInt32Type, UInt64Type};
+use arrow_array::types::{
+    Float64Type, Int64Type, TimestampNanosecondType, UInt8Type, UInt32Type, UInt64Type,
+};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{ArrowError, DataType};
 
@@ -51,6 +53,13 @@ fn reads_as_u64(data_type: &DataType) -> bool {
     matches!(data_type, DataType::UInt32 | DataType::UInt64)
 }
 
+fn reads_as_i64(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int64 | DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+    )
+}
+
 fn reads_as_str(data_type: &DataType) -> bool {
     match data_type {
         DataType::Utf8 => true,
@@ -65,7 +74,7 @@ fn addresses_column(want: &ColumnValue, data_type: &DataType) -> bool {
     match want {
         ColumnValue::Str(_) => reads_as_str(data_type),
         ColumnValue::U64(_) => reads_as_u64(data_type),
-        ColumnValue::I64(_) => matches!(data_type, DataType::Int64),
+        ColumnValue::I64(_) => reads_as_i64(data_type),
         ColumnValue::F64(_) => matches!(data_type, DataType::Float64),
         ColumnValue::Bool(_) => matches!(data_type, DataType::Boolean),
     }
@@ -75,7 +84,7 @@ fn wanted_type_name(want: &ColumnValue) -> &'static str {
     match want {
         ColumnValue::Str(_) => "Utf8 or a Utf8 dictionary",
         ColumnValue::U64(_) => "UInt32 or UInt64",
-        ColumnValue::I64(_) => "Int64",
+        ColumnValue::I64(_) => "Int64 or timestamp[ns]",
         ColumnValue::F64(_) => "Float64",
         ColumnValue::Bool(_) => "Boolean",
     }
@@ -266,7 +275,10 @@ fn i64_at(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i64>, Ar
     }
     match col.data_type() {
         DataType::Int64 => Ok(Some(col.as_primitive::<Int64Type>().value(row))),
-        other => Err(type_error(name, "Int64", other)),
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None) => Ok(Some(
+            col.as_primitive::<TimestampNanosecondType>().value(row),
+        )),
+        other => Err(type_error(name, "Int64 or timestamp[ns]", other)),
     }
 }
 

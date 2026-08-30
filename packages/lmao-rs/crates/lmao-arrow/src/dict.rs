@@ -385,18 +385,16 @@ pub(crate) struct FirstSeenDictionary<'a> {
 
 impl<'a> FirstSeenDictionary<'a> {
     #[inline]
-    pub fn observe(&mut self, value: &'a str) {
-        if self.index.contains_key(value) {
-            return;
+    pub fn observe(&mut self, value: &'a str) -> u32 {
+        match self.index.entry(value) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let index = self.values.len() as u32;
+                entry.insert(index);
+                self.values.push(value);
+                index
+            }
         }
-        let index = self.values.len() as u32;
-        self.values.push(value);
-        self.index.insert(value, index);
-    }
-
-    #[inline]
-    pub fn index_of(&self, value: &str) -> Option<u32> {
-        self.index.get(value).copied()
     }
 }
 
