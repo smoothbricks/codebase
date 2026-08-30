@@ -32,6 +32,7 @@ use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{SandboxConfig, SandboxProfileRole, seatbelt_profile};
 use crate::storage::audit::AuditSinkError;
+use crate::workspace_environment::{GO_ENV, PORT_BASE_ENV, WORKSPACE_TOKEN_ENV};
 use cowshed_gateway::WorkspaceToken;
 
 use crate::storage::job_artifact::{
@@ -1262,7 +1263,7 @@ async fn sandboxed_command(
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("TMPDIR", &sandbox.exec_temp_dir)
         .env("PWD", &plan.cwd)
-        .env("GOENV", private_cache.join("go/env"))
+        .env(GO_ENV, private_cache.join("go/env"))
         // rustc-wrapper clients speak to the host-owned sccache daemon; the
         // Seatbelt profile admits exactly this socket and denies binding it,
         // so a client whose daemon is down fails fast instead of spawning a
@@ -1272,8 +1273,8 @@ async fn sandboxed_command(
             crate::sandbox::sccache_server_socket(),
         )
         .env("SCCACHE_DIR", crate::sandbox::sccache_cache_directory())
-        .env("COWSHED_PORT_BASE", &port_base)
-        .env("COWSHED_WORKSPACE_TOKEN", encoded_token)
+        .env(PORT_BASE_ENV, &port_base)
+        .env(WORKSPACE_TOKEN_ENV, encoded_token)
         .env("HTTP_PROXY", &gateway_http)
         .env("HTTPS_PROXY", &gateway_http)
         .env("http_proxy", &gateway_http)
@@ -3908,15 +3909,14 @@ mod workspace_toolchain_tests {
             ("SAME".to_owned(), "snapshot".to_owned()),
             ("SNAPSHOT_ONLY".to_owned(), "yes".to_owned()),
         ]);
-        let controller = BTreeMap::from([
-            ("SAME".to_owned(), "controller".to_owned()),
-            ("GOENV".to_owned(), "/workspace/goenv".to_owned()),
-        ]);
+        let go_env = (GO_ENV.to_owned(), "/workspace/goenv".to_owned());
+        let controller =
+            BTreeMap::from([("SAME".to_owned(), "controller".to_owned()), go_env.clone()]);
 
         assert_eq!(
             merge_devenv_environment(snapshot, controller),
             BTreeMap::from([
-                ("GOENV".to_owned(), "/workspace/goenv".to_owned()),
+                go_env,
                 ("SAME".to_owned(), "controller".to_owned()),
                 ("SNAPSHOT_ONLY".to_owned(), "yes".to_owned()),
             ])
