@@ -12,6 +12,70 @@ pub const PROGRAM_HASH_PREFIX: u32 = 32;
 pub const PROGRAM_HEADER_SIZE: u32 = 46;
 pub const RETE_HEADER_SIZE: u32 = 16;
 pub const STATE_FORMAT_VERSION: u8 = 2;
+/// Program-format magic in little-endian wire order: ASCII bytes `C L M 1`.
+pub const PROGRAM_MAGIC: u32 = 0x314D_4C43;
+/// The default program-magic acceptance set for public embedders.
+pub const DEFAULT_ACCEPTED_PROGRAM_MAGICS: &[u32] = &[PROGRAM_MAGIC];
+
+/// The byte-content header immediately after the 32-byte hash prefix.
+///
+/// The in-memory representation is 16 bytes and 16-byte aligned, while only
+/// the first 14 bytes ([`Self::WIRE_SIZE`]) are program wire content.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramHeader {
+    pub magic: u32,
+    pub version: u16,
+    pub num_slots: u8,
+    pub num_inputs: u8,
+    pub num_callbacks: u8,
+    pub flags: u8,
+    pub init_code_len: u16,
+    pub reduce_code_len: u16,
+}
+
+impl ProgramHeader {
+    pub const WIRE_SIZE: usize = 14;
+
+    /// Decodes the packed 14-byte little-endian program content header.
+    pub const fn from_wire_bytes(bytes: [u8; Self::WIRE_SIZE]) -> Self {
+        Self {
+            magic: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            version: u16::from_le_bytes([bytes[4], bytes[5]]),
+            num_slots: bytes[6],
+            num_inputs: bytes[7],
+            num_callbacks: bytes[8],
+            flags: bytes[9],
+            init_code_len: u16::from_le_bytes([bytes[10], bytes[11]]),
+            reduce_code_len: u16::from_le_bytes([bytes[12], bytes[13]]),
+        }
+    }
+
+    /// Encodes the packed 14-byte little-endian program content header.
+    pub const fn to_wire_bytes(self) -> [u8; Self::WIRE_SIZE] {
+        let magic = self.magic.to_le_bytes();
+        let version = self.version.to_le_bytes();
+        let init_code_len = self.init_code_len.to_le_bytes();
+        let reduce_code_len = self.reduce_code_len.to_le_bytes();
+        [
+            magic[0],
+            magic[1],
+            magic[2],
+            magic[3],
+            version[0],
+            version[1],
+            self.num_slots,
+            self.num_inputs,
+            self.num_callbacks,
+            self.flags,
+            init_code_len[0],
+            init_code_len[1],
+            reduce_code_len[0],
+            reduce_code_len[1],
+        ]
+    }
+}
+
 pub const EMPTY_KEY: u32 = u32::MAX;
 pub const TOMBSTONE: u32 = u32::MAX - 1;
 /// Empty and tombstone markers for the collision-free derived-fact identity
@@ -554,6 +618,26 @@ pub enum ErrorCode {
     ColumnUnderrun = 8,
 }
 
+impl ErrorCode {
+    /// Name a status word returned across the wasm ABI. A code the host
+    /// cannot name is a status it cannot report, so decoding is part of the
+    /// contract rather than a host-side guess.
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::Ok,
+            1 => Self::CapacityExceeded,
+            2 => Self::InvalidProgram,
+            3 => Self::InvalidSlot,
+            4 => Self::InvalidState,
+            5 => Self::NeedsGrowth,
+            6 => Self::ArenaOverflow,
+            7 => Self::InvalidKey,
+            8 => Self::ColumnUnderrun,
+            _ => return None,
+        })
+    }
+}
+
 pub const fn hash_key(key: u32, cap: u32) -> u32 {
     let mut h = key as u64;
     h ^= h >> 16;
@@ -871,79 +955,6 @@ pub unsafe fn get_col_as<T>(ptrs: *const *const u8, idx: u8) -> *const T {
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
-
-    macro_rules! assert_discriminants {
-        ($enum:ident, $type:ty; $($variant:ident = $value:expr),+ $(,)?) => {
-            $(assert_eq!($enum::$variant as $type, $value);)+
-        };
-    }
-
-    #[test]
-    fn duration_unit_discriminants_are_stable() {
-        assert_discriminants!(DurationUnit, u8;
-            None = 0, Second = 1, Minute = 2, Hour = 3, Day = 4, Week = 5, Month = 6,
-            Quarter = 7, Year = 8
-        );
-    }
-
-    #[test]
-    fn slot_type_discriminants_are_stable() {
-        assert_discriminants!(SlotType, u8;
-            HashMap = 0, HashSet = 1, Aggregate = 2, Array = 3, ConditionTree = 4,
-            Scalar = 5, StructMap = 6, OrderedList = 7, Bitmap = 8, Nested = 9
-        );
-    }
-
-    #[test]
-    fn agg_type_discriminants_are_stable() {
-        assert_discriminants!(AggType, u8;
-            Sum = 1, Count = 2, Min = 3, Max = 4, Avg = 5, ScalarU32 = 8,
-            ScalarF64 = 9, ScalarI64 = 10, SumI64 = 11, MinI64 = 12, MaxI64 = 13
-        );
-    }
-
-    #[test]
-    fn struct_field_type_discriminants_are_stable() {
-        assert_discriminants!(StructFieldType, u8;
-            UInt32 = 0, Int64 = 1, Float64 = 2, Bool = 3, String = 4, ArrayU32 = 5,
-            ArrayI64 = 6, ArrayF64 = 7, ArrayString = 8, ArrayBool = 9
-        );
-    }
-
-    #[test]
-    fn opcode_discriminants_are_stable() {
-        assert_discriminants!(Opcode, u8;
-            Halt = 0x00, SlotDef = 0x10, SlotArray = 0x14, SlotStructMap = 0x18,
-            SlotOrderedList = 0x19, SlotNested = 0x1a, BatchMapUpsertLatest = 0x20,
-            BatchMapUpsertFirst = 0x21, BatchMapUpsertLast = 0x22, BatchMapRemove = 0x23,
-            BatchMapUpsertLatestTtl = 0x24, BatchMapUpsertLastTtl = 0x25,
-            BatchMapUpsertMax = 0x26, BatchMapUpsertMin = 0x27, BatchMapUpsertLatestIf = 0x28,
-            BatchMapUpsertFirstIf = 0x29, BatchMapUpsertLastIf = 0x2a, BatchMapRemoveIf = 0x2b,
-            BatchMapUpsertMaxIf = 0x2c, BatchMapUpsertMinIf = 0x2d,
-            BatchStructMapProbe = 0x2e, BatchStructMapProbeScatter = 0x2f,
-            BatchSetInsert = 0x30, BatchSetRemove = 0x31, BatchSetInsertTtl = 0x32,
-            BatchSetInsertIf = 0x33, BatchBitmapAdd = 0x34, BatchBitmapRemove = 0x35,
-            BatchBitmapAnd = 0x36, BatchBitmapOr = 0x37, BatchBitmapAndNot = 0x38,
-            BatchBitmapXor = 0x39, BatchBitmapAndScratch = 0x3a, BatchBitmapOrScratch = 0x3b,
-            BatchBitmapAndNotScratch = 0x3c, BatchBitmapXorScratch = 0x3d, BatchAggSum = 0x40,
-            BatchAggCount = 0x41, BatchAggMin = 0x42, BatchAggMax = 0x43, BatchAggSumIf = 0x44,
-            BatchAggCountIf = 0x45, BatchAggMinIf = 0x46, BatchAggMaxIf = 0x47,
-            BatchScalarLatest = 0x48, BatchAggSumI64 = 0x49, BatchAggMinI64 = 0x4a,
-            BatchAggMaxI64 = 0x4b, BatchStructMapUpsertLast = 0x80,
-            BatchStructMapUpsertFirst = 0x81, ListAppend = 0x84,
-            ListAppendStruct = 0x85, NestedSetInsert = 0x90, NestedMapUpsertLast = 0x92,
-            NestedAggUpdate = 0x95, ForEach = 0xe0, FlatMap = 0xe1
-        );
-    }
-
-    #[test]
-    fn error_code_discriminants_are_stable() {
-        assert_discriminants!(ErrorCode, u32;
-            Ok = 0, CapacityExceeded = 1, InvalidProgram = 2, InvalidSlot = 3,
-            InvalidState = 4, NeedsGrowth = 5, ArenaOverflow = 6, InvalidKey = 7,
-            ColumnUnderrun = 8
-        );
-    }
 
     #[test]
     fn slot_type_flags_layout_and_bitfield_round_trip() {

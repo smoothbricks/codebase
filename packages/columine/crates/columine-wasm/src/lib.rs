@@ -21,7 +21,7 @@
 // which keep their own docs.
 #![allow(clippy::missing_safety_doc)]
 
-use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
+use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::ErrorCode;
 use columine_vm::bitmap_ops;
 use columine_vm::state_init;

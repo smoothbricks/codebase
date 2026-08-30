@@ -28,7 +28,7 @@ use crate::undo_log::{
     self, FLAT_UNDO_ENTRY_SIZE, FlatUndoEntry, FlatUndoOp, SMF_BIT_SET, SMF_ROW_ABSENT,
     SMR_ROW_ABSENT,
 };
-use columine_types::opcodes::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
+use columine_types::DEFAULT_ACCEPTED_PROGRAM_MAGICS;
 use columine_types::types::{
     ChangeFlag, DERIVED_FACT_TOMBSTONE_IDENTITY, EMPTY_KEY, ErrorCode, Opcode, PROGRAM_HASH_PREFIX,
     PROGRAM_HEADER_SIZE, SLOT_META_SIZE, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
