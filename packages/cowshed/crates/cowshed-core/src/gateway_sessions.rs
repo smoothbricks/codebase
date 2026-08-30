@@ -16,9 +16,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use cowshed_gateway::{
-    ControlError, EgressGrant, GatewayControlClient, GatewayHandle, GatewayStatus, MirrorProtocol,
-    MirrorRoute, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+use cowshed_gateway_types::{
+    EgressGrant, GatewayStatus, MirrorProtocol, MirrorRoute, WorkspaceCa, WorkspaceEndpoint,
+    WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -27,7 +27,6 @@ use crate::error::{CowshedError, Result};
 use crate::gateway_inventory::{GatewaySessionFact, NativeGatewayInventory};
 use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
 use crate::repository::RepoId;
-use crate::storage::bootstrap::native::validate_existing_host_storage;
 use crate::storage::bootstrap::{STORE_ROOT, ValidatedHostStorage};
 
 /// The gateway control socket, at the store root.
@@ -56,6 +55,13 @@ pub enum GatewayStatusError {
     Control(String),
 }
 
+/// The running daemon, as reconciliation needs to see it.
+///
+/// Everything below is a pure function of inventory and this trait's three answers, so the
+/// controller never links the daemon: `cowshed-cli` implements it over the real control client,
+/// and the tests implement it over a fake. `GatewayStatusError::Absent` is a distinct answer
+/// rather than an error string because "no gateway is running" is a normal state with its own
+/// operator remedy, not a control-plane fault.
 #[async_trait]
 pub trait GatewayControl: Send + Sync {
     async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError>;
@@ -65,36 +71,6 @@ pub trait GatewayControl: Send + Sync {
         workspace_id: &str,
         expected_revision: u64,
     ) -> std::result::Result<(), String>;
-}
-
-#[async_trait]
-impl GatewayControl for GatewayControlClient {
-    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
-        GatewayControlClient::status(self)
-            .await
-            .map_err(|error| match error {
-                ControlError::Io(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    GatewayStatusError::Absent
-                }
-                error => GatewayStatusError::Control(error.to_string()),
-            })
-    }
-
-    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String> {
-        GatewayControlClient::install(self, session)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn remove(
-        &self,
-        workspace_id: &str,
-        expected_revision: u64,
-    ) -> std::result::Result<(), String> {
-        GatewayControlClient::remove(self, workspace_id, expected_revision)
-            .await
-            .map_err(|error| error.to_string())
-    }
 }
 
 #[async_trait]
@@ -136,18 +112,12 @@ impl SessionInventory for NativeSessionInventory {
     }
 }
 
+/// Installing into a daemon this process itself owns, as opposed to one reached over the control
+/// socket. Implemented in `cowshed-cli` over the in-process `GatewayHandle`, for the same reason
+/// as [`GatewayControl`]: recovery is inventory-driven and needs no runtime of its own.
 #[async_trait]
 pub trait GatewayInstaller: Send + Sync {
     async fn install_session(&self, session: WorkspaceSession) -> Result<()>;
-}
-
-#[async_trait]
-impl GatewayInstaller for GatewayHandle {
-    async fn install_session(&self, session: WorkspaceSession) -> Result<()> {
-        self.install(session).await.map_err(|error| {
-            CowshedError::internal(format!("could not restore gateway session: {error}"))
-        })
-    }
 }
 
 pub async fn install_all_sessions<I, G>(inventory: &I, gateway: &G) -> Result<usize>
@@ -456,15 +426,6 @@ where
         uid,
     )
     .await
-}
-
-pub async fn reconcile_native_project(repo_id: &RepoId) -> Result<ReconcileReport> {
-    let home = canonical_home()?;
-    let storage = validate_existing_host_storage(&home).await?;
-    let control_socket = control_socket_path();
-    let inventory = NativeSessionInventory::new(storage);
-    let control = GatewayControlClient::new(control_socket).map_err(control_error)?;
-    reconcile_inventory_project(&inventory, &control, repo_id, effective_uid()).await
 }
 
 pub fn canonical_home() -> Result<PathBuf> {
