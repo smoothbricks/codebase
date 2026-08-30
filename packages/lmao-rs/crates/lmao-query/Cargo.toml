@@ -13,3 +13,4 @@ arrow-schema = { workspace = true }
 [dev-dependencies]
 lmao-arrow = { path = "../lmao-arrow" }
 lmao-core = { workspace = true }
+proptest = { workspace = true }
