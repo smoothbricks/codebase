@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
-const COWSHED_FSTAB_TAG: &str = "# cowshed created volume labelled";
+pub(crate) const COWSHED_FSTAB_TAG: &str = "# cowshed created volume labelled";
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum FstabBuildError {
