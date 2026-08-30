@@ -531,28 +531,7 @@ fn normalize_mirror_suffix(
     let path = path_and_query
         .split_once('?')
         .map_or(path_and_query, |(path, _)| path);
-    let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            decoded.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return Err(PolicyError::InvalidPath);
-        }
-        let high = hex(bytes[index + 1]).ok_or(PolicyError::InvalidPath)?;
-        let low = hex(bytes[index + 2]).ok_or(PolicyError::InvalidPath)?;
-        let value = (high << 4) | low;
-        if matches!(value, b'\\' | 0 | b'%') {
-            return Err(PolicyError::InvalidPath);
-        }
-        decoded.push(value);
-        index += 3;
-    }
-    let admission_path = String::from_utf8(decoded).map_err(|_| PolicyError::InvalidPath)?;
+    let admission_path = decode_percent(path, |value| matches!(value, b'\\' | 0 | b'%'))?;
     if admission_path.contains("//")
         || admission_path
             .split('/')
@@ -567,6 +546,20 @@ pub fn normalize_path(path: &str) -> Result<String, PolicyError> {
     if !path.starts_with('/') || path.len() > 8192 || path.contains(['\\', '\0']) {
         return Err(PolicyError::InvalidPath);
     }
+    let decoded = decode_percent(path, |value| matches!(value, b'/' | b'\\' | 0 | b'%'))?;
+    if decoded
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(PolicyError::InvalidPath);
+    }
+    Ok(decoded)
+}
+
+pub(crate) fn decode_percent(
+    path: &str,
+    forbidden: impl Fn(u8) -> bool,
+) -> Result<String, PolicyError> {
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -579,26 +572,19 @@ pub fn normalize_path(path: &str) -> Result<String, PolicyError> {
         if index + 2 >= bytes.len() {
             return Err(PolicyError::InvalidPath);
         }
-        let high = hex(bytes[index + 1]).ok_or(PolicyError::InvalidPath)?;
-        let low = hex(bytes[index + 2]).ok_or(PolicyError::InvalidPath)?;
+        let high = percent_nibble(bytes[index + 1]).ok_or(PolicyError::InvalidPath)?;
+        let low = percent_nibble(bytes[index + 2]).ok_or(PolicyError::InvalidPath)?;
         let value = (high << 4) | low;
-        if matches!(value, b'/' | b'\\' | 0 | b'%') {
+        if forbidden(value) {
             return Err(PolicyError::InvalidPath);
         }
         decoded.push(value);
         index += 3;
     }
-    let decoded = String::from_utf8(decoded).map_err(|_| PolicyError::InvalidPath)?;
-    if decoded
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        return Err(PolicyError::InvalidPath);
-    }
-    Ok(decoded)
+    String::from_utf8(decoded).map_err(|_| PolicyError::InvalidPath)
 }
 
-fn hex(byte: u8) -> Option<u8> {
+fn percent_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),

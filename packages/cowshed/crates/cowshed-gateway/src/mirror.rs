@@ -16,7 +16,7 @@ use crate::{
         ObjectDigest, ObjectExpectation, hex_decode, unix_ms,
     },
     interfaces::UpstreamHealth,
-    policy::{CanonicalTarget, MirrorProtocol, normalize_path},
+    policy::{CanonicalTarget, MirrorProtocol, decode_percent, normalize_path},
 };
 
 const MAX_REDIRECTS: u8 = 5;
@@ -930,7 +930,8 @@ fn classify_npm(path: &str) -> Result<(MirrorResourceKind, String), MirrorError>
     let lower = relative.to_ascii_lowercase();
     let tarball = lower.ends_with(".tgz") && lower.contains("/-/");
     let package_path = relative.split("/-/").next().unwrap_or(relative);
-    let decoded = percent_decode(package_path)?;
+    let decoded =
+        decode_percent(package_path, |_| false).map_err(|_| MirrorError::InvalidProtocolPath)?;
     let identity = if decoded.starts_with('@') {
         let mut parts = decoded.split('/');
         let scope = parts.next().ok_or(MirrorError::InvalidProtocolPath)?;
@@ -1037,36 +1038,6 @@ fn validate_mirror_path(path: &str, protocol: MirrorProtocol) -> Result<(), Mirr
         return Err(MirrorError::InvalidProtocolPath);
     }
     Ok(())
-}
-
-fn percent_decode(value: &str) -> Result<String, MirrorError> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return Err(MirrorError::InvalidProtocolPath);
-            }
-            let high = hex(bytes[index + 1])?;
-            let low = hex(bytes[index + 2])?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| MirrorError::InvalidProtocolPath)
-}
-
-fn hex(value: u8) -> Result<u8, MirrorError> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(MirrorError::InvalidProtocolPath),
-    }
 }
 
 fn strip_request_secrets(headers: &mut HeaderMap) {
