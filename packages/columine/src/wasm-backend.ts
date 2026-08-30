@@ -30,9 +30,16 @@ import { AggType, ErrorCode, SlotType, SlotTypeFlag } from './types.js';
 // Constants
 // =============================================================================
 
+// Raw-state layout. These are `columine_types::types` — STATE_HEADER_SIZE,
+// SLOT_META_SIZE, the SlotMetaOffset fields this host indexes with, and
+// size_of::<EvictionEntry>(). A layout bump there fails
+// `crates/columine-types/tests/typescript_abi.rs` rather than silently
+// misreading a state blob here.
 const STATE_HEADER_SIZE = 32;
-// Must match vm.zig SLOT_META_SIZE (48 bytes with TTL/eviction fields)
 const SLOT_META_SIZE = 48;
+const SLOT_META_TYPE_FLAGS_OFFSET = 12;
+const SLOT_META_EVICTED_BUFFER_OFFSET = 36;
+const SLOT_META_EVICTED_COUNT_OFFSET = 40;
 const EVICTION_ENTRY_SIZE = 16;
 const WASM_PAGE_SIZE = 64 * 1024;
 const STATE_REGION_OFFSET = WASM_PAGE_SIZE;
@@ -473,9 +480,9 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     const rows: EvictedRow[] = [];
     for (let slot = 0; slot < program.numSlots; slot++) {
       const meta = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
-      if ((view.getUint8(meta + 12) & SlotTypeFlag.HAS_EVICT_TRIGGER) === 0) continue;
-      const bufferOffset = view.getUint32(meta + 36, true);
-      const count = view.getUint32(meta + 40, true);
+      if ((view.getUint8(meta + SLOT_META_TYPE_FLAGS_OFFSET) & SlotTypeFlag.HAS_EVICT_TRIGGER) === 0) continue;
+      const bufferOffset = view.getUint32(meta + SLOT_META_EVICTED_BUFFER_OFFSET, true);
+      const count = view.getUint32(meta + SLOT_META_EVICTED_COUNT_OFFSET, true);
       for (let i = 0; i < count; i++) {
         const entry = bufferOffset + i * EVICTION_ENTRY_SIZE;
         rows.push({
