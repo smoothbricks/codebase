@@ -65,17 +65,39 @@ impl From<CowshedError> for AddonFailure {
 
 type AddonResult<T> = std::result::Result<T, AddonFailure>;
 
+/// Hands JavaScript a `CowshedError`-shaped rejection: `code` from core's taxonomy, `message`
+/// unmodified, and `hint` as a real property on the JS `Error`.
+///
+/// The hint used to be appended to `message` behind a `\nnext: ` delimiter that `src/index.ts`
+/// split back off, which made one wire delimiter a literal in two languages and turned any
+/// message containing that sequence into a mis-parsed hint. A property has no delimiter to agree
+/// on, and `index.ts` reading `error.hint` directly means an error without one is no longer
+/// dressed up with an invented hint.
 fn to_napi_error(env: Env, failure: AddonFailure) -> napi::Error {
     let AddonFailure {
         code,
         message,
         hint,
     } = failure;
-    // `\nnext: ` is the wire delimiter `NEXT_HINT_MARKER` in src/index.ts splits on; the two
-    // spellings must stay byte-identical or hints silently merge back into messages.
-    let reason = format!("{message}\nnext: {hint}");
-    let error = JsError::from(napi::Error::new(code, reason)).into_unknown(env);
-    napi::Error::from(error)
+    match hinted_error(env, code, message.clone(), &hint) {
+        Ok(error) => error,
+        // Building the JS object is the only fallible step. If the environment refuses it, the
+        // code and message still have to reach the caller rather than being swallowed.
+        Err(_) => napi::Error::new(code, message),
+    }
+}
+
+fn hinted_error(
+    env: Env,
+    code: &'static str,
+    message: String,
+    hint: &str,
+) -> napi::Result<napi::Error> {
+    let mut error = JsError::from(napi::Error::new(code, message))
+        .into_unknown(env)
+        .coerce_to_object()?;
+    error.set_named_property("hint", hint)?;
+    Ok(napi::Error::from(error.into_unknown()))
 }
 
 fn spawn_promise<T, F>(env: Env, future: F) -> napi::Result<JsObject>
