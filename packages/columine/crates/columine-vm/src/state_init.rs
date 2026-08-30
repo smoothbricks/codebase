@@ -55,10 +55,11 @@ const STRUCT_ROW_SIZE: u32 = SlotMetaOffset::TTL_SECONDS;
 const STRUCT_KIND_BYTE: u32 = SlotMetaOffset::TTL_SECONDS + 2;
 const STRUCT_ARENA_HDR: u32 = SlotMetaOffset::GRACE_SECONDS;
 
-#[allow(clippy::too_many_arguments)]
-fn write_overlay_meta(
-    state: &mut [u8],
-    meta_base: u32,
+/// Overlay record written into a STRUCT_MAP or ORDERED_LIST slot's metadata.
+///
+/// `data_offset` and `capacity` address the power-of-two table; the remaining
+/// fields overlay the TTL/grace metadata slots.
+struct OverlayMeta {
     data_offset: u32,
     capacity: u32,
     type_flags_byte: u8,
@@ -66,16 +67,26 @@ fn write_overlay_meta(
     bitset_bytes: u8,
     row_size: u16,
     kind_byte: u8,
-) {
-    bytes::write_u32(state, meta_base + SlotMetaOffset::OFFSET, data_offset);
-    bytes::write_u32(state, meta_base + SlotMetaOffset::CAPACITY, capacity);
+}
+
+fn write_overlay_meta(state: &mut [u8], meta_base: u32, overlay: &OverlayMeta) {
+    bytes::write_u32(
+        state,
+        meta_base + SlotMetaOffset::OFFSET,
+        overlay.data_offset,
+    );
+    bytes::write_u32(
+        state,
+        meta_base + SlotMetaOffset::CAPACITY,
+        overlay.capacity,
+    );
     bytes::write_u32(state, meta_base + SlotMetaOffset::SIZE, 0);
-    state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = type_flags_byte;
-    state[(meta_base + STRUCT_NUM_FIELDS) as usize] = num_fields;
+    state[(meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = overlay.type_flags_byte;
+    state[(meta_base + STRUCT_NUM_FIELDS) as usize] = overlay.num_fields;
     state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
-    state[(meta_base + STRUCT_BITSET_BYTES) as usize] = bitset_bytes;
-    bytes::write_u16(state, meta_base + STRUCT_ROW_SIZE, row_size);
-    state[(meta_base + STRUCT_KIND_BYTE) as usize] = kind_byte;
+    state[(meta_base + STRUCT_BITSET_BYTES) as usize] = overlay.bitset_bytes;
+    bytes::write_u16(state, meta_base + STRUCT_ROW_SIZE, overlay.row_size);
+    state[(meta_base + STRUCT_KIND_BYTE) as usize] = overlay.kind_byte;
     let pad_from = (meta_base + STRUCT_KIND_BYTE + 1) as usize;
     let pad_to = (meta_base + SLOT_META_SIZE) as usize;
     state[pad_from..pad_to].fill(0);
@@ -911,13 +922,15 @@ pub fn init_state(
             write_overlay_meta(
                 state,
                 meta_base,
-                data_offset,
-                capacity,
-                type_flags.to_byte(),
-                num_fields,
-                layout.bitset_bytes as u8,
-                layout.row_size as u16,
-                0,
+                &OverlayMeta {
+                    data_offset,
+                    capacity,
+                    type_flags_byte: type_flags.to_byte(),
+                    num_fields,
+                    bitset_bytes: layout.bitset_bytes as u8,
+                    row_size: layout.row_size as u16,
+                    kind_byte: 0,
+                },
             );
 
             // Field descriptor, exact key lane(s), then zeroed rows.
@@ -976,13 +989,15 @@ pub fn init_state(
                 write_overlay_meta(
                     state,
                     meta_base,
-                    data_offset,
-                    capacity,
-                    type_flags_byte,
-                    num_fields,
-                    layout.bitset_bytes as u8,
-                    layout.row_size as u16,
-                    elem_type,
+                    &OverlayMeta {
+                        data_offset,
+                        capacity,
+                        type_flags_byte,
+                        num_fields,
+                        bitset_bytes: layout.bitset_bytes as u8,
+                        row_size: layout.row_size as u16,
+                        kind_byte: elem_type,
+                    },
                 );
 
                 bytes::copy(state, data_offset, &field_types, 0, u32::from(num_fields));
@@ -1001,13 +1016,15 @@ pub fn init_state(
                 write_overlay_meta(
                     state,
                     meta_base,
-                    data_offset,
-                    capacity,
-                    type_flags_byte,
-                    0,
-                    0,
-                    elem_size as u16,
-                    elem_type,
+                    &OverlayMeta {
+                        data_offset,
+                        capacity,
+                        type_flags_byte,
+                        num_fields: 0,
+                        bitset_bytes: 0,
+                        row_size: elem_size as u16,
+                        kind_byte: elem_type,
+                    },
                 );
 
                 bytes::zero(state, data_offset, capacity * elem_size);
@@ -1359,14 +1376,18 @@ pub fn grow_state(
                     };
                     let new_rows_base = new_keys_off + key_lane_bytes;
 
+                    let table = slot_growth::StructMapTable {
+                        old_offset,
+                        new_offset,
+                        old_cap,
+                        new_cap,
+                        num_fields: nf,
+                        row_size: rs,
+                    };
                     let rehashed = if m.slot_type == SlotType::StructMap2 {
-                        slot_growth::grow_struct_map2(
-                            old_state, new_state, old_offset, new_offset, old_cap, new_cap, nf, rs,
-                        )
+                        slot_growth::grow_struct_map2(old_state, new_state, &table)
                     } else {
-                        slot_growth::grow_struct_map(
-                            old_state, new_state, old_offset, new_offset, old_cap, new_cap, nf, rs,
-                        )
+                        slot_growth::grow_struct_map(old_state, new_state, &table)
                     };
                     bytes::write_u32(new_state, meta_base + SlotMetaOffset::SIZE, rehashed);
 

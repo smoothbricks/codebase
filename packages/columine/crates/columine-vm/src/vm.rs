@@ -150,11 +150,10 @@ pub fn col_at<'a>(cols: &[&'a [u8]], idx: usize) -> &'a [u8] {
 
 // =============================================================================
 // Eviction entries — 16-byte little-endian records
-//
-// EvictionEntry layout: timestamp:f64 @0, key_or_idx:u32 @8, value:u32 @12
-// (layout pinned in columine-types; byte size is state_init::EVICTION_ENTRY_SIZE).
-// Accessors below address entry i of the index/buffer starting at base.
 
+/// `EvictionEntry` layout: `timestamp:f64 @0, key_or_idx:u32 @8, value:u32 @12`
+/// (layout pinned in columine-types; byte size is `state_init::EVICTION_ENTRY_SIZE`).
+/// Accessors below address entry `i` of the index/buffer starting at `base`.
 fn evict_ts(state: &[u8], base: u32, i: u32) -> f64 {
     bytes::read_f64(state, base + i * EVICTION_ENTRY_SIZE)
 }
