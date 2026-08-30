@@ -1204,7 +1204,16 @@ impl SpawnSink for SystemSpawnSink {
         let private_home = private_root.join("home");
         let private_config = private_root.join("config");
         let private_cache = private_root.join("cache");
-        for directory in [&private_home, &private_config, &private_cache] {
+        // exec_temp_dir joins the loop because it is exported as TMPDIR below.
+        // Exporting a directory without creating it makes every child that
+        // shells out to mktemp fail on a path the child never chose, and the
+        // failure names cowshed's quarantine rather than the caller's test.
+        for directory in [
+            &private_home,
+            &private_config,
+            &private_cache,
+            &request.sandbox.exec_temp_dir,
+        ] {
             tokio::fs::create_dir_all(directory)
                 .await
                 .map_err(|error| {
