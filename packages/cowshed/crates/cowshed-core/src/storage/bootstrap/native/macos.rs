@@ -32,7 +32,7 @@ use super::shared::{
     setup_execution_error,
 };
 use crate::error::CowshedError;
-use crate::storage::fstab::{FstabPin, build_fstab};
+use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
 
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
@@ -1484,7 +1484,7 @@ fn host_uninstall_plan_from_text(
     let pins_to_remove = existing
         .lines()
         .filter_map(|line| {
-            line.split_once("# cowshed created volume labelled")
+            line.split_once(COWSHED_FSTAB_TAG)
                 .map(|(_, label)| label.trim().to_owned())
         })
         .collect::<Vec<_>>();
