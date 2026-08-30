@@ -242,6 +242,31 @@ fn acquire_image_locks(
     Ok(Some(ImageLockGuard { _files: files }))
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CheckpointPinWire {
+    Pinned,
+    Automatic,
+}
+
+impl From<Pin> for CheckpointPinWire {
+    fn from(pin: Pin) -> Self {
+        match pin {
+            Pin::Pinned => Self::Pinned,
+            Pin::Automatic => Self::Automatic,
+        }
+    }
+}
+
+impl From<CheckpointPinWire> for Pin {
+    fn from(pin: CheckpointPinWire) -> Self {
+        match pin {
+            CheckpointPinWire::Pinned => Self::Pinned,
+            CheckpointPinWire::Automatic => Self::Automatic,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CheckpointFactWire {
@@ -250,7 +275,7 @@ struct CheckpointFactWire {
     workspace: WorkspaceName,
     label: CheckpointLabel,
     revision: u64,
-    pin: String,
+    pin: CheckpointPinWire,
 }
 
 const RESTORE_RECOVERY_FACT_VERSION: u32 = 2;
@@ -1839,8 +1864,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         if fact.version == CHECKPOINT_FACT_VERSION
                             && fact.repo_id == *retired.workspace().repo()
                             && fact.workspace == *retired.workspace().name()
-                            && fact.label == label
-                            && matches!(fact.pin.as_str(), "pinned" | "automatic") => {}
+                            && fact.label == label => {}
                     Ok(_) => {
                         return Err(ApfsStorageError::Host(format!(
                             "checkpoint fact does not match retired image path: {}",
@@ -2172,7 +2196,6 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     || fact.repo_id != *repo
                     || fact.workspace != workspace_name
                     || fact.label.as_str() != expected_label
-                    || !matches!(fact.pin.as_str(), "pinned" | "automatic")
                 {
                     return Err(ApfsStorageError::Host(format!(
                         "checkpoint fact does not match image path: {}",
@@ -2190,7 +2213,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 examined = examined
                     .checked_add(1)
                     .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-                if fact.pin == "pinned" {
+                if fact.pin == CheckpointPinWire::Pinned {
                     retained_pinned = retained_pinned
                         .checked_add(1)
                         .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
@@ -3543,11 +3566,7 @@ where
             workspace: metadata.workspace,
             label: label.clone(),
             revision: revision.get(),
-            pin: match pin {
-                Pin::Pinned => "pinned",
-                Pin::Automatic => "automatic",
-            }
-            .to_owned(),
+            pin: pin.into(),
         };
         let path = checkpoint_fact_path(image);
         crate::metadata::write_json(&path, &fact)
@@ -4017,16 +4036,7 @@ where
                 }
                 let wire: CheckpointFactWire = crate::metadata::read_json(&fact_path)
                     .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-                let pin = match wire.pin.as_str() {
-                    "pinned" => Pin::Pinned,
-                    "automatic" => Pin::Automatic,
-                    _ => {
-                        return Err(ApfsStorageError::Host(format!(
-                            "invalid checkpoint pin in {}",
-                            fact_path.display()
-                        )));
-                    }
-                };
+                let pin = Pin::from(wire.pin);
                 let expected_label = image
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -4709,16 +4719,7 @@ where
                             fact_path.display()
                         )));
                     }
-                    match fact.pin.as_str() {
-                        "pinned" => true,
-                        "automatic" => false,
-                        _ => {
-                            return Err(ApfsStorageError::Host(format!(
-                                "invalid checkpoint pin in {}",
-                                fact_path.display()
-                            )));
-                        }
-                    }
+                    fact.pin == CheckpointPinWire::Pinned
                 };
             let bytes =
                 allocated_file_bytes(&fs::metadata(&checkpoint_image).map_err(|error| {
@@ -5008,6 +5009,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn checkpoint_fact_pin_rejects_unknown_spellings() {
+        let json = r#"{
+            "version": 1,
+            "repoId": "acme/widget",
+            "workspace": "main",
+            "label": "ok",
+            "revision": 1,
+            "pin": "pinnned"
+        }"#;
+        serde_json::from_str::<CheckpointFactWire>(json)
+            .expect_err("unknown pin spelling is not a legitimate pin");
     }
 
     #[cfg(unix)]
