@@ -54,7 +54,7 @@ index 78bb5a4..7c6e2cb 100644
          match lookup {
              CacheLookupResult::Success(compile_result, output) => {
                  Ok::<_, Error>((compile_result, output))
-@@ -789,11 +834,14 @@ where
+@@ -789,11 +834,20 @@
                  );
  
                  let out_pretty2 = out_pretty.clone();
@@ -63,27 +63,23 @@ index 78bb5a4..7c6e2cb 100644
 -                let future = async move {
 -                    let start = Instant::now();
 -                    match storage.put(&key, entry).await {
-+                // An in-flight owner must publish before dropping the slot, or
-+                // waiters look up a key that is not there yet and compile again.
-+                // Always await the put so both paths share one future type.
-+                let start = Instant::now();
-+                let put = storage.put(&key, entry).await;
-+                drop(inflight_owner);
-+                let future = Box::pin(async move {
++                // Try to finish storing the newly-written cache entry. We'll
++                // get the result back elsewhere.
++                //
++                // The in-flight owner moves in here and drops once the put
++                // resolves. Waiters must not wake before the key is published,
++                // but making them wait must not move the store onto the
++                // compile path: awaiting it there parks the owner and every
++                // waiter on that key behind one cache write, and a saturated
++                // pool then accepts requests it never executes.
++                let future = async move {
++                    let start = Instant::now();
++                    let put = storage.put(&key, entry).await;
++                    drop(inflight_owner);
 +                    match put {
                          Ok(_) => {
                              debug!("[{}]: Stored in cache successfully!", out_pretty2);
                              Ok(CacheWriteInfo {
-@@ -803,8 +851,7 @@ where
-                         }
-                         Err(e) => Err(e),
-                     }
--                };
--                let future = Box::pin(future);
-+                });
-                 Ok((
-                     CompileResult::CacheMiss(miss_type, dist_type, duration_compilation, future),
-                     compiler_result,
 diff --git a/src/server.rs b/src/server.rs
 index 6180e76..6548887 100644
 --- a/src/server.rs
