@@ -146,6 +146,26 @@ describe('Cargo cache policy', () => {
     expect(result.messages.join('\n')).not.toContain('tests/integration.rs');
   });
 
+  it('ignores the macro named in a comment but still reports it in code', async () => {
+    const result = await check({
+      'src/documented.rs': [
+        '/// A crate compiling env!("CARGO_MANIFEST_DIR") fails closed across paths.',
+        '// So does env!("CARGO_MANIFEST_DIR") in a plain comment.',
+        '/* and env!("CARGO_MANIFEST_DIR") in a block */',
+        'const SEPARATOR: &str = "// not a comment";',
+        'const RAW: &str = r#"env!("CARGO_MANIFEST_DIR") inside a raw string"#;',
+        'const REAL: &str = env!("CARGO_MANIFEST_DIR");',
+        '',
+      ].join('\n'),
+    });
+    expect(result.failures).toBe(0);
+    const messages = result.messages.join('\n');
+    expect(messages).toContain('src/documented.rs:6');
+    expect(messages).not.toContain('src/documented.rs:1');
+    expect(messages).not.toContain('src/documented.rs:2');
+    expect(messages).not.toContain('src/documented.rs:3');
+  });
+
   it('honours an explicit ignore marker for a non-hidden subtree', async () => {
     const result = await check({
       'vendor/Cargo.toml': '# smoo-cargo-policy: ignore\n[workspace]\nmembers = []\n',
