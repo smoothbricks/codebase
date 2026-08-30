@@ -31,6 +31,7 @@ export async function applyWorkspaceGitConfig(root: string): Promise<void> {
   );
   linkHook(gitDir, tooling, 'pre-commit');
   linkHook(gitDir, tooling, 'commit-msg');
+  linkHook(gitDir, tooling, 'pre-push');
 }
 
 function linkHook(gitDir: string, tooling: string, name: string): void {

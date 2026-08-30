@@ -204,6 +204,12 @@ const managedFiles: ManagedFile[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/git-hooks/pre-push.sh',
+    target: 'tooling/git-hooks/pre-push.sh',
+    executable: true,
+  },
+  {
+    kind: 'raw',
     source: 'git-format-staged.yml',
     target: '.git-format-staged.yml',
   },
