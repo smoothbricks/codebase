@@ -1,2 +1,2 @@
 [test]
-preload = ["@smoothbricks/cli/bun/preload"]
+preload = ["@smoothbricks/cli/bun/preload", "./src/bun/isolate-nx-env.ts"]
