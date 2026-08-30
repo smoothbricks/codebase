@@ -59,6 +59,8 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
+    #[serde(skip)]
+    lifecycle_conflict: Option<crate::storage::lifecycle::Conflict>,
 }
 
 impl CowshedError {
@@ -67,6 +69,7 @@ impl CowshedError {
             code,
             message: message.into(),
             hint: hint.into(),
+            lifecycle_conflict: None,
         }
     }
 
@@ -80,6 +83,16 @@ impl CowshedError {
 
     pub fn conflict(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self::new(ErrorCode::Conflict, message, hint)
+    }
+
+    /// Preserve the structured CAS refusal while retaining the stable public error envelope.
+    pub fn lifecycle_conflict(conflict: crate::storage::lifecycle::Conflict) -> Self {
+        Self {
+            code: ErrorCode::Conflict,
+            message: conflict.to_string(),
+            hint: "refresh workspace state and retry".to_owned(),
+            lifecycle_conflict: Some(conflict),
+        }
     }
 
     pub fn environment_missing(message: impl Into<String>, hint: impl Into<String>) -> Self {
@@ -98,6 +111,11 @@ impl CowshedError {
         Self::new(ErrorCode::Internal, message, "cowshed doctor --json")
     }
 
+    /// The exact stale lifecycle fact, when this error came from `execute_checked`.
+    pub fn lifecycle_conflict_source(&self) -> Option<&crate::storage::lifecycle::Conflict> {
+        self.lifecycle_conflict.as_ref()
+    }
+
     pub const fn exit_code(&self) -> u8 {
         self.code.exit_code()
     }
@@ -113,7 +131,13 @@ impl fmt::Display for CowshedError {
     }
 }
 
-impl std::error::Error for CowshedError {}
+impl std::error::Error for CowshedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.lifecycle_conflict
+            .as_ref()
+            .map(|conflict| conflict as &(dyn std::error::Error + 'static))
+    }
+}
 
 pub type Result<T> = std::result::Result<T, CowshedError>;
 
