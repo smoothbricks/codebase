@@ -25,6 +25,10 @@ pub mod lifecycle;
 pub mod recovery;
 
 pub const WORKSPACE_MARKER_PATH: &str = ".cowshed/workspace.json";
+/// The undo-image grammar [`CheckpointLabel`] refuses and the restorer writes. One constant,
+/// because a label admitted here that later collides with a controller undo image would
+/// silently overwrite the only crash-consistent copy of a workspace.
+pub const PRE_RESTORE_PREFIX: &str = "pre-restore-";
 use recovery::STAGING_NAMESPACE;
 
 /// A validated, path-safe checkpoint label.
@@ -36,7 +40,7 @@ impl CheckpointLabel {
         let value = value.into();
         let bytes = value.as_bytes();
         let valid = (1..=128).contains(&bytes.len())
-            && !value.starts_with("pre-restore-")
+            && !value.starts_with(PRE_RESTORE_PREFIX)
             && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
             && bytes.iter().all(|byte| {
                 byte.is_ascii_lowercase()
@@ -288,20 +292,25 @@ impl StorageLayout {
     /// path and that directory is never made. A project with no record and no configured main
     /// mountpoint is either not adopted yet — in which case the answer is whatever adopt is about
     /// to choose — or it is a detached symlink-layout project whose mountpoint `gc` has since
-    /// removed, and guessing
-    /// between those would silently point every resolver at the wrong path. That case is an error,
-    /// not a default. Callers record whatever they resolve, so the inference runs at most once.
+    /// removed, and guessing between those would silently point every resolver at the wrong path.
+    /// That case is an error, not a default. Callers record whatever they resolve, so the
+    /// inference runs at most once.
+    ///
+    /// Only absence is migratable. A record that is present but unreadable — truncated write,
+    /// corrupt bytes, a version this build does not understand — is evidence that a writer was
+    /// interrupted, and inference is not entitled to overrule it: the same bytes would be
+    /// answered `DirectMount` for a symlink-layout project. It fails closed, exactly as
+    /// [`Self::slot_bindings`] does with the sibling record next to it.
     pub fn checkout_layout(&self) -> Result<CheckoutLayout, StorageLayoutError> {
-        if let Ok(record) =
-            crate::metadata::read_json::<CheckoutLayoutRecord>(&self.project.checkout_layout)
-        {
-            record.validate()?;
-            return Ok(record.checkout_layout);
+        match crate::metadata::read_json::<CheckoutLayoutRecord>(&self.project.checkout_layout) {
+            Ok(record) => {
+                record.validate()?;
+                return Ok(record.checkout_layout);
+            }
+            Err(MetadataError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        if self
-            .workspace_mount(&WorkspaceName::new("main").expect("fixed main"))?
-            .is_dir()
-        {
+        if self.workspace_mount(&WorkspaceName::main())?.is_dir() {
             return Ok(CheckoutLayout::Symlink);
         }
         for format in [ImageFormat::Asif, ImageFormat::Sparse] {
@@ -548,7 +557,7 @@ mod tests {
 
     fn layout() -> StorageLayout {
         StorageLayout::with_mount_root(
-            "/private/cowshed/store",
+            bootstrap::STORE_ROOT,
             "/Users/test/.cowshed/mnt",
             &RepoId::parse("acme/widget").unwrap(),
         )
@@ -615,12 +624,7 @@ mod tests {
         let layout = layout_under(&root);
         fs::create_dir_all(&layout.project().project_root).unwrap();
         // Plant the shape that would otherwise be read as the symlink layout.
-        fs::create_dir_all(
-            layout
-                .workspace_mount(&WorkspaceName::new("main").unwrap())
-                .unwrap(),
-        )
-        .unwrap();
+        fs::create_dir_all(layout.workspace_mount(&WorkspaceName::main()).unwrap()).unwrap();
         layout
             .record_checkout_layout(CheckoutLayout::DirectMount)
             .unwrap();
@@ -628,6 +632,24 @@ mod tests {
             layout.checkout_layout().unwrap(),
             CheckoutLayout::DirectMount
         );
+    }
+
+    /// A record that cannot be parsed is evidence, not an absence.
+    ///
+    /// Inference exists for the project that never wrote a record; a truncated or corrupt record
+    /// says a writer was interrupted, and answering it with the inferred default would report a
+    /// direct-mount project as direct-mount by luck and a symlink project as direct-mount wrongly.
+    #[test]
+    fn malformed_checkout_layout_fails_closed() {
+        let root = temp_store("malformed-checkout-layout");
+        let layout = layout_under(&root);
+        fs::create_dir_all(&layout.project().project_root).unwrap();
+        fs::write(&layout.project().checkout_layout, b"{not json").unwrap();
+
+        assert!(matches!(
+            layout.checkout_layout(),
+            Err(StorageLayoutError::Metadata(MetadataError::Json { .. }))
+        ));
     }
 
     #[test]
@@ -654,12 +676,7 @@ mod tests {
         ));
 
         // Only the symlink layout ever creates this directory, so its presence is conclusive.
-        fs::create_dir_all(
-            layout
-                .workspace_mount(&WorkspaceName::new("main").unwrap())
-                .unwrap(),
-        )
-        .unwrap();
+        fs::create_dir_all(layout.workspace_mount(&WorkspaceName::main()).unwrap()).unwrap();
         assert_eq!(layout.checkout_layout().unwrap(), CheckoutLayout::Symlink);
     }
 
