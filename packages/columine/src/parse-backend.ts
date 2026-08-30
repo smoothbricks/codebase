@@ -7,8 +7,10 @@
 
 import type { CompactBatch, CompactColumn, EncodedArrowSchema, ParseConfig, ParseResult } from './pipeline.js';
 import {
+  align8,
   calculateRequiredWasmBytes,
   ensureWasmMemoryForWorkingSet,
+  loadWasmBytes,
   WASM_MAX_BYTES,
   WASM_MAX_PAGES,
 } from './wasm-memory-contract.js';
@@ -231,14 +233,6 @@ function checkedAdd(left: number, right: number, label: string): number {
     throw new RangeError(`${label} exceeds JavaScript safe-integer arithmetic`);
   }
   return result;
-}
-
-function align8(value: number, label = 'aligned byte count'): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError(`${label} must be a non-negative safe integer`);
-  }
-  const remainder = value % 8;
-  return remainder === 0 ? value : checkedAdd(value, 8 - remainder, label);
 }
 
 function formatBytes(bytes: number): string {
@@ -830,7 +824,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         const fieldCount = config.fieldMetadata.length / 4;
         handle = fieldNamesBuffer
           ? wasm.ep_create_with_schema_and_names(
-              256,
+              MAX_EVENTS_PER_BATCH,
               layout.schemaOffset,
               config.schemaBytes.length,
               layout.fieldMetaOffset,
@@ -839,7 +833,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
               fieldNamesBuffer.length,
             )
           : wasm.ep_create_with_schema(
-              256,
+              MAX_EVENTS_PER_BATCH,
               layout.schemaOffset,
               config.schemaBytes.length,
               layout.fieldMetaOffset,
@@ -923,7 +917,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         memory.set(batch.schema.schemaBytes, layout.schemaOffset);
         memory.set(batch.schema.fieldMetadata, layout.fieldMetaOffset);
         handle = wasm.ep_create_with_schema(
-          256,
+          MAX_EVENTS_PER_BATCH,
           layout.schemaOffset,
           batch.schema.schemaBytes.length,
           layout.fieldMetaOffset,
@@ -1056,45 +1050,4 @@ export async function loadParseBackend(wasmPath?: string | URL): Promise<ParseCo
   const exports = parseEventProcessorWasmExports(instance.exports);
 
   return createParseCompactWasmBackend(exports);
-}
-
-/**
- * Load WASM bytes from path or default locations.
- * Follows the same pattern as wasm-backend.ts.
- */
-async function loadWasmBytes(
-  customPath: string | URL | undefined,
-  defaultFileName: string,
-): Promise<ArrayBuffer | undefined> {
-  if (customPath) {
-    try {
-      const response = await fetch(customPath);
-      if (response.ok) {
-        return await response.arrayBuffer();
-      }
-    } catch {
-      // File not found
-    }
-    return undefined;
-  }
-
-  const defaultPaths = [
-    // Built module: dist/ts/*.js -> dist/*.wasm.
-    new URL(`../${defaultFileName}`, import.meta.url),
-    // Development source: src/*.ts -> dist/*.wasm.
-    new URL(`../dist/${defaultFileName}`, import.meta.url),
-  ];
-
-  for (const path of defaultPaths) {
-    try {
-      const response = await fetch(path);
-      if (response.ok) {
-        return await response.arrayBuffer();
-      }
-    } catch {
-      // Try next
-    }
-  }
-
-  return undefined;
 }

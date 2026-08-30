@@ -116,3 +116,54 @@ export function ensureWasmMemoryForWorkingSet(
     totalPages: currentPages + grownPages,
   };
 }
+
+export function align8(value: number, label = 'aligned byte count'): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${label} must be a non-negative safe integer`);
+  }
+  const remainder = value % 8;
+  if (remainder === 0) {
+    return value;
+  }
+  const result = value + (8 - remainder);
+  if (!Number.isSafeInteger(result)) {
+    throw new RangeError(`${label} exceeds JavaScript safe-integer arithmetic`);
+  }
+  return result;
+}
+
+/** Load a wasm artifact from an explicit path or the two default dist locations. */
+export async function loadWasmBytes(
+  customPath: string | URL | undefined,
+  defaultFileName: string,
+): Promise<ArrayBuffer | undefined> {
+  if (customPath) {
+    try {
+      const response = await fetch(customPath);
+      if (response.ok) {
+        return await response.arrayBuffer();
+      }
+    } catch {
+      // File not found or other error
+    }
+    return undefined;
+  }
+
+  const defaultPaths = [
+    new URL(`../${defaultFileName}`, import.meta.url),
+    new URL(`../dist/${defaultFileName}`, import.meta.url),
+  ];
+
+  for (const path of defaultPaths) {
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        return await response.arrayBuffer();
+      }
+    } catch {
+      // Try next
+    }
+  }
+
+  return undefined;
+}
