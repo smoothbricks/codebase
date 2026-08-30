@@ -176,7 +176,9 @@ fn stable_and_dynamic_vocabulary_have_query_and_archive_parity() {
             "dynamic {name}"
         );
         assert_eq!(
-            static_query.count(&selector).expect("valid static selector"),
+            static_query
+                .count(&selector)
+                .expect("valid static selector"),
             expected,
             "static {name}"
         );
