@@ -8,6 +8,7 @@ use std::process::Output;
 
 use tokio::process::Command;
 
+use crate::api::dto::GitOid;
 use crate::error::{CowshedError, Result};
 use crate::workspace_environment::WORKSPACE_ENVIRONMENT_PATH;
 
@@ -483,8 +484,9 @@ impl GitRepository {
         Ok(remotes)
     }
 
-    pub async fn head_oid(&self) -> Result<String> {
-        self.read_one(["rev-parse", "HEAD"], "read HEAD").await
+    pub async fn head_oid(&self) -> Result<GitOid> {
+        let value = self.read_one(["rev-parse", "HEAD"], "read HEAD").await?;
+        parse_oid(value, "HEAD")
     }
 
     pub async fn current_branch(&self) -> Result<Option<String>> {
@@ -734,13 +736,15 @@ impl GitRepository {
     /// `rev-parse --verify --quiet` is the only spelling that answers this in one call for both
     /// refs and oids. `show-ref --verify` is fatal (exit 128) on a ref that is merely absent, and
     /// `cat-file -e` cannot take a ref name.
-    async fn resolve_commit(&self, revision: &str) -> Result<Option<String>> {
+    async fn resolve_commit(&self, revision: &str) -> Result<Option<GitOid>> {
         let peeled = format!("{revision}^{{commit}}");
         let output = self
             .run(["rev-parse", "--verify", "--quiet", peeled.as_str()])
             .await?;
         match output.status.code() {
-            Some(0) => parse_one_string(&output.stdout, "commit revision").map(Some),
+            Some(0) => parse_one_string(&output.stdout, "commit revision")
+                .and_then(|value| parse_oid(value, "commit revision"))
+                .map(Some),
             Some(1) => Ok(None),
             _ => Err(git_internal("resolve commit revision", &output)),
         }
@@ -798,7 +802,7 @@ impl GitRepository {
     }
 
     /// The tip of local branch `branch`, or `None` when this repository has no such branch.
-    pub async fn branch_tip(&self, branch: &str) -> Result<Option<String>> {
+    pub async fn branch_tip(&self, branch: &str) -> Result<Option<GitOid>> {
         self.resolve_commit(&format!("refs/heads/{branch}")).await
     }
 
@@ -1009,7 +1013,7 @@ impl GitRepository {
     }
 
     /// The `exclude` endpoint of a range, reduced to an oid this repository holds.
-    async fn usable_exclude(&self, exclude: Option<&str>) -> Result<Option<String>> {
+    async fn usable_exclude(&self, exclude: Option<&str>) -> Result<Option<GitOid>> {
         match exclude {
             Some(exclude) => self.resolve_commit(exclude).await,
             None => Ok(None),
@@ -2034,6 +2038,15 @@ fn parse_one_string(bytes: &[u8], description: &str) -> Result<String> {
         .map_err(|_| CowshedError::internal(format!("{description} is not valid UTF-8")))
 }
 
+fn parse_oid(value: String, description: &str) -> Result<GitOid> {
+    GitOid::new(value).map_err(|error| {
+        CowshedError::integrity(
+            format!("{description} is not a git object id: {error}"),
+            "repair the git repository",
+        )
+    })
+}
+
 fn parse_one_path(bytes: &[u8], description: &str) -> Result<PathBuf> {
     let value = parse_one_line(bytes, description)?;
     Ok(PathBuf::from(OsString::from_vec(value.to_vec())))
@@ -2337,7 +2350,7 @@ mod tests {
             repo.current_branch().await.expect("read branch").as_deref(),
             Some("main")
         );
-        assert_eq!(repo.head_oid().await.expect("read head").len(), 40);
+        assert_eq!(repo.head_oid().await.expect("read head").as_str().len(), 40);
         assert!(!repo.is_dirty().await.expect("read clean status"));
         fs::write(root.join("untracked"), b"dirty\n").expect("write untracked file");
         assert!(repo.is_dirty().await.expect("read dirty status"));
@@ -2866,26 +2879,26 @@ mod tests {
         let host_head = host_repo.head_oid().await.expect("read host head");
         assert!(
             host_repo
-                .commit_is_preserved(&host_head)
+                .commit_is_preserved(host_head.as_str())
                 .await
                 .expect("main preserves its head")
         );
         assert!(
             !host_repo
-                .commit_is_remote_preserved(&host_head)
+                .commit_is_remote_preserved(host_head.as_str())
                 .await
                 .expect("local head is not remotely preserved")
         );
         let status = Command::new("git")
             .arg("-C")
             .arg(&host)
-            .args(["update-ref", "refs/remotes/origin/main", &host_head])
+            .args(["update-ref", "refs/remotes/origin/main", host_head.as_str()])
             .status()
             .expect("write remote-tracking ref");
         assert!(status.success());
         assert!(
             host_repo
-                .commit_is_remote_preserved(&host_head)
+                .commit_is_remote_preserved(host_head.as_str())
                 .await
                 .expect("remote-tracking ref preserves head")
         );
@@ -2934,7 +2947,7 @@ mod tests {
             .expect("read session head");
         assert!(
             !host_repo
-                .commit_is_preserved(&session_head)
+                .commit_is_preserved(session_head.as_str())
                 .await
                 .expect("absent session object is not preserved")
         );
@@ -2948,7 +2961,7 @@ mod tests {
         assert!(status.success());
         assert!(
             host_repo
-                .commit_is_preserved(&session_head)
+                .commit_is_preserved(session_head.as_str())
                 .await
                 .expect("preservation ref contains session commit")
         );
@@ -3045,13 +3058,13 @@ mod tests {
         // Not landed: main does not contain the session commit.
         assert!(
             !repo
-                .commit_is_ancestor(&work, &base)
+                .commit_is_ancestor(&work, base.as_str())
                 .await
                 .expect("compare ancestry")
         );
         // The base is landed by definition, and a commit is its own ancestor.
         assert!(
-            repo.commit_is_ancestor(&base, &work)
+            repo.commit_is_ancestor(base.as_str(), &work)
                 .await
                 .expect("compare")
         );
@@ -3077,9 +3090,9 @@ mod tests {
         git(&root, &["switch", "-q", "main"]);
         git(&root, &["merge", "-q", "--ff-only", "cowshed/raven"]);
         let landed_tip = repo.branch_tip("main").await.expect("tip").expect("branch");
-        assert_eq!(landed_tip, work);
+        assert_eq!(landed_tip.as_str(), work);
         assert!(
-            repo.commit_is_ancestor(&work, &landed_tip)
+            repo.commit_is_ancestor(&work, landed_tip.as_str())
                 .await
                 .expect("landed work is contained by main")
         );
@@ -3096,7 +3109,7 @@ mod tests {
         commit_on(&root, "two");
 
         assert_eq!(
-            repo.commits_ahead(Some(&base), "HEAD")
+            repo.commits_ahead(Some(base.as_str()), "HEAD")
                 .await
                 .expect("count ahead of main"),
             2
@@ -3151,7 +3164,7 @@ mod tests {
         let live_main = main_repo.head_oid().await.expect("read rewritten main");
         assert!(
             !main_repo
-                .commit_is_preserved(&clone_time_main)
+                .commit_is_preserved(clone_time_main.as_str())
                 .await
                 .expect("check clone-time tip reachability"),
             "the test must orphan the clone-time main snapshot deliberately"
@@ -3166,7 +3179,7 @@ mod tests {
             .expect("attach live main objects");
         let bundle = workspace.join("history-diverged.bundle");
         let reported_count = workspace_repo
-            .bundle_commits(&bundle, Some(&live_main), "HEAD")
+            .bundle_commits(&bundle, Some(live_main.as_str()), "HEAD")
             .await
             .expect("write and verify self-contained abandonment bundle");
         let claimed = workspace_repo
@@ -3184,7 +3197,11 @@ mod tests {
 
         // A raw-oid tip advertises no fetchable ref, even though it names the right object.
         let refless = workspace_repo
-            .bundle_commits(&workspace.join("refless.bundle"), Some(&live_main), &tip)
+            .bundle_commits(
+                &workspace.join("refless.bundle"),
+                Some(live_main.as_str()),
+                &tip,
+            )
             .await
             .expect_err("an oid tip produces a ref-less bundle git will not write");
         assert!(refless.message.contains("empty bundle"), "{refless:?}");
@@ -3225,7 +3242,7 @@ mod tests {
         let recovery_repo = GitRepository::from_root(&recovery);
         assert!(
             recovery_repo
-                .has_commit(&live_main)
+                .has_commit(live_main.as_str())
                 .await
                 .expect("bundle carries the live target"),
             "the live target must travel in the self-contained artifact"
@@ -3269,7 +3286,7 @@ mod tests {
         );
 
         let error = repo
-            .verify_bundle(&thin, &tip, Some(&base), 2)
+            .verify_bundle(&thin, &tip, Some(base.as_str()), 2)
             .await
             .expect_err("a prerequisite-dependent artifact must abort abandonment");
         assert!(
@@ -3281,7 +3298,10 @@ mod tests {
             "verification must not destroy the workspace"
         );
         assert_eq!(
-            repo.head_oid().await.expect("workspace remains readable"),
+            repo.head_oid()
+                .await
+                .expect("workspace remains readable")
+                .as_str(),
             tip,
             "verification failure must leave the workspace tip untouched"
         );
