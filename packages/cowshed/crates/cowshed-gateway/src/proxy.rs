@@ -2226,25 +2226,8 @@ fn extract_mirror_trace(path: &str, kind: AuditKind) -> Option<(String, Option<S
     let prefix = format!("/{protocol}/t/");
     let remainder = path.strip_prefix(&prefix)?;
     let (traceparent, suffix) = remainder.split_once('/')?;
-    let bytes = traceparent.as_bytes();
-    if bytes.len() != 55
-        || bytes[2] != b'-'
-        || bytes[35] != b'-'
-        || bytes[52] != b'-'
-        || !bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 2 | 35 | 52) || byte.is_ascii_hexdigit())
-        || &traceparent[..2] == "ff"
-        || traceparent[3..35].bytes().all(|byte| byte == b'0')
-        || traceparent[36..52].bytes().all(|byte| byte == b'0')
-    {
-        return None;
-    }
-    Some((
-        format!("/{protocol}/{suffix}"),
-        Some(traceparent[3..35].to_ascii_lowercase()),
-    ))
+    let (trace_id, _, _) = parse_traceparent(traceparent)?;
+    Some((format!("/{protocol}/{suffix}"), Some(trace_id)))
 }
 
 fn local_request_kind(path: &str) -> Option<AuditKind> {
@@ -3191,6 +3174,13 @@ mod tests {
         assert_eq!(go_path, "/go/example.com/mod/@v/list");
         assert_eq!(go_trace, npm_trace);
         assert!(extract_mirror_trace("/npm/t/invalid/react", AuditKind::Npm).is_none());
+
+        let version1 = "01-0123456789abcdef0123456789abcdef-0123456789abcdef-01-extra";
+        let (npm_v1_path, npm_v1_trace) =
+            extract_mirror_trace(&format!("/npm/t/{version1}/react"), AuditKind::Npm)
+                .expect("version-1 extra-field path uses the header grammar");
+        assert_eq!(npm_v1_path, "/npm/react");
+        assert_eq!(npm_v1_trace, npm_trace);
     }
     #[test]
     fn generic_w3c_context_is_strictly_parsed_and_canonically_serialized() {
