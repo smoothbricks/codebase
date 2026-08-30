@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod dto;
+pub(crate) mod frame;
 pub(crate) mod peer_credentials;
 pub mod server;
 

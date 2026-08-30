@@ -1,4 +1,5 @@
-use super::peer_credentials::{self, PeerCredentialsError};
+use super::frame;
+use super::peer_credentials::PeerCredentialsError;
 use crate::error::{CowshedError, ErrorCode, Result};
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::RepoId;
@@ -956,19 +957,14 @@ async fn write_frame(
     maximum: usize,
     description: &'static str,
 ) -> Result<()> {
-    if bytes.is_empty() || bytes.len() > maximum {
-        return Err(protocol_error(format!("{description} has invalid length")));
-    }
-    let length = u32::try_from(bytes.len())
-        .map_err(|_| protocol_error(format!("{description} length does not fit the wire")))?;
-    stream
-        .write_all(&length.to_be_bytes())
-        .await
-        .map_err(|error| connection_error(format!("{description} write failed: {error}")))?;
-    stream
-        .write_all(bytes)
-        .await
-        .map_err(|error| connection_error(format!("{description} write failed: {error}")))
+    frame::write_frame(
+        stream,
+        bytes,
+        maximum,
+        || protocol_error(format!("{description} has invalid length")),
+        |error| connection_error(format!("{description} write failed: {error}")),
+    )
+    .await
 }
 
 async fn read_binary_frame(
@@ -1080,7 +1076,7 @@ async fn write_rpc_error(
 }
 
 fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
-    let peer_uid = peer_credentials::peer_uid(descriptor).map_err(|error| match error {
+    frame::verify_peer(descriptor, |error| match error {
         PeerCredentialsError::SocketTypeSizeOverflow => {
             connection_error("socket type size does not fit socklen_t")
         }
@@ -1090,15 +1086,7 @@ fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
         PeerCredentialsError::PeerCredentialQueryFailed => {
             connection_error("controller descriptor peer does not match the current uid")
         }
-    })?;
-    // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
-    let current_uid = unsafe { libc::geteuid() };
-    if peer_uid != current_uid {
-        return Err(connection_error(
-            "controller descriptor peer does not match the current uid",
-        ));
-    }
-    Ok(())
+    })
 }
 
 fn router_closed(message: &'static str) -> CowshedError {
