@@ -1172,6 +1172,19 @@ fn ordered_list_primary_size_from_meta(old_state: &[u8], meta_base: u32, cap: u3
     }
 }
 
+/// Nested-slot primary size from the prefix written at init. Inner capacity
+/// is power-of-two'd the same way `init_state` / `calculate_state_size` do
+/// before calling `nested_slot_data_size`.
+fn nested_primary_size_from_prefix(old_state: &[u8], slot_offset: u32, outer_cap: u32) -> u32 {
+    let prefix = nested::read_nested_prefix(old_state, slot_offset);
+    nested::nested_slot_data_size(
+        outer_cap,
+        next_power_of_2(u32::from(prefix.inner_initial_cap)),
+        prefix.inner_type,
+        prefix.inner_agg_type_byte,
+    )
+}
+
 /// Calculate grown-state size with 2× capacity for `grown_slot_idx`, reading
 /// the slot metadata from the old state so already-grown states grow again
 /// correctly.
@@ -1207,6 +1220,7 @@ pub fn calculate_grown_state_size(old_state: &[u8], grown_slot_idx: u32) -> u32 
                 sz
             }
             SlotType::OrderedList => ordered_list_primary_size_from_meta(old_state, meta_base, cap),
+            SlotType::Nested => nested_primary_size_from_prefix(old_state, m.offset, cap),
             _ => slot_growth::slot_data_size(
                 m.slot_type,
                 cap,
@@ -1250,7 +1264,7 @@ pub fn grow_state(
         };
         let new_offset = data_cursor;
 
-        // Primary data size (STRUCT_MAP and ORDERED_LIST are metadata-based).
+        // Primary data size (STRUCT_MAP, ORDERED_LIST, NESTED are layout-driven).
         let new_primary_size = match m.slot_type {
             SlotType::StructMap | SlotType::StructMap2 => {
                 struct_map_primary_size_from_meta(old_state, meta_base, new_cap, m.slot_type)
@@ -1258,6 +1272,7 @@ pub fn grow_state(
             SlotType::OrderedList => {
                 ordered_list_primary_size_from_meta(old_state, meta_base, new_cap)
             }
+            SlotType::Nested => nested_primary_size_from_prefix(old_state, old_offset, new_cap),
             _ => slot_growth::slot_data_size(
                 m.slot_type,
                 new_cap,
@@ -1492,6 +1507,7 @@ pub fn grow_state(
                 SlotType::OrderedList => {
                     ordered_list_primary_size_from_meta(old_state, meta_base, old_cap)
                 }
+                SlotType::Nested => nested_primary_size_from_prefix(old_state, old_offset, old_cap),
                 _ => slot_growth::slot_data_size(
                     m.slot_type,
                     old_cap,
