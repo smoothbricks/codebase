@@ -295,6 +295,12 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::{marker::PhantomData, mem::ManuallyDrop};
+
+    use serde::Serialize;
+
+    use super::{TOKEN_BYTES, WorkspaceCa, WorkspaceToken};
+    use crate::policy::EgressMode;
     use crate::repo_id::validate_repo_id;
 
     #[test]
@@ -315,5 +321,91 @@ mod tests {
         ] {
             assert!(validate_repo_id(value).is_err(), "{value}");
         }
+    }
+
+    /// `WorkspaceToken` must not gain a serializer.
+    ///
+    /// Every other value in a `WorkspaceSession` is serialized over the control socket; a
+    /// `#[derive(Serialize)]` added here out of symmetry would put the live bearer token into
+    /// control frames, logs and status output. Rust cannot express "does not implement", so this
+    /// resolves the name twice: the inherent method on `Probe<T>` exists only where `T: Serialize`
+    /// and shadows the blanket trait method when it applies. If the derive is ever added, the
+    /// inherent method wins and the assertion fails.
+    #[test]
+    fn a_token_is_not_serializable() {
+        struct Probe<T>(PhantomData<T>);
+
+        trait NotSerialized {
+            const SERIALIZABLE: bool = false;
+            fn serializable() -> bool {
+                Self::SERIALIZABLE
+            }
+        }
+        impl<T> NotSerialized for Probe<T> {}
+
+        impl<T: Serialize> Probe<T> {
+            fn serializable() -> bool {
+                true
+            }
+        }
+
+        assert!(
+            !Probe::<WorkspaceToken>::serializable(),
+            "WorkspaceToken must stay unserializable"
+        );
+        // The probe reports honestly: `EgressMode` does derive `Serialize` and answers true.
+        assert!(Probe::<EgressMode>::serializable());
+    }
+
+    /// Dropping a token must leave no copy of the secret in the memory it occupied.
+    ///
+    /// `drop_in_place` runs `Drop::drop` while the storage is still live and owned by this frame,
+    /// so the zeroized bytes are observable; the payload is `[u8; 32]`, which has no invalid bit
+    /// patterns and owns nothing, so reading it afterwards is defined. Nothing else drops it.
+    #[test]
+    fn dropping_a_token_zeroizes_the_secret() {
+        let mut token = ManuallyDrop::new(WorkspaceToken::from_bytes([0xA5; TOKEN_BYTES]));
+        assert_eq!(token.0, [0xA5; TOKEN_BYTES]);
+        unsafe { std::ptr::drop_in_place(&mut *token) };
+        assert_eq!(token.0, [0; TOKEN_BYTES]);
+    }
+
+    /// Diagnostics must never carry the token, and there must be no `Display` route around
+    /// `Debug`: `encode` is the single deliberate way to render one.
+    #[test]
+    fn diagnostics_redact_the_token_and_the_ca_key() {
+        let encoded = "3q2-796tvu_erb7v3q2-796tvu_erb7v3q2-796tvu8";
+        let token = WorkspaceToken::parse(encoded).expect("valid token");
+        let rendered = format!("{token:?}");
+        assert_eq!(rendered, "WorkspaceToken([REDACTED])");
+        assert!(!rendered.contains(encoded));
+        assert_eq!(token.encode(), encoded);
+
+        let ca = WorkspaceCa::new(
+            "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n".to_owned(),
+            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n".to_owned(),
+        )
+        .expect("valid CA");
+        let rendered = format!("{ca:?}");
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    /// A token compares in constant time and rejects anything that is not exactly 32 unpadded
+    /// base64url bytes, so a near-miss cannot be distinguished from a wild guess.
+    #[test]
+    fn token_comparison_admits_only_the_exact_encoding() {
+        let bytes = [0x11; TOKEN_BYTES];
+        let token = WorkspaceToken::from_bytes(bytes);
+        let encoded = token.encode();
+        assert!(token.matches_encoded(&encoded));
+
+        let mut other = bytes;
+        other[TOKEN_BYTES - 1] ^= 1;
+        assert!(!token.matches_encoded(&WorkspaceToken::from_bytes(other).encode()));
+        assert!(!token.matches_encoded(&encoded[..encoded.len() - 1]));
+        assert!(!token.matches_encoded(&format!("{encoded}=")));
+        assert!(!token.matches_encoded(""));
+        assert!(!token.matches_encoded("not base64!"));
     }
 }
