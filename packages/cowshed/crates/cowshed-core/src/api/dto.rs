@@ -131,6 +131,12 @@ impl GitOid {
     }
 }
 
+impl AsRef<str> for GitOid {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl fmt::Display for GitOid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
