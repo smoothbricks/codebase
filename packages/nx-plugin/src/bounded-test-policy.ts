@@ -145,11 +145,13 @@ export function checkWorkspaceBoundedTestTargetPolicy(
  * 1. `targetDefaults.test.dependsOn` in `nx.json` REPLACES an inferred
  *    `dependsOn` rather than merging, and a package-local `nx.targets.test`
  *    replaces it outright. `nx test <project>` then executes nothing.
- * 2. A PARTIAL package-local override of `cargo-test` itself replaces the whole
- *    inferred target, not just the named field: declaring only `dependsOn`
- *    leaves `executor: nx:noop` with empty options, so `cargo-test` still
- *    "reaches" its dependencies while no test binary is ever run. Reachability
- *    alone cannot see this, because `cargo-test-compile` is `--no-run`.
+ * 2. `dependsOn` REPLACES rather than unions at every merge layer, so a
+ *    package-local `nx.targets['cargo-test'].dependsOn` that omits the inferred
+ *    runner leg leaves a target that still "reaches" its dependencies while no
+ *    test binary is ever run. Reachability alone cannot see this, because
+ *    `cargo-test-compile` is `--no-run`. (Inference itself no longer skips a
+ *    declared cargo key, so the executor and options survive the declaration —
+ *    see `index.ts`.)
  *
  * So this checks both: `test` reaches `cargo-test`, AND some target in
  * `cargo-test`'s closure actually executes tests rather than only compiling them.
@@ -187,7 +189,7 @@ export function checkWorkspaceCargoTestReachabilityPolicy(
         path,
         message:
           `${scope}.${CARGO_TEST_TARGET} reaches no target that RUNS tests — only ones that compile them. ` +
-          'A partial override replaces the whole inferred target, leaving nx:noop with empty options',
+          'A declared dependsOn replaces the inferred one; spread it with "..." instead of omitting the runner leg',
       });
     }
   }
