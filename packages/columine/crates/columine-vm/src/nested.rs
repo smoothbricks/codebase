@@ -288,41 +288,19 @@ impl OuterTable {
     }
 
     /// Look up an outer key's inner-container offset, or return zero when
-    /// absent. Only `EMPTY_KEY` terminates the probe; tombstones are skipped.
+    /// absent. Arena data never starts at offset zero, so zero is outside the
+    /// domain of live inner offsets and is a sound absence marker.
     pub fn lookup(&self, state: &[u8], outer_key: u32) -> u32 {
-        if outer_key == EMPTY_KEY || outer_key == TOMBSTONE {
-            return 0;
-        }
-        hash_table::probe_linear(
-            self.cap,
-            hash_key(outer_key, self.cap),
-            false,
-            |pos| match self.key_at(state, pos) {
-                current if current == outer_key => hash_table::ProbeCell::Match,
-                EMPTY_KEY => hash_table::ProbeCell::Empty,
-                TOMBSTONE => hash_table::ProbeCell::Tombstone,
-                _ => hash_table::ProbeCell::Occupied,
-            },
-        )
-        .filter(|probe| probe.found)
-        .map_or(0, |probe| self.ptr_at(state, probe.pos))
+        hash_table::find_key(state, self.keys_off, self.cap, outer_key)
+            .map_or(0, |pos| self.ptr_at(state, pos))
     }
 
     /// Repoint an existing outer key at a grown inner container. The probe is
     /// bounded by `cap`; absence is a programmer error.
     pub fn update_ptr(&self, state: &mut [u8], outer_key: u32, new_offset: u32) {
-        let probe =
-            hash_table::probe_linear(self.cap, hash_key(outer_key, self.cap), false, |pos| {
-                match self.key_at(state, pos) {
-                    current if current == outer_key => hash_table::ProbeCell::Match,
-                    EMPTY_KEY => hash_table::ProbeCell::Empty,
-                    TOMBSTONE => hash_table::ProbeCell::Tombstone,
-                    _ => hash_table::ProbeCell::Occupied,
-                }
-            })
-            .filter(|probe| probe.found)
+        let pos = hash_table::find_key(state, self.keys_off, self.cap, outer_key)
             .unwrap_or_else(|| columine_types::die!("outer key vanished during inner growth"));
-        bytes::write_u32(state, self.ptrs_off + probe.pos * 4, new_offset);
+        bytes::write_u32(state, self.ptrs_off + pos * 4, new_offset);
     }
 }
 
