@@ -23,9 +23,9 @@ use crate::apfs::{
 };
 use crate::copy::copy_until_quiescent_blocking;
 use crate::metadata::{
-    DetachedWorkspaceMetadata, ImageCapacity, ImageFormat, METADATA_VERSION, Platform,
-    PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker, WorkspaceName,
-    WorkspaceRole, sidecar_path,
+    DetachedWorkspaceMetadata, GRANTS_SIDECAR_SUFFIX, ImageCapacity, ImageFormat, METADATA_VERSION,
+    Platform, PublicationState, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceMarker,
+    WorkspaceName, WorkspaceRole, sidecar_path,
 };
 use crate::repository::RepoId;
 use crate::workspace_credentials::{
@@ -881,7 +881,7 @@ fn collect_restore_sidecars(
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if name.starts_with("pre-restore-") && name.ends_with(".grants.json") {
+            if name.starts_with("pre-restore-") && name.ends_with(GRANTS_SIDECAR_SUFFIX) {
                 sidecars.push(path);
             }
         }
@@ -890,17 +890,12 @@ fn collect_restore_sidecars(
 }
 
 fn image_from_sidecar(sidecar: &Path) -> Result<PathBuf, ApfsStorageError> {
-    let value = sidecar
-        .as_os_str()
-        .to_str()
-        .and_then(|value| value.strip_suffix(".grants.json"))
-        .ok_or_else(|| {
-            ApfsStorageError::Host(format!(
-                "invalid detached restore sidecar path: {}",
-                sidecar.display()
-            ))
-        })?;
-    Ok(PathBuf::from(value))
+    crate::metadata::image_from_sidecar_path(sidecar).ok_or_else(|| {
+        ApfsStorageError::Host(format!(
+            "invalid detached restore sidecar path: {}",
+            sidecar.display()
+        ))
+    })
 }
 
 struct MountedAttachment {
@@ -1232,11 +1227,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let layout = layout(&self.config, repo)?;
         let mut found = None;
         for format in [ImageFormat::Asif, ImageFormat::Sparse] {
-            let image = if workspace.is_main() {
-                layout.main_image(format)?.image().to_owned()
-            } else {
-                layout.session_image(workspace, format)?.image().to_owned()
-            };
+            let image = layout
+                .canonical_image(workspace, format)?
+                .image()
+                .to_owned();
             if image.exists() {
                 if found.is_some() {
                     return Err(ApfsStorageError::Host(format!(
@@ -1792,7 +1786,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".grants.json"))
+                .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 let image = image_from_sidecar(path)?;
                 if let Ok(format) = ImageFormat::from_image_path(&image) {
@@ -2001,7 +1995,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".grants.json"))
+                .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 let image = image_from_sidecar(&path)?;
                 if let Ok(format) = ImageFormat::from_image_path(&image) {
@@ -2084,7 +2078,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".grants.json"))
+                .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 let image = image_from_sidecar(&path)?;
                 if staged_image_format(&image).is_some() {
@@ -2548,7 +2542,7 @@ where
             if !sidecar
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".grants.json"))
+                .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
             {
                 continue;
             }
@@ -4085,7 +4079,7 @@ where
                     if !canonical_sidecar
                         .file_name()
                         .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.ends_with(".grants.json"))
+                        .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
                     {
                         continue;
                     }
@@ -4217,7 +4211,7 @@ where
                     if !path
                         .file_name()
                         .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.ends_with(".grants.json"))
+                        .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
                     {
                         continue;
                     }
