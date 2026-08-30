@@ -181,7 +181,7 @@
       },
       "rust-wasm": {
         "executor": "nx:run-commands",
-        "cache": true,
+        "cache": false,
         "dependsOn": [
           "^build",
           {
@@ -189,11 +189,6 @@
               "lmao-rs"
             ],
             "target": "cargo-wasm"
-          }
-        ],
-        "inputs": [
-          {
-            "dependentTasksOutputFiles": "**/*.wasm"
           }
         ],
         "outputs": [
