@@ -321,8 +321,14 @@ pub fn plan(existing: Option<&str>, store: &SharedStore) -> ConfigPlan {
     match disk_directory(&document) {
         DiskDirectory::TableAbsent => {
             // A blank line between their last setting and cowshed's marker, so the boundary
-            // between the two authors is visible at a glance.
-            let contents = format!("{}\n\n{block}", text.trim_end());
+            // between the two authors is visible at a glance. The prefix is concatenated
+            // verbatim: only a missing final newline is inserted, then one blank line.
+            let mut contents = String::from(text);
+            if !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push('\n');
+            contents.push_str(&block);
             // The one shape check that matters, made by construction rather than by enumeration:
             // if the merged file does not parse into the directory that was wanted, it is not
             // written. An inline `cache` table lands here.
@@ -551,7 +557,8 @@ mod tests {
     }
 
     /// A user's own settings are preserved byte for byte, because they are never rewritten: the
-    /// block is appended below them.
+    /// block is appended below them. Trailing whitespace in the prefix stays; only a missing
+    /// final newline is inserted.
     #[test]
     fn a_config_without_a_disk_table_keeps_every_byte_and_gains_the_block() {
         let existing = "# my own notes\n[dist]\nscheduler_url = \"http://build.invalid\"\n";
@@ -566,6 +573,18 @@ mod tests {
                 .expect("url"),
             "http://build.invalid"
         );
+    }
+
+    #[test]
+    fn append_preserves_trailing_whitespace_in_the_user_prefix() {
+        let existing = "# notes\n[dist]\nurl = \"http://build.invalid\"\n   ";
+        let (change, contents) = written(Some(existing));
+        assert_eq!(change, ConfigChange::Appended);
+        assert!(
+            contents.starts_with(existing),
+            "prefix must be byte-for-byte, including trailing spaces"
+        );
+        assert!(directs_to(&contents, &store()));
     }
 
     /// The conflict that must never be resolved by clobbering: somebody else already chose a
