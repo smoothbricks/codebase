@@ -607,6 +607,7 @@ dependencies = [
  "arrow-schema",
  "lmao-arrow",
  "lmao-core",
+ "proptest",
 ]
 
 [[package]]
