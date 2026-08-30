@@ -38,6 +38,16 @@ export const DEVENV_CROSS_PROFILE = 'linux-cross';
  */
 export const CARGO_CROSS_LINT_TARGET = 'cargo-lint-cross';
 
+const CARGO_CROSS_LINT_GUARD = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ "$(uname -s)" = Linux ] || { echo 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux' >&2; exit 2; }`;
+
+/**
+ * Point this cargo at a project-local home so parallel Nx cargos do not
+ * exclusive-lock `~/.cargo/.package-cache`. Downloaded crates stay shared.
+ */
+export function withProjectCargoHome(homeRel: string, command: string): string {
+  return `host_cargo_home="\${CARGO_HOME:-$HOME/.cargo}"; mkdir -p ${homeRel}; if [ -d "$host_cargo_home/registry" ]; then ln -sfn "$host_cargo_home/registry" ${homeRel}/registry; fi; if [ -d "$host_cargo_home/git" ]; then ln -sfn "$host_cargo_home/git" ${homeRel}/git; fi; CARGO_HOME="$PWD/${homeRel}" ${command}`;
+}
+
 /**
  * Clippy rather than `cargo check`, and `-D warnings`, because that is exactly
  * what CI's `lint` runs; a weaker local command would pass where CI fails.
@@ -55,8 +65,21 @@ export const CARGO_CROSS_LINT_TARGET = 'cargo-lint-cross';
  *
  * `cargo fmt` is absent on purpose: formatting is target-independent and already
  * covered by `cargo-lint`, so repeating it here would only cost time.
+ *
+ * `CARGO_HOME` is per-project (`$PWD/target/cargo-lint-cross-home`). Cargo's
+ * package-cache flock lives in CARGO_HOME; three workspaces otherwise serialize
+ * on `~/.cargo/.package-cache` even with distinct `--target-dir`. Registry and
+ * git are linked to the host home so crates are not re-fetched.
  */
-export const CARGO_CROSS_LINT_COMMAND = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ "$(uname -s)" = Linux ] || { echo 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux' >&2; exit 2; }; cargo clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`;
+export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${withProjectCargoHome(
+  'target/cargo-lint-cross-home',
+  `cargo clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross -- -D warnings`,
+)}`;
+
+export const CARGO_LINT_CLIPPY_COMMAND = withProjectCargoHome(
+  'target/cargo-lint-home',
+  'cargo clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
+);
 
 /** Root `package.json` script name, in the repo's `verb:qualifier` style. */
 export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';

@@ -3,10 +3,12 @@ import { describe, expect, it } from 'bun:test';
 import {
   CARGO_CROSS_LINT_COMMAND,
   CARGO_CROSS_LINT_TARGET,
+  CARGO_LINT_CLIPPY_COMMAND,
   CARGO_LINUX_TRIPLE,
   CROSS_CHECK_SCRIPT_COMMAND,
   CROSS_CHECK_SCRIPT_NAME,
   DEVENV_CROSS_PROFILE,
+  withProjectCargoHome,
 } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
@@ -69,6 +71,13 @@ describe('Linux cross-check policy', () => {
     // triple ambient instead, running this target outside the cross shell would
     // lint the host and report green — a gate that cannot fail.
     expect(CARGO_CROSS_LINT_COMMAND).toContain('--target ');
+  });
+
+  it('gives each project its own CARGO_HOME so parallel clippy does not flock ~/.cargo', () => {
+    expect(CARGO_CROSS_LINT_COMMAND).toContain('CARGO_HOME="$PWD/target/cargo-lint-cross-home"');
+    expect(CARGO_CROSS_LINT_COMMAND).toContain('ln -sfn "$host_cargo_home/registry"');
+    expect(CARGO_LINT_CLIPPY_COMMAND).toContain('CARGO_HOME="$PWD/target/cargo-lint-home"');
+    expect(withProjectCargoHome('target/h', 'cargo clippy')).toContain('CARGO_HOME="$PWD/target/h" cargo clippy');
   });
 
   it('drives the Nx target through the cross profile from the root script', () => {
