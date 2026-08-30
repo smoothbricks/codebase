@@ -7,7 +7,10 @@
 //! - Assertions select by TEMPLATE/name + typed columns, never rendered text.
 //! - Negative assertions ("this event never appears") are first-class.
 //! - Ordering asserts use span parentage, not wall-clock across threads:
-//!   [`TraceQuery::all_children_of`] checks `(trace_id, parent_span_id)` linkage.
+//!   [`TraceQuery::all_children_of`] checks FULL span identity — `(trace_id, thread_id,
+//!   span_id)` against `(trace_id, parent_thread_id, parent_span_id)`. Span ids are
+//!   per-thread counters, so dropping thread identity conflates same-numbered spans on
+//!   different threads and answers the assertion with its PASS value.
 //! - Planned sugar: a Tracetest-style selector language (`span[name="..." attr:x=y]`)
 //!   compiling to the same predicate — thin layer, not built yet.
 
@@ -85,11 +88,8 @@ pub trait TraceQuery {
     }
 
     /// Causal-ordering assertion: every row matching `child` belongs to a span whose
-    /// `(trace_id, parent_span_id)` points at a span with a row matching `parent`.
-    /// Vacuously true when nothing matches `child` — pair with a positive `count`.
-    fn all_children_of(
-        &self,
-        child: &Selector,
-        parent: &Selector,
-    ) -> Result<bool, Self::Error>;
+    /// `(trace_id, parent_thread_id, parent_span_id)` names a span with a row matching
+    /// `parent`. Vacuously true when nothing matches `child` — pair with a positive
+    /// `count`.
+    fn all_children_of(&self, child: &Selector, parent: &Selector) -> Result<bool, Self::Error>;
 }
