@@ -1355,18 +1355,9 @@ impl Actor {
 
     async fn cancel_queued(&mut self, workspace_id: &str) {
         let mut retained = VecDeque::new();
-        while let Some(mut pending) = self.queue.pop_front() {
+        while let Some(pending) = self.queue.pop_front() {
             if pending.seed.workspace_id == workspace_id {
-                if let Some(timer) = pending.timer.take() {
-                    timer.abort();
-                }
-                if let Some(cancellation) = pending.cancellation.take() {
-                    cancellation.abort();
-                }
-                if let Some(session) = self.sessions.get_mut(workspace_id) {
-                    session.queued = session.queued.saturating_sub(1);
-                }
-                self.global_queued = self.global_queued.saturating_sub(1);
+                let pending = self.take_pending(pending);
                 let draft = pending_audit_draft(
                     &pending.seed,
                     AuditStatus::Cancelled,
@@ -1399,17 +1390,8 @@ impl Actor {
         else {
             return;
         };
-        let mut pending = self.queue.remove(position).expect("queued position exists");
-        if let Some(timer) = pending.timer.take() {
-            timer.abort();
-        }
-        if let Some(cancellation) = pending.cancellation.take() {
-            cancellation.abort();
-        }
-        if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
-            session.queued = session.queued.saturating_sub(1);
-        }
-        self.global_queued = self.global_queued.saturating_sub(1);
+        let pending = self.queue.remove(position).expect("queued position exists");
+        let pending = self.take_pending(pending);
         let draft = pending_audit_draft(
             &pending.seed,
             AuditStatus::Cancelled,
@@ -1428,17 +1410,8 @@ impl Actor {
         else {
             return;
         };
-        let mut pending = self.queue.remove(position).expect("queued position exists");
-        if let Some(timer) = pending.timer.take() {
-            timer.abort();
-        }
-        if let Some(cancellation) = pending.cancellation.take() {
-            cancellation.abort();
-        }
-        if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
-            session.queued = session.queued.saturating_sub(1);
-        }
-        self.global_queued = self.global_queued.saturating_sub(1);
+        let pending = self.queue.remove(position).expect("queued position exists");
+        let pending = self.take_pending(pending);
         let draft = pending_audit_draft(
             &pending.seed,
             AuditStatus::TimedOut,
@@ -1456,6 +1429,20 @@ impl Actor {
         } else {
             audit_unavailable()
         }));
+    }
+
+    fn take_pending(&mut self, mut pending: Pending) -> Pending {
+        if let Some(timer) = pending.timer.take() {
+            timer.abort();
+        }
+        if let Some(cancellation) = pending.cancellation.take() {
+            cancellation.abort();
+        }
+        if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
+            session.queued = session.queued.saturating_sub(1);
+        }
+        self.global_queued = self.global_queued.saturating_sub(1);
+        pending
     }
 
     async fn audit_denial(&mut self, workspace_id: &str, attempt: AuditAttempt) -> bool {
@@ -1570,17 +1557,8 @@ impl Actor {
             let _ = session.accept_stop.send(true);
             let _ = session.audit_stop.send(true);
         }
-        while let Some(mut pending) = self.queue.pop_front() {
-            if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
-                session.queued = session.queued.saturating_sub(1);
-            }
-            self.global_queued = self.global_queued.saturating_sub(1);
-            if let Some(timer) = pending.timer.take() {
-                timer.abort();
-            }
-            if let Some(cancellation) = pending.cancellation.take() {
-                cancellation.abort();
-            }
+        while let Some(pending) = self.queue.pop_front() {
+            let pending = self.take_pending(pending);
             let _ = pending.reply.send(Err(audit_unavailable()));
         }
     }
@@ -1614,17 +1592,8 @@ impl Actor {
             let _ = session.accept_stop.send(true);
             let _ = session.connection_stop.send(true);
         }
-        while let Some(mut pending) = self.queue.pop_front() {
-            if let Some(session) = self.sessions.get_mut(&pending.seed.workspace_id) {
-                session.queued = session.queued.saturating_sub(1);
-            }
-            self.global_queued = self.global_queued.saturating_sub(1);
-            if let Some(timer) = pending.timer.take() {
-                timer.abort();
-            }
-            if let Some(cancellation) = pending.cancellation.take() {
-                cancellation.abort();
-            }
+        while let Some(pending) = self.queue.pop_front() {
+            let pending = self.take_pending(pending);
             let draft = pending_audit_draft(
                 &pending.seed,
                 AuditStatus::Cancelled,
