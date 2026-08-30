@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { CARGO_TEST_TARGET } from './cargo-workspace.js';
 import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
@@ -132,6 +133,68 @@ export function checkWorkspaceBoundedTestTargetPolicy(
     }
   }
   return issues;
+}
+
+/**
+ * A cargo workspace's `test` aggregate MUST reach `cargo-test`.
+ *
+ * Inference already wires `test` to `cargo-test` (see `index.ts`), but
+ * `targetDefaults.test.dependsOn` in `nx.json` REPLACES an inferred `dependsOn`
+ * rather than merging with it, and a package-local `nx.targets.test` replaces it
+ * outright. Either path silently drops every Rust test from the aggregate the
+ * gate runs, and the result is green: `nx test <project>` on a cargo workspace
+ * reported success having executed nothing. Only project-level config outranks
+ * `targetDefaults`, so the fix is per-project and therefore forgettable — hence
+ * this check.
+ */
+export function checkWorkspaceCargoTestReachabilityPolicy(
+  root: string,
+  options: PackageTargetPolicyOptions = {},
+): BoundedTestPolicyIssue[] {
+  const issues: BoundedTestPolicyIssue[] = [];
+  for (const packageJsonPath of listWorkspacePackageJsonPaths(root)) {
+    const packageJson = readPackageJson(packageJsonPath);
+    const projectJsonPath = projectJsonPathForPackageJson(packageJsonPath);
+    const projectJson = existsSync(projectJsonPath) ? readProjectJson(projectJsonPath) : undefined;
+    const projectName = packageProjectName(packageJson, projectJson);
+    if (!projectName) {
+      continue;
+    }
+    const resolvedProject = resolvedProjectFor(options, projectName);
+    // Without a resolved graph there is nothing to judge, and without a
+    // cargo-test target this is not a cargo workspace.
+    if (!resolvedProject?.targets?.has(CARGO_TEST_TARGET) || !resolvedProject.targets.has('test')) {
+      continue;
+    }
+    if (!resolvedTargetReaches(resolvedProject, 'test', CARGO_TEST_TARGET)) {
+      issues.push({
+        path: projectJson ? projectJsonPath : packageJsonPath,
+        message:
+          `${projectJson ? 'targets' : 'nx.targets'}.test must depend on ${CARGO_TEST_TARGET} ` +
+          'so the Rust tests run in the test aggregate; nx.json targetDefaults replaces the inferred dependsOn',
+      });
+    }
+  }
+  return issues;
+}
+
+function resolvedTargetReaches(project: ResolvedProjectTargets, from: string, goal: string): boolean {
+  const visiting = new Set<string>();
+  const visit = (targetName: string): boolean => {
+    if (targetName === goal) {
+      return true;
+    }
+    if (visiting.has(targetName) || !project.targets.has(targetName)) {
+      return false;
+    }
+    visiting.add(targetName);
+    const reached = (project.targetDependencies?.get(targetName) ?? []).some((dependency) =>
+      matchingResolvedTargets(dependency, project.targets).some(visit),
+    );
+    visiting.delete(targetName);
+    return reached;
+  };
+  return visit(from);
 }
 
 export function checkBoundedTestTargetPolicy(

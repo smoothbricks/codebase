@@ -3,6 +3,7 @@ import { dirname, join, relative, sep } from 'node:path';
 import {
   applyWorkspaceBoundedTestTargetPolicy,
   checkWorkspaceBoundedTestTargetPolicy,
+  checkWorkspaceCargoTestReachabilityPolicy,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
 import {
   CARGO_CROSS_LINT_TARGET,
@@ -561,6 +562,10 @@ export function validateWorkspaceDependencies(root: string, options: PackageTarg
     failures++;
   }
   for (const issue of checkWorkspaceBoundedTestTargetPolicy(root, options)) {
+    console.error(`${issue.path}: ${issue.message}`);
+    failures++;
+  }
+  for (const issue of checkWorkspaceCargoTestReachabilityPolicy(root, options)) {
     console.error(`${issue.path}: ${issue.message}`);
     failures++;
   }
