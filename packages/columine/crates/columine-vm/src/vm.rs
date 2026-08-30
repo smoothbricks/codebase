@@ -17,6 +17,7 @@ use crate::bitmap_ops::{
     bitmap_load, bitmap_select, bitmap_store, get_bitmap_storage,
 };
 use crate::bytes;
+use crate::hash_table;
 use crate::hashmap_ops::{self, CmpType, Strategy};
 use crate::hashset_ops;
 use crate::hooks::{MutationOp, MutationRecord, VmHooks};
@@ -1111,9 +1112,7 @@ fn rollback_struct_map_field(state: &mut [u8], entry: &FlatUndoEntry) {
     let want_absent = entry.pad2 & SMF_ROW_ABSENT != 0;
     let want_bit_set = entry.pad2 & SMF_BIT_SET != 0;
     if want_absent {
-        if let Some(pos) = smap.find(state, entry.key) {
-            smap.set_key_at(state, pos, TOMBSTONE);
-            smap.set_size(state, smap.size(state) - 1);
+        if let Some(pos) = smap.remove(state, entry.key) {
             smap.clear_bitset(state, smap.row_off(pos));
         }
         return;
@@ -1142,9 +1141,7 @@ fn rollback_struct_map_field(state: &mut [u8], entry: &FlatUndoEntry) {
 fn rollback_struct_map_row(state: &mut [u8], entry: &FlatUndoEntry) {
     let smap = StructMapSlot::bind(state, entry.slot);
     if entry.pad2 & SMR_ROW_ABSENT != 0 {
-        if let Some(pos) = smap.find(state, entry.key) {
-            smap.set_key_at(state, pos, TOMBSTONE);
-            smap.set_size(state, smap.size(state) - 1);
+        if let Some(pos) = smap.remove(state, entry.key) {
             smap.clear_bitset(state, smap.row_off(pos));
         }
         return;
@@ -4934,21 +4931,16 @@ fn parse_entry(segment: &[u8], i: usize) -> FlatUndoEntry {
 // =============================================================================
 
 /// Look up a value in a HASHMAP slot, returning `EMPTY_KEY` when absent.
+///
+/// The lookup goes through [`hash_table::find_key`] rather than a local probe:
+/// a hand-rolled loop that only terminates on `EMPTY_KEY` matches a TOMBSTONE
+/// cell when the caller passes `TOMBSTONE` as the key, and would return the
+/// removed entry's stale value lane as a live value.
 pub fn vm_map_get(state: &[u8], slot_offset: u32, capacity: u32, key: u32) -> u32 {
-    let keys = slot_offset;
-    let values = slot_offset + capacity * 4;
-    let mut slot = columine_types::types::hash_key(key, capacity);
-    for _ in 0..capacity {
-        let k = bytes::read_u32(state, keys + slot * 4);
-        if k == EMPTY_KEY {
-            return EMPTY_KEY;
-        }
-        if k == key {
-            return bytes::read_u32(state, values + slot * 4);
-        }
-        slot = (slot + 1) & (capacity - 1);
+    match hash_table::find_key(state, slot_offset, capacity, key) {
+        Some(pos) => bytes::read_u32(state, slot_offset + capacity * 4 + pos * 4),
+        None => EMPTY_KEY,
     }
-    EMPTY_KEY
 }
 
 /// Test whether a set contains a key.
@@ -4969,38 +4961,17 @@ pub fn vm_set_contains(
             .is_some_and(|data| bitmap_ops::contains_serialized(data, elem));
     }
 
-    let mut slot = columine_types::types::hash_key(elem, capacity);
-    for _ in 0..capacity {
-        let k = bytes::read_u32(state, slot_offset + slot * 4);
-        if k == EMPTY_KEY {
-            return false;
-        }
-        if k == elem {
-            return true;
-        }
-        slot = (slot + 1) & (capacity - 1);
-    }
-    false
+    hash_table::find_key(state, slot_offset, capacity, elem).is_some()
 }
 
 /// Start a map iterator by scanning live key cells in ascending order.
 pub fn vm_map_iter_start(state: &[u8], slot_offset: u32, capacity: u32) -> u32 {
-    (0..capacity)
-        .find(|&i| {
-            let k = bytes::read_u32(state, slot_offset + i * 4);
-            k != EMPTY_KEY && k != TOMBSTONE
-        })
-        .unwrap_or(capacity)
+    hash_table::next_live_key(state, slot_offset, capacity, 0)
 }
 
 /// Advance a map iterator.
 pub fn vm_map_iter_next(state: &[u8], slot_offset: u32, capacity: u32, current: u32) -> u32 {
-    ((current + 1)..capacity)
-        .find(|&i| {
-            let k = bytes::read_u32(state, slot_offset + i * 4);
-            k != EMPTY_KEY && k != TOMBSTONE
-        })
-        .unwrap_or(capacity)
+    hash_table::next_live_key(state, slot_offset, capacity, current + 1)
 }
 
 /// Return the key and value at a map iterator position, packed as u64.
@@ -5054,7 +5025,11 @@ pub fn find_slot_meta_by_offset(state: &[u8], slot_offset: u32) -> Option<SlotMe
         .find(|meta| meta.offset == slot_offset)
 }
 
-/// Return a struct-map row offset, or `0xFFFF_FFFF` when absent.
+/// Return a struct-map row offset, or `u32::MAX` when absent.
+///
+/// Rollback of a struct-map insert stamps a TOMBSTONE key cell, so a local
+/// probe that only terminates on `EMPTY_KEY` resolves a live-looking row for a
+/// `TOMBSTONE` query key. [`hash_table::find_key`] refuses both sentinels.
 pub fn vm_struct_map_get_row_ptr(
     state: &[u8],
     slot_offset: u32,
@@ -5063,21 +5038,12 @@ pub fn vm_struct_map_get_row_ptr(
     row_size: u32,
     key: u32,
 ) -> u32 {
-    let descriptor_size = align8(num_fields);
-    let keys_off = slot_offset + descriptor_size;
+    let keys_off = slot_offset + align8(num_fields);
     let rows_base = keys_off + capacity * 4;
-    let mut slot = columine_types::types::hash_key(key, capacity);
-    for _ in 0..capacity {
-        let k = bytes::read_u32(state, keys_off + slot * 4);
-        if k == EMPTY_KEY {
-            return 0xFFFF_FFFF;
-        }
-        if k == key {
-            return rows_base + slot * row_size;
-        }
-        slot = (slot + 1) & (capacity - 1);
+    match hash_table::find_key(state, keys_off, capacity, key) {
+        Some(pos) => rows_base + pos * row_size,
+        None => u32::MAX,
     }
-    0xFFFF_FFFF
 }
 
 /// Start a struct-map iterator by scanning live key cells.
@@ -5087,13 +5053,7 @@ pub fn vm_struct_map_iter_start(
     capacity: u32,
     num_fields: u32,
 ) -> u32 {
-    let keys_off = slot_offset + align8(num_fields);
-    (0..capacity)
-        .find(|&pos| {
-            let k = bytes::read_u32(state, keys_off + pos * 4);
-            k != EMPTY_KEY && k != TOMBSTONE
-        })
-        .unwrap_or(capacity)
+    hash_table::next_live_key(state, slot_offset + align8(num_fields), capacity, 0)
 }
 
 /// Advance a struct-map iterator.
@@ -5104,13 +5064,12 @@ pub fn vm_struct_map_iter_next(
     num_fields: u32,
     current: u32,
 ) -> u32 {
-    let keys_off = slot_offset + align8(num_fields);
-    ((current + 1)..capacity)
-        .find(|&pos| {
-            let k = bytes::read_u32(state, keys_off + pos * 4);
-            k != EMPTY_KEY && k != TOMBSTONE
-        })
-        .unwrap_or(capacity)
+    hash_table::next_live_key(
+        state,
+        slot_offset + align8(num_fields),
+        capacity,
+        current + 1,
+    )
 }
 
 /// Return the key at a struct-map iterator position.
@@ -5128,25 +5087,13 @@ pub fn vm_struct_map2_get_row_ptr(
     key1: u32,
     key2: u32,
 ) -> u32 {
-    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
-        return u32::MAX;
-    }
-    let descriptor_size = align8(num_fields);
-    let keys1 = slot_offset + descriptor_size;
+    let keys1 = slot_offset + align8(num_fields);
     let keys2 = keys1 + capacity * 4;
     let rows = keys2 + capacity * 4;
-    let mut pos = columine_types::types::hash_key_pair(key1, key2, capacity);
-    for _ in 0..capacity {
-        let first = bytes::read_u32(state, keys1 + pos * 4);
-        if first == EMPTY_KEY {
-            return u32::MAX;
-        }
-        if first == key1 && bytes::read_u32(state, keys2 + pos * 4) == key2 {
-            return rows + pos * row_size;
-        }
-        pos = (pos + 1) & (capacity - 1);
+    match hash_table::find_key_pair(state, keys1, keys2, capacity, key1, key2) {
+        Some(pos) => rows + pos * row_size,
+        None => u32::MAX,
     }
-    u32::MAX
 }
 
 pub fn vm_struct_map2_iter_start(

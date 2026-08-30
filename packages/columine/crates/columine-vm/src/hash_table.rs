@@ -14,7 +14,7 @@
 //! TypeScript backends.
 
 use crate::bytes;
-use columine_types::types::{EMPTY_KEY, TOMBSTONE, hash_key};
+use columine_types::types::{EMPTY_KEY, TOMBSTONE, hash_key, hash_key_pair};
 
 /// Inline table header field offsets.
 const HDR_CAP: u32 = 0;
@@ -102,6 +102,76 @@ pub(crate) fn probe_linear(
         position = (position + 1) & (capacity - 1);
     }
     first_tombstone.map(|pos| Probe { pos, found: false })
+}
+
+/// Point lookup over a headerless `u32` key array. This is the read half of
+/// the probe contract, taking raw offsets so the exported ABI helpers — which
+/// receive a slot offset and a capacity, never a bound view — resolve keys
+/// through the same primitive as every bound table.
+///
+/// Both sentinels are refused as query keys: `EMPTY_KEY` marks a vacant cell
+/// and `TOMBSTONE` a vacated one, so admitting either would match a dead cell
+/// and report its stale payload as a live entry.
+#[inline]
+pub(crate) fn find_key(state: &[u8], keys_off: u32, cap: u32, key: u32) -> Option<u32> {
+    if key == EMPTY_KEY || key == TOMBSTONE {
+        return None;
+    }
+    probe_linear(cap, hash_key(key, cap), false, |pos| match bytes::read_u32(
+        state,
+        keys_off + pos * 4,
+    ) {
+        current if current == key => ProbeCell::Match,
+        EMPTY_KEY => ProbeCell::Empty,
+        TOMBSTONE => ProbeCell::Tombstone,
+        _ => ProbeCell::Occupied,
+    })
+    .filter(|probe| probe.found)
+    .map(|probe| probe.pos)
+}
+
+/// Point lookup over two parallel `u32` key lanes. Lane one owns the sentinel
+/// state and lane two preserves every u32 value, so identity compares both
+/// lanes while the hash only chooses the home position.
+#[inline]
+pub(crate) fn find_key_pair(
+    state: &[u8],
+    keys1_off: u32,
+    keys2_off: u32,
+    cap: u32,
+    key1: u32,
+    key2: u32,
+) -> Option<u32> {
+    if key1 == EMPTY_KEY || key1 == TOMBSTONE {
+        return None;
+    }
+    probe_linear(cap, hash_key_pair(key1, key2, cap), false, |pos| {
+        let first = bytes::read_u32(state, keys1_off + pos * 4);
+        if first == key1 && bytes::read_u32(state, keys2_off + pos * 4) == key2 {
+            ProbeCell::Match
+        } else {
+            match first {
+                EMPTY_KEY => ProbeCell::Empty,
+                TOMBSTONE => ProbeCell::Tombstone,
+                _ => ProbeCell::Occupied,
+            }
+        }
+    })
+    .filter(|probe| probe.found)
+    .map(|probe| probe.pos)
+}
+
+/// Index of the first live key cell at or after `from`, or `cap` when the scan
+/// is exhausted. This ascending-cell order is THE iteration ABI exported to
+/// TypeScript backends; both sentinels mark dead cells and are skipped.
+#[inline]
+pub(crate) fn next_live_key(state: &[u8], keys_off: u32, cap: u32, from: u32) -> u32 {
+    (from..cap)
+        .find(|&pos| {
+            let key = bytes::read_u32(state, keys_off + pos * 4);
+            key != EMPTY_KEY && key != TOMBSTONE
+        })
+        .unwrap_or(cap)
 }
 
 /// Bound table view. Carries offsets into the state buffer, never pointers.
@@ -220,19 +290,7 @@ impl FlatTable {
     /// Find a key by linear probing. The sequence starts at `hash_key`, steps
     /// by one, and wraps with `& (cap - 1)`.
     pub fn find(&self, state: &[u8], key: u32) -> Option<u32> {
-        if key == EMPTY_KEY || key == TOMBSTONE {
-            return None;
-        }
-        probe_linear(self.cap, hash_key(key, self.cap), false, |pos| {
-            match self.key_at(state, pos) {
-                current if current == key => ProbeCell::Match,
-                EMPTY_KEY => ProbeCell::Empty,
-                TOMBSTONE => ProbeCell::Tombstone,
-                _ => ProbeCell::Occupied,
-            }
-        })
-        .filter(|probe| probe.found)
-        .map(|probe| probe.pos)
+        find_key(state, self.keys_off, self.cap, key)
     }
 
     /// Insert-or-update probe: scan past tombstones to find a deeper matching
@@ -323,13 +381,17 @@ impl FlatTable {
         dst
     }
 
-    /// Ascending-slot-order scan of live keys — THE iteration order
-    /// `vm_map_iter_*` exposes to TS backends (the vm slice wraps this).
-    /// Yields `(slot_index, key)`.
+    /// Ascending-cell scan of live keys, stepping with [`next_live_key`] so the
+    /// bound view and the `vm_map_iter_*` exports walk one implementation.
+    /// Yields `(cell_index, key)`.
     pub fn iter_live<'a>(&'a self, state: &'a [u8]) -> impl Iterator<Item = (u32, u32)> + 'a {
-        (0..self.cap).filter_map(move |pos| {
-            let k = self.key_at(state, pos);
-            (k != EMPTY_KEY && k != TOMBSTONE).then_some((pos, k))
+        let mut pos = next_live_key(state, self.keys_off, self.cap, 0);
+        std::iter::from_fn(move || {
+            (pos < self.cap).then(|| {
+                let cell = (pos, self.key_at(state, pos));
+                pos = next_live_key(state, self.keys_off, self.cap, pos + 1);
+                cell
+            })
         })
     }
 }

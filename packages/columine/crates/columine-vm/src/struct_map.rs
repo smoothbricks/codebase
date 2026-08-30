@@ -10,7 +10,7 @@
 //! tombstones are not expected in a well-formed state.
 
 use crate::bytes;
-use crate::hash_table::{Probe, ProbeCell, probe_linear};
+use crate::hash_table::{Probe, ProbeCell, find_key, find_key_pair, probe_linear};
 use crate::meta::slot_meta_base;
 use columine_types::types::{
     EMPTY_KEY, SlotMetaOffset, StructFieldType, TOMBSTONE, align8, hash_key, hash_key_pair,
@@ -119,22 +119,7 @@ impl StructMapSlot {
 
     /// Find a key, or return `None`. Sentinel keys are never present.
     pub fn find(&self, state: &[u8], key: u32) -> Option<u32> {
-        if key == EMPTY_KEY || key == TOMBSTONE {
-            return None;
-        }
-        probe_linear(
-            self.capacity,
-            hash_key(key, self.capacity),
-            false,
-            |pos| match self.key_at(state, pos) {
-                current if current == key => ProbeCell::Match,
-                EMPTY_KEY => ProbeCell::Empty,
-                TOMBSTONE => ProbeCell::Tombstone,
-                _ => ProbeCell::Occupied,
-            },
-        )
-        .filter(|probe| probe.found)
-        .map(|probe| probe.pos)
+        find_key(state, self.keys_off, self.capacity, key)
     }
 
     /// Insert-or-update probe: find an existing key before reusing the first
@@ -214,6 +199,16 @@ impl StructMapSlot {
             pos: probe.pos,
             is_new: !probe.found,
         })
+    }
+
+    /// Stamp `key`'s cell as a TOMBSTONE and decrement size, returning the
+    /// vacated position. The row payload is left to the caller (rollback
+    /// clears the bitset); the same shape as [`StructMap2Slot::remove`].
+    pub fn remove(&self, state: &mut [u8], key: u32) -> Option<u32> {
+        let pos = self.find(state, key)?;
+        self.set_key_at(state, pos, TOMBSTONE);
+        self.set_size(state, self.size(state) - 1);
+        Some(pos)
     }
 
     /// Write one scalar field from a raw little-endian column into the row,
@@ -368,28 +363,14 @@ impl StructMap2Slot {
     }
 
     pub fn find(&self, state: &[u8], key1: u32, key2: u32) -> Option<u32> {
-        if key1 == EMPTY_KEY || key1 == TOMBSTONE {
-            return None;
-        }
-        probe_linear(
+        find_key_pair(
+            state,
+            self.keys1_off,
+            self.keys2_off,
             self.capacity,
-            hash_key_pair(key1, key2, self.capacity),
-            false,
-            |pos| {
-                let first = self.key1_at(state, pos);
-                if first == key1 && self.key2_at(state, pos) == key2 {
-                    ProbeCell::Match
-                } else {
-                    match first {
-                        EMPTY_KEY => ProbeCell::Empty,
-                        TOMBSTONE => ProbeCell::Tombstone,
-                        _ => ProbeCell::Occupied,
-                    }
-                }
-            },
+            key1,
+            key2,
         )
-        .filter(|probe| probe.found)
-        .map(|probe| probe.pos)
     }
 
     pub fn find_insert(&self, state: &[u8], key1: u32, key2: u32) -> Option<Probe> {
