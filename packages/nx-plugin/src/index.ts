@@ -19,7 +19,12 @@ import {
   listCargoWorkspacePackages,
   nextestConfigRelPath,
 } from './cargo-workspace.js';
-import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
+import {
+  CARGO_CROSS_LINT_COMMAND,
+  CARGO_CROSS_LINT_TARGET,
+  CARGO_LINT_CLIPPY_COMMAND,
+  cargoFrozen,
+} from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
@@ -133,7 +138,9 @@ function createCargoWasmTarget(projectRoot: string, config: ResolvedCargoWasmCon
     outputs: [`{projectRoot}/${config.outputDirectory}`],
     options: {
       commands: [
-        `cargo build --release --target wasm32-unknown-unknown --target-dir ${cargoTargetDirectory} --manifest-path ${config.manifestPath}`,
+        cargoFrozen(
+          `build --release --target wasm32-unknown-unknown --target-dir ${cargoTargetDirectory} --manifest-path ${config.manifestPath}`,
+        ),
         ...config.targets.map(
           ({ bindgenTarget, outputName }) =>
             `wasm-bindgen --target ${bindgenTarget} --out-dir ${config.outputDirectory}/${outputName} ${wasmInput}`,
@@ -168,11 +175,11 @@ function createCargoTestCompileTarget(projectRoot: string): TargetConfiguration 
     cache: true,
     inputs: CARGO_INPUTS,
     options: {
-      command: 'cargo test --workspace --no-run',
+      command: cargoFrozen('test --workspace --no-run'),
       cwd: projectRoot,
     },
     configurations: {
-      production: { command: 'cargo test --workspace --release --no-run' },
+      production: { command: cargoFrozen('test --workspace --release --no-run') },
     },
   };
 }
@@ -184,13 +191,13 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
     inputs: CARGO_INPUTS,
     dependsOn: [CARGO_TEST_COMPILE_TARGET],
     options: {
-      command: 'cargo test --workspace',
+      command: cargoFrozen('test --workspace'),
       cwd: projectRoot,
       timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
       killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
     },
     configurations: {
-      production: { command: 'cargo test --workspace --release' },
+      production: { command: cargoFrozen('test --workspace --release') },
     },
   };
 }
@@ -219,7 +226,9 @@ async function addPerPackageCargoTestTargets(
       inputs: await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir),
       dependsOn: [previous],
       options: {
-        command: `cargo nextest run --workspace --package ${pkg.name} --user-config-file none --config-file ${configFile}`,
+        command: cargoFrozen(
+          `nextest run --workspace --package ${pkg.name} --user-config-file none --config-file ${configFile}`,
+        ),
         cwd: projectRoot,
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
@@ -469,14 +478,14 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       targets.mutation = {
         executor: 'nx:run-commands',
         cache: false,
-        options: { command: 'cargo mutants --workspace', cwd: projectRoot },
+        options: { command: cargoFrozen('mutants --workspace'), cwd: projectRoot },
       };
     }
     if (!('bench' in declared)) {
       targets.bench = {
         executor: 'nx:run-commands',
         cache: false,
-        options: { command: 'cargo bench --workspace', cwd: projectRoot },
+        options: { command: cargoFrozen('bench --workspace'), cwd: projectRoot },
       };
     }
     if (!('cargo-sweep' in declared)) {

@@ -270,7 +270,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-sweep']?.cache).toBe(false);
       expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-compile']?.options).toMatchObject({
-        command: 'cargo test --workspace --no-run',
+        command: 'cargo --frozen test --workspace --no-run',
         cwd: 'packages/ferris',
       });
       expect(targets['cargo-test']?.executor).toBe('nx:noop');
@@ -278,7 +278,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-test-compile']);
       expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-test-ferris-core']);
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^cargo nextest run --workspace --package ferris-core --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --workspace --package ferris-core --user-config-file none --config-file /,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toEqual([
         '{projectRoot}/Cargo.toml',
@@ -302,8 +302,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.test?.executor).toBe('nx:noop');
       expect(targets.test?.dependsOn).toEqual(['cargo-test']);
       expect(targets.mutation?.cache).toBe(false);
-      expect(targets.mutation?.options).toMatchObject({ command: 'cargo mutants --workspace' });
-      expect(targets.bench?.options).toMatchObject({ command: 'cargo bench --workspace' });
+      expect(targets.mutation?.options).toMatchObject({ command: 'cargo --frozen mutants --workspace' });
+      expect(targets.bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
     } finally {
       await workspace.cleanup();
     }
@@ -350,7 +350,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         outputs: ['{projectRoot}/generated/wasm'],
         options: {
           commands: [
-            'cargo build --release --target wasm32-unknown-unknown --target-dir crates/git-do/target/cargo-wasm --manifest-path crates/git-do/Cargo.toml',
+            'cargo --frozen build --release --target wasm32-unknown-unknown --target-dir crates/git-do/target/cargo-wasm --manifest-path crates/git-do/Cargo.toml',
             'wasm-bindgen --target nodejs --out-dir generated/wasm/node crates/git-do/target/cargo-wasm/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
             'wasm-bindgen --target web --out-dir generated/wasm/web crates/git-do/target/cargo-wasm/wasm32-unknown-unknown/release/gitoxide_engine.wasm',
           ],
@@ -508,7 +508,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
       expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['napi-debug']);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^cargo nextest run --workspace --package cowshed-napi --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --workspace --package cowshed-napi --user-config-file none --config-file /,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
