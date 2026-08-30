@@ -113,6 +113,12 @@ pub fn workspace_remote_name(workspace: &str) -> String {
     format!("cowshed/{workspace}")
 }
 
+fn workspace_branch(name: &str) -> (String, String) {
+    let branch = format!("cowshed/{name}");
+    let branch_ref = format!("refs/heads/{branch}");
+    (branch, branch_ref)
+}
+
 #[derive(Clone, Debug)]
 pub struct GitRepository {
     root: PathBuf,
@@ -1243,6 +1249,42 @@ impl GitRepository {
         })
     }
 
+    async fn ensure_workspace_branch_absent(
+        &self,
+        name: &str,
+        holder: &str,
+        retry: String,
+    ) -> Result<String> {
+        let (branch, branch_ref) = workspace_branch(name);
+        let exists = self
+            .run(["show-ref", "--verify", "--quiet", branch_ref.as_str()])
+            .await?;
+        if exists.status.success() {
+            return Err(CowshedError::conflict(
+                format!("branch {branch} already exists in {holder}"),
+                retry,
+            ));
+        }
+        if exists.status.code() != Some(1) {
+            return Err(git_internal("check workspace branch", &exists));
+        }
+        Ok(branch)
+    }
+
+    async fn switch_to_workspace_branch(&self, branch: &str, start: Option<&str>) -> Result<()> {
+        let mut args = vec![
+            OsString::from("switch"),
+            OsString::from("-c"),
+            OsString::from(branch),
+        ];
+        if let Some(start) = start {
+            args.push(OsString::from("--"));
+            args.push(OsString::from(start));
+        }
+        let output = self.run(args).await?;
+        ensure_git_success("create workspace branch", output)
+    }
+
     /// Configure local-only workspace Git and create its session branch.
     ///
     /// `main_mount` is main's *canonical mount*, never the recorded checkout path. Under the
@@ -1261,20 +1303,13 @@ impl GitRepository {
                 "retry from a resolved repository root",
             ));
         }
-        let branch = format!("cowshed/{name}");
-        let branch_ref = format!("refs/heads/{branch}");
-        let exists = self
-            .run(["show-ref", "--verify", "--quiet", branch_ref.as_str()])
+        let branch = self
+            .ensure_workspace_branch_absent(
+                name,
+                "the cloned workspace",
+                format!("remove or rename cowshed/{name}, then retry: cowshed new {name}"),
+            )
             .await?;
-        if exists.status.success() {
-            return Err(CowshedError::conflict(
-                format!("branch {branch} already exists in the cloned workspace"),
-                format!("remove or rename {branch}, then retry: cowshed new {name}"),
-            ));
-        }
-        if exists.status.code() != Some(1) {
-            return Err(git_internal("check workspace branch", &exists));
-        }
 
         // The `.git` directory arrived by CoW carrying every remote main had, including network
         // URLs. Sandboxed git speaks only local paths, so a fresh mint drops the lot before
@@ -1294,17 +1329,7 @@ impl GitRepository {
         self.restore_inherited_links(main_mount).await?;
         let main_remote = self.configure_main_remote(main_mount).await?;
 
-        let mut args = vec![
-            OsString::from("switch"),
-            OsString::from("-c"),
-            OsString::from(branch),
-        ];
-        if let Some(start) = start {
-            args.push(OsString::from("--"));
-            args.push(OsString::from(start));
-        }
-        let output = self.run(args).await?;
-        ensure_git_success("create workspace branch", output)?;
+        self.switch_to_workspace_branch(&branch, start).await?;
         Ok(main_remote)
     }
 
@@ -1676,22 +1701,17 @@ impl GitRepository {
             ));
         }
         let main = Self::from_root(main_mount);
-        let branch = format!("cowshed/{name}");
-        let branch_ref = format!("refs/heads/{branch}");
         // The branch is created in main's ref namespace, so the collision to check is main's, not
         // this image's — the image is about to stop having a ref namespace of its own.
-        let exists = main
-            .run(["show-ref", "--verify", "--quiet", branch_ref.as_str()])
+        let branch = main
+            .ensure_workspace_branch_absent(
+                name,
+                "main's repository",
+                format!(
+                    "remove or rename cowshed/{name}, then retry: cowshed new {name} --git-worktree"
+                ),
+            )
             .await?;
-        if exists.status.success() {
-            return Err(CowshedError::conflict(
-                format!("branch {branch} already exists in main's repository"),
-                format!("remove or rename {branch}, then retry: cowshed new {name} --git-worktree"),
-            ));
-        }
-        if exists.status.code() != Some(1) {
-            return Err(git_internal("check workspace branch", &exists));
-        }
         let admin = main.worktree_admin_dir(name).await?;
         if admin.exists() {
             return Err(CowshedError::conflict(
@@ -1774,17 +1794,7 @@ impl GitRepository {
         let reset = self.run(["reset", "-q"]).await?;
         ensure_git_success("populate linked worktree index", reset)?;
 
-        let mut args = vec![
-            OsString::from("switch"),
-            OsString::from("-c"),
-            OsString::from(branch),
-        ];
-        if let Some(start) = start {
-            args.push(OsString::from("--"));
-            args.push(OsString::from(start));
-        }
-        let output = self.run(args).await?;
-        ensure_git_success("create workspace branch", output)?;
+        self.switch_to_workspace_branch(&branch, start).await?;
         Ok(())
     }
 
