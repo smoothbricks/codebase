@@ -178,6 +178,12 @@ struct ProjectInventoryFacts {
     mount_paths: BTreeMap<String, PathBuf>,
 }
 
+struct DerivedInventory {
+    layout: StorageLayout,
+    mount_paths: BTreeMap<String, PathBuf>,
+    derived: Vec<crate::storage::lifecycle::DerivedWorkspace>,
+}
+
 trait InventorySource: Send + Sync {
     fn project_facts(
         &self,
@@ -858,17 +864,7 @@ impl NativeGatewayInventory {
         Ok(facts)
     }
 
-    fn load_derived(
-        &self,
-        repo_id: &RepoId,
-    ) -> Result<
-        (
-            crate::storage::StorageLayout,
-            BTreeMap<String, PathBuf>,
-            Vec<crate::storage::lifecycle::DerivedWorkspace>,
-        ),
-        GatewayInventoryError,
-    > {
+    fn load_derived(&self, repo_id: &RepoId) -> Result<DerivedInventory, GatewayInventoryError> {
         let authoritative = self.source.project_facts(&self.storage, repo_id)?;
         reject_duplicate_mount_facts(&authoritative.mounts)?;
         let derived = derive_workspaces(
@@ -882,14 +878,22 @@ impl NativeGatewayInventory {
                 message: error.to_string(),
             }
         })?;
-        Ok((layout, authoritative.mount_paths, derived))
+        Ok(DerivedInventory {
+            layout,
+            mount_paths: authoritative.mount_paths,
+            derived,
+        })
     }
 
     fn load_project_workspaces(
         &self,
         repo_id: &RepoId,
     ) -> Result<ProjectWorkspaces, GatewayInventoryError> {
-        let (layout, mount_paths, derived) = self.load_derived(repo_id)?;
+        let DerivedInventory {
+            layout,
+            mount_paths,
+            derived,
+        } = self.load_derived(repo_id)?;
         let mut workspaces = Vec::with_capacity(derived.len());
         for workspace in derived {
             let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
@@ -923,7 +927,11 @@ impl NativeGatewayInventory {
         &self,
         repo_id: &RepoId,
     ) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
-        let (layout, mount_paths, derived) = self.load_derived(repo_id)?;
+        let DerivedInventory {
+            layout,
+            mount_paths,
+            derived,
+        } = self.load_derived(repo_id)?;
         // Read once per project: the certificate subject inside a workspace image names whichever
         // identity was current when the image was minted, which after an identity change is one of
         // the project's former identities.
