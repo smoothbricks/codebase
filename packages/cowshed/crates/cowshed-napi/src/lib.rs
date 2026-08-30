@@ -985,7 +985,7 @@ mod parity_tests {
             Command::Push(_) => "WorkspaceHandle.push",
             Command::Rebase(_) => "Coordinator.rebase",
             Command::Land(_) => "Coordinator.land",
-            Command::Doctor => "Coordinator.doctor",
+            Command::Doctor(_) => "Coordinator.doctor",
             Command::Gateway(_)
             | Command::Sccache(_)
             | Command::Skill(_)

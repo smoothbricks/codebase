@@ -422,6 +422,19 @@ impl NativeGatewayInventory {
             .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
+    pub async fn doctor_projects(
+        &self,
+    ) -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>), GatewayInventoryError> {
+        let inventory = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let projects = inventory.adopted_projects_blocking()?;
+            let unreachable = inventory.unmounted_mains_for(&projects)?;
+            Ok((projects, unreachable))
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
     /// Enumerate every current workspace directly from the host storage registry.
     ///
     /// Unlike a project runtime open, this never discovers a Git repository or reads remotes from
@@ -591,8 +604,16 @@ impl NativeGatewayInventory {
     }
 
     fn unmounted_mains_blocking(&self) -> Result<Vec<UnreachableMain>, GatewayInventoryError> {
+        let projects = self.adopted_projects_blocking()?;
+        self.unmounted_mains_for(&projects)
+    }
+
+    fn unmounted_mains_for(
+        &self,
+        projects: &[AdoptedProject],
+    ) -> Result<Vec<UnreachableMain>, GatewayInventoryError> {
         let mut unreachable = Vec::new();
-        for project in self.adopted_projects_blocking()? {
+        for project in projects {
             let layout =
                 StorageLayout::new(self.storage.store(), &project.repo_id).map_err(|error| {
                     GatewayInventoryError::InvalidMetadata {
@@ -630,7 +651,7 @@ impl NativeGatewayInventory {
             };
             if let Some(reason) = reason {
                 unreachable.push(UnreachableMain {
-                    repo_id: project.repo_id,
+                    repo_id: project.repo_id.clone(),
                     image,
                     mountpoint,
                     reason,

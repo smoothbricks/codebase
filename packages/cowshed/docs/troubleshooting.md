@@ -111,6 +111,12 @@ retries or grants do not repair it. Preserve the workspace/checkpoint and follow
 cowshed fails closed rather than choosing the caller-visible redirect source, a publication copy, or whichever record
 looks newer.
 
+An `artifact ordering failure` is different: every frame may still be complete and readable while
+two independent writers allocated the same sequence. Run `cowshed doctor --repair`; it repairs
+only that fully validated ordering case and preserves the exact original beside the log. A digest,
+trailer, Arrow, record, or checkpoint-prefix failure is content corruption and the repair refuses
+to rewrite it.
+
 **Checkpoint was not pruned.** GC keeps the union of three sets: explicit pins, every checkpoint younger than 14 days,
 and the newest five checkpoints per workspace. A user label and `cowshed checkpoint --keep` both pin; age or count does
 not override a pin. Unpin explicitly before expecting GC to remove it.

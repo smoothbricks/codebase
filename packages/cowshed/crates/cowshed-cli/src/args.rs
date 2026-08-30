@@ -73,7 +73,7 @@ pub enum Command {
     Push(PushArgs),
     Rebase(RebaseArgs),
     Land(LandArgs),
-    Doctor,
+    Doctor(DoctorArgs),
     Gateway(GatewayCommand),
     Sccache(SccacheCommand),
     Skill(SkillArgs),
@@ -111,7 +111,7 @@ impl Command {
             | Self::Rebase(_)
             | Self::Land(_) => ProjectDiscovery::Required,
             Self::List(args) if !args.all => ProjectDiscovery::Optional,
-            Self::Doctor => ProjectDiscovery::Optional,
+            Self::Doctor(_) => ProjectDiscovery::Optional,
             Self::List(_)
             | Self::Setup(_)
             | Self::Gateway(_)
@@ -353,6 +353,11 @@ pub struct LandArgs {
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
     pub expected_target_head: Option<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DoctorArgs {
+    pub repair: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -662,7 +667,7 @@ fn cli_command() -> ClapCommand {
             value("expected-source-head"),
             value("expected-target-head"),
         ]))
-        .subcommand(leaf("doctor"))
+        .subcommand(leaf("doctor").arg(flag("repair")))
         .subcommand(
             leaf("gateway")
                 .subcommand_required(true)
@@ -772,7 +777,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "push" => parse_push(leaf)?,
         "rebase" => parse_rebase(leaf)?,
         "land" => parse_land(leaf)?,
-        "doctor" => parse_empty(leaf, &DOCTOR, Command::Doctor)?,
+        "doctor" => parse_doctor(leaf)?,
         "gateway" => parse_gateway(leaf, &global)?,
         "sccache" => parse_sccache(leaf, &global)?,
         "skill" => parse_skill(leaf, &global)?,
@@ -2013,16 +2018,18 @@ const DOCTOR: CommandSpec = CommandSpec {
     summary: "check invariants",
     about: &[
         "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh. Exit 0 when healthy, otherwise 5.",
+        "With `--repair`, first validates every mounted workspace artifact frame and non-destructively resequences only logs whose payloads are intact but whose physical sequence order raced. Every changed log keeps a byte-for-byte pre-repair backup beside it.",
     ],
-    options: &[],
+    options: &[Opt {
+        spelling: "--repair",
+        meaning: "repair raced artifact sequence ordering before running the health checks",
+    }],
 };
 
-fn parse_empty(
-    _matches: &ArgMatches,
-    _spec: &'static CommandSpec,
-    parsed: Command,
-) -> Result<Command, UsageError> {
-    Ok(parsed)
+fn parse_doctor(matches: &ArgMatches) -> Result<Command, UsageError> {
+    Ok(Command::Doctor(DoctorArgs {
+        repair: flagged(matches, "repair"),
+    }))
 }
 
 fn set_stdin(
@@ -2089,6 +2096,25 @@ mod tests {
             assert_eq!(cli.command, Command::Version);
             assert_eq!(cli.command.project_discovery(), ProjectDiscovery::NotUsed);
         }
+    }
+
+    #[test]
+    fn doctor_repair_is_an_explicit_project_scoped_flag() {
+        let Command::Doctor(default) = parse_args(["doctor"]).unwrap().command else {
+            panic!("expected doctor")
+        };
+        assert!(!default.repair);
+
+        let parsed = parse_args(["doctor", "--repair", "--project", "/repo"]).unwrap();
+        let Command::Doctor(repair) = parsed.command else {
+            panic!("expected doctor repair")
+        };
+        assert!(repair.repair);
+        assert_eq!(parsed.global.project, Some(PathBuf::from("/repo")));
+        assert_eq!(
+            Command::Doctor(repair).project_discovery(),
+            ProjectDiscovery::Optional
+        );
     }
 
     #[test]
