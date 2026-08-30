@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::metadata::WorkspaceName;
+use crate::metadata::{GRANTS_SIDECAR_SUFFIX, WorkspaceName};
 use crate::repository::RepoId;
 
 pub const HOST_CONFIG_FILE: &str = "host.json";
@@ -243,7 +243,7 @@ pub fn retired_layout_paths(
                 || !entry
                     .file_name()
                     .to_string_lossy()
-                    .ends_with(".grants.json")
+                    .ends_with(GRANTS_SIDECAR_SUFFIX)
             {
                 continue;
             }

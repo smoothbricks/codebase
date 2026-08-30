@@ -1338,11 +1338,8 @@ fn workspace_mountpoint(
     checkout_path: &Path,
     workspace: &WorkspaceName,
 ) -> Result<PathBuf, GatewayInventoryError> {
-    if workspace.is_main() && checkout_layout.mounts_at_checkout() {
-        return Ok(checkout_path.to_owned());
-    }
     layout
-        .workspace_mount(workspace)
+        .main_aware_workspace_mount(checkout_layout, checkout_path, workspace)
         .map_err(|error| GatewayInventoryError::InvalidMetadata {
             path: layout.project().mount_root.clone(),
             message: error.to_string(),
@@ -1452,11 +1449,7 @@ fn canonical_image_paths(
     layout: &StorageLayout,
     workspace: &crate::storage::lifecycle::LifecycleWorkspace,
 ) -> Result<crate::storage::ImagePaths, GatewayInventoryError> {
-    let result = if workspace.name().is_main() {
-        layout.main_image(workspace.format())
-    } else {
-        layout.session_image(workspace.name(), workspace.format())
-    };
+    let result = layout.canonical_image(workspace.name(), workspace.format());
     result.map_err(|error| GatewayInventoryError::InvalidMetadata {
         path: layout.project().project_root.clone(),
         message: error.to_string(),
