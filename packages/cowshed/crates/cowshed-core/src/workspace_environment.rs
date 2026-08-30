@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 
@@ -24,7 +25,7 @@ pub enum WorkspaceEnvironmentError {
 pub fn write_workspace_environment(
     image_root: &Path,
     workspace_mount: &Path,
-    token: &str,
+    token: &Zeroizing<String>,
     platform: Platform,
     port_block: Option<PortBlock>,
 ) -> Result<(), WorkspaceEnvironmentError> {
@@ -55,11 +56,21 @@ pub fn write_workspace_environment(
     let go_env = go_env
         .to_str()
         .ok_or_else(|| WorkspaceEnvironmentError::InvalidMount(workspace_mount.to_owned()))?;
-    let mut contents = format!(
-        "export GOENV={}\nexport COWSHED_WORKSPACE_TOKEN={}\n",
-        shell_word(go_env),
-        shell_word(token),
-    );
+    let go_env_word = shell_word(go_env);
+    // Token alphabet is unpadded base64url (`A-Za-z0-9_-`), already shell-safe.
+    // `shell_word` would `to_owned()`/`format!` it into a plain String that is
+    // never zeroized; push the borrowed token into a Zeroizing buffer instead.
+    // Capacity is sized so the buffer cannot reallocate after the token is copied.
+    let mut contents = Zeroizing::new(String::with_capacity(
+        "export GOENV=\nexport COWSHED_WORKSPACE_TOKEN=\nexport COWSHED_PORT_BASE=65535\n".len()
+            + go_env_word.len()
+            + token.len(),
+    ));
+    contents.push_str("export GOENV=");
+    contents.push_str(&go_env_word);
+    contents.push_str("\nexport COWSHED_WORKSPACE_TOKEN=");
+    contents.push_str(token);
+    contents.push('\n');
     if let Some(block) = port_block {
         contents.push_str(&format!("export COWSHED_PORT_BASE={}\n", block.base()));
     }
