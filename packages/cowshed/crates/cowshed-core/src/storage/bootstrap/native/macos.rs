@@ -6191,10 +6191,9 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
                 .args()
                 .first()
                 .is_some_and(|argument| argument == "add-generic-password")
+                && let Some(output) = &self.persist_output
             {
-                if let Some(output) = &self.persist_output {
-                    return Ok(output.clone());
-                }
+                return Ok(output.clone());
             }
             Ok(HostCommandOutput::default())
         }
