@@ -371,7 +371,7 @@ fn config() -> WorkspaceSupervisorConfig {
             mount_root: workspace_root.parent().expect("temp root").to_path_buf(),
             workspace_mount: workspace_root,
             exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
-            port_block: PortBlock::new(49_152, 16).unwrap(),
+            port_block: PortBlock::new(49_136, 16).unwrap(),
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),

@@ -122,7 +122,7 @@ impl Default for WorkspaceSupervisorConfig {
                 mount_root: PathBuf::from("/tmp/cowshed-mounts"),
                 workspace_mount: workspace_root,
                 exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
-                port_block: crate::metadata::PortBlock::new(49_152, 16).expect("static port block"),
+                port_block: crate::metadata::PortBlock::new(49_136, 16).expect("static port block"),
                 mode: crate::sandbox::RunSandboxMode::ReadWrite,
                 grants: crate::sandbox::SandboxGrants::default(),
                 allowed_unix_sockets: Vec::new(),
@@ -1268,8 +1268,11 @@ impl SpawnSink for SystemSpawnSink {
                 crate::sandbox::sccache_server_socket(),
             )
             .env("SCCACHE_DIR", crate::sandbox::sccache_cache_directory())
-            .env("COWSHED_PORT_BASE", &port_base)
-            .env("COWSHED_WORKSPACE_TOKEN", workspace_token)
+            .env(crate::workspace_environment::PORT_BASE_ENV, &port_base)
+            .env(
+                crate::workspace_environment::WORKSPACE_TOKEN_ENV,
+                workspace_token,
+            )
             .env("HTTP_PROXY", &gateway_http)
             .env("HTTPS_PROXY", &gateway_http)
             .env("http_proxy", &gateway_http)

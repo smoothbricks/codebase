@@ -11,6 +11,13 @@ const BINDING_VERSION: u32 = 1;
 /// The one file that makes a store directory an adopted project. Its presence is what discovery
 /// keys on, and retirement deletes it.
 pub const REPOSITORY_BINDING_FILE: &str = "repository.json";
+pub const CHECKOUT_LAYOUT_FILE: &str = "checkout-layout.json";
+pub const SLOT_BINDINGS_FILE: &str = "slot-bindings.json";
+pub const POLICY_FILE: &str = "policy.json";
+pub const SESSIONS_DIRECTORY: &str = "sessions";
+pub const CHECKPOINTS_DIRECTORY: &str = "checkpoints";
+pub const QUARANTINE_DIRECTORY: &str = "quarantine";
+pub const WAIVERS_FILE: &str = "waivers.json";
 const RESERVED_LAYOUT_OWNERS: &[&str] = &[
     "gateway",
     "telemetry",
@@ -367,8 +374,8 @@ pub enum ComponentEncodingError {
     Empty,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BoundIdentity {
     pub repo_id: RepoId,
     pub remote_name: Option<String>,
@@ -620,7 +627,7 @@ impl<'de> Deserialize<'de> for RepositoryBinding {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct RawBinding {
             version: u32,
             identities: Vec<BoundIdentity>,
@@ -636,29 +643,6 @@ impl<'de> Deserialize<'de> for RepositoryBinding {
         };
         binding.validate().map_err(serde::de::Error::custom)?;
         Ok(binding)
-    }
-}
-impl<'de> Deserialize<'de> for BoundIdentity {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RawIdentity {
-            repo_id: RepoId,
-            remote_name: Option<String>,
-            remote_url: Option<String>,
-            primary: bool,
-        }
-
-        let raw = RawIdentity::deserialize(deserializer)?;
-        Ok(Self {
-            repo_id: raw.repo_id,
-            remote_name: raw.remote_name,
-            remote_url: raw.remote_url,
-            primary: raw.primary,
-        })
     }
 }
 
@@ -695,13 +679,13 @@ impl ProjectPaths {
 
         Ok(Self {
             repository_binding: checked_join(&project_root, [REPOSITORY_BINDING_FILE])?,
-            checkout_layout: checked_join(&project_root, ["checkout-layout.json"])?,
-            slot_bindings: checked_join(&project_root, ["slot-bindings.json"])?,
-            policy: checked_join(&project_root, ["policy.json"])?,
-            sessions: checked_join(&project_root, ["sessions"])?,
-            checkpoints: checked_join(&project_root, ["checkpoints"])?,
-            quarantine: checked_join(&project_root, ["quarantine"])?,
-            waivers: checked_join(&project_root, ["waivers.json"])?,
+            checkout_layout: checked_join(&project_root, [CHECKOUT_LAYOUT_FILE])?,
+            slot_bindings: checked_join(&project_root, [SLOT_BINDINGS_FILE])?,
+            policy: checked_join(&project_root, [POLICY_FILE])?,
+            sessions: checked_join(&project_root, [SESSIONS_DIRECTORY])?,
+            checkpoints: checked_join(&project_root, [CHECKPOINTS_DIRECTORY])?,
+            quarantine: checked_join(&project_root, [QUARANTINE_DIRECTORY])?,
+            waivers: checked_join(&project_root, [WAIVERS_FILE])?,
             store_root,
             host_mount_root,
             project_root,

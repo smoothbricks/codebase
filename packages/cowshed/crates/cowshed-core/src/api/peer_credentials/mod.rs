@@ -31,6 +31,7 @@ pub(crate) fn peer_uid(descriptor: &OwnedFd) -> Result<libc::uid_t, PeerCredenti
     let mut socket_type: libc::c_int = 0;
     let mut socket_type_len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
         .map_err(|_| PeerCredentialsError::SocketTypeSizeOverflow)?;
+    // SAFETY: `descriptor` owns a live fd and the output pointer/length describe one `c_int`.
     let result = unsafe {
         libc::getsockopt(
             fd,
@@ -41,6 +42,9 @@ pub(crate) fn peer_uid(descriptor: &OwnedFd) -> Result<libc::uid_t, PeerCredenti
         )
     };
     if result != 0 {
+        return Err(PeerCredentialsError::SocketTypeQueryFailed);
+    }
+    if socket_type_len as usize != std::mem::size_of::<libc::c_int>() {
         return Err(PeerCredentialsError::SocketTypeQueryFailed);
     }
     if socket_type != libc::SOCK_STREAM {

@@ -51,7 +51,10 @@ pub enum MetadataError {
         base: u16,
         size: u16,
     },
-    InvalidPath(PathBuf),
+    InvalidPath {
+        path: PathBuf,
+        reason: &'static str,
+    },
     SlotOutOfRange(u32),
     SlotAlreadyBound {
         slot: u32,
@@ -121,8 +124,8 @@ impl fmt::Display for MetadataError {
             Self::InvalidPortBlock { base, size } => {
                 write!(f, "invalid port block {{ base: {base}, size: {size} }}")
             }
-            Self::InvalidPath(path) => {
-                write!(f, "metadata path has no file name: {}", path.display())
+            Self::InvalidPath { path, reason } => {
+                write!(f, "invalid metadata path {}: {reason}", path.display())
             }
             Self::SlotOutOfRange(slot) => {
                 write!(f, "slot {slot} is outside 0..={}", SlotId::MAX)
@@ -456,7 +459,7 @@ impl CheckoutLayout {
 }
 
 /// The project-level record of the chosen layout, written by adopt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckoutLayoutRecord {
     pub version: u32,
@@ -479,6 +482,28 @@ impl CheckoutLayoutRecord {
             });
         }
         Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckoutLayoutRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            version: u32,
+            checkout_layout: CheckoutLayout,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let record = Self {
+            version: wire.version,
+            checkout_layout: wire.checkout_layout,
+        };
+        record.validate().map_err(serde::de::Error::custom)?;
+        Ok(record)
     }
 }
 
@@ -552,7 +577,7 @@ pub struct SlotBinding {
 ///
 /// A list rather than a map: the durable form is order-stable, the validation that no slot and no
 /// workspace appears twice is explicit, and JSON map keys stay out of it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SlotBindingsRecord {
     pub version: u32,
@@ -579,6 +604,31 @@ impl SlotBindingsRecord {
             bindings.bind(entry.slot, entry.workspace)?;
         }
         Ok(bindings)
+    }
+}
+
+impl<'de> Deserialize<'de> for SlotBindingsRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            version: u32,
+            bindings: Vec<SlotBinding>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let record = Self {
+            version: wire.version,
+            bindings: wire.bindings,
+        };
+        record
+            .clone()
+            .into_bindings()
+            .map_err(serde::de::Error::custom)?;
+        Ok(record)
     }
 }
 
@@ -865,6 +915,8 @@ fn is_intercept(mode: &EgressMode) -> bool {
     *mode == EgressMode::Intercept
 }
 
+pub const DEFAULT_EGRESS_PORTS: [u16; 2] = [443, 80];
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressRule {
@@ -875,6 +927,16 @@ pub struct EgressRule {
     pub mode: EgressMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impersonate: Option<String>,
+}
+
+impl EgressRule {
+    pub fn effective_ports(&self) -> &[u16] {
+        if self.ports.is_empty() {
+            &DEFAULT_EGRESS_PORTS
+        } else {
+            &self.ports
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -920,7 +982,16 @@ impl GrantSet {
 
     pub fn validate(&self, platform: Platform) -> Result<(), MetadataError> {
         match (platform, self.port_block) {
-            (Platform::Macos, Some(block)) => block.validate(),
+            (Platform::Macos, Some(block))
+                if (MACOS_PORT_BLOCK_MIN..=MACOS_PORT_BLOCK_LAST_BASE).contains(&block.base)
+                    && block.base.is_multiple_of(PORT_BLOCK_SIZE) =>
+            {
+                block.validate()
+            }
+            (Platform::Macos, Some(block)) => Err(MetadataError::InvalidPortBlock {
+                base: block.base,
+                size: block.size,
+            }),
             (Platform::Linux, None) => Ok(()),
             (_, Some(block)) => Err(MetadataError::InvalidPortBlock {
                 base: block.base,
@@ -1062,7 +1133,10 @@ impl DetachedWorkspaceMetadata {
         self.grants.validate(self.platform)?;
         if let Some(info) = &self.info_snapshot {
             if !info.project_root.is_absolute() {
-                return Err(MetadataError::InvalidPath(info.project_root.clone()));
+                return Err(MetadataError::InvalidPath {
+                    path: info.project_root.clone(),
+                    reason: "path is not absolute",
+                });
             }
             let expected_role = WorkspaceRole::for_name(&self.workspace);
             if info.role != expected_role {
@@ -1686,11 +1760,26 @@ mod tests {
             ));
         }
 
-        let macos = GrantSet::closed_baseline(Some(lowest)).unwrap();
-        assert_eq!(macos.port_block, Some(lowest));
+        let macos_block = PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).unwrap();
+        let macos = GrantSet::closed_baseline(Some(macos_block)).unwrap();
+        assert_eq!(macos.port_block, Some(macos_block));
         assert_eq!(macos.revision, 0);
         assert!(macos.read.is_empty() && macos.write.is_empty() && macos.egress.is_empty());
         macos.validate(Platform::Macos).unwrap();
+        assert!(
+            GrantSet::closed_baseline(Some(lowest))
+                .unwrap()
+                .validate(Platform::Macos)
+                .is_err()
+        );
+        assert!(
+            GrantSet::closed_baseline(Some(
+                PortBlock::new(MACOS_PORT_BLOCK_MIN + 1, PORT_BLOCK_SIZE).unwrap()
+            ))
+            .unwrap()
+            .validate(Platform::Macos)
+            .is_err()
+        );
         assert!(
             GrantSet::closed_baseline(Some(PortBlock {
                 base: u16::MAX,
@@ -1708,7 +1797,7 @@ mod tests {
         assert!(matches!(
             macos.validate(Platform::Linux),
             Err(MetadataError::InvalidPortBlock {
-                base: 0,
+                base: MACOS_PORT_BLOCK_MIN,
                 size: PORT_BLOCK_SIZE
             })
         ));

@@ -541,8 +541,6 @@ fn cli_status(
         socket,
         cli_version: env!("CARGO_PKG_VERSION").to_owned(),
         daemon_version: status.map(|status| status.version.clone()),
-        cache_entries: 0,
-        cache_bytes: 0,
         active_workspaces: status.map_or(0, |status| status.sessions.len() as u64),
     }
 }
