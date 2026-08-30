@@ -1038,33 +1038,22 @@ impl MirrorUpstream for ProxyMirrorUpstream<'_> {
             )
             .map_err(|error| -> CacheBodyError { Box::new(error) })?;
         *outbound.headers_mut() = request.headers;
-        strip_upstream_request_headers(outbound.headers_mut());
-        outbound.headers_mut().insert(
-            header::HOST,
-            HeaderValue::from_str(&request.target.authority())
-                .map_err(|error| -> CacheBodyError { Box::new(error) })?,
-        );
-        if !self.impersonate {
-            let trace_id = self
-                .trace_id
-                .ok_or_else(|| -> CacheBodyError { "mirror trace id is missing".into() })?;
-            let upstream_span_id = self
-                .upstream_span_id
-                .ok_or_else(|| -> CacheBodyError { "mirror upstream span id is missing".into() })?;
-            let trace = serialize_traceparent(trace_id, upstream_span_id, self.trace_flags);
-            outbound.headers_mut().insert(
-                HeaderName::from_static("traceparent"),
-                HeaderValue::from_str(&trace)
-                    .map_err(|error| -> CacheBodyError { Box::new(error) })?,
-            );
-            if let Some(tracestate) = self.tracestate {
-                outbound.headers_mut().insert(
-                    HeaderName::from_static("tracestate"),
-                    HeaderValue::from_str(tracestate)
-                        .map_err(|error| -> CacheBodyError { Box::new(error) })?,
-                );
-            }
-        }
+        let trace = if self.impersonate {
+            None
+        } else {
+            Some(UpstreamTrace {
+                trace_id: self
+                    .trace_id
+                    .ok_or_else(|| -> CacheBodyError { "mirror trace id is missing".into() })?,
+                span_id: self.upstream_span_id.ok_or_else(|| -> CacheBodyError {
+                    "mirror upstream span id is missing".into()
+                })?,
+                flags: self.trace_flags,
+                tracestate: self.tracestate,
+            })
+        };
+        write_upstream_headers(outbound.headers_mut(), &request.target, trace)
+            .map_err(|error| -> CacheBodyError { Box::new(error) })?;
         if self.credential_allowed {
             let query = CredentialQuery {
                 workspace_id: self.workspace_id.to_owned(),
@@ -1092,27 +1081,11 @@ impl MirrorUpstream for ProxyMirrorUpstream<'_> {
                 );
             }
         }
-        match upstream.transport {
-            NegotiatedTransport::Http1 => {
-                *outbound.version_mut() = Version::HTTP_11;
-                *outbound.uri_mut() = Uri::builder()
-                    .path_and_query(request.path)
-                    .build()
-                    .map_err(|error| -> CacheBodyError { Box::new(error) })?;
-            }
-            NegotiatedTransport::Http2 => {
-                *outbound.version_mut() = Version::HTTP_2;
-                *outbound.uri_mut() = Uri::builder()
-                    .scheme(request.target.scheme.as_str())
-                    .authority(request.target.authority())
-                    .path_and_query(request.path)
-                    .build()
-                    .map_err(|error| -> CacheBodyError { Box::new(error) })?;
-            }
-            NegotiatedTransport::Raw => {
-                return Err("mirror connector returned raw transport for HTTP".into());
-            }
-        }
+        let (version, uri) =
+            upstream_request_target(upstream.transport, &request.target, &request.path)
+                .map_err(|error| -> CacheBodyError { Box::new(error) })?;
+        *outbound.version_mut() = version;
+        *outbound.uri_mut() = uri;
         let mut sender = timeout(
             self.context.timeouts.response_headers,
             handshake_upstream(upstream),
@@ -1859,6 +1832,67 @@ async fn upstream_health(context: &AcceptContext, target: &CanonicalTarget) -> U
         .unwrap_or(UpstreamHealth::Unknown)
 }
 
+#[derive(Clone, Copy)]
+struct UpstreamTrace<'a> {
+    trace_id: &'a str,
+    span_id: u64,
+    flags: u8,
+    tracestate: Option<&'a str>,
+}
+
+fn write_upstream_headers(
+    headers: &mut HeaderMap,
+    target: &CanonicalTarget,
+    trace: Option<UpstreamTrace<'_>>,
+) -> Result<(), http::header::InvalidHeaderValue> {
+    strip_upstream_request_headers(headers);
+    headers.insert(header::HOST, HeaderValue::from_str(&target.authority())?);
+    if let Some(trace) = trace {
+        let traceparent = serialize_traceparent(trace.trace_id, trace.span_id, trace.flags);
+        headers.insert(
+            HeaderName::from_static("traceparent"),
+            HeaderValue::from_str(&traceparent)?,
+        );
+        if let Some(tracestate) = trace.tracestate {
+            headers.insert(
+                HeaderName::from_static("tracestate"),
+                HeaderValue::from_str(tracestate)?,
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum UpstreamUriError {
+    #[error("raw transport cannot carry an HTTP request")]
+    RawTransport,
+    #[error("upstream request URI is invalid")]
+    InvalidUri(#[from] http::Error),
+}
+
+fn upstream_request_target(
+    transport: NegotiatedTransport,
+    target: &CanonicalTarget,
+    path: &str,
+) -> Result<(Version, Uri), UpstreamUriError> {
+    match transport {
+        NegotiatedTransport::Http1 => Ok((
+            Version::HTTP_11,
+            Uri::builder().path_and_query(path).build()?,
+        )),
+        NegotiatedTransport::Http2 => Ok((
+            Version::HTTP_2,
+            Uri::builder()
+                .scheme(target.scheme.as_str())
+                .authority(target.authority())
+                .path_and_query(path)
+                .build()?,
+        )),
+        NegotiatedTransport::Raw => Err(UpstreamUriError::RawTransport),
+    }
+}
+
 async fn prepare_upstream_request(
     request: Request<Incoming>,
     admission: &Admission,
@@ -1874,32 +1908,23 @@ async fn prepare_upstream_request(
     StatusCode,
 > {
     let (mut parts, body) = request.into_parts();
-    strip_upstream_request_headers(&mut parts.headers);
-    parts.headers.insert(
-        header::HOST,
-        HeaderValue::from_str(&admission.target.authority())
-            .map_err(|_| StatusCode::BAD_REQUEST)?,
-    );
-    if !admission.impersonate {
-        let trace_id = admission
-            .trace_id
-            .as_deref()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        let upstream_span_id = admission
-            .upstream_span_id
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-        let trace = serialize_traceparent(trace_id, upstream_span_id, admission.trace_flags);
-        parts.headers.insert(
-            HeaderName::from_static("traceparent"),
-            HeaderValue::from_str(&trace).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-        );
-        if let Some(tracestate) = admission.tracestate.as_deref() {
-            parts.headers.insert(
-                HeaderName::from_static("tracestate"),
-                HeaderValue::from_str(tracestate).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-            );
-        }
-    }
+    let trace = if admission.impersonate {
+        None
+    } else {
+        Some(UpstreamTrace {
+            trace_id: admission
+                .trace_id
+                .as_deref()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+            span_id: admission
+                .upstream_span_id
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?,
+            flags: admission.trace_flags,
+            tracestate: admission.tracestate.as_deref(),
+        })
+    };
+    write_upstream_headers(&mut parts.headers, &admission.target, trace)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if admission.credential_allowed {
         let protocol = admission
             .protocol
@@ -1929,22 +1954,14 @@ async fn prepare_upstream_request(
             parts.headers.insert(record.header_name.clone(), value);
         }
     }
-    parts.uri = match transport {
-        NegotiatedTransport::Http1 => {
-            parts.version = Version::HTTP_11;
-            Uri::builder().path_and_query(path).build()
-        }
-        NegotiatedTransport::Http2 => {
-            parts.version = Version::HTTP_2;
-            Uri::builder()
-                .scheme(admission.target.scheme.as_str())
-                .authority(admission.target.authority())
-                .path_and_query(path)
-                .build()
-        }
-        NegotiatedTransport::Raw => return Err(StatusCode::BAD_GATEWAY),
-    }
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (version, uri) = upstream_request_target(transport, &admission.target, path).map_err(
+        |error| match error {
+            UpstreamUriError::RawTransport => StatusCode::BAD_GATEWAY,
+            UpstreamUriError::InvalidUri(_) => StatusCode::BAD_REQUEST,
+        },
+    )?;
+    parts.version = version;
+    parts.uri = uri;
     let body = Limited::new(body, MAX_REQUEST_BODY).boxed();
     let (signal, request_timeout) = oneshot::channel();
     let body =
@@ -3103,6 +3120,48 @@ mod tests {
             .headers_mut()
             .insert(header::HOST, HeaderValue::from_static("other.test"));
         assert!(!request_authority_matches(&conflicting_host, &target));
+    }
+
+    #[test]
+    fn upstream_builder_covers_both_http_transports() {
+        let target =
+            CanonicalTarget::from_authority("secure.test:443", TargetScheme::Https).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("secret"));
+        write_upstream_headers(
+            &mut headers,
+            &target,
+            Some(UpstreamTrace {
+                trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
+                span_id: 0x00f0_67aa_0ba9_02b7,
+                flags: 1,
+                tracestate: Some("vendor=value"),
+            }),
+        )
+        .expect("valid upstream headers");
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+        assert_eq!(headers[header::HOST], "secure.test:443");
+        assert_eq!(
+            headers["traceparent"],
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        assert_eq!(headers["tracestate"], "vendor=value");
+
+        let (version, uri) =
+            upstream_request_target(NegotiatedTransport::Http1, &target, "/path?q=1")
+                .expect("HTTP/1 target");
+        assert_eq!(version, Version::HTTP_11);
+        assert_eq!(uri, "/path?q=1");
+
+        let (version, uri) =
+            upstream_request_target(NegotiatedTransport::Http2, &target, "/path?q=1")
+                .expect("HTTP/2 target");
+        assert_eq!(version, Version::HTTP_2);
+        assert_eq!(uri, "https://secure.test:443/path?q=1");
+        assert!(matches!(
+            upstream_request_target(NegotiatedTransport::Raw, &target, "/"),
+            Err(UpstreamUriError::RawTransport)
+        ));
     }
 
     #[test]
