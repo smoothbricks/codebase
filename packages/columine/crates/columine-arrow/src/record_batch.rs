@@ -4,7 +4,9 @@
 //! FlatBuffer library or intermediate model is needed. The emitted bytes are
 //! the contract consumed by Flechette and arrow-js, so every offset is explicit.
 
-use crate::schema::{ArrowType, SignalSchemaField};
+use crate::schema::{ArrowType, MAX_SCHEMA_FIELDS, SignalSchemaField};
+
+pub use crate::schema::compute_buffer_count;
 
 /// Continuation marker for Arrow IPC messages.
 pub const CONTINUATION_MARKER: u32 = 0xFFFF_FFFF;
@@ -28,15 +30,6 @@ pub fn align_to_8(size: usize) -> usize {
     (size + 7) & !7usize
 }
 
-/// Buffer count for a schema: each field contributes per its type
-/// (`computeBufferCount`). SignalSchemaField is the flattened physical wire
-/// layout: logical nested, list, and dictionary payloads arrive as Binary
-/// leaves, so summing each leaf's exact layout covers every recursive
-/// physical child exactly once.
-pub fn compute_buffer_count(fields: &[SignalSchemaField]) -> u32 {
-    fields.iter().map(|f| f.buffer_count()).sum()
-}
-
 /// Exact size of the RecordBatch FlatBuffer metadata this encoder emits
 /// (`recordBatchMetadataSize`): 76-byte base + 16 bytes per buffer/node
 /// vector entry, 8-aligned.
@@ -57,8 +50,8 @@ pub struct MetadataLimits {
 impl Default for MetadataLimits {
     fn default() -> Self {
         Self {
-            max_fields: 256,
-            max_buffers: 768,
+            max_fields: MAX_SCHEMA_FIELDS,
+            max_buffers: MAX_SCHEMA_FIELDS * 3,
         }
     }
 }
