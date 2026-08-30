@@ -20,7 +20,7 @@ use cowshed_core::runtime::{
     ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeJobStream, RuntimeLogChunk,
     WorkspaceSnapshot,
 };
-use cowshed_core::storage::lifecycle::{Conflict, ExpectedState, ObservedState, Revision};
+use cowshed_core::storage::lifecycle::{Conflict, LifecycleFact, Revision};
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -322,12 +322,12 @@ fn stale_lifecycle_conflict() -> CowshedError {
     let name = WorkspaceName::new("main").expect("fixed workspace");
     CowshedError::lifecycle_conflict(Conflict::Stale {
         index: 1,
-        expected: Box::new(ExpectedState::Absent {
+        expected: Box::new(LifecycleFact::Absent {
             repo: repo.clone(),
             name: name.clone(),
             topology_revision: Revision::new(1),
         }),
-        actual: Box::new(ObservedState::Absent {
+        actual: Box::new(LifecycleFact::Absent {
             repo,
             name,
             topology_revision: Revision::new(2),
