@@ -279,6 +279,11 @@ impl MirrorProtocol {
         }
     }
 
+    pub fn matches_local_path(self, path: &str) -> bool {
+        let prefix = self.local_prefix();
+        path == &prefix[..prefix.len() - 1] || path.starts_with(prefix)
+    }
+
     pub const fn baseline_origin(self) -> &'static str {
         match self {
             Self::Npm => "https://registry.npmjs.org:443",

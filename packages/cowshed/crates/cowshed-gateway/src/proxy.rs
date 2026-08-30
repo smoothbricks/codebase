@@ -49,7 +49,9 @@ use crate::{
         MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
         MirrorOutcome, MirrorRequest, MirrorService, MirrorUpstream,
     },
-    policy::{CanonicalHost, CanonicalTarget, EgressMode, TargetScheme, normalize_path},
+    policy::{
+        CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, TargetScheme, normalize_path,
+    },
     repo_mirror::RepoMirrorHandle,
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRequest},
 };
@@ -2249,15 +2251,18 @@ fn local_request_kind(path: &str) -> Option<AuditKind> {
     if path == "/sim" {
         return Some(AuditKind::Sim);
     }
-    if path == "/npm" || path.starts_with("/npm/") {
-        Some(AuditKind::Npm)
-    } else if path == "/cargo" || path.starts_with("/cargo/") {
-        Some(AuditKind::Cargo)
-    } else if path == "/go" || path.starts_with("/go/") {
-        Some(AuditKind::Go)
-    } else {
-        None
-    }
+    let protocol = [
+        MirrorProtocol::Npm,
+        MirrorProtocol::Cargo,
+        MirrorProtocol::Go,
+    ]
+    .into_iter()
+    .find(|protocol| protocol.matches_local_path(path))?;
+    Some(match protocol {
+        MirrorProtocol::Npm => AuditKind::Npm,
+        MirrorProtocol::Cargo => AuditKind::Cargo,
+        MirrorProtocol::Go => AuditKind::Go,
+    })
 }
 
 /// Display length of `uri` without allocating. Matches `http::Uri`'s `fmt`
