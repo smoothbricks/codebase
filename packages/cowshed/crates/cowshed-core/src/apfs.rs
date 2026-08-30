@@ -1489,9 +1489,16 @@ fn parse_asif_resize_limits(bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
         .ok_or_else(|| ApfsError::InvalidResizeLimits("missing unsigned current".to_owned()))
 }
 
-/// The capacity the kernel exposes for an attached image, as `blockcount` blocks of `blocksize`
-/// bytes in the same read-only inventory attachment discovery already parses.
-fn parse_attachment_capacity(image: &Path, bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
+/// One walk of `hdiutil info -plist`: devices from `system-entities`, capacity from
+/// `blockcount * blocksize`. The two public projections must not drift about which
+/// image-path is a match.
+struct AttachmentInventory {
+    devices: BTreeSet<String>,
+    capacity: Option<ImageCapacity>,
+    matched: bool,
+}
+
+fn parse_hdiutil_images(image: &Path, bytes: &[u8]) -> Result<AttachmentInventory, ApfsError> {
     let expected = image.to_str().ok_or_else(|| {
         ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
     })?;
@@ -1502,44 +1509,98 @@ fn parse_attachment_capacity(image: &Path, bytes: &[u8]) -> Result<ImageCapacity
         .and_then(|root| root.get("images"))
         .and_then(plist::Value::as_array)
         .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
+    let mut devices = BTreeSet::new();
     let mut capacity = None;
+    let mut matched = false;
     for entry in images {
         let dictionary = entry.as_dictionary().ok_or_else(|| {
             ApfsError::InvalidAttachmentInventory("images entry is not a dictionary".into())
         })?;
-        if dictionary
+        let reported_path = dictionary
             .get("image-path")
             .and_then(plist::Value::as_string)
-            != Some(expected)
-        {
+            .ok_or_else(|| {
+                ApfsError::InvalidAttachmentInventory(
+                    "images entry has no string image-path".into(),
+                )
+            })?;
+        if reported_path != expected {
             continue;
+        }
+        matched = true;
+        let entities = dictionary
+            .get("system-entities")
+            .and_then(plist::Value::as_array)
+            .ok_or_else(|| {
+                ApfsError::InvalidAttachmentInventory(
+                    "matching image has no system-entities array".into(),
+                )
+            })?;
+        let mut roots = 0usize;
+        for entity in entities {
+            let device = entity
+                .as_dictionary()
+                .and_then(|entity| entity.get("dev-entry"))
+                .and_then(plist::Value::as_string)
+                .and_then(device_path)
+                .ok_or_else(|| {
+                    ApfsError::InvalidAttachmentInventory(
+                        "matching image has an invalid dev-entry".into(),
+                    )
+                })?;
+            if device_depth(&device) == 0 && is_kernel_device_path(&device) {
+                roots += 1;
+                devices.insert(device);
+            }
+        }
+        if roots == 0 {
+            return Err(ApfsError::InvalidAttachmentInventory(
+                "matching image has no canonical whole device".into(),
+            ));
         }
         let extent = |key: &str| {
             dictionary
                 .get(key)
                 .and_then(plist::Value::as_unsigned_integer)
-                .ok_or_else(|| {
-                    ApfsError::InvalidAttachmentInventory(format!(
-                        "matching image has no unsigned {key}"
-                    ))
-                })
         };
-        let bytes = extent("blockcount")?
-            .checked_mul(extent("blocksize")?)
-            .ok_or_else(|| {
-                ApfsError::InvalidAttachmentInventory(
-                    "matching image reports an overflowing extent".into(),
-                )
-            })?;
-        let observed = ImageCapacity::from_bytes(bytes);
-        if capacity.is_some_and(|previous| previous != observed) {
-            return Err(ApfsError::InvalidAttachmentInventory(
-                "matching image is attached twice at different capacities".into(),
-            ));
+        match (extent("blockcount"), extent("blocksize")) {
+            (None, None) => {}
+            (Some(blockcount), Some(blocksize)) => {
+                let bytes = blockcount.checked_mul(blocksize).ok_or_else(|| {
+                    ApfsError::InvalidAttachmentInventory(
+                        "matching image reports an overflowing extent".into(),
+                    )
+                })?;
+                let observed = ImageCapacity::from_bytes(bytes);
+                if capacity.is_some_and(|previous| previous != observed) {
+                    return Err(ApfsError::InvalidAttachmentInventory(
+                        "matching image is attached twice at different capacities".into(),
+                    ));
+                }
+                capacity = Some(observed);
+            }
+            _ => {
+                return Err(ApfsError::InvalidAttachmentInventory(
+                    "matching image has no unsigned blockcount".into(),
+                ));
+            }
         }
-        capacity = Some(observed);
     }
-    capacity.ok_or_else(|| ApfsError::ImageNotAttached(image.to_owned()))
+    Ok(AttachmentInventory {
+        devices,
+        capacity,
+        matched,
+    })
+}
+
+fn parse_attachment_capacity(image: &Path, bytes: &[u8]) -> Result<ImageCapacity, ApfsError> {
+    let parsed = parse_hdiutil_images(image, bytes)?;
+    if !parsed.matched {
+        return Err(ApfsError::ImageNotAttached(image.to_owned()));
+    }
+    parsed.capacity.ok_or_else(|| {
+        ApfsError::InvalidAttachmentInventory("matching image has no unsigned blockcount".into())
+    })
 }
 
 fn validate_detach_target(target: DetachTarget<'_>) -> Result<OsString, ApfsError> {
@@ -1585,64 +1646,7 @@ fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
 }
 
 fn parse_attachment_inventory(image: &Path, bytes: &[u8]) -> Result<BTreeSet<String>, ApfsError> {
-    let expected = image.to_str().ok_or_else(|| {
-        ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
-    })?;
-    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
-    let images = value
-        .as_dictionary()
-        .and_then(|root| root.get("images"))
-        .and_then(plist::Value::as_array)
-        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
-    let mut devices = BTreeSet::new();
-    for image_entry in images {
-        let dictionary = image_entry.as_dictionary().ok_or_else(|| {
-            ApfsError::InvalidAttachmentInventory("images entry is not a dictionary".into())
-        })?;
-        let reported_path = dictionary
-            .get("image-path")
-            .and_then(plist::Value::as_string)
-            .ok_or_else(|| {
-                ApfsError::InvalidAttachmentInventory(
-                    "images entry has no string image-path".into(),
-                )
-            })?;
-        if reported_path != expected {
-            continue;
-        }
-        let entities = dictionary
-            .get("system-entities")
-            .and_then(plist::Value::as_array)
-            .ok_or_else(|| {
-                ApfsError::InvalidAttachmentInventory(
-                    "matching image has no system-entities array".into(),
-                )
-            })?;
-        let mut roots = 0usize;
-        for entity in entities {
-            let device = entity
-                .as_dictionary()
-                .and_then(|entity| entity.get("dev-entry"))
-                .and_then(plist::Value::as_string)
-                .and_then(device_path)
-                .ok_or_else(|| {
-                    ApfsError::InvalidAttachmentInventory(
-                        "matching image has an invalid dev-entry".into(),
-                    )
-                })?;
-            if device_depth(&device) == 0 && is_kernel_device_path(&device) {
-                roots += 1;
-                devices.insert(device);
-            }
-        }
-        if roots == 0 {
-            return Err(ApfsError::InvalidAttachmentInventory(
-                "matching image has no canonical whole device".into(),
-            ));
-        }
-    }
-    Ok(devices)
+    Ok(parse_hdiutil_images(image, bytes)?.devices)
 }
 
 fn is_canonical_mount_point(path: &Path) -> bool {
@@ -4556,14 +4560,18 @@ mod tests {
             ("/tmp/cowshed-unrelated.asif", &["/dev/disk20"][..]),
         ]);
 
+        let parsed =
+            parse_hdiutil_images(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes()).unwrap();
         assert_eq!(
-            parse_attachment_inventory(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes())
-                .unwrap(),
+            parsed.devices,
             BTreeSet::from(["/dev/disk4".into(), "/dev/disk5".into()])
         );
+        assert!(parsed.matched);
+        assert_eq!(parsed.capacity, None);
         assert!(
-            parse_attachment_inventory(Path::new("/tmp/cowshed-absent.asif"), plist.as_bytes())
+            parse_hdiutil_images(Path::new("/tmp/cowshed-absent.asif"), plist.as_bytes())
                 .unwrap()
+                .devices
                 .is_empty()
         );
     }
@@ -4583,6 +4591,33 @@ mod tests {
                 Err(ApfsError::InvalidAttachmentInventory(_))
             ));
         }
+    }
+
+    #[test]
+    fn attachment_inventory_parse_returns_devices_and_capacity() {
+        let plist = r#"<?xml version="1.0"?><plist><dict><key>images</key><array>
+          <dict>
+            <key>image-path</key><string>/tmp/cowshed-target.asif</string>
+            <key>blockcount</key><integer>419430400</integer>
+            <key>blocksize</key><integer>512</integer>
+            <key>system-entities</key><array>
+              <dict><key>dev-entry</key><string>/dev/disk4</string></dict>
+            </array>
+          </dict>
+        </array></dict></plist>"#;
+        let parsed =
+            parse_hdiutil_images(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes()).unwrap();
+        assert_eq!(parsed.devices, BTreeSet::from(["/dev/disk4".into()]));
+        assert_eq!(
+            parsed.capacity,
+            Some(ImageCapacity::from_bytes(419_430_400_u64 * 512)),
+        );
+        assert!(parsed.matched);
+        assert_eq!(
+            parse_attachment_capacity(Path::new("/tmp/cowshed-target.asif"), plist.as_bytes())
+                .unwrap(),
+            parsed.capacity.unwrap()
+        );
     }
 
     #[test]
