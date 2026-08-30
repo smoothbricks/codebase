@@ -354,7 +354,7 @@ fn validate_restore_recovery_lineage(
 fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
-        metadata.blocks().saturating_mul(512)
+        metadata.blocks().saturating_mul(crate::apfs::SECTOR_BYTES)
     }
     #[cfg(not(unix))]
     {
