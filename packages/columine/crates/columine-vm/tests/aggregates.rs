@@ -21,15 +21,15 @@ fn approx(a: f64, b: f64) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn batch_agg_sum_f64_simd_reduction() {
+fn batch_agg_sum_f64_fixed_lane_order() {
     //
     let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
     approx(batch_agg_sum(&data[..7]), 28.0);
-    approx(batch_agg_sum(&data[..4]), 10.0); // SIMD-only (no tail)
+    approx(batch_agg_sum(&data[..4]), 10.0);
 }
 
 #[test]
-fn batch_agg_min_max_f64_simd() {
+fn batch_agg_min_max_f64_profile() {
     //
     let data = [5.0, 2.0, 8.0, 1.0, 7.0];
     approx(batch_agg_min(&data, f64::INFINITY), 1.0);
@@ -272,21 +272,10 @@ fn probe_pin_min_nan_and_signed_zero() {
 // Proptests: reference-model differential + scalar-path equivalences
 // ---------------------------------------------------------------------------
 
-/// Independent lane model written with index arithmetic rather than lane
-/// iterators, used for differential comparison.
-fn ref_lane_sum(vals: &[f64]) -> f64 {
-    let chunks = vals.len() / 4;
-    let mut l = [0.0f64; 4];
-    for c in 0..chunks {
-        for k in 0..4 {
-            l[k] += vals[c * 4 + k];
-        }
-    }
-    let mut r = ((l[0] + l[1]) + l[2]) + l[3];
-    for &v in &vals[chunks * 4..] {
-        r += v;
-    }
-    r
+/// Independent scalar oracle. Inputs are bounded integral f64 values so every
+/// intermediate sum is exact and association cannot hide a wrong kernel.
+fn ref_sequential_sum(vals: &[f64]) -> f64 {
+    vals.iter().copied().fold(0.0, |sum, value| sum + value)
 }
 
 fn adversarial_f64() -> impl Strategy<Value = f64> {
@@ -305,14 +294,15 @@ fn adversarial_f64() -> impl Strategy<Value = f64> {
 }
 
 proptest! {
-    /// batch_agg_sum equals the reference lane model bit-for-bit, including
-    /// NaN/inf inputs (NaN payload canonicalization is the caller's concern;
-    /// equal bits here means equal-or-both-NaN).
+    /// The numeric result agrees with an independent left-to-right fold on a
+    /// domain where addition is exact. Cancellation-sensitive lane order is
+    /// pinned separately by `probe_pin_batch_sum_lane_order`.
     #[test]
-    fn sum_matches_reference_lane_model(vals in prop::collection::vec(adversarial_f64(), 0..64)) {
-        let a = batch_agg_sum(&vals);
-        let b = ref_lane_sum(&vals);
-        prop_assert!(a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()));
+    fn sum_matches_sequential_oracle(
+        vals in prop::collection::vec(-1_000_000i32..1_000_001, 0..64)
+    ) {
+        let vals: Vec<f64> = vals.into_iter().map(f64::from).collect();
+        prop_assert_eq!(batch_agg_sum(&vals).to_bits(), ref_sequential_sum(&vals).to_bits());
     }
 
     /// min/max: against a sequential scalar fold with the probed reference min

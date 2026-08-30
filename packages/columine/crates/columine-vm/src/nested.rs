@@ -8,7 +8,7 @@
 use crate::meta::SlotMetaView;
 use crate::{aggregates, bytes, hash_table};
 use columine_types::types::{
-    ChangeFlag, EMPTY_KEY, ErrorCode, SlotType, TOMBSTONE, hash_key, next_power_of_2,
+    AggType, ChangeFlag, EMPTY_KEY, ErrorCode, SlotType, TOMBSTONE, hash_key, next_power_of_2,
 };
 
 /// Prefix stored at the start of a nested slot's data:
@@ -430,13 +430,6 @@ pub fn nested_map_upsert_last(
     ErrorCode::Ok
 }
 
-/// Raw AggType discriminants nested aggregates switch on (see `aggregates`
-/// on why raw bytes, not the enum, are the contract here).
-const AGG_SUM: u8 = 1;
-const AGG_COUNT: u8 = 2;
-const AGG_MIN: u8 = 3;
-const AGG_MAX: u8 = 4;
-
 /// Update an outer-keyed inner aggregate. `value_bits` carries the f64 bit
 /// pattern in the aggregate value lane.
 pub fn nested_agg_update(
@@ -446,6 +439,9 @@ pub fn nested_agg_update(
     value_bits: u64,
 ) -> ErrorCode {
     let prefix = read_nested_prefix(state, meta.offset);
+    let Some(agg_type) = AggType::from_u8(prefix.inner_agg_type_byte) else {
+        return ErrorCode::InvalidProgram;
+    };
     let outer = OuterTable::bind(meta);
     let Some(resolved) = outer.resolve(state, outer_key, prefix) else {
         return ErrorCode::CapacityExceeded;
@@ -458,34 +454,38 @@ pub fn nested_agg_update(
     // Aggregate is fixed-size, no hash table — just raw bytes. Zeroed at
     // allocation, so MIN/MAX use `count == 0` instead of infinity sentinels.
     let base = resolved.offset;
-    match prefix.inner_agg_type_byte {
-        AGG_COUNT => {
+    match agg_type {
+        AggType::Count => {
             let count = bytes::read_u64(state, base);
             bytes::write_u64(state, base, count + 1);
         }
-        AGG_SUM => {
+        AggType::Sum => {
             let val = bytes::read_f64(state, base);
             let count = bytes::read_u64(state, base + 8);
             bytes::write_f64(state, base, val + f64::from_bits(value_bits));
             bytes::write_u64(state, base + 8, count + 1);
         }
-        AGG_MIN => {
+        AggType::Min | AggType::Max => {
             let count = bytes::read_u64(state, base + 8);
-            let new_val = f64::from_bits(value_bits);
-            if count == 0 || new_val < bytes::read_f64(state, base) {
-                bytes::write_f64(state, base, new_val);
-            }
+            let current = if count == 0 {
+                if agg_type == AggType::Min {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                }
+            } else {
+                bytes::read_f64(state, base)
+            };
+            let new_value = f64::from_bits(value_bits);
+            let next = if agg_type == AggType::Min {
+                aggregates::min_profile(current, new_value)
+            } else {
+                aggregates::max_profile(current, new_value)
+            };
+            bytes::write_f64(state, base, next);
             bytes::write_u64(state, base + 8, count + 1);
         }
-        AGG_MAX => {
-            let count = bytes::read_u64(state, base + 8);
-            let new_val = f64::from_bits(value_bits);
-            if count == 0 || new_val > bytes::read_f64(state, base) {
-                bytes::write_f64(state, base, new_val);
-            }
-            bytes::write_u64(state, base + 8, count + 1);
-        }
-        _ => {}
+        _ => return ErrorCode::InvalidProgram,
     }
     meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
     ErrorCode::Ok
@@ -538,6 +538,10 @@ pub fn inner_agg_get_count(state: &[u8], inner_offset: u32, agg_type_byte: u8) -
     if inner_offset == 0 {
         return 0;
     }
-    let count_off = if agg_type_byte == AGG_COUNT { 0 } else { 8 };
+    let count_off = if agg_type_byte == AggType::Count as u8 {
+        0
+    } else {
+        8
+    };
     bytes::read_u64(state, inner_offset + count_off)
 }
