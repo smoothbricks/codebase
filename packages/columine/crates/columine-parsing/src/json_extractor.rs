@@ -431,7 +431,7 @@ fn extract_json_event_open(
         append(columns, *presence_column, Some(ColumnValue::Bool(present)))?;
         columns.columns_seen[*presence_column] = true;
     }
-    for (column, _, _) in &config.field_entries {
+    for (column, _) in &config.field_entries {
         if !columns.columns_seen[*column] {
             append(columns, *column, None)?;
         }
