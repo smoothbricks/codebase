@@ -25,7 +25,7 @@ use crate::api::dto::{
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
-    SandboxExecRequest, SpawnFailure, SpawnPlan, classify_spawn_error, plan_exec,
+    ExecError, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec,
     prepare_child_descriptors,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -1350,7 +1350,9 @@ impl SpawnSink for SystemSpawnSink {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
-        prepare_child_descriptors(command.as_std_mut()).map_err(map_spawn_failure)?;
+        prepare_child_descriptors(command.as_std_mut())
+            .map_err(ExecError::from)
+            .map_err(map_exec_error)?;
         // SAFETY: `pre_exec` runs in the forked child, between `fork` and `exec`, in a process
         // that was multithreaded at the fork. Only async-signal-safe calls are legal there, and
         // POSIX lists `setpgid` as one; it allocates nothing, takes no lock, and touches no
@@ -1370,7 +1372,8 @@ impl SpawnSink for SystemSpawnSink {
         let mut child = command
             .spawn()
             .map_err(classify_spawn_error)
-            .map_err(map_spawn_failure)?;
+            .map_err(ExecError::from)
+            .map_err(map_exec_error)?;
         let pid = child.id().ok_or_else(|| {
             CowshedError::internal("spawned sandbox process has no process identity")
         })?;
@@ -3580,16 +3583,6 @@ pub(crate) fn utc_now() -> Result<UtcTimestamp> {
 
 fn byte_count(value: usize) -> u64 {
     u64::try_from(value).expect("supported platforms have at most 64-bit usize")
-}
-
-fn map_spawn_failure(failure: SpawnFailure) -> CowshedError {
-    CowshedError::environment_missing(
-        format!(
-            "sandbox wrapper failed during {:?}: {}",
-            failure.stage, failure.source
-        ),
-        "verify the macOS sandbox execution environment",
-    )
 }
 
 fn map_exec_error(error: crate::exec::ExecError) -> CowshedError {
