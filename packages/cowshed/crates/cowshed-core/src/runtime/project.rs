@@ -61,10 +61,25 @@ pub struct ProjectDescriptor {
     pub store_root: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Which captured stream a log read walks.
+///
+/// Deserialized straight off the wire and converted once, at the supervisor boundary, into the
+/// storage layer's [`crate::storage::job_artifact::StreamKind`]. A second wire spelling could
+/// not be caught by any test, because both would be structurally identical.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
 pub enum RuntimeJobStream {
     Stdout,
     Stderr,
+}
+
+impl From<RuntimeJobStream> for crate::storage::job_artifact::StreamKind {
+    fn from(stream: RuntimeJobStream) -> Self {
+        match stream {
+            RuntimeJobStream::Stdout => Self::Stdout,
+            RuntimeJobStream::Stderr => Self::Stderr,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -898,17 +913,13 @@ impl ProjectActor {
         let params: LogsParams = decode_params(request.params(), request.method())?;
         self.require_scoped_workspace(request.authority(), &params.workspace_params())
             .await?;
-        let stream = match params.stream {
-            JobStreamWire::Stdout => RuntimeJobStream::Stdout,
-            JobStreamWire::Stderr => RuntimeJobStream::Stderr,
-        };
         let chunk = self
             .host
             .read_log(
                 params.workspace,
                 params.workspace_incarnation,
                 params.job_id,
-                stream,
+                params.stream,
                 params.offset,
                 params.follow,
             )
@@ -1301,13 +1312,6 @@ impl WorkerPushParams {
     }
 }
 
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum JobStreamWire {
-    Stdout,
-    Stderr,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LogsParams {
@@ -1315,7 +1319,7 @@ struct LogsParams {
     workspace: WorkspaceName,
     workspace_incarnation: WorkspaceIncarnation,
     job_id: JobId,
-    stream: JobStreamWire,
+    stream: RuntimeJobStream,
     follow: bool,
     offset: u64,
 }
@@ -1338,19 +1342,12 @@ struct ExecWire {
     session: Option<String>,
     argv: Vec<CommandArg>,
     cwd: Option<crate::api::dto::WorkspacePath>,
-    mode: ExecModeWire,
+    mode: RunSandboxMode,
     env: std::collections::HashMap<String, String>,
     trace: Option<crate::api::dto::TraceContext>,
     stdin: StdinWire,
     stdout_copy: Option<crate::api::dto::OutputPublication>,
     stderr_copy: Option<crate::api::dto::OutputPublication>,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum ExecModeWire {
-    ReadWrite,
-    ReadOnly,
 }
 
 #[derive(Deserialize)]
@@ -1409,10 +1406,7 @@ fn decode_exec_request(
             StdinSource::WorkspaceFile(workspace_path)
         }
     };
-    let mode = match wire.mode {
-        ExecModeWire::ReadWrite => RunSandboxMode::ReadWrite,
-        ExecModeWire::ReadOnly => RunSandboxMode::ReadOnly,
-    };
+    let mode = wire.mode;
     let scope = WorkerScope {
         repo_id: wire.repo_id,
         workspace: wire.workspace,
@@ -6629,10 +6623,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     ) -> Result<RuntimeLogChunk> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
-        let stream = match stream {
-            RuntimeJobStream::Stdout => super::supervisor::OutputStream::Stdout,
-            RuntimeJobStream::Stderr => super::supervisor::OutputStream::Stderr,
-        };
+        let stream = crate::storage::job_artifact::StreamKind::from(stream);
         let chunk = self
             .ensure_supervisor(&workspace)
             .await?
@@ -8172,11 +8163,11 @@ async fn read_job_stderr_tail(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     job_id: JobId,
 ) -> String {
-    use crate::runtime::supervisor::OutputStream;
+    use crate::storage::job_artifact::StreamKind;
     let mut collected = Vec::new();
     let mut offset = 0_u64;
     while let Ok(chunk) = handle
-        .log_read(job_id, OutputStream::Stderr, offset, false)
+        .log_read(job_id, StreamKind::Stderr, offset, false)
         .await
     {
         collected.extend_from_slice(&chunk.bytes);
