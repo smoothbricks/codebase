@@ -8512,7 +8512,9 @@ fn native_environment_error(
     }
 }
 
-#[cfg(target_os = "macos")]
+// Not platform-specific: the body only builds a CowshedError. It was gated when every caller
+// happened to be macOS-only, which broke the Linux cross-lint once the shared workspace-marker
+// reader started using it.
 fn native_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "cowshed doctor --json")
 }
