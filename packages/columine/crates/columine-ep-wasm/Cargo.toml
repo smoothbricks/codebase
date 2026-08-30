@@ -16,6 +16,8 @@ columine-event-processor = { path = "../columine-event-processor" }
 columine-arrow = { path = "../columine-arrow" }
 
 [dev-dependencies]
+# The export audit reads the wasm export section and the frozen ABI table.
+columine-types = { workspace = true, features = ["audit"] }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }

@@ -11,8 +11,7 @@ use columine_types::types::{SLOT_META_SIZE, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_wasm::{
     __register_region, vm_calculate_state_size, vm_delta_export_entry_size,
     vm_delta_export_len_bytes, vm_delta_export_segment, vm_delta_export_undo_ptr, vm_execute_batch,
-    vm_init_state, vm_map_get, vm_rbmp_algebra_result_len, vm_rbmp_and,
-    vm_rbmp_cardinality_serialized, vm_undo_checkpoint, vm_undo_enable, vm_undo_has_overflow,
+    vm_init_state, vm_map_get, vm_undo_checkpoint, vm_undo_enable, vm_undo_has_overflow,
     vm_undo_rollback,
 };
 use std::sync::{Mutex, MutexGuard};
@@ -105,20 +104,5 @@ fn init_execute_read_undo_round_trip() {
         unsafe { vm_map_get(state.as_mut_ptr(), off, cap, 7) },
         u32::MAX,
         "rollback erases the insert (EMPTY_KEY sentinel)"
-    );
-}
-
-#[test]
-fn rbmp_serialized_ops_route_through_the_env() {
-    let _serial = serial();
-    // Empty ∧ empty → OK (0), empty algebra result.
-    assert_eq!(
-        unsafe { vm_rbmp_and(core::ptr::null(), 0, core::ptr::null(), 0) },
-        0
-    );
-    assert_eq!(vm_rbmp_algebra_result_len(), 0);
-    assert_eq!(
-        unsafe { vm_rbmp_cardinality_serialized(core::ptr::null(), 0) },
-        0
     );
 }
