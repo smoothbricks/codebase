@@ -334,7 +334,7 @@ async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
     assert!(invalid.0.contains("non-mirror"));
     sink.flush()
         .await
-        .expect_err("invalid event hard-stops the audit writer");
+        .expect("invalid event leaves the audit writer available");
     let partition = std::fs::read_dir(&root)
         .expect("read telemetry root")
         .next()
