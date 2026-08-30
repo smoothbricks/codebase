@@ -20,7 +20,7 @@ use crate::bytes;
 use crate::hash_table;
 use crate::hashmap_ops::{self, CmpType, Strategy};
 use crate::hashset_ops;
-use crate::hooks::{MutationOp, MutationRecord, VmHooks};
+use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
 use crate::state_init::{self, ARENA_HEADER_SIZE, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
@@ -839,19 +839,9 @@ impl Vm {
     }
 }
 
-const fn mutation_op_to_flat(op: MutationOp) -> FlatUndoOp {
-    match op {
-        MutationOp::SetInsert => FlatUndoOp::SetInsert,
-        MutationOp::SetDelete => FlatUndoOp::SetDelete,
-        MutationOp::MapInsert => FlatUndoOp::MapInsert,
-        MutationOp::MapDelete => FlatUndoOp::MapDelete,
-        MutationOp::MapUpdate => FlatUndoOp::MapUpdate,
-    }
-}
-
 const fn record_to_entry(r: MutationRecord) -> FlatUndoEntry {
     FlatUndoEntry {
-        op: mutation_op_to_flat(r.op),
+        op: r.op,
         slot: r.slot,
         pad1: 0,
         pad2: 0,
