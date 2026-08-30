@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
-import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET } from './cross-check-policy.js';
+import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2 } from './index.js';
 import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
 
@@ -290,10 +290,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         '!{projectRoot}/**/target/**',
       ]);
       expect(targets['cargo-lint']?.options).toMatchObject({
-        commands: [
-          'cargo fmt --all --check',
-          'cargo clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
-        ],
+        commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
       });
       expect(targets.lint?.dependsOn).toEqual(['cargo-lint']);
       expect(targets[CARGO_CROSS_LINT_TARGET]?.options).toMatchObject({
