@@ -1469,26 +1469,23 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn hex_decode_32(value: &str) -> Result<[u8; 32], CacheError> {
-    if value.len() != 64 {
+pub(crate) fn hex_decode<const N: usize>(value: &str) -> Result<[u8; N], CacheError> {
+    if value.len() != N * 2 {
         return Err(CacheError::InvalidMetadata);
     }
-    let mut decoded = [0; 32];
+    let mut decoded = [0; N];
     for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Ok(decoded)
 }
 
+fn hex_decode_32(value: &str) -> Result<[u8; 32], CacheError> {
+    hex_decode(value)
+}
+
 fn hex_decode_64(value: &str) -> Result<[u8; 64], CacheError> {
-    if value.len() != 128 {
-        return Err(CacheError::InvalidMetadata);
-    }
-    let mut decoded = [0; 64];
-    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
-    }
-    Ok(decoded)
+    hex_decode(value)
 }
 
 fn hex_nibble(value: u8) -> Result<u8, CacheError> {
