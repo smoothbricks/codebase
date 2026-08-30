@@ -20,6 +20,13 @@ use columine_types::types::{EMPTY_KEY, TOMBSTONE, hash_key, hash_key_pair};
 const HDR_CAP: u32 = 0;
 const HDR_SIZE: u32 = 4;
 pub const HDR_BYTES: u32 = 8;
+/// Occupied-cell admission: 70% integer load (`cap * 7 / 10`).
+pub const LOAD_NUM: u32 = 7;
+pub const LOAD_DEN: u32 = 10;
+
+pub const fn max_load_for_cap(cap: u32) -> u32 {
+    cap * LOAD_NUM / LOAD_DEN
+}
 
 /// Entry sizes for the concrete table forms.
 pub const ENTRY_NONE: u32 = 0; // HashSet
@@ -284,7 +291,7 @@ impl FlatTable {
 
     /// Maximum size before growth, using a 70% integer load factor.
     pub const fn max_load(&self) -> u32 {
-        self.cap * 7 / 10
+        max_load_for_cap(self.cap)
     }
 
     /// Find a key by linear probing. The sequence starts at `hash_key`, steps
