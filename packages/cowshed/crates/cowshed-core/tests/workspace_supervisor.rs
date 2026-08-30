@@ -157,7 +157,11 @@ enum OrderObservation {
     Spawn(JobId),
 }
 
+/// `sealed_stdout` lets a test commit a stdout stream that differs from the bytes the job wrote,
+/// which is the only way to observe from outside whether a terminal log read is answered from the
+/// store's committed copy or from a second copy the actor kept.
 struct FakeArtifactSink {
+    sealed_stdout: Option<Vec<u8>>,
     next: JobId,
     next_barrier: u64,
     quota: u64,
@@ -190,6 +194,7 @@ impl ArtifactSink for FakeArtifactSink {
             expected_job_id,
             FakeArtifactJob {
                 id: expected_job_id,
+                sealed_stdout: self.sealed_stdout.clone(),
                 quota: self.quota,
                 accepted: 0,
                 stdout: Vec::new(),
@@ -247,6 +252,7 @@ impl ArtifactSink for FakeArtifactSink {
 
 struct FakeArtifactJob {
     id: JobId,
+    sealed_stdout: Option<Vec<u8>>,
     quota: u64,
     accepted: u64,
     stdout: Vec<u8>,
@@ -294,7 +300,7 @@ impl FakeArtifactJob {
             .send(OrderObservation::ArtifactSeal(self.id))
             .expect("order observer");
         Ok(ArtifactSeal {
-            stdout: stream(self.stdout),
+            stdout: stream(self.sealed_stdout.unwrap_or(self.stdout)),
             stderr: stream(self.stderr),
             terminal_batch_sha256: Sha256Digest::compute(&self.id.get().to_be_bytes()),
             output_limit: self.crossing,
@@ -408,6 +414,20 @@ fn harness_with_config(
         fail_next,
         backpressure,
         VecDeque::new(),
+        None,
+    )
+}
+
+/// A harness whose artifact sink commits a stdout stream that is not what the job wrote.
+fn harness_with_sealed_stdout(sealed_stdout: Vec<u8>) -> Harness {
+    harness_with_devenv_outputs(
+        config(),
+        1,
+        1024,
+        false,
+        false,
+        VecDeque::new(),
+        Some(sealed_stdout),
     )
 }
 
@@ -418,6 +438,7 @@ fn harness_with_devenv_outputs(
     fail_next: bool,
     backpressure: bool,
     devenv_outputs: VecDeque<CommandOutput>,
+    sealed_stdout: Option<Vec<u8>>,
 ) -> Harness {
     let (spawn_tx, spawned) = mpsc::unbounded_channel();
     let (process_tx, process) = mpsc::unbounded_channel();
@@ -437,6 +458,7 @@ fn harness_with_devenv_outputs(
             devenv_outputs,
         }),
         Box::new(FakeArtifactSink {
+            sealed_stdout,
             next: JobId::new(start_id).unwrap(),
             next_barrier: 1,
             quota,
@@ -654,6 +676,7 @@ async fn stale_devenv_snapshot_refreshes_once_and_merges_before_spawn() {
         false,
         false,
         VecDeque::from([output]),
+        None,
     );
     let mut exec = request(StdinSource::Empty);
     exec.env.insert("CONFLICT".into(), "controller".into());
@@ -732,6 +755,7 @@ async fn a_persisted_devenv_snapshot_is_reused_by_the_next_supervisor_without_ev
         VecDeque::from([printed_devenv_output(serde_json::json!({
             "FROM_SNAPSHOT": { "type": "exported", "value": "ready" }
         }))]),
+        None,
     );
     let job = first
         .handle
@@ -809,6 +833,7 @@ async fn configured_missing_devenv_and_failed_refresh_are_fail_closed() {
         false,
         false,
         VecDeque::from([CommandOutput::failure(42, b"evaluation exploded".to_vec())]),
+        None,
     );
     let error = failed
         .handle
@@ -1533,4 +1558,62 @@ async fn a_wait_failure_fails_the_job_without_inventing_an_exit_status() {
 
     // A retire must not hang on a job whose child was never reaped.
     h.handle.retire().await.unwrap();
+}
+
+/// After seal there must be exactly one copy of a job's output, and it must be the store's.
+///
+/// The fake sink seals a stream that deliberately differs from the bytes the job wrote. A
+/// terminal `log_read` that answers from the actor's retained deque returns the written bytes;
+/// one that answers from the sealed artifact returns the committed bytes. The retained deque is
+/// the second copy this test exists to forbid -- it is also unbounded growth, since the store's
+/// per-job output quota is a gigabyte and no terminal record was ever released.
+#[tokio::test]
+async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_copy() {
+    let mut h = harness_with_sealed_stdout(b"sealed".to_vec());
+    let job = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"written", b"", ExitStatus::Exited { code: 0 }).await;
+    let info = h.handle.wait(job).await.unwrap();
+    assert_eq!(info.stdout.bytes, 6);
+
+    let chunk = h
+        .handle
+        .log_read(job, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(chunk.bytes, Bytes::from_static(b"sealed"));
+    assert_eq!(chunk.next_offset, 6);
+    assert!(chunk.eof);
+
+    // Paging from an offset walks the sealed stream, and reading at the end is a clean eof.
+    let tail = h
+        .handle
+        .log_read(job, StreamKind::Stdout, 2, false)
+        .await
+        .unwrap();
+    assert_eq!(tail.bytes, Bytes::from_static(b"aled"));
+    assert_eq!(tail.next_offset, 6);
+    assert!(tail.eof);
+
+    let end = h
+        .handle
+        .log_read(job, StreamKind::Stdout, 6, false)
+        .await
+        .unwrap();
+    assert!(end.bytes.is_empty());
+    assert!(end.eof);
+
+    // An offset past the committed length is a refusal, not a short read.
+    assert_eq!(
+        h.handle
+            .log_read(job, StreamKind::Stdout, 7, false)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
 }
