@@ -706,8 +706,12 @@ async fn stale_devenv_snapshot_refreshes_once_and_merges_before_spawn() {
     std::fs::remove_dir_all(root).ok();
 }
 
+/// Startup reuse through the real persistence path, which is the scenario the reconciliation
+/// exists for: a supervisor that starts over a mount someone else already evaluated must not
+/// evaluate again. The second harness is given NO devenv output, so reusing the persisted
+/// snapshot is the only way it can produce the variable -- an evaluation would fail the exec.
 #[tokio::test]
-async fn fresh_devenv_snapshot_spawns_without_source_stats_or_devenv_invocation() {
+async fn a_persisted_devenv_snapshot_is_reused_by_the_next_supervisor_without_evaluating() {
     let (supervisor_config, root) = isolated_config("devenv-fresh");
     let mount = supervisor_config.workspace_root.clone();
     let devenv_dir = mount.join("tooling/devenv");
@@ -718,28 +722,51 @@ async fn fresh_devenv_snapshot_spawns_without_source_stats_or_devenv_invocation(
     )
     .expect("config");
     std::fs::write(devenv_dir.join("devenv.nix"), "{}").expect("devenv.nix");
-    std::thread::sleep(Duration::from_millis(20));
-    write_devenv_snapshot(&devenv_dir, serde_json::json!({ "FROM_SNAPSHOT": "ready" }));
 
-    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
-    let job = h
+    let mut first = harness_with_devenv_outputs(
+        supervisor_config.clone(),
+        1,
+        1024,
+        false,
+        false,
+        VecDeque::from([printed_devenv_output(serde_json::json!({
+            "FROM_SNAPSHOT": { "type": "exported", "value": "ready" }
+        }))]),
+    );
+    let job = first
         .handle
         .exec(None, request(StdinSource::Empty))
         .await
         .unwrap();
-    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(first.devenv_requests.recv().await.unwrap(), devenv_dir);
+    let spawned = first.spawned.recv().await.unwrap();
+    assert_eq!(
+        spawned.request.env.get("FROM_SNAPSHOT").map(String::as_str),
+        Some("ready")
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    first.handle.wait(job).await.unwrap();
+    drop(first);
+
+    let mut second = harness_with_config(supervisor_config, 2, 1024, false, false);
+    let job = second
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = second.spawned.recv().await.unwrap();
     assert_eq!(
         spawned.request.env.get("FROM_SNAPSHOT").map(String::as_str),
         Some("ready")
     );
     assert!(matches!(
-        h.devenv_requests.try_recv(),
+        second.devenv_requests.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(job).await.unwrap();
+    second.handle.wait(job).await.unwrap();
 
-    drop(h);
+    drop(second);
     std::fs::remove_dir_all(root).ok();
 }
 
