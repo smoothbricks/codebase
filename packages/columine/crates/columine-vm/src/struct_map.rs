@@ -26,6 +26,31 @@ pub struct Upsert {
     pub is_new: bool,
 }
 
+fn write_scalar_cell(
+    state: &mut [u8],
+    f_off: u32,
+    ft: StructFieldType,
+    col: &[u8],
+    element_idx: u32,
+) {
+    match ft {
+        StructFieldType::UInt32 | StructFieldType::String => {
+            bytes::write_u32(state, f_off, bytes::read_u32(col, element_idx * 4));
+        }
+        StructFieldType::Int64 | StructFieldType::Float64 => {
+            bytes::write_u64(state, f_off, bytes::read_u64(col, element_idx * 8));
+        }
+        StructFieldType::Bool => {
+            state[f_off as usize] = u8::from(bytes::read_u32(col, element_idx * 4) != 0);
+        }
+        StructFieldType::ArrayU32
+        | StructFieldType::ArrayI64
+        | StructFieldType::ArrayF64
+        | StructFieldType::ArrayString
+        | StructFieldType::ArrayBool => {}
+    }
+}
+
 /// Bound struct-map view carrying offsets into the state buffer.
 /// No pointers into state are formed.
 #[derive(Clone, Copy, Debug)]
@@ -227,35 +252,8 @@ impl StructMapSlot {
         let row = self.row_off(pos);
         let ft = self.field_type(state, field_idx);
         let f_off = row + self.field_offset(state, field_idx);
-        let col = cols[val_col as usize];
-
         Self::set_field_bit(state, row, field_idx);
-
-        match ft {
-            StructFieldType::UInt32 | StructFieldType::String => {
-                let v = bytes::read_u32(col, element_idx * 4);
-                bytes::write_u32(state, f_off, v);
-            }
-            StructFieldType::Int64 => {
-                let v = bytes::read_u64(col, element_idx * 8);
-                bytes::write_u64(state, f_off, v);
-            }
-            StructFieldType::Float64 => {
-                // Preserve the f64 bit pattern as its raw little-endian bytes.
-                let v = bytes::read_u64(col, element_idx * 8);
-                bytes::write_u64(state, f_off, v);
-            }
-            StructFieldType::Bool => {
-                let v = bytes::read_u32(col, element_idx * 4);
-                state[f_off as usize] = u8::from(v != 0);
-            }
-            // Array fields are handled separately.
-            StructFieldType::ArrayU32
-            | StructFieldType::ArrayI64
-            | StructFieldType::ArrayF64
-            | StructFieldType::ArrayString
-            | StructFieldType::ArrayBool => {}
-        }
+        write_scalar_cell(state, f_off, ft, cols[val_col as usize], element_idx);
     }
 
     /// Return the absolute byte offset of a key's row, or `0xFFFF_FFFF` when
@@ -458,24 +456,8 @@ impl StructMap2Slot {
         let row = self.row_off(pos);
         let ft = self.field_type(state, field_idx);
         let f_off = row + self.field_offset(state, field_idx);
-        let col = cols[val_col as usize];
         StructMapSlot::set_field_bit(state, row, field_idx);
-        match ft {
-            StructFieldType::UInt32 | StructFieldType::String => {
-                bytes::write_u32(state, f_off, bytes::read_u32(col, element_idx * 4));
-            }
-            StructFieldType::Int64 | StructFieldType::Float64 => {
-                bytes::write_u64(state, f_off, bytes::read_u64(col, element_idx * 8));
-            }
-            StructFieldType::Bool => {
-                state[f_off as usize] = u8::from(bytes::read_u32(col, element_idx * 4) != 0);
-            }
-            StructFieldType::ArrayU32
-            | StructFieldType::ArrayI64
-            | StructFieldType::ArrayF64
-            | StructFieldType::ArrayString
-            | StructFieldType::ArrayBool => {}
-        }
+        write_scalar_cell(state, f_off, ft, cols[val_col as usize], element_idx);
     }
 
     pub fn get_row_ptr_by_key(&self, state: &[u8], key1: u32, key2: u32) -> u32 {
