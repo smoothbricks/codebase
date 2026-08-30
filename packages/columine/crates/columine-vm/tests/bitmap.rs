@@ -10,10 +10,13 @@ use columine_vm::bitmap_ops::{
 use columine_vm::hooks::{MutationOp, MutationRecord, NoVm, VmHooks};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::minroar::MiniRoaring as RoaringBitmap;
+use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
+use columine_vm::vm::{EVICTION_ENTRY_SIZE, Vm, find_latest_eviction_timestamp_for_key};
 use proptest::prelude::*;
 
+use columine_types::opcodes::PROGRAM_MAGIC;
 use columine_types::types::{
-    BITMAP_BASE_BYTES, BITMAP_BYTES_PER_CAPACITY, BITMAP_SERIALIZED_LEN_BYTES, ErrorCode,
+    BITMAP_BASE_BYTES, BITMAP_BYTES_PER_CAPACITY, BITMAP_SERIALIZED_LEN_BYTES, ErrorCode, Opcode,
     SLOT_META_SIZE, STATE_FORMAT_VERSION, STATE_HEADER_SIZE, STATE_MAGIC, SlotMetaOffset, SlotType,
     StateHeaderOffset,
 };
@@ -127,6 +130,70 @@ fn init_ttl_bitmap_slot_state(state: &mut [u8], capacity: u32) -> SlotMetaView {
     let meta = init_bitmap_slot_state(state, capacity);
     state[(meta.meta_base + SlotMetaOffset::TYPE_FLAGS) as usize] = SlotType::Bitmap as u8 | 0x10;
     SlotMetaView::read(state, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Real-VM scaffolding: a program-initialized TTL BITMAP slot, so the eviction
+// index and the payload region are laid out by `init_state` rather than by the
+// test hand-writing metadata offsets.
+// ---------------------------------------------------------------------------
+
+/// `SlotTypeFlags::HAS_TTL_MASK`, which is private to `columine-types`.
+const TTL_FLAG: u8 = 0x10;
+
+/// Assemble a program: 32-byte hash prefix + 14-byte content header + init and
+/// reduce sections, each NUL-terminated.
+fn program(num_slots: u8, num_inputs: u8, init: &[u8], reduce: &[u8]) -> Vec<u8> {
+    let mut init = init.to_vec();
+    init.push(Opcode::Halt as u8);
+    let mut reduce = reduce.to_vec();
+    reduce.push(Opcode::Halt as u8);
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, num_slots, num_inputs, 0, 0]);
+    prog.extend((init.len() as u16).to_le_bytes());
+    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend(init);
+    prog.extend(reduce);
+    prog
+}
+
+/// One TTL BITMAP slot fed by BATCH_SET_INSERT. `requested` is the program's
+/// capacity request; initialization normalizes it to `next_power_of_2(2n)`.
+fn ttl_bitmap_program(requested: u16) -> Vec<u8> {
+    let mut def = vec![
+        Opcode::SlotDef as u8,
+        0,
+        SlotType::Bitmap as u8 | TTL_FLAG,
+        requested as u8,
+        (requested >> 8) as u8,
+    ];
+    def.extend(10.0f32.to_le_bytes()); // ttl_seconds
+    def.extend(0.0f32.to_le_bytes()); // grace_seconds
+    def.push(1); // timestamp column index
+    def.push(0); // DurationUnit::NONE
+    program(1, 2, &def, &[Opcode::BatchSetInsert as u8, 0, 0])
+}
+
+fn init_program_state(prog: &[u8]) -> Vec<u8> {
+    let size = calculate_state_size(prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    assert!(size > 0, "program must size a state");
+    let mut state = vec![0u8; size as usize];
+    init_state(&mut state, prog, DEFAULT_ACCEPTED_PROGRAM_MAGICS).expect("init_state");
+    state
+}
+
+/// One element per 16-bit container. minroar promotes arrays to bitsets at 4096
+/// entries and never demotes, so keeping every container at cardinality one is
+/// what makes a byte-level payload comparison meaningful instead of flaky.
+fn sparse_key(high: u16) -> u32 {
+    u32::from(high) << 16
+}
+
+/// A timestamp that is a pure function of the key — see the reversibility
+/// property for why a key-varying timestamp is not recoverable.
+fn sparse_ts(key: u32) -> f64 {
+    f64::from(key >> 16)
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +728,178 @@ proptest! {
         prop_assert_eq!(state, initial_state);
         prop_assert_eq!(hooks, RecordingHooks::default());
     }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Apply-then-undo is the identity on a TTL BITMAP slot, driven through the
+    /// real `Vm` undo log and the real in-state eviction index rather than a
+    /// hand replay — and including operations refused for payload capacity,
+    /// which must commit nothing on any of the three planes.
+    ///
+    /// The refusal is spliced at a randomized point in a randomized add/remove
+    /// sequence: the flood batch asks for more sparse containers than the
+    /// payload can hold, while staying under `meta.capacity` elements so the
+    /// element-cap branch — which deliberately commits what fits — stays
+    /// unreachable and every `CapacityExceeded` here is the payload one.
+    ///
+    /// Timestamps are a pure function of the key. A TTL refresh of an element
+    /// that is already present emits no undo record, so a key-varying timestamp
+    /// would not be recoverable; that gap is pinned by
+    /// `ttl_refresh_of_present_member_records_no_undo_entry`.
+    #[test]
+    fn bitmap_apply_then_undo_is_identity_across_payload_refusal(
+        batches in prop::collection::vec(
+            (prop::collection::btree_set(1u16..240, 1..24), any::<bool>()),
+            1..14,
+        ),
+        flood_at in any::<prop::sample::Index>(),
+    ) {
+        let prog = ttl_bitmap_program(128);
+        let mut state = init_program_state(&prog);
+        let meta = SlotMetaView::read(&state, 0);
+        prop_assert_eq!(meta.capacity, 256); // next_power_of_2(128 * 2)
+        prop_assert!(meta.has_ttl());
+        prop_assert_eq!(meta.eviction_index_capacity(&state), 256);
+
+        let mut vm = Vm::default();
+
+        // Seed with undo disabled so the eviction index starts non-empty and
+        // rollback's restore path has real entries to put back.
+        let seed: Vec<u32> = (1u16..61).map(sparse_key).collect();
+        let seed_ts: Vec<f64> = seed.iter().copied().map(sparse_ts).collect();
+        prop_assert_eq!(
+            vm.ctx()
+                .batch_bitmap_add(false, &mut state, &meta, 0, &seed, Some(&seed_ts)),
+            ErrorCode::Ok
+        );
+        prop_assert_eq!(meta.eviction_index_size(&state), 60);
+
+        vm.undo_enable(&state);
+        let checkpoint = vm.undo_checkpoint();
+        let initial = state.clone();
+
+        // Every distinct high word: more containers than the payload can hold.
+        let flood: Vec<u32> = (1u16..240).map(sparse_key).collect();
+        let flood_ts: Vec<f64> = flood.iter().copied().map(sparse_ts).collect();
+        let flood_at = flood_at.index(batches.len() + 1);
+
+        let mut saw_payload_refusal = false;
+        for step in 0..=batches.len() {
+            if step == flood_at {
+                let before = state.clone();
+                let undo_before = vm.undo_checkpoint();
+                prop_assert_eq!(
+                    vm.ctx().batch_bitmap_add(
+                        false, &mut state, &meta, 0, &flood, Some(&flood_ts)
+                    ),
+                    ErrorCode::CapacityExceeded
+                );
+                saw_payload_refusal = true;
+                prop_assert_ne!(
+                    vm.bitmap_env.last_error, 0,
+                    "a payload refusal must leave a diagnostic behind"
+                );
+                prop_assert_eq!(
+                    &state, &before,
+                    "refused add wrote slot bytes or the eviction index"
+                );
+                prop_assert_eq!(
+                    vm.undo_checkpoint(), undo_before,
+                    "refused add appended undo records"
+                );
+            }
+            let Some((highs, is_remove)) = batches.get(step) else {
+                continue;
+            };
+            let elems: Vec<u32> = highs.iter().copied().map(sparse_key).collect();
+            let result = if *is_remove {
+                vm.ctx()
+                    .batch_bitmap_remove(false, &mut state, &meta, 0, &elems)
+            } else {
+                let ts: Vec<f64> = elems.iter().copied().map(sparse_ts).collect();
+                vm.ctx()
+                    .batch_bitmap_add(false, &mut state, &meta, 0, &elems, Some(&ts))
+            };
+            prop_assert_eq!(result, ErrorCode::Ok, "accepted workload stays under both ceilings");
+        }
+        prop_assert!(saw_payload_refusal);
+
+        vm.undo_rollback(&mut state, checkpoint);
+        prop_assert_eq!(vm.undo_checkpoint(), checkpoint);
+
+        // Slot bytes and the metadata record are byte-exact: `bitmap_store`
+        // re-serializes the whole payload and zeroes its tail.
+        let storage = get_bitmap_storage(&meta);
+        let slot = meta.offset as usize
+            ..(storage.payload_offset() + storage.payload_capacity) as usize;
+        prop_assert_eq!(&state[slot.clone()], &initial[slot]);
+        let record = meta.meta_base as usize..(meta.meta_base + SLOT_META_SIZE) as usize;
+        prop_assert_eq!(&state[record.clone()], &initial[record]);
+
+        // The eviction index is a length-prefixed array, and
+        // `remove_eviction_entries_for_key` compacts without clearing the tail,
+        // so entries past `size` are outside the structure — the same rule that
+        // lets a rolled-back hash table keep stale bytes in dead cells.
+        let size = meta.eviction_index_size(&state);
+        prop_assert_eq!(size, meta.eviction_index_size(&initial));
+        let base = meta.eviction_index_offset(&state) as usize;
+        let live = base..base + (size * EVICTION_ENTRY_SIZE) as usize;
+        prop_assert_eq!(&state[live.clone()], &initial[live]);
+    }
+}
+
+/// A TTL refresh of an element that is already present rewrites its eviction
+/// timestamp without appending an undo record, so rollback cannot restore the
+/// previous one. `hashset_ops::batch_set_insert` refreshes the same way, so this
+/// is one policy rather than two — but it is a policy, not an accident, and the
+/// reversibility property above keeps timestamps key-derived to stay inside it.
+///
+/// Recording it needs an undo op for "member stays, timestamp reverts", which is
+/// a new `FlatUndoOp` wire value and therefore a cross-slice change.
+#[test]
+fn ttl_refresh_of_present_member_records_no_undo_entry() {
+    let prog = ttl_bitmap_program(128);
+    let mut state = init_program_state(&prog);
+    let meta = SlotMetaView::read(&state, 0);
+    let mut vm = Vm::default();
+
+    let elem = [sparse_key(9)];
+    assert_eq!(
+        vm.ctx()
+            .batch_bitmap_add(false, &mut state, &meta, 0, &elem, Some(&[100.0])),
+        ErrorCode::Ok
+    );
+
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+    assert_eq!(
+        find_latest_eviction_timestamp_for_key(&state, &meta, elem[0]),
+        Some(100.0)
+    );
+
+    assert_eq!(
+        vm.ctx()
+            .batch_bitmap_add(false, &mut state, &meta, 0, &elem, Some(&[500.0])),
+        ErrorCode::Ok
+    );
+    assert_eq!(
+        find_latest_eviction_timestamp_for_key(&state, &meta, elem[0]),
+        Some(500.0)
+    );
+    assert_eq!(
+        vm.undo_checkpoint(),
+        checkpoint,
+        "the refresh appended no undo record"
+    );
+
+    vm.undo_rollback(&mut state, checkpoint);
+    assert_eq!(
+        find_latest_eviction_timestamp_for_key(&state, &meta, elem[0]),
+        Some(500.0),
+        "rollback leaves the refreshed timestamp in place"
+    );
 }
 
 proptest! {
