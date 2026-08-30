@@ -30,10 +30,12 @@ Concrete targets come from concrete files:
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
-- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`. Cargo flocks one
-  `target/` per invocation, so inferred writers that share it are chained (`cargo-test-compile` → `napi-debug` →
-  `cargo-test`) rather than run as Nx siblings. Clippy uses `--target-dir target/cargo-lint` so lint can overlap tests.
-  Workspaces with `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
+- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
+  `cargo-test-compile` is one workspace `cargo test --no-run`. Each member crate gets a cached `cargo-test-<package>`
+  run (`cargo nextest`, 30s per-test timeout like `bun test --timeout=30000`) whose inputs are that crate and its path
+  deps, so unchanged crates are skipped. Those runs are chained so two cargos never share `target/`; `napi-debug` sits
+  on that chain after compile. Clippy uses `--target-dir target/cargo-lint` so lint can overlap tests. Workspaces with
+  `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling

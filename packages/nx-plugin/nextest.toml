@@ -1,0 +1,5 @@
+# Injected by @smoothbricks/nx-plugin as `--config-file` on inferred cargo-test
+# package targets. `period` matches bun's `--timeout=30000`; `terminate-after = 1`
+# kills at that bound instead of warning then waiting another period.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 1 }
