@@ -24,7 +24,6 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use arrow_ipc::writer::StreamWriter;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -35,7 +34,7 @@ use crate::api::dto::{
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
-use crate::storage::job_artifact::controller_commitments_to_batch;
+use crate::storage::job_artifact::write_controller_commitment;
 
 use crate::fsio::rename_noreplace;
 
@@ -372,8 +371,6 @@ impl ArrowAuditSink {
 
     fn seal(&mut self, commitment: &ControllerCommitment) -> Result<(), AuditSinkError> {
         let order = commitment.order();
-        let batch = controller_commitments_to_batch(std::slice::from_ref(commitment))
-            .map_err(|error| integrity(error.to_string()))?;
         let date = self
             .environment
             .utc_date()
@@ -397,16 +394,8 @@ impl ArrowAuditSink {
             .map_err(|_| integrity("sealed segment name contains NUL"))?;
         let mut file = create_new_file_at(&date_directory, &temporary)?;
         let mut cleanup = TemporaryCleanup::new(date_directory.as_raw_fd(), temporary.clone());
-        {
-            let mut writer = StreamWriter::try_new(&mut file, &batch.schema())
-                .map_err(|error| integrity(error.to_string()))?;
-            writer
-                .write(&batch)
-                .map_err(|error| integrity(error.to_string()))?;
-            writer
-                .finish()
-                .map_err(|error| integrity(error.to_string()))?;
-        }
+        write_controller_commitment(&mut file, commitment)
+            .map_err(|error| integrity(error.to_string()))?;
         file.flush()
             .map_err(|source| io_failure("flushing audit segment", source))?;
         file.sync_all()

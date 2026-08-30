@@ -2683,18 +2683,21 @@ fn truncate_incomplete(file: &mut File, path: &Path, offset: usize) -> Result<()
     Ok(())
 }
 
+fn write_batch<W: Write>(writer: W, batch: &RecordBatch) -> Result<(), ArtifactError> {
+    let mut stream = StreamWriter::try_new(writer, &batch.schema())
+        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    stream
+        .write(batch)
+        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    stream
+        .finish()
+        .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
+    Ok(())
+}
+
 fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArtifactError> {
     let mut payload = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut payload, &batch.schema())
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-        writer
-            .write(batch)
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-        writer
-            .finish()
-            .map_err(|error| ArtifactError::Arrow(error.to_string()))?;
-    }
+    write_batch(&mut payload, batch)?;
     Ok(payload)
 }
 
@@ -3639,18 +3642,27 @@ pub fn controller_commitments_to_batch(
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
-/// Decode one controller audit batch, validating every row on its own.
-///
 /// One commitment as a self-contained Arrow IPC stream — the byte form an
 /// external [`crate::storage::audit::AuditSink`] stores. Owned here beside
 /// the batch codec so the schema and the encoding drift together or not at
 /// all; a host that carried its own Arrow dependency would fork the version.
+pub fn write_controller_commitment<W: Write>(
+    writer: W,
+    commitment: &ControllerCommitment,
+) -> Result<(), ArtifactError> {
+    write_batch(
+        writer,
+        &controller_commitments_to_batch(std::slice::from_ref(commitment))?,
+    )
+}
+
+/// Buffer form of [`write_controller_commitment`].
 pub fn encode_controller_commitment(
     commitment: &ControllerCommitment,
 ) -> Result<Vec<u8>, ArtifactError> {
-    encode_batch(&controller_commitments_to_batch(std::slice::from_ref(
-        commitment,
-    ))?)
+    let mut payload = Vec::new();
+    write_controller_commitment(&mut payload, commitment)?;
+    Ok(payload)
 }
 
 /// The inverse of [`encode_controller_commitment`]: exactly one commitment.
@@ -3666,6 +3678,8 @@ pub fn decode_controller_commitment(bytes: &[u8]) -> Result<ControllerCommitment
     Ok(commitments.remove(0))
 }
 
+/// Decode one controller audit batch, validating every row on its own.
+///
 /// The audit records are telemetry: nothing replays them for a decision, so there is no
 /// cross-row sequence validation here — a reader that wants ordering sorts by `order`
 /// within a writer and by segment name across writers.
