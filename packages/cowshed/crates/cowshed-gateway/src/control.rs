@@ -18,7 +18,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     actor::{GatewayError, GatewayHandle, GatewayStatus},
-    config::{WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken},
+    config::{CONTROL_TCP_ADDR, WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken},
     interfaces::AuditEvent,
     policy::{EgressGrant, EgressMode, HostPattern, MirrorProtocol, MirrorRoute, WorkspacePolicy},
     repo_mirror::{MirrorInfo, RepoMirrorError, RepoMirrorHandle, RepoMirrorRequest},
@@ -63,9 +63,7 @@ impl GatewayControlClient {
     }
 
     pub fn new_tcp(address: SocketAddr, credential_file: PathBuf) -> Result<Self, ControlError> {
-        if address != "127.0.0.1:7644".parse().expect("literal control address")
-            || !credential_file.is_absolute()
-        {
+        if address != CONTROL_TCP_ADDR || !credential_file.is_absolute() {
             return Err(ControlError::InvalidTcpEndpoint);
         }
         Ok(Self {

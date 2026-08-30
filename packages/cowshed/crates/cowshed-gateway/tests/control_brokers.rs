@@ -1,14 +1,14 @@
 #![cfg(target_os = "macos")]
 
-use std::{net::SocketAddr, os::unix::fs::PermissionsExt as _, path::PathBuf, sync::Arc};
+use std::{os::unix::fs::PermissionsExt as _, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cowshed_gateway::{
-    AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, ControlFailureCode,
-    ControlTcpConfig, CredentialError, CredentialProvider, CredentialQuery, CredentialRecord,
-    Gateway, GatewayConfig, GatewayControlClient, MirrorCacheConfig, UpstreamConnection,
-    UpstreamConnector, UpstreamHealth,
+    AuditError, AuditEvent, AuditSink, AuthorizedTarget, CONTROL_TCP_ADDR, ConnectError,
+    ControlFailureCode, ControlTcpConfig, CredentialError, CredentialProvider, CredentialQuery,
+    CredentialRecord, Gateway, GatewayConfig, GatewayControlClient, MirrorCacheConfig,
+    UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -81,7 +81,7 @@ fn write_credential(path: &std::path::Path, byte: u8, controller_domain: bool) {
 }
 
 async fn raw_tcp(request: serde_json::Value) -> serde_json::Value {
-    let mut stream = TcpStream::connect("127.0.0.1:7644")
+    let mut stream = TcpStream::connect(CONTROL_TCP_ADDR)
         .await
         .expect("connect control TCP");
     let mut bytes = serde_json::to_vec(&request).expect("encode request");
@@ -129,16 +129,11 @@ async fn tcp_credential_is_distinct_unix_is_local_and_shutdown_closes_both() {
     let unix_status = unix.status().await.expect("Unix status");
     assert!(unix_status.sessions.is_empty());
     assert_eq!(unix_status.version, env!("CARGO_PKG_VERSION"));
-    let tcp = GatewayControlClient::new_tcp(
-        "127.0.0.1:7644".parse::<SocketAddr>().expect("address"),
-        credential,
-    )
-    .expect("TCP client");
+    let tcp = GatewayControlClient::new_tcp(CONTROL_TCP_ADDR, credential).expect("TCP client");
     assert!(tcp.status().await.expect("TCP status").sessions.is_empty());
 
-    let wrong =
-        GatewayControlClient::new_tcp("127.0.0.1:7644".parse().expect("address"), wrong_credential)
-            .expect("wrong TCP client");
+    let wrong = GatewayControlClient::new_tcp(CONTROL_TCP_ADDR, wrong_credential)
+        .expect("wrong TCP client");
     assert!(matches!(
         wrong.status().await,
         Err(cowshed_gateway::ControlError::Rejected {
@@ -146,9 +141,8 @@ async fn tcp_credential_is_distinct_unix_is_local_and_shutdown_closes_both() {
             ..
         })
     ));
-    let confused =
-        GatewayControlClient::new_tcp("127.0.0.1:7644".parse().expect("address"), data_token_file)
-            .expect("token-confused client");
+    let confused = GatewayControlClient::new_tcp(CONTROL_TCP_ADDR, data_token_file)
+        .expect("token-confused client");
     assert!(matches!(
         confused.status().await,
         Err(cowshed_gateway::ControlError::InvalidControllerCredential)
@@ -186,6 +180,6 @@ async fn tcp_credential_is_distinct_unix_is_local_and_shutdown_closes_both() {
 
     gateway.drain().await.expect("drain");
     assert!(!socket.exists());
-    assert!(TcpStream::connect("127.0.0.1:7644").await.is_err());
+    assert!(TcpStream::connect(CONTROL_TCP_ADDR).await.is_err());
     let _ = std::fs::remove_dir_all(root);
 }
