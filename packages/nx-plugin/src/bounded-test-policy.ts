@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { CARGO_TEST_TARGET } from './cargo-workspace.js';
+import { CARGO_TEST_TARGET, listCargoWorkspacePackages, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
 
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
@@ -153,8 +153,12 @@ export function checkWorkspaceBoundedTestTargetPolicy(
  *    declared cargo key, so the executor and options survive the declaration —
  *    see `index.ts`.)
  *
- * So this checks both: `test` reaches `cargo-test`, AND some target in
- * `cargo-test`'s closure actually executes tests rather than only compiling them.
+ * So this checks three things: `test` reaches `cargo-test`; some target in
+ * `cargo-test`'s closure actually executes tests rather than only compiling them;
+ * and when the run is split into per-crate `cargo-test-<package>` children, their
+ * union equals the workspace member set. A missing child is silent once
+ * `--package` actually filters: the remaining targets stay green and the
+ * uncovered member never runs.
  */
 export function checkWorkspaceCargoTestReachabilityPolicy(
   root: string,
@@ -191,6 +195,11 @@ export function checkWorkspaceCargoTestReachabilityPolicy(
           `${scope}.${CARGO_TEST_TARGET} reaches no target that RUNS tests — only ones that compile them. ` +
           'A declared dependsOn replaces the inferred one; spread it with "..." instead of omitting the runner leg',
       });
+    } else {
+      const coverage = cargoTestMemberCoverageIssue(root, path, scope, resolvedProject);
+      if (coverage !== undefined) {
+        issues.push(coverage);
+      }
     }
   }
   return issues;
@@ -220,6 +229,69 @@ function resolvedTargetRunsTests(project: ResolvedProjectTargets, target: string
     return reached;
   };
   return visit(target);
+}
+
+/**
+ * Per-crate nextest targets that `cargo-test` actually reaches. `cargo-test-compile`
+ * is excluded: it is not a runner. Members come from the same Cargo.toml walk
+ * inference uses; the child list is the graph, not a hand-written crate list.
+ */
+function cargoTestPackageChildren(project: ResolvedProjectTargets): string[] {
+  const packages = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = (targetName: string): void => {
+    if (visiting.has(targetName) || !project.targets.has(targetName)) {
+      return;
+    }
+    visiting.add(targetName);
+    const pkg = packageNameFromCargoTestTarget(targetName);
+    if (pkg !== null) {
+      packages.add(pkg);
+    }
+    for (const dependency of project.targetDependencies?.get(targetName) ?? []) {
+      for (const matched of matchingResolvedTargets(dependency, project.targets)) {
+        visit(matched);
+      }
+    }
+  };
+  visit(CARGO_TEST_TARGET);
+  return [...packages].sort((left, right) => left.localeCompare(right));
+}
+
+function cargoTestMemberCoverageIssue(
+  workspaceRoot: string,
+  path: string,
+  scope: string,
+  project: ResolvedProjectTargets,
+): BoundedTestPolicyIssue | undefined {
+  if (typeof project.root !== 'string' || project.root.length === 0) {
+    return undefined;
+  }
+  const members = listCargoWorkspacePackages(join(workspaceRoot, project.root)).map((pkg) => pkg.name);
+  if (members.length === 0) {
+    return undefined;
+  }
+  const children = cargoTestPackageChildren(project);
+  if (children.length === 0) {
+    return undefined;
+  }
+  const memberSet = new Set(members);
+  const childSet = new Set(children);
+  const missing = members.filter((name) => !childSet.has(name));
+  const extra = children.filter((name) => !memberSet.has(name));
+  if (missing.length === 0 && extra.length === 0) {
+    return undefined;
+  }
+  const details = [
+    ...(missing.length > 0 ? [`missing ${missing.join(', ')}`] : []),
+    ...(extra.length > 0 ? [`extra ${extra.join(', ')}`] : []),
+  ];
+  return {
+    path,
+    message:
+      `${scope}.${CARGO_TEST_TARGET} per-crate children must equal workspace members that have tests ` +
+      `(${members.join(', ')}); ${details.join('; ')}`,
+  };
 }
 
 function commandOf(project: ResolvedProjectTargets, targetName: string): string | undefined {

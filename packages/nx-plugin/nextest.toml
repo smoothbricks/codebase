@@ -3,3 +3,14 @@
 # kills at that bound instead of warning then waiting another period.
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 1 }
+
+# Compile-fail tests compile fixture crates (or rustc a negative contract) as
+# their body. `cargo test --no-run` cannot pre-build those; they are generated
+# at test time. Filterset matches the class by test name rather than listing
+# today's two tests (`compile_fail_cases`, `lesser_capabilities_fail_to_compile_*`).
+#
+# 180s is provisional: measure on an idle machine with `--test-threads=1`.
+# An unbounded run phase is how a hung test becomes a hung lane.
+[[profile.default.overrides]]
+filter = 'test(/compile_fail|fail_to_compile/)'
+slow-timeout = { period = "180s", terminate-after = 1 }

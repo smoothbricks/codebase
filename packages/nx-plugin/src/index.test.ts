@@ -279,7 +279,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-test-compile']);
       expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-test-ferris-core']);
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --workspace --package ferris-core --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --package ferris-core --user-config-file none --config-file /,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toEqual([
         '{projectRoot}/Cargo.toml',
@@ -305,6 +305,35 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.mutation?.cache).toBe(false);
       expect(targets.mutation?.options).toMatchObject({ command: 'cargo --frozen mutants --workspace' });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('scopes each per-crate cargo-test command to exactly one package', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/ferris/package.json', '{"name":"ferris"}\n');
+      await workspace.write(
+        'packages/ferris/Cargo.toml',
+        '[workspace]\nmembers = ["crates/ferris-core", "crates/ferris-wasm"]\n',
+      );
+      await workspace.write('packages/ferris/crates/ferris-core/Cargo.toml', '[package]\nname = "ferris-core"\n');
+      await workspace.write('packages/ferris/crates/ferris-wasm/Cargo.toml', '[package]\nname = "ferris-wasm"\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
+
+      expect(cargoPackageSelection(String(targets['cargo-test-ferris-core']?.options?.command ?? ''))).toEqual({
+        workspace: false,
+        packages: ['ferris-core'],
+      });
+      expect(cargoPackageSelection(String(targets['cargo-test-ferris-wasm']?.options?.command ?? ''))).toEqual({
+        workspace: false,
+        packages: ['ferris-wasm'],
+      });
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-test-compile']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-test-ferris-core']);
+      expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
     } finally {
       await workspace.cleanup();
     }
@@ -509,7 +538,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
       expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['napi-debug']);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --workspace --package cowshed-napi --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --package cowshed-napi --user-config-file none --config-file /,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -751,4 +780,24 @@ function resolveDeclaredOverInferred(
 ): TargetConfiguration | undefined {
   const inferred = targets[name];
   return inferred && mergeTargetConfigurations(declared[name] ?? {}, inferred);
+}
+
+/**
+ * `--workspace` selects every member; `--package` names a crate. Both together
+ * is the defect: nextest keeps the workspace set and the package flag does not
+ * narrow it. A per-crate target is scoped iff it names exactly one package and
+ * does not also select the workspace.
+ */
+function cargoPackageSelection(command: string): { workspace: boolean; packages: string[] } {
+  const tokens = command.split(/\s+/);
+  const packages: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === '--package' || tokens[i] === '-p') {
+      const name = tokens[i + 1];
+      if (name !== undefined && name.length > 0) {
+        packages.push(name);
+      }
+    }
+  }
+  return { workspace: tokens.includes('--workspace'), packages };
 }
