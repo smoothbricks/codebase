@@ -25,12 +25,15 @@ use crate::api::dto::{
 };
 use crate::error::{CowshedError, Result};
 use crate::exec::{
-    SandboxExecRequest, SpawnFailure, classify_spawn_error, plan_exec, prepare_child_descriptors,
+    SandboxExecRequest, SpawnFailure, SpawnPlan, classify_spawn_error, plan_exec,
+    prepare_child_descriptors,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{SandboxConfig, SandboxProfileRole, seatbelt_profile};
 use crate::storage::audit::AuditSinkError;
+use cowshed_gateway::WorkspaceToken;
+
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, OutputTargets,
     SealedCheckpointManifest, StreamKind,
@@ -254,7 +257,12 @@ pub trait SpawnSink: Send {
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>>;
 
-    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<CommandOutput> {
+    async fn print_devenv_env(
+        &mut self,
+        devenv_dir: &Path,
+        sandbox: &SandboxConfig,
+    ) -> Result<CommandOutput> {
+        let _ = sandbox;
         Err(CowshedError::internal(format!(
             "spawn sink cannot evaluate devenv at {}",
             devenv_dir.display()
@@ -547,6 +555,7 @@ impl CommitmentSink for CommitmentPublisherHandle {
 const COWSHED_CONFIG_FILE: &str = ".cowshed.toml";
 const DEVENV_PROFILE_BIN: &str = ".devenv/profile/bin";
 const DEVENV_SNAPSHOT_FILE: &str = ".devenv/cowshed-env.json";
+const DEVENV_PRINT_ARGV: [&str; 3] = ["devenv", "print-dev-env", "--json"];
 const DEVENV_INPUT_FILES: [&str; 4] = [
     "devenv.nix",
     "devenv.lock",
@@ -685,6 +694,7 @@ impl DevenvEnvironment {
     async fn environment_for_spawn(
         &mut self,
         spawner: &mut dyn SpawnSink,
+        sandbox: &SandboxConfig,
         controller_env: BTreeMap<String, String>,
     ) -> Result<(Option<PathBuf>, BTreeMap<String, String>)> {
         let mut changed = self.dirty.swap(false, Ordering::AcqRel);
@@ -716,7 +726,7 @@ impl DevenvEnvironment {
         }
 
         let inputs_before = self.input_fingerprint();
-        match refresh_devenv_snapshot(spawner, &devenv_dir).await {
+        match refresh_devenv_snapshot(spawner, sandbox, &devenv_dir).await {
             Ok(vars) => {
                 let inputs_after = self.input_fingerprint();
                 self.evaluated_inputs = match (inputs_before, inputs_after) {
@@ -876,9 +886,10 @@ async fn read_devenv_snapshot(devenv_dir: &Path) -> Option<DevenvEnvSnapshot> {
 
 async fn refresh_devenv_snapshot(
     spawner: &mut dyn SpawnSink,
+    sandbox: &SandboxConfig,
     devenv_dir: &Path,
 ) -> Result<BTreeMap<String, String>> {
-    let output = spawner.print_devenv_env(devenv_dir).await?;
+    let output = spawner.print_devenv_env(devenv_dir, sandbox).await?;
     if !output.status.succeeded() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
@@ -1059,13 +1070,6 @@ fn developer_directory() -> Option<PathBuf> {
         })
 }
 
-fn valid_workspace_token(token: &str) -> bool {
-    token.len() == 43
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
 /// The `HTTP_PROXY` value for a workspace's own gateway endpoint.
 ///
 /// The token rides as basic-auth userinfo because that is the only channel a standard client has:
@@ -1078,8 +1082,11 @@ fn valid_workspace_token(token: &str) -> bool {
 /// the token authenticates against nothing but this workspace's own loopback port. The username is
 /// a fixed label the gateway does not compare. The token's alphabet is unpadded base64url, which
 /// is userinfo-safe, so the value never needs percent-encoding.
-fn gateway_proxy_url(port_base: &str, workspace_token: &str) -> String {
-    format!("http://cowshed:{workspace_token}@127.0.0.1:{port_base}")
+fn gateway_proxy_url(port_base: &str, workspace_token: &WorkspaceToken) -> String {
+    format!(
+        "http://cowshed:{}@127.0.0.1:{port_base}",
+        workspace_token.encode()
+    )
 }
 
 /// Point the private HOME's `$CARGO_HOME` registry at the host's download cache.
@@ -1142,6 +1149,123 @@ async fn link_cargo_registry(private_home: &Path, host_home: &Path) -> Result<()
     Ok(())
 }
 
+/// Build the sandboxed `Command` for a child of this workspace.
+///
+/// Every process the supervisor launches goes through here, including the `devenv print-dev-env`
+/// evaluation that produces the environment the others consume. That is the point: the evaluation
+/// reads workspace-controlled Nix, so running it as a bare host `Command` with the daemon's
+/// inherited environment handed workspace content the one path to host credentials, `PATH`, and
+/// agent env that no other child has. It is a child of the workspace and it is sandboxed like one.
+///
+/// Caller `env` is applied first so the policy variables below always win; `env_clear` means
+/// nothing is inherited that is not named here.
+async fn sandboxed_command(
+    plan: &SpawnPlan,
+    sandbox: &SandboxConfig,
+    devenv_dir: Option<&Path>,
+    env: &BTreeMap<String, String>,
+) -> Result<tokio::process::Command> {
+    let private_root = sandbox.workspace_mount.join(".cowshed");
+    let private_home = private_root.join("home");
+    let private_config = private_root.join("config");
+    let private_cache = private_root.join("cache");
+    for directory in [&private_home, &private_config, &private_cache] {
+        tokio::fs::create_dir_all(directory)
+            .await
+            .map_err(|error| {
+                CowshedError::environment_missing(
+                    format!(
+                        "cannot prepare sandbox environment directory {}: {error}",
+                        directory.display()
+                    ),
+                    "reattach the workspace and retry",
+                )
+            })?;
+    }
+    let token_path = sandbox
+        .workspace_mount
+        .join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH);
+    let encoded_token = tokio::fs::read_to_string(&token_path)
+        .await
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "cannot read workspace token {}: {error}",
+                    token_path.display()
+                ),
+                "reattach the workspace to mint fresh credentials",
+            )
+        })?;
+    let workspace_token = WorkspaceToken::parse(encoded_token.trim()).map_err(|error| {
+        CowshedError::integrity(
+            format!(
+                "workspace token is malformed at {}: {error}",
+                token_path.display()
+            ),
+            "reattach the workspace to mint fresh credentials",
+        )
+    })?;
+    link_cargo_registry(&private_home, &sandbox.home).await?;
+    let path = sandbox_path(sandbox, devenv_dir)?;
+    let port_base = sandbox.port_block.base().to_string();
+    let encoded_token = workspace_token.encode();
+    let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
+
+    let mut command = tokio::process::Command::new(&plan.program);
+    command
+        .env_clear()
+        .args(&plan.args)
+        .current_dir(&plan.cwd)
+        .envs(env)
+        .env("PATH", path)
+        .env("HOME", &private_home)
+        .env("XDG_CONFIG_HOME", &private_config)
+        .env("XDG_CACHE_HOME", &private_cache)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("TMPDIR", &sandbox.exec_temp_dir)
+        .env("PWD", &plan.cwd)
+        .env("GOENV", private_cache.join("go/env"))
+        // rustc-wrapper clients speak to the host-owned sccache daemon; the
+        // Seatbelt profile admits exactly this socket and denies binding it,
+        // so a client whose daemon is down fails fast instead of spawning a
+        // wrong-boundary server inside the sandbox.
+        .env(
+            "SCCACHE_SERVER_UDS",
+            crate::sandbox::sccache_server_socket(),
+        )
+        .env("SCCACHE_DIR", crate::sandbox::sccache_cache_directory())
+        .env("COWSHED_PORT_BASE", &port_base)
+        .env("COWSHED_WORKSPACE_TOKEN", encoded_token)
+        .env("HTTP_PROXY", &gateway_http)
+        .env("HTTPS_PROXY", &gateway_http)
+        .env("http_proxy", &gateway_http)
+        .env("https_proxy", &gateway_http);
+    for key in ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    // Rust routes through sccache in EVERY workspace. Cargo's `-C metadata` is
+    // path-independent for workspace members (cargo >= 1.97, measured), and the bundled
+    // sccache normalizes the residual path-bearing key inputs (cwd, blanket CARGO_* env,
+    // argument bytes) against the request cwd when the client sets SCCACHE_BASEDIR_CWD=1 —
+    // so name-mounted workspaces share entries with each other, not just successive slot
+    // tenants. env-dep values stay unnormalized in the key, so a crate that compiles
+    // env!("CARGO_MANIFEST_DIR") into its output still fail-closes across paths.
+    // Incremental stays off: sccache refuses incremental compilations, and the shared
+    // cache is worth more to a fleet of clones than per-unit local state.
+    command
+        .env("RUSTC_WRAPPER", "sccache")
+        .env("CARGO_INCREMENTAL", "0")
+        .env("SCCACHE_BASEDIR_CWD", "1");
+    if let Some(directory) = developer_directory() {
+        command.env("DEVELOPER_DIR", directory);
+    }
+    Ok(command)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemSpawnSink;
 
@@ -1178,117 +1302,18 @@ impl SpawnSink for SystemSpawnSink {
             ));
         }
 
-        let private_root = request.sandbox.workspace_mount.join(".cowshed");
-        let private_home = private_root.join("home");
-        let private_config = private_root.join("config");
-        let private_cache = private_root.join("cache");
-        // exec_temp_dir joins the loop because it is exported as TMPDIR below.
-        // Exporting a directory without creating it makes every child that
-        // shells out to mktemp fail on a path the child never chose, and the
-        // failure names cowshed's quarantine rather than the caller's test.
-        for directory in [
-            &private_home,
-            &private_config,
-            &private_cache,
-            &request.sandbox.exec_temp_dir,
-        ] {
-            tokio::fs::create_dir_all(directory)
-                .await
-                .map_err(|error| {
-                    CowshedError::environment_missing(
-                        format!(
-                            "cannot prepare sandbox environment directory {}: {error}",
-                            directory.display()
-                        ),
-                        "reattach the workspace and retry",
-                    )
-                })?;
-        }
-        let token_path = request
-            .sandbox
-            .workspace_mount
-            .join(crate::workspace_credentials::WORKSPACE_TOKEN_PATH);
-        let workspace_token = tokio::fs::read_to_string(&token_path)
-            .await
-            .map_err(|error| {
-                CowshedError::integrity(
-                    format!(
-                        "cannot read workspace token {}: {error}",
-                        token_path.display()
-                    ),
-                    "reattach the workspace to mint fresh credentials",
-                )
-            })?;
-        if !valid_workspace_token(&workspace_token) {
-            return Err(CowshedError::integrity(
-                format!("workspace token is malformed at {}", token_path.display()),
-                "reattach the workspace to mint fresh credentials",
-            ));
-        }
-        link_cargo_registry(&private_home, &request.sandbox.home).await?;
-        let path = sandbox_path(&request.sandbox, request.devenv_dir.as_deref())?;
-        let port_base = request.sandbox.port_block.base().to_string();
-        let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
-
-        let mut command = tokio::process::Command::new(&plan.program);
+        let mut command = sandboxed_command(
+            &plan,
+            &request.sandbox,
+            request.devenv_dir.as_deref(),
+            &request.env,
+        )
+        .await?;
         command
-            .env_clear()
-            .args(&plan.args)
-            .current_dir(&plan.cwd)
-            .envs(&request.env)
-            .env("PATH", path)
-            .env("HOME", &private_home)
-            .env("XDG_CONFIG_HOME", &private_config)
-            .env("XDG_CACHE_HOME", &private_cache)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_ATTR_NOSYSTEM", "1")
-            .env("TMPDIR", &request.sandbox.exec_temp_dir)
-            .env("PWD", &plan.cwd)
-            .env("GOENV", private_cache.join("go/env"))
-            // rustc-wrapper clients speak to the host-owned sccache daemon; the
-            // Seatbelt profile admits exactly this socket and denies binding it,
-            // so a client whose daemon is down fails fast instead of spawning a
-            // wrong-boundary server inside the sandbox.
-            .env(
-                "SCCACHE_SERVER_UDS",
-                crate::sandbox::sccache_server_socket(),
-            )
-            .env("SCCACHE_DIR", crate::sandbox::sccache_cache_directory())
-            .env(crate::workspace_environment::PORT_BASE_ENV, &port_base)
-            .env(
-                crate::workspace_environment::WORKSPACE_TOKEN_ENV,
-                workspace_token,
-            )
-            .env("HTTP_PROXY", &gateway_http)
-            .env("HTTPS_PROXY", &gateway_http)
-            .env("http_proxy", &gateway_http)
-            .env("https_proxy", &gateway_http)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
-        for key in ["LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        // Rust routes through sccache in EVERY workspace. Cargo's `-C metadata` is
-        // path-independent for workspace members (cargo >= 1.97, measured), and the bundled
-        // sccache normalizes the residual path-bearing key inputs (cwd, blanket CARGO_* env,
-        // argument bytes) against the request cwd when the client sets SCCACHE_BASEDIR_CWD=1 —
-        // so name-mounted workspaces share entries with each other, not just successive slot
-        // tenants. env-dep values stay unnormalized in the key, so a crate that compiles
-        // env!("CARGO_MANIFEST_DIR") into its output still fail-closes across paths.
-        // Incremental stays off: sccache refuses incremental compilations, and the shared
-        // cache is worth more to a fleet of clones than per-unit local state.
-        command
-            .env("RUSTC_WRAPPER", "sccache")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("SCCACHE_BASEDIR_CWD", "1");
-        if let Some(directory) = developer_directory() {
-            command.env("DEVELOPER_DIR", directory);
-        }
         prepare_child_descriptors(command.as_std_mut()).map_err(map_spawn_failure)?;
         unsafe {
             command.pre_exec(|| {
@@ -1358,10 +1383,24 @@ impl SpawnSink for SystemSpawnSink {
         }))
     }
 
-    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<CommandOutput> {
-        let output = tokio::process::Command::new("devenv")
-            .args(["print-dev-env", "--json"])
-            .current_dir(devenv_dir)
+    async fn print_devenv_env(
+        &mut self,
+        devenv_dir: &Path,
+        sandbox: &SandboxConfig,
+    ) -> Result<CommandOutput> {
+        let plan = plan_exec(
+            SandboxExecRequest {
+                argv: DEVENV_PRINT_ARGV.map(OsString::from).to_vec(),
+                cwd: devenv_dir.to_path_buf(),
+            },
+            sandbox,
+        )
+        .map_err(map_exec_error)?;
+        // The evaluation writes `.devenv/` and talks to the nix daemon, both of which the
+        // executed-child profile already admits: the daemon socket is a standing grant because
+        // building inside a workspace is the point of a workspace.
+        let output = sandboxed_command(&plan, sandbox, Some(devenv_dir), &BTreeMap::new())
+            .await?
             .output()
             .await
             .map_err(|error| {
@@ -2431,7 +2470,7 @@ impl SupervisorActor {
         };
         let (devenv_dir, merged_env) = match self
             .devenv
-            .environment_for_spawn(&mut *self.spawner, merged_env)
+            .environment_for_spawn(&mut *self.spawner, &self.sandbox, merged_env)
             .await
         {
             Ok(environment) => environment,
@@ -3530,6 +3569,48 @@ mod workspace_toolchain_tests {
         }
     }
 
+    /// `print-dev-env` reads workspace-controlled Nix, so it is the one child that must not be
+    /// a bare host `Command`. This pins the argv through the same `plan_exec` every job uses: the
+    /// program is the Seatbelt wrapper, the profile is the executed-child role, and the cwd is
+    /// contained in the workspace mount. Reverting to `Command::new("devenv")` fails it.
+    #[test]
+    fn the_devenv_evaluation_is_planned_through_seatbelt_like_any_other_child() {
+        let root = scratch("devenv-sandboxed");
+        let mount = root.join("workspace");
+        let devenv_dir = mount.join("tooling/devenv");
+        std::fs::create_dir_all(&devenv_dir).expect("devenv dir");
+        let sandbox = sandbox_at(&mount);
+
+        let plan = plan_exec(
+            SandboxExecRequest {
+                argv: DEVENV_PRINT_ARGV.map(OsString::from).to_vec(),
+                cwd: devenv_dir.clone(),
+            },
+            &sandbox,
+        )
+        .expect("the devenv argv is a plannable sandboxed exec");
+
+        assert_eq!(plan.program, Path::new(crate::exec::SANDBOX_EXEC));
+        assert_eq!(
+            plan.args.first().map(OsString::as_os_str),
+            Some("-p".as_ref())
+        );
+        assert_eq!(
+            plan.args.get(1).and_then(|profile| profile.to_str()),
+            seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild)
+                .expect("executed-child profile")
+                .as_str()
+                .into()
+        );
+        assert!(plan.cwd.starts_with(&mount));
+        assert_eq!(
+            plan.args.last().and_then(|argument| argument.to_str()),
+            Some("--json")
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_workspace_without_an_evaluated_profile_is_unchanged() {
         let root = scratch("absent");
@@ -3700,7 +3781,11 @@ mod workspace_toolchain_tests {
         // macOS FSEvents can deliver the source write that preceded watcher registration late.
         environment.dirty.store(true, Ordering::Release);
         let (_, variables) = environment
-            .environment_for_spawn(&mut NoSpawn, BTreeMap::new())
+            .environment_for_spawn(
+                &mut NoSpawn,
+                &WorkspaceSupervisorConfig::default().sandbox,
+                BTreeMap::new(),
+            )
             .await
             .expect("unchanged inputs reuse the evaluated snapshot");
 
@@ -4085,11 +4170,35 @@ mod sandbox_environment_tests {
 
     #[test]
     fn proxy_url_carries_the_token_as_basic_auth_userinfo() {
-        let token = "0123456789abcdefghijklmnopqrstuvwxyz-_ABCDE";
-        assert!(valid_workspace_token(token));
+        let token = WorkspaceToken::from_bytes([7; 32]);
+        let encoded = token.encode();
         assert_eq!(
-            gateway_proxy_url("40960", token),
-            format!("http://cowshed:{token}@127.0.0.1:40960")
+            gateway_proxy_url("40960", &token),
+            format!("http://cowshed:{encoded}@127.0.0.1:40960")
+        );
+    }
+
+    /// The gateway decodes the token to exactly 32 bytes before it authenticates a CONNECT, so
+    /// "43 characters from the right alphabet" is not the same predicate. 43 unpadded base64url
+    /// symbols carry 258 bits, and the two bits past 32 bytes must be zero; this fixture ends in
+    /// `B`, whose low bits are not, so a strict decoder refuses it. The length-and-alphabet check
+    /// this file used to carry accepted exactly this string, put it in `HTTP_PROXY`, and left the
+    /// rejection to surface as a spurious network error inside the workspace.
+    #[test]
+    fn a_well_formed_looking_string_is_not_a_token_unless_it_decodes() {
+        let non_canonical = "0123456789abcdefghijklmnopqrstuvwxyz-_ABCDB";
+        assert_eq!(
+            non_canonical.len(),
+            WorkspaceToken::from_bytes([0; 32]).encode().len()
+        );
+        assert!(
+            non_canonical
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        assert!(
+            WorkspaceToken::parse(non_canonical).is_err(),
+            "a 43-character alphabet-valid string that is not 32 encoded bytes must be refused"
         );
     }
 

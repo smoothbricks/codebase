@@ -81,7 +81,17 @@ impl SpawnSink for FakeSpawner {
         }))
     }
 
-    async fn print_devenv_env(&mut self, devenv_dir: &std::path::Path) -> Result<CommandOutput> {
+    async fn print_devenv_env(
+        &mut self,
+        devenv_dir: &std::path::Path,
+        sandbox: &SandboxConfig,
+    ) -> Result<CommandOutput> {
+        // The evaluation is a child of the workspace, so it must arrive carrying that workspace's
+        // sandbox rather than the daemon's inherited host environment.
+        assert!(
+            devenv_dir.starts_with(&sandbox.workspace_mount),
+            "devenv evaluation must run inside the sandboxed workspace mount"
+        );
         self.devenv_requests
             .send(devenv_dir.to_owned())
             .expect("devenv request observer");
