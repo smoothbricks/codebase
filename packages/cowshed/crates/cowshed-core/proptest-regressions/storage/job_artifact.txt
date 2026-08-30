@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 80608d1af430e3541d15590a724f6158c44705d6493d3bad399891b9b64a1643 # shrinks to steps = [Checkpoint, LoseTail, Checkpoint]
