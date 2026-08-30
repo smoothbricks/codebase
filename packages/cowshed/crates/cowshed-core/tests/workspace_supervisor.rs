@@ -7,23 +7,23 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
-    CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecRequest, JobId, JobState,
-    MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
-    ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource, StreamInfo, WorkspacePath,
+    CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecRequest, ExitStatus,
+    JobId, JobState, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage,
+    OutputSummary, ProtectedOutput, RunSandboxMode, Sha256Digest, StdinSource, StreamInfo,
+    WorkspacePath,
 };
 use cowshed_core::error::{CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
-use cowshed_core::storage::job_artifact::ArtifactConfig;
+use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
-    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
-    CommitmentDraft, CommitmentSink, DevenvCommandOutput, OutputStream, ProcessEvent, ProcessExit,
-    ProcessSignal, ProcessSpawnRequest, RunningProcess, SessionToken, SpawnSink,
-    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
-    WorkspaceSupervisorHandle,
+    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier, CommandOutput,
+    CommitmentDraft, CommitmentSink, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
+    RunningProcess, SessionToken, SpawnSink, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
+    WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
 
 #[derive(Debug)]
@@ -46,7 +46,7 @@ struct FakeSpawner {
     backpressure: bool,
     order: mpsc::UnboundedSender<OrderObservation>,
     devenv_requests: mpsc::UnboundedSender<PathBuf>,
-    devenv_outputs: VecDeque<DevenvCommandOutput>,
+    devenv_outputs: VecDeque<CommandOutput>,
 }
 
 #[async_trait]
@@ -81,10 +81,7 @@ impl SpawnSink for FakeSpawner {
         }))
     }
 
-    async fn print_devenv_env(
-        &mut self,
-        devenv_dir: &std::path::Path,
-    ) -> Result<DevenvCommandOutput> {
+    async fn print_devenv_env(&mut self, devenv_dir: &std::path::Path) -> Result<CommandOutput> {
         self.devenv_requests
             .send(devenv_dir.to_owned())
             .expect("devenv request observer");
@@ -136,7 +133,7 @@ impl RunningProcess for FakeProcess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ArtifactObservation {
     Admit(JobId),
-    Write(JobId, OutputStream, Bytes),
+    Write(JobId, StreamKind, Bytes),
     Seal(JobId, JobState),
     Barrier(u64),
 }
@@ -201,12 +198,7 @@ impl ArtifactSink for FakeArtifactSink {
         Ok(())
     }
 
-    fn write(
-        &mut self,
-        job_id: JobId,
-        stream: OutputStream,
-        bytes: &[u8],
-    ) -> Result<ArtifactWrite> {
+    fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite> {
         self.jobs
             .get_mut(&job_id)
             .expect("live fake artifact job")
@@ -255,13 +247,13 @@ struct FakeArtifactJob {
 }
 
 impl FakeArtifactJob {
-    fn write(&mut self, stream: OutputStream, bytes: &[u8]) -> Result<ArtifactWrite> {
+    fn write(&mut self, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite> {
         let remaining = self.quota.saturating_sub(self.accepted);
         let accepted = usize::try_from(remaining.min(u64::try_from(bytes.len()).unwrap())).unwrap();
         let admitted = &bytes[..accepted];
         match stream {
-            OutputStream::Stdout => self.stdout.extend_from_slice(admitted),
-            OutputStream::Stderr => self.stderr.extend_from_slice(admitted),
+            StreamKind::Stdout => self.stdout.extend_from_slice(admitted),
+            StreamKind::Stderr => self.stderr.extend_from_slice(admitted),
         }
         self.accepted += u64::try_from(accepted).unwrap();
         self.observations
@@ -415,7 +407,7 @@ fn harness_with_devenv_outputs(
     quota: u64,
     fail_next: bool,
     backpressure: bool,
-    devenv_outputs: VecDeque<DevenvCommandOutput>,
+    devenv_outputs: VecDeque<CommandOutput>,
 ) -> Harness {
     let (spawn_tx, spawned) = mpsc::unbounded_channel();
     let (process_tx, process) = mpsc::unbounded_channel();
@@ -539,12 +531,10 @@ fn isolated_config(label: &str) -> (WorkspaceSupervisorConfig, PathBuf) {
     (supervisor_config, root)
 }
 
-fn printed_devenv_output(variables: serde_json::Value) -> DevenvCommandOutput {
-    DevenvCommandOutput {
-        status: 0,
-        stdout: serde_json::to_vec(&serde_json::json!({ "variables": variables })).unwrap(),
-        stderr: Vec::new(),
-    }
+fn printed_devenv_output(variables: serde_json::Value) -> CommandOutput {
+    CommandOutput::success(
+        serde_json::to_vec(&serde_json::json!({ "variables": variables })).unwrap(),
+    )
 }
 
 fn write_devenv_snapshot(devenv_dir: &std::path::Path, vars: serde_json::Value) {
@@ -575,12 +565,12 @@ fn stream(bytes: Vec<u8>) -> StreamInfo {
     }
 }
 
-async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: ProcessExit) {
+async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: ExitStatus) {
     spawned
         .events
         .send(ProcessEvent::Output {
             job_id: spawned.request.job_id,
-            stream: OutputStream::Stdout,
+            stream: StreamKind::Stdout,
             bytes: Bytes::copy_from_slice(stdout),
         })
         .await
@@ -589,7 +579,7 @@ async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: Process
         .events
         .send(ProcessEvent::Output {
             job_id: spawned.request.job_id,
-            stream: OutputStream::Stderr,
+            stream: StreamKind::Stderr,
             bytes: Bytes::copy_from_slice(stderr),
         })
         .await
@@ -602,7 +592,7 @@ async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: Process
         })
         .await
         .unwrap();
-    for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
         spawned
             .events
             .send(ProcessEvent::OutputEof {
@@ -680,7 +670,7 @@ async fn stale_devenv_snapshot_refreshes_once_and_merges_before_spawn() {
     .unwrap();
     assert_eq!(snapshot["vars"]["ONLY_DEVENV"], "updated");
     assert_eq!(snapshot["vars"]["PATH"], "/new/untrusted/bin");
-    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
 
     let mut exec = request(StdinSource::Empty);
@@ -699,7 +689,7 @@ async fn stale_devenv_snapshot_refreshes_once_and_merges_before_spawn() {
         h.devenv_requests.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
-    complete(&second_spawn, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&second_spawn, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second).await.unwrap();
 
     drop(h);
@@ -736,7 +726,7 @@ async fn fresh_devenv_snapshot_spawns_without_source_stats_or_devenv_invocation(
         h.devenv_requests.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
-    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
 
     drop(h);
@@ -781,11 +771,7 @@ async fn configured_missing_devenv_and_failed_refresh_are_fail_closed() {
         1024,
         false,
         false,
-        VecDeque::from([DevenvCommandOutput {
-            status: 42,
-            stdout: Vec::new(),
-            stderr: b"evaluation exploded".to_vec(),
-        }]),
+        VecDeque::from([CommandOutput::failure(42, b"evaluation exploded".to_vec())]),
     );
     let error = failed
         .handle
@@ -822,7 +808,7 @@ async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
     assert_eq!(spawned.request.argv[0].as_os_str().as_bytes(), raw);
     let info = h.handle.info(job).await.unwrap();
     assert_eq!(info.argv[0].as_os_str().as_bytes(), raw);
-    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
 }
 
@@ -884,8 +870,8 @@ async fn monotonic_ids_and_simultaneous_completions_are_serialized() {
     let first_spawn = h.spawned.recv().await.unwrap();
     let second_spawn = h.spawned.recv().await.unwrap();
 
-    let a = complete(&first_spawn, b"one", b"", ProcessExit::Exited(0));
-    let b = complete(&second_spawn, b"two", b"", ProcessExit::Exited(0));
+    let a = complete(&first_spawn, b"one", b"", ExitStatus::Exited { code: 0 });
+    let b = complete(&second_spawn, b"two", b"", ExitStatus::Exited { code: 0 });
     tokio::join!(a, b);
 
     let (first_info, second_info) = tokio::join!(h.handle.wait(first), h.handle.wait(second));
@@ -944,7 +930,7 @@ async fn disconnect_does_not_cancel_background_process() {
     let spawned = h.spawned.recv().await.unwrap();
     let survivor = h.handle.clone();
     drop(h.handle);
-    complete(&spawned, b"alive", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"alive", b"", ExitStatus::Exited { code: 0 }).await;
     let info = survivor.wait(job).await.unwrap();
     assert_eq!(info.state, JobState::Exited);
     assert_eq!(info.stdout.bytes, 5);
@@ -960,12 +946,12 @@ async fn opaque_non_utf8_output_round_trips_through_logs_and_artifacts() {
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     let opaque = [0xff, 0x00, 0x80, b'x'];
-    complete(&spawned, &opaque, b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, &opaque, b"", ExitStatus::Exited { code: 0 }).await;
     let info = h.handle.wait(job).await.unwrap();
     assert_eq!(info.stdout.bytes, u64::try_from(opaque.len()).unwrap());
     let log = h
         .handle
-        .log_read(job, OutputStream::Stdout, 0, false)
+        .log_read(job, StreamKind::Stdout, 0, false)
         .await
         .unwrap();
     assert_eq!(log.bytes.as_ref(), opaque);
@@ -976,7 +962,7 @@ async fn opaque_non_utf8_output_round_trips_through_logs_and_artifacts() {
     ));
     assert!(matches!(
         h.artifacts.recv().await.unwrap(),
-        ArtifactObservation::Write(id, OutputStream::Stdout, bytes)
+        ArtifactObservation::Write(id, StreamKind::Stdout, bytes)
             if id == job && bytes.as_ref() == opaque
     ));
 }
@@ -1018,7 +1004,7 @@ async fn stdin_write_observes_bounded_backpressure() {
     );
 
     drop(stream_writer);
-    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
 }
 
@@ -1035,7 +1021,7 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
         .events
         .send(ProcessEvent::Output {
             job_id: job,
-            stream: OutputStream::Stdout,
+            stream: StreamKind::Stdout,
             bytes: Bytes::from_static(b"abcdef"),
         })
         .await
@@ -1057,14 +1043,14 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
         .events
         .send(ProcessEvent::Exited {
             job_id: job,
-            exit: ProcessExit::Signaled {
+            exit: ExitStatus::Signaled {
                 signal: 9,
                 core_dumped: false,
             },
         })
         .await
         .unwrap();
-    for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
         spawned
             .events
             .send(ProcessEvent::OutputEof {
@@ -1121,7 +1107,7 @@ async fn named_session_preserves_cwd_env_and_background_membership() {
     assert_eq!(snapshot.env["MODE"], "watch");
     assert!(snapshot.background_jobs.contains(&job));
     assert_eq!(spawned.request.env["MODE"], "watch");
-    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
     assert!(
         h.handle
@@ -1224,14 +1210,14 @@ async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
         .events
         .send(ProcessEvent::Exited {
             job_id: job,
-            exit: ProcessExit::Signaled {
+            exit: ExitStatus::Signaled {
                 signal: 15,
                 core_dumped: false,
             },
         })
         .await
         .unwrap();
-    for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
         spawned
             .events
             .send(ProcessEvent::OutputEof {
@@ -1292,14 +1278,14 @@ async fn kill_acknowledges_only_after_terminal_artifact_and_commitment() {
         .events
         .send(ProcessEvent::Exited {
             job_id: job,
-            exit: ProcessExit::Signaled {
+            exit: ExitStatus::Signaled {
                 signal: 15,
                 core_dumped: false,
             },
         })
         .await
         .unwrap();
-    for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
         spawned
             .events
             .send(ProcessEvent::OutputEof {
@@ -1332,14 +1318,14 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
     let spawned = h.spawned.recv().await.unwrap();
     let handle = h.handle.clone();
     let follow =
-        tokio::spawn(async move { handle.log_read(job, OutputStream::Stdout, 0, true).await });
+        tokio::spawn(async move { handle.log_read(job, StreamKind::Stdout, 0, true).await });
     tokio::task::yield_now().await;
     assert!(!follow.is_finished());
     spawned
         .events
         .send(ProcessEvent::Output {
             job_id: job,
-            stream: OutputStream::Stdout,
+            stream: StreamKind::Stdout,
             bytes: Bytes::from_static(b"first"),
         })
         .await
@@ -1350,15 +1336,14 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
     assert!(!first.eof);
 
     let handle = h.handle.clone();
-    let attach =
-        tokio::spawn(async move { handle.attach_read(job, OutputStream::Stdout, 5).await });
+    let attach = tokio::spawn(async move { handle.attach_read(job, StreamKind::Stdout, 5).await });
     tokio::task::yield_now().await;
     assert!(!attach.is_finished());
     spawned
         .events
         .send(ProcessEvent::Output {
             job_id: job,
-            stream: OutputStream::Stdout,
+            stream: StreamKind::Stdout,
             bytes: Bytes::from_static(b"-second"),
         })
         .await
@@ -1371,11 +1356,11 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
         .events
         .send(ProcessEvent::Exited {
             job_id: job,
-            exit: ProcessExit::Exited(0),
+            exit: ExitStatus::Exited { code: 0 },
         })
         .await
         .unwrap();
-    for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+    for stream in [StreamKind::Stdout, StreamKind::Stderr] {
         spawned
             .events
             .send(ProcessEvent::OutputEof {
@@ -1388,7 +1373,7 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
     h.handle.wait(job).await.unwrap();
     let eof = h
         .handle
-        .attach_read(job, OutputStream::Stdout, 12)
+        .attach_read(job, StreamKind::Stdout, 12)
         .await
         .unwrap();
     assert!(eof.bytes.is_empty());
@@ -1416,7 +1401,7 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
             .code,
         ErrorCode::Conflict
     );
-    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     quiesce.await.unwrap().unwrap();
     assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Exited);
 }
@@ -1432,6 +1417,83 @@ async fn none_cwd_is_preserved_as_workspace_root_without_a_sentinel() {
     let spawned = h.spawned.recv().await.unwrap();
     assert!(spawned.request.cwd.as_os_str().is_empty());
     assert_eq!(h.handle.info(job).await.unwrap().cwd, None);
-    complete(&spawned, b"", b"", ProcessExit::Exited(0)).await;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     assert_eq!(h.handle.wait(job).await.unwrap().cwd, None);
+}
+
+/// The lifecycle half of the same defect: `wait(2)` failing must not produce a terminal job that
+/// claims a signal death. The job seals as `Failed` with no exit status, the group is killed, and
+/// everyone awaiting the job is handed the integrity error instead of a false success.
+#[tokio::test]
+async fn a_wait_failure_fails_the_job_without_inventing_an_exit_status() {
+    let mut h = harness(1, 1024, false, false);
+    let job = h
+        .handle
+        .exec(None, request(StdinSource::Empty))
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+
+    let handle = h.handle.clone();
+    let waiter = tokio::spawn(async move { handle.wait(job).await });
+
+    spawned
+        .events
+        .send(ProcessEvent::Output {
+            job_id: job,
+            stream: StreamKind::Stdout,
+            bytes: Bytes::from_static(b"partial"),
+        })
+        .await
+        .unwrap();
+    spawned
+        .events
+        .send(ProcessEvent::WaitFailed {
+            job_id: job,
+            error: CowshedError::integrity(
+                "cannot wait for the sandbox process: injected",
+                "cowshed doctor --json",
+            ),
+        })
+        .await
+        .unwrap();
+
+    // No `OutputEof` is sent: an unreaped child can hold its pipes open forever, so the job must
+    // still reach a terminal record.
+    let error = waiter
+        .await
+        .unwrap()
+        .expect_err("an unobserved termination must not resolve as a completed job");
+    assert_eq!(error.code, ErrorCode::Integrity);
+
+    // The sealed record is honest: failed, with no fabricated exit.
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(info.state, JobState::Failed);
+    assert_eq!(info.exit, None);
+    assert_eq!(
+        h.artifacts.recv().await.unwrap(),
+        ArtifactObservation::Admit(job)
+    );
+    assert_eq!(
+        h.artifacts.recv().await.unwrap(),
+        ArtifactObservation::Write(job, StreamKind::Stdout, Bytes::from_static(b"partial"))
+    );
+    assert_eq!(
+        h.artifacts.recv().await.unwrap(),
+        ArtifactObservation::Seal(job, JobState::Failed)
+    );
+
+    // Killing the group is what stops an unobservable child from outliving its record. Stdin
+    // bookkeeping for the empty pump also lands on this lane, so scan rather than pin an index.
+    let mut killed = false;
+    while let Ok(observation) = h.process.try_recv() {
+        killed |= observation == ProcessObservation::Signal(job, ProcessSignal::Kill);
+    }
+    assert!(
+        killed,
+        "an unreaped child's process group must be killed, not left running behind a sealed record"
+    );
+
+    // A retire must not hang on a job whose child was never reaped.
+    h.handle.retire().await.unwrap();
 }

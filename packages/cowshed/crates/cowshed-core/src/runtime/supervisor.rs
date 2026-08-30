@@ -164,12 +164,6 @@ pub struct SessionSnapshot {
     pub background_jobs: BTreeSet<JobId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OutputStream {
-    Stdout,
-    Stderr,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogChunk {
     pub bytes: Bytes,
@@ -190,12 +184,6 @@ pub enum ProcessSignal {
     Kill,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProcessExit {
-    Exited(i32),
-    Signaled { signal: i32, core_dumped: bool },
-}
-
 #[derive(Clone, Debug)]
 pub struct ProcessSpawnRequest {
     pub authority: WorkspaceAuthoritySnapshot,
@@ -209,27 +197,26 @@ pub struct ProcessSpawnRequest {
     pub executed_child_profile: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DevenvCommandOutput {
-    pub status: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
 #[derive(Debug)]
 pub enum ProcessEvent {
     Output {
         job_id: JobId,
-        stream: OutputStream,
+        stream: StreamKind,
         bytes: Bytes,
     },
     OutputEof {
         job_id: JobId,
-        stream: OutputStream,
+        stream: StreamKind,
     },
     Exited {
         job_id: JobId,
-        exit: ProcessExit,
+        exit: ExitStatus,
+    },
+    /// `wait(2)` did not report how the child died. Carries the failure instead of a status so
+    /// no consumer can mistake an unreaped child for a terminated one.
+    WaitFailed {
+        job_id: JobId,
+        error: CowshedError,
     },
     StdinReady {
         job_id: JobId,
@@ -267,7 +254,7 @@ pub trait SpawnSink: Send {
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>>;
 
-    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<DevenvCommandOutput> {
+    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<CommandOutput> {
         Err(CowshedError::internal(format!(
             "spawn sink cannot evaluate devenv at {}",
             devenv_dir.display()
@@ -293,8 +280,7 @@ pub trait ArtifactSink: Send {
     fn next_job_id(&self) -> Result<JobId>;
     fn admit(&mut self, job_id: JobId, grant_revision: u64, argv: &[CommandArg]) -> Result<()>;
     fn prepare_background(&mut self, job_id: JobId) -> Result<()>;
-    fn write(&mut self, job_id: JobId, stream: OutputStream, bytes: &[u8])
-    -> Result<ArtifactWrite>;
+    fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite>;
     fn seal(
         &mut self,
         job_id: JobId,
@@ -305,6 +291,7 @@ pub trait ArtifactSink: Send {
     fn checkpoint(&mut self) -> Result<CheckpointBarrier>;
 }
 
+pub use crate::process::{CommandOutput, ProcessStatus};
 pub use crate::storage::audit::CommitmentDraft;
 
 /// Where a supervisor sends its audit records. Recording is best effort by contract: the act a
@@ -370,20 +357,11 @@ impl ArtifactSink for ArtifactStoreSink {
         store.prepare_background(token).map_err(map_artifact_error)
     }
 
-    fn write(
-        &mut self,
-        job_id: JobId,
-        stream: OutputStream,
-        bytes: &[u8],
-    ) -> Result<ArtifactWrite> {
+    fn write(&mut self, job_id: JobId, stream: StreamKind, bytes: &[u8]) -> Result<ArtifactWrite> {
         let (store, tokens) = (&mut self.store, &self.tokens);
         let token = tokens
             .get(&job_id)
             .ok_or_else(|| missing_artifact_token(job_id))?;
-        let stream = match stream {
-            OutputStream::Stdout => StreamKind::Stdout,
-            OutputStream::Stderr => StreamKind::Stderr,
-        };
         let outcome = store
             .append(token, stream, bytes)
             .map_err(map_artifact_error)?;
@@ -901,13 +879,13 @@ async fn refresh_devenv_snapshot(
     devenv_dir: &Path,
 ) -> Result<BTreeMap<String, String>> {
     let output = spawner.print_devenv_env(devenv_dir).await?;
-    if output.status != 0 {
+    if !output.status.succeeded() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
         return Err(CowshedError::environment_missing(
             if detail.is_empty() {
                 format!(
-                    "devenv print-dev-env --json failed in {} with status {}",
+                    "devenv print-dev-env --json failed in {} with {}",
                     devenv_dir.display(),
                     output.status
                 )
@@ -1350,34 +1328,28 @@ impl SpawnSink for SystemSpawnSink {
         ));
         tokio::spawn(run_system_output(
             job_id,
-            OutputStream::Stdout,
+            StreamKind::Stdout,
             stdout,
             events.clone(),
         ));
         tokio::spawn(run_system_output(
             job_id,
-            OutputStream::Stderr,
+            StreamKind::Stderr,
             stderr,
             events.clone(),
         ));
         tokio::spawn(async move {
-            let exit = match child.wait().await {
-                Ok(status) => {
-                    if let Some(code) = status.code() {
-                        ProcessExit::Exited(code)
-                    } else {
-                        ProcessExit::Signaled {
-                            signal: status.signal().unwrap_or(libc::SIGKILL),
-                            core_dumped: status.core_dumped(),
-                        }
-                    }
+            let event = match process_termination_from_wait(child.wait().await) {
+                Ok(exit) => ProcessEvent::Exited { job_id, exit },
+                Err(error) => {
+                    // The child was never reaped, so it may still be running. Kill the group
+                    // before reporting: a job that cannot be observed must not be left alive
+                    // behind a terminal record.
+                    let _ = kill_process_group(pid, libc::SIGKILL);
+                    ProcessEvent::WaitFailed { job_id, error }
                 }
-                Err(_) => ProcessExit::Signaled {
-                    signal: libc::SIGKILL,
-                    core_dumped: false,
-                },
             };
-            let _ = events.send(ProcessEvent::Exited { job_id, exit }).await;
+            let _ = events.send(event).await;
         });
         Ok(Box::new(SystemRunningProcess {
             pid,
@@ -1386,7 +1358,7 @@ impl SpawnSink for SystemSpawnSink {
         }))
     }
 
-    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<DevenvCommandOutput> {
+    async fn print_devenv_env(&mut self, devenv_dir: &Path) -> Result<CommandOutput> {
         let output = tokio::process::Command::new("devenv")
             .args(["print-dev-env", "--json"])
             .current_dir(devenv_dir)
@@ -1401,11 +1373,61 @@ impl SpawnSink for SystemSpawnSink {
                     "install devenv or repair the host PATH, then retry",
                 )
             })?;
-        Ok(DevenvCommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        Ok(CommandOutput::from(output))
+    }
+}
+
+/// Translate a `wait(2)` result into the job's terminal exit status.
+///
+/// Every branch that cannot name how the child died returns `Err`. A `wait` that fails, or that
+/// reports neither an exit code nor a terminating signal, means the child has not been reaped:
+/// answering with a synthesized `SIGKILL` would let `finalize_job` seal the artifact and drain
+/// the job's waiters with a successful terminal status while the process is still running.
+fn process_termination_from_wait(
+    waited: io::Result<std::process::ExitStatus>,
+) -> Result<ExitStatus> {
+    let status = waited.map_err(|error| {
+        CowshedError::integrity(
+            format!("cannot wait for the sandbox process: {error}"),
+            "cowshed doctor --json",
+        )
+    })?;
+    match ProcessStatus::from(status) {
+        ProcessStatus::Exit(code) => Ok(ExitStatus::Exited { code }),
+        ProcessStatus::Signal(signal) => Ok(ExitStatus::Signaled {
+            signal,
+            core_dumped: status.core_dumped(),
+        }),
+        ProcessStatus::Unknown => Err(CowshedError::integrity(
+            format!("sandbox process reported {}", ProcessStatus::Unknown),
+            "cowshed doctor --json",
+        )),
+    }
+}
+
+/// Signal a process group created by `setpgid(0, 0)` in the child.
+///
+/// SAFETY: `kill` is a plain syscall with no memory operands, so the only precondition is the
+/// argument itself. The negation is only a process-group target for a strictly positive pid:
+/// `kill(-1, ...)` is "every process the caller may signal" and `kill(0, ...)` is the caller's
+/// own group, so both are rejected before negating rather than escaping the sandbox tree. A
+/// group whose last member already exited (`ESRCH`) is the intended outcome, not a failure.
+fn kill_process_group(pid: u32, signal: i32) -> Result<()> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| CowshedError::internal("process id is not a signalable process group"))?;
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(CowshedError::environment_missing(
+            format!("failed to signal sandbox process tree: {error}"),
+            "inspect the job and retry",
+        ))
     }
 }
 
@@ -1463,26 +1485,13 @@ impl RunningProcess for SystemRunningProcess {
     }
 
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
-        let raw = match signal {
-            ProcessSignal::Term => libc::SIGTERM,
-            ProcessSignal::Kill => libc::SIGKILL,
-        };
-        let pid = i32::try_from(self.pid)
-            .map_err(|_| CowshedError::internal("process id exceeds platform range"))?;
-        let result = unsafe { libc::kill(-pid, raw) };
-        if result == 0 {
-            Ok(())
-        } else {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(CowshedError::environment_missing(
-                    format!("failed to signal sandbox process tree: {error}"),
-                    "inspect the job and retry",
-                ))
-            }
-        }
+        kill_process_group(
+            self.pid,
+            match signal {
+                ProcessSignal::Term => libc::SIGTERM,
+                ProcessSignal::Kill => libc::SIGKILL,
+            },
+        )
     }
 }
 
@@ -1516,7 +1525,7 @@ async fn run_system_stdin(
 
 async fn run_system_output<R>(
     job_id: JobId,
-    stream: OutputStream,
+    stream: StreamKind,
     mut reader: R,
     events: mpsc::Sender<ProcessEvent>,
 ) where
@@ -1715,7 +1724,7 @@ impl WorkspaceSupervisorHandle {
     pub async fn log_read(
         &self,
         job_id: JobId,
-        stream: OutputStream,
+        stream: StreamKind,
         offset: u64,
         follow: bool,
     ) -> Result<LogChunk> {
@@ -1733,7 +1742,7 @@ impl WorkspaceSupervisorHandle {
     pub async fn attach_read(
         &self,
         job_id: JobId,
-        stream: OutputStream,
+        stream: StreamKind,
         offset: u64,
     ) -> Result<LogChunk> {
         self.log_read(job_id, stream, offset, true).await
@@ -1908,7 +1917,7 @@ enum Command {
     LogRead {
         authority: WorkspaceAuthoritySnapshot,
         job_id: JobId,
-        stream: OutputStream,
+        stream: StreamKind,
         offset: u64,
         follow: bool,
         reply: oneshot::Sender<Result<LogChunk>>,
@@ -1937,11 +1946,18 @@ enum ActorLifecycle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Why the actor stopped a job before it terminated on its own. Every variant is a distinct
+/// diagnosis: `doctor` cannot tell a stdin pump error from a corrupt artifact append if they
+/// share a discriminant, and all four of the failure variants land on `JobState::Failed`.
 enum KillReason {
     Requested,
     OutputLimit,
     Retire,
+    SpawnFailure,
     StdinFailure,
+    ArtifactFailure,
+    /// `wait(2)` never reported a status, so the child's fate is unknown.
+    WaitFailure,
 }
 
 struct PendingStdin {
@@ -1950,7 +1966,7 @@ struct PendingStdin {
 }
 
 struct PendingLog {
-    stream: OutputStream,
+    stream: StreamKind,
     offset: u64,
     reply: oneshot::Sender<Result<LogChunk>>,
 }
@@ -1974,7 +1990,10 @@ struct JobStateRecord {
     stderr_len: u64,
     stdout_eof: bool,
     stderr_eof: bool,
-    exit: Option<ProcessExit>,
+    exit: Option<ExitStatus>,
+    /// Set when `wait(2)` could not name the child's termination. Keeps the job's terminal
+    /// record free of a fabricated exit and hands the failure to everyone awaiting the job.
+    wait_failure: Option<CowshedError>,
     output_limit: Option<OutputLimitInfo>,
     kill_reason: Option<KillReason>,
     terminal_committed: bool,
@@ -1995,10 +2014,21 @@ impl JobStateRecord {
         !matches!(self.info.state, JobState::Queued | JobState::Running)
     }
 
-    fn stream(&self, stream: OutputStream) -> (&VecDeque<Bytes>, u64, bool) {
+    /// The answer to "how did this job end", for every caller that asked to be told.
+    ///
+    /// A retained wait failure outranks the record: the state and byte counts are true, but
+    /// nothing observed the child terminate, so `Ok` would be a wrong-success channel.
+    fn terminal_outcome(&self) -> Result<JobInfo> {
+        match &self.wait_failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(self.info.clone()),
+        }
+    }
+
+    fn stream(&self, stream: StreamKind) -> (&VecDeque<Bytes>, u64, bool) {
         match stream {
-            OutputStream::Stdout => (&self.stdout, self.stdout_len, self.stdout_eof),
-            OutputStream::Stderr => (&self.stderr, self.stderr_len, self.stderr_eof),
+            StreamKind::Stdout => (&self.stdout, self.stdout_len, self.stdout_eof),
+            StreamKind::Stderr => (&self.stderr, self.stderr_len, self.stderr_eof),
         }
     }
 }
@@ -2538,6 +2568,7 @@ impl SupervisorActor {
             stdout_eof: false,
             stderr_eof: false,
             exit: None,
+            wait_failure: None,
             output_limit: None,
             kill_reason: None,
             terminal_committed: false,
@@ -2574,8 +2605,10 @@ impl SupervisorActor {
             Err(error) => {
                 job.stdout_eof = true;
                 job.stderr_eof = true;
-                job.exit = Some(ProcessExit::Exited(error.exec_wrapper_exit_code().into()));
-                job.kill_reason = Some(KillReason::StdinFailure);
+                job.exit = Some(ExitStatus::Exited {
+                    code: error.exec_wrapper_exit_code().into(),
+                });
+                job.kill_reason = Some(KillReason::SpawnFailure);
                 self.jobs.insert(job_id, job);
                 self.finalize_job(job_id, Some(JobState::Failed)).await;
                 let _ = reply.send(Err(error));
@@ -2685,7 +2718,7 @@ impl SupervisorActor {
             return;
         };
         if job.terminal() {
-            let _ = reply.send(Ok(job.info.clone()));
+            let _ = reply.send(job.terminal_outcome());
         } else {
             job.waiters.push(reply);
         }
@@ -2709,7 +2742,7 @@ impl SupervisorActor {
             .get_mut(&job_id)
             .expect("begin_kill validated the job");
         if job.terminal_committed {
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(job.terminal_outcome().map(|_| ()));
         } else {
             job.kill_waiters.push(reply);
         }
@@ -2719,7 +2752,7 @@ impl SupervisorActor {
         &mut self,
         authority: &WorkspaceAuthoritySnapshot,
         job_id: JobId,
-        stream: OutputStream,
+        stream: StreamKind,
         offset: u64,
         follow: bool,
         reply: oneshot::Sender<Result<LogChunk>>,
@@ -2788,8 +2821,8 @@ impl SupervisorActor {
             ProcessEvent::OutputEof { job_id, stream } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     match stream {
-                        OutputStream::Stdout => job.stdout_eof = true,
-                        OutputStream::Stderr => job.stderr_eof = true,
+                        StreamKind::Stdout => job.stdout_eof = true,
+                        StreamKind::Stderr => job.stderr_eof = true,
                     }
                     flush_log_waiters(job);
                 }
@@ -2797,18 +2830,29 @@ impl SupervisorActor {
             ProcessEvent::Exited { job_id, exit } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.exit = Some(exit);
-                    job.process = None;
-                    for pending in job.pending_stdin.drain(..) {
-                        let _ = pending.reply.send(Err(CowshedError::conflict(
-                            "job exited before stdin was accepted",
-                            "inspect the terminal job status",
-                        )));
-                    }
-                    for waiter in job.close_waiters.drain(..) {
-                        let _ = waiter.send(Ok(()));
-                    }
-                    job.info.stdin.complete = true;
+                    release_exited_process(job);
                 }
+            }
+            ProcessEvent::WaitFailed { job_id, error } => {
+                let Some(job) = self.jobs.get_mut(&job_id) else {
+                    return;
+                };
+                if job.terminal_committed {
+                    return;
+                }
+                // `exit` stays `None`: there is no truthful status to publish. The job seals as
+                // `Failed` and every waiter gets the integrity error, so a still-running child
+                // can never be read as a completed one.
+                job.wait_failure = Some(error);
+                job.kill_reason = Some(KillReason::WaitFailure);
+                // The child was never reaped, so it may still be running. Kill the group before
+                // retiring the handle: an unobservable process must not outlive its record. The
+                // spawn sink's own wait task kills too, because it is the one component that is
+                // still alive if this actor has already stopped.
+                if let Some(process) = job.process.as_mut() {
+                    let _ = process.signal_process_tree(ProcessSignal::Kill);
+                }
+                release_exited_process(job);
             }
             ProcessEvent::StdinReady { job_id } => self.flush_stdin(job_id),
             ProcessEvent::StdinPumpWrite {
@@ -2838,7 +2882,7 @@ impl SupervisorActor {
         }
     }
 
-    fn process_output(&mut self, job_id: JobId, stream: OutputStream, bytes: Bytes) {
+    fn process_output(&mut self, job_id: JobId, stream: StreamKind, bytes: Bytes) {
         let Some(job) = self.jobs.get(&job_id) else {
             return;
         };
@@ -2854,11 +2898,11 @@ impl SupervisorActor {
                 if admission.accepted_bytes != 0 {
                     let accepted = bytes.slice(..admission.accepted_bytes);
                     match stream {
-                        OutputStream::Stdout => {
+                        StreamKind::Stdout => {
                             job.stdout_len += byte_count(accepted.len());
                             job.stdout.push_back(accepted);
                         }
-                        OutputStream::Stderr => {
+                        StreamKind::Stderr => {
                             job.stderr_len += byte_count(accepted.len());
                             job.stderr.push_back(accepted);
                         }
@@ -2874,7 +2918,7 @@ impl SupervisorActor {
                 }
             }
             Err(_) => {
-                let _ = self.begin_kill(job_id, KillReason::StdinFailure);
+                let _ = self.begin_kill(job_id, KillReason::ArtifactFailure);
             }
         }
     }
@@ -2955,7 +2999,12 @@ impl SupervisorActor {
             .jobs
             .iter()
             .filter_map(|(id, job)| {
-                (!job.terminal_committed && job.exit.is_some() && job.stdout_eof && job.stderr_eof)
+                // An unreaped child may hold its pipes open forever, so a wait failure does not
+                // wait for EOF. Output already accepted is sealed; anything later is dropped by
+                // the `terminal_committed` guard in `process_output`.
+                (!job.terminal_committed
+                    && (job.wait_failure.is_some()
+                        || (job.exit.is_some() && job.stdout_eof && job.stderr_eof)))
                     .then_some(*id)
             })
             .collect::<Vec<_>>();
@@ -2974,10 +3023,15 @@ impl SupervisorActor {
         let state = forced_state.unwrap_or_else(|| match job.kill_reason {
             Some(KillReason::OutputLimit) => JobState::OutputLimit,
             Some(KillReason::Requested | KillReason::Retire) => JobState::Killed,
-            Some(KillReason::StdinFailure) => JobState::Failed,
-            None => match job.exit.expect("ready terminal job has exit") {
-                ProcessExit::Exited(_) => JobState::Exited,
-                ProcessExit::Signaled { .. } => JobState::Signaled,
+            Some(
+                KillReason::SpawnFailure
+                | KillReason::StdinFailure
+                | KillReason::ArtifactFailure
+                | KillReason::WaitFailure,
+            ) => JobState::Failed,
+            None => match job.exit.as_ref().expect("ready terminal job has exit") {
+                ExitStatus::Exited { .. } => JobState::Exited,
+                ExitStatus::Signaled { .. } => JobState::Signaled,
             },
         });
         if !job.artifact_live {
@@ -3035,17 +3089,7 @@ impl SupervisorActor {
                 .try_into()
                 .unwrap_or(u64::MAX),
         );
-        job.info.exit = match job.exit {
-            Some(ProcessExit::Exited(code)) => Some(ExitStatus::Exited { code }),
-            Some(ProcessExit::Signaled {
-                signal,
-                core_dumped,
-            }) => Some(ExitStatus::Signaled {
-                signal,
-                core_dumped,
-            }),
-            None => None,
-        };
+        job.info.exit = job.exit.clone();
         job.info.stdout = seal.stdout;
         job.info.stderr = seal.stderr;
         job.info.output_limit = seal.output_limit;
@@ -3055,12 +3099,12 @@ impl SupervisorActor {
         {
             session.background_jobs.remove(&job_id);
         }
-        let info = job.info.clone();
+        let outcome = job.terminal_outcome();
         for waiter in job.waiters.drain(..) {
-            let _ = waiter.send(Ok(info.clone()));
+            let _ = waiter.send(outcome.clone());
         }
         for waiter in job.kill_waiters.drain(..) {
-            let _ = waiter.send(Ok(()));
+            let _ = waiter.send(outcome.clone().map(|_| ()));
         }
         flush_log_waiters(job);
     }
@@ -3217,7 +3261,7 @@ fn empty_stream() -> StreamInfo {
 
 fn make_log_chunk(
     job: &JobStateRecord,
-    stream: OutputStream,
+    stream: StreamKind,
     offset: u64,
 ) -> Result<Option<LogChunk>> {
     let (chunks, len, eof) = job.stream(stream);
@@ -3255,6 +3299,22 @@ fn make_log_chunk(
         next_offset,
         eof: (eof || job.terminal()) && next_offset == len,
     }))
+}
+
+/// Retire the process handle and release everything that was waiting on its stdin.
+fn release_exited_process(job: &mut JobStateRecord) {
+    job.process = None;
+    for pending in job.pending_stdin.drain(..) {
+        let _ = pending.reply.send(Err(CowshedError::conflict(
+            "job exited before stdin was accepted",
+            "inspect the terminal job status",
+        )));
+    }
+    job.pending_stdin_bytes = 0;
+    for waiter in job.close_waiters.drain(..) {
+        let _ = waiter.send(Ok(()));
+    }
+    job.info.stdin.complete = true;
 }
 
 fn flush_log_waiters(job: &mut JobStateRecord) {
@@ -4110,5 +4170,60 @@ mod sandbox_environment_tests {
         assert!(owned.join("index.crates.io-0000000000000000").is_dir());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod process_death_tests {
+    use super::*;
+
+    /// A `wait(2)` that fails tells us nothing about the child. Reporting it as a signal death
+    /// publishes a terminal status the kernel never gave us, and finalizes the job while the
+    /// child may still be running.
+    #[test]
+    fn a_failed_wait_is_not_a_terminal_exit_status() {
+        let error = process_termination_from_wait(Err(io::Error::from_raw_os_error(libc::ECHILD)))
+            .expect_err("a failed wait must stay an error, not a fabricated signal death");
+        assert_eq!(error.code, crate::error::ErrorCode::Integrity);
+    }
+
+    /// `wait` succeeding is not the same as `wait` answering. A stopped child is neither exited
+    /// nor signalled, which is the other way the old mapping reached a synthesized SIGKILL.
+    #[test]
+    fn a_wait_status_that_names_neither_exit_nor_signal_is_an_error() {
+        // Classic `WIFSTOPPED` wait status: SIGTSTP in the high byte, 0x7f in the low byte.
+        let stopped = std::process::ExitStatus::from_raw((libc::SIGTSTP << 8) | 0x7f);
+        assert_eq!(ProcessStatus::from(stopped), ProcessStatus::Unknown);
+        let error = process_termination_from_wait(Ok(stopped))
+            .expect_err("an unreaped child has no terminal exit status");
+        assert_eq!(error.code, crate::error::ErrorCode::Integrity);
+    }
+
+    #[test]
+    fn a_clean_exit_and_a_signal_death_keep_their_status() {
+        assert_eq!(
+            process_termination_from_wait(Ok(std::process::ExitStatus::from_raw(0))).unwrap(),
+            ExitStatus::Exited { code: 0 }
+        );
+        assert_eq!(
+            process_termination_from_wait(Ok(std::process::ExitStatus::from_raw(libc::SIGKILL)))
+                .unwrap(),
+            ExitStatus::Signaled {
+                signal: libc::SIGKILL,
+                core_dumped: false,
+            }
+        );
+    }
+
+    /// `kill(-pid)` is a process-group signal only for a strictly positive pid. `kill(-1, ...)`
+    /// would signal every process the daemon may signal.
+    #[test]
+    fn a_pid_that_is_not_a_process_group_is_refused() {
+        for pid in [0, 1] {
+            assert!(
+                kill_process_group(pid, 0).is_err(),
+                "pid {pid} must not be negated into a process-group target"
+            );
+        }
     }
 }
