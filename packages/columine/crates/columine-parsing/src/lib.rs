@@ -17,12 +17,60 @@ pub mod msgpack_scanner;
 pub mod scan;
 
 pub use columine_arrow::{
-    ArrowType, ColumnStorage, ColumnType, DynamicColumns, EventColumns, MAX_EVENTS_PER_BATCH,
-    MAX_STRING_BYTES, MAX_VALUE_BYTES, ParseError, SignalSchemaField,
+    ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, ColumnStorage, ColumnType,
+    DynamicColumns, MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES, ParseError, SignalSchemaField,
 };
 
-/// A base event as a row view over [`EventColumns`] (scanner tests and
-/// row-oriented consumers; the columnar buffers are the storage of record).
+/// Column indices of the base event log, matching
+/// [`BASE_EVENT_LOG_FIELDS`] by position.
+pub mod base_column {
+    pub const ID: u32 = 0;
+    pub const TYPE: u32 = 1;
+    pub const TIMESTAMP: u32 = 2;
+    pub const VALUE: u32 = 3;
+}
+
+/// Commit one base event into the four base-event-log columns.
+///
+/// Both scanners end here, so the column order and the null-`value` rule live
+/// in one place rather than being restated per format.
+pub(crate) fn commit_base_event(
+    columns: &mut DynamicColumns,
+    id: &[u8],
+    event_type: &[u8],
+    timestamp_micros: i64,
+    value: Option<&[u8]>,
+) -> Result<(), ParseError> {
+    if !columns.begin_row() {
+        return Err(ParseError::TooManyEvents);
+    }
+    let result = (|| {
+        columns.append_utf8(base_column::ID, id)?;
+        columns.append_utf8(base_column::TYPE, event_type)?;
+        columns.append_int64(base_column::TIMESTAMP, timestamp_micros)?;
+        match value {
+            Some(bytes) => columns.append_binary(base_column::VALUE, bytes),
+            None => columns.append_null(base_column::VALUE),
+        }
+    })();
+    if result.is_err() {
+        // A half-written row must not become visible.
+        columns.abandon_row();
+        return result;
+    }
+    columns.end_row();
+    Ok(())
+}
+
+/// Base event-log columns for scanner tests: the one column store, configured
+/// with the base schema the scanners write by index.
+#[cfg(test)]
+pub(crate) fn base_columns(capacity: u32) -> DynamicColumns {
+    DynamicColumns::new(&BASE_EVENT_LOG_FIELDS, capacity)
+}
+
+/// A base event as a row view over the base event-log columns (scanner tests
+/// and row-oriented consumers; the columnar buffers are the storage of record).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedEvent {
     pub id: String,
@@ -32,12 +80,29 @@ pub struct ParsedEvent {
 }
 
 /// Row view over the real columnar storage.
-pub fn parsed_event(cols: &EventColumns, row: u32) -> Option<ParsedEvent> {
+pub fn parsed_event(columns: &DynamicColumns, row: u32) -> Option<ParsedEvent> {
+    if row >= columns.count {
+        return None;
+    }
+    let text = |column: u32| -> Option<String> {
+        Some(
+            String::from_utf8_lossy(columns.get_column(column)?.read_variable(row)?).into_owned(),
+        )
+    };
     Some(ParsedEvent {
-        id: String::from_utf8_lossy(cols.get_id(row)?).into_owned(),
-        event_type: String::from_utf8_lossy(cols.get_type(row)?).into_owned(),
-        timestamp_micros: cols.get_timestamp(row)?,
-        value: cols.get_value(row).map(<[u8]>::to_vec),
+        id: text(base_column::ID)?,
+        event_type: text(base_column::TYPE)?,
+        timestamp_micros: columns
+            .get_column(base_column::TIMESTAMP)?
+            .read_fixed_i64(row)?,
+        value: (!columns.is_null(base_column::VALUE, row))
+            .then(|| {
+                columns
+                    .get_column(base_column::VALUE)
+                    .and_then(|column| column.read_variable(row))
+                    .map(<[u8]>::to_vec)
+            })
+            .flatten(),
     })
 }
 
@@ -282,7 +347,7 @@ mod properties {
             assert_eq!(parser.expect_field_name().unwrap(), "id");
             assert_eq!(parser.expect_string().unwrap(), id);
 
-            let mut columns = EventColumns::new(1);
+            let mut columns = base_columns(1);
             json_scanner::parse_json_events(document.as_bytes(), &mut columns).unwrap();
             let event = parsed_event(&columns, 0).unwrap();
             assert_eq!(event.id, id);
@@ -306,7 +371,7 @@ mod properties {
             write_fixstr(&mut input, "timestamp"); input.push(0xd3); input.extend(timestamp.to_be_bytes());
             write_fixstr(&mut input, "quantity"); input.push(quantity as u8);
 
-            let mut base = EventColumns::new(1);
+            let mut base = base_columns(1);
             msgpack_scanner::parse_msgpack_stream(&input, &mut base).unwrap();
             assert_eq!(parsed_event(&base, 0).unwrap().id, id);
 

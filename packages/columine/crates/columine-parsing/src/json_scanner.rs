@@ -1,7 +1,7 @@
 //! Streaming JSON scanner and UTC timestamp conversion.
 
 use crate::{
-    EventColumns, ParseError,
+    DynamicColumns, ParseError,
     json_parser::{JsonParser, ParserError, Token},
 };
 
@@ -26,8 +26,12 @@ impl From<JsonScannerError> for ParseError {
     }
 }
 
-/// Parses a JSON event array into the Stage-4B event-column boundary.
-pub fn parse_json_events(input: &[u8], output: &mut EventColumns) -> Result<(), JsonScannerError> {
+/// Parses a JSON event array into the base event-log columns
+/// (`columine_arrow::BASE_EVENT_LOG_FIELDS`: id, type, timestamp, value).
+pub fn parse_json_events(
+    input: &[u8],
+    output: &mut DynamicColumns,
+) -> Result<(), JsonScannerError> {
     let mut parser = JsonParser::new(input);
     parser.expect_array_begin().map_err(json_error)?;
     while !parser.is_array_end() {
@@ -41,7 +45,7 @@ pub fn parse_json_events(input: &[u8], output: &mut EventColumns) -> Result<(), 
 
 fn parse_event_object(
     parser: &mut JsonParser<'_>,
-    output: &mut EventColumns,
+    output: &mut DynamicColumns,
 ) -> Result<(), JsonScannerError> {
     parser.expect_object_begin().map_err(json_error)?;
     let mut id = None;
@@ -79,18 +83,18 @@ fn parse_event_object(
         Token::ObjectEnd => {}
         _ => return Err(JsonScannerError::InvalidJson),
     }
-    output
-        .add_event(
-            id.ok_or(JsonScannerError::MissingField)?.as_bytes(),
-            event_type.ok_or(JsonScannerError::MissingField)?.as_bytes(),
-            timestamp_micros.ok_or(JsonScannerError::MissingField)?,
-            value.as_deref(),
-        )
-        .map_err(|error| match error {
-            ParseError::TooManyEvents => JsonScannerError::TooManyEvents,
-            ParseError::BufferOverflow => JsonScannerError::BufferOverflow,
-            _ => JsonScannerError::InvalidJson,
-        })
+    crate::commit_base_event(
+        output,
+        id.ok_or(JsonScannerError::MissingField)?.as_bytes(),
+        event_type.ok_or(JsonScannerError::MissingField)?.as_bytes(),
+        timestamp_micros.ok_or(JsonScannerError::MissingField)?,
+        value.as_deref(),
+    )
+    .map_err(|error| match error {
+        ParseError::TooManyEvents => JsonScannerError::TooManyEvents,
+        ParseError::BufferOverflow => JsonScannerError::BufferOverflow,
+        _ => JsonScannerError::InvalidJson,
+    })
 }
 
 fn parse_timestamp_token(parser: &mut JsonParser<'_>) -> Result<i64, JsonScannerError> {
@@ -204,8 +208,8 @@ fn epoch_days(year: i32, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn columns() -> EventColumns {
-        EventColumns::new(10)
+    fn columns() -> DynamicColumns {
+        DynamicColumns::new(&crate::BASE_EVENT_LOG_FIELDS, 10)
     }
     #[test]
     fn parse_iso8601_to_micros_full_format_with_millis() {
