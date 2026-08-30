@@ -810,6 +810,32 @@ pub enum RestoreFailpoint {
     AfterRestoreMetadataParentFsync = 18,
 }
 
+fn collect_dir_entry_paths(
+    directory: &Path,
+    operation: &'static str,
+    entries: impl IntoIterator<Item = io::Result<PathBuf>>,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    entries
+        .into_iter()
+        .map(|entry| entry.map_err(|error| io_error(operation, directory, error)))
+        .collect()
+}
+
+fn read_dir_paths(
+    directory: &Path,
+    operation: &'static str,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    match fs::read_dir(directory) {
+        Ok(entries) => collect_dir_entry_paths(
+            directory,
+            operation,
+            entries.map(|entry| entry.map(|entry| entry.path())),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(io_error(operation, directory, error)),
+    }
+}
+
 fn directory_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
@@ -1484,29 +1510,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 volume_key: volume_key(repo, &main),
             });
         }
-        let entries = match fs::read_dir(&layout.project().sessions) {
-            // An entry that cannot be read is a shorter workspace list, and the callers of this
-            // enumeration decide what exists from it. `entry.ok()` would report a workspace whose
-            // directory entry failed as absent, which is a wrong-success answer to a probe.
-            Ok(entries) => entries
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<io::Result<Vec<_>>>()
-                .map_err(|error| {
-                    io_error(
-                        "enumerate session image entry",
-                        &layout.project().sessions,
-                        error,
-                    )
-                })?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                return Err(io_error(
-                    "enumerate session images",
-                    &layout.project().sessions,
-                    error,
-                ));
-            }
-        };
+        let entries = read_dir_paths(&layout.project().sessions, "enumerate session images")?;
         for discovered in discover_session_images(entries)? {
             let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -3962,26 +3966,10 @@ where
                 image,
             });
         }
-        let entries = match fs::read_dir(&storage.project().sessions) {
-            Ok(entries) => entries
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<io::Result<Vec<_>>>()
-                .map_err(|error| {
-                    io_error(
-                        "enumerate pending session image entry",
-                        &storage.project().sessions,
-                        error,
-                    )
-                })?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                return Err(io_error(
-                    "enumerate pending session images",
-                    &storage.project().sessions,
-                    error,
-                ));
-            }
-        };
+        let entries = read_dir_paths(
+            &storage.project().sessions,
+            "enumerate pending session images",
+        )?;
         for discovered in discover_session_images(entries)? {
             let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
@@ -4244,7 +4232,14 @@ where
             }
 
             let staging = project.join(super::STAGING_NAMESPACE);
-            if let Ok(entries) = fs::read_dir(&staging) {
+            let entries = match fs::read_dir(&staging) {
+                Ok(entries) => Some(entries),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(io_error("enumerate staging recovery", &staging, error));
+                }
+            };
+            if let Some(entries) = entries {
                 for entry in entries {
                     let path = entry
                         .map_err(|error| io_error("read staging recovery entry", &staging, error))?
@@ -5028,6 +5023,27 @@ mod tests {
         ] {
             assert_eq!(should_retry_lock(kind), retry);
         }
+    }
+
+    #[test]
+    fn session_enumeration_propagates_a_read_dir_entry_error() {
+        let directory = Path::new("/sessions");
+        let error = collect_dir_entry_paths(
+            directory,
+            "enumerate session images",
+            [
+                Ok(PathBuf::from("/sessions/a.sparseimage")),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+            ],
+        )
+        .expect_err("an unreadable directory entry is not an absent workspace");
+        assert!(matches!(
+            error,
+            ApfsStorageError::Io {
+                operation: "enumerate session images",
+                ..
+            }
+        ));
     }
 
     #[cfg(unix)]
