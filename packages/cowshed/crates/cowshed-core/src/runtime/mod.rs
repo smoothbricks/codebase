@@ -7,6 +7,6 @@ pub use project::{
 };
 pub use supervisor::{
     CheckpointBarrier, CommitmentDraft, CommitmentPublisher, CommitmentPublisherHandle, LogChunk,
-    OutputStream, SessionSnapshot, SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
+    SessionSnapshot, SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
     WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
