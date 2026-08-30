@@ -128,14 +128,14 @@ export interface WasmAllocator {
 }
 
 /**
- * Size class discriminants shared with the allocator ABI.
+ * Size class discriminants shared with the allocator ABI (`lmao_arena::SizeClass`).
+ * Identity blocks use a separate header freelist, not a fifth size class.
  */
 export enum SizeClass {
   SpanSystem = 0,
   Col1B = 1,
   Col4B = 2,
   Col8B = 3,
-  Identity = 4,
 }
 
 export interface WasmAllocatorOptions {
