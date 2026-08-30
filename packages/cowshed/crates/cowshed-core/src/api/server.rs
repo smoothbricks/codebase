@@ -419,70 +419,67 @@ pub(crate) mod codec {
 const ROUTER_CLOSED_HINT: &str = "restart the trusted cowshed controller";
 
 /// Methods emitted by the capability API. Coordinator connections may call every one of them.
-pub const CAPABILITY_METHODS: &[&str] = &[
-    "project.open",
-    "project.workspace",
-    "project.workspaceAt",
-    "project.list",
-    "workspace.info",
-    "workspace.attach",
-    "workspace.grants",
-    "coordinator.rename",
-    "coordinator.adopt",
-    "coordinator.create",
-    "coordinator.fork",
-    "coordinator.moveCheckout",
-    "coordinator.changeRepoId",
-    "coordinator.grant",
-    "coordinator.revoke",
-    "coordinator.rebase",
-    "coordinator.land",
-    "coordinator.restore",
-    "coordinator.resize",
-    "coordinator.detach",
-    "coordinator.assignSlot",
-    "coordinator.destroy",
-    "coordinator.gc",
-    "coordinator.repoMirror",
-    "coordinator.setCheckpointQuota",
-    "coordinator.doctor",
-    "coordinator.worker",
-    "worker.exec",
-    "worker.stdinChunk",
-    "worker.stdinClose",
-    "worker.shell",
-    "worker.listJobs",
-    "worker.job",
-    "worker.checkpoint",
-    "worker.push",
-    "job.status",
-    "job.logs",
-    "job.attachWrite",
-    "job.detach",
-    "job.wait",
-    "job.kill",
-    "session.close",
-];
+/// Worker-callable methods are marked `worker` so the two allowlists cannot drift.
+macro_rules! capability_methods {
+    (@acc_all [$($all:literal)*] @acc_worker [$($worker:literal)*]) => {
+        pub const CAPABILITY_METHODS: &[&str] = &[$($all),*];
+        pub const WORKER_METHODS: &[&str] = &[$($worker),*];
+    };
+    (@acc_all [$($all:literal)*] @acc_worker [$($worker:literal)*] worker $name:literal $($rest:tt)*) => {
+        capability_methods!(@acc_all [$($all)* $name] @acc_worker [$($worker)* $name] $($rest)*);
+    };
+    (@acc_all [$($all:literal)*] @acc_worker [$($worker:literal)*] $name:literal $($rest:tt)*) => {
+        capability_methods!(@acc_all [$($all)* $name] @acc_worker [$($worker)*] $($rest)*);
+    };
+    ($($rest:tt)*) => {
+        capability_methods!(@acc_all [] @acc_worker [] $($rest)*);
+    };
+}
 
-/// Capability methods a workspace-bound worker connection may call.
-pub const WORKER_METHODS: &[&str] = &[
-    "workspace.grants",
-    "worker.exec",
-    "worker.stdinChunk",
-    "worker.stdinClose",
-    "worker.shell",
-    "worker.listJobs",
-    "worker.job",
-    "worker.checkpoint",
-    "worker.push",
-    "job.status",
-    "job.logs",
-    "job.attachWrite",
-    "job.detach",
-    "job.wait",
-    "job.kill",
-    "session.close",
-];
+capability_methods! {
+    "project.open"
+    "project.workspace"
+    "project.workspaceAt"
+    "project.list"
+    "workspace.info"
+    "workspace.attach"
+    worker "workspace.grants"
+    "coordinator.rename"
+    "coordinator.adopt"
+    "coordinator.create"
+    "coordinator.fork"
+    "coordinator.moveCheckout"
+    "coordinator.changeRepoId"
+    "coordinator.grant"
+    "coordinator.revoke"
+    "coordinator.rebase"
+    "coordinator.land"
+    "coordinator.restore"
+    "coordinator.resize"
+    "coordinator.detach"
+    "coordinator.assignSlot"
+    "coordinator.destroy"
+    "coordinator.gc"
+    "coordinator.repoMirror"
+    "coordinator.setCheckpointQuota"
+    "coordinator.doctor"
+    "coordinator.worker"
+    worker "worker.exec"
+    worker "worker.stdinChunk"
+    worker "worker.stdinClose"
+    worker "worker.shell"
+    worker "worker.listJobs"
+    worker "worker.job"
+    worker "worker.checkpoint"
+    worker "worker.push"
+    worker "job.status"
+    worker "job.logs"
+    worker "job.attachWrite"
+    worker "job.detach"
+    worker "job.wait"
+    worker "job.kill"
+    worker "session.close"
+}
 
 const UPLOAD_METHODS: &[&str] = &["worker.exec", "worker.stdinChunk", "job.attachWrite"];
 
