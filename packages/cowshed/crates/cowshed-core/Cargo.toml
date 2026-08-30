@@ -18,7 +18,10 @@ arrow-schema = "56"
 base64 = "0.22"
 async-trait = "0.1"
 bytes = "1"
-cowshed-gateway = { path = "../cowshed-gateway" }
+# The control-plane data model only. Reconciling the gateway's session table against host
+# inventory is a pure function of these values, so the controller has no reason to link the
+# daemon's hyper/rustls closure; `cowshed-cli` owns the wiring to the running daemon.
+cowshed-gateway-types = { path = "../cowshed-gateway-types" }
 getrandom = "0.3"
 libc = "0.2"
 plist = "1"

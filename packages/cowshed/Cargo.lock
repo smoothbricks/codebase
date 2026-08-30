@@ -368,7 +368,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
- "cowshed-gateway",
+ "cowshed-gateway-types",
  "getrandom 0.3.4",
  "libc",
  "notify",
