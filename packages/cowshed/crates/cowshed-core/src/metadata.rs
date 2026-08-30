@@ -4,11 +4,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const METADATA_VERSION: u32 = 1;
 pub const PORT_BLOCK_SIZE: u16 = 16;
@@ -53,7 +52,6 @@ pub enum MetadataError {
         size: u16,
     },
     InvalidPath(PathBuf),
-    TemporaryFileExhausted(PathBuf),
     SlotOutOfRange(u32),
     SlotAlreadyBound {
         slot: u32,
@@ -125,13 +123,6 @@ impl fmt::Display for MetadataError {
             }
             Self::InvalidPath(path) => {
                 write!(f, "metadata path has no file name: {}", path.display())
-            }
-            Self::TemporaryFileExhausted(path) => {
-                write!(
-                    f,
-                    "could not allocate a temporary file beside {}",
-                    path.display()
-                )
             }
             Self::SlotOutOfRange(slot) => {
                 write!(f, "slot {slot} is outside 0..={}", SlotId::MAX)
@@ -1114,21 +1105,6 @@ impl DetachedWorkspaceMetadata {
 /// below go through it.
 pub const GRANTS_SIDECAR_SUFFIX: &str = ".grants.json";
 
-/// Open a directory and fsync it — the one durability barrier for directory entries. Opened with
-/// `O_DIRECTORY` so a path swapped for a file between derivation and sync fails instead of
-/// silently syncing the wrong object, and `O_CLOEXEC` so the descriptor never leaks into an
-/// exec'd child.
-pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC);
-    }
-    options.open(path)?.sync_all()
-}
-
 /// Append a suffix to a path's final component without touching its extension handling.
 pub(crate) fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value: OsString = path.as_os_str().to_owned();
@@ -1160,32 +1136,7 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, MetadataError> {
 }
 
 pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), MetadataError> {
-    write_json_with_nonce(path, value, atomic_nonce())
-}
-
-/// Atomically publishes private bytes with mode `0600`, without following a temporary-file
-/// symlink, and fsyncs both the file and its parent directory before returning.
-pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), MetadataError> {
-    write_atomic_with_nonce(path, atomic_nonce(), |writer| {
-        writer
-            .write_all(bytes)
-            .map_err(|source| io_error(path, source))
-    })
-}
-
-fn atomic_nonce() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-}
-
-fn write_json_with_nonce<T: Serialize + ?Sized>(
-    path: &Path,
-    value: &T,
-    nonce: u128,
-) -> Result<(), MetadataError> {
-    write_atomic_with_nonce(path, nonce, |writer| {
+    publish(path, |writer| {
         serde_json::to_writer_pretty(&mut *writer, value).map_err(|source| {
             MetadataError::Json {
                 path: path.to_owned(),
@@ -1198,82 +1149,24 @@ fn write_json_with_nonce<T: Serialize + ?Sized>(
     })
 }
 
-fn write_atomic_with_nonce(
+/// Atomically publishes private bytes with mode `0600` and fsyncs both the file and its parent
+/// directory before returning.
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), MetadataError> {
+    publish(path, |writer| {
+        writer
+            .write_all(bytes)
+            .map_err(|source| io_error(path, source))
+    })
+}
+
+fn publish(
     path: &Path,
-    nonce: u128,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), MetadataError>,
 ) -> Result<(), MetadataError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| MetadataError::InvalidPath(path.to_owned()))?;
-    let mut opened = None;
-    for attempt in 0..128_u8 {
-        let mut temp_name = file_name.to_os_string();
-        temp_name.push(format!(".tmp.{}.{nonce}.{attempt}", std::process::id()));
-        let temp_path = parent.join(temp_name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        match options.open(&temp_path) {
-            Ok(file) => {
-                opened = Some((temp_path, file));
-                break;
-            }
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(source) => return Err(io_error(&temp_path, source)),
-        }
-    }
-
-    let (temp_path, file) =
-        opened.ok_or_else(|| MetadataError::TemporaryFileExhausted(path.to_owned()))?;
-    let mut cleanup = TempCleanup {
-        path: temp_path.clone(),
-        armed: true,
-    };
-    {
-        let mut writer = BufWriter::new(file);
-        write(&mut writer)?;
-        writer
-            .flush()
-            .map_err(|source| io_error(&temp_path, source))?;
-        #[cfg(unix)]
-        writer
-            .get_ref()
-            .set_permissions({
-                use std::os::unix::fs::PermissionsExt;
-                fs::Permissions::from_mode(0o600)
-            })
-            .map_err(|source| io_error(&temp_path, source))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|source| io_error(&temp_path, source))?;
-    }
-
-    fs::rename(&temp_path, path).map_err(|source| io_error(path, source))?;
-    cleanup.armed = false;
-    sync_directory(parent).map_err(|source| io_error(parent, source))?;
-    Ok(())
-}
-
-struct TempCleanup {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl Drop for TempCleanup {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
+    crate::fsio::publish_private_file(path, write).map_err(|error| match error {
+        crate::fsio::PublishError::Io { path, source } => io_error(&path, source),
+        crate::fsio::PublishError::Write(error) => error,
+    })
 }
 
 #[cfg(test)]
@@ -1281,6 +1174,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const LEGACY_V1_SIDECAR: &str = r#"{
   "version": 1,
@@ -1899,38 +1794,30 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_retries_only_name_collisions() {
-        let directory = temp_directory("atomic-collision");
+    fn atomic_write_publishes_durably_and_leaves_no_residue() {
+        let directory = temp_directory("atomic-publish");
         let path = directory.join("metadata.json");
-        let nonce = 42;
-        let collision = directory.join(format!(
-            "metadata.json.tmp.{}.{nonce}.0",
-            std::process::id()
-        ));
-        fs::write(&collision, "do not replace").unwrap();
 
         let value = json!({ "revision": 9 });
-        write_json_with_nonce(&path, &value, nonce).unwrap();
-        assert_eq!(fs::read_to_string(&collision).unwrap(), "do not replace");
+        write_json(&path, &value).unwrap();
         assert_eq!(read_json::<serde_json::Value>(&path).unwrap(), value);
+        let residue: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| crate::fsio::is_temp_artifact(name))
+            .collect();
         assert!(
-            !directory
-                .join(format!(
-                    "metadata.json.tmp.{}.{nonce}.1",
-                    std::process::id()
-                ))
-                .exists()
+            residue.is_empty(),
+            "publish leaves no temp residue: {residue:?}"
         );
 
         let missing_parent_path = directory.join("missing").join("metadata.json");
-        let error = write_json_with_nonce(&missing_parent_path, &value, nonce).unwrap_err();
+        let error = write_json(&missing_parent_path, &value).unwrap_err();
         assert!(matches!(
             error,
             MetadataError::Io { path: error_path, source }
-                if error_path == directory.join("missing").join(format!(
-                    "metadata.json.tmp.{}.{nonce}.0",
-                    std::process::id()
-                )) && source.kind() == io::ErrorKind::NotFound
+                if error_path.parent() == Some(directory.join("missing").as_path())
+                    && source.kind() == io::ErrorKind::NotFound
         ));
         fs::remove_dir_all(directory).unwrap();
     }

@@ -1,11 +1,10 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::metadata::{GRANTS_SIDECAR_SUFFIX, WorkspaceName};
@@ -319,45 +318,18 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), HostConfigError
     })?;
     fs::create_dir_all(parent)
         .map_err(|source| io_error("create host configuration directory", parent, source))?;
-    let temporary = parent.join(format!(
-        ".{HOST_CONFIG_FILE}.{}.tmp",
-        Uuid::new_v4().simple()
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|source| io_error("create temporary host configuration", &temporary, source))?;
-    let written = (|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    crate::fsio::publish_private_file::<io::Error>(path, |writer| {
+        writer.write_all(bytes)?;
+        writer.write_all(b"\n")
+    })
+    .map_err(|error| match error {
+        crate::fsio::PublishError::Io { path, source } => {
+            io_error("publish host configuration", path, source)
         }
-        file.write_all(bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()
-    })();
-    if let Err(source) = written {
-        let _ = fs::remove_file(&temporary);
-        return Err(io_error(
-            "write temporary host configuration",
-            temporary,
-            source,
-        ));
-    }
-    drop(file);
-    fs::rename(&temporary, path).map_err(|source| {
-        let _ = fs::remove_file(&temporary);
-        io_error("publish host configuration", path, source)
-    })?;
-    sync_directory(parent)?;
-    Ok(())
+        crate::fsio::PublishError::Write(source) => {
+            io_error("write host configuration", path.to_path_buf(), source)
+        }
+    })
 }
 
 fn require_private_file(path: &Path) -> Result<(), HostConfigError> {
@@ -381,11 +353,6 @@ fn require_private_file(path: &Path) -> Result<(), HostConfigError> {
         }
     }
     Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<(), HostConfigError> {
-    crate::metadata::sync_directory(path)
-        .map_err(|source| io_error("sync host configuration directory", path, source))
 }
 
 fn io_error(

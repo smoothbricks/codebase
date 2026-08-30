@@ -7515,8 +7515,12 @@ fn quarantine_secret_files(
                 "move the existing quarantine artifact aside and retry adopt",
             ));
         }
-        let temporary =
-            destination_parent.join(format!(".cowshed-quarantine-{}.tmp", uuid::Uuid::new_v4()));
+        let temporary = destination_parent.join(crate::fsio::temp_name(
+            destination
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("cowshed-quarantine")),
+            uuid::Uuid::new_v4().simple(),
+        ));
         if let Err(error) = std::fs::copy(&source, &temporary) {
             return Err(quarantine_io_error(
                 "copy secret into quarantine",
