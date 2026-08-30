@@ -5954,13 +5954,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let mut fetch_remote = None;
         let git_worktree = is_git_worktree(&current.metadata);
         let default_onto = if git_worktree {
-            "main".to_owned()
+            DEFAULT_LANDING_BRANCH.to_owned()
         } else {
             let main_remote = crate::git::GitRepository::from_root(&root)
                 .configure_main_remote(&main_mount)
                 .await?;
             fetch_remote = Some(main_remote.remote_name().to_owned());
-            format!("{}/main", main_remote.remote_name())
+            format!("{}/{DEFAULT_LANDING_BRANCH}", main_remote.remote_name())
         };
         let onto = options
             .onto
