@@ -339,8 +339,8 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
 /// });
 /// ```
 ///
-/// Expands to `trace.span(name, parent, DEFAULT_CAPACITY, ...)` with
-/// `set_callsite(file!(), line!())` applied before the body runs. Use
+/// Expands to `trace.span(name, parent, DEFAULT_CAPACITY, ...)` with compile-time
+/// package/file/git attribution applied before the body runs. Use
 /// `span!(trace, parent_expr, "name", |ctx| ...)` to nest under a parent identity.
 #[proc_macro]
 pub fn span(input: TokenStream) -> TokenStream {
@@ -405,7 +405,12 @@ pub fn span(input: TokenStream) -> TokenStream {
     };
     quote! {
         (#trace).span(#name, #parent_expr, ::lmao_core::DEFAULT_CAPACITY, |__lmao_ctx| {
-            __lmao_ctx.set_callsite(file!(), line!());
+            __lmao_ctx.set_source(::lmao_core::SourceMetadata {
+                package_name: env!("CARGO_PKG_NAME"),
+                package_file: file!(),
+                git_sha: option_env!("GIT_SHA").or(option_env!("GITHUB_SHA")),
+                line: line!(),
+            });
             (#body)(__lmao_ctx)
         })
     }

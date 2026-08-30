@@ -19,7 +19,7 @@ pub mod packed_header;
 pub mod result;
 pub mod tuning;
 
-pub use buffer::SpanBuffer;
+pub use buffer::{SourceMetadata, SpanBuffer};
 pub use clock::{Clock, CoarseClock, SystemClock, TraceAnchor};
 pub use columns::{
     BoolColumn, EnumColumn, EnumIndexError, F64Column, FieldMeta, FieldStrategy, NumColumn,

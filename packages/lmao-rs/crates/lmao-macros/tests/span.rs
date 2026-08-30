@@ -29,9 +29,10 @@ fn span_macro_injects_callsite_and_supports_parent_form() {
     let (result, root) = span!(trace, "root", root_body);
     assert_eq!(result, Ok(42));
     assert_eq!(root.capacity(), lmao_core::DEFAULT_CAPACITY);
-    let (file, line) = root.callsite().expect("span! injects its callsite");
-    assert!(file.ends_with("tests/span.rs"));
-    assert!(line > 0);
+    let source = root.source().expect("span! injects source attribution");
+    assert_eq!(source.package_name, "lmao-macros");
+    assert!(source.package_file.ends_with("tests/span.rs"));
+    assert!(source.line > 0);
 
     let parent = root.identity.clone();
     let (result, child) = span!(trace, parent.clone(), "child", child_body);
