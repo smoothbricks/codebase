@@ -1,15 +1,13 @@
 //! Property tests for the arena's allocation and ownership invariants.
 //!
 //! Buddy merges are ADDRESS-based (right buddy = offset + block_size). Bump
-//! allocation aligns to 8 bytes, so two consecutively bump-allocated blocks are
-//! adjacent ONLY when the block size is a multiple of 8 (span_system always is;
-//! column blocks usually are not because of the null-bitmap prefix). Merges are
-//! therefore guaranteed within SPLIT FAMILIES (children of one buddy split are
-//! exactly adjacent) — the conservation property is stated over split families,
-//! not over arbitrary bump-allocated neighbors.
+//! allocation aligns to 64 bytes. Column block sizes still include a null-bitmap
+//! prefix and are not generally powers of two, so merges are guaranteed within
+//! SPLIT FAMILIES (children of one buddy split are exactly adjacent), not between
+//! arbitrary bump-allocated neighbors.
 
 use lmao_arena::raw::{self};
-use lmao_arena::{Arena, Mem, SizeClass, block_size};
+use lmao_arena::{Arena, Mem, SizeClass};
 use proptest::prelude::*;
 
 fn size_class_strategy() -> impl Strategy<Value = SizeClass> {
@@ -37,7 +35,7 @@ proptest! {
             let off = arena.alloc(sc, cap);
             prop_assert!(off != 0, "OOM not expected at this scale");
             prop_assert!(off >= lmao_arena::HEADER_SIZE as u32);
-            let size = block_size(sc, cap);
+            let size = raw::effective_block_size(sc, cap).unwrap();
             for &(o, s) in &live {
                 prop_assert!(off + size <= o || off >= o + s, "blocks overlap");
             }
@@ -77,8 +75,11 @@ proptest! {
         let cap = 8u32 << tier;
         // Skip combos collapsed by the small-block tier clamp (col_1b cap 8/16
         // share one effective tier — no split relationship to test).
-        prop_assume!(raw::effective_block_size(sc, cap * 2) == 2 * raw::effective_block_size(sc, cap));
-        let child_size = raw::effective_block_size(sc, cap);
+        prop_assume!(
+            raw::effective_block_size(sc, cap * 2).unwrap()
+                == 2 * raw::effective_block_size(sc, cap).unwrap()
+        );
+        let child_size = raw::effective_block_size(sc, cap).unwrap();
         let mut arena = Arena::new(1 << 20);
         // Seed a tier+1 block and free it, so the next two tier-N allocs split it.
         let parent = arena.alloc(sc, cap * 2);
@@ -135,7 +136,10 @@ proptest! {
         tier in 0usize..6,
     ) {
         let cap = 8u32 << tier;
-        prop_assume!(raw::effective_block_size(sc, cap) < raw::effective_block_size(sc, 512));
+        prop_assume!(
+            raw::effective_block_size(sc, cap).unwrap()
+                < raw::effective_block_size(sc, 512).unwrap()
+        );
         let mut arena = Arena::new(1 << 20);
         let a = arena.alloc(sc, cap); // bump top tier, split chain down
         prop_assert_eq!(arena.freelist_len(sc, cap), 1, "own-tier sibling parked on freelist");
@@ -169,16 +173,14 @@ proptest! {
         }
     }
 
-    /// Memory growth: a minimal arena grows on demand (native Vec backend) instead
-    /// of returning the OOM sentinel; all offsets stay valid post-growth.
+    /// Native arenas reserve their complete admitted region up front. Exhaustion
+    /// returns the public offset-0 sentinel without reallocating or copying it.
     #[test]
-    fn arena_grows_on_demand(count in 1usize..64) {
-        let mut arena = Arena::new(lmao_arena::HEADER_SIZE); // header only, zero slack
+    fn arena_exhaustion_is_a_stable_sentinel(count in 1usize..64) {
+        let mut arena = Arena::new(lmao_arena::HEADER_SIZE);
         for _ in 0..count {
-            let off = arena.alloc(SizeClass::Col8B, 512);
-            prop_assert!(off != 0, "Vec backend must grow, not OOM");
-            let end = off + block_size(SizeClass::Col8B, 512);
-            prop_assert!((end as usize) <= arena.len());
+            prop_assert_eq!(arena.alloc(SizeClass::Col8B, 512), 0);
+            prop_assert_eq!(arena.len(), lmao_arena::HEADER_SIZE);
         }
     }
 
@@ -211,6 +213,17 @@ proptest! {
         raw::span_end(m, system, root, cap, raw::ENTRY_TYPE_SPAN_OK, 99.0);
         prop_assert_eq!(raw::read_entry_type(m, system, 1, cap), raw::ENTRY_TYPE_SPAN_OK);
         prop_assert!(raw::read_timestamp(m, system, 1) > prev_ts);
+
+        while raw::read_write_index(m, identity) < cap {
+            let idx = raw::write_log_entry(m, system, identity, root, 5, cap, 100.0);
+            prop_assert!(idx >= 2);
+        }
+        prop_assert_eq!(
+            raw::write_log_entry(m, system, identity, root, 5, cap, 101.0),
+            0,
+            "full system block must reject a write instead of touching the next block"
+        );
+        prop_assert_eq!(raw::read_write_index(m, identity), cap);
     }
 
     /// Column writes: value readback + null-bitmap validity bits, with lazy
@@ -248,7 +261,7 @@ proptest! {
     fn exact_slabs_are_aligned_disjoint_and_single_owner(
         requests in prop::collection::vec((1u32..2048, 0u32..8), 1..100),
     ) {
-        let mut arena = Arena::new(lmao_arena::HEADER_SIZE);
+        let mut arena = Arena::new(1 << 20);
         let mut live: Vec<(u32, u32, u32)> = Vec::with_capacity(requests.len());
 
         for (byte_len, alignment_power) in requests {

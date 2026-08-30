@@ -19,8 +19,6 @@
 //! On non-wasm targets the exports compile against an in-process static arena so
 //! `cargo test --workspace` can exercise the ABI surface natively.
 
-#![allow(clippy::missing_safety_doc)]
-
 use lmao_arena::SizeClass;
 #[cfg(target_arch = "wasm32")]
 use lmao_arena::raw::Mem;
@@ -46,10 +44,12 @@ unsafe fn host_date_now() -> f64 {
 }
 
 fn performance_now() -> f64 {
+    // SAFETY: the instantiated module contract requires the zero-argument `env.performanceNow`.
     unsafe { host_performance_now() }
 }
 
 fn date_now() -> f64 {
+    // SAFETY: the instantiated module contract requires the zero-argument `env.dateNow`.
     unsafe { host_date_now() }
 }
 
@@ -60,53 +60,69 @@ fn date_now() -> f64 {
 #[cfg(target_arch = "wasm32")]
 struct WasmMem;
 
-/// Absolute offset → pointer, laundered through `black_box` so LLVM cannot prove
-/// offset 0 is a null pointer: the header legitimately lives at address 0 of WASM
-/// linear memory. Without this, LLVM folds header writes into `unreachable` and
-/// `reset()` traps.
+/// Absolute offset → pointer. Offset 0 alone is laundered so LLVM cannot treat
+/// the valid header address as Rust's null pointer and fold its accesses away.
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
-fn laundered(off: u32) -> *mut u8 {
-    core::hint::black_box(off as usize) as *mut u8
+fn linear_address(off: u32) -> *mut u8 {
+    let address = if off == 0 {
+        core::hint::black_box(0usize)
+    } else {
+        off as usize
+    };
+    address as *mut u8
 }
 
+#[cfg(target_arch = "wasm32")]
+const WASM_PAGE_SIZE: u32 = 65_536;
 #[cfg(target_arch = "wasm32")]
 impl Mem for WasmMem {
     #[inline]
     fn size(&self) -> u32 {
-        (core::arch::wasm32::memory_size(0) as u32).saturating_mul(65536)
+        (core::arch::wasm32::memory_size(0) as u32).saturating_mul(WASM_PAGE_SIZE)
     }
     fn grow_to(&mut self, new_size: u32) -> bool {
         let current = self.size();
         if new_size <= current {
             return true;
         }
-        let pages_needed = ((new_size - current) as usize).div_ceil(65536);
+        let pages_needed = ((new_size - current) as usize).div_ceil(WASM_PAGE_SIZE as usize);
         core::arch::wasm32::memory_grow(0, pages_needed) != usize::MAX
+    }
+    fn fill(&mut self, off: u32, len: u32, value: u8) {
+        // SAFETY: `Mem` callers only pass admitted arena ranges; `write_bytes`
+        // supports the ABI's unaligned blocks and writes exactly `len` bytes.
+        unsafe { linear_address(off).write_bytes(value, len as usize) }
     }
     #[inline]
     fn read_u8(&self, off: u32) -> u8 {
-        unsafe { laundered(off).read() }
+        // SAFETY: the arena admits every `Mem` offset before access.
+        unsafe { linear_address(off).read() }
     }
     #[inline]
     fn write_u8(&mut self, off: u32, v: u8) {
-        unsafe { laundered(off).write(v) }
+        // SAFETY: the arena admits every `Mem` offset before access.
+        unsafe { linear_address(off).write(v) }
     }
     #[inline]
     fn read_u32(&self, off: u32) -> u32 {
-        unsafe { laundered(off).cast::<u32>().read_unaligned() }
+        // SAFETY: the arena admits the range; column payloads may be unaligned.
+        unsafe { linear_address(off).cast::<u32>().read_unaligned() }
     }
     #[inline]
     fn write_u32(&mut self, off: u32, v: u32) {
-        unsafe { laundered(off).cast::<u32>().write_unaligned(v) }
+        // SAFETY: the arena admits the range; column payloads may be unaligned.
+        unsafe { linear_address(off).cast::<u32>().write_unaligned(v) }
     }
     #[inline]
     fn read_u64(&self, off: u32) -> u64 {
-        unsafe { laundered(off).cast::<u64>().read_unaligned() }
+        // SAFETY: the arena admits the range; column payloads may be unaligned.
+        unsafe { linear_address(off).cast::<u64>().read_unaligned() }
     }
     #[inline]
     fn write_u64(&mut self, off: u32, v: u64) {
-        unsafe { laundered(off).cast::<u64>().write_unaligned(v) }
+        // SAFETY: the arena admits the range; column payloads may be unaligned.
+        unsafe { linear_address(off).cast::<u64>().write_unaligned(v) }
     }
 }
 
@@ -127,12 +143,13 @@ fn with_mem<R>(f: impl FnOnce(&mut lmao_arena::VecMem) -> R) -> R {
     MEM.with(|m| f(&mut m.borrow_mut()))
 }
 
-fn size_class(sc: u8) -> SizeClass {
+fn size_class(sc: u8) -> Option<SizeClass> {
     match sc {
-        0 => SizeClass::SpanSystem,
-        1 => SizeClass::Col1B,
-        2 => SizeClass::Col4B,
-        _ => SizeClass::Col8B,
+        0 => Some(SizeClass::SpanSystem),
+        1 => Some(SizeClass::Col1B),
+        2 => Some(SizeClass::Col4B),
+        3 => Some(SizeClass::Col8B),
+        _ => None,
     }
 }
 
@@ -171,7 +188,10 @@ pub extern "C" fn get_free_count() -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn debug_get_freelist_head(sc: u8, capacity: u32) -> u32 {
-    with_mem(|m| raw::debug_freelist_head(m, size_class(sc), capacity))
+    let Some(sc) = size_class(sc) else {
+        return 0;
+    };
+    with_mem(|m| raw::debug_freelist_head(m, sc, capacity))
 }
 
 #[unsafe(no_mangle)]
@@ -181,22 +201,34 @@ pub extern "C" fn debug_read_next_ptr(offset: u32) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_freelist_len(sc: u8, capacity: u32) -> u32 {
-    with_mem(|m| raw::freelist_len(m, size_class(sc), capacity))
+    let Some(sc) = size_class(sc) else {
+        return 0;
+    };
+    with_mem(|m| raw::freelist_len(m, sc, capacity))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_freelist_reuse_count(sc: u8, capacity: u32) -> u32 {
-    with_mem(|m| raw::freelist_reuse_count(m, size_class(sc), capacity))
+    let Some(sc) = size_class(sc) else {
+        return 0;
+    };
+    with_mem(|m| raw::freelist_reuse_count(m, sc, capacity))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_freelist_split_count(sc: u8, capacity: u32) -> u32 {
-    with_mem(|m| raw::freelist_split_count(m, size_class(sc), capacity))
+    let Some(sc) = size_class(sc) else {
+        return 0;
+    };
+    with_mem(|m| raw::freelist_split_count(m, sc, capacity))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_freelist_merge_count(sc: u8, capacity: u32) -> u32 {
-    with_mem(|m| raw::freelist_merge_count(m, size_class(sc), capacity))
+    let Some(sc) = size_class(sc) else {
+        return 0;
+    };
+    with_mem(|m| raw::freelist_merge_count(m, sc, capacity))
 }
 
 // =============================================================================

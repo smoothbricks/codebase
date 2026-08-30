@@ -8,9 +8,11 @@
 //! deterministic — the wasm exports fetch host clocks, native callers use
 //! `Clock` from lmao-core.
 
+use core::mem::{offset_of, size_of};
+
 use crate::{
-    FREE_BLOCK_SIZE, HEADER_SIZE, IDENTITY_SIZE, NUM_TIERS, SizeClass, block_size,
-    capacity_to_tier, tier_to_capacity,
+    FREE_BLOCK_SIZE, FreeBlock, HEADER_SIZE, Header, IDENTITY_SIZE, Identity, NUM_TIERS, SizeClass,
+    TraceRoot, block_size, capacity_to_tier, null_bitmap_bytes, tier_to_capacity,
 };
 
 /// Linear memory backend. Offsets are absolute byte offsets; offset 0 holds the
@@ -23,6 +25,12 @@ pub trait Mem {
     fn size(&self) -> u32;
     /// Ensure at least `new_size` bytes are addressable. False = OOM.
     fn grow_to(&mut self, new_size: u32) -> bool;
+    /// Fill one addressable range. Backends should override this with their bulk primitive.
+    fn fill(&mut self, off: u32, len: u32, value: u8) {
+        for byte_offset in off..off + len {
+            self.write_u8(byte_offset, value);
+        }
+    }
     fn read_u8(&self, off: u32) -> u8;
     fn write_u8(&mut self, off: u32, v: u8);
     fn read_u32(&self, off: u32) -> u32;
@@ -43,44 +51,46 @@ pub trait Mem {
     }
 }
 
-// --- Header field offsets in the linear-memory ABI ---
-const H_BUMP_PTR: u32 = 0;
-const H_SPAN_ID_COUNTER: u32 = 4;
-const H_ALLOC_COUNT: u32 = 8;
-const H_FREE_COUNT: u32 = 12;
-const H_FREELIST_IDENTITY: u32 = 16;
-const H_THREAD_ID: u32 = 24;
-const H_FREELISTS: u32 = 32; // [u32; 28]
-const H_THREAD_ID_SET: u32 = 144;
-/// Head of the exact-block freelist. This occupies bytes 148..152 of the
-/// header's existing reserved tail; the header remains 192 bytes.
-const H_FREELIST_EXACT: u32 = 148;
+// --- Field offsets derived from the ABI structs ---
+const H_BUMP_PTR: u32 = offset_of!(Header, bump_ptr) as u32;
+const H_SPAN_ID_COUNTER: u32 = offset_of!(Header, span_id_counter) as u32;
+const H_ALLOC_COUNT: u32 = offset_of!(Header, alloc_count) as u32;
+const H_FREE_COUNT: u32 = offset_of!(Header, free_count) as u32;
+const H_FREELIST_IDENTITY: u32 = offset_of!(Header, freelist_identity) as u32;
+const H_THREAD_ID: u32 = offset_of!(Header, thread_id) as u32;
+const H_FREELISTS: u32 = offset_of!(Header, freelists) as u32;
+const H_THREAD_ID_SET: u32 = offset_of!(Header, thread_id_set) as u32;
+const H_FREELIST_EXACT: u32 = offset_of!(Header, freelist_exact) as u32;
 
-// --- FreeBlock field offsets (overlaid on freed memory) ---
-const FB_NEXT_PTR: u32 = 0;
-const FB_FREELIST_LEN: u32 = 4;
-const FB_REUSE_COUNT: u32 = 8;
-const FB_SPLIT_COUNT: u32 = 12;
-const FB_MERGE_COUNT: u32 = 16;
-const _: () = assert!(FB_MERGE_COUNT as usize + 4 == FREE_BLOCK_SIZE);
+const FB_NEXT_PTR: u32 = offset_of!(FreeBlock, next_ptr) as u32;
+const FB_FREELIST_LEN: u32 = offset_of!(FreeBlock, freelist_len) as u32;
+const FB_REUSE_COUNT: u32 = offset_of!(FreeBlock, reuse_count) as u32;
+const FB_SPLIT_COUNT: u32 = offset_of!(FreeBlock, split_count) as u32;
+const FB_MERGE_COUNT: u32 = offset_of!(FreeBlock, merge_count) as u32;
+const _: () = assert!(FB_MERGE_COUNT as usize + size_of::<u32>() == FREE_BLOCK_SIZE);
 
-// --- ExactFreeBlock field offsets (overlaid on freed memory) ---
-const EFB_NEXT_PTR: u32 = 0;
-const EFB_BYTE_LEN: u32 = 4;
-const EFB_ALIGNMENT: u32 = 8;
-const EFB_STORAGE_LEN: u32 = 12;
-const EXACT_FREE_BLOCK_SIZE: u32 = 16;
+#[repr(C)]
+struct ExactFreeBlock {
+    next_ptr: u32,
+    byte_len: u32,
+    alignment: u32,
+    storage_len: u32,
+}
 
-// --- Identity field offsets ---
-const ID_WRITE_INDEX: u32 = 0;
-const ID_SPAN_ID: u32 = 4;
-const ID_TRACE_ID_LEN: u32 = 8;
-pub const ID_TRACE_ID: u32 = 9; // offset of trace_id in Identity
-const ID_TRACE_ID_MAX: u32 = 119;
+const EFB_NEXT_PTR: u32 = offset_of!(ExactFreeBlock, next_ptr) as u32;
+const EFB_BYTE_LEN: u32 = offset_of!(ExactFreeBlock, byte_len) as u32;
+const EFB_ALIGNMENT: u32 = offset_of!(ExactFreeBlock, alignment) as u32;
+const EFB_STORAGE_LEN: u32 = offset_of!(ExactFreeBlock, storage_len) as u32;
+const EXACT_FREE_BLOCK_SIZE: u32 = size_of::<ExactFreeBlock>() as u32;
 
-// --- TraceRoot field offsets ---
-const TR_WALL_CLOCK_NANOS: u32 = 0;
-const TR_MONOTONIC_MS: u32 = 8;
+const ID_WRITE_INDEX: u32 = offset_of!(Identity, write_index) as u32;
+const ID_SPAN_ID: u32 = offset_of!(Identity, span_id) as u32;
+const ID_TRACE_ID_LEN: u32 = offset_of!(Identity, trace_id_len) as u32;
+pub const ID_TRACE_ID: u32 = offset_of!(Identity, trace_id) as u32;
+const ID_TRACE_ID_MAX: u32 = size_of::<[u8; 119]>() as u32;
+
+const TR_WALL_CLOCK_NANOS: u32 = offset_of!(TraceRoot, wall_clock_nanos) as u32;
+const TR_MONOTONIC_MS: u32 = offset_of!(TraceRoot, monotonic_ms) as u32;
 
 // Entry types (specs/lmao/01h)
 pub const ENTRY_TYPE_SPAN_START: u8 = 1;
@@ -99,6 +109,8 @@ pub struct SpanLayout {
     pub entry_type_offset: u32,
     pub row_header_offset: u32,
 }
+
+const BUMP_ALIGNMENT: u32 = 64;
 
 #[inline]
 fn freelist_off(sc: SizeClass, tier: usize) -> u32 {
@@ -176,12 +188,20 @@ fn alloc_at_tier<M: Mem>(m: &mut M, sc: SizeClass, tier: usize) -> u32 {
         }
     }
 
-    // Bump allocate, 8-byte aligned, growing memory as needed.
+    // Bump allocate on a cache-line boundary.
     let size = block_size(sc, tier_to_capacity(tier));
-    let aligned = (m.read_u32(H_BUMP_PTR) + 7) & !7u32;
-    let new_bump = aligned + size;
+    let Some(aligned) = m
+        .read_u32(H_BUMP_PTR)
+        .checked_add(BUMP_ALIGNMENT - 1)
+        .map(|value| value & !(BUMP_ALIGNMENT - 1))
+    else {
+        return 0;
+    };
+    let Some(new_bump) = aligned.checked_add(size) else {
+        return 0;
+    };
     if new_bump > m.size() && !m.grow_to(new_bump) {
-        return 0; // OOM sentinel
+        return 0;
     }
     m.write_u32(H_BUMP_PTR, new_bump);
     bump_counter(m, H_ALLOC_COUNT);
@@ -299,9 +319,7 @@ fn find_and_remove_by_offset<M: Mem>(m: &mut M, sc: SizeClass, tier: usize, targ
 #[inline]
 fn clear_bytes<M: Mem>(m: &mut M, offset: u32, len: u32) {
     debug_assert_ne!(offset, 0);
-    for byte_offset in offset..offset + len {
-        m.write_u8(byte_offset, 0);
-    }
+    m.fill(offset, len, 0);
 }
 
 /// Returns true when `offset` is already covered by a free block for this size
@@ -340,17 +358,19 @@ fn effective_tier(sc: SizeClass, tier: usize) -> usize {
 
 /// The byte extent a request actually occupies (post tier-clamping); use this
 /// for adjacency/overlap reasoning instead of [`block_size`].
-pub fn effective_block_size(sc: SizeClass, capacity: u32) -> u32 {
-    block_size(
-        sc,
-        tier_to_capacity(effective_tier(sc, capacity_to_tier(capacity))),
-    )
+pub fn effective_block_size(sc: SizeClass, capacity: u32) -> Option<u32> {
+    let tier = capacity_to_tier(capacity)?;
+    Some(block_size(sc, tier_to_capacity(effective_tier(sc, tier))))
 }
 
 /// `allocWithCapacity`.
 pub fn alloc_with_capacity<M: Mem>(m: &mut M, sc: SizeClass, capacity: u32) -> u32 {
-    let size = effective_block_size(sc, capacity);
-    let offset = alloc_at_tier(m, sc, effective_tier(sc, capacity_to_tier(capacity)));
+    let Some(tier) = capacity_to_tier(capacity) else {
+        return 0;
+    };
+    let tier = effective_tier(sc, tier);
+    let size = block_size(sc, tier_to_capacity(tier));
+    let offset = alloc_at_tier(m, sc, tier);
     if offset != 0 {
         clear_bytes(m, offset, size);
     }
@@ -359,15 +379,13 @@ pub fn alloc_with_capacity<M: Mem>(m: &mut M, sc: SizeClass, capacity: u32) -> u
 
 /// `freeWithCapacity`.
 pub fn free_with_capacity<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, capacity: u32) {
+    let Some(tier) = capacity_to_tier(capacity) else {
+        return;
+    };
     if offset == 0 || capacity_block_is_free(m, offset, sc) {
         return;
     }
-    free_at_tier(
-        m,
-        offset,
-        sc,
-        effective_tier(sc, capacity_to_tier(capacity)),
-    );
+    free_at_tier(m, offset, sc, effective_tier(sc, tier));
 }
 
 /// Allocate an exactly described logical block from the general intrusive
@@ -400,7 +418,7 @@ pub fn alloc_exact<M: Mem>(m: &mut M, byte_len: u32, alignment: u32) -> u32 {
     }
 
     let storage_len = byte_len.max(EXACT_FREE_BLOCK_SIZE);
-    let storage_alignment = alignment.max(4);
+    let storage_alignment = alignment.max(BUMP_ALIGNMENT);
     let Some(aligned) = m
         .read_u32(H_BUMP_PTR)
         .checked_add(storage_alignment - 1)
@@ -460,9 +478,7 @@ pub fn free_exact<M: Mem>(m: &mut M, offset: u32, byte_len: u32, alignment: u32)
 
 // --- Identity blocks (fixed 128B, separate freelist, no buddy) ---
 
-/// Identity allocation pops the freelist or uses an aligned bump. The bump path
-/// grows the backend when needed, keeping native `Vec` and WASM memory
-/// implementations safe when the initial region is too small.
+/// Identity allocation pops the freelist or uses a cache-line-aligned bump.
 fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
     let head_offset = m.read_u32(H_FREELIST_IDENTITY);
     if head_offset != 0 {
@@ -475,8 +491,16 @@ fn alloc_identity_block<M: Mem>(m: &mut M) -> u32 {
         bump_counter(m, H_ALLOC_COUNT);
         return head_offset;
     }
-    let aligned = (m.read_u32(H_BUMP_PTR) + 7) & !7u32;
-    let new_bump = aligned + IDENTITY_SIZE as u32;
+    let Some(aligned) = m
+        .read_u32(H_BUMP_PTR)
+        .checked_add(BUMP_ALIGNMENT - 1)
+        .map(|value| value & !(BUMP_ALIGNMENT - 1))
+    else {
+        return 0;
+    };
+    let Some(new_bump) = aligned.checked_add(IDENTITY_SIZE as u32) else {
+        return 0;
+    };
     if new_bump > m.size() && !m.grow_to(new_bump) {
         return 0;
     }
@@ -605,7 +629,9 @@ pub fn span_id_counter<M: Mem>(m: &M) -> u32 {
 }
 
 pub fn debug_freelist_head<M: Mem>(m: &M, sc: SizeClass, capacity: u32) -> u32 {
-    freelist_head(m, sc, effective_tier(sc, capacity_to_tier(capacity)))
+    capacity_to_tier(capacity)
+        .map(|tier| freelist_head(m, sc, effective_tier(sc, tier)))
+        .unwrap_or(0)
 }
 
 pub fn debug_next_ptr<M: Mem>(m: &M, offset: u32) -> u32 {
@@ -617,7 +643,10 @@ pub fn debug_next_ptr<M: Mem>(m: &M, offset: u32) -> u32 {
 }
 
 fn freelist_head_stat<M: Mem>(m: &M, sc: SizeClass, capacity: u32, field: u32) -> u32 {
-    let head = freelist_head(m, sc, effective_tier(sc, capacity_to_tier(capacity)));
+    let Some(tier) = capacity_to_tier(capacity) else {
+        return 0;
+    };
+    let head = freelist_head(m, sc, effective_tier(sc, tier));
     if head == 0 {
         0
     } else {
@@ -771,6 +800,9 @@ pub fn span_start<M: Mem>(
     capacity: u32,
     current_ms: f64,
 ) {
+    if capacity_to_tier(capacity).is_none() || capacity < 2 {
+        return;
+    }
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
     m.write_i64(system_ptr, ts);
     m.write_u8(system_ptr + capacity * 8, ENTRY_TYPE_SPAN_START);
@@ -788,6 +820,9 @@ pub fn span_end<M: Mem>(
     entry_type: u8,
     current_ms: f64,
 ) {
+    if capacity_to_tier(capacity).is_none() || capacity < 2 {
+        return;
+    }
     m.write_u8(system_ptr + capacity * 8 + 1, entry_type);
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
     m.write_i64(system_ptr + 8, ts);
@@ -804,6 +839,9 @@ pub fn write_log_entry<M: Mem>(
     current_ms: f64,
 ) -> u32 {
     let idx = m.read_u32(identity_ptr + ID_WRITE_INDEX);
+    if capacity_to_tier(capacity).is_none() || idx >= capacity {
+        return 0;
+    }
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
     m.write_i64(system_ptr + idx * 8, ts);
     m.write_u8(system_ptr + capacity * 8 + idx, entry_type);
@@ -821,6 +859,9 @@ pub fn write_col_f64<M: Mem>(
     value: f64,
     capacity: u32,
 ) -> u32 {
+    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
+        return 0;
+    }
     let offset = if col_offset == 0 {
         alloc_with_capacity(m, SizeClass::Col8B, capacity)
     } else {
@@ -829,7 +870,7 @@ pub fn write_col_f64<M: Mem>(
     if offset == 0 {
         return 0;
     }
-    let null_bitmap_size = (capacity + 7) >> 3;
+    let null_bitmap_size = null_bitmap_bytes(capacity);
     m.write_f64(offset + null_bitmap_size + row_idx * 8, value);
     set_valid_bit(m, offset, row_idx);
     offset
@@ -843,6 +884,9 @@ pub fn write_col_u32<M: Mem>(
     value: u32,
     capacity: u32,
 ) -> u32 {
+    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
+        return 0;
+    }
     let offset = if col_offset == 0 {
         alloc_with_capacity(m, SizeClass::Col4B, capacity)
     } else {
@@ -851,7 +895,7 @@ pub fn write_col_u32<M: Mem>(
     if offset == 0 {
         return 0;
     }
-    let null_bitmap_size = (capacity + 7) >> 3;
+    let null_bitmap_size = null_bitmap_bytes(capacity);
     m.write_u32(offset + null_bitmap_size + row_idx * 4, value);
     set_valid_bit(m, offset, row_idx);
     offset
@@ -865,6 +909,9 @@ pub fn write_col_u8<M: Mem>(
     value: u8,
     capacity: u32,
 ) -> u32 {
+    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
+        return 0;
+    }
     let offset = if col_offset == 0 {
         alloc_with_capacity(m, SizeClass::Col1B, capacity)
     } else {
@@ -873,7 +920,7 @@ pub fn write_col_u8<M: Mem>(
     if offset == 0 {
         return 0;
     }
-    let null_bitmap_size = (capacity + 7) >> 3;
+    let null_bitmap_size = null_bitmap_bytes(capacity);
     m.write_u8(offset + null_bitmap_size + row_idx, value);
     set_valid_bit(m, offset, row_idx);
     offset
@@ -895,8 +942,7 @@ pub fn read_entry_type<M: Mem>(m: &M, system_ptr: u32, row_idx: u32, capacity: u
 }
 
 pub fn read_col_f64<M: Mem>(m: &M, col_offset: u32, row_idx: u32, capacity: u32) -> f64 {
-    let null_bitmap_size = (capacity + 7) >> 3;
-    m.read_f64(col_offset + null_bitmap_size + row_idx * 8)
+    m.read_f64(col_offset + null_bitmap_bytes(capacity) + row_idx * 8)
 }
 
 pub fn read_col_is_valid<M: Mem>(m: &M, col_offset: u32, row_idx: u32) -> u8 {
