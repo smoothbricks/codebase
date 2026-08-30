@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,6 +20,7 @@ use cowshed_core::runtime::{
     ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RuntimeJobStream, RuntimeLogChunk,
     WorkspaceSnapshot,
 };
+use cowshed_core::storage::lifecycle::{Conflict, ExpectedState, ObservedState, Revision};
 use cowshed_core::{CowshedError, ErrorCode, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -105,6 +106,21 @@ impl Default for FakeRemoval {
     }
 }
 
+struct RecoveryRace {
+    fact: AtomicUsize,
+    attempts: AtomicUsize,
+    first_read: Notify,
+    mutated: Notify,
+}
+
+enum RecoveryBehavior {
+    None,
+    Contended(Arc<RecoveryRace>),
+    Mutate(Arc<RecoveryRace>),
+    AlwaysLifecycleConflict(Arc<AtomicUsize>),
+    ImmediateFailure(Arc<AtomicUsize>),
+}
+
 struct FakeHost {
     descriptor: ProjectDescriptor,
     state_path: PathBuf,
@@ -115,6 +131,7 @@ struct FakeHost {
     doctor_findings: Vec<Finding>,
     reclaim_gate: Option<Arc<Notify>>,
     removal: FakeRemoval,
+    recovery_behavior: RecoveryBehavior,
 }
 
 impl FakeHost {
@@ -150,6 +167,7 @@ impl FakeHost {
             doctor_findings,
             reclaim_gate: None,
             removal: FakeRemoval::default(),
+            recovery_behavior: RecoveryBehavior::None,
         }
     }
 
@@ -299,6 +317,24 @@ impl FakeHost {
     }
 }
 
+fn stale_lifecycle_conflict() -> CowshedError {
+    let repo = RepoId::parse("acme/widget").expect("fixed repo id");
+    let name = WorkspaceName::new("main").expect("fixed workspace");
+    CowshedError::lifecycle_conflict(Conflict::Stale {
+        index: 1,
+        expected: Box::new(ExpectedState::Absent {
+            repo: repo.clone(),
+            name: name.clone(),
+            topology_revision: Revision::new(1),
+        }),
+        actual: Box::new(ObservedState::Absent {
+            repo,
+            name,
+            topology_revision: Revision::new(2),
+        }),
+    })
+}
+
 #[async_trait]
 impl ProjectRuntimeHost for FakeHost {
     fn descriptor(&self) -> &ProjectDescriptor {
@@ -306,6 +342,39 @@ impl ProjectRuntimeHost for FakeHost {
     }
 
     async fn recover(&mut self) -> Result<()> {
+        match &self.recovery_behavior {
+            RecoveryBehavior::None => {}
+            RecoveryBehavior::Contended(race) => {
+                race.attempts.fetch_add(1, Ordering::SeqCst);
+                let expected = race.fact.load(Ordering::SeqCst);
+                if expected == 0 {
+                    race.first_read.notify_one();
+                    race.mutated.notified().await;
+                }
+                let actual = race.fact.load(Ordering::SeqCst);
+                if actual != expected {
+                    return Err(CowshedError::lifecycle_conflict(Conflict::FactCount {
+                        expected: expected + 1,
+                        actual: actual + 1,
+                    }));
+                }
+            }
+            RecoveryBehavior::Mutate(race) => {
+                race.fact.fetch_add(1, Ordering::SeqCst);
+                race.mutated.notify_one();
+            }
+            RecoveryBehavior::AlwaysLifecycleConflict(attempts) => {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(stale_lifecycle_conflict());
+            }
+            RecoveryBehavior::ImmediateFailure(attempts) => {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(CowshedError::environment_missing(
+                    "fixture storage is unreadable",
+                    "repair fixture permissions",
+                ));
+            }
+        }
         self.load()?;
         if self.state.pending_has_evidence
             && let Some(pending) = self.state.pending_restore.take()
@@ -2568,6 +2637,71 @@ async fn crash_reopen_recovers_published_and_pending_state() {
         ),
         root.join("checkout")
     );
+}
+
+#[tokio::test]
+async fn controller_startup_replans_after_cross_runtime_lifecycle_conflict() {
+    let root = test_root();
+    let race = Arc::new(RecoveryRace {
+        fact: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        first_read: Notify::new(),
+        mutated: Notify::new(),
+    });
+    let (events, _receiver) = mpsc::unbounded_channel();
+    let mut starting = FakeHost::new(&root, events.clone(), false, false, Vec::new());
+    starting.recovery_behavior = RecoveryBehavior::Contended(Arc::clone(&race));
+    let startup = tokio::spawn(ProjectRuntime::start(starting));
+
+    race.first_read.notified().await;
+    let mut mutating = FakeHost::new(&root, events, false, false, Vec::new());
+    mutating.recovery_behavior = RecoveryBehavior::Mutate(Arc::clone(&race));
+    let concurrent = ProjectRuntime::start(mutating)
+        .await
+        .expect("concurrent lifecycle runtime starts");
+    concurrent.shutdown().await.expect("stop mutating runtime");
+
+    let runtime = startup
+        .await
+        .expect("startup task joins")
+        .expect("controller reaches ready after refreshing its plan");
+    assert_eq!(race.attempts.load(Ordering::SeqCst), 2);
+    runtime.shutdown().await.expect("stop recovered runtime");
+}
+
+#[tokio::test]
+async fn controller_startup_does_not_retry_non_lifecycle_failures() {
+    let root = test_root();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (events, _receiver) = mpsc::unbounded_channel();
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.recovery_behavior = RecoveryBehavior::ImmediateFailure(Arc::clone(&attempts));
+
+    let error = match ProjectRuntime::start(host).await {
+        Ok(_) => panic!("non-conflict startup failure must remain fatal"),
+        Err(error) => error,
+    };
+    assert_eq!(error.message, "fixture storage is unreadable");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn controller_startup_names_exhausted_lifecycle_fact() {
+    let root = test_root();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (events, _receiver) = mpsc::unbounded_channel();
+    let mut host = FakeHost::new(&root, events, false, false, Vec::new());
+    host.recovery_behavior = RecoveryBehavior::AlwaysLifecycleConflict(Arc::clone(&attempts));
+
+    let error = match ProjectRuntime::start(host).await {
+        Ok(_) => panic!("permanent contention must exhaust its bounded attempts"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.message,
+        "controller startup exhausted 8 lifecycle attempts; authoritative fact 1 kept changing"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 8);
 }
 
 #[cfg(not(target_os = "macos"))]
