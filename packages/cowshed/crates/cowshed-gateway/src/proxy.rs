@@ -497,8 +497,7 @@ async fn handle_request(
     };
     let status = response.status();
     let (mut parts, body) = response.into_parts();
-    strip_response_secrets(&mut parts.headers);
-    strip_hop_headers(&mut parts.headers);
+    strip_upstream_response_headers(&mut parts.headers);
     let total_deadline = admitted_at + response_total_duration(&parts.headers, context.timeouts);
     let completion = Completion::new(context.commands.clone(), admission, status, None);
     let body = ProxyBody::stream(
@@ -802,8 +801,7 @@ async fn handle_mirror_request(
         .protocol
         .expect("mirror admission must carry a protocol");
     let mut headers = request.headers().clone();
-    strip_client_secrets(&mut headers);
-    strip_hop_headers(&mut headers);
+    strip_upstream_request_headers(&mut headers);
     let cache_scope = if admission.credential_allowed {
         MirrorCacheScope::Project(admission.repo_id.clone())
     } else {
@@ -851,8 +849,7 @@ async fn handle_mirror_request(
                 let status = response.response.status();
                 let cache_status = response.cache_status;
                 let (mut parts, body) = response.response.into_parts();
-                strip_response_secrets(&mut parts.headers);
-                strip_hop_headers(&mut parts.headers);
+                strip_upstream_response_headers(&mut parts.headers);
                 let total_deadline =
                     admitted_at + response_total_duration(&parts.headers, context.timeouts);
                 let completion = Completion::new(
@@ -1041,8 +1038,7 @@ impl MirrorUpstream for ProxyMirrorUpstream<'_> {
             )
             .map_err(|error| -> CacheBodyError { Box::new(error) })?;
         *outbound.headers_mut() = request.headers;
-        strip_client_secrets(outbound.headers_mut());
-        strip_hop_headers(outbound.headers_mut());
+        strip_upstream_request_headers(outbound.headers_mut());
         outbound.headers_mut().insert(
             header::HOST,
             HeaderValue::from_str(&request.target.authority())
@@ -1132,8 +1128,7 @@ impl MirrorUpstream for ProxyMirrorUpstream<'_> {
         .map_err(|_| -> CacheBodyError { "mirror response headers timed out".into() })?
         .map_err(|error| -> CacheBodyError { Box::new(error) })?;
         let (mut parts, body) = response.into_parts();
-        strip_response_secrets(&mut parts.headers);
-        strip_hop_headers(&mut parts.headers);
+        strip_upstream_response_headers(&mut parts.headers);
         let body = body
             .map_err(|error| -> CacheBodyError { Box::new(error) })
             .boxed();
@@ -1879,8 +1874,7 @@ async fn prepare_upstream_request(
     StatusCode,
 > {
     let (mut parts, body) = request.into_parts();
-    strip_client_secrets(&mut parts.headers);
-    strip_hop_headers(&mut parts.headers);
+    strip_upstream_request_headers(&mut parts.headers);
     parts.headers.insert(
         header::HOST,
         HeaderValue::from_str(&admission.target.authority())
@@ -2458,12 +2452,13 @@ fn sni_matches(sni: Option<&str>, host: &CanonicalHost) -> bool {
     }
 }
 
-fn strip_client_secrets(headers: &mut HeaderMap) {
+pub(crate) fn strip_upstream_request_headers(headers: &mut HeaderMap) {
     const SENSITIVE: &[&str] = &[
         "authorization",
         "proxy-authorization",
         "cookie",
         "set-cookie",
+        "npm-auth-type",
         "npm-auth-token",
         "x-npm-token",
         "npm-otp",
@@ -2474,11 +2469,14 @@ fn strip_client_secrets(headers: &mut HeaderMap) {
     for name in SENSITIVE {
         headers.remove(*name);
     }
+    strip_hop_headers(headers);
 }
 
-fn strip_response_secrets(headers: &mut HeaderMap) {
+pub(crate) fn strip_upstream_response_headers(headers: &mut HeaderMap) {
     headers.remove(header::SET_COOKIE);
     headers.remove(header::PROXY_AUTHENTICATE);
+    headers.remove(header::WWW_AUTHENTICATE);
+    strip_hop_headers(headers);
 }
 
 fn strip_hop_headers(headers: &mut HeaderMap) {
@@ -2497,7 +2495,9 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
         header::UPGRADE,
         header::TRAILER,
         header::TRANSFER_ENCODING,
-        HeaderName::from_static("te"),
+        header::TE,
+        header::PROXY_AUTHENTICATE,
+        header::PROXY_AUTHORIZATION,
         HeaderName::from_static("keep-alive"),
         HeaderName::from_static("proxy-connection"),
     ] {
