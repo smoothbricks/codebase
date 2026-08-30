@@ -12,11 +12,9 @@ repository = "https://github.com/smoothbricks/smoothbricks"
 [workspace.dependencies]
 columine-types = { path = "crates/columine-types" }
 columine-vm = { path = "crates/columine-vm" }
-rustc-hash = "2"
 # Portable RoaringFormatSpec (same spec rawr implements — cookies 12346/12347).
 roaring = { version = "0.11", default-features = false, features = ["std"] }
 proptest = "1"
-criterion = { version = "0.5", default-features = false }
 arrow-array = { version = "56", default-features = false }
 arrow-ipc = { version = "56", default-features = false }
 arrow-schema = { version = "56", default-features = false }
