@@ -2849,7 +2849,7 @@ impl NativeProjectRuntimeHost {
     ) -> Result<crate::storage::lifecycle::OperationIdentity> {
         Ok(crate::storage::lifecycle::OperationIdentity {
             project_root: self.descriptor.git_root.clone(),
-            base_commit: self.git.head_oid().await?,
+            base_commit: self.git.head_oid().await?.as_str().to_owned(),
             // One clock for the runtime module. Spawning `/bin/date` was a process, a pipe, and
             // a UTF-8 parse to render what `SystemTime` already holds.
             created_at: super::supervisor::utc_now()?.as_str().to_owned(),
@@ -2867,7 +2867,7 @@ impl NativeProjectRuntimeHost {
     ) -> Result<NativeRemovalGitFence> {
         let root = current_snapshot_mount(self, workspace)?;
         let git = crate::git::GitRepository::from_root(root);
-        let head = GitOid::new(git.head_oid().await?).map_err(native_integrity_error)?;
+        let head = git.head_oid().await?;
         Ok(NativeRemovalGitFence {
             incarnation: workspace.derived.workspace.incarnation().clone(),
             head,
