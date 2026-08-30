@@ -118,18 +118,23 @@ proptest! {
         prop_assert_eq!(num.allocated_bytes(), 0);
         prop_assert_eq!(s.allocated_bytes(), 0);
         let mut expected_num = 0;
+        let mut expected_str = 0;
         for t in &touches {
             let row = *t as usize & (cap - 1);
             num.set(row, cap, 1.0);
             s.set(row, cap, "static-template");
             if expected_num == 0 {
                 expected_num = num.allocated_bytes();
+                expected_str = s.allocated_bytes();
                 prop_assert!(expected_num > 0);
+                prop_assert!(expected_str > 0);
             }
             prop_assert_eq!(num.allocated_bytes(), expected_num);
+            prop_assert_eq!(s.allocated_bytes(), expected_str);
         }
         if touches.is_empty() {
             prop_assert_eq!(num.allocated_bytes(), 0);
+            prop_assert_eq!(s.allocated_bytes(), 0);
         }
     }
 

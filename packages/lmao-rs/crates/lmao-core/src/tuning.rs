@@ -12,13 +12,10 @@
 //! stats reset after each adjustment
 //! ```
 
-pub const MIN_CAPACITY: usize = 8;
-pub const MAX_CAPACITY: usize = 1024;
+include!(concat!(env!("OUT_DIR"), "/tuning.rs"));
 
-const GROW_THRESHOLD: f64 = 1.5;
-const SHRINK_THRESHOLD: f64 = 0.5;
-/// Don't adjust on tiny samples.
-const MIN_SPANS_SAMPLE: u64 = 16;
+/// Default capacity used before a schema-specific ratchet has learned a workload.
+pub const DEFAULT_CAPACITY: usize = 64;
 
 /// Per-schema capacity ratchet. One instance lives on each generated buffer class.
 #[derive(Debug)]
@@ -82,6 +79,17 @@ mod tests {
             r.record_span(1000); // way over capacity → overflow-heavy
         }
         assert_eq!(r.capacity(), MAX_CAPACITY);
+    }
+
+    #[test]
+    fn adjusts_after_ten_spans() {
+        let mut ratchet = CapacityRatchet::new(MIN_CAPACITY);
+        for _ in 1..10 {
+            ratchet.record_span(1000);
+            assert_eq!(ratchet.capacity(), MIN_CAPACITY);
+        }
+        ratchet.record_span(1000);
+        assert_eq!(ratchet.capacity(), MIN_CAPACITY * 2);
     }
 
     #[test]

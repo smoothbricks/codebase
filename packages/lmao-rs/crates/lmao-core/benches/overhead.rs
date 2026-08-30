@@ -1,11 +1,7 @@
-//! Placeholder bench harness for the overhead gates
-//! (deterministic scheduler specification §5):
-//! - enabling tracing must not cut median throughput by >20% at a 10^6-event run
-//! - peak RSS increase ≤25%
+//! Measures the cold `SpanBuffer` construction cost.
 //!
-//! Once the tracer facade exists, add a traced-vs-untraced pair over the same
-//! synthetic workload and report the ratio. For now this benches buffer creation
-//! so the harness wiring is proven.
+//! This is deliberately not labeled as an end-to-end tracing-overhead or RSS gate:
+//! those require an untraced control executing the same application workload.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lmao_core::clock::{Clock, TraceAnchor};

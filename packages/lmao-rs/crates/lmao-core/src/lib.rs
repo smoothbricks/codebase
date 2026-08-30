@@ -21,7 +21,10 @@ pub mod tuning;
 
 pub use buffer::SpanBuffer;
 pub use clock::{Clock, CoarseClock, SystemClock, TraceAnchor};
-pub use columns::{BoolColumn, EnumColumn, F64Column, NumColumn, SharedStr, StrColumn, U64Column};
+pub use columns::{
+    BoolColumn, EnumColumn, EnumIndexError, F64Column, FieldMeta, FieldStrategy, NumColumn,
+    SharedStr, StrColumn, U64Column,
+};
 pub use context::{SpanContext, TraceContext};
 pub use entry_type::EntryType;
 pub use identity::{Entropy, SpanIdentity, TraceId};
@@ -31,4 +34,4 @@ pub use packed_header::{
     vocabulary_id_from_header,
 };
 pub use result::{RetryPolicy, SpanOutcome, Transient};
-pub use tuning::CapacityRatchet;
+pub use tuning::{CapacityRatchet, DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY};

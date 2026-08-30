@@ -12,7 +12,7 @@ publish.workspace = true
 proptest = { workspace = true }
 criterion = { workspace = true }
 lmao-macros = { path = "../lmao-macros" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [[example]]
 name = "jcode_tracer"
