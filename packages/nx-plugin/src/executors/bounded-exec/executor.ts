@@ -4,6 +4,7 @@ import { isAbsolute, join } from 'node:path';
 import type { BoundedExecOptions } from './schema.js';
 
 const DEFAULT_KILL_AFTER_MS = 10_000;
+const REAP_AFTER_FORCE_KILL_MS = 2_000;
 const EXIT_CODE_BY_SIGNAL: Partial<Record<NodeJS.Signals, number>> = {
   SIGHUP: 129,
   SIGINT: 130,
@@ -101,49 +102,44 @@ export async function runBoundedExec(
   process.on('SIGTERM', onSigterm);
   process.on('SIGHUP', onSighup);
 
-  let timeout: NodeJS.Timeout | undefined;
-  const timeoutPromise = new Promise<void>((resolve) => {
-    timeout = setTimeout(() => {
-      state.timedOut = true;
-      const elapsedMs = Date.now() - startedAt;
-      appendStderr(`\nCommand timed out after ${elapsedMs}ms (timeoutMs=${timeoutMs}, cwd=${cwd}): ${command}\n`);
-      void (async () => {
-        await ignoreKillError(killChildTree(false));
-        if (!state.settled && killAfterMs > 0) {
-          await delay(killAfterMs);
-        }
-        if (!state.settled) {
-          state.forceKillNeeded = true;
-          appendStderr(`Force-killing timed out command after killAfterMs=${killAfterMs}: ${command}\n`);
-          await ignoreKillError(killChildTree(true));
-        }
-        resolve();
-      })();
-    }, timeoutMs);
-  });
-
+  let resolveExit!: (value: { code: number | null; signal: NodeJS.Signals | null }) => void;
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    resolveExit = resolve;
     child.once('error', (error) => {
       appendStderr(`${error.message}\n`);
+      state.settled = true;
       resolve({ code: 1, signal: null });
     });
     child.once('exit', (code, signal) => {
+      state.settled = true;
       resolve({ code, signal });
     });
   });
 
-  const exit = await exitPromise;
-  const exitedGracefullyAfterTimeout = state.timedOut && exit.code === 0 && exit.signal === null;
-  state.settled = !state.timedOut || exitedGracefullyAfterTimeout;
-  if (timeout) {
-    clearTimeout(timeout);
-  }
-  removeSignalHandlers();
+  const timeout = setTimeout(() => {
+    state.timedOut = true;
+    const elapsedMs = Date.now() - startedAt;
+    appendStderr(`\nCommand timed out after ${elapsedMs}ms (timeoutMs=${timeoutMs}, cwd=${cwd}): ${command}\n`);
+    void (async () => {
+      await ignoreKillError(killChildTree(false));
+      if (!state.settled && killAfterMs > 0) {
+        await delay(killAfterMs);
+      }
+      if (!state.settled) {
+        state.forceKillNeeded = true;
+        appendStderr(`Force-killing timed out command after killAfterMs=${killAfterMs}: ${command}\n`);
+        await ignoreKillError(killChildTree(true));
+        await delay(REAP_AFTER_FORCE_KILL_MS);
+      }
+      if (!state.settled) {
+        resolveExit({ code: 1, signal: 'SIGKILL' });
+      }
+    })();
+  }, timeoutMs);
 
-  if (state.timedOut) {
-    await timeoutPromise;
-    state.settled = true;
-  }
+  const exit = await exitPromise;
+  clearTimeout(timeout);
+  removeSignalHandlers();
 
   const code = exit.code ?? signalToExitCode(exit.signal);
   if (code !== 0 && !state.timedOut) {
@@ -169,19 +165,22 @@ export function createProcessTreeKiller(): ProcessTreeKiller {
 }
 
 function killProcessGroup(pid: number, signal: NodeJS.Signals): Promise<void> {
-  return new Promise((resolve) => {
-    try {
-      // Send signal to the entire process group (negative PID).
-      // The executor spawns with detached: true on POSIX, which creates a
-      // dedicated process group. Signaling -pid is atomic and catches all
-      // descendants, including grandchildren that tree-walk libraries miss
-      // when parents die and children get reparented to init.
-      process.kill(-pid, signal);
-    } catch {
-      // ESRCH: process group already exited between timeout and kill.
-    }
-    resolve();
-  });
+  try {
+    // Send signal to the entire process group (negative PID).
+    // The executor spawns with detached: true on POSIX, which creates a
+    // dedicated process group. Signaling -pid is atomic and catches all
+    // descendants, including grandchildren that tree-walk libraries miss
+    // when parents die and children get reparented to init.
+    process.kill(-pid, signal);
+  } catch {
+    // ESRCH: process group already exited, or this pid is not a group leader.
+  }
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // Already reaped.
+  }
+  return Promise.resolve();
 }
 
 function resolveCwd(cwd: string | undefined, root: string): string {

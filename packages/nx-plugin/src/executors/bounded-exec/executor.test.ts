@@ -149,6 +149,42 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(calls).toEqual(['SIGTERM', 'SIGKILL']);
   });
 
+  it('returns after force-kill even when the process tree ignores SIGKILL', async () => {
+    // Real clock: this is the platform kill/reap path. Fake timers cannot
+    // drive child_process exit or SIGKILL delivery.
+    if (process.platform === 'win32') {
+      return;
+    }
+    const workspace = await createWorkspace();
+    let leaked: number | undefined;
+    const killer: ProcessTreeKiller = {
+      async kill(pid) {
+        leaked = pid;
+      },
+    };
+    const started = Date.now();
+    const result = await runBoundedExec(
+      { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 50, killAfterMs: 10 },
+      workspace.context,
+      killer,
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Force-killing timed out command');
+    if (leaked !== undefined) {
+      try {
+        process.kill(-leaked, 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+      try {
+        process.kill(leaked, 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    }
+  });
+
   it('forwards args by default and can suppress unparsed args', async () => {
     const workspace = await createWorkspace();
 
