@@ -597,7 +597,14 @@ fn the_committed_wire_corpus_is_what_core_serializes() {
     rendered.push('\n');
 
     if std::env::var(WRITE_ENV).as_deref() == Ok("write") {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/wire-fixtures.json");
+        // Read at runtime, not through `env!`. The macro bakes the manifest path into the crate's
+        // output, which rustc records as `# env-dep:` and the patched sccache never normalises, so
+        // this crate and everything downstream would miss the compile cache at every new workspace
+        // mount path. Cargo exports CARGO_MANIFEST_DIR to the test process, which is the only place
+        // this regeneration branch runs.
+        let manifest_directory = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("cargo exports CARGO_MANIFEST_DIR to the test process");
+        let path = PathBuf::from(manifest_directory).join("../../src/wire-fixtures.json");
         std::fs::write(&path, &rendered).expect("the corpus path is writable");
     }
 
