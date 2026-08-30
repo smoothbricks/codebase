@@ -92,11 +92,13 @@ const ID_TRACE_ID_MAX: u32 = size_of::<[u8; 119]>() as u32;
 const TR_WALL_CLOCK_NANOS: u32 = offset_of!(TraceRoot, wall_clock_nanos) as u32;
 const TR_MONOTONIC_MS: u32 = offset_of!(TraceRoot, monotonic_ms) as u32;
 
-// Entry types (specs/lmao/01h)
-pub const ENTRY_TYPE_SPAN_START: u8 = 1;
-pub const ENTRY_TYPE_SPAN_OK: u8 = 2;
-pub const ENTRY_TYPE_SPAN_ERR: u8 = 3;
-pub const ENTRY_TYPE_SPAN_EXCEPTION: u8 = 4;
+// Span lifecycle discriminants (`01h` / `lmao_core::EntryType` 1..=4). Private:
+// the 24-wide table is `lmao-core`; arena stays dep-free and does not export a
+// second enum.
+const ENTRY_TYPE_SPAN_START: u8 = 1;
+const ENTRY_TYPE_SPAN_OK: u8 = 2;
+const ENTRY_TYPE_SPAN_ERR: u8 = 3;
+const ENTRY_TYPE_SPAN_EXCEPTION: u8 = 4;
 
 pub const SPAN_IDENTITY_ROOT: u8 = 0;
 pub const SPAN_IDENTITY_CHILD: u8 = 1;
@@ -538,31 +540,33 @@ fn initialize_identity<M: Mem>(m: &mut M, offset: u32, trace_id_len: u32) {
     m.write_u8(offset + ID_TRACE_ID_LEN, trace_id_len as u8);
 }
 
-/// `alloc_identity_root_for_js_write` — returns `(identity_offset << 32) | trace_id_field_offset`,
-/// 0 if the trace id is too long (or OOM).
-pub fn alloc_identity_root_for_js_write<M: Mem>(m: &mut M, trace_id_len: u32) -> u64 {
-    if trace_id_len > ID_TRACE_ID_MAX {
-        return 0;
-    }
+fn alloc_initialized_identity<M: Mem>(m: &mut M, trace_id_len: u32) -> u32 {
     let offset = alloc_identity_block(m);
     if offset == 0 {
         return 0;
     }
     clear_bytes(m, offset, IDENTITY_SIZE as u32);
     initialize_identity(m, offset, trace_id_len);
+    offset
+}
+
+/// `alloc_identity_root_for_js_write` — returns `(identity_offset << 32) | trace_id_field_offset`,
+/// 0 if the trace id is too long (or OOM).
+pub fn alloc_identity_root_for_js_write<M: Mem>(m: &mut M, trace_id_len: u32) -> u64 {
+    if trace_id_len > ID_TRACE_ID_MAX {
+        return 0;
+    }
+    let offset = alloc_initialized_identity(m, trace_id_len);
+    if offset == 0 {
+        return 0;
+    }
     let trace_id_field_offset = offset + ID_TRACE_ID;
     (u64::from(offset) << 32) | u64::from(trace_id_field_offset)
 }
 
 /// `alloc_identity_child`.
 pub fn alloc_identity_child<M: Mem>(m: &mut M) -> u32 {
-    let offset = alloc_identity_block(m);
-    if offset == 0 {
-        return 0;
-    }
-    clear_bytes(m, offset, IDENTITY_SIZE as u32);
-    initialize_identity(m, offset, 0);
-    offset
+    alloc_initialized_identity(m, 0)
 }
 
 pub fn read_identity_span_id<M: Mem>(m: &M, identity_ptr: u32) -> u32 {
@@ -812,6 +816,40 @@ pub fn span_end<M: Mem>(
     m.write_i64(system_ptr + 8, ts);
 }
 
+pub fn span_end_ok<M: Mem>(
+    m: &mut M,
+    system_ptr: u32,
+    trace_root_ptr: u32,
+    capacity: u32,
+    current_ms: f64,
+) {
+    span_end(
+        m,
+        system_ptr,
+        trace_root_ptr,
+        capacity,
+        ENTRY_TYPE_SPAN_OK,
+        current_ms,
+    );
+}
+
+pub fn span_end_err<M: Mem>(
+    m: &mut M,
+    system_ptr: u32,
+    trace_root_ptr: u32,
+    capacity: u32,
+    current_ms: f64,
+) {
+    span_end(
+        m,
+        system_ptr,
+        trace_root_ptr,
+        capacity,
+        ENTRY_TYPE_SPAN_ERR,
+        current_ms,
+    );
+}
+
 /// `write_log_entry` — bump write_index, stamp row, return the row index written.
 pub fn write_log_entry<M: Mem>(
     m: &mut M,
@@ -835,6 +873,23 @@ pub fn write_log_entry<M: Mem>(
 
 // --- Column IO (null bitmap precedes values, sharing one block) ---
 
+fn admit_col_write<M: Mem>(
+    m: &mut M,
+    col_offset: u32,
+    row_idx: u32,
+    capacity: u32,
+    sc: SizeClass,
+) -> u32 {
+    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
+        return 0;
+    }
+    if col_offset == 0 {
+        alloc_with_capacity(m, sc, capacity)
+    } else {
+        col_offset
+    }
+}
+
 /// `write_col_f64` — lazily allocates the column block on first write.
 pub fn write_col_f64<M: Mem>(
     m: &mut M,
@@ -843,19 +898,11 @@ pub fn write_col_f64<M: Mem>(
     value: f64,
     capacity: u32,
 ) -> u32 {
-    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
-        return 0;
-    }
-    let offset = if col_offset == 0 {
-        alloc_with_capacity(m, SizeClass::Col8B, capacity)
-    } else {
-        col_offset
-    };
+    let offset = admit_col_write(m, col_offset, row_idx, capacity, SizeClass::Col8B);
     if offset == 0 {
         return 0;
     }
-    let null_bitmap_size = null_bitmap_bytes(capacity);
-    m.write_f64(offset + null_bitmap_size + row_idx * 8, value);
+    m.write_f64(offset + null_bitmap_bytes(capacity) + row_idx * 8, value);
     set_valid_bit(m, offset, row_idx);
     offset
 }
@@ -868,19 +915,11 @@ pub fn write_col_u32<M: Mem>(
     value: u32,
     capacity: u32,
 ) -> u32 {
-    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
-        return 0;
-    }
-    let offset = if col_offset == 0 {
-        alloc_with_capacity(m, SizeClass::Col4B, capacity)
-    } else {
-        col_offset
-    };
+    let offset = admit_col_write(m, col_offset, row_idx, capacity, SizeClass::Col4B);
     if offset == 0 {
         return 0;
     }
-    let null_bitmap_size = null_bitmap_bytes(capacity);
-    m.write_u32(offset + null_bitmap_size + row_idx * 4, value);
+    m.write_u32(offset + null_bitmap_bytes(capacity) + row_idx * 4, value);
     set_valid_bit(m, offset, row_idx);
     offset
 }
@@ -893,19 +932,11 @@ pub fn write_col_u8<M: Mem>(
     value: u8,
     capacity: u32,
 ) -> u32 {
-    if capacity_to_tier(capacity).is_none() || row_idx >= capacity {
-        return 0;
-    }
-    let offset = if col_offset == 0 {
-        alloc_with_capacity(m, SizeClass::Col1B, capacity)
-    } else {
-        col_offset
-    };
+    let offset = admit_col_write(m, col_offset, row_idx, capacity, SizeClass::Col1B);
     if offset == 0 {
         return 0;
     }
-    let null_bitmap_size = null_bitmap_bytes(capacity);
-    m.write_u8(offset + null_bitmap_size + row_idx, value);
+    m.write_u8(offset + null_bitmap_bytes(capacity) + row_idx, value);
     set_valid_bit(m, offset, row_idx);
     offset
 }
