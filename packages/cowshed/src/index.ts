@@ -113,6 +113,8 @@ const parseResizeResult = typia.json.createAssertParse<ResizeResult>();
 const parseDoctorReport = typia.json.createAssertParse<DoctorReport>();
 const parseRemoveReport = typia.json.createAssertParse<RemoveReport>();
 const assertAttachOptions = typia.createAssertEquals<AttachOptions>();
+// Wire delimiter written by `to_napi_error` in crates/cowshed-napi/src/lib.rs; the two spellings
+// must stay byte-identical or hints silently merge back into messages.
 const NEXT_HINT_MARKER = '\nnext: ';
 
 function normalizeNativeError(error: unknown): unknown {
