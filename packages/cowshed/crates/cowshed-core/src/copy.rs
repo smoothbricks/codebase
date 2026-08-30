@@ -61,6 +61,16 @@ pub struct CopyReport {
     pub passes: usize,
     /// Source entries observed changing across passes.
     pub changed_entries: usize,
+    /// Regular files materialized with copy-on-write.
+    pub cloned_files: usize,
+    /// Leaves materialized by the explicit data-copy fallback.
+    pub copied_files: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CopyCounts {
+    cloned_files: usize,
+    copied_files: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -194,15 +204,24 @@ fn converge(
     let mut observed = observe(source)?;
     let mut changed_entries = 0usize;
     let mut last_changes = Vec::new();
+    let mut materialized = CopyCounts::default();
 
     for pass in 1..=pass_budget {
-        reconcile(source, destination, &mut mirrored, &observed)?;
+        let copied = reconcile(source, destination, &mut mirrored, &observed)?;
+        materialized.cloned_files = materialized
+            .cloned_files
+            .saturating_add(copied.cloned_files);
+        materialized.copied_files = materialized
+            .copied_files
+            .saturating_add(copied.copied_files);
         let current = observe(source)?;
         let changes = describe_churn(&observed, &current);
         if changes.is_empty() {
             return Ok(CopyReport {
                 passes: pass,
                 changed_entries,
+                cloned_files: materialized.cloned_files,
+                copied_files: materialized.copied_files,
             });
         }
         changed_entries = changed_entries.saturating_add(changes.len());
@@ -242,7 +261,7 @@ fn reconcile(
     destination: &Path,
     mirrored: &mut MirrorState,
     target: &Snapshot,
-) -> Result<()> {
+) -> Result<CopyCounts> {
     let obsolete = obsolete_paths(mirrored, target);
     let outdated = outdated_paths(mirrored, target);
     let staging = staging_directories(target, &obsolete, &outdated);
@@ -311,8 +330,13 @@ fn reconcile(
         }
     }
 
+    let mut copied = CopyCounts::default();
     for outcome in copy_leaves_parallel(source, destination, &leaf_copies)? {
-        if outcome.materialized {
+        if let Some(materialization) = outcome.materialization {
+            match materialization {
+                native::LeafMaterialization::Cloned => copied.cloned_files += 1,
+                native::LeafMaterialization::Copied => copied.copied_files += 1,
+            }
             mirrored.insert(outcome.relative, outcome.state);
         } else {
             mirrored.remove(&outcome.relative);
@@ -342,7 +366,7 @@ fn reconcile(
         }
         mirrored.insert(relative.clone(), Mirrored::from(entry));
     }
-    Ok(())
+    Ok(copied)
 }
 
 struct LeafCopy {
@@ -353,7 +377,7 @@ struct LeafCopy {
 struct LeafCopyOutcome {
     relative: PathBuf,
     state: Mirrored,
-    materialized: bool,
+    materialization: Option<native::LeafMaterialization>,
 }
 
 struct HardLinkAlias {
@@ -395,7 +419,7 @@ fn copy_leaves_parallel(
                     outcomes.push(LeafCopyOutcome {
                         relative: leaf.relative.clone(),
                         state: leaf.state,
-                        materialized: copy_leaf(
+                        materialization: copy_leaf(
                             &source.join(&leaf.relative),
                             &destination.join(&leaf.relative),
                         )?,
@@ -676,13 +700,13 @@ fn link_leaf(primary: &Path, destination: &Path) -> Result<bool> {
     }
 }
 
-/// Copy one file or symlink with every attribute it carries. Reports `false` if
-/// the source vanished mid-pass.
-fn copy_leaf(source: &Path, destination: &Path) -> Result<bool> {
+/// Copy one file or symlink with every attribute it carries. `None` means the source vanished
+/// mid-pass.
+fn copy_leaf(source: &Path, destination: &Path) -> Result<Option<native::LeafMaterialization>> {
     remove(destination, EntryKind::File)?;
     match copy_leaf_native(source, destination) {
-        Ok(()) => Ok(true),
-        Err(error) if vanished(&error) => Ok(false),
+        Ok(materialization) => Ok(Some(materialization)),
+        Err(error) if vanished(&error) => Ok(None),
         Err(error) => Err(copy_error(source, destination, &error)),
     }
 }
@@ -699,7 +723,7 @@ fn apply_directory_metadata(source: &Path, destination: &Path) -> Result<bool> {
 
 mod native;
 
-fn copy_leaf_native(source: &Path, destination: &Path) -> io::Result<()> {
+fn copy_leaf_native(source: &Path, destination: &Path) -> io::Result<native::LeafMaterialization> {
     native::copy_leaf(source, destination)
 }
 
@@ -902,6 +926,19 @@ mod tests {
             inode_before,
             "an up-to-date file is left alone rather than recopied"
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn same_volume_regular_file_copy_is_a_clone() {
+        let (root, source, destination) = copy_roots("clone-guard");
+        fs::write(source.join("large"), vec![0x5a; 1024 * 1024]).expect("write source");
+
+        let report = run(&source, &destination, 2);
+
+        assert_eq!(report.cloned_files, 1);
+        assert_eq!(report.copied_files, 0);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
