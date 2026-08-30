@@ -164,6 +164,31 @@ fn unknown_and_truncated_block_opcodes_reject_before_mutation_or_undo() {
 }
 
 #[test]
+fn truncated_top_level_opcode_rejects_before_mutation_or_undo() {
+    let init_code = [
+        Opcode::SlotOrderedList as u8,
+        0,
+        SlotType::OrderedList as u8,
+        8,
+        0,
+        0,
+    ];
+    let prog = program(1, 0, &init_code, &[Opcode::BatchMapUpsertLatest as u8, 0]);
+    let mut state = init(&prog);
+    let before = state.clone();
+    let mut vm = Vm::default();
+    vm.undo_enable(&state);
+    let checkpoint = vm.undo_checkpoint();
+
+    assert_eq!(
+        INVALID_PROGRAM,
+        vm.execute_batch_delta(&mut state, &prog, &[], 0)
+    );
+    assert_eq!(state, before);
+    assert_eq!(vm.undo_checkpoint(), checkpoint);
+}
+
+#[test]
 fn unknown_block_scalar_subtype_rejects_before_mutation_or_undo() {
     let init_code = [
         Opcode::SlotDef as u8,

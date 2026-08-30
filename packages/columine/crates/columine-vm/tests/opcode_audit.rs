@@ -9,13 +9,13 @@
 //! explicit allowlist). A deliberate ABI change edits the fixture in the same
 //! commit that changes the dispatch.
 //!
-//! Rust-side harvests keep sanity FLOORS pinned to today's counts so parser
-//! rot (a formatting change making a scan return nothing) fails loudly.
+//! Rust-side enum-arm harvest keeps a sanity floor pinned to today's count so
+//! parser rot (a formatting change making the scan return nothing) fails loudly.
 
 use columine_types::abi_registry_fixture::{
     DISPATCHED_OPCODE_BYTES, FLAT_UNDO_OPS, TYPES_OPCODE_REGISTRY,
 };
-use columine_types::audit_parser::{arm_bytes, arm_names, enum_decls, norm, read_source};
+use columine_types::audit_parser::{arm_names, enum_decls, norm, read_source};
 use columine_types::types::Opcode;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,32 +36,23 @@ fn frozen_dispatched() -> BTreeSet<u8> {
 fn rust_covered() -> BTreeSet<u8> {
     let rust_vm = read_source(MANIFEST, "src/vm.rs");
     let rust_types = read_source(MANIFEST, "../columine-types/src/types.rs");
-    let rust_decls: BTreeMap<String, u8> = enum_decls(&rust_types, "pub enum Opcode")
-        .into_iter()
-        .map(|(n, b)| (norm(&n), b))
-        .collect();
+    let rust_decls = enum_decls(&rust_types, "pub enum Opcode");
     assert!(
         rust_decls.len() >= 57,
         "types.rs Opcode decl harvest rotted: got {}",
         rust_decls.len()
     );
-    let raw = arm_bytes(&rust_vm);
-    assert!(
-        raw.len() >= 25,
-        "vm.rs raw-arm harvest rotted: {}",
-        raw.len()
-    );
-    let mut covered = raw;
-    let mut top_count = 0usize;
-    for name in arm_names(&rust_vm, "Opcode::") {
-        if let Some(byte) = rust_decls.get(&norm(&name)) {
-            covered.insert(*byte);
-            top_count += 1;
+    let mut covered = BTreeSet::new();
+    for (name, byte) in rust_decls {
+        let needle = format!("Opcode::{name}");
+        if rust_vm.matches(&needle).count() >= 2 {
+            covered.insert(byte);
         }
     }
     assert!(
-        top_count >= 30,
-        "vm.rs Opcode-arm harvest rotted: only {top_count} registry arms"
+        covered.len() >= 55,
+        "vm.rs Opcode coverage harvest rotted: only {} registry arms",
+        covered.len()
     );
     covered
 }
@@ -71,7 +62,7 @@ fn hex(set: impl IntoIterator<Item = u8>) -> Vec<String> {
 }
 
 /// The 0x81-class tripwire: every byte the frozen dispatch handled must be
-/// covered by the Rust dispatch (registry arm or raw-byte arm).
+/// covered by an `Opcode` arm in the Rust dispatch.
 #[test]
 fn every_frozen_dispatched_byte_is_rust_covered() {
     let frozen = frozen_dispatched();

@@ -1798,9 +1798,7 @@ fn should_upsert_struct_map_max(
         StructFieldType::UInt32 | StructFieldType::String => {
             u64::from(bytes::read_u32(state, field_offset))
         }
-        StructFieldType::Bool => {
-            u64::from(state[usize::try_from(field_offset).expect("state offset fits usize")])
-        }
+        StructFieldType::Bool => u64::from(state[field_offset as usize]),
         StructFieldType::Int64 | StructFieldType::Float64 => bytes::read_u64(state, field_offset),
         StructFieldType::ArrayU32
         | StructFieldType::ArrayI64
@@ -2447,29 +2445,29 @@ fn exec_scalar_latest(
 // Block-based execution tables
 // =============================================================================
 
-/// Test whether an opcode belongs to the aggregate block (0x40–0x4F).
-const fn is_aggregate_op(op_byte: u8) -> bool {
-    op_byte & 0xF0 == 0x40
-}
-
-/// Return the length of an aggregate opcode.
-const fn agg_op_len(op_byte: u8) -> u32 {
-    match op_byte {
-        0x40 => 3,
-        0x41 => 2,
-        0x42 | 0x43 => 3,
-        0x44 => 4,
-        0x45 => 3,
-        0x46..=0x48 => 4,
-        0x49..=0x4b => 3,
-        _ => 2, // conservative fallback for unknown aggregate opcodes
-    }
+const fn is_aggregate_op(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::BatchAggSum
+            | Opcode::BatchAggCount
+            | Opcode::BatchAggMin
+            | Opcode::BatchAggMax
+            | Opcode::BatchAggSumIf
+            | Opcode::BatchAggCountIf
+            | Opcode::BatchAggMinIf
+            | Opcode::BatchAggMaxIf
+            | Opcode::BatchScalarLatest
+            | Opcode::BatchAggSumI64
+            | Opcode::BatchAggMinI64
+            | Opcode::BatchAggMaxI64
+    )
 }
 
 /// Return the length (including opcode) of a non-aggregate body operation.
 fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
     let op = Opcode::from_u8(*code.get(pc)?)?;
     let len = match op {
+        Opcode::Halt => 1,
         Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => 6,
         Opcode::BatchMapUpsertFirst | Opcode::BatchMapUpsertLast => 4,
         Opcode::BatchMapRemove => 3,
@@ -2495,7 +2493,15 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         Opcode::BatchSetInsert
         | Opcode::BatchSetRemove
         | Opcode::BatchBitmapAdd
-        | Opcode::BatchBitmapRemove => 3,
+        | Opcode::BatchBitmapRemove
+        | Opcode::BatchBitmapAnd
+        | Opcode::BatchBitmapOr
+        | Opcode::BatchBitmapAndNot
+        | Opcode::BatchBitmapXor => 3,
+        Opcode::BatchBitmapAndScratch
+        | Opcode::BatchBitmapOrScratch
+        | Opcode::BatchBitmapAndNotScratch
+        | Opcode::BatchBitmapXorScratch => 2,
         Opcode::BatchSetInsertTtl | Opcode::BatchSetInsertIf => 4,
         Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => 3,
         Opcode::BatchAggCount => 2,
@@ -2535,6 +2541,17 @@ fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
         Opcode::NestedSetInsert => 4,
         Opcode::NestedMapUpsertLast => 5,
         Opcode::NestedAggUpdate => 4,
+        Opcode::ForEach => {
+            let match_count = usize::from(*code.get(pc.checked_add(2)?)?);
+            let ids_len = match_count.checked_mul(4)?;
+            let body_len_offset = pc.checked_add(3)?.checked_add(ids_len)?;
+            let body_len_bytes = code.get(body_len_offset..body_len_offset.checked_add(2)?)?;
+            let body_len = usize::from(body_len_bytes[0]) | (usize::from(body_len_bytes[1]) << 8);
+            body_len_offset
+                .checked_add(2)?
+                .checked_add(body_len)?
+                .checked_sub(pc)?
+        }
         _ => return None,
     };
     let end = pc.checked_add(len)?;
@@ -2677,9 +2694,11 @@ impl Vm {
 
         let mut pc = 0usize;
         while pc < code.len() {
+            let Some(_) = body_op_len(code, pc) else {
+                return INVALID_PROGRAM;
+            };
             let op_byte = code[pc];
             pc += 1;
-            // Unknown or registry-only opcodes are invalid in the reduce dispatch.
             let Some(op) = Opcode::from_u8(op_byte) else {
                 return INVALID_PROGRAM;
             };
@@ -3155,17 +3174,15 @@ impl Vm {
                         batch_len
                     ));
                     for i in 0..batch_len {
-                        let key = keys[usize::try_from(i).expect("batch index fits usize")];
+                        let key = keys[i as usize];
                         let should_write = match op {
                             Opcode::BatchStructMapUpsertFirst => smap.find(state, key).is_none(),
-                            Opcode::BatchStructMapUpsertMax => should_upsert_struct_map_max(
-                                state,
-                                &smap,
-                                key,
-                                comparison.expect("max comparison resolved"),
-                                cols,
-                                i,
-                            ),
+                            Opcode::BatchStructMapUpsertMax => {
+                                let Some(comparison) = comparison else {
+                                    return INVALID_PROGRAM;
+                                };
+                                should_upsert_struct_map_max(state, &smap, key, comparison, cols, i)
+                            }
                             _ => true,
                         };
                         if !should_write {
@@ -3216,7 +3233,7 @@ impl Vm {
                         batch_len
                     ));
                     for i in 0..batch_len {
-                        let index = usize::try_from(i).expect("batch index fits usize");
+                        let index = i as usize;
                         let result = single_struct_map2_upsert_last(
                             &mut self.undo,
                             delta_mode,
@@ -3256,7 +3273,7 @@ impl Vm {
                         batch_len
                     ));
                     for i in 0..batch_len {
-                        let index = usize::try_from(i).expect("batch index fits usize");
+                        let index = i as usize;
                         let result = single_struct_map2_upsert_max_i64x2(
                             &mut self.undo,
                             delta_mode,
@@ -3398,21 +3415,23 @@ impl Vm {
         let type_data = batch_col!(col_u32_exact(type_col, batch_len));
         let mut bpc = 0usize;
         while bpc < body.len() {
-            let op_byte = body[bpc];
-            if !is_aggregate_op(op_byte) {
+            let Some(op) = Opcode::from_u8(body[bpc]) else {
+                return INVALID_PROGRAM;
+            };
+            if !is_aggregate_op(op) {
                 let Some(op_len) = body_op_len(body, bpc) else {
                     return INVALID_PROGRAM;
                 };
                 bpc += op_len;
                 continue;
             }
-            match op_byte {
-                0x40 | 0x42 | 0x43 => {
+            match op {
+                Opcode::BatchAggSum | Opcode::BatchAggMin | Opcode::BatchAggMax => {
                     let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
-                    let kind = match op_byte {
-                        0x40 => AggKind::Sum,
-                        0x42 => AggKind::Min,
+                    let kind = match op {
+                        Opcode::BatchAggSum => AggKind::Sum,
+                        Opcode::BatchAggMin => AggKind::Min,
                         _ => AggKind::Max,
                     };
                     exec_agg_f64(
@@ -3429,18 +3448,18 @@ impl Vm {
                         None,
                     );
                 }
-                0x41 => {
+                Opcode::BatchAggCount => {
                     let slot = body[bpc + 1];
                     bpc += 2;
                     let matched = aggregates::masked_agg_count(type_data, type_id);
                     exec_agg_count(&mut self.undo, delta_mode, state, slot, u64::from(matched));
                 }
-                0x44 | 0x46 | 0x47 => {
+                Opcode::BatchAggSumIf | Opcode::BatchAggMinIf | Opcode::BatchAggMaxIf => {
                     let (slot, val_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
-                    let kind = match op_byte {
-                        0x44 => AggKind::Sum,
-                        0x46 => AggKind::Min,
+                    let kind = match op {
+                        Opcode::BatchAggSumIf => AggKind::Sum,
+                        Opcode::BatchAggMinIf => AggKind::Min,
                         _ => AggKind::Max,
                     };
                     exec_agg_f64(
@@ -3460,7 +3479,7 @@ impl Vm {
                         ))),
                     );
                 }
-                0x45 => {
+                Opcode::BatchAggCountIf => {
                     let (slot, pred_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
                     let preds =
@@ -3473,7 +3492,7 @@ impl Vm {
                     }
                     exec_agg_count(&mut self.undo, delta_mode, state, slot, matched);
                 }
-                0x48 => {
+                Opcode::BatchScalarLatest => {
                     let (slot, val_col, cmp_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let cmp_vals =
@@ -3492,12 +3511,12 @@ impl Vm {
                         return result as u32;
                     }
                 }
-                0x49..=0x4b => {
+                Opcode::BatchAggSumI64 | Opcode::BatchAggMinI64 | Opcode::BatchAggMaxI64 => {
                     let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
-                    let kind = match op_byte {
-                        0x49 => AggKind::Sum,
-                        0x4a => AggKind::Min,
+                    let kind = match op {
+                        Opcode::BatchAggSumI64 => AggKind::Sum,
+                        Opcode::BatchAggMinI64 => AggKind::Min,
                         _ => AggKind::Max,
                     };
                     exec_agg_i64(
@@ -3514,9 +3533,7 @@ impl Vm {
                         None,
                     );
                 }
-                _ => {
-                    bpc += agg_op_len(op_byte) as usize;
-                }
+                _ => return INVALID_PROGRAM,
             }
         }
         OK
@@ -3543,15 +3560,19 @@ impl Vm {
 
         let mut bpc = 0usize;
         while bpc < body.len() {
-            let op_byte = body[bpc];
-            if is_aggregate_op(op_byte) {
-                bpc += agg_op_len(op_byte) as usize;
+            let Some(op) = Opcode::from_u8(body[bpc]) else {
+                return INVALID_PROGRAM;
+            };
+            let Some(op_len) = body_op_len(body, bpc) else {
+                return INVALID_PROGRAM;
+            };
+            if is_aggregate_op(op) {
+                bpc += op_len;
                 continue;
             }
 
-            match op_byte {
-                // MAP_UPSERT_LATEST (0x20) / MAP_UPSERT_LATEST_TTL (0x24)
-                0x20 | 0x24 => {
+            match op {
+                Opcode::BatchMapUpsertLatest | Opcode::BatchMapUpsertLatestTtl => {
                     let (slot, key_col, val_col, ts_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
@@ -3586,7 +3607,7 @@ impl Vm {
                 }
 
                 // MAP_UPSERT_FIRST (0x21)
-                0x21 => {
+                Opcode::BatchMapUpsertFirst => {
                     let (slot, key_col, val_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let meta = SlotMetaView::read(state, slot);
@@ -3609,7 +3630,7 @@ impl Vm {
                 }
 
                 // MAP_UPSERT_LAST (0x22)
-                0x22 => {
+                Opcode::BatchMapUpsertLast => {
                     let (slot, key_col, val_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let meta = SlotMetaView::read(state, slot);
@@ -3637,7 +3658,7 @@ impl Vm {
                 }
 
                 // MAP_UPSERT_LAST_TTL (0x25)
-                0x25 => {
+                Opcode::BatchMapUpsertLastTtl => {
                     let (slot, key_col, val_col, ts_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     bpc += 5;
@@ -3668,7 +3689,7 @@ impl Vm {
                 }
 
                 // MAP_REMOVE (0x23)
-                0x23 => {
+                Opcode::BatchMapRemove => {
                     let (slot, key_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
                     let meta = SlotMetaView::read(state, slot);
@@ -3683,14 +3704,14 @@ impl Vm {
                 }
 
                 // MAP_UPSERT_MAX (0x26) / MIN (0x27)
-                0x26 | 0x27 => {
+                Opcode::BatchMapUpsertMax | Opcode::BatchMapUpsertMin => {
                     let (slot, key_col, val_col, cmp_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
                         return INVALID_PROGRAM;
                     };
                     bpc += 6;
-                    let strategy = if op_byte == 0x26 {
+                    let strategy = if op == Opcode::BatchMapUpsertMax {
                         Strategy::Max
                     } else {
                         Strategy::Min
@@ -3720,7 +3741,7 @@ impl Vm {
                 }
 
                 // MAP_UPSERT_LATEST_IF (0x28)
-                0x28 => {
+                Opcode::BatchMapUpsertLatestIf => {
                     let (slot, key_col, val_col, ts_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
@@ -3760,7 +3781,7 @@ impl Vm {
                 }
 
                 // MAP_UPSERT_FIRST_IF (0x29) / LAST_IF (0x2A)
-                0x29 | 0x2A => {
+                Opcode::BatchMapUpsertFirstIf | Opcode::BatchMapUpsertLastIf => {
                     let (slot, key_col, val_col, pred_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     bpc += 5;
@@ -3770,7 +3791,7 @@ impl Vm {
                     }
 
                     let meta = SlotMetaView::read(state, slot);
-                    let (strategy, cmp) = if op_byte == 0x29 {
+                    let (strategy, cmp) = if op == Opcode::BatchMapUpsertFirstIf {
                         (Strategy::First, 0u64)
                     } else {
                         let ttl_cmp = if meta.has_ttl() {
@@ -3799,7 +3820,7 @@ impl Vm {
                 }
 
                 // MAP_REMOVE_IF (0x2B)
-                0x2B => {
+                Opcode::BatchMapRemoveIf => {
                     let (slot, key_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     if cell_u32(cols, pred_col, child_idx) == 0 {
@@ -3817,7 +3838,7 @@ impl Vm {
                 }
 
                 // MAP_UPSERT_MAX_IF (0x2C) / MIN_IF (0x2D)
-                0x2C | 0x2D => {
+                Opcode::BatchMapUpsertMaxIf | Opcode::BatchMapUpsertMinIf => {
                     let (slot, key_col, val_col, cmp_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     let Some(cmp_type) = CmpType::from_u8(body[bpc + 5]) else {
@@ -3830,7 +3851,7 @@ impl Vm {
                         continue;
                     }
 
-                    let strategy = if op_byte == 0x2C {
+                    let strategy = if op == Opcode::BatchMapUpsertMaxIf {
                         Strategy::Max
                     } else {
                         Strategy::Min
@@ -3860,7 +3881,7 @@ impl Vm {
                 }
 
                 // SET_INSERT and BITMAP_ADD share the single-element set path.
-                0x30 | 0x34 => {
+                Opcode::BatchSetInsert | Opcode::BatchBitmapAdd => {
                     let (slot, elem_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
                     let meta = SlotMetaView::read(state, slot);
@@ -3885,7 +3906,7 @@ impl Vm {
                 }
 
                 // SET_INSERT_TTL (0x32)
-                0x32 => {
+                Opcode::BatchSetInsertTtl => {
                     let (slot, elem_col, ts_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let ts = if parent_ts_col != 0xFF {
@@ -3910,7 +3931,7 @@ impl Vm {
                 }
 
                 // SET_INSERT_IF (0x33)
-                0x33 => {
+                Opcode::BatchSetInsertIf => {
                     let (slot, elem_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     if cell_u32(cols, pred_col, child_idx) == 0 {
@@ -3938,7 +3959,7 @@ impl Vm {
                 }
 
                 // SET_REMOVE (0x31) / BITMAP_REMOVE (0x35)
-                0x31 | 0x35 => {
+                Opcode::BatchSetRemove | Opcode::BatchBitmapRemove => {
                     let (slot, elem_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
                     let meta = SlotMetaView::read(state, slot);
@@ -3956,10 +3977,14 @@ impl Vm {
                 }
 
                 // STRUCT_MAP_UPSERT_LAST/FIRST/MAX (0x80/0x81/0x82)
-                0x80..=0x82 => {
-                    let Some(operands) =
-                        decode_struct_map_upsert_operands(body, bpc + 1, op_byte == 0x82)
-                    else {
+                Opcode::BatchStructMapUpsertLast
+                | Opcode::BatchStructMapUpsertFirst
+                | Opcode::BatchStructMapUpsertMax => {
+                    let Some(operands) = decode_struct_map_upsert_operands(
+                        body,
+                        bpc + 1,
+                        op == Opcode::BatchStructMapUpsertMax,
+                    ) else {
                         return INVALID_PROGRAM;
                     };
                     bpc = operands.end;
@@ -4005,16 +4030,16 @@ impl Vm {
                         None => None,
                     };
                     let key = cell_u32(cols, operands.key_col, child_idx);
-                    let should_write = match op_byte {
-                        0x81 => smap.find(state, key).is_none(),
-                        0x82 => should_upsert_struct_map_max(
-                            state,
-                            &smap,
-                            key,
-                            comparison.expect("max comparison resolved"),
-                            cols,
-                            child_idx,
-                        ),
+                    let should_write = match op {
+                        Opcode::BatchStructMapUpsertFirst => smap.find(state, key).is_none(),
+                        Opcode::BatchStructMapUpsertMax => {
+                            let Some(comparison) = comparison else {
+                                return INVALID_PROGRAM;
+                            };
+                            should_upsert_struct_map_max(
+                                state, &smap, key, comparison, cols, child_idx,
+                            )
+                        }
                         _ => true,
                     };
                     if should_write {
@@ -4092,7 +4117,7 @@ impl Vm {
                 }
 
                 // Exact two-lane struct map upsert/remove.
-                0x83 => {
+                Opcode::BatchStructMap2UpsertLast => {
                     let Some(operands) = decode_struct_map2_upsert_operands(body, bpc + 1) else {
                         return INVALID_PROGRAM;
                     };
@@ -4128,7 +4153,7 @@ impl Vm {
                         return result.err as u32;
                     }
                 }
-                0x87 => {
+                Opcode::BatchStructMap2UpsertMaxI64x2 => {
                     let Some(operands) = decode_struct_map2_max_i64x2_operands(body, bpc + 1)
                     else {
                         return INVALID_PROGRAM;
@@ -4156,7 +4181,7 @@ impl Vm {
                         return result.err as u32;
                     }
                 }
-                0x86 => {
+                Opcode::BatchStructMap2Remove => {
                     let (slot, key1_col, key2_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
                     let result = single_struct_map2_remove(
@@ -4174,7 +4199,7 @@ impl Vm {
 
                 //#region reduce-typed-state.probe-exec
                 // STRUCT_MAP_PROBE (0x2e)
-                0x2e => {
+                Opcode::BatchStructMapProbe => {
                     let (probe_slot, key_col, _miss_mode, out_slot, num_fields) = (
                         body[bpc + 1],
                         body[bpc + 2],
@@ -4224,7 +4249,7 @@ impl Vm {
 
                 //#region reduce-typed-state.scatter-exec
                 // STRUCT_MAP_PROBE_SCATTER (0x2f)
-                0x2f => {
+                Opcode::BatchStructMapProbeScatter => {
                     let (
                         probe_slot,
                         key_col,
@@ -4427,7 +4452,7 @@ impl Vm {
                 //#endregion reduce-typed-state.scatter-exec
 
                 // LIST_APPEND (0x84)
-                0x84 => {
+                Opcode::ListAppend => {
                     let (slot, val_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
 
@@ -4492,7 +4517,7 @@ impl Vm {
                 }
 
                 // LIST_APPEND_STRUCT (0x85)
-                0x85 => {
+                Opcode::ListAppendStruct => {
                     let (slot, num_vals) = (body[bpc + 1], body[bpc + 2] as usize);
                     bpc += 3;
 
@@ -4608,7 +4633,7 @@ impl Vm {
                 }
 
                 // FLAT_MAP (0xE1)
-                0xE1 => {
+                Opcode::FlatMap => {
                     let offsets_col = body[bpc + 1];
                     let inner_parent_ts_col = body[bpc + 2];
                     let inner_body_len =
@@ -4638,7 +4663,7 @@ impl Vm {
                 }
 
                 // NESTED_SET_INSERT (0x90)
-                0x90 => {
+                Opcode::NestedSetInsert => {
                     let (slot, outer_key_col, elem_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
@@ -4662,7 +4687,7 @@ impl Vm {
                 }
 
                 // NESTED_MAP_UPSERT_LAST (0x92)
-                0x92 => {
+                Opcode::NestedMapUpsertLast => {
                     let (slot, outer_key_col, inner_key_col, val_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     bpc += 5;
@@ -4687,7 +4712,7 @@ impl Vm {
                 }
 
                 // NESTED_AGG_UPDATE (0x95)
-                0x95 => {
+                Opcode::NestedAggUpdate => {
                     let (slot, outer_key_col, val_col) =
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
