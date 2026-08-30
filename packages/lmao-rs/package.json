@@ -15,6 +15,13 @@
           "parallel": false
         }
       },
+      "test": {
+        "executor": "nx:noop",
+        "cache": true,
+        "dependsOn": [
+          "cargo-test"
+        ]
+      },
       "cargo-wasm": {
         "executor": "nx:run-commands",
         "cache": true,
