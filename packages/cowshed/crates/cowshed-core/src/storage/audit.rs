@@ -276,13 +276,12 @@ pub struct CommitmentDate {
 
 impl CommitmentDate {
     pub fn new(year: u16, month: u8, day: u8) -> Result<Self, AuditSinkError> {
-        if valid_calendar_date(year, month, day) {
-            Ok(Self { year, month, day })
-        } else {
-            Err(AuditSinkError::Integrity {
+        if super::days_from_civil(u64::from(year), u64::from(month), u64::from(day)).is_none() {
+            return Err(AuditSinkError::Integrity {
                 message: "invalid UTC commitment date".into(),
-            })
+            });
         }
+        Ok(Self { year, month, day })
     }
 }
 
@@ -458,38 +457,23 @@ impl AuditSinkEnvironment for SystemEnvironment {
         if unsafe { libc::time(&mut timestamp) } == -1 {
             return Err(io::Error::last_os_error());
         }
-        let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
-        if unsafe { libc::gmtime_r(&timestamp, broken_down.as_mut_ptr()) }.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let broken_down = unsafe { broken_down.assume_init() };
-        let year = u16::try_from(broken_down.tm_year + 1900)
-            .map_err(|_| io::Error::other("UTC year is outside the supported range"))?;
-        let month = u8::try_from(broken_down.tm_mon + 1)
-            .map_err(|_| io::Error::other("UTC month is outside the supported range"))?;
-        let day = u8::try_from(broken_down.tm_mday)
-            .map_err(|_| io::Error::other("UTC day is outside the supported range"))?;
-        CommitmentDate::new(year, month, day).map_err(|error| io::Error::other(error.to_string()))
+        let seconds = u64::try_from(timestamp)
+            .map_err(|_| io::Error::other("UTC timestamp is before the epoch"))?;
+        let (year, month, day) = super::civil_from_days(seconds / 86_400);
+        Ok(CommitmentDate {
+            year: u16::try_from(year)
+                .map_err(|_| io::Error::other("UTC year is outside the supported range"))?,
+            month: u8::try_from(month)
+                .map_err(|_| io::Error::other("UTC month is outside the supported range"))?,
+            day: u8::try_from(day)
+                .map_err(|_| io::Error::other("UTC day is outside the supported range"))?,
+        })
     }
 }
 
 /// Sealed segment name: `commitment-<order>-<writer>.arrow`.
 pub fn segment_name(order: u64, writer: Uuid) -> String {
     format!("{SEGMENT_PREFIX}{order:020}-{}.arrow", writer.hyphenated())
-}
-
-fn valid_calendar_date(year: u16, month: u8, day: u8) -> bool {
-    if year == 0 || !(1..=12).contains(&month) {
-        return false;
-    }
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let days = match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    (1..=days).contains(&day)
 }
 
 fn open_or_create_directory_chain(path: &Path) -> Result<File, AuditSinkError> {
