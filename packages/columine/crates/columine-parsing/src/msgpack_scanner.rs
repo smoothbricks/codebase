@@ -265,21 +265,28 @@ impl<'a> Reader<'a> {
         }
         None
     }
+    /// Skip `count` nested values. Counts are `u64` so map32's `n * 2` cannot
+    /// wrap; bail if even one-byte values would overrun the remaining input.
+    fn skip_n(&mut self, count: u64) -> Option<()> {
+        if count > self.input.len().saturating_sub(self.pos) as u64 {
+            return None;
+        }
+        for _ in 0..count {
+            self.skip_value()?;
+        }
+        Some(())
+    }
     pub(crate) fn skip_value(&mut self) -> Option<()> {
         let byte = *self.input.get(self.pos)?;
         match byte {
             0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => self.pos += 1,
             0x80..=0x8f => {
                 self.pos += 1;
-                for _ in 0..u32::from(byte & 0x0f) * 2 {
-                    self.skip_value()?;
-                }
+                self.skip_n(u64::from(byte & 0x0f).checked_mul(2)?)?;
             }
             0x90..=0x9f => {
                 self.pos += 1;
-                for _ in 0..u32::from(byte & 0x0f) {
-                    self.skip_value()?;
-                }
+                self.skip_n(u64::from(byte & 0x0f))?;
             }
             0xa0..=0xbf => {
                 self.pos = self.pos.checked_add(1 + usize::from(byte & 0x1f))?;
@@ -303,18 +310,18 @@ impl<'a> Reader<'a> {
             0xc7 => {
                 self.pos += 1;
                 let n = usize::from(self.take()?);
-                self.pos = self.pos.checked_add(n + 1)?;
+                self.pos = self.pos.checked_add(n)?.checked_add(1)?;
             }
             0xc8 => {
                 self.pos += 1;
                 let n = usize::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
-                self.pos = self.pos.checked_add(n + 1)?;
+                self.pos = self.pos.checked_add(n)?.checked_add(1)?;
             }
             0xc9 => {
                 self.pos += 1;
                 let n = usize::try_from(u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?))
                     .ok()?;
-                self.pos = self.pos.checked_add(n + 1)?;
+                self.pos = self.pos.checked_add(n)?.checked_add(1)?;
             }
             0xca => self.pos = self.pos.checked_add(5)?,
             0xcb => self.pos = self.pos.checked_add(9)?,
@@ -346,30 +353,22 @@ impl<'a> Reader<'a> {
             0xdc => {
                 self.pos += 1;
                 let n = u32::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
-                for _ in 0..n {
-                    self.skip_value()?;
-                }
+                self.skip_n(u64::from(n))?;
             }
             0xdd => {
                 self.pos += 1;
                 let n = u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?);
-                for _ in 0..n {
-                    self.skip_value()?;
-                }
+                self.skip_n(u64::from(n))?;
             }
             0xde => {
                 self.pos += 1;
                 let n = u32::from(u16::from_be_bytes(self.take_slice(2)?.try_into().ok()?));
-                for _ in 0..n * 2 {
-                    self.skip_value()?;
-                }
+                self.skip_n(u64::from(n).checked_mul(2)?)?;
             }
             0xdf => {
                 self.pos += 1;
                 let n = u32::from_be_bytes(self.take_slice(4)?.try_into().ok()?);
-                for _ in 0..n * 2 {
-                    self.skip_value()?;
-                }
+                self.skip_n(u64::from(n).checked_mul(2)?)?;
             }
             _ => return None,
         };
@@ -520,6 +519,30 @@ mod tests {
         let mut c = EventColumns::new(1);
         assert_eq!(
             parse_msgpack_stream(&[0x01], &mut c),
+            Err(MsgpackScannerError::InvalidMsgpack)
+        );
+    }
+    #[test]
+    fn skip_value_map32_high_bit_count_fails() {
+        let mut reader = Reader::new(&[0xdf, 0x80, 0x00, 0x00, 0x00]);
+        assert_eq!(reader.skip_value(), None);
+    }
+    #[test]
+    fn skip_map32_huge_count_does_not_parse_body_as_parent_keys() {
+        // map32 n=2^31 used to wrap `n * 2` in u32; skip succeeded and the
+        // following parent keys were parsed as if the map were empty.
+        let mut input = vec![0x84];
+        str_(&mut input, "x");
+        input.extend_from_slice(&[0xdf, 0x80, 0x00, 0x00, 0x00]);
+        str_(&mut input, "id");
+        str_(&mut input, "abc-123");
+        str_(&mut input, "type");
+        str_(&mut input, "orderPlaced");
+        str_(&mut input, "timestamp");
+        int64(&mut input, 1_000);
+        let mut c = EventColumns::new(1);
+        assert_eq!(
+            parse_msgpack_stream(&input, &mut c),
             Err(MsgpackScannerError::InvalidMsgpack)
         );
     }
