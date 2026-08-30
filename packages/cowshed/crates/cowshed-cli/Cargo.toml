@@ -23,8 +23,8 @@ serde_json.workspace = true
 tokio.workspace = true
 # sccache's own config file is TOML, and `setup` has to read one it did not write without
 # reordering or dropping a key its author set. Parsing is what makes the never-clobber decision
-# honest; preservation comes from never rewriting those bytes at all — cowshed's block is appended
-# below them, and only that block is ever rewritten.
+# honest; preservation is keys and byte-for-byte prefix — only a missing final newline is
+# inserted — and only cowshed's appended block is ever rewritten.
 #
 # `serde` is load-bearing and is NOT about (de)serializing our own types, so enumerating call
 # sites will mislead you: in toml 1.x the `toml::Table` and `toml::Value` types are themselves
