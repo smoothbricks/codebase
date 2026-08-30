@@ -44,13 +44,32 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Ident, LitStr, Token, Visibility, braced, bracketed};
 
-enum FieldKind {
-    Number,
-    Uint64,
-    Boolean,
-    Category,
-    Text,
-    Enum(Vec<String>),
+macro_rules! field_kinds {
+    ($(($ident:ident, $variant:ident)),+ $(,)?) => {
+        enum FieldKind {
+            $($variant,)+
+            Enum(Vec<String>),
+        }
+
+        fn parse_scalar_kind(name: &str) -> Option<FieldKind> {
+            match name {
+                $(stringify!($ident) => Some(FieldKind::$variant),)+
+                _ => None,
+            }
+        }
+
+        fn supported_field_kinds() -> &'static str {
+            concat!($(stringify!($ident), ", ",)+ "enum[..]")
+        }
+    };
+}
+
+field_kinds! {
+    (number, Number),
+    (uint64, Uint64),
+    (boolean, Boolean),
+    (category, Category),
+    (text, Text),
 }
 
 struct Field {
@@ -76,40 +95,34 @@ impl Parse for Field {
             let ident: Ident = input.parse()?;
             (ident.to_string(), ident.span())
         };
-        let kind = match kind_name.as_str() {
-            "number" => FieldKind::Number,
-            "uint64" => FieldKind::Uint64,
-            "boolean" => FieldKind::Boolean,
-            "category" => FieldKind::Category,
-            "text" => FieldKind::Text,
-            "enum" => {
-                let content;
-                bracketed!(content in input);
-                let values: Punctuated<LitStr, Token![,]> = content.parse_terminated(
-                    <LitStr as syn::parse::Parse>::parse as fn(ParseStream) -> syn::Result<LitStr>,
-                    Token![,],
-                )?;
-                if values.is_empty() {
-                    return Err(syn::Error::new(
-                        kind_span,
-                        "enum field needs at least one value: `enum[\"A\", ...]`",
-                    ));
-                }
-                if values.len() > u16::MAX as usize {
-                    return Err(syn::Error::new(kind_span, "enum dictionary too large"));
-                }
-                FieldKind::Enum(values.iter().map(|v| v.value()).collect())
-            }
-            other => {
+        let kind = if kind_name == "enum" {
+            let content;
+            bracketed!(content in input);
+            let values: Punctuated<LitStr, Token![,]> = content.parse_terminated(
+                <LitStr as syn::parse::Parse>::parse as fn(ParseStream) -> syn::Result<LitStr>,
+                Token![,],
+            )?;
+            if values.is_empty() {
                 return Err(syn::Error::new(
                     kind_span,
-                    format!(
-                        "unknown field kind `{other}`; expected one of: number, uint64, \
-                         boolean, category, text, enum[..] (binary/unknown are not \
-                         supported yet — see lmao-macros docs)"
-                    ),
+                    "enum field needs at least one value: `enum[\"A\", ...]`",
                 ));
             }
+            if values.len() > u16::MAX as usize {
+                return Err(syn::Error::new(kind_span, "enum dictionary too large"));
+            }
+            FieldKind::Enum(values.iter().map(|v| v.value()).collect())
+        } else if let Some(kind) = parse_scalar_kind(&kind_name) {
+            kind
+        } else {
+            return Err(syn::Error::new(
+                kind_span,
+                format!(
+                    "unknown field kind `{kind_name}`; expected one of: {} \
+                     (binary/unknown are not supported yet — see lmao-macros docs)",
+                    supported_field_kinds()
+                ),
+            ));
         };
         Ok(Field { name, kind })
     }
