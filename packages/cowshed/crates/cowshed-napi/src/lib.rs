@@ -1118,3 +1118,34 @@ mod parity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod host_stable_path_tests {
+    use std::path::Path;
+
+    /// The trampoline must not load napi to ask where launchd installed the binary, so
+    /// `platform.ts` restates the segments. This test is the check that those segments still
+    /// produce `HostStableExecutable`'s path: changing either side without the other is red.
+    #[test]
+    fn platform_ts_host_stable_path_matches_launchd() {
+        let ts = include_str!("../../../src/platform.ts");
+        assert!(
+            ts.contains("['Library', 'Application Support', 'dev.cowshed', 'bin']"),
+            "HOST_STABLE_BINARY_SEGMENTS must stay the launchd path segments"
+        );
+        assert!(
+            ts.contains("export const HOST_STABLE_BINARY_NAME = 'cowshed'"),
+            "HOST_STABLE_BINARY_NAME must stay the launchd cowshed binary name"
+        );
+
+        let executable = cowshed_cli::launchd::HostStableExecutable::new(
+            Path::new("/Users/test"),
+            cowshed_cli::launchd::COWSHED_BINARY_NAME,
+        )
+        .expect("a lexical home path is accepted");
+        assert_eq!(
+            executable.path(),
+            Path::new("/Users/test/Library/Application Support/dev.cowshed/bin/cowshed")
+        );
+    }
+}
