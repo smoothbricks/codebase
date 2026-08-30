@@ -198,6 +198,29 @@ describe('cowshed CLI trampoline', () => {
     expect(spawns).toEqual([packaged]);
   });
 
+  it('keeps setup and skill on the packaged binary: setup writes the stable install and must never run from it', async () => {
+    const root = await fixtureRoot();
+    const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');
+    const stable = join(root, 'home', 'Library', 'Application Support', 'dev.cowshed', 'bin', 'cowshed');
+    await Promise.all([fixtureFile(packaged), fixtureFile(stable)]);
+    const spawns: string[] = [];
+
+    for (const argv of [['setup'], ['skill', 'install']]) {
+      await runCli(argv, {
+        packageRoot: root,
+        platform: 'darwin',
+        arch: 'arm64',
+        home: join(root, 'home'),
+        async spawnBinary(executable) {
+          spawns.push(executable);
+          return 0;
+        },
+      });
+    }
+
+    expect(spawns).toEqual([packaged, packaged]);
+  });
+
   it('falls through to the packaged binary for daemon verbs when no stable install exists', async () => {
     const root = await fixtureRoot();
     const packaged = join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed');

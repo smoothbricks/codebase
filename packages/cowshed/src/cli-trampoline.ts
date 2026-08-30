@@ -37,6 +37,10 @@ export function packageRootFromModule(moduleUrl: string): string {
   return resolve(moduleDirectory, '..');
 }
 
+// Exactly the daemon-control verbs, deliberately narrower than the host-management set (gateway,
+// sccache, skill, setup): only launchd-managed daemons make the installed copy authoritative, and
+// `setup` must run the invoking binary because it is what WRITES the stable install — routing it
+// through a stale install would have the old binary reinstall itself.
 const SERVICE_VERBS: Record<string, true> = { gateway: true, sccache: true };
 
 function isServiceVerb(argv: readonly string[] | undefined): boolean {
