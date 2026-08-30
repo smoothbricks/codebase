@@ -167,8 +167,13 @@ impl AuditSink for ChannelAudit {
 ///
 /// The bind probe still runs, because it is the only thing that catches a block held by something
 /// outside the test run: a live `cowshed gateway run` daemon owns real blocks on a developer host.
-/// It cannot close the window entirely — the listener has to drop before the caller binds — which
-/// is why disjoint ranges, not the probe, are what make this reliable.
+/// The probe alone cannot make this reliable — the listener has to drop before the caller binds —
+/// and neither can `process::id() % BLOCKS`, which is a hash, not a partition: nextest runs every
+/// test in its own process, so two concurrent pids congruent mod `BLOCKS` walk the same order and
+/// hand out the same port. That is what produced `AddrInUse` on a varying subset of tests each run.
+///
+/// The block is therefore claimed with `flock` before it is probed. The kernel releases it when the
+/// process exits, so a crashed or killed test cannot strand a block the way a lockfile would.
 fn free_endpoint() -> SocketAddr {
     const BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN)
         / cowshed_gateway::MACOS_PORT_BLOCK_SIZE;
@@ -177,6 +182,9 @@ fn free_endpoint() -> SocketAddr {
     for _ in 0..BLOCKS {
         let step = NEXT_BLOCK.fetch_add(1, Ordering::Relaxed);
         let index = ((u32::from(seed) + u32::from(step)) % u32::from(BLOCKS)) as u16;
+        if !claim_port_block(index) {
+            continue;
+        }
         let port = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::MACOS_PORT_BLOCK_SIZE;
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         if std::net::TcpListener::bind(address).is_ok() {
@@ -184,6 +192,28 @@ fn free_endpoint() -> SocketAddr {
         }
     }
     panic!("no free macOS gateway port block in {BLOCKS} candidates");
+}
+
+/// Claim one port block for this process's lifetime, across processes.
+///
+/// The descriptor is deliberately leaked: the claim must outlive this call and last until the test
+/// process exits, which is precisely what dropping the probe listener failed to do.
+fn claim_port_block(index: u16) -> bool {
+    let path = std::env::temp_dir().join(format!("cowshed-gateway-port-block-{index}.lock"));
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return false;
+    };
+    let descriptor = std::os::unix::io::IntoRawFd::into_raw_fd(file);
+    if unsafe { libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return true;
+    }
+    unsafe { libc::close(descriptor) };
+    false
 }
 
 fn tls_client_hello(host: &str) -> Vec<u8> {
