@@ -319,6 +319,7 @@ describe('managed raw files', () => {
     expect(generated).toContain('uname -s');
     expect(generated).toContain('cargo-lint-cross');
     expect(generated).toContain('bun run check:linux');
+    expect(generated).not.toMatch(/^bun run check:linux$/m);
   });
 
   it('exports the restored ttsc cache path while preserving host cache overrides', async () => {
