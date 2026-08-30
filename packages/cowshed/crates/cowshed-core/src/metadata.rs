@@ -1078,19 +1078,8 @@ struct DetachedWorkspaceMetadataWire {
     #[serde(default = "active_publication_state")]
     publication_state: PublicationState,
     updated_at: String,
-    revision: u64,
-    #[serde(default)]
-    port_block: Option<PortBlock>,
-    #[serde(default)]
-    read: Vec<PathBuf>,
-    #[serde(default)]
-    write: Vec<PathBuf>,
-    #[serde(default)]
-    egress: Vec<EgressRule>,
-    #[serde(default)]
-    repos: Vec<RepoRule>,
-    #[serde(default)]
-    sim: Vec<SimVerb>,
+    #[serde(flatten)]
+    grants: GrantSet,
     #[serde(default)]
     info_snapshot: Option<WorkspaceInfoSnapshot>,
 }
@@ -1110,15 +1099,7 @@ impl<'de> Deserialize<'de> for DetachedWorkspaceMetadata {
             platform: wire.platform,
             publication_state: wire.publication_state,
             updated_at: wire.updated_at,
-            grants: GrantSet {
-                revision: wire.revision,
-                port_block: wire.port_block,
-                read: wire.read,
-                write: wire.write,
-                egress: wire.egress,
-                repos: wire.repos,
-                sim: wire.sim,
-            },
+            grants: wire.grants,
             info_snapshot: wire.info_snapshot,
         };
         metadata
