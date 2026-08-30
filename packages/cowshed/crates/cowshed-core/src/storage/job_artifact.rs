@@ -39,7 +39,7 @@ const BATCH_TRAILER: &[u8; 8] = b"CSEND001";
 const FRAME_HEADER_BYTES: usize = 24;
 const FRAME_OVERHEAD_BYTES: usize = FRAME_HEADER_BYTES + 32 + BATCH_TRAILER.len();
 const MAX_RECORD_BATCH_BYTES: u64 = 8_388_608;
-const IO_BUFFER_BYTES: usize = 65_536;
+pub(super) const IO_BUFFER_BYTES: usize = 65_536;
 pub(super) const PROTECTED_DIRECTORY: &str = ".cowshed";
 const JOB_DIRECTORY: &str = "job";
 const RECORDS_FILE: &str = "records.arrow";
@@ -1545,6 +1545,33 @@ fn verify_file_content(
     .map(|_| ())
 }
 
+pub(super) fn hash_reader<R, E>(
+    reader: &mut R,
+    mut on_chunk: impl FnMut(&[u8], u64) -> Result<(), E>,
+    map_err: impl Fn(io::Error) -> E,
+    overflow: E,
+) -> Result<(u64, Sha256Digest), E>
+where
+    R: Read,
+    E: Clone,
+{
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; IO_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).map_err(&map_err)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| overflow.clone())?;
+        hasher.update(&buffer[..read]);
+        on_chunk(&buffer[..read], bytes)?;
+    }
+    Ok((bytes, Sha256Digest::from_bytes(hasher.finalize().into())))
+}
+
 fn read_file_verified(
     workspace_root: &Path,
     relative: &WorkspacePath,
@@ -1563,38 +1590,30 @@ fn read_file_verified(
     }
     reject_hardlink(&path, &metadata)?;
     verify_private_file_mode(&path, &metadata, true)?;
-    let mut hasher = Sha256::new();
-    let mut observed = 0_u64;
     let mut output = Vec::new();
-    let mut buffer = [0_u8; IO_BUFFER_BYTES];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| io_error(&path, error))?;
-        if read == 0 {
-            break;
-        }
-        observed = observed
-            .checked_add(read as u64)
-            .ok_or_else(|| integrity(0, "protected artifact byte count overflow"))?;
-        if observed > expected_bytes {
-            return Err(ArtifactError::Integrity {
-                offset: 0,
-                message: format!(
-                    "sealed artifact {} exceeds its committed byte count",
-                    path.display()
-                ),
-            });
-        }
-        hasher.update(&buffer[..read]);
-        if collect {
-            output
-                .try_reserve(read)
-                .map_err(|_| ArtifactError::BufferAllocation)?;
-            output.extend_from_slice(&buffer[..read]);
-        }
-    }
-    let observed_digest = Sha256Digest::from_bytes(hasher.finalize().into());
+    let (observed, observed_digest) = hash_reader(
+        &mut file,
+        |chunk, observed| {
+            if observed > expected_bytes {
+                return Err(ArtifactError::Integrity {
+                    offset: 0,
+                    message: format!(
+                        "sealed artifact {} exceeds its committed byte count",
+                        path.display()
+                    ),
+                });
+            }
+            if collect {
+                output
+                    .try_reserve(chunk.len())
+                    .map_err(|_| ArtifactError::BufferAllocation)?;
+                output.extend_from_slice(chunk);
+            }
+            Ok(())
+        },
+        |error| io_error(&path, error),
+        integrity(0, "protected artifact byte count overflow"),
+    )?;
     if observed != expected_bytes || observed_digest != expected_digest {
         return Err(ArtifactError::Integrity {
             offset: 0,
@@ -1675,18 +1694,13 @@ fn hash_file_incrementally(path: &Path) -> Result<Sha256Digest, ArtifactError> {
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path).map_err(|error| io_error(path, error))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; IO_BUFFER_BYTES];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| io_error(path, error))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
+    let (_, digest) = hash_reader(
+        &mut file,
+        |_, _| Ok(()),
+        |error| io_error(path, error),
+        integrity(0, "file byte count overflow"),
+    )?;
+    Ok(digest)
 }
 
 enum VerifiedStreamSource<'a> {
