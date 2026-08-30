@@ -1236,6 +1236,10 @@ fn hash_component(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// Mirror of `validate_identity_component` in cowshed-core's `repository.rs` — the gateway sits
+/// below core and cannot import it, so the rules are restated here and must stay identical: an
+/// identity core admits that the gateway refuses (or the reverse) strands a repository between
+/// the two layers.
 fn validate_repo_id(value: &str) -> Result<(), RepoMirrorError> {
     let (owner, name) = value
         .split_once('/')
@@ -1244,11 +1248,13 @@ fn validate_repo_id(value: &str) -> Result<(), RepoMirrorError> {
         || matches!(owner, "." | "..")
         || matches!(name, "." | "..")
         || [owner, name].into_iter().any(|component| {
-            component.is_empty()
-                || component.len() > 128
-                || !component
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            let bytes = component.as_bytes();
+            bytes
+                .first()
+                .is_none_or(|first| !first.is_ascii_lowercase() && !first.is_ascii_digit())
+                || !bytes.iter().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte)
+                })
         })
     {
         return Err(RepoMirrorError::InvalidRepoId);
