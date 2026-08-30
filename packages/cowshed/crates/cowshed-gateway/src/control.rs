@@ -75,7 +75,7 @@ impl GatewayControlClient {
     }
 
     pub async fn status(&self) -> Result<GatewayStatus, ControlError> {
-        self.send(&ControlRequestOut::Status)
+        self.send(&ControlRequest::Status)
             .await?
             .status
             .ok_or(ControlError::InvalidResponse)
@@ -86,7 +86,7 @@ impl GatewayControlClient {
             .validate()
             .map_err(|error| ControlError::InvalidSession(error.to_string()))?;
         let wire = SessionWire::from(session);
-        self.send(&ControlRequestOut::Install { session: &wire })
+        self.send(&ControlRequest::Install { session: wire })
             .await?;
         Ok(())
     }
@@ -96,8 +96,8 @@ impl GatewayControlClient {
         workspace_id: &str,
         expected_revision: u64,
     ) -> Result<(), ControlError> {
-        self.send(&ControlRequestOut::Remove {
-            workspace_id,
+        self.send(&ControlRequest::Remove {
+            workspace_id: workspace_id.to_owned(),
             expected_revision,
         })
         .await?;
@@ -108,15 +108,19 @@ impl GatewayControlClient {
         &self,
         request: &RepoMirrorRequest,
     ) -> Result<MirrorInfo, ControlError> {
-        self.send(&ControlRequestOut::RepoMirror { request })
-            .await?
-            .mirror_info
-            .ok_or(ControlError::InvalidResponse)
+        self.send(&ControlRequest::RepoMirror {
+            request: request.clone(),
+        })
+        .await?
+        .mirror_info
+        .ok_or(ControlError::InvalidResponse)
     }
 
     pub async fn configure_simulator(&self, config: &SimProjectConfig) -> Result<(), ControlError> {
-        self.send(&ControlRequestOut::SimConfigure { config })
-            .await?;
+        self.send(&ControlRequest::SimConfigure {
+            config: config.clone(),
+        })
+        .await?;
         Ok(())
     }
 
@@ -124,8 +128,10 @@ impl GatewayControlClient {
         &self,
         approval: &SimInstallApproval,
     ) -> Result<(), ControlError> {
-        self.send(&ControlRequestOut::SimApprove { approval })
-            .await?;
+        self.send(&ControlRequest::SimApprove {
+            approval: approval.clone(),
+        })
+        .await?;
         Ok(())
     }
 
@@ -133,10 +139,12 @@ impl GatewayControlClient {
         &self,
         repo_id: &str,
     ) -> Result<Vec<SimDevice>, ControlError> {
-        self.send(&ControlRequestOut::SimList { repo_id })
-            .await?
-            .sim_devices
-            .ok_or(ControlError::InvalidResponse)
+        self.send(&ControlRequest::SimList {
+            repo_id: repo_id.to_owned(),
+        })
+        .await?
+        .sim_devices
+        .ok_or(ControlError::InvalidResponse)
     }
 
     pub async fn boot_simulator_device(
@@ -144,8 +152,11 @@ impl GatewayControlClient {
         repo_id: &str,
         device: &str,
     ) -> Result<(), ControlError> {
-        self.send(&ControlRequestOut::SimBoot { repo_id, device })
-            .await?;
+        self.send(&ControlRequest::SimBoot {
+            repo_id: repo_id.to_owned(),
+            device: device.to_owned(),
+        })
+        .await?;
         Ok(())
     }
 
@@ -167,8 +178,8 @@ impl GatewayControlClient {
         if limit == 0 || limit > MAX_AUDIT_TAIL_LIMIT {
             return Err(ControlError::InvalidAuditTailLimit);
         }
-        let request = ControlRequestOut::AuditTail {
-            workspace_id,
+        let request = ControlRequest::AuditTail {
+            workspace_id: workspace_id.map(str::to_owned),
             after_sequence,
             limit,
             follow,
@@ -217,7 +228,7 @@ impl GatewayControlClient {
         Ok(receiver)
     }
 
-    async fn send(&self, request: &ControlRequestOut<'_>) -> Result<ControlResponse, ControlError> {
+    async fn send(&self, request: &ControlRequest) -> Result<ControlResponse, ControlError> {
         let (mut stream, encoded) = self.connect_and_encode(request).await?;
         stream.write_all(&encoded).await?;
         stream.shutdown().await?;
@@ -229,7 +240,7 @@ impl GatewayControlClient {
 
     async fn connect_and_encode(
         &self,
-        request: &ControlRequestOut<'_>,
+        request: &ControlRequest,
     ) -> Result<(BoxControlIo, Zeroizing<Vec<u8>>), ControlError> {
         let (stream, mut encoded) = match &self.endpoint {
             ControlEndpoint::Unix(socket) => {
@@ -269,53 +280,12 @@ impl GatewayControlClient {
 #[serde(rename_all = "camelCase")]
 struct AuthenticatedControlRequestOut<'a> {
     controller_credential: &'a str,
-    request: &'a ControlRequestOut<'a>,
+    request: &'a ControlRequest,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "op", rename_all = "kebab-case")]
-enum ControlRequestOut<'a> {
-    Status,
-    Install {
-        session: &'a SessionWire,
-    },
-    Remove {
-        #[serde(rename = "workspaceId")]
-        workspace_id: &'a str,
-        #[serde(rename = "expectedRevision")]
-        expected_revision: u64,
-    },
-    AuditTail {
-        #[serde(rename = "workspaceId")]
-        workspace_id: Option<&'a str>,
-        #[serde(rename = "afterSequence")]
-        after_sequence: Option<u64>,
-        limit: usize,
-        follow: bool,
-    },
-    RepoMirror {
-        request: &'a RepoMirrorRequest,
-    },
-    SimConfigure {
-        config: &'a SimProjectConfig,
-    },
-    SimApprove {
-        approval: &'a SimInstallApproval,
-    },
-    SimList {
-        #[serde(rename = "repoId")]
-        repo_id: &'a str,
-    },
-    SimBoot {
-        #[serde(rename = "repoId")]
-        repo_id: &'a str,
-        device: &'a str,
-    },
-}
-
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
-enum ControlRequestIn {
+enum ControlRequest {
     Status,
     Install {
         session: SessionWire,
@@ -687,13 +657,13 @@ pub(crate) async fn serve_control_tcp(
     serve_request(writer, request, services).await;
 }
 
-fn parse_control_request(bytes: &[u8]) -> Result<ControlRequestIn, ControlError> {
+fn parse_control_request(bytes: &[u8]) -> Result<ControlRequest, ControlError> {
     let value =
         serde_json::from_slice(bytes).map_err(|error| ControlError::Encoding(error.to_string()))?;
     parse_control_request_value(value)
 }
 
-fn parse_control_request_value(value: serde_json::Value) -> Result<ControlRequestIn, ControlError> {
+fn parse_control_request_value(value: serde_json::Value) -> Result<ControlRequest, ControlError> {
     let object = value
         .as_object()
         .ok_or_else(|| ControlError::Encoding("control request must be an object".to_owned()))?;
@@ -727,7 +697,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<ControlReques
 
 async fn serve_request<W>(
     mut writer: W,
-    request: Result<ControlRequestIn, ControlError>,
+    request: Result<ControlRequest, ControlError>,
     services: ControlServices,
 ) where
     W: AsyncWrite + Unpin,
@@ -767,11 +737,11 @@ async fn serve_request<W>(
 }
 
 async fn dispatch(
-    request: ControlRequestIn,
+    request: ControlRequest,
     services: &ControlServices,
 ) -> (ControlResponse, Option<mpsc::Receiver<AuditEvent>>) {
     match request {
-        ControlRequestIn::Status => (
+        ControlRequest::Status => (
             match services.handle.status().await {
                 Ok(status) => ControlResponse {
                     status: Some(status),
@@ -781,7 +751,7 @@ async fn dispatch(
             },
             None,
         ),
-        ControlRequestIn::Install { session } => (
+        ControlRequest::Install { session } => (
             match session.into_session() {
                 Ok(session) => match services.handle.install(session).await {
                     Ok(()) => success(),
@@ -791,7 +761,7 @@ async fn dispatch(
             },
             None,
         ),
-        ControlRequestIn::Remove {
+        ControlRequest::Remove {
             workspace_id,
             expected_revision,
         } => (
@@ -805,7 +775,7 @@ async fn dispatch(
             },
             None,
         ),
-        ControlRequestIn::AuditTail {
+        ControlRequest::AuditTail {
             workspace_id,
             after_sequence,
             limit,
@@ -861,7 +831,7 @@ async fn dispatch(
                 ),
             }
         }
-        ControlRequestIn::RepoMirror { request } => (
+        ControlRequest::RepoMirror { request } => (
             match services.repo_mirror.mirror(request).await {
                 Ok(info) => ControlResponse {
                     mirror_info: Some(info),
@@ -871,21 +841,21 @@ async fn dispatch(
             },
             None,
         ),
-        ControlRequestIn::SimConfigure { config } => (
+        ControlRequest::SimConfigure { config } => (
             match services.sim_broker.configure(config).await {
                 Ok(()) => success(),
                 Err(error) => sim_rejected(error),
             },
             None,
         ),
-        ControlRequestIn::SimApprove { approval } => (
+        ControlRequest::SimApprove { approval } => (
             match services.sim_broker.approve(approval).await {
                 Ok(()) => success(),
                 Err(error) => sim_rejected(error),
             },
             None,
         ),
-        ControlRequestIn::SimList { repo_id } => (
+        ControlRequest::SimList { repo_id } => (
             match services.sim_broker.list_devices(repo_id).await {
                 Ok(devices) => ControlResponse {
                     sim_devices: Some(devices),
@@ -895,7 +865,7 @@ async fn dispatch(
             },
             None,
         ),
-        ControlRequestIn::SimBoot { repo_id, device } => (
+        ControlRequest::SimBoot { repo_id, device } => (
             match services.sim_broker.boot_device(repo_id, device).await {
                 Ok(()) => success(),
                 Err(error) => sim_rejected(error),
