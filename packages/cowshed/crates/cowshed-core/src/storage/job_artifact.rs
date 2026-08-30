@@ -68,6 +68,14 @@ pub enum ArtifactError {
     Arrow(String),
     #[error("artifact integrity failure at byte {offset}: {message}")]
     Integrity { offset: u64, message: String },
+    #[error(
+        "artifact ordering failure at byte {offset}: record sequence {current} does not follow {previous}; concurrent appends raced; run `cowshed doctor --repair`"
+    )]
+    SequenceOrdering {
+        offset: u64,
+        previous: u64,
+        current: u64,
+    },
     #[error("artifact write integrity failure: {0}")]
     WriteIntegrity(String),
     #[error("artifact token conflict for job {job_id:?}: {message}")]
@@ -461,6 +469,23 @@ pub struct RecoveryReport {
     pub next_job_id: JobId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordSequenceViolation {
+    pub offset: u64,
+    pub previous_offset: u64,
+    pub previous: JobArtifactRecord,
+    pub current: JobArtifactRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactRepairReport {
+    pub records_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
+    pub frame_count: usize,
+    pub resequenced_records: usize,
+    pub violations: Vec<RecordSequenceViolation>,
+}
+
 pub struct ArtifactStore {
     workspace_root: PathBuf,
     token_namespace: Sha256Digest,
@@ -469,8 +494,6 @@ pub struct ArtifactStore {
     config: ArtifactConfig,
     budget: BufferBudget,
     next_job_id: u64,
-    next_sequence: u64,
-    last_checkpoint_barrier: u64,
     live_jobs: BTreeMap<JobId, LiveJobState>,
     committed_jobs: BTreeMap<JobId, JobArtifactRecord>,
     recovery: RecoveryReport,
@@ -570,32 +593,6 @@ impl ArtifactStore {
             .checked_add(1)
             .ok_or(ArtifactError::InvalidConfig("job id allocation exhausted"))?;
         recovery.next_job_id = JobId::new(next_job_id)?;
-        let next_sequence = recovery
-            .frames
-            .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::Job(record) => Some(record.sequence),
-                ProtectedRecord::CheckpointManifest(_) => None,
-            })
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(ArtifactError::InvalidConfig(
-                "record sequence allocation exhausted",
-            ))?;
-        let last_checkpoint_barrier = recovery
-            .frames
-            .iter()
-            .filter_map(|frame| match &frame.record {
-                ProtectedRecord::CheckpointManifest(manifest)
-                    if manifest.origin_incarnation == workspace_incarnation =>
-                {
-                    Some(manifest.barrier_id)
-                }
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
         let mut committed_jobs = BTreeMap::new();
         for frame in &recovery.frames {
             let ProtectedRecord::Job(record) = &frame.record else {
@@ -624,8 +621,6 @@ impl ArtifactStore {
                 limit: config.supervisor_buffer_budget_bytes,
             },
             next_job_id,
-            next_sequence,
-            last_checkpoint_barrier,
             live_jobs: BTreeMap::new(),
             committed_jobs,
             recovery,
@@ -709,28 +704,51 @@ impl ArtifactStore {
 
     fn append_record(
         &mut self,
-        mut record: JobArtifactRecord,
+        record: JobArtifactRecord,
     ) -> Result<(JobArtifactRecord, Sha256Digest), ArtifactError> {
+        let path = records_path(&self.workspace_root);
+        let _lock = RecordsLock::acquire(&path)?;
+        let recovery = recover_records_with_budget_unlocked(
+            &path,
+            self.config.retained_recovery_budget_bytes,
+            SequencePolicy::Strict,
+        )?;
+        let sequence = recovery
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                ProtectedRecord::Job(record) => Some(record.sequence),
+                ProtectedRecord::CheckpointManifest(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(ArtifactError::InvalidConfig(
+                "record sequence allocation exhausted",
+            ))?;
         if !matches!(record.state, JobState::Queued | JobState::Running)
-            && self.committed_jobs.contains_key(&record.job_id)
+            && recovery.frames.iter().any(|frame| {
+                matches!(
+                    &frame.record,
+                    ProtectedRecord::Job(existing)
+                        if existing.workspace_incarnation == record.workspace_incarnation
+                            && existing.job_id == record.job_id
+                            && !matches!(existing.state, JobState::Queued | JobState::Running)
+                )
+            })
         {
             return Err(integrity(
                 0,
                 "duplicate terminal artifact record for job id",
             ));
         }
-        record.sequence = self.next_sequence;
+        let mut record = record;
+        record.sequence = sequence;
         record.validate()?;
         let batch = protected_record_to_batch(&ProtectedRecord::Job(record.clone()))?;
         let payload = encode_batch(&batch)?;
         let digest = Sha256Digest::compute(&payload);
-        append_framed_batch(&records_path(&self.workspace_root), &payload, digest)?;
-        self.next_sequence =
-            self.next_sequence
-                .checked_add(1)
-                .ok_or(ArtifactError::InvalidConfig(
-                    "record sequence allocation exhausted",
-                ))?;
+        append_framed_batch_unlocked(&path, &payload, digest, None)?;
         if !matches!(record.state, JobState::Queued | JobState::Running) {
             self.committed_jobs.insert(record.job_id, record.clone());
         }
@@ -743,12 +761,6 @@ impl ArtifactStore {
     /// checkpoint that fails after its barrier merely skips an id instead of leaving a consumed
     /// id that every later checkpoint trips over.
     pub fn checkpoint(&mut self) -> Result<SealedCheckpointManifest, ArtifactError> {
-        let barrier_id =
-            self.last_checkpoint_barrier
-                .checked_add(1)
-                .ok_or(ArtifactError::InvalidConfig(
-                    "checkpoint barrier allocation exhausted",
-                ))?;
         let mut visible = self
             .committed_jobs
             .values()
@@ -763,6 +775,29 @@ impl ArtifactStore {
             visible.insert(job_id, commitment);
         }
         let path = records_path(&self.workspace_root);
+        let _lock = RecordsLock::acquire(&path)?;
+        let recovery = recover_records_with_budget_unlocked(
+            &path,
+            self.config.retained_recovery_budget_bytes,
+            SequencePolicy::Strict,
+        )?;
+        let barrier_id = recovery
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                ProtectedRecord::CheckpointManifest(manifest)
+                    if manifest.origin_incarnation == self.workspace_incarnation =>
+                {
+                    Some(manifest.barrier_id)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(ArtifactError::InvalidConfig(
+                "checkpoint barrier allocation exhausted",
+            ))?;
         let records_sha256 = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.len() == 0 => Sha256Digest::compute(RECORD_MAGIC),
             Ok(_) => hash_file_incrementally(&path)?,
@@ -784,8 +819,7 @@ impl ArtifactStore {
             protected_record_to_batch(&ProtectedRecord::CheckpointManifest(record.clone()))?;
         let payload = encode_batch(&batch)?;
         let manifest_batch_sha256 = Sha256Digest::compute(&payload);
-        append_framed_batch(&path, &payload, manifest_batch_sha256)?;
-        self.last_checkpoint_barrier = barrier_id;
+        append_framed_batch_unlocked(&path, &payload, manifest_batch_sha256, None)?;
         Ok(SealedCheckpointManifest {
             record,
             manifest_batch_sha256,
@@ -1908,6 +1942,55 @@ fn records_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".cowshed/job/records.arrow")
 }
 
+struct RecordsLock {
+    _file: File,
+}
+
+impl RecordsLock {
+    fn acquire(records: &Path) -> Result<Self, ArtifactError> {
+        verify_records_layout(records)?;
+        let workspace_root = records
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .ok_or_else(|| integrity(0, "records path has no workspace root"))?;
+        let job_root = ensure_private_job_root(workspace_root)?;
+        let path = job_root.join("records.lock");
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| io_error(&path, error))?;
+        let metadata = file.metadata().map_err(|error| io_error(&path, error))?;
+        reject_hardlink(&path, &metadata)?;
+        verify_private_file_mode(&path, &metadata, false)?;
+        #[cfg(unix)]
+        loop {
+            use std::os::fd::AsRawFd;
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(io_error(&path, error));
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(ArtifactError::InvalidConfig(
+            "cross-process artifact locking requires Unix flock",
+        ));
+        Ok(Self { _file: file })
+    }
+}
+
 /// Every incarnation other than `current` that wrote a frame into this workspace's records.
 ///
 /// Only the one-time lineage heal reads this: a marker written before lineage was recorded has
@@ -2093,6 +2176,7 @@ fn scan_job_directories(workspace_root: &Path) -> Result<u64, ArtifactError> {
     Ok(maximum)
 }
 
+#[cfg(test)]
 fn append_framed_batch(
     path: &Path,
     payload: &[u8],
@@ -2101,7 +2185,18 @@ fn append_framed_batch(
     append_framed_batch_impl(path, payload, digest, None)
 }
 
+#[cfg(test)]
 fn append_framed_batch_impl(
+    path: &Path,
+    payload: &[u8],
+    digest: Sha256Digest,
+    fail_after_bytes: Option<usize>,
+) -> Result<(), ArtifactError> {
+    let _lock = RecordsLock::acquire(path)?;
+    append_framed_batch_unlocked(path, payload, digest, fail_after_bytes)
+}
+
+fn append_framed_batch_unlocked(
     path: &Path,
     payload: &[u8],
     digest: Sha256Digest,
@@ -2213,6 +2308,20 @@ pub fn recover_records_with_budget(
     path: &Path,
     retained_budget_bytes: usize,
 ) -> Result<RecoveryReport, ArtifactError> {
+    let _lock = RecordsLock::acquire(path)?;
+    recover_records_with_budget_unlocked(path, retained_budget_bytes, SequencePolicy::Strict)
+}
+
+enum SequencePolicy<'a> {
+    Strict,
+    Collect(&'a mut Vec<RecordSequenceViolation>),
+}
+
+fn recover_records_with_budget_unlocked(
+    path: &Path,
+    retained_budget_bytes: usize,
+    mut sequence_policy: SequencePolicy<'_>,
+) -> Result<RecoveryReport, ArtifactError> {
     if retained_budget_bytes == 0 {
         return Err(ArtifactError::InvalidConfig(
             "retained recovery budget must be positive",
@@ -2276,7 +2385,7 @@ pub fn recover_records_with_budget(
     let mut records = Vec::new();
     let mut prefix_hasher = Sha256::new();
     prefix_hasher.update(RECORD_MAGIC);
-    let mut last_sequence = 0_u64;
+    let mut previous_job: Option<(usize, JobArtifactRecord)> = None;
     let mut terminal_jobs = BTreeSet::new();
     while (offset as u64) < original_len {
         let frame_start = offset;
@@ -2362,16 +2471,32 @@ pub fn recover_records_with_budget(
             .validate()
             .map_err(|error| integrity(frame_start, &error.to_string()))?;
         match &record {
-            ProtectedRecord::Job(record) => {
-                if record.sequence <= last_sequence {
-                    return Err(integrity(
-                        frame_start,
-                        "record sequences are not strictly increasing",
-                    ));
+            ProtectedRecord::Job(current) => {
+                if let Some((previous_offset, previous)) = previous_job.as_ref()
+                    && current.sequence <= previous.sequence
+                {
+                    match &mut sequence_policy {
+                        SequencePolicy::Strict => {
+                            return Err(ArtifactError::SequenceOrdering {
+                                offset: frame_start as u64,
+                                previous: previous.sequence,
+                                current: current.sequence,
+                            });
+                        }
+                        SequencePolicy::Collect(violations) => {
+                            violations.push(RecordSequenceViolation {
+                                offset: frame_start as u64,
+                                previous_offset: *previous_offset as u64,
+                                previous: previous.clone(),
+                                current: current.clone(),
+                            });
+                        }
+                    }
                 }
-                last_sequence = record.sequence;
-                if !matches!(record.state, JobState::Queued | JobState::Running)
-                    && !terminal_jobs.insert((record.workspace_incarnation.clone(), record.job_id))
+                previous_job = Some((frame_start, current.clone()));
+                if !matches!(current.state, JobState::Queued | JobState::Running)
+                    && !terminal_jobs
+                        .insert((current.workspace_incarnation.clone(), current.job_id))
                 {
                     return Err(integrity(
                         frame_start,
@@ -3690,9 +3815,139 @@ fn require_protected_columns(
     Ok(())
 }
 
+pub fn repair_workspace_record_sequences(
+    workspace_root: &Path,
+    retained_budget_bytes: usize,
+) -> Result<ArtifactRepairReport, ArtifactError> {
+    let path = records_path(workspace_root);
+    let _lock = RecordsLock::acquire(&path)?;
+    let mut violations = Vec::new();
+    let recovery = recover_records_with_budget_unlocked(
+        &path,
+        retained_budget_bytes,
+        SequencePolicy::Collect(&mut violations),
+    )?;
+    let frame_count = recovery.frames.len();
+    if violations.is_empty() {
+        return Ok(ArtifactRepairReport {
+            records_path: path,
+            backup_path: None,
+            frame_count,
+            resequenced_records: 0,
+            violations,
+        });
+    }
+
+    let original = fs::read(&path).map_err(|error| io_error(&path, error))?;
+    let original_digest = Sha256Digest::compute(&original).to_string();
+    let backup = path.with_file_name(format!(
+        "records.arrow.pre-repair-{}",
+        &original_digest[..16]
+    ));
+    let mut backup_options = OpenOptions::new();
+    backup_options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        backup_options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    match backup_options.open(&backup) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(&original).and_then(|_| file.sync_data()) {
+                drop(file);
+                let _ = fs::remove_file(&backup);
+                return Err(io_error(&backup, error));
+            }
+            sync_parent_directory(&backup)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing = fs::read(&backup).map_err(|error| io_error(&backup, error))?;
+            if existing != original {
+                return Err(ArtifactError::WriteIntegrity(format!(
+                    "repair backup {} already exists with different bytes",
+                    backup.display()
+                )));
+            }
+        }
+        Err(error) => return Err(io_error(&backup, error)),
+    }
+
+    let mut bytes = Vec::with_capacity(original.len());
+    bytes.extend_from_slice(RECORD_MAGIC);
+    let mut next_sequence = 1_u64;
+    let mut resequenced_records = 0_usize;
+    for frame in recovery.frames {
+        let mut record = frame.record;
+        match &mut record {
+            ProtectedRecord::Job(job) => {
+                if job.sequence != next_sequence {
+                    resequenced_records += 1;
+                }
+                job.sequence = next_sequence;
+                next_sequence =
+                    next_sequence
+                        .checked_add(1)
+                        .ok_or(ArtifactError::InvalidConfig(
+                            "record sequence allocation exhausted",
+                        ))?;
+            }
+            ProtectedRecord::CheckpointManifest(manifest) => {
+                manifest.records_sha256 = Sha256Digest::compute(&bytes);
+            }
+        }
+        record.validate()?;
+        let batch = protected_record_to_batch(&record)?;
+        let payload = encode_batch(&batch)?;
+        let payload_len = u64::try_from(payload.len())
+            .map_err(|_| ArtifactError::Arrow("record batch is too large".into()))?;
+        bytes.extend_from_slice(BATCH_MAGIC);
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&(!payload_len).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(Sha256Digest::compute(&payload).as_bytes());
+        bytes.extend_from_slice(BATCH_TRAILER);
+    }
+
+    let temporary = path.with_file_name(format!("records.arrow.repair-{original_digest}.tmp"));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| io_error(&temporary, error))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_data()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(io_error(&temporary, error));
+    }
+    drop(file);
+    fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
+    sync_parent_directory(&path)?;
+    recover_records_with_budget_unlocked(&path, retained_budget_bytes, SequencePolicy::Strict)?;
+
+    Ok(ArtifactRepairReport {
+        records_path: path,
+        backup_path: Some(backup),
+        frame_count,
+        resequenced_records,
+        violations,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn repo() -> RepoId {
@@ -3994,8 +4249,12 @@ mod tests {
 
         let error = store.checkpoint().unwrap_err();
         assert!(
-            matches!(error, ArtifactError::Io { path, .. } if path == records_path(&root)),
-            "checkpoint must return the records metadata error without attempting publication"
+            matches!(
+                &error,
+                ArtifactError::Integrity { message, .. }
+                    if message.contains("Permission denied")
+            ),
+            "checkpoint must return the protected metadata error without attempting publication: {error:?}"
         );
 
         fs::set_permissions(&job_root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4570,5 +4829,269 @@ mod tests {
         assert!(!records_path(&root).exists());
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn repair_resequences_intact_frames_without_losing_records() {
+        let root = temp_root("repair-sequences");
+        let mut first_running = valid_job_record(1);
+        first_running.state = JobState::Running;
+        first_running.sequence = 1;
+        let mut first_exited = valid_job_record(1);
+        first_exited.sequence = 2;
+        let mut second_running = valid_job_record(2);
+        second_running.state = JobState::Running;
+        second_running.sequence = 2;
+        let mut second_exited = valid_job_record(2);
+        second_exited.sequence = 3;
+        for record in [first_running, first_exited, second_running, second_exited] {
+            append_protected_record(&root, ProtectedRecord::Job(record));
+        }
+        let path = records_path(&root);
+        let original = fs::read(&path).unwrap();
+        assert!(matches!(
+            recover_records(&path),
+            Err(ArtifactError::SequenceOrdering {
+                offset,
+                previous: 2,
+                current: 2,
+            }) if offset > 0
+        ));
+
+        let report = repair_workspace_record_sequences(
+            &root,
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap();
+        assert_eq!(report.frame_count, 4);
+        assert_eq!(report.resequenced_records, 2);
+        assert_eq!(report.violations.len(), 1);
+        let backup = report.backup_path.expect("repair preserves the original");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+
+        let repaired = recover_records(&path).unwrap();
+        let jobs = repaired
+            .frames
+            .into_iter()
+            .filter_map(|frame| match frame.record {
+                ProtectedRecord::Job(job) => Some(job),
+                ProtectedRecord::CheckpointManifest(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            jobs.iter().map(|job| job.sequence).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            jobs.iter()
+                .map(|job| (job.job_id.get(), job.state))
+                .collect::<Vec<_>>(),
+            [
+                (1, JobState::Running),
+                (1, JobState::Exited),
+                (2, JobState::Running),
+                (2, JobState::Exited),
+            ]
+        );
+
+        let repeated = repair_workspace_record_sequences(
+            &root,
+            ArtifactConfig::default().retained_recovery_budget_bytes,
+        )
+        .unwrap();
+        assert_eq!(repeated.frame_count, 4);
+        assert_eq!(repeated.resequenced_records, 0);
+        assert!(repeated.backup_path.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_refuses_unreadable_payload_without_writing_a_backup() {
+        let root = temp_root("repair-refuses-corruption");
+        append_protected_record(&root, ProtectedRecord::Job(valid_job_record(1)));
+        let path = records_path(&root);
+        let mut corrupted = fs::read(&path).unwrap();
+        corrupted[RECORD_MAGIC.len() + FRAME_HEADER_BYTES + 10] ^= 1;
+        fs::write(&path, &corrupted).unwrap();
+
+        assert!(matches!(
+            repair_workspace_record_sequences(
+                &root,
+                ArtifactConfig::default().retained_recovery_budget_bytes,
+            ),
+            Err(ArtifactError::Integrity { message, .. })
+                if message.contains("digest mismatch")
+        ));
+        assert_eq!(fs::read(&path).unwrap(), corrupted);
+        assert!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| !name
+                    .to_string_lossy()
+                    .starts_with("records.arrow.pre-repair-"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn read_job_records_in_physical_order(path: &Path) -> Result<Vec<JobArtifactRecord>, String> {
+        let bytes = fs::read(path).map_err(|error| error.to_string())?;
+        if !bytes.starts_with(RECORD_MAGIC) {
+            return Err("records magic is invalid".into());
+        }
+        let mut offset = RECORD_MAGIC.len();
+        let mut records = Vec::new();
+        while offset < bytes.len() {
+            let frame_start = offset;
+            let header_end = offset
+                .checked_add(FRAME_HEADER_BYTES)
+                .ok_or("frame header offset overflow")?;
+            let header = bytes
+                .get(offset..header_end)
+                .ok_or_else(|| format!("incomplete frame header at byte {frame_start}"))?;
+            if &header[..BATCH_MAGIC.len()] != BATCH_MAGIC {
+                return Err(format!("invalid frame magic at byte {frame_start}"));
+            }
+            let payload_len =
+                u64::from_le_bytes(header[8..16].try_into().expect("eight bytes")) as usize;
+            if u64::from_le_bytes(header[16..24].try_into().expect("eight bytes"))
+                != !(payload_len as u64)
+            {
+                return Err(format!("invalid frame length at byte {frame_start}"));
+            }
+            let payload_start = header_end;
+            let payload_end = payload_start
+                .checked_add(payload_len)
+                .ok_or("payload offset overflow")?;
+            let digest_end = payload_end
+                .checked_add(32)
+                .ok_or("digest offset overflow")?;
+            let trailer_end = digest_end
+                .checked_add(BATCH_TRAILER.len())
+                .ok_or("trailer offset overflow")?;
+            let payload = bytes
+                .get(payload_start..payload_end)
+                .ok_or_else(|| format!("incomplete payload at byte {frame_start}"))?;
+            let digest: [u8; 32] = bytes
+                .get(payload_end..digest_end)
+                .ok_or_else(|| format!("incomplete digest at byte {frame_start}"))?
+                .try_into()
+                .expect("digest slice is fixed width");
+            if Sha256Digest::compute(payload) != Sha256Digest::from_bytes(digest) {
+                return Err(format!("digest mismatch at byte {frame_start}"));
+            }
+            if bytes.get(digest_end..trailer_end) != Some(BATCH_TRAILER.as_slice()) {
+                return Err(format!("invalid trailer at byte {frame_start}"));
+            }
+            let batch = decode_single_batch(payload).map_err(|error| error.to_string())?;
+            if let ProtectedRecord::Job(record) =
+                batch_to_protected_record(&batch).map_err(|error| error.to_string())?
+            {
+                records.push(record);
+            }
+            offset = trailer_end;
+        }
+        Ok(records)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn concurrent_store_instances_append_unique_monotonic_gapless_records(
+            writer_count in 2_usize..=32,
+        ) {
+            let root = temp_root("concurrent-sequences");
+            let stores = (0..writer_count)
+                .map(|_| store_at(&root, ArtifactConfig::default()))
+                .collect::<Vec<_>>();
+            ensure_private_job_root(&root).unwrap();
+            let barrier = Arc::new(Barrier::new(writer_count));
+            let writers = stores
+                .into_iter()
+                .enumerate()
+                .map(|(index, mut store)| {
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        store.append_record(valid_job_record(index as u64 + 1))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let appended = writers
+                .into_iter()
+                .map(|writer| {
+                    writer
+                        .join()
+                        .expect("concurrent writer panicked")
+                        .expect("concurrent append failed")
+                        .0
+                })
+                .collect::<Vec<_>>();
+            prop_assert_eq!(
+                appended.len(),
+                writer_count,
+                "N={}: successful append count differs from writer count",
+                writer_count,
+            );
+            let mut allocated_sequences = appended
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>();
+            allocated_sequences.sort_unstable();
+            if let Some(pair) = allocated_sequences
+                .windows(2)
+                .find(|pair| pair[1] == pair[0])
+            {
+                prop_assert!(
+                    false,
+                    "N={}: record sequences are not unique; offending pair {} -> {}",
+                    writer_count,
+                    pair[0],
+                    pair[1]
+                );
+            }
+            prop_assert_eq!(
+                allocated_sequences,
+                (1..=writer_count as u64).collect::<Vec<_>>(),
+                "N={}: allocated record sequences are not gapless",
+                writer_count,
+            );
+
+            let records = read_job_records_in_physical_order(&records_path(&root))
+                .unwrap_or_else(|error| panic!("N={writer_count}: {error}"));
+            prop_assert_eq!(
+                records.len(),
+                writer_count,
+                "N={}: durable record count differs from successful append count",
+                writer_count,
+            );
+            let sequences = records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>();
+            if let Some(pair) = sequences.windows(2).find(|pair| pair[1] <= pair[0]) {
+                prop_assert!(
+                    false,
+                    "N={}: durable record sequences are not strictly increasing; offending pair {} -> {}",
+                    writer_count,
+                    pair[0],
+                    pair[1]
+                );
+            }
+            prop_assert_eq!(
+                sequences.iter().copied().collect::<BTreeSet<_>>().len(),
+                writer_count,
+                "N={}: durable record sequences are not unique: {:?}",
+                writer_count,
+                sequences,
+            );
+            prop_assert_eq!(
+                sequences,
+                (1..=writer_count as u64).collect::<Vec<_>>(),
+                "N={}: durable record sequences are not gapless",
+                writer_count,
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
