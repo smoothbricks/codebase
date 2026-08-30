@@ -14,7 +14,12 @@ pub const HOST_CONFIG_FILE: &str = "host.json";
 pub const RETIRED_LAYOUT_HINT: &str =
     "cowshed setup --mount-root <dir> after detaching every workspace";
 const HOST_CONFIG_VERSION: u32 = 1;
-const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
+pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
+
+/// Where a host presents workspace mounts when no configuration has been written. Stated once:
+/// the retired-layout migration in `runtime::project` has to recognise the same directory, and a
+/// literal there could not follow a change made here.
+pub(crate) const DEFAULT_MOUNT_RELATIVE: &str = ".cowshed/mnt";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -42,7 +47,7 @@ impl HostConfig {
     pub fn load(store_root: &Path, home: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
         validate_absolute_path(home)?;
-        Self::load_or_default(store_root, home.join(".cowshed/mnt"))
+        Self::load_or_default(store_root, home.join(DEFAULT_MOUNT_RELATIVE))
     }
 
     /// Resolve configuration for callers that only possess the canonical store root.
@@ -57,7 +62,7 @@ impl HostConfig {
             let home = std::env::var_os("HOME").ok_or(HostConfigError::HomeUnavailable)?;
             let home = PathBuf::from(home);
             validate_absolute_path(&home)?;
-            home.join(".cowshed/mnt")
+            home.join(DEFAULT_MOUNT_RELATIVE)
         } else {
             store_root.join(RETIRED_MOUNT_DIRECTORY)
         };
