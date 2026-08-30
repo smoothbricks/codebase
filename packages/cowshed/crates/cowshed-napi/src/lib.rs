@@ -36,29 +36,20 @@ struct AddonFailure {
     hint: String,
 }
 
+// Constructors delegate to `CowshedError` so the addon can never invent a code spelling or a
+// default hint that disagrees with core's taxonomy; this type exists only as the flattened form
+// `to_napi_error` needs.
 impl AddonFailure {
     fn usage(message: impl Into<String>, hint: impl Into<String>) -> Self {
-        Self {
-            code: "usage",
-            message: message.into(),
-            hint: hint.into(),
-        }
+        CowshedError::usage(message, hint).into()
     }
 
     fn conflict(message: impl Into<String>, hint: impl Into<String>) -> Self {
-        Self {
-            code: "conflict",
-            message: message.into(),
-            hint: hint.into(),
-        }
+        CowshedError::conflict(message, hint).into()
     }
 
-    fn internal(message: impl Into<String>, hint: impl Into<String>) -> Self {
-        Self {
-            code: "internal",
-            message: message.into(),
-            hint: hint.into(),
-        }
+    fn internal(message: impl Into<String>) -> Self {
+        CowshedError::internal(message).into()
     }
 }
 
@@ -80,6 +71,8 @@ fn to_napi_error(env: Env, failure: AddonFailure) -> napi::Error {
         message,
         hint,
     } = failure;
+    // `\nnext: ` is the wire delimiter `NEXT_HINT_MARKER` in src/index.ts splits on; the two
+    // spellings must stay byte-identical or hints silently merge back into messages.
     let reason = format!("{message}\nnext: {hint}");
     let error = JsError::from(napi::Error::new(code, reason)).into_unknown(env);
     napi::Error::from(error)
@@ -99,12 +92,8 @@ where
 }
 
 fn canonical_json<T: Serialize>(kind: &'static str, value: &T) -> AddonResult<String> {
-    serde_json::to_string(value).map_err(|error| {
-        AddonFailure::internal(
-            format!("failed to serialize {kind}: {error}"),
-            "cowshed doctor --json",
-        )
-    })
+    serde_json::to_string(value)
+        .map_err(|error| AddonFailure::internal(format!("failed to serialize {kind}: {error}")))
 }
 
 fn parse_json<T: DeserializeOwned>(kind: &'static str, value: &str) -> AddonResult<T> {
@@ -123,7 +112,7 @@ struct NapiExecRequest {
     #[serde(default)]
     cwd: Option<WorkspacePath>,
     #[serde(default)]
-    mode: NapiRunSandboxMode,
+    mode: RunSandboxMode,
     #[serde(default)]
     env: HashMap<String, String>,
     #[serde(default)]
@@ -136,14 +125,6 @@ struct NapiExecRequest {
     stdout_copy: Option<OutputPublication>,
     #[serde(default)]
     stderr_copy: Option<OutputPublication>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum NapiRunSandboxMode {
-    #[default]
-    ReadWrite,
-    ReadOnly,
 }
 
 impl TryFrom<NapiExecRequest> for ExecRequest {
@@ -164,10 +145,7 @@ impl TryFrom<NapiExecRequest> for ExecRequest {
         Ok(Self {
             argv: request.argv.into_iter().map(Into::into).collect(),
             cwd: request.cwd,
-            mode: match request.mode {
-                NapiRunSandboxMode::ReadWrite => RunSandboxMode::ReadWrite,
-                NapiRunSandboxMode::ReadOnly => RunSandboxMode::ReadOnly,
-            },
+            mode: request.mode,
             env: request.env,
             trace: request.trace,
             stdin,
@@ -551,10 +529,7 @@ impl WorkspaceHandle {
             .ok_or_else(|| {
                 to_napi_error(
                     env,
-                    AddonFailure::internal(
-                        "controller returned a non-UTF-8 workspace mount path",
-                        "cowshed doctor --json",
-                    ),
+                    AddonFailure::internal("controller returned a non-UTF-8 workspace mount path"),
                 )
             })
     }
@@ -768,10 +743,11 @@ impl JobAttachment {
             let attachment = attachment
                 .lock()
                 .map_err(|_| {
-                    AddonFailure::internal(
+                    AddonFailure::from(CowshedError::new(
+                        cowshed_core::ErrorCode::Internal,
                         "job attachment mutex was poisoned",
                         "restart the coordinator process",
-                    )
+                    ))
                 })?
                 .take()
                 .ok_or_else(|| {
@@ -806,10 +782,7 @@ impl Project {
             .ok_or_else(|| {
                 to_napi_error(
                     env,
-                    AddonFailure::internal(
-                        "controller returned a non-UTF-8 Git root",
-                        "cowshed doctor --json",
-                    ),
+                    AddonFailure::internal("controller returned a non-UTF-8 Git root"),
                 )
             })
     }
@@ -898,10 +871,7 @@ impl WorkspaceRef {
             .ok_or_else(|| {
                 to_napi_error(
                     env,
-                    AddonFailure::internal(
-                        "controller returned a non-UTF-8 workspace mount path",
-                        "cowshed doctor --json",
-                    ),
+                    AddonFailure::internal("controller returned a non-UTF-8 workspace mount path"),
                 )
             })
     }

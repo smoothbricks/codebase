@@ -1803,7 +1803,8 @@ impl fmt::Debug for StdinSource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RunSandboxMode {
     #[default]
     ReadWrite,
