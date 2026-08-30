@@ -819,12 +819,7 @@ impl ArtifactStore {
             protected_record_to_batch(&ProtectedRecord::CheckpointManifest(record.clone()))?;
         let payload = encode_batch(&batch)?;
         let manifest_batch_sha256 = Sha256Digest::compute(&payload);
-        append_framed_batch_under_lock(
-            &lock,
-            &payload,
-            manifest_batch_sha256,
-            None,
-        )?;
+        append_framed_batch_under_lock(&lock, &payload, manifest_batch_sha256, None)?;
         Ok(SealedCheckpointManifest {
             record,
             manifest_batch_sha256,
@@ -2325,11 +2320,7 @@ pub fn recover_records_with_budget(
     retained_budget_bytes: usize,
 ) -> Result<RecoveryReport, ArtifactError> {
     let lock = RecordsLock::acquire(path)?;
-    recover_records_with_budget_under_lock(
-        &lock,
-        retained_budget_bytes,
-        SequencePolicy::Strict,
-    )
+    recover_records_with_budget_under_lock(&lock, retained_budget_bytes, SequencePolicy::Strict)
 }
 
 enum SequencePolicy<'a> {
@@ -3952,11 +3943,7 @@ pub fn repair_workspace_record_sequences(
     drop(file);
     fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
     sync_parent_directory(&path)?;
-    recover_records_with_budget_under_lock(
-        &lock,
-        retained_budget_bytes,
-        SequencePolicy::Strict,
-    )?;
+    recover_records_with_budget_under_lock(&lock, retained_budget_bytes, SequencePolicy::Strict)?;
 
     Ok(ArtifactRepairReport {
         records_path: path,
