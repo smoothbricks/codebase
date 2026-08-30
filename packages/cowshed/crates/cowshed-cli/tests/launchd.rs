@@ -11,8 +11,8 @@ use cowshed_cli::launchd::{
     GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
     LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand, LaunchdError, LaunchdExecutor,
     LaunchdFilesystem, LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE,
-    PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle,
-    UnstableExecutableSource, classify_executable_source, containing_mount_point,
+    PRIVATE_PLIST_MODE, ProcessType, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE,
+    ServiceLifecycle, UnstableExecutableSource, classify_executable_source, containing_mount_point,
     plan_executable_install, plan_install, plan_remove,
 };
 use cowshed_core::metadata::ImageCapacity;
@@ -39,6 +39,7 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
     assert_eq!(spec.executable(), Path::new(EXECUTABLE));
     assert_eq!(spec.arguments(), ["gateway", "run"]);
     assert_eq!(spec.lifecycle(), ServiceLifecycle::KeepAlive);
+    assert_eq!(spec.process_type(), ProcessType::Background);
     assert_eq!(
         spec.plist_path(),
         Path::new("/Users/cowshed-test/Library/LaunchAgents/dev.cowshed.gateway.plist")
@@ -123,6 +124,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     assert_eq!(spec.label(), SCCACHE_LABEL);
     assert_eq!(spec.arguments(), [] as [String; 0]);
     assert_eq!(spec.lifecycle(), ServiceLifecycle::KeepAlive);
+    assert_eq!(spec.process_type(), ProcessType::Standard);
     assert_eq!(
         spec.plist_path(),
         Path::new("/Users/cowshed-test/Library/LaunchAgents/dev.cowshed.sccache.plist")
@@ -170,7 +172,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         "  <key>KeepAlive</key>\n",
         "  <true/>\n",
         "  <key>ProcessType</key>\n",
-        "  <string>Background</string>\n",
+        "  <string>Standard</string>\n",
         "  <key>StandardErrorPath</key>\n",
         "  <string>/Users/cowshed-test/Library/Logs/cowshed/sccache-stderr.log</string>\n",
         "  <key>EnvironmentVariables</key>\n",
