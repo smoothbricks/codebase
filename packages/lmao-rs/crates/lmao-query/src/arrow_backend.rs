@@ -1,14 +1,84 @@
 //! In-process backend: hand-rolled scan over flushed RecordBatches.
+//!
+//! Every column read is typed and fallible. A column of an unexpected type, a
+//! selector naming a column no batch carries, or a query against zero batches is an
+//! `Err` — never "no rows matched". A count that silently becomes 0 makes `never()`
+//! report that an event never appeared and `all_children_of()` report that every child
+//! is correctly parented, so a coerced error here answers the caller's assertion with
+//! its PASS value (minigraf PERFORMANCE-HANDBOOK §7.10f).
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int64Type, UInt8Type, UInt32Type, UInt64Type};
+use arrow_array::types::{Float64Type, Int64Type, UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType};
 
 use crate::{ColumnValue, Selector, TraceQuery};
 
+/// Span identity columns. Span ids are per-thread counters, so thread identity is part
+/// of the key, not decoration: without it a child whose `parent_span_id` collides with
+/// a same-numbered span on another thread reads as correctly parented.
+const IDENTITY_COLUMNS: [&str; 5] = [
+    "trace_id",
+    "thread_id",
+    "span_id",
+    "parent_thread_id",
+    "parent_span_id",
+];
+
 pub struct ArrowTraceQuery {
     batches: Vec<RecordBatch>,
+}
+
+/// A span's full identity within a trace.
+type SpanKey = (String, u64, u64);
+
+fn type_error(column: &str, want: &str, got: &DataType) -> ArrowError {
+    ArrowError::SchemaError(format!("column {column} must be {want}, found {got}"))
+}
+
+fn selector_columns(selector: &Selector) -> Vec<&str> {
+    let mut columns = Vec::with_capacity(selector.constraints.len() + 1);
+    if selector.template.is_some() {
+        columns.push("message");
+    }
+    columns.extend(selector.constraints.iter().map(|(name, _)| name.as_str()));
+    columns
+}
+
+/// A span id or thread id widened from 32 to 64 unsigned bits is lossless, so both are
+/// accepted; a signed or narrower column is not an identity this reader can trust.
+fn reads_as_u64(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::UInt32 | DataType::UInt64)
+}
+
+fn reads_as_str(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 => true,
+        DataType::Dictionary(key, value) => {
+            **value == DataType::Utf8 && matches!(**key, DataType::UInt8 | DataType::UInt32)
+        }
+        _ => false,
+    }
+}
+
+fn addresses_column(want: &ColumnValue, data_type: &DataType) -> bool {
+    match want {
+        ColumnValue::Str(_) => reads_as_str(data_type),
+        ColumnValue::U64(_) => reads_as_u64(data_type),
+        ColumnValue::I64(_) => matches!(data_type, DataType::Int64),
+        ColumnValue::F64(_) => matches!(data_type, DataType::Float64),
+        ColumnValue::Bool(_) => matches!(data_type, DataType::Boolean),
+    }
+}
+
+fn wanted_type_name(want: &ColumnValue) -> &'static str {
+    match want {
+        ColumnValue::Str(_) => "Utf8 or a Utf8 dictionary",
+        ColumnValue::U64(_) => "UInt32 or UInt64",
+        ColumnValue::I64(_) => "Int64",
+        ColumnValue::F64(_) => "Float64",
+        ColumnValue::Bool(_) => "Boolean",
+    }
 }
 
 impl ArrowTraceQuery {
@@ -20,20 +90,16 @@ impl ArrowTraceQuery {
         &self.batches
     }
 
-    fn validate_selector(&self, selector: &Selector) -> Result<(), ArrowError> {
-        for batch in &self.batches {
-            let schema = batch.schema();
-            if selector.template.is_some() {
-                schema.index_of("message")?;
-            }
-            for (name, _) in &selector.constraints {
-                schema.index_of(name)?;
-            }
-        }
-        Ok(())
-    }
-
+    /// Errors when a needed column is absent from any batch, and when there are no
+    /// batches at all: with no schema to resolve against, answering 0 would be a
+    /// vacuous pass for `never()` rather than a fact about the trace.
     fn require_columns(&self, columns: &[&str]) -> Result<(), ArrowError> {
+        if self.batches.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "no batches to query: cannot resolve columns [{}]",
+                columns.join(", ")
+            )));
+        }
         for batch in &self.batches {
             let schema = batch.schema();
             for column in columns {
@@ -43,96 +109,220 @@ impl ArrowTraceQuery {
         Ok(())
     }
 
-    fn matching_rows<'a>(
-        &'a self,
-        selector: &'a Selector,
-    ) -> impl Iterator<Item = (&'a RecordBatch, usize)> + 'a {
-        self.batches.iter().flat_map(move |batch| {
-            (0..batch.num_rows())
-                .filter_map(move |row| row_matches(batch, row, selector).then_some((batch, row)))
-        })
+    /// Validates presence AND type before any row is read. Checking lazily per row
+    /// would leave a mistyped column undetected whenever no row reaches it — the
+    /// selector would be answered from a schema the reader cannot actually interpret
+    /// (§7.7: validate once, then trust).
+    fn validate_selector(&self, selector: &Selector) -> Result<(), ArrowError> {
+        self.require_columns(&selector_columns(selector))?;
+        for batch in &self.batches {
+            let schema = batch.schema();
+            if selector.template.is_some() {
+                let data_type = schema.field(schema.index_of("message")?).data_type();
+                if !reads_as_str(data_type) {
+                    return Err(type_error(
+                        "message",
+                        "Utf8 or a Utf8 dictionary",
+                        data_type,
+                    ));
+                }
+            }
+            for (name, want) in &selector.constraints {
+                let data_type = schema.field(schema.index_of(name)?).data_type();
+                if !addresses_column(want, data_type) {
+                    return Err(type_error(name, wanted_type_name(want), data_type));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Same up-front discipline for the identity columns `all_children_of` reads.
+    fn require_identity_columns(&self) -> Result<(), ArrowError> {
+        self.require_columns(&IDENTITY_COLUMNS)?;
+        for batch in &self.batches {
+            let schema = batch.schema();
+            for column in IDENTITY_COLUMNS {
+                let data_type = schema.field(schema.index_of(column)?).data_type();
+                let ok = if column == "trace_id" {
+                    reads_as_str(data_type)
+                } else {
+                    reads_as_u64(data_type)
+                };
+                if !ok {
+                    let want = if column == "trace_id" {
+                        "Utf8 or a Utf8 dictionary"
+                    } else {
+                        "UInt32 or UInt64"
+                    };
+                    return Err(type_error(column, want, data_type));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Visits every row matching `selector`, propagating the first column-read error.
+    fn visit_matching<F>(&self, selector: &Selector, mut visit: F) -> Result<(), ArrowError>
+    where
+        F: FnMut(&RecordBatch, usize) -> Result<(), ArrowError>,
+    {
+        for batch in &self.batches {
+            for row in 0..batch.num_rows() {
+                if row_matches(batch, row, selector)? {
+                    visit(batch, row)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn span_key(batch: &RecordBatch, row: usize) -> Result<Option<SpanKey>, ArrowError> {
+        let (Some(trace), Some(thread), Some(span)) = (
+            str_at(batch, "trace_id", row)?,
+            u64_at(batch, "thread_id", row)?,
+            u64_at(batch, "span_id", row)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some((trace, thread, span)))
+    }
+
+    fn parent_key(batch: &RecordBatch, row: usize) -> Result<Option<SpanKey>, ArrowError> {
+        let (Some(trace), Some(thread), Some(span)) = (
+            str_at(batch, "trace_id", row)?,
+            u64_at(batch, "parent_thread_id", row)?,
+            u64_at(batch, "parent_span_id", row)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some((trace, thread, span)))
     }
 }
 
-fn dict_str_value(batch: &RecordBatch, name: &str, row: usize) -> Option<String> {
-    let idx = batch.schema().index_of(name).ok()?;
-    let col = batch.column(idx);
-    match col.data_type() {
-        arrow_schema::DataType::Dictionary(k, _) => {
-            let values = match **k {
-                arrow_schema::DataType::UInt8 => {
-                    let d = col.as_dictionary::<UInt8Type>();
-                    if d.keys().is_null(row) {
-                        return None;
-                    }
-                    let key = d.keys().value(row) as usize;
-                    d.values().as_string::<i32>().value(key).to_string()
-                }
-                arrow_schema::DataType::UInt32 => {
-                    let d = col.as_dictionary::<UInt32Type>();
-                    if d.keys().is_null(row) {
-                        return None;
-                    }
-                    let key = d.keys().value(row) as usize;
-                    d.values().as_string::<i32>().value(key).to_string()
-                }
-                _ => return None,
-            };
-            Some(values)
-        }
-        arrow_schema::DataType::Utf8 => {
-            let s = col.as_string::<i32>();
-            (!s.is_null(row)).then(|| s.value(row).to_string())
-        }
-        _ => None,
-    }
-}
-
-fn column_equals(batch: &RecordBatch, name: &str, row: usize, want: &ColumnValue) -> bool {
-    let Ok(idx) = batch.schema().index_of(name) else {
-        return false;
-    };
+fn str_at(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>, ArrowError> {
+    let idx = batch.schema().index_of(name)?;
     let col = batch.column(idx);
     if col.is_null(row) {
-        return false;
+        return Ok(None);
     }
-    match want {
-        ColumnValue::Str(s) => dict_str_value(batch, name, row).as_deref() == Some(s.as_str()),
-        ColumnValue::U64(v) => match col.data_type() {
-            arrow_schema::DataType::UInt64 => col.as_primitive::<UInt64Type>().value(row) == *v,
-            arrow_schema::DataType::UInt32 => {
-                col.as_primitive::<UInt32Type>().value(row) as u64 == *v
+    match col.data_type() {
+        DataType::Dictionary(key, value) => {
+            if **value != DataType::Utf8 {
+                return Err(type_error(name, "a Utf8 dictionary", col.data_type()));
             }
-            _ => false,
-        },
-        ColumnValue::I64(v) => match col.data_type() {
-            arrow_schema::DataType::Int64 => col.as_primitive::<Int64Type>().value(row) == *v,
-            _ => false,
-        },
-        ColumnValue::F64(v) => match col.data_type() {
-            arrow_schema::DataType::Float64 => {
-                col.as_primitive::<arrow_array::types::Float64Type>()
-                    .value(row)
-                    == *v
+            let (key_index, is_null) = match **key {
+                DataType::UInt8 => {
+                    let dict = col.as_dictionary::<UInt8Type>();
+                    (dict.keys().value(row) as usize, dict.keys().is_null(row))
+                }
+                DataType::UInt32 => {
+                    let dict = col.as_dictionary::<UInt32Type>();
+                    (dict.keys().value(row) as usize, dict.keys().is_null(row))
+                }
+                _ => {
+                    return Err(type_error(
+                        name,
+                        "a dictionary keyed by UInt8 or UInt32",
+                        col.data_type(),
+                    ));
+                }
+            };
+            if is_null {
+                return Ok(None);
             }
-            _ => false,
-        },
-        ColumnValue::Bool(v) => col
-            .as_boolean_opt()
-            .is_some_and(|b| !b.is_null(row) && b.value(row) == *v),
+            let values = match **key {
+                DataType::UInt8 => col.as_dictionary::<UInt8Type>().values().clone(),
+                _ => col.as_dictionary::<UInt32Type>().values().clone(),
+            };
+            let strings = values
+                .as_string_opt::<i32>()
+                .ok_or_else(|| type_error(name, "a Utf8 dictionary", col.data_type()))?;
+            Ok(Some(strings.value(key_index).to_string()))
+        }
+        DataType::Utf8 => Ok(Some(col.as_string::<i32>().value(row).to_string())),
+        other => Err(type_error(name, "Utf8 or a Utf8 dictionary", other)),
     }
 }
 
-fn row_matches(batch: &RecordBatch, row: usize, selector: &Selector) -> bool {
-    if let Some(template) = &selector.template
-        && dict_str_value(batch, "message", row).as_deref() != Some(template.as_str())
-    {
-        return false;
+fn u64_at(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<u64>, ArrowError> {
+    let idx = batch.schema().index_of(name)?;
+    let col = batch.column(idx);
+    if col.is_null(row) {
+        return Ok(None);
     }
-    selector
-        .constraints
-        .iter()
-        .all(|(name, want)| column_equals(batch, name, row, want))
+    match col.data_type() {
+        DataType::UInt64 => Ok(Some(col.as_primitive::<UInt64Type>().value(row))),
+        DataType::UInt32 => Ok(Some(u64::from(col.as_primitive::<UInt32Type>().value(row)))),
+        other => Err(type_error(name, "UInt32 or UInt64", other)),
+    }
+}
+
+fn i64_at(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i64>, ArrowError> {
+    let idx = batch.schema().index_of(name)?;
+    let col = batch.column(idx);
+    if col.is_null(row) {
+        return Ok(None);
+    }
+    match col.data_type() {
+        DataType::Int64 => Ok(Some(col.as_primitive::<Int64Type>().value(row))),
+        other => Err(type_error(name, "Int64", other)),
+    }
+}
+
+fn f64_at(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<f64>, ArrowError> {
+    let idx = batch.schema().index_of(name)?;
+    let col = batch.column(idx);
+    if col.is_null(row) {
+        return Ok(None);
+    }
+    match col.data_type() {
+        DataType::Float64 => Ok(Some(col.as_primitive::<Float64Type>().value(row))),
+        other => Err(type_error(name, "Float64", other)),
+    }
+}
+
+fn bool_at(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<bool>, ArrowError> {
+    let idx = batch.schema().index_of(name)?;
+    let col = batch.column(idx);
+    if col.is_null(row) {
+        return Ok(None);
+    }
+    match col.data_type() {
+        DataType::Boolean => Ok(Some(col.as_boolean().value(row))),
+        other => Err(type_error(name, "Boolean", other)),
+    }
+}
+
+/// A constraint whose value type cannot address the column is a malformed selector,
+/// not an empty result — the typed accessors above report it as an error.
+fn column_equals(
+    batch: &RecordBatch,
+    name: &str,
+    row: usize,
+    want: &ColumnValue,
+) -> Result<bool, ArrowError> {
+    Ok(match want {
+        ColumnValue::Str(s) => str_at(batch, name, row)?.as_deref() == Some(s.as_str()),
+        ColumnValue::U64(v) => u64_at(batch, name, row)? == Some(*v),
+        ColumnValue::I64(v) => i64_at(batch, name, row)? == Some(*v),
+        ColumnValue::F64(v) => f64_at(batch, name, row)? == Some(*v),
+        ColumnValue::Bool(v) => bool_at(batch, name, row)? == Some(*v),
+    })
+}
+
+fn row_matches(batch: &RecordBatch, row: usize, selector: &Selector) -> Result<bool, ArrowError> {
+    if let Some(template) = &selector.template
+        && str_at(batch, "message", row)?.as_deref() != Some(template.as_str())
+    {
+        return Ok(false);
+    }
+    for (name, want) in &selector.constraints {
+        if !column_equals(batch, name, row, want)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl TraceQuery for ArrowTraceQuery {
@@ -140,40 +330,35 @@ impl TraceQuery for ArrowTraceQuery {
 
     fn count(&self, selector: &Selector) -> Result<usize, Self::Error> {
         self.validate_selector(selector)?;
-        Ok(self.matching_rows(selector).count())
+        let mut matched = 0usize;
+        self.visit_matching(selector, |_, _| {
+            matched += 1;
+            Ok(())
+        })?;
+        Ok(matched)
     }
 
-    fn all_children_of(
-        &self,
-        child: &Selector,
-        parent: &Selector,
-    ) -> Result<bool, Self::Error> {
+    fn all_children_of(&self, child: &Selector, parent: &Selector) -> Result<bool, Self::Error> {
         self.validate_selector(child)?;
         self.validate_selector(parent)?;
-        self.require_columns(&["trace_id", "span_id", "parent_span_id"])?;
+        self.require_identity_columns()?;
 
-        // Parent identity set: (trace_id, span_id) of rows matching `parent`.
-        let parents: std::collections::HashSet<(String, u64)> = self
-            .matching_rows(parent)
-            .filter_map(|(batch, row)| {
-                let trace = dict_str_value(batch, "trace_id", row)?;
-                let span = batch
-                    .column(batch.schema().index_of("span_id").ok()?)
-                    .as_primitive::<UInt32Type>()
-                    .value(row) as u64;
-                Some((trace, span))
-            })
-            .collect();
+        let mut parents: std::collections::HashSet<SpanKey> = std::collections::HashSet::new();
+        self.visit_matching(parent, |batch, row| {
+            if let Some(key) = Self::span_key(batch, row)? {
+                parents.insert(key);
+            }
+            Ok(())
+        })?;
 
-        Ok(self.matching_rows(child).all(|(batch, row)| {
-            let Some(trace) = dict_str_value(batch, "trace_id", row) else {
-                return false;
-            };
-            let Ok(idx) = batch.schema().index_of("parent_span_id") else {
-                return false;
-            };
-            let col = batch.column(idx).as_primitive::<UInt32Type>();
-            !col.is_null(row) && parents.contains(&(trace, col.value(row) as u64))
-        }))
+        let mut all_parented = true;
+        self.visit_matching(child, |batch, row| {
+            if all_parented {
+                all_parented =
+                    Self::parent_key(batch, row)?.is_some_and(|key| parents.contains(&key));
+            }
+            Ok(())
+        })?;
+        Ok(all_parented)
     }
 }
