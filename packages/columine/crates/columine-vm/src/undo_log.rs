@@ -140,9 +140,11 @@ impl FlatUndoEntry {
             slot: buf[1],
             pad1: buf[2],
             pad2: buf[3],
-            key: u32::from_le_bytes(buf[4..8].try_into().expect("4-byte slice")),
-            prev_value: u32::from_le_bytes(buf[8..12].try_into().expect("4-byte slice")),
-            aux: u64::from_le_bytes(buf[16..24].try_into().expect("8-byte slice")),
+            key: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            prev_value: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            aux: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
         })
     }
 }

@@ -9,7 +9,6 @@ use columine_types::types::{
 };
 use columine_vm::hash_table::{
     ENTRY_NONE, ENTRY_U32, FlatTable, hashmap_byte_size, hashset_byte_size,
-    timestamped_map_byte_size,
 };
 use columine_vm::hashmap_ops::{
     CmpType, Strategy, batch_map_remove, batch_map_upsert, bind_slot_map, single_map_remove,
@@ -234,7 +233,6 @@ fn bind_to_existing_table() {
 fn byte_size_calculation() {
     assert_eq!(hashset_byte_size(16), 72); // 8 + 16*4
     assert_eq!(hashmap_byte_size(16), 136); // 8 + 16*4 + 16*4
-    assert_eq!(timestamped_map_byte_size(16), 328); // 8 + 16*4 + 16*16
 }
 
 ///  `test "EMPTY_KEY and TOMBSTONE are rejected"`

@@ -24,7 +24,6 @@ pub const HDR_BYTES: u32 = 8;
 /// Entry sizes for the concrete table forms.
 pub const ENTRY_NONE: u32 = 0; // HashSet
 pub const ENTRY_U32: u32 = 4; // HashMap / PtrMap
-pub const ENTRY_TIMESTAMPED: u32 = 16; // TimestampedMap
 
 /// HashMap byte size: inline header, keys, and u32 entries.
 pub const fn hashmap_byte_size(capacity: u32) -> u32 {
@@ -34,11 +33,6 @@ pub const fn hashmap_byte_size(capacity: u32) -> u32 {
 /// `HashSet.byteSize(capacity)` (`FlatHashTable(void)`) — header + keys.
 pub const fn hashset_byte_size(capacity: u32) -> u32 {
     byte_size(capacity, ENTRY_NONE)
-}
-
-/// `TimestampedMap.byteSize(capacity)`.
-pub const fn timestamped_map_byte_size(capacity: u32) -> u32 {
-    byte_size(capacity, ENTRY_TIMESTAMPED)
 }
 
 /// Byte size of a table with the given capacity and entry size.
@@ -198,25 +192,6 @@ impl FlatTable {
     pub fn set_entry_u32_at(&self, state: &mut [u8], pos: u32, value: u32) {
         debug_assert_eq!(self.entry_size, ENTRY_U32);
         bytes::write_u32(state, self.entries_off + pos * 4, value);
-    }
-
-    /// Timestamped entry accessors use `{ value: u32, _pad: u32, timestamp:
-    /// f64 }`, 16 bytes.
-    pub fn ts_entry_at(&self, state: &[u8], pos: u32) -> (u32, f64) {
-        debug_assert_eq!(self.entry_size, ENTRY_TIMESTAMPED);
-        let base = self.entries_off + pos * 16;
-        (
-            bytes::read_u32(state, base),
-            bytes::read_f64(state, base + 8),
-        )
-    }
-
-    pub fn set_ts_entry_at(&self, state: &mut [u8], pos: u32, value: u32, timestamp: f64) {
-        debug_assert_eq!(self.entry_size, ENTRY_TIMESTAMPED);
-        let base = self.entries_off + pos * 16;
-        bytes::write_u32(state, base, value);
-        bytes::write_u32(state, base + 4, 0); // _pad — keep the lane zeroed
-        bytes::write_f64(state, base + 8, timestamp);
     }
 
     fn raw_entry_copy(&self, state: &mut [u8], src_off: u32, dst_pos: u32) {

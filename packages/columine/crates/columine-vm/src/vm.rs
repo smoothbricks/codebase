@@ -2174,7 +2174,11 @@ fn write_struct_map_array_fields(
                 &state[slot_offset as usize..(slot_offset + u32::from(num_fields)) as usize];
             state_init::struct_field_offset(num_fields, descriptor, field_idx)
         };
-        let elem_size = state_init::arena_elem_size_strict(field_type_byte);
+        let elem_size = columine_types::types::arena_elem_size(
+            StructFieldType::from_u8(field_type_byte).unwrap_or_else(|| {
+                columine_types::die!("validated array field type vanished during execution")
+            }),
+        );
 
         let offsets = col_u32(cols[array_offsets_cols[vi] as usize], child_idx + 2);
         let arr_start = offsets[child_idx as usize];
