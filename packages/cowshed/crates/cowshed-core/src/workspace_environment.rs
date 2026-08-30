@@ -9,6 +9,7 @@ use crate::metadata::{MetadataError, Platform, PortBlock, write_atomic_bytes};
 pub const WORKSPACE_ENVIRONMENT_PATH: &str = ".cowshed/env";
 pub const WORKSPACE_TOKEN_ENV: &str = "COWSHED_WORKSPACE_TOKEN";
 pub const PORT_BASE_ENV: &str = "COWSHED_PORT_BASE";
+pub const GO_ENV: &str = "GOENV";
 const GO_ENV_RELATIVE_PATH: &str = ".cowshed/cache/go/env";
 
 #[derive(Debug, Error)]
@@ -65,7 +66,9 @@ pub fn write_workspace_environment(
     // never zeroized; push the borrowed token into a Zeroizing buffer instead.
     // Capacity is sized so the buffer cannot reallocate after the token is copied.
     let mut contents = Zeroizing::new(String::with_capacity(96 + go_env_word.len() + token.len()));
-    contents.push_str("export GOENV=");
+    contents.push_str("export ");
+    contents.push_str(GO_ENV);
+    contents.push('=');
     contents.push_str(&go_env_word);
     contents.push_str("\nexport ");
     contents.push_str(WORKSPACE_TOKEN_ENV);
@@ -109,5 +112,12 @@ mod tests {
     #[test]
     fn shell_words_quote_mounts_with_spaces_and_single_quotes() {
         assert_eq!(shell_word("/tmp/a b's/env"), "'/tmp/a b'\"'\"'s/env'");
+    }
+
+    #[test]
+    fn workspace_env_var_names_are_the_sandbox_contract() {
+        assert_eq!(GO_ENV, "GOENV");
+        assert_eq!(WORKSPACE_TOKEN_ENV, "COWSHED_WORKSPACE_TOKEN");
+        assert_eq!(PORT_BASE_ENV, "COWSHED_PORT_BASE");
     }
 }

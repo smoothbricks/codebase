@@ -625,6 +625,7 @@ mod tests {
         github_token_byte, redact_line, scan_tree, secret_key_byte, slack_token_byte,
         waiver_guidance,
     };
+    use crate::workspace_environment::GO_ENV;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -729,11 +730,8 @@ mod tests {
             "setup.sh",
             "export BUILD_MODE=debug\nexport SERVICE_TOKEN=super-sensitive-value",
         );
-        tree.write(
-            ".envrc",
-            "GOENV=.cowshed/cache/go/env\nAPI_KEY=envrc-secret",
-        );
-
+        let envrc = format!("{GO_ENV}=.cowshed/cache/go/env\nAPI_KEY=envrc-secret");
+        tree.write(".envrc", &envrc);
         let scan = scan_tree(tree.path(), &[]).expect("scan succeeds");
         assert_eq!(scan.findings.len(), 4);
         let serialized = serde_json::to_string(&scan).expect("scan serializes");
