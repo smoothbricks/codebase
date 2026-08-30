@@ -10,6 +10,11 @@
  * 0644). This guard runs wherever freshly built outputs exist so a stripped
  * state is a red pipeline instead of an EACCES in a user's bunx.
  *
+ * An absent `dist/bin` is a failure, not a pass. This used to exit 0 with "no packaged binaries
+ * to verify", which meant the guard reported success in exactly the situation where it had
+ * verified nothing — including a build that silently produced no binaries at all. The nx target
+ * depends on `build`, so by the time this runs the directory has to be there.
+ *
  * Run with: `nx run cowshed:verify-packaging`
  */
 
@@ -29,9 +34,10 @@ function listFilesRecursively(directory: string): string[] {
 let stat: Stats;
 try {
   stat = statSync(BIN_ROOT);
-} catch {
-  console.log(`no packaged binaries to verify (${BIN_ROOT} does not exist)`);
-  process.exit(0);
+} catch (error) {
+  console.error(`${BIN_ROOT} does not exist, so no packaged binary was checked`);
+  console.error(`  ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
 }
 if (!stat.isDirectory()) {
   console.error(`${BIN_ROOT} is not a directory`);
@@ -39,6 +45,11 @@ if (!stat.isDirectory()) {
 }
 
 const files = listFilesRecursively(BIN_ROOT);
+if (files.length === 0) {
+  console.error(`${BIN_ROOT} holds no files, so no packaged binary was checked`);
+  process.exit(1);
+}
+
 const notExecutable = files.filter((path) => (statSync(path).mode & EXECUTABLE_OWNER_BIT) === 0);
 
 if (notExecutable.length > 0) {
