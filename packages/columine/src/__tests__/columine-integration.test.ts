@@ -398,7 +398,20 @@ describe('SC1: Reduce stage for aggregation', () => {
           { type: 'scalar', aggType: AggType.SCALAR_I64 },
         ],
         numInputs: 4,
-        reduceOps: [0x48, 0, 0, 3, 0x48, 1, 1, 3, 0x48, 2, 2, 3],
+        reduceOps: [
+          Opcode.BATCH_SCALAR_LATEST,
+          0,
+          0,
+          3,
+          Opcode.BATCH_SCALAR_LATEST,
+          1,
+          1,
+          3,
+          Opcode.BATCH_SCALAR_LATEST,
+          2,
+          2,
+          3,
+        ],
       }),
     );
     const state = backend.createState(scalarProgram);

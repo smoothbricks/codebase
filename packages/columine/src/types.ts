@@ -228,14 +228,17 @@ export const PROGRAM_HASH_PREFIX = 32;
 export enum Opcode {
   HALT = 0x00,
 
-  // Slot creation (init section) - must match vm.zig Opcode enum
+  // Slot creation (init section) - must match columine-types Opcode
   SLOT_DEF = 0x10, // slot, type_flags, cap_lo, cap_hi [aggType in cap_lo when type=AGGREGATE]
+  SLOT_ARRAY = 0x14, // For `.within()` without keyBy — stores array of events
 
   // Batch HashMap ops
   BATCH_MAP_UPSERT_LATEST = 0x20,
   BATCH_MAP_UPSERT_FIRST = 0x21,
   BATCH_MAP_UPSERT_LAST = 0x22,
   BATCH_MAP_REMOVE = 0x23,
+  BATCH_MAP_UPSERT_LATEST_TTL = 0x24, // slot, key_col, val_col, ts_col, cmp_type (tracks eviction index)
+  BATCH_MAP_UPSERT_LAST_TTL = 0x25, // slot, key_col, val_col, ts_col (tracks eviction index)
   // Max/Min pick strategies
   BATCH_MAP_UPSERT_MAX = 0x26,
   BATCH_MAP_UPSERT_MIN = 0x27,
@@ -274,6 +277,7 @@ export enum Opcode {
   // Batch HashSet ops
   BATCH_SET_INSERT = 0x30,
   BATCH_SET_REMOVE = 0x31,
+  BATCH_SET_INSERT_TTL = 0x32, // slot, elem_col, ts_col
   BATCH_SET_INSERT_IF = 0x33,
 
   // Batch bitmap ops (u32 ordinal membership)
@@ -301,6 +305,7 @@ export enum Opcode {
   BATCH_AGG_COUNT_IF = 0x45,
   BATCH_AGG_MIN_IF = 0x46,
   BATCH_AGG_MAX_IF = 0x47,
+  BATCH_SCALAR_LATEST = 0x48, // slot, val_col, cmp_col (AggType subtype lives in slot metadata)
 
   // i64 aggregate ops — lossless integer accumulation for S.bigint()/S.i64()/S.timestamp()
   BATCH_AGG_SUM_I64 = 0x49,
@@ -319,15 +324,21 @@ export enum Opcode {
 
   // Ordered list ops
   SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]
+  SLOT_NESTED = 0x1a, // slot, outer_type_flags, outer_cap_lo, outer_cap_hi, inner_type, inner_cap_lo, inner_cap_hi, inner_agg_type
   LIST_APPEND = 0x84, // slot, val_col
   LIST_APPEND_STRUCT = 0x85, // slot, num_vals, [(val_col, field_idx) × N]
+
+  // Nested container ops (body opcodes inside FOR_EACH blocks)
+  NESTED_SET_INSERT = 0x90, // slot, outer_key_col, elem_col
+  NESTED_MAP_UPSERT_LAST = 0x92, // slot, outer_key_col, inner_key_col, val_col
+  NESTED_AGG_UPDATE = 0x95, // slot, outer_key_col, val_col
 
   // Block-based reduce opcodes (body opcodes use same values as BATCH_* but process one element)
   FOR_EACH = 0xe0, // col, match_count, match_ids (u32 LE × match_count), body_len (u16 LE)
   FLAT_MAP = 0xe1, // offsets_col, parent_ts_col, inner_body_len (u16 LE: 2 bytes)
 
   // Note: 0x50+ range reserved for RETE (superset binary)
-  // Columine's reducer opcodes end at 0x4F (except struct map at 0x80+, blocks at 0xE0+)
+  // Nested container ops at 0x90+; struct map at 0x80+; blocks at 0xE0+
 }
 
 // =============================================================================
