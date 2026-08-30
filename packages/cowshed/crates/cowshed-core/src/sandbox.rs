@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 pub use crate::metadata::PortBlock;
 use crate::storage::bootstrap::{CACHES_ROOT, STORE_ROOT};
 
-const COWSHED_ROOT: &str = "/private/cowshed";
+fn cowshed_root() -> &'static Path {
+    Path::new(STORE_ROOT)
+        .parent()
+        .expect("STORE_ROOT is a child of the machine-global cowshed root")
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressGrant {
@@ -220,7 +224,7 @@ pub fn seatbelt_profile(
         }
     }
 
-    let cowshed = Path::new(COWSHED_ROOT);
+    let cowshed = cowshed_root();
     let caches = Path::new(CACHES_ROOT);
     let mut profile = String::new();
 
@@ -440,7 +444,7 @@ fn hard_denies<'a>(
     additional: &'a [PathBuf],
 ) -> Result<Vec<Cow<'a, Path>>, SandboxError> {
     let mut denies = vec![
-        Cow::Borrowed(Path::new(COWSHED_ROOT)),
+        Cow::Borrowed(cowshed_root()),
         Cow::Borrowed(mount_root),
         Cow::Owned(home.join(".ssh")),
         Cow::Owned(home.join(".gnupg")),
