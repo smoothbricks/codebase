@@ -123,6 +123,9 @@ where
 /// on its own restarts the program the agent was loaded with — which, for a plist rewritten to
 /// name the host-stable binary, is exactly the vanished path the rewrite exists to stop naming.
 /// A changed plist is therefore booted out first, and the bootstrap that follows reads it.
+///
+/// Bootstrap already starts a `RunAtLoad` agent. `kickstart -k` on the heels of that returns
+/// launchctl 37 (operation already in progress) and fails a setup that already copied the binary.
 pub fn activate_launch_agent<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     uid: u32,
@@ -135,12 +138,14 @@ where
     if plist == InstallOutcome::Changed {
         deactivate_launch_agent(executor, uid, spec)?;
     }
-    if !launch_agent_is_loaded(executor, uid, spec)?
-        && let Err(error) =
+    if !launch_agent_is_loaded(executor, uid, spec)? {
+        if let Err(error) =
             executor.execute_control(&crate::launchd::ControlPlan::bootstrap(uid, spec))
-        && !launch_agent_is_loaded(executor, uid, spec)?
-    {
-        return Err(launchd_error(error));
+            && !launch_agent_is_loaded(executor, uid, spec)?
+        {
+            return Err(launchd_error(error));
+        }
+        return Ok(());
     }
     executor
         .execute_control(&crate::launchd::ControlPlan::kickstart(uid, spec))

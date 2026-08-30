@@ -83,17 +83,14 @@ fn launch_agent_activation_bootstraps_only_when_not_loaded() {
             stderr: b"not loaded".to_vec(),
         }),
         Ok(CommandOutput::success()),
-        Ok(CommandOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
     activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
         .expect("activation succeeds");
     let (_, command) = executor.into_parts();
-    assert_eq!(command.argv.len(), 3);
+    assert_eq!(command.argv.len(), 2);
     assert_eq!(command.argv[0][0], "print");
     assert_eq!(command.argv[1][0], "bootstrap");
-    assert_eq!(command.argv[2][0], "kickstart");
-    assert_eq!(command.argv[2][1], "-k");
 }
 
 #[test]
@@ -120,8 +117,9 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
 }
 
 /// A rewritten plist is only a file: launchd runs the definition it bootstrapped, so the agent
-/// has to be booted out and bootstrapped again or the kickstart restarts the old program — the
-/// path the rewrite exists to stop naming.
+/// has to be booted out and bootstrapped again or a later kickstart restarts the old program —
+/// the path the rewrite exists to stop naming. Bootstrap starts `RunAtLoad`; kickstart after
+/// that is a race (launchctl 37).
 #[test]
 fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
     let command = RecordingLaunchctl::new([
@@ -132,7 +130,6 @@ fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
             stdout: Vec::new(),
             stderr: b"not loaded".to_vec(),
         }),
-        Ok(CommandOutput::success()),
         Ok(CommandOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
@@ -145,7 +142,7 @@ fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
             .iter()
             .map(|argv| argv[0].to_str().expect("utf-8 argv"))
             .collect::<Vec<_>>(),
-        ["print", "bootout", "print", "bootstrap", "kickstart"]
+        ["print", "bootout", "print", "bootstrap"]
     );
 }
 
