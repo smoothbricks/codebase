@@ -22,8 +22,8 @@ pub use compact::{
 
 use columine_arrow::{
     DynamicColumns, DynamicSchemaConfig, IpcError, MAX_VALUE_BYTES, MIN_ARROW_OUTPUT_CAPACITY,
-    MetadataLimits, MetadataStorage, required_arrow_ipc_len,
-    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_dynamic_columns,
+    MetadataLimits, MetadataStorage, required_arrow_ipc_len, write_arrow_ipc_from_borrowed_columns,
+    write_arrow_ipc_from_dynamic_columns,
 };
 use columine_parsing::{
     ExtractionConfig, build_extraction_config, json_extractor, json_scanner, msgpack_extractor,
@@ -665,8 +665,6 @@ mod tests {
     use super::*;
     use arrow_array::{Array, NullArray};
     use arrow_ipc::reader::StreamReader;
-    use arrow_ipc::writer::StreamWriter;
-    use arrow_schema::{DataType, Field, Schema};
     use columine_arrow::{ArrowType, SignalSchemaField};
     use std::io::Cursor;
 
@@ -680,30 +678,7 @@ mod tests {
     }
 
     fn schema_with_names(fields: &[SignalSchemaField], names: &[u8]) -> DynamicSchemaConfig {
-        let schema_fields = fields
-            .iter()
-            .enumerate()
-            .map(|(index, metadata)| {
-                let data_type = match metadata.arrow_type {
-                    ArrowType::Null => DataType::Null,
-                    ArrowType::Int32 => DataType::Int32,
-                    ArrowType::Float64 => DataType::Float64,
-                    ArrowType::Binary => DataType::Binary,
-                    ArrowType::Utf8 => DataType::Utf8,
-                    ArrowType::Bool => DataType::Boolean,
-                    ArrowType::Int64 => DataType::Int64,
-                };
-                Field::new(format!("field_{index}"), data_type, metadata.is_nullable())
-            })
-            .collect::<Vec<_>>();
-        let mut schema_bytes = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::try_new(&mut schema_bytes, &Schema::new(schema_fields)).unwrap();
-            writer.finish().unwrap();
-        }
-        schema_bytes.truncate(schema_bytes.len() - 8);
-        DynamicSchemaConfig::with_field_names(&schema_bytes, fields, names).unwrap()
+        DynamicSchemaConfig::from_physical_fields_with_names(fields, names).unwrap()
     }
 
     #[test]

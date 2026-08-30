@@ -353,29 +353,7 @@ mod tests {
     }
 
     fn schema_bytes(fields: &[SignalSchemaField]) -> Vec<u8> {
-        let fields = fields
-            .iter()
-            .enumerate()
-            .map(|(index, metadata)| {
-                let data_type = match metadata.arrow_type {
-                    ArrowType::Null => DataType::Null,
-                    ArrowType::Int32 => DataType::Int32,
-                    ArrowType::Float64 => DataType::Float64,
-                    ArrowType::Binary => DataType::Binary,
-                    ArrowType::Utf8 => DataType::Utf8,
-                    ArrowType::Bool => DataType::Boolean,
-                    ArrowType::Int64 => DataType::Int64,
-                };
-                Field::new(format!("field_{index}"), data_type, metadata.is_nullable())
-            })
-            .collect::<Vec<_>>();
-        let mut bytes = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut bytes, &Schema::new(fields)).unwrap();
-            writer.finish().unwrap();
-        }
-        bytes.truncate(bytes.len() - EOS_MARKER.len());
-        bytes
+        crate::schema::schema_ipc_bytes(fields).unwrap()
     }
 
     /// The base event log goes through the one writer, and the schema names
@@ -406,8 +384,8 @@ mod tests {
 
         let mut metadata = MetadataStorage::for_fields(&fields, MetadataLimits::default()).unwrap();
         let mut out = vec![0u8; 8192];
-        let len =
-            write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut out, &mut metadata).unwrap();
+        let len = write_arrow_ipc_from_dynamic_columns(&columns, &config, &mut out, &mut metadata)
+            .unwrap();
         assert!(out[..len].ends_with(&EOS_MARKER));
 
         // Read it back through the official reader: the id/type/timestamp
