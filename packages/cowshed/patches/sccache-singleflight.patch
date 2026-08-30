@@ -54,7 +54,7 @@ index 78bb5a4..7c6e2cb 100644
          match lookup {
              CacheLookupResult::Success(compile_result, output) => {
                  Ok::<_, Error>((compile_result, output))
-@@ -789,11 +834,19 @@
+@@ -789,11 +834,20 @@
                  );
  
                  let out_pretty2 = out_pretty.clone();
