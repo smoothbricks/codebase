@@ -12,7 +12,7 @@ use cowshed_core::gateway_sessions::{
 use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnation};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, Result};
-use cowshed_gateway::{
+use cowshed_gateway_types::{
     GatewayStatus, SessionStatus, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy,
     WorkspaceSession, WorkspaceToken,
 };

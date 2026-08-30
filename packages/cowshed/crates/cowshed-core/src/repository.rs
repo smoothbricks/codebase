@@ -46,13 +46,14 @@ impl RepoId {
 
         reject_empty_or_traversal(owner, RepoIdComponent::Owner)?;
         reject_empty_or_traversal(repo, RepoIdComponent::Repo)?;
-        // Character class and component length live in cowshed-gateway::validate_repo_id.
-        cowshed_gateway::validate_repo_id(value).map_err(|_| {
-            let component = if cowshed_gateway::validate_repo_id(&format!("{owner}/x")).is_err() {
-                RepoIdComponent::Owner
-            } else {
-                RepoIdComponent::Repo
-            };
+        // Character class and component length live in cowshed_gateway_types::validate_repo_id.
+        cowshed_gateway_types::validate_repo_id(value).map_err(|_| {
+            let component =
+                if cowshed_gateway_types::validate_repo_id(&format!("{owner}/x")).is_err() {
+                    RepoIdComponent::Owner
+                } else {
+                    RepoIdComponent::Repo
+                };
             RepoIdError::InvalidComponent { component }
         })?;
         Ok(Self(format!("{owner}/{repo}")))

@@ -9,13 +9,14 @@ use crate::launchd::{
 use crate::output::Output;
 use async_trait::async_trait;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus};
+use cowshed_core::repository::RepoId;
 use cowshed_core::{
     CowshedError, NativeGatewayInventory, Result, ValidatedHostStorage,
     validate_existing_host_storage,
 };
 use cowshed_gateway::{
-    ArrowAuditConfig, Gateway, GatewayConfig, GatewayControlClient, GatewayStatus,
-    MirrorCacheConfig,
+    ArrowAuditConfig, ControlError, Gateway, GatewayConfig, GatewayControlClient, GatewayHandle,
+    GatewayStatus, MirrorCacheConfig, WorkspaceSession,
 };
 use std::fs;
 use std::io::{self, Read as _, Write};
@@ -24,12 +25,88 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use cowshed_core::gateway_sessions::{
-    GATEWAY_START_HINT, GatewayControl, GatewayInstaller, NativeSessionInventory, ReconcileReport,
-    SessionInventory, canonical_home, control_error, control_socket_path, effective_uid,
-    gateway_absent, install_all_sessions, policy_from_grants, project_session_prefix,
-    reconcile_against_status, reconcile_inventory_project, reconcile_native_project,
+    GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayStatusError,
+    NativeSessionInventory, ReconcileReport, SessionInventory, canonical_home, control_error,
+    control_socket_path, effective_uid, gateway_absent, install_all_sessions, policy_from_grants,
+    project_session_prefix, reconcile_against_status, reconcile_inventory_project,
     reconcile_project, session_from_fact, sessions_from_facts, stable_workspace_id,
 };
+
+/// A running daemon reached over its control socket.
+///
+/// Reconciliation lives in `cowshed-core` and is a pure function of host inventory plus the three
+/// answers [`GatewayControl`] gives, so the controller crate depends only on
+/// `cowshed-gateway-types` and never links the daemon's hyper/rustls closure. That leaves neither
+/// crate able to write the impl — the trait belongs to one, the client to the other — so it lands
+/// here in the composition root, the one place holding both halves.
+pub struct ControlSocket(GatewayControlClient);
+
+impl ControlSocket {
+    pub fn at(socket: PathBuf) -> Result<Self> {
+        GatewayControlClient::new(socket)
+            .map(Self)
+            .map_err(control_error)
+    }
+}
+
+#[async_trait]
+impl GatewayControl for ControlSocket {
+    async fn status(&self) -> std::result::Result<GatewayStatus, GatewayStatusError> {
+        self.0.status().await.map_err(|error| match error {
+            // A missing socket is not a fault: no daemon is running, and the remedy is to start
+            // one rather than to report a broken control plane.
+            ControlError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
+                GatewayStatusError::Absent
+            }
+            error => GatewayStatusError::Control(error.to_string()),
+        })
+    }
+
+    async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), String> {
+        self.0
+            .install(session)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn remove(
+        &self,
+        workspace_id: &str,
+        expected_revision: u64,
+    ) -> std::result::Result<(), String> {
+        self.0
+            .remove(workspace_id, expected_revision)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The daemon this process itself runs, installed into through its actor handle rather than over
+/// the socket — the startup heal, before anything outside can connect.
+pub struct OwnedGateway(GatewayHandle);
+
+impl OwnedGateway {
+    pub fn new(handle: GatewayHandle) -> Self {
+        Self(handle)
+    }
+}
+
+#[async_trait]
+impl GatewayInstaller for OwnedGateway {
+    async fn install_session(&self, session: WorkspaceSession) -> Result<()> {
+        self.0.install(session).await.map_err(|error| {
+            CowshedError::internal(format!("could not restore gateway session: {error}"))
+        })
+    }
+}
+
+pub async fn reconcile_native_project(repo_id: &RepoId) -> Result<ReconcileReport> {
+    let home = canonical_home()?;
+    let storage = validate_existing_host_storage(&home).await?;
+    let inventory = NativeSessionInventory::new(storage);
+    let control = ControlSocket::at(control_socket_path())?;
+    reconcile_inventory_project(&inventory, &control, repo_id, effective_uid()).await
+}
 
 /// How long `gateway start` waits for the daemon's control socket.
 ///
@@ -445,7 +522,7 @@ async fn run_daemon() -> Result<()> {
     let gateway = Gateway::start_host(config, telemetry)
         .await
         .map_err(|error| CowshedError::internal(format!("could not start gateway: {error}")))?;
-    let handle = gateway.handle();
+    let handle = OwnedGateway::new(gateway.handle());
     if let Err(primary) = install_all_sessions(&inventory, &handle).await {
         return match gateway.drain().await {
             Ok(()) => Err(primary),

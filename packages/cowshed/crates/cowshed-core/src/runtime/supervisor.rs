@@ -33,7 +33,7 @@ use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{SandboxConfig, SandboxProfileRole, seatbelt_profile};
 use crate::storage::audit::AuditSinkError;
 use crate::workspace_environment::{GO_ENV, PORT_BASE_ENV, WORKSPACE_TOKEN_ENV};
-use cowshed_gateway::WorkspaceToken;
+use cowshed_gateway_types::WorkspaceToken;
 
 use crate::storage::job_artifact::{
     ArtifactConfig, ArtifactError, ArtifactStore, CompletedJobArtifacts, OutputTargets,
