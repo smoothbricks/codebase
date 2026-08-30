@@ -98,9 +98,7 @@ const seamTypes = {
  */
 const assertCorpus = typia.createAssert<Record<string, Record<string, unknown>>>();
 
-const corpus = assertCorpus(
-  JSON.parse(readFileSync(new URL('./wire-fixtures.json', import.meta.url), 'utf8')),
-);
+const corpus = assertCorpus(JSON.parse(readFileSync(new URL('./wire-fixtures.json', import.meta.url), 'utf8')));
 
 describe('napi wire contract', () => {
   it('has a corpus and a validator for exactly the same seam types', () => {
