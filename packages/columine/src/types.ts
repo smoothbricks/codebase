@@ -200,7 +200,7 @@ export type EvictionResult =
   | { readonly ok: false; readonly error: ErrorCode };
 
 // =============================================================================
-// Error Codes
+// Error Codes — must match columine-types ErrorCode (`types.rs` / `opcodes.rs`)
 // =============================================================================
 
 export enum ErrorCode {
@@ -212,6 +212,8 @@ export enum ErrorCode {
   NEEDS_GROWTH = 5,
   ARENA_OVERFLOW = 6,
   INVALID_KEY = 7,
+  /** Column cannot cover `batch_len` cells. Legal VM refusal, not a host crash. */
+  COLUMN_UNDERRUN = 8,
 }
 
 // =============================================================================
