@@ -328,6 +328,9 @@ impl fmt::Display for ImageCapacity {
 pub struct WorkspaceName(String);
 
 impl WorkspaceName {
+    /// User-facing grammar `WorkspaceName::new` enforces: 1..=64 of `[a-z0-9][a-z0-9-]*`.
+    pub const USAGE: &'static str = "workspace names must match [a-z0-9][a-z0-9-]{0,63}";
+
     pub fn new(value: impl Into<String>) -> Result<Self, MetadataError> {
         let value = value.into();
         let bytes = value.as_bytes();
