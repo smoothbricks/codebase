@@ -39,8 +39,8 @@ pub fn slot_data_size(
     }
 }
 
-/// Rehash HASHMAP keys and values, carrying the timestamps side-array when
-/// present. Return the number of entries rehashed.
+/// Probe live keys into a power-of-two table and invoke `on_place` at each new pos.
+#[allow(clippy::too_many_arguments)]
 fn rehash_occupied(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -128,6 +128,7 @@ pub fn grow_hash_set(
 
 /// Copy a STRUCT_MAP descriptor, rehash keys, and move live rows to their new
 /// probe positions. Return the number of entries rehashed.
+#[allow(clippy::too_many_arguments)]
 pub fn grow_struct_map(
     old_state: &[u8],
     new_state: &mut [u8],
@@ -166,6 +167,7 @@ pub fn grow_struct_map(
 
 /// Rehash an exact two-lane-key struct map while preserving both key cells
 /// and each row byte-for-byte.
+#[allow(clippy::too_many_arguments)]
 pub fn grow_struct_map2(
     old_state: &[u8],
     new_state: &mut [u8],

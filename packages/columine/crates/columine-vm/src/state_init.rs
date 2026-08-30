@@ -55,6 +55,7 @@ const STRUCT_ROW_SIZE: u32 = SlotMetaOffset::TTL_SECONDS;
 const STRUCT_KIND_BYTE: u32 = SlotMetaOffset::TTL_SECONDS + 2;
 const STRUCT_ARENA_HDR: u32 = SlotMetaOffset::GRACE_SECONDS;
 
+#[allow(clippy::too_many_arguments)]
 fn write_overlay_meta(
     state: &mut [u8],
     meta_base: u32,
