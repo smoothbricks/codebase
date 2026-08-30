@@ -26,16 +26,19 @@ const MAX_APP_ENTRIES: usize = 100_000;
 const MAX_DEVICE_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum SimGrant {
+    #[serde(rename = "openurl")]
     OpenUrl,
+    #[serde(rename = "install")]
     Install,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "verb", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "verb", deny_unknown_fields)]
 pub enum SimRequest {
+    #[serde(rename = "openurl")]
     OpenUrl { device: String, url: String },
+    #[serde(rename = "install")]
     Install { device: String, digest: String },
 }
 
@@ -372,7 +375,7 @@ fn configure_project(
     projects: &mut HashMap<String, ProjectState>,
     config: SimProjectConfig,
 ) -> Result<(), SimBrokerError> {
-    validate_repo_id(&config.repo_id)?;
+    crate::validate_repo_id(&config.repo_id).map_err(|_| SimBrokerError::InvalidRepoId)?;
     if config.registered_schemes.len() > MAX_SCHEMES
         || (projects.len() >= MAX_PROJECTS && !projects.contains_key(&config.repo_id))
     {
@@ -402,7 +405,7 @@ fn approve_install(
     used_receipts: &mut VecDeque<[u8; 32]>,
     mut approval: SimInstallApproval,
 ) -> Result<(), SimBrokerError> {
-    validate_repo_id(&approval.repo_id)?;
+    crate::validate_repo_id(&approval.repo_id).map_err(|_| SimBrokerError::InvalidRepoId)?;
     validate_device(&approval.device)?;
     validate_digest(&approval.artifact_digest)?;
     if approval.human_receipt.len() < 16 || approval.human_receipt.len() > 4096 {
@@ -701,7 +704,7 @@ async fn control_list(
     projects: &HashMap<String, ProjectState>,
     runner: &dyn SimRunner,
 ) -> Result<Vec<SimDevice>, SimBrokerError> {
-    validate_repo_id(repo_id)?;
+    crate::validate_repo_id(repo_id).map_err(|_| SimBrokerError::InvalidRepoId)?;
     if !projects.contains_key(repo_id) {
         return Err(SimBrokerError::ProjectNotConfigured);
     }
@@ -738,7 +741,7 @@ async fn control_boot(
     projects: &HashMap<String, ProjectState>,
     runner: &dyn SimRunner,
 ) -> Result<(), SimBrokerError> {
-    validate_repo_id(repo_id)?;
+    crate::validate_repo_id(repo_id).map_err(|_| SimBrokerError::InvalidRepoId)?;
     validate_device(device)?;
     if !projects.contains_key(repo_id) {
         return Err(SimBrokerError::ProjectNotConfigured);
@@ -854,16 +857,6 @@ fn validate_identifier(value: &str) -> Result<(), SimBrokerError> {
     }
     Ok(())
 }
-fn validate_repo_id(value: &str) -> Result<(), SimBrokerError> {
-    let (owner, name) = value
-        .split_once('/')
-        .ok_or(SimBrokerError::InvalidIdentifier)?;
-    if name.contains('/') || matches!(owner, "." | "..") || matches!(name, "." | "..") {
-        return Err(SimBrokerError::InvalidIdentifier);
-    }
-    validate_identifier(owner)?;
-    validate_identifier(name)
-}
 
 fn validate_device(value: &str) -> Result<(), SimBrokerError> {
     if value == "booted" {
@@ -935,6 +928,8 @@ pub enum SimBrokerError {
     DigestMismatch,
     #[error("simulator artifact digest is invalid")]
     InvalidDigest,
+    #[error("simulator repository identity is invalid")]
+    InvalidRepoId,
     #[error("simulator device identifier is invalid")]
     InvalidIdentifier,
     #[error("simulator broker capacity is exhausted")]
@@ -1231,12 +1226,19 @@ mod tests {
     }
 
     #[test]
-    fn data_plane_schema_rejects_controller_and_unknown_verbs() {
+    fn data_plane_schema_uses_canonical_sim_verbs() {
+        assert!(
+            serde_json::from_str::<SimRequest>(
+                r#"{"verb":"openurl","device":"booted","url":"x://y"}"#,
+            )
+            .is_ok()
+        );
         for request in [
             r#"{"verb":"list"}"#,
             r#"{"verb":"boot","device":"booted"}"#,
             r#"{"verb":"unknown"}"#,
-            r#"{"verb":"open-url","device":"booted","url":"x://y","extra":true}"#,
+            r#"{"verb":"open-url","device":"booted","url":"x://y"}"#,
+            r#"{"verb":"openurl","device":"booted","url":"x://y","extra":true}"#,
         ] {
             assert!(serde_json::from_str::<SimRequest>(request).is_err());
         }
