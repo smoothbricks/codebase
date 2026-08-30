@@ -5,7 +5,7 @@
   "sideEffects": false,
   "scripts": {
     "test": "nx run cowshed:test --outputStyle=stream",
-    "cowshed": "nx run cowshed:run-cli --"
+    "cowshed": "nx run cowshed:build && node dist/ts/cli.js"
   },
   "bin": {
     "cowshed": "./dist/ts/cli.js"
@@ -67,18 +67,6 @@
         "options": {
           "cwd": "packages/cowshed",
           "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
-        }
-      },
-      "run-cli": {
-        "executor": "nx:run-commands",
-        "cache": false,
-        "dependsOn": [
-          "^build",
-          "cli-arm64-macos"
-        ],
-        "options": {
-          "cwd": "{projectRoot}",
-          "command": "dist/bin/darwin-arm64/cowshed {args}"
         }
       },
       "cli-x64-macos": {
@@ -164,7 +152,22 @@
           "typecheck-tests"
         ],
         "options": {
-          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 cli-trampoline.test.ts",
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 cli-trampoline.test.ts platform.test.ts",
+          "cwd": "{projectRoot}/src",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
+      "wire-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "dependsOn": [
+          "typecheck-tests",
+          "cargo-test"
+        ],
+        "options": {
+          "comment": "Runs from source under the typia transform because the validators under test are the point; cargo-test is a dependency because it proves wire-fixtures.json is still what cowshed-core serializes.",
+          "command": "bun test --config=../bunfig.toml --timeout=30000 wire-contract.test.ts",
           "cwd": "{projectRoot}/src",
           "timeoutMs": 120000,
           "killAfterMs": 10000
@@ -173,7 +176,11 @@
       "verify-packaging": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": false,
+        "dependsOn": [
+          "build"
+        ],
         "options": {
+          "comment": "dependsOn build so dist/bin exists: the check used to pass by finding nothing.",
           "command": "bun scripts/verify-packaged-bin-bits.ts",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
@@ -185,6 +192,7 @@
         "dependsOn": [
           "napi-test",
           "trampoline-test",
+          "wire-test",
           "verify-packaging"
         ]
       },
