@@ -35,6 +35,18 @@
   "nx": {
     "name": "cowshed",
     "targets": {
+      "cli": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "comment": "Runs the TS entry, not dist/bin/darwin-arm64 directly: the trampoline resolves the host's native binary through src/platform.ts, so this works on every arch instead of only Apple Silicon.",
+          "cwd": "{projectRoot}",
+          "command": "node dist/ts/cli.js {args}"
+        }
+      },
       "refresh-harnesses": {
         "executor": "nx:run-commands",
         "cache": false,
