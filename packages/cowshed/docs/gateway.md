@@ -6,20 +6,21 @@ connection. This lets it add narrowly scoped credentials and trace context witho
 in-image CA certificate trusts the gateway as a server only; it is not a client identity and is never sent upstream.
 Protocol mirrors cache registry artifacts, and certificate-pinning clients can use an allowlisted opaque tunnel.
 
-The host control plane is host-netns `127.0.0.1:7644` plus `/private/cowshed/store/gateway.sock`; neither host endpoint is reachable
-from a workspace. Linux reuses the numeric loopback address inside each private netns for a distinct data-plane
-connector; it is not the host control listener. Data-plane identity depends on the OS:
+The host control plane is host-netns `127.0.0.1:7644` plus `/private/cowshed/store/gateway.sock`; neither host endpoint
+is reachable from a workspace. Linux reuses the numeric loopback address inside each private netns for a distinct
+data-plane connector; it is not the host control listener. Data-plane identity depends on the OS:
 
 - **macOS:** each workspace has a 16-port block from `40960–49151`. The gateway listener is `base`; service ports are
   `base+1 … base+15`. Seatbelt lets the workspace connect only to its own block, so the destination listener identifies
   the workspace.
-- **Linux:** there is no port block. A controller-owned socket at `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock`
-  is mounted as `/run/cowshed/gateway.sock` inside that workspace's private loopback-only network namespace. The
-  controller launches exactly one trusted minimal connector in the netns, under a controller-owned identity and
-  dedicated cgroup that workspace processes cannot signal, ptrace, inspect, or join. It binds only IPv4
-  `127.0.0.1:7644`, rejects non-loopback traffic, and copies bytes unchanged only to the mounted socket. It owns no
-  policy, token, CA key, registry credential, or upstream-network authority. There is no veth, route, DNAT, host
-  listener, or sibling-reachable loopback; socket inode plus netns, not port 7644, identifies the workspace.
+- **Linux:** there is no port block. A controller-owned socket at
+  `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` is mounted as `/run/cowshed/gateway.sock` inside that
+  workspace's private loopback-only network namespace. The controller launches exactly one trusted minimal connector in
+  the netns, under a controller-owned identity and dedicated cgroup that workspace processes cannot signal, ptrace,
+  inspect, or join. It binds only IPv4 `127.0.0.1:7644`, rejects non-loopback traffic, and copies bytes unchanged only
+  to the mounted socket. It owns no policy, token, CA key, registry credential, or upstream-network authority. There is
+  no veth, route, DNAT, host listener, or sibling-reachable loopback; socket inode plus netns, not port 7644, identifies
+  the workspace.
 
 Every request also carries the workspace's 32-byte unpadded-base64url token in `Proxy-Authorization`, in one of two
 accepted spellings: `Bearer <token>` for anything that can set a header, and `Basic <base64(cowshed:<token>)>` for the
@@ -78,19 +79,20 @@ the home directory — is refused rather than copied, because nothing would be m
 would exit 78 in a `KeepAlive` loop. `stop` and `status` derive the same path rather than the running executable.
 
 `start` then atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with that binary
-followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures
-go only to `~/Library/Logs/cowshed/daemon-stderr.log`, never under the `/private/cowshed/store` mountpoint. The CLI uses fixed
+followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures go only to
+`~/Library/Logs/cowshed/daemon-stderr.log`, never under the `/private/cowshed/store` mountpoint. The CLI uses fixed
 `/bin/launchctl bootstrap`, `kickstart -k`, `bootout`, and `print` argv—never shell text—and maps
 already-loaded/not-loaded states idempotently. A plist this run rewrote is booted out and bootstrapped again rather than
-kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits for the
-authenticated Unix control socket before returning success. `cowshed gateway stop` boots out the agent and removes its
-plist; the installed binary stays, as host state rather than agent state.
+kickstarted: launchd keeps the definition it loaded, so a kickstart alone would restart the old program. It waits for
+the authenticated Unix control socket before returning success. `cowshed gateway stop` boots out the agent and removes
+its plist; the installed binary stays, as host state rather than agent state.
 
 The internal `cowshed gateway run` entrypoint first remounts already-created host volumes if macOS auto-mounted them at
-`/Volumes` or if a leftover launchd stub occupies `/private/cowshed/store`. It never creates volumes or opens an authorization
-prompt. After the store is mounted at the canonical path it starts the gateway and restores all canonical attached
-sessions from repository bindings, mount/incarnation facts, grants, and validated workspace credentials. Detached and
-retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before exit.
+`/Volumes` or if a leftover launchd stub occupies `/private/cowshed/store`. It never creates volumes or opens an
+authorization prompt. After the store is mounted at the canonical path it starts the gateway and restores all canonical
+attached sessions from repository bindings, mount/incarnation facts, grants, and validated workspace credentials.
+Detached and retired workspaces are never installed. SIGTERM and SIGINT stop admissions and drain the gateway before
+exit.
 
 Every ordinary `exec`, `attach`, and `doctor` invocation reconciles the current project before use. Attach, detach,
 restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed
@@ -160,8 +162,8 @@ Main gets identical platform wiring and warms the same validated artifact cache.
 Policy is monotonic. `repo_id` is stable lowercase `owner/repo`, normalized from a chosen remote URL; its binding
 records and validates that remote. Multiple identities may be bound with exactly one primary. Local-only repositories
 require an explicit identifier, and discovery may propose but never silently mint one. Effective filesystem denies are
-the canonical-path union of built-ins, trusted operator policy at `/private/cowshed/store/<owner>/<repo>/policy.json`, and
-repository-added denies; repository config can add protection but cannot remove or carve back earlier entries. The
+the canonical-path union of built-ins, trusted operator policy at `/private/cowshed/store/<owner>/<repo>/policy.json`,
+and repository-added denies; repository config can add protection but cannot remove or carve back earlier entries. The
 trusted path is formed from separately validated `owner` and `repo` segments—never by accepting separators, `.`, `..`,
 encoded separators, or a repository-relative path. Malformed trusted policy fails closed.
 
