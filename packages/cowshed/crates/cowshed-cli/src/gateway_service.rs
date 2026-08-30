@@ -662,38 +662,47 @@ pub fn refresh_gateway_binary(home: &Path) -> Result<Option<ServiceBinaryRefresh
     }))
 }
 
+fn is_user_owned(metadata: &fs::Metadata, want_dir: bool) -> bool {
+    let kind_ok = if want_dir {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    kind_ok && !metadata.file_type().is_symlink() && metadata.uid() == effective_uid()
+}
+
+fn inspect_existing(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(CowshedError::internal(format!(
+            "could not inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 /// What the host has at the stable path, and whether it is already this source.
 fn observe_executable_install(
     executable: &HostStableExecutable,
     source: &Path,
 ) -> Result<ExecutableInstallState> {
-    let installed = match fs::symlink_metadata(executable.path()) {
-        Ok(metadata) => {
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.uid() != effective_uid()
-            {
-                return Err(CowshedError::integrity(
-                    format!(
-                        "the installed {} binary is not a user-owned regular file: {}",
-                        executable.name(),
-                        executable.path().display()
-                    ),
-                    "remove it and rerun the service start command",
-                ));
-            }
-            Some(InstalledExecutable {
-                mode: metadata.permissions().mode() & 0o777,
-                matches_source: same_contents(source, executable.path(), metadata.len())?,
-            })
+    let installed = match inspect_existing(executable.path())? {
+        Some(metadata) if is_user_owned(&metadata, false) => Some(InstalledExecutable {
+            mode: metadata.permissions().mode() & 0o777,
+            matches_source: same_contents(source, executable.path(), metadata.len())?,
+        }),
+        Some(_) => {
+            return Err(CowshedError::integrity(
+                format!(
+                    "the installed {} binary is not a user-owned regular file: {}",
+                    executable.name(),
+                    executable.path().display()
+                ),
+                "remove it and rerun the service start command",
+            ));
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(CowshedError::internal(format!(
-                "could not inspect {}: {error}",
-                executable.path().display()
-            )));
-        }
+        None => None,
     };
     Ok(ExecutableInstallState {
         support_directory_mode: private_directory_mode(executable.support_directory())?,
@@ -757,24 +766,15 @@ fn fill(file: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
 
 /// The mode of a cowshed-owned directory, `None` when it does not exist yet.
 fn private_directory_mode(path: &Path) -> Result<Option<u32>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_dir()
-                || metadata.file_type().is_symlink()
-                || metadata.uid() != effective_uid()
-            {
-                return Err(CowshedError::integrity(
-                    format!("path is not a user-owned directory: {}", path.display()),
-                    format!("repair the ownership of {} and retry", path.display()),
-                ));
-            }
+    match inspect_existing(path)? {
+        Some(metadata) if is_user_owned(&metadata, true) => {
             Ok(Some(metadata.permissions().mode() & 0o777))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(CowshedError::internal(format!(
-            "could not inspect {}: {error}",
-            path.display()
-        ))),
+        Some(_) => Err(CowshedError::integrity(
+            format!("path is not a user-owned directory: {}", path.display()),
+            format!("repair the ownership of {} and retry", path.display()),
+        )),
+        None => Ok(None),
     }
 }
 
@@ -790,21 +790,8 @@ pub(crate) struct ObservedPlist {
 
 pub(crate) fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedInstallState> {
     let directory_mode = private_directory_mode(spec.launch_agents_directory())?;
-    match fs::symlink_metadata(spec.plist_path()) {
-        Ok(metadata) => {
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.uid() != effective_uid()
-            {
-                return Err(CowshedError::integrity(
-                    format!(
-                        "{} LaunchAgent plist is not a user-owned regular file: {}",
-                        spec.label(),
-                        spec.plist_path().display()
-                    ),
-                    "remove the unsafe plist and rerun the service start command",
-                ));
-            }
+    match inspect_existing(spec.plist_path())? {
+        Some(metadata) if is_user_owned(&metadata, false) => {
             let bytes = fs::read(spec.plist_path()).map_err(|error| {
                 CowshedError::internal(format!(
                     "could not read {}: {error}",
@@ -819,14 +806,18 @@ pub(crate) fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedIn
                 }),
             })
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ObservedInstallState {
+        Some(_) => Err(CowshedError::integrity(
+            format!(
+                "{} LaunchAgent plist is not a user-owned regular file: {}",
+                spec.label(),
+                spec.plist_path().display()
+            ),
+            "remove the unsafe plist and rerun the service start command",
+        )),
+        None => Ok(ObservedInstallState {
             directory_mode,
             plist: None,
         }),
-        Err(error) => Err(CowshedError::internal(format!(
-            "could not inspect {}: {error}",
-            spec.plist_path().display()
-        ))),
     }
 }
 
@@ -843,11 +834,10 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
             "cowshed doctor --json",
         ));
     }
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        CowshedError::internal(format!("could not inspect {}: {error}", path.display()))
+    let metadata = inspect_existing(path)?.ok_or_else(|| {
+        CowshedError::internal(format!("could not inspect {}: not found", path.display()))
     })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != effective_uid()
-    {
+    if !is_user_owned(&metadata, true) {
         return Err(CowshedError::integrity(
             format!(
                 "gateway path is not a private directory: {}",
