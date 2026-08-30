@@ -1396,39 +1396,6 @@ async fn open_and_validate(path: &Path, response: &CachedResponse) -> Result<Fil
         return Err(CacheError::DigestMismatch);
     }
     file.seek(SeekFrom::Start(HEADER_REGION)).await?;
-    let mut remaining = response.content_length;
-    let mut digest = Sha256::new();
-    let mut expected_sha512 = response
-        .expected
-        .and_then(|expected| matches!(expected.digest, ObjectDigest::Sha512(_)).then(Sha512::new));
-    let mut buffer = vec![0; STREAM_CHUNK_BYTES];
-    while remaining > 0 {
-        let length = usize::try_from(remaining.min(buffer.len() as u64))
-            .expect("validation read is bounded by the buffer");
-        let read = file.read(&mut buffer[..length]).await?;
-        if read == 0 {
-            return Err(CacheError::DigestMismatch);
-        }
-        digest.update(&buffer[..read]);
-        if let Some(expected_sha512) = &mut expected_sha512 {
-            expected_sha512.update(&buffer[..read]);
-        }
-        remaining -= read as u64;
-    }
-    let actual: [u8; 32] = digest.finalize().into();
-    let expected_matches = response.expected.is_none_or(|expected| {
-        expected.length == response.content_length
-            && match expected.digest {
-                ObjectDigest::Sha256(digest) => digest == actual,
-                ObjectDigest::Sha512(digest) => {
-                    expected_sha512.map(|value| <[u8; 64]>::from(value.finalize())) == Some(digest)
-                }
-            }
-    });
-    if actual != response.content_sha256 || !expected_matches {
-        return Err(CacheError::DigestMismatch);
-    }
-    file.seek(SeekFrom::Start(HEADER_REGION)).await?;
     Ok(file)
 }
 
@@ -1529,4 +1496,38 @@ fn unix_ms(time: SystemTime) -> Result<u64, CacheError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| CacheError::InvalidMetadata)?;
     u64::try_from(duration.as_millis()).map_err(|_| CacheError::InvalidMetadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sealed_open_validates_geometry_without_rehashing_body() {
+        let path = std::env::temp_dir().join(format!("cowshed-cache-open-{}", Uuid::new_v4()));
+        let mut file = create_new_nofollow(&path).await.expect("create fixture");
+        file.seek(SeekFrom::Start(HEADER_REGION))
+            .await
+            .expect("seek body");
+        file.write_all(b"tampered").await.expect("write body");
+        file.sync_all().await.expect("sync body");
+        drop(file);
+
+        let response = CachedResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            content_length: 8,
+            content_sha256: Sha256::digest(b"original").into(),
+            expected: None,
+            stored_unix_ms: 0,
+        };
+        let mut opened = open_and_validate(&path, &response)
+            .await
+            .expect("sealed object geometry");
+        let mut body = [0; 8];
+        opened.read_exact(&mut body).await.expect("read body");
+        assert_eq!(&body, b"tampered");
+        drop(opened);
+        fs::remove_file(path).await.expect("remove fixture");
+    }
 }
