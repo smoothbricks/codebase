@@ -107,12 +107,7 @@ pub(crate) fn fmt_command_failure<A: AsRef<OsStr>>(
     output: &CommandOutput,
 ) -> fmt::Result {
     write!(f, "{operation} failed: executable {program:?}, argv [")?;
-    for (index, arg) in args.iter().enumerate() {
-        if index != 0 {
-            f.write_str(", ")?;
-        }
-        write!(f, "{:?}", arg.as_ref())?;
-    }
+    fmt_argv(f, args)?;
     write!(
         f,
         "], {}; stdout: {}; stderr: {}",
@@ -129,13 +124,18 @@ pub(crate) fn fmt_command_spawn<A: AsRef<OsStr>>(
     source: &std::io::Error,
 ) -> fmt::Result {
     write!(f, "could not run executable {program:?}, argv [")?;
+    fmt_argv(f, args)?;
+    write!(f, "]: {source}")
+}
+
+fn fmt_argv<A: AsRef<OsStr>>(f: &mut fmt::Formatter<'_>, args: &[A]) -> fmt::Result {
     for (index, arg) in args.iter().enumerate() {
         if index != 0 {
             f.write_str(", ")?;
         }
         write!(f, "{:?}", arg.as_ref())?;
     }
-    write!(f, "]: {source}")
+    Ok(())
 }
 
 struct DiagnosticBytes<'a>(&'a [u8]);
@@ -187,5 +187,36 @@ mod tests {
             "left\\xffright\\x80"
         );
         assert_eq!(DiagnosticBytes(b" \t\n").to_string(), "<empty>");
+    }
+
+    #[test]
+    fn command_failure_and_spawn_share_argv_rendering() {
+        let args = ["--flag", "value with space"];
+        struct Failure<'a>(&'a [&'a str]);
+        impl fmt::Display for Failure<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt_command_failure(
+                    f,
+                    "copy",
+                    OsStr::new("diskutil"),
+                    self.0,
+                    &CommandOutput::failure(1, "denied"),
+                )
+            }
+        }
+        struct Spawn<'a>(&'a [&'a str]);
+        impl fmt::Display for Spawn<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt_command_spawn(
+                    f,
+                    OsStr::new("diskutil"),
+                    self.0,
+                    &std::io::Error::from_raw_os_error(2),
+                )
+            }
+        }
+        let argv = r#"argv ["--flag", "value with space"]"#;
+        assert!(Failure(&args).to_string().contains(argv));
+        assert!(Spawn(&args).to_string().contains(argv));
     }
 }
