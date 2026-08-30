@@ -454,7 +454,6 @@ where
     output
         .guidance(&format!("workspace mount root is {}", path.display()))
         .map_err(output_error)?;
-    output.hint("cowshed doctor").map_err(output_error)?;
     Ok(0)
 }
 
@@ -545,7 +544,6 @@ where
     if let Some(failure) = failure {
         return Err(partial_setup_failure(failure));
     }
-    output.hint("cowshed doctor").map_err(output_error)?;
     // The gateway's startup pass is what mounts mains, so restarting it is the remedy — and it is
     // the remedy whether or not the volumes needed repairing, which is why this hint is not tied to
     // anything the plan did.
@@ -596,7 +594,6 @@ where
     } else {
         render_uninstall(&census, &system_removals, &removals, &report, output)?;
     }
-    output.hint("cowshed doctor").map_err(output_error)?;
     Ok(0)
 }
 

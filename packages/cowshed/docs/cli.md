@@ -113,7 +113,6 @@ cowshed: cowshed.store (store): present but not mounted -> mounted
 cowshed: cowshed.caches (caches): present but not mounted -> mounted
 cowshed: pinned the boot mounts in /etc/fstab
 cowshed: host storage is set up (one administrator authorization was used)
-next: cowshed doctor
 ```
 
 Sizes are decimal, as `diskutil` and the hardware state them, so the number matches what Disk Utility shows. Reclaimable
@@ -178,7 +177,6 @@ cowshed: cowshed.caches (caches): mis-mounted at /Volumes/cowshed.caches -> remo
 cowshed: /etc/fstab already pins the boot mounts
 cowshed: wrote ~/Library/Application Support/Mozilla.sccache/config: an sccache client that inherited no cowshed environment now caches in /private/cowshed/caches/sccache
 cowshed: host storage is set up
-next: cowshed doctor
 
 $ cowshed setup
 cowshed: cowshed.store (store): mounted at its canonical path -> already-current
@@ -186,7 +184,6 @@ cowshed: cowshed.caches (caches): mounted at its canonical path -> already-curre
 cowshed: /etc/fstab already pins the boot mounts
 cowshed: ~/Library/Application Support/Mozilla.sccache/config already sends a store-less sccache client to /private/cowshed/caches/sccache
 cowshed: everything already set up
-next: cowshed doctor
 ```
 
 A volume that exists **outside this host's container** — a `cowshed.store` on another disk — is reported as its own
