@@ -521,9 +521,9 @@ impl ProjectActor {
         // and so does a workspace mount whose marker records that root.
         let bound = self.host.descriptor().git_root.clone();
         let belongs = names_one_root(&requested, &bound)
-            || marker_project_root(&requested)
+            || read_workspace_marker(&requested)
                 .await?
-                .is_some_and(|root| names_one_root(&root, &bound));
+                .is_some_and(|marker| names_one_root(&marker.project_root, &bound));
         if !belongs {
             return Err(CowshedError::conflict(
                 format!(
@@ -635,7 +635,7 @@ impl ProjectActor {
 
     async fn coordinator_fork(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
-        let params: ForkParams = decode_params(request.params(), request.method())?;
+        let params: SourceDestinationParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         let snapshot = self.host.fork(params.source, params.destination).await?;
         workspace_response(&snapshot)
@@ -643,7 +643,7 @@ impl ProjectActor {
 
     async fn coordinator_rename(&mut self, request: RouterRequest) -> Result<RouterResponse> {
         require_coordinator(request.authority())?;
-        let params: ForkParams = decode_params(request.params(), request.method())?;
+        let params: SourceDestinationParams = decode_params(request.params(), request.method())?;
         self.require_repo(&params.repo_id)?;
         let snapshot = self.host.rename(params.source, params.destination).await?;
         workspace_response(&snapshot)
@@ -1077,8 +1077,11 @@ fn json_response(value: impl Serialize) -> Result<RouterResponse> {
         .map_err(|error| CowshedError::internal(format!("serialize router response: {error}")))
 }
 
+/// Deserialize borrowed from the router's `Value`. `from_value` needs ownership, so it cloned
+/// the whole params object on every RPC -- including exec's `env` map and argv, which are the
+/// cases that are not small.
 fn decode_params<T: DeserializeOwned>(params: &Value, method: &str) -> Result<T> {
-    serde_json::from_value(params.clone()).map_err(|error| {
+    T::deserialize(params).map_err(|error| {
         CowshedError::usage(
             format!("invalid {method} parameters: {error}"),
             "upgrade the client and controller together",
@@ -1156,7 +1159,7 @@ impl<T> WorkspaceOptionsParams<T> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ForkParams {
+struct SourceDestinationParams {
     repo_id: RepoId,
     source: WorkspaceName,
     destination: WorkspaceName,
@@ -2681,7 +2684,10 @@ impl NativeProjectRuntimeHost {
                     "{} overlaps cowshed storage or the current checkout",
                     destination.display()
                 ),
-                "choose a destination outside /private/cowshed/store and outside the current checkout",
+                format!(
+                    "choose a destination outside {} and outside the current checkout",
+                    self.descriptor.store_root.display()
+                ),
             ));
         }
         let destination = destination.to_owned();
@@ -2904,7 +2910,9 @@ impl NativeProjectRuntimeHost {
         Ok(crate::storage::lifecycle::OperationIdentity {
             project_root: self.descriptor.git_root.clone(),
             base_commit: self.git.head_oid().await?,
-            created_at: utc_timestamp().await?,
+            // One clock for the runtime module. Spawning `/bin/date` was a process, a pipe, and
+            // a UTF-8 parse to render what `SystemTime` already holds.
+            created_at: super::supervisor::utc_now()?.as_str().to_owned(),
             branch,
             forked_from,
             created_trace: uuid::Uuid::new_v4().simple().to_string(),
@@ -3166,8 +3174,7 @@ impl NativeProjectRuntimeHost {
                 "restore the exact .pre-cowshed tree or move the collision aside",
             )
         })?;
-        let main_mount =
-            self.workspace_mount_path(&WorkspaceName::new("main").expect("fixed main"))?;
+        let main_mount = self.workspace_mount_path(&main_name())?;
         let resolved =
             resolve_checkout_identity_path(path, &path_metadata, &main_mount, description).await?;
         let path = resolved.as_path();
@@ -4015,17 +4022,18 @@ fn known_retired_main_targets(
     binding: &RepositoryBinding,
 ) -> Result<Vec<PathBuf>> {
     let repo_id = &binding.primary().map_err(native_integrity_error)?.repo_id;
+    let retired_leaf = |root: PathBuf| {
+        root.join(repo_id.owner())
+            .join(repo_id.repo())
+            .join(main_name().as_str())
+    };
     let candidates = [
         current_main_mount.to_owned(),
-        invoking_home
-            .join(".cowshed/mnt")
-            .join(repo_id.owner())
-            .join(repo_id.repo())
-            .join("main"),
-        Path::new("/private/cowshed/store/mnt")
-            .join(repo_id.owner())
-            .join(repo_id.repo())
-            .join("main"),
+        retired_leaf(invoking_home.join(crate::storage::host_config::DEFAULT_MOUNT_RELATIVE)),
+        retired_leaf(
+            Path::new(crate::storage::bootstrap::STORE_ROOT)
+                .join(crate::storage::host_config::RETIRED_MOUNT_DIRECTORY),
+        ),
     ];
     let mut targets = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -4086,7 +4094,13 @@ fn swap_checkout_paths(left: &Path, right: &Path) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let right = CString::new(right.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    /// `RENAME_SWAP` from `<sys/stdio.h>`: exchange the two directory entries atomically.
     const RENAME_SWAP: u32 = 0x0000_0002;
+    // SAFETY: both paths are `CString`s built above, so they are NUL-terminated, live for the
+    // duration of the call, are not aliased by each other, and are never mutated by it --
+    // `renameatx_np` only reads the path bytes. `AT_FDCWD` resolves each relative to the calling
+    // process's cwd, which is this process's own. `RENAME_SWAP` either exchanges both entries or
+    // leaves both untouched, so a failure cannot leave one checkout half-moved.
     let result = unsafe {
         libc::renameatx_np(
             libc::AT_FDCWD,
@@ -4321,16 +4335,12 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         } else {
             authoritative
         };
-        let attached = authoritative
-            .into_iter()
-            .filter(|workspace| {
-                matches!(
-                    workspace.derived.mount_state,
-                    crate::storage::lifecycle::MountState::Mounted { .. }
-                )
-            })
-            .collect::<Vec<_>>();
-        for workspace in attached {
+        for workspace in authoritative.into_iter().filter(|workspace| {
+            matches!(
+                workspace.derived.mount_state,
+                crate::storage::lifecycle::MountState::Mounted { .. }
+            )
+        }) {
             self.ensure_supervisor_for(workspace).await?;
         }
         Ok(())
@@ -4488,10 +4498,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "choose another workspace name",
             ));
         }
-        let source_name = options
-            .from_workspace
-            .clone()
-            .unwrap_or_else(|| WorkspaceName::new("main").expect("fixed main"));
+        let source_name = options.from_workspace.clone().unwrap_or_else(main_name);
         let source = self.current(&source_name).await?;
         // Git-worktree-ness is inherited, not just requested. A clone of a git-worktree workspace
         // carries no repository of its own — only a pointer file naming the *source's*
@@ -6746,21 +6753,32 @@ fn binding_integrity_error(error: impl std::fmt::Display) -> CowshedError {
     CowshedError::integrity(error.to_string(), "repair the repository binding")
 }
 
-/// The project checkout a path's workspace marker records, if it carries one.
+/// Read a directory's workspace marker, if it has one.
+///
+/// Only an absent marker is `None`. A marker that exists but cannot be parsed is an integrity
+/// error, because the two answers are not interchangeable: swallowing a damaged
+/// `.cowshed/workspace.json` as "no marker" made a workspace cwd fail the belongs-to-project
+/// check with "path does not belong", naming the wrong problem and pointing the operator at the
+/// wrong repair.
 ///
 /// Portable because the router needs it on every target: a marker is plain metadata, and the
 /// question "which project does this directory belong to" has nothing platform-specific in it.
-async fn marker_project_root(path: &Path) -> Result<Option<PathBuf>> {
+async fn read_workspace_marker(path: &Path) -> Result<Option<crate::metadata::WorkspaceMarker>> {
     let marker_path = path.join(crate::storage::WORKSPACE_MARKER_PATH);
-    let marker = crate::storage::lifecycle::dispatch_blocking(move || {
+    crate::storage::lifecycle::dispatch_blocking(move || {
         match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
             Ok(marker) => Ok(Some(marker)),
-            Err(_) => Ok::<_, CowshedError>(None),
+            Err(crate::metadata::MetadataError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
     })
     .await
-    .map_err(|error| CowshedError::internal(format!("workspace marker task failed: {error}")))??;
-    Ok(marker.map(|marker| marker.project_root))
+    .map_err(|error| CowshedError::internal(format!("workspace marker task failed: {error}")))?
+    .map_err(native_integrity_error)
 }
 
 #[cfg(target_os = "macos")]
@@ -6905,22 +6923,7 @@ struct WorkspaceOrigin {
 
 #[cfg(target_os = "macos")]
 async fn workspace_origin_from_marker(project_root: &Path) -> Result<Option<WorkspaceOrigin>> {
-    let marker_path = project_root.join(crate::storage::WORKSPACE_MARKER_PATH);
-    let marker = crate::storage::lifecycle::dispatch_blocking(move || {
-        match crate::metadata::WorkspaceMarker::read_from(&marker_path) {
-            Ok(marker) => Ok(Some(marker)),
-            Err(crate::metadata::MetadataError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
-    })
-    .await
-    .map_err(|error| CowshedError::internal(format!("workspace marker task failed: {error}")))?
-    .map_err(native_integrity_error)?;
-    let Some(marker) = marker else {
+    let Some(marker) = read_workspace_marker(project_root).await? else {
         return Ok(None);
     };
     // The marker's job here is to name the repository, and every workspace's marker names it. A
@@ -7844,26 +7847,6 @@ fn revision_target(target: &crate::api::dto::RevisionTarget) -> String {
         crate::api::dto::RevisionTarget::Ref(reference) => reference.as_str().to_owned(),
         crate::api::dto::RevisionTarget::Oid(oid) => oid.as_str().to_owned(),
     }
-}
-
-#[cfg(target_os = "macos")]
-async fn utc_timestamp() -> Result<String> {
-    let output = tokio::process::Command::new("/bin/date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .await
-        .map_err(|error| {
-            CowshedError::environment_missing(error.to_string(), "restore /bin/date")
-        })?;
-    if !output.status.success() {
-        return Err(CowshedError::environment_missing(
-            "cannot read the system UTC clock",
-            "repair /bin/date and retry",
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim_end().to_owned())
-        .map_err(|error| CowshedError::integrity(error.to_string(), "repair /bin/date"))
 }
 
 #[cfg(target_os = "macos")]
@@ -9239,6 +9222,49 @@ mod git_worktree_tests {
         let decoded: DetachedWorkspaceMetadata =
             serde_json::from_value(wire).expect("decode legacy sidecar");
         assert!(!is_git_worktree(&decoded));
+    }
+}
+
+/// Portable: a marker is plain metadata and the reader is not platform-specific.
+#[cfg(test)]
+mod workspace_marker_reader_tests {
+    use super::*;
+
+    fn temp_directory(test: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cowshed-marker-{test}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&path).expect("temp directory");
+        path
+    }
+
+    /// "No marker" and "a marker I cannot read" are different facts and must not share an answer.
+    /// The swallowing reader this replaced turned a damaged `.cowshed/workspace.json` into
+    /// `None`, so `project.open` from that directory refused with "path does not belong to the
+    /// bound project" -- naming the wrong problem and sending the operator to the wrong repair.
+    #[tokio::test]
+    async fn an_absent_marker_is_none_and_a_damaged_marker_is_an_integrity_error() {
+        let root = temp_directory("damaged");
+
+        assert!(
+            read_workspace_marker(&root)
+                .await
+                .expect("an absent marker is not a failure")
+                .is_none()
+        );
+
+        let marker = root.join(crate::storage::WORKSPACE_MARKER_PATH);
+        std::fs::create_dir_all(marker.parent().expect("marker parent")).expect("marker directory");
+        std::fs::write(&marker, b"{ this is not a marker").expect("damaged marker");
+
+        let error = read_workspace_marker(&root)
+            .await
+            .expect_err("a marker that exists but cannot be parsed is damage, not absence");
+        assert_eq!(error.code, ErrorCode::Integrity);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
 

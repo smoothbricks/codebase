@@ -3553,7 +3553,7 @@ fn new_trace_context() -> TraceContext {
 /// its out-parameter, all to compute what `SystemTime` already holds. `civil_from_days` is total
 /// over every `u64` second count, which is exactly why it exists. The one remaining failure is a
 /// clock before the epoch, which is a real operational fault, not an invariant.
-fn utc_now() -> Result<UtcTimestamp> {
+pub(crate) fn utc_now() -> Result<UtcTimestamp> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| CowshedError::internal(format!("system clock is before epoch: {error}")))?
