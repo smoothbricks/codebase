@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int64Type, UInt32Type};
+use arrow_array::types::{TimestampNanosecondType, UInt32Type};
+use arrow_schema::{DataType, TimeUnit};
 use lmao_arrow::{
     PartitionCardinality, StableVocabularyCatalog, convert_span_trees,
-    inspect_partition_cardinality, split_chunk_by_partition,
+    inspect_partition_cardinality, split_chunk_by_partition, write_ipc_stream,
 };
 use lmao_core::{Clock, EntryType, SpanBuffer, SpanIdentity, TraceAnchor, TraceId};
 
@@ -66,13 +67,13 @@ fn converts_core_span_buffers_with_overflow() {
     let batch = convert_span_trees(&roots, &empty_catalog).unwrap();
     // Root 1: 2 fixed rows + 20 logs + child (2 rows); root 2: 2 + 3 + 2.
     assert_eq!(batch.num_rows(), 24 + 7);
-    // Row 1 of each span is a completion entry (span-ok, discriminant 2 → key 1).
+    // Entry-type dictionary keys are the ABI discriminants; slot 0 is intentionally empty.
     let et = batch
         .column(6)
         .as_dictionary::<arrow_array::types::UInt8Type>();
-    assert_eq!(et.keys().value(1), 1);
+    assert_eq!(et.keys().value(1), EntryType::SpanOk.as_u8());
     // TickClock timestamps: anchor consumes tick 0, row 0 = wall + 1.
-    let ts = batch.column(0).as_primitive::<Int64Type>();
+    let ts = batch.column(0).as_primitive::<TimestampNanosecondType>();
     assert_eq!(ts.value(0), 1_700_000_000_000_000_001);
     assert!(
         ts.value(2) > ts.value(0),
@@ -80,13 +81,13 @@ fn converts_core_span_buffers_with_overflow() {
     );
     // Row 0 message is the span name; log rows carry templates + line numbers.
     let msg = batch
-        .column(7)
+        .column(10)
         .as_dictionary::<arrow_array::types::UInt32Type>();
     let msg_values = msg.values().as_string::<i32>();
     assert_eq!(msg_values.value(msg.keys().value(0) as usize), "root-op");
     assert_eq!(msg_values.value(msg.keys().value(2) as usize), "log {i}");
     assert!(msg.keys().is_null(1), "completion row has no template");
-    let lines = batch.column(8).as_primitive::<UInt32Type>();
+    let lines = batch.column(11).as_primitive::<UInt32Type>();
     assert_eq!(lines.value(0), 41, "callsite line on row 0");
     assert_eq!(lines.value(2), 100, "dynamic append line on first log row");
     // Children were walked: the child span's name appears after the root's rows.
@@ -142,13 +143,49 @@ fn pyarrow_reads_our_ipc() {
     let dir = std::env::temp_dir().join("lmao-rs-pyarrow-verify");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("chunk.arrow");
-    let file = std::fs::File::create(&path).unwrap();
-    let mut w = arrow_ipc::writer::StreamWriter::try_new(file, &batch.schema()).unwrap();
-    w.write(&batch).unwrap();
-    w.finish().unwrap();
+    let expected_schema = [
+        ("timestamp", DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        (
+            "trace_id",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        ),
+        ("thread_id", DataType::UInt64),
+        ("span_id", DataType::UInt32),
+        ("parent_thread_id", DataType::UInt64),
+        ("parent_span_id", DataType::UInt32),
+        (
+            "entry_type",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+        ),
+        (
+            "package_name",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        ),
+        (
+            "package_file",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        ),
+        (
+            "git_sha",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        ),
+        (
+            "message",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+        ),
+        ("line", DataType::UInt32),
+    ];
+    let schema = batch.schema();
+    for (index, (name, data_type)) in expected_schema.iter().enumerate() {
+        assert_eq!(schema.field(index).name(), name);
+        assert_eq!(schema.field(index).data_type(), data_type);
+    }
+
+    let mut file = std::fs::File::create(&path).unwrap();
+    write_ipc_stream(&mut file, &batch).unwrap();
 
     let script = format!(
-        "import pyarrow.ipc as ipc\nt = ipc.open_stream('{}').read_all()\nprint(t.num_rows)\nprint(','.join(t.schema.names))",
+        "import pyarrow.ipc as ipc\nt = ipc.open_stream('{}').read_all()\nprint(t.num_rows)",
         path.display()
     );
     let out = std::process::Command::new("python3")
@@ -161,10 +198,5 @@ fn pyarrow_reads_our_ipc() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let mut lines = stdout.lines();
-    assert_eq!(lines.next().unwrap(), batch.num_rows().to_string());
-    assert_eq!(
-        lines.next().unwrap(),
-        "timestamp,trace_id,thread_id,span_id,parent_thread_id,parent_span_id,entry_type,message,line_number"
-    );
+    assert_eq!(stdout.trim(), batch.num_rows().to_string());
 }

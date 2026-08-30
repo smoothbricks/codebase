@@ -1,45 +1,62 @@
 //! Archive-pipeline primitives, per `01t_trace_archive_pipeline.md`.
-//!
-//! Library-owned, PURE and DETERMINISTIC only (same input → same output, safe for
-//! retries): envelope identity, partition inspection/split, chunk stats. Control-plane
-//! fan-out belongs to the consuming system and is out of scope.
 
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int64Type, UInt32Type};
+use arrow_array::types::{TimestampNanosecondType, UInt32Type};
+use serde_json::Value;
 
-/// FNV-1a 64-bit over canonicalized content — deterministic chunk identity (`01t`:
-/// chunk ids are content hashes, never random).
+/// FNV-1a 64-bit over bytes.
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_units(bytes.iter().map(|byte| u64::from(*byte)))
+}
+
+/// TypeScript's `charCodeAt` hashes UTF-16 code units, not UTF-8 bytes.
+fn fnv1a64_utf16(value: &str) -> u64 {
+    fnv1a64_units(value.encode_utf16().map(u64::from))
+}
+
+fn fnv1a64_units(units: impl IntoIterator<Item = u64>) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
-    bytes
-        .iter()
-        .fold(OFFSET, |h, b| (h ^ (*b as u64)).wrapping_mul(PRIME))
+    units
+        .into_iter()
+        .fold(OFFSET, |hash, unit| (hash ^ unit).wrapping_mul(PRIME))
 }
 
-/// Envelope referencing already-flushed Arrow payload by ref, not inline bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceChunkEnvelope {
-    /// `fnv1a64` over the canonicalized content descriptor (`file_ref`, refs, row
-    /// count, time bounds) — NOT over the payload bytes, matching the TS
-    /// `buildTraceChunkEnvelope` behavior of hashing the canonical descriptor.
-    pub chunk_id: u64,
+    pub chunk_id: String,
     pub file_ref: String,
+    pub chunk_ref: String,
     pub row_count: usize,
-    pub min_timestamp: i64,
-    pub max_timestamp: i64,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub partition_keys: Vec<String>,
+    pub metadata: Option<Value>,
 }
 
-/// Chunk-level rollups (`extractChunkStats`): row count and time bounds.
-/// (Per-column min/max/null-count rollups are not yet built upstream either.)
+pub struct TraceChunkEnvelopeInput<'a> {
+    pub file_ref: &'a str,
+    pub chunk_ref: &'a str,
+    pub batch: &'a RecordBatch,
+    pub partition_keys: &'a [&'a str],
+    pub metadata: Option<&'a Value>,
+}
+
+/// Chunk-level rollups: row count and nanosecond timestamp bounds.
 pub fn extract_chunk_stats(batch: &RecordBatch) -> (usize, i64, i64) {
-    let timestamps = batch.column(0).as_primitive::<Int64Type>();
+    let timestamp_index = batch
+        .schema_ref()
+        .index_of("timestamp")
+        .expect("canonical trace batch contains timestamp");
+    let timestamps = batch
+        .column(timestamp_index)
+        .as_primitive::<TimestampNanosecondType>();
     let mut min = i64::MAX;
     let mut max = i64::MIN;
-    for ts in timestamps.values() {
-        min = min.min(*ts);
-        max = max.max(*ts);
+    for timestamp in timestamps.values() {
+        min = min.min(*timestamp);
+        max = max.max(*timestamp);
     }
     if timestamps.is_empty() {
         (0, 0, 0)
@@ -48,22 +65,78 @@ pub fn extract_chunk_stats(batch: &RecordBatch) -> (usize, i64, i64) {
     }
 }
 
-pub fn build_trace_chunk_envelope(file_ref: &str, batch: &RecordBatch) -> TraceChunkEnvelope {
-    let (row_count, min_timestamp, max_timestamp) = extract_chunk_stats(batch);
-    // Canonical descriptor: stable field order, unambiguous separators.
-    let canonical =
-        format!("v1\x1f{file_ref}\x1f{row_count}\x1f{min_timestamp}\x1f{max_timestamp}");
+pub fn build_trace_chunk_envelope(input: TraceChunkEnvelopeInput<'_>) -> TraceChunkEnvelope {
+    let (row_count, min_timestamp, max_timestamp) = extract_chunk_stats(input.batch);
+    let started_at_ms = min_timestamp.div_euclid(1_000_000);
+    let ended_at_ms = max_timestamp.div_euclid(1_000_000);
+    let mut partition_keys: Vec<String> = input
+        .partition_keys
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect();
+    partition_keys.sort_unstable();
+
+    // This field order and stable recursive serialization are byte-for-byte the
+    // TypeScript `buildTraceChunkEnvelope` canonical descriptor.
+    let canonical = format!(
+        "{{\"chunk_ref\":{},\"ended_at_ms\":{ended_at_ms},\"file_ref\":{},\"metadata\":{},\"partition_keys\":{},\"row_count\":{row_count},\"started_at_ms\":{started_at_ms}}}",
+        serde_json::to_string(input.chunk_ref).expect("string serialization is infallible"),
+        serde_json::to_string(input.file_ref).expect("string serialization is infallible"),
+        input
+            .metadata
+            .map(stable_serialize)
+            .unwrap_or_else(|| "null".to_owned()),
+        stable_serialize(&Value::Array(
+            partition_keys.iter().cloned().map(Value::String).collect(),
+        )),
+    );
+    let chunk_id = format!("chunk_{:016x}", fnv1a64_utf16(&canonical));
+
     TraceChunkEnvelope {
-        chunk_id: fnv1a64(canonical.as_bytes()),
-        file_ref: file_ref.to_string(),
+        chunk_id,
+        file_ref: input.file_ref.to_owned(),
+        chunk_ref: input.chunk_ref.to_owned(),
         row_count,
-        min_timestamp,
-        max_timestamp,
+        started_at_ms,
+        ended_at_ms,
+        partition_keys,
+        metadata: input.metadata.cloned(),
     }
 }
 
-/// Partition-key cardinality of a chunk over the `trace_id` column
-/// (`inspectPartitionCardinality`): `single` | `mixed` | `unknown`(empty).
+fn stable_serialize(value: &Value) -> String {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(value).expect("JSON value serialization is infallible")
+        }
+        Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(stable_serialize)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{values}]")
+        }
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let entries = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("object key serialization is infallible"),
+                        stable_serialize(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{entries}}}")
+        }
+    }
+}
+
+/// Partition-key cardinality of a chunk over the `trace_id` column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionCardinality {
     Single,
@@ -72,8 +145,12 @@ pub enum PartitionCardinality {
 }
 
 fn trace_key_at(batch: &RecordBatch, row: usize) -> u32 {
+    let trace_index = batch
+        .schema_ref()
+        .index_of("trace_id")
+        .expect("canonical trace batch contains trace_id");
     batch
-        .column(1)
+        .column(trace_index)
         .as_dictionary::<UInt32Type>()
         .keys()
         .value(row)
@@ -92,11 +169,9 @@ pub fn inspect_partition_cardinality(batch: &RecordBatch) -> PartitionCardinalit
     PartitionCardinality::Single
 }
 
-/// Deterministic split by partition key (trace_id), sorted by key
-/// (`splitChunkByPartition`): returns per-partition row-index runs in sorted-key
-/// order. Row indices are returned (not sliced batches) so callers control slicing.
+/// Deterministic split by partition key, sorted by dictionary key.
 pub fn split_chunk_by_partition(batch: &RecordBatch) -> Vec<(u32, Vec<usize>)> {
-    let mut groups: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut groups = std::collections::BTreeMap::<u32, Vec<usize>>::new();
     for row in 0..batch.num_rows() {
         groups
             .entry(trace_key_at(batch, row))
@@ -109,15 +184,13 @@ pub fn split_chunk_by_partition(batch: &RecordBatch) -> Vec<(u32, Vec<usize>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::convert_span_trees;
+    use crate::dict::StableVocabularyCatalog;
+    use crate::source::MockSpan;
+    use lmao_core::{SpanIdentity, TraceId};
+    use std::sync::Arc;
 
-    #[test]
-    fn chunk_stats_values_are_exact() {
-        use crate::convert::convert_span_trees;
-        use crate::dict::StableVocabularyCatalog;
-        use crate::source::MockSpan;
-        use lmao_core::{SpanIdentity, TraceId};
-        use std::sync::Arc;
-
+    fn fixture() -> RecordBatch {
         let span = MockSpan {
             identity: Arc::new(SpanIdentity {
                 thread_id: 1,
@@ -131,23 +204,35 @@ mod tests {
             overflow: None,
             children: vec![],
         };
-        let empty_catalog = StableVocabularyCatalog::EMPTY;
-        let batch = convert_span_trees(&[span], &empty_catalog).unwrap();
+        convert_span_trees(&[span], &StableVocabularyCatalog::EMPTY).unwrap()
+    }
+
+    #[test]
+    fn chunk_stats_values_are_exact() {
+        let batch = fixture();
         assert_eq!(extract_chunk_stats(&batch), (3, 50, 900));
-
-        let empty = convert_span_trees::<MockSpan>(&[], &empty_catalog).unwrap();
+        let empty = convert_span_trees::<MockSpan>(&[], &StableVocabularyCatalog::EMPTY).unwrap();
         assert_eq!(extract_chunk_stats(&empty), (0, 0, 0));
+    }
 
-        let env = build_trace_chunk_envelope("ref", &batch);
-        assert_eq!(
-            (env.row_count, env.min_timestamp, env.max_timestamp),
-            (3, 50, 900)
-        );
+    #[test]
+    fn envelope_matches_the_typescript_canonical_contract() {
+        let batch = fixture();
+        let metadata = serde_json::json!({"z": 1, "a": "é"});
+        let envelope = build_trace_chunk_envelope(TraceChunkEnvelopeInput {
+            file_ref: "file://trace.arrow",
+            chunk_ref: "chunk/ref",
+            batch: &batch,
+            partition_keys: &["z", "a"],
+            metadata: Some(&metadata),
+        });
+        assert_eq!(envelope.chunk_id, "chunk_9554ebf6c00f2da5");
+        assert_eq!(envelope.partition_keys, ["a", "z"]);
+        assert_eq!((envelope.started_at_ms, envelope.ended_at_ms), (0, 0));
     }
 
     #[test]
     fn fnv_matches_reference_vectors() {
-        // Standard FNV-1a 64 test vectors.
         assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
         assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
         assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);

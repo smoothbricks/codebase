@@ -9,7 +9,8 @@ use arrow_array::types::UInt32Type;
 use lmao_arrow::{
     ColumnDictionary, ConvertError, MockSpan, StableVocabularyCatalog,
     StableVocabularyCatalogError, StableVocabularyEntry, StableVocabularyKind,
-    StableVocabularyLookupError, build_trace_chunk_envelope, convert_span_trees,
+    StableVocabularyLookupError, TraceChunkEnvelopeInput, build_trace_chunk_envelope,
+    convert_span_trees, write_ipc_stream,
 };
 use lmao_core::{SpanIdentity, TraceId};
 use proptest::prelude::*;
@@ -115,11 +116,7 @@ fn build_tree(n: usize, trace: &str) -> MockSpan {
 
 fn ipc_bytes(batch: &arrow_array::RecordBatch) -> Vec<u8> {
     let mut out = Vec::new();
-    {
-        let mut w = arrow_ipc::writer::StreamWriter::try_new(&mut out, &batch.schema()).unwrap();
-        w.write(batch).unwrap();
-        w.finish().unwrap();
-    }
+    write_ipc_stream(&mut out, batch).unwrap();
     out
 }
 
@@ -205,7 +202,7 @@ fn dictionary_span(trace: &str, span_id: u32, rows: &[(i64, u32, Option<String>)
 fn message_dictionary(
     batch: &arrow_array::RecordBatch,
 ) -> (&arrow_array::UInt32Array, &arrow_array::StringArray) {
-    let message = batch.column(7).as_dictionary::<UInt32Type>();
+    let message = batch.column(10).as_dictionary::<UInt32Type>();
     (message.keys(), message.values().as_string::<i32>())
 }
 
@@ -393,8 +390,8 @@ fn message_dictionary_reuses_static_prefix_and_appends_first_seen_dynamic_suffix
         &catalog,
     )
     .unwrap();
-    let static_message = static_batch.column(7).as_dictionary::<UInt32Type>();
-    let second_static_message = second_static_batch.column(7).as_dictionary::<UInt32Type>();
+    let static_message = static_batch.column(10).as_dictionary::<UInt32Type>();
+    let second_static_message = second_static_batch.column(10).as_dictionary::<UInt32Type>();
     assert!(
         Arc::ptr_eq(static_message.values(), second_static_message.values()),
         "static-only conversions reuse the catalog's cached Arrow dictionary",
@@ -609,7 +606,10 @@ proptest! {
         let mut expected: Vec<(i64, u8)> = Vec::new();
         walk_pre_order(std::slice::from_ref(&tree), &mut |b: &MockSpan| {
             for row in 0..b.row_count() {
-                expected.push((b.timestamp(row), b.packed_header(row) as u8));
+                expected.push((
+                    b.timestamp(row).unwrap(),
+                    b.packed_header(row).unwrap() as u8,
+                ));
             }
         });
 
@@ -619,12 +619,13 @@ proptest! {
             &empty_catalog,
         ).unwrap();
         prop_assert_eq!(batch.num_rows(), expected.len());
-        let ts = batch.column(0).as_primitive::<arrow_array::types::Int64Type>();
+        let ts = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::TimestampNanosecondType>();
         let et = batch.column(6).as_dictionary::<arrow_array::types::UInt8Type>();
         for (row, (want_ts, want_et)) in expected.iter().enumerate() {
             prop_assert_eq!(ts.value(row), *want_ts);
-            // Dictionary key is discriminant − 1.
-            prop_assert_eq!(et.keys().value(row), want_et - 1);
+            prop_assert_eq!(et.keys().value(row), *want_et);
         }
     }
 
@@ -637,9 +638,18 @@ proptest! {
             &[build_tree(n, "trace-env")],
             &empty_catalog,
         ).unwrap();
-        let e1 = build_trace_chunk_envelope("s3://bucket/chunk-1", &batch);
-        let e2 = build_trace_chunk_envelope("s3://bucket/chunk-1", &batch);
-        let e3 = build_trace_chunk_envelope("s3://bucket/chunk-2", &batch);
+        let envelope = |file_ref| {
+            build_trace_chunk_envelope(TraceChunkEnvelopeInput {
+                file_ref,
+                chunk_ref: "chunk-ref",
+                batch: &batch,
+                partition_keys: &[],
+                metadata: None,
+            })
+        };
+        let e1 = envelope("s3://bucket/chunk-1");
+        let e2 = envelope("s3://bucket/chunk-1");
+        let e3 = envelope("s3://bucket/chunk-2");
         prop_assert_eq!(&e1, &e2);
         prop_assert_ne!(e1.chunk_id, e3.chunk_id);
     }

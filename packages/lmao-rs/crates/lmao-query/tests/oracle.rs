@@ -33,7 +33,7 @@ const ENTRY_SPAN_OK: u32 = 2;
 const ENTRY_INFO: u32 = 8;
 
 fn entry_name(entry_type: u32) -> &'static str {
-    ENTRY_TYPE_NAMES[(entry_type - 1) as usize]
+    ENTRY_TYPE_NAMES[entry_type as usize]
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ struct ModelRow {
     parent_span_id: Option<u32>,
     entry_type: &'static str,
     message: Option<String>,
-    line_number: u32,
+    line: u32,
 }
 
 /// The model's error channel. A selector naming a column the model does not carry, or
@@ -191,7 +191,7 @@ struct ModelQuery {
 }
 
 impl ModelQuery {
-    const COLUMNS: [&'static str; 9] = [
+    const COLUMNS: [&'static str; 12] = [
         "timestamp",
         "trace_id",
         "thread_id",
@@ -199,8 +199,11 @@ impl ModelQuery {
         "parent_thread_id",
         "parent_span_id",
         "entry_type",
+        "package_name",
+        "package_file",
+        "git_sha",
         "message",
-        "line_number",
+        "line",
     ];
 
     fn new(specs: &[SpanSpec]) -> Self {
@@ -222,7 +225,7 @@ impl ModelQuery {
                     parent_span_id: parent.map(|(_, s)| s),
                     entry_type: entry_name(entry),
                     message,
-                    line_number: 0,
+                    line: 0,
                 });
             }
         }
@@ -249,8 +252,9 @@ impl ModelQuery {
                 row.parent_span_id.map(u64::from) == Some(*v)
             }
             ("entry_type", ColumnValue::Str(s)) => row.entry_type == s.as_str(),
+            ("package_name" | "package_file" | "git_sha", ColumnValue::Str(_)) => false,
             ("message", ColumnValue::Str(s)) => row.message.as_deref() == Some(s.as_str()),
-            ("line_number", ColumnValue::U64(v)) => u64::from(row.line_number) == *v,
+            ("line", ColumnValue::U64(v)) => u64::from(row.line) == *v,
             // A value type that cannot address the column is a malformed selector, so
             // it is an error rather than a silent non-match.
             _ => return Err(ModelError::TypeMismatch(name.to_string())),

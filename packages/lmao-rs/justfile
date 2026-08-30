@@ -5,10 +5,9 @@
 test:
     cargo test --workspace
 
-# Heavy property tier: includes the TDD-red #[ignore]d tests and elevated proptest
-# cases. Expect failures until the corresponding implementation lands (that's TDD).
+# Heavy property tier: elevated proptest cases over the same mandatory suite.
 proptest-heavy cases="10000":
-    PROPTEST_CASES={{cases}} cargo test --workspace --release -- --include-ignored
+    PROPTEST_CASES={{cases}} cargo test --workspace --release
 
 # Mutation tier (see mutants.toml for arid/exclusion policy).
 mutants:
@@ -30,20 +29,3 @@ check:
     cargo check --workspace --all-targets
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Proof-only timestamp artifacts consumed by the timestamp accuracy harness.
-# WASM preserves the original shared, imported 16-page memory contract; NAPI
-# accepts ArrayBuffer directly and is renamed to Node's conventional .node suffix.
-timestamp-proof-artifacts:
-    LMAO_TIMESTAMP_PROOF_SHARED_MEMORY=1 RUSTC_BOOTSTRAP=1 \
-    RUSTFLAGS="-Aunstable-features -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals" \
-    cargo build -p lmao-timestamp-proof --target wasm32-unknown-unknown --profile wasm-release \
-        -Zbuild-std=core,panic_abort
-    cargo build -p lmao-timestamp-proof --features napi --release
-    mkdir -p dist/timestamp-accuracy
-    cp target/wasm32-unknown-unknown/wasm-release/lmao_timestamp_proof.wasm dist/timestamp-accuracy/span_start.wasm
-    @case "$(uname -s)" in \
-      Darwin) lib=target/release/liblmao_timestamp_proof.dylib ;; \
-      Linux) lib=target/release/liblmao_timestamp_proof.so ;; \
-      *) echo "unsupported timestamp-proof NAPI host: $(uname -s)" >&2; exit 1 ;; \
-    esac; cp "$lib" dist/timestamp-accuracy/span_start.node
-    @ls -la dist/timestamp-accuracy/span_start.wasm dist/timestamp-accuracy/span_start.node

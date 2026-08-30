@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use lmao_arrow::{
     MockSpan, StableVocabularyCatalog, StableVocabularyEntry, StableVocabularyKind,
-    build_trace_chunk_envelope, convert_span_trees,
+    TraceChunkEnvelopeInput, build_trace_chunk_envelope, convert_span_trees,
 };
 use lmao_core::{SpanIdentity, TraceId};
 use lmao_query::{ArrowTraceQuery, Selector, TraceQuery};
@@ -183,9 +183,18 @@ fn stable_and_dynamic_vocabulary_have_query_and_archive_parity() {
             "static {name}"
         );
     }
+    let envelope = |batch| {
+        build_trace_chunk_envelope(TraceChunkEnvelopeInput {
+            file_ref: "archive://fixture",
+            chunk_ref: "fixture",
+            batch,
+            partition_keys: &[],
+            metadata: None,
+        })
+    };
     assert_eq!(
-        build_trace_chunk_envelope("archive://fixture", &dynamic_batch),
-        build_trace_chunk_envelope("archive://fixture", &static_batch),
+        envelope(&dynamic_batch),
+        envelope(&static_batch),
         "archive identity and bounds are independent of vocabulary encoding",
     );
 }

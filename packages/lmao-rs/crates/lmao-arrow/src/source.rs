@@ -17,12 +17,22 @@ pub trait SpanSource {
     fn identity(&self) -> &SpanIdentity;
     /// Number of valid rows in THIS buffer (not counting overflow/children).
     fn row_count(&self) -> usize;
-    fn timestamp(&self, row: usize) -> i64;
+    fn timestamp(&self, row: usize) -> Option<i64>;
     /// Private packed u32 row header: entry type in low 8 bits, vocabulary ID in high 24.
-    fn packed_header(&self, row: usize) -> u32;
+    fn packed_header(&self, row: usize) -> Option<u32>;
     /// Dynamic row text; static rows store no source string.
     fn dynamic_message(&self, row: usize) -> Option<&str>;
-    /// Callsite line for the row (`01f` lineNumber system column; 0 = unset).
+    /// Source attribution. Unknown values remain null rather than becoming empty strings.
+    fn package_name(&self) -> Option<&str> {
+        None
+    }
+    fn package_file(&self) -> Option<&str> {
+        None
+    }
+    fn git_sha(&self) -> Option<&str> {
+        None
+    }
+    /// Callsite line for the row (`01f` `line` system column; 0 = unset).
     fn line_number(&self, row: usize) -> u32;
     /// Overflow continuation (same identity), yielded immediately after this buffer
     /// so one logical span's rows stay contiguous (`01k`).
@@ -42,16 +52,20 @@ impl SpanSource for SpanBuffer {
         self.write_index()
     }
 
-    fn timestamp(&self, row: usize) -> i64 {
-        self.timestamp_at(row).unwrap_or(0)
+    fn timestamp(&self, row: usize) -> Option<i64> {
+        self.timestamp_at(row)
     }
 
-    fn packed_header(&self, row: usize) -> u32 {
-        self.packed_header_at(row).unwrap_or(0)
+    fn packed_header(&self, row: usize) -> Option<u32> {
+        self.packed_header_at(row)
     }
 
     fn dynamic_message(&self, row: usize) -> Option<&str> {
         self.dynamic_message_at(row)
+    }
+
+    fn package_file(&self) -> Option<&str> {
+        self.callsite().map(|(file, _)| file)
     }
 
     fn line_number(&self, row: usize) -> u32 {
@@ -110,12 +124,12 @@ impl SpanSource for MockSpan {
         self.timestamps.len()
     }
 
-    fn timestamp(&self, row: usize) -> i64 {
-        self.timestamps[row]
+    fn timestamp(&self, row: usize) -> Option<i64> {
+        self.timestamps.get(row).copied()
     }
 
-    fn packed_header(&self, row: usize) -> u32 {
-        self.packed_headers[row]
+    fn packed_header(&self, row: usize) -> Option<u32> {
+        self.packed_headers.get(row).copied()
     }
 
     fn dynamic_message(&self, row: usize) -> Option<&str> {
