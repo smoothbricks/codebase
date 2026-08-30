@@ -197,8 +197,8 @@ proptest! {
         raw::init_trace_root(m, root, 1_000.0, 10.0);
 
         raw::span_start(m, system, identity, root, cap, 11.0);
-        prop_assert_eq!(raw::read_entry_type(m, system, 0, cap), raw::ENTRY_TYPE_SPAN_START);
-        prop_assert_eq!(raw::read_entry_type(m, system, 1, cap), raw::ENTRY_TYPE_SPAN_EXCEPTION);
+        prop_assert_eq!(raw::read_entry_type(m, system, 0, cap), 1); // span-start
+        prop_assert_eq!(raw::read_entry_type(m, system, 1, cap), 4); // span-exception
         prop_assert_eq!(raw::read_write_index(m, identity), 2);
 
         let mut prev_ts = raw::read_timestamp(m, system, 0);
@@ -210,8 +210,8 @@ proptest! {
             prev_ts = ts;
         }
 
-        raw::span_end(m, system, root, cap, raw::ENTRY_TYPE_SPAN_OK, 99.0);
-        prop_assert_eq!(raw::read_entry_type(m, system, 1, cap), raw::ENTRY_TYPE_SPAN_OK);
+        raw::span_end_ok(m, system, root, cap, 99.0);
+        prop_assert_eq!(raw::read_entry_type(m, system, 1, cap), 2); // span-ok
         prop_assert!(raw::read_timestamp(m, system, 1) > prev_ts);
 
         while raw::read_write_index(m, identity) < cap {
@@ -407,11 +407,11 @@ fn packed_root_span_allocates_and_initializes_in_one_operation() {
     assert_eq!(raw::read_timestamp(arena.mem(), system, 0), 1_002_000_000);
     assert_eq!(
         raw::read_entry_type(arena.mem(), system, 0, CAPACITY),
-        raw::ENTRY_TYPE_SPAN_START
+        1 // span-start
     );
     assert_eq!(
         raw::read_entry_type(arena.mem(), system, 1, CAPACITY),
-        raw::ENTRY_TYPE_SPAN_EXCEPTION
+        4 // span-exception
     );
     assert_eq!(raw::read_timestamp(arena.mem(), system, 1), 0);
 
@@ -466,13 +466,13 @@ fn packed_child_and_overflow_validate_layout_and_clear_recycled_bytes() {
         arena
             .mem()
             .read_u32(child + SYSTEM_OFFSET + ROW_HEADER_OFFSET),
-        u32::from(raw::ENTRY_TYPE_SPAN_START)
+        1 // span-start
     );
     assert_eq!(
         arena
             .mem()
             .read_u32(child + SYSTEM_OFFSET + ROW_HEADER_OFFSET + 4),
-        u32::from(raw::ENTRY_TYPE_SPAN_EXCEPTION)
+        4 // span-exception
     );
 
     raw::free_exact(arena.mem_mut(), child, SUPERBLOCK_BYTES, 8);

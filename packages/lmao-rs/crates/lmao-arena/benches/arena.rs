@@ -72,7 +72,7 @@ fn span_hot_path(c: &mut Criterion) {
             for (i, &col) in cols.iter().enumerate() {
                 raw::write_col_f64(m, col, 0, i as f64, cap);
             }
-            raw::span_end(m, system, root, cap, raw::ENTRY_TYPE_SPAN_OK, now);
+            raw::span_end_ok(m, system, root, cap, now);
             black_box(raw::read_timestamp(m, system, 1))
         });
     });

@@ -377,31 +377,13 @@ pub extern "C" fn span_start(
 #[unsafe(no_mangle)]
 pub extern "C" fn span_end_ok(system_ptr: u32, trace_root_ptr: u32, capacity: u32) {
     let now = performance_now();
-    with_mem(|m| {
-        raw::span_end(
-            m,
-            system_ptr,
-            trace_root_ptr,
-            capacity,
-            raw::ENTRY_TYPE_SPAN_OK,
-            now,
-        )
-    });
+    with_mem(|m| raw::span_end_ok(m, system_ptr, trace_root_ptr, capacity, now));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn span_end_err(system_ptr: u32, trace_root_ptr: u32, capacity: u32) {
     let now = performance_now();
-    with_mem(|m| {
-        raw::span_end(
-            m,
-            system_ptr,
-            trace_root_ptr,
-            capacity,
-            raw::ENTRY_TYPE_SPAN_ERR,
-            now,
-        )
-    });
+    with_mem(|m| raw::span_end_err(m, system_ptr, trace_root_ptr, capacity, now));
 }
 
 #[unsafe(no_mangle)]
@@ -508,18 +490,15 @@ mod tests {
         init_trace_root(root);
 
         span_start(system, identity, root, cap);
-        assert_eq!(read_entry_type(system, 0, cap), raw::ENTRY_TYPE_SPAN_START);
-        assert_eq!(
-            read_entry_type(system, 1, cap),
-            raw::ENTRY_TYPE_SPAN_EXCEPTION
-        );
+        assert_eq!(read_entry_type(system, 0, cap), 1); // span-start
+        assert_eq!(read_entry_type(system, 1, cap), 4); // span-exception
         assert_eq!(read_write_index(identity), 2);
 
         let idx = write_log_entry(system, identity, root, 5, cap);
         assert_eq!(idx, 2);
 
         span_end_ok(system, root, cap);
-        assert_eq!(read_entry_type(system, 1, cap), raw::ENTRY_TYPE_SPAN_OK);
+        assert_eq!(read_entry_type(system, 1, cap), 2); // span-ok
 
         free_exact(root, 16, 8);
         free_exact(system, cap * 9, 8);
