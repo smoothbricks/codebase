@@ -454,6 +454,12 @@ fn checked_child(root: &Path, component: &str) -> Result<PathBuf, StorageLayoutE
 /// The root must exist. Missing descendants are accepted so the same check can guard creation,
 /// but every existing component from the root down is inspected with `symlink_metadata`.
 pub fn verify_no_symlinks(root: &Path, candidate: &Path) -> Result<(), StorageLayoutError> {
+    // A non-canonical root voids the lexical containment below (`..` in the root lets a candidate
+    // strip-prefix cleanly while resolving elsewhere), so it is refused the same way
+    // `is_lexically_contained` in repository.rs refuses it.
+    if !crate::repository::is_lexically_canonical(root) {
+        return Err(StorageLayoutError::EscapesStoreRoot);
+    }
     let relative = candidate
         .strip_prefix(root)
         .map_err(|_| StorageLayoutError::EscapesStoreRoot)?;
