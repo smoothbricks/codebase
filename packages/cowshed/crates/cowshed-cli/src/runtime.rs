@@ -3419,6 +3419,85 @@ mod tests {
         assert!(stdout.is_empty() && stderr.is_empty());
     }
 
+    /// `--json`, `--landing` and `--landed` have one precedence, and the project-scoped and
+    /// store-wide listings answer to it identically.
+    ///
+    /// Two emitters is deliberate — the two JSON bodies are different frozen shapes and the tables
+    /// carry different columns — but the order they consult the flags in is one user-visible
+    /// contract, and it had two authors and no guard.
+    #[tokio::test]
+    async fn both_listings_resolve_the_output_flags_in_the_same_order() {
+        use crate::args::ListArgs;
+
+        async fn rendered(args: ListArgs, json: bool) -> (String, String) {
+            let mut workspaces = Output::new(Vec::new(), Vec::new(), false);
+            emit_workspace_listing(&mut workspaces, json, args, None, Vec::new())
+                .await
+                .expect("workspace listing");
+            let mut projects = Output::new(Vec::new(), Vec::new(), false);
+            emit_project_listing(&mut projects, json, args, Vec::new())
+                .await
+                .expect("project listing");
+            (
+                String::from_utf8(workspaces.into_inner().0).expect("utf-8"),
+                String::from_utf8(projects.into_inner().0).expect("utf-8"),
+            )
+        }
+
+        let every = ListArgs {
+            all: true,
+            landing: true,
+            landed: true,
+        };
+
+        // JSON outranks both table forms, in both listings.
+        let (workspaces, projects) = rendered(every, true).await;
+        assert!(
+            workspaces.starts_with("{\"ok\":true"),
+            "--json outranks the table forms: {workspaces:?}"
+        );
+        assert!(
+            projects.starts_with("{\"ok\":true"),
+            "--json outranks the table forms: {projects:?}"
+        );
+
+        // Without JSON, --landing outranks --landed: the table, not bare names.
+        let (workspaces, projects) = rendered(every, false).await;
+        assert!(
+            workspaces.contains("UNLANDED"),
+            "--landing outranks --landed: {workspaces:?}"
+        );
+        assert!(
+            projects.contains("UNLANDED"),
+            "--landing outranks --landed: {projects:?}"
+        );
+        // Only the project listing carries the repository column.
+        assert!(
+            !workspaces.contains("REPOSITORY"),
+            "a project-scoped listing has one repository: {workspaces:?}"
+        );
+        assert!(
+            projects.contains("REPOSITORY"),
+            "a store-wide listing has to name the repository: {projects:?}"
+        );
+
+        // --landed alone is bare names, so nothing is printed for an empty listing.
+        let landed = ListArgs {
+            all: true,
+            landing: false,
+            landed: true,
+        };
+        let (workspaces, projects) = rendered(landed, false).await;
+        assert!(
+            workspaces.is_empty(),
+            "--landed alone prints bare names and nothing else: {workspaces:?}"
+        );
+        assert!(
+            projects.is_empty(),
+            "--landed alone prints bare names and nothing else: {projects:?}"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
