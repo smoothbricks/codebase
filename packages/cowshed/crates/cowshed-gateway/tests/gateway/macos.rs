@@ -158,19 +158,32 @@ impl AuditSink for ChannelAudit {
         Ok(())
     }
 }
+/// A gateway port block no other test process is about to claim.
+///
+/// nextest runs every test in its own process, so a counter seeded at `MACOS_PORT_MIN` hands the
+/// identical sequence to every process and they race for the same block — `install` then fails with
+/// `AddrInUse`, intermittently, depending on which process binds first. Offsetting the start by pid
+/// makes concurrent processes walk disjoint parts of the range.
+///
+/// The bind probe still runs, because it is the only thing that catches a block held by something
+/// outside the test run: a live `cowshed gateway run` daemon owns real blocks on a developer host.
+/// It cannot close the window entirely — the listener has to drop before the caller binds — which
+/// is why disjoint ranges, not the probe, are what make this reliable.
 fn free_endpoint() -> SocketAddr {
-    static NEXT_PORT: AtomicU16 = AtomicU16::new(cowshed_gateway::MACOS_PORT_MIN);
-    loop {
-        let port = NEXT_PORT.fetch_add(cowshed_gateway::MACOS_PORT_BLOCK_SIZE, Ordering::Relaxed);
-        assert!(
-            port <= cowshed_gateway::MACOS_PORT_MAX,
-            "no free macOS gateway port block"
-        );
+    const BLOCKS: u16 = (cowshed_gateway::MACOS_PORT_MAX - cowshed_gateway::MACOS_PORT_MIN)
+        / cowshed_gateway::MACOS_PORT_BLOCK_SIZE;
+    static NEXT_BLOCK: AtomicU16 = AtomicU16::new(0);
+    let seed = (std::process::id() % u32::from(BLOCKS)) as u16;
+    for _ in 0..BLOCKS {
+        let step = NEXT_BLOCK.fetch_add(1, Ordering::Relaxed);
+        let index = ((u32::from(seed) + u32::from(step)) % u32::from(BLOCKS)) as u16;
+        let port = cowshed_gateway::MACOS_PORT_MIN + index * cowshed_gateway::MACOS_PORT_BLOCK_SIZE;
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         if std::net::TcpListener::bind(address).is_ok() {
             return address;
         }
     }
+    panic!("no free macOS gateway port block in {BLOCKS} candidates");
 }
 
 fn tls_client_hello(host: &str) -> Vec<u8> {
