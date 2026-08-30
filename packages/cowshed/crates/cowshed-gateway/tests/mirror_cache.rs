@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
     fs::OpenOptions as StdOpenOptions,
-    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -275,13 +274,13 @@ async fn immutable_fill_hit_offline_and_corruption_refusal() {
                 .is_some_and(|name| name.to_string_lossy().starts_with("obj-"))
         })
         .expect("cached object");
-    let mut file = StdOpenOptions::new()
+    let file = StdOpenOptions::new()
         .write(true)
         .open(&object)
-        .expect("open cached object for corruption fixture");
-    file.seek(SeekFrom::End(-1)).expect("seek final byte");
-    file.write_all(b"!").expect("corrupt cached byte");
-    file.sync_all().expect("sync corruption fixture");
+        .expect("open cached object for truncation fixture");
+    let truncated = file.metadata().expect("cached object metadata").len() - 1;
+    file.set_len(truncated).expect("truncate cached object");
+    file.sync_all().expect("sync truncation fixture");
 
     drop(file);
     let error = restarted
