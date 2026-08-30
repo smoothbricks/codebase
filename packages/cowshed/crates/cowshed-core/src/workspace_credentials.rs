@@ -11,7 +11,7 @@ use rcgen::{
 };
 use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::metadata::{
     Platform, PortBlock, WorkspaceIncarnation, WorkspaceName, write_atomic_bytes,
@@ -436,9 +436,15 @@ fn read_bounded_utf8(
     if bytes.len() as u64 > maximum {
         return Err(invalid(kind, path));
     }
-    String::from_utf8(std::mem::take(&mut *bytes))
-        .map(Zeroizing::new)
-        .map_err(|_| invalid(kind, path))
+    // `FromUtf8Error` owns the secret bytes and does not zeroize on drop.
+    String::from_utf8(std::mem::take(&mut *bytes)).map_or_else(
+        |error| {
+            let mut leaked = error.into_bytes();
+            leaked.zeroize();
+            Err(invalid(kind, path))
+        },
+        |text| Ok(Zeroizing::new(text)),
+    )
 }
 
 fn sync_directory(path: &Path, operation: &'static str) -> Result<(), WorkspaceCredentialError> {
