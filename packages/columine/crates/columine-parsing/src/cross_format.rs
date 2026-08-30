@@ -85,12 +85,12 @@ pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnVa
             .or_else(|_| parse_iso8601_to_micros(text).map_err(|_| ()))
             .map(|micros| Some(ColumnValue::Int64(micros)))
             .map_err(|_| ()),
-        (ArrowType::Float64, Logical::Int(value)) => {
-            Ok(Some(ColumnValue::Float64(*value as f64)))
-        }
+        (ArrowType::Float64, Logical::Int(value)) => Ok(Some(ColumnValue::Float64(*value as f64))),
         (ArrowType::Float64, Logical::Float(value)) => Ok(Some(ColumnValue::Float64(*value))),
         (ArrowType::Bool, Logical::Bool(value)) => Ok(Some(ColumnValue::Bool(*value))),
-        (ArrowType::Binary, value) => Ok(Some(ColumnValue::Binary(canonical_msgpack(&value.json())))),
+        (ArrowType::Binary, value) => {
+            Ok(Some(ColumnValue::Binary(canonical_msgpack(&value.json()))))
+        }
         _ => Err(()),
     }
 }
@@ -101,7 +101,8 @@ pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnVa
 pub(crate) fn canonical_msgpack(json: &str) -> Vec<u8> {
     let mut buffer = vec![0_u8; 1 << 16];
     let written = {
-        let mut writer = MsgpackValueWriter::new(&mut buffer).expect("64 KiB is above the 5-byte floor");
+        let mut writer =
+            MsgpackValueWriter::new(&mut buffer).expect("64 KiB is above the 5-byte floor");
         let mut parser = JsonParser::new(json.as_bytes());
         let token = parser.next_token().expect("generated JSON is well formed");
         writer

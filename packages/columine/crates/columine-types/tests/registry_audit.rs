@@ -9,8 +9,7 @@
 //! registry in the same commit.
 
 use columine_types::abi_registry_fixture::{
-    AGG_TYPES, DURATION_UNITS, ERROR_CODES, SLOT_TYPES, STRUCT_FIELD_TYPES,
-    TYPES_OPCODE_REGISTRY,
+    AGG_TYPES, DURATION_UNITS, ERROR_CODES, SLOT_TYPES, STRUCT_FIELD_TYPES, TYPES_OPCODE_REGISTRY,
 };
 use columine_types::audit_parser::{enum_decls, norm, read_source};
 use columine_types::types::{
@@ -81,7 +80,11 @@ fn agg_type_registry_matches_fixture() {
 
 #[test]
 fn struct_field_type_registry_matches_fixture() {
-    audit_u8_registry("StructFieldType", STRUCT_FIELD_TYPES, StructFieldType::from_u8);
+    audit_u8_registry(
+        "StructFieldType",
+        STRUCT_FIELD_TYPES,
+        StructFieldType::from_u8,
+    );
 }
 
 #[test]
@@ -94,7 +97,9 @@ fn duration_unit_registry_matches_fixture() {
 #[test]
 fn error_code_registry_matches_fixture() {
     let decoded: BTreeMap<String, u32> = (0..64_u32)
-        .filter_map(|value| ErrorCode::from_u32(value).map(|code| (norm(&format!("{code:?}")), value)))
+        .filter_map(|value| {
+            ErrorCode::from_u32(value).map(|code| (norm(&format!("{code:?}")), value))
+        })
         .collect();
     let frozen: BTreeMap<String, u32> = ERROR_CODES
         .iter()
