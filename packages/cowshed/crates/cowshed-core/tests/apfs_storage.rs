@@ -21,10 +21,10 @@ use cowshed_core::storage::apfs::{
     RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
-    AdoptRequest, CheckpointFact, Destination, ExpectedState, KernelMountFact, LifecyclePlanner,
-    LifecycleWorkspace, MountIntent, MountState, ObservedState, OperationIdentity, Pin,
-    ResizeOutcome, RestoreMode, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport,
-    Substrate, SubstrateStats,
+    AdoptRequest, CheckpointFact, Destination, KernelMountFact, LifecycleFact, LifecyclePlanner,
+    LifecycleWorkspace, MountIntent, MountState, OperationIdentity, Pin, ResizeOutcome,
+    RestoreMode, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate,
+    SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -179,19 +179,19 @@ impl ApfsExecutionHost for FakeHost {
 
     type Attachment = FakeAttachment;
 
-    fn observe(&self, expected: &[ExpectedState]) -> Result<Vec<ObservedState>, ApfsStorageError> {
+    fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError> {
         self.record("observe");
         Ok(expected
             .iter()
             .map(|fact| match fact {
-                ExpectedState::Exists {
+                LifecycleFact::Exists {
                     repo,
                     name,
                     incarnation,
                     revision,
                     topology_revision,
                     retired,
-                } => ObservedState::Exists {
+                } => LifecycleFact::Exists {
                     repo: repo.clone(),
                     name: name.clone(),
                     incarnation: incarnation.clone(),
@@ -199,21 +199,21 @@ impl ApfsExecutionHost for FakeHost {
                     topology_revision: *topology_revision,
                     retired: *retired,
                 },
-                ExpectedState::Absent {
+                LifecycleFact::Absent {
                     repo,
                     name,
                     topology_revision,
-                } => ObservedState::Absent {
+                } => LifecycleFact::Absent {
                     repo: repo.clone(),
                     name: name.clone(),
                     topology_revision: *topology_revision,
                 },
-                ExpectedState::Checkpoint {
+                LifecycleFact::Checkpoint {
                     repo,
                     workspace,
                     label,
                     revision,
-                } => ObservedState::Checkpoint {
+                } => LifecycleFact::Checkpoint {
                     repo: repo.clone(),
                     workspace: workspace.clone(),
                     label: label.clone(),

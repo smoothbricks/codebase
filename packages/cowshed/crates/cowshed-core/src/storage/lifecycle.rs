@@ -130,8 +130,15 @@ pub enum RestoreMode {
     VerifyOnly,
 }
 
+/// One authoritative lifecycle fact, whether a planner asserted it or a substrate observed it.
+///
+/// Expectation and observation are the same fact at two moments, so they are one type: a plan
+/// carries the facts it was made against, the substrate rereads the facts under exclusion, and
+/// revalidation is `==`. Two structurally identical enums made a mixed expected/observed pair
+/// representable, cost a 40-line field-by-field match to reject, and turned "add a field to one,
+/// forget the other" into a silent stale-plan miss.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExpectedState {
+pub enum LifecycleFact {
     Exists {
         repo: RepoId,
         name: WorkspaceName,
@@ -153,7 +160,7 @@ pub enum ExpectedState {
     },
 }
 
-impl ExpectedState {
+impl LifecycleFact {
     fn active(workspace: &LifecycleWorkspace) -> Self {
         Self::Exists {
             repo: workspace.repo.clone(),
@@ -166,29 +173,6 @@ impl ExpectedState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ObservedState {
-    Exists {
-        repo: RepoId,
-        name: WorkspaceName,
-        incarnation: WorkspaceIncarnation,
-        revision: Revision,
-        topology_revision: Revision,
-        retired: bool,
-    },
-    Absent {
-        repo: RepoId,
-        name: WorkspaceName,
-        topology_revision: Revision,
-    },
-    Checkpoint {
-        repo: RepoId,
-        workspace: WorkspaceName,
-        label: CheckpointLabel,
-        revision: Revision,
-    },
-}
-
 /// A structured stale-plan refusal. Executors return this before mutation.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum Conflict {
@@ -197,12 +181,12 @@ pub enum Conflict {
     #[error("authoritative fact {index} changed")]
     Stale {
         index: usize,
-        expected: Box<ExpectedState>,
-        actual: Box<ObservedState>,
+        expected: Box<LifecycleFact>,
+        actual: Box<LifecycleFact>,
     },
 }
 
-pub fn revalidate(expected: &[ExpectedState], actual: &[ObservedState]) -> Result<(), Conflict> {
+pub fn revalidate(expected: &[LifecycleFact], actual: &[LifecycleFact]) -> Result<(), Conflict> {
     if expected.len() != actual.len() {
         return Err(Conflict::FactCount {
             expected: expected.len(),
@@ -210,54 +194,7 @@ pub fn revalidate(expected: &[ExpectedState], actual: &[ObservedState]) -> Resul
         });
     }
     for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-        let matches = match (expected, actual) {
-            (
-                ExpectedState::Exists {
-                    repo: er,
-                    name: en,
-                    incarnation: ei,
-                    revision: ev,
-                    topology_revision: et,
-                    retired: ex,
-                },
-                ObservedState::Exists {
-                    repo: ar,
-                    name: an,
-                    incarnation: ai,
-                    revision: av,
-                    topology_revision: at,
-                    retired: ax,
-                },
-            ) => er == ar && en == an && ei == ai && ev == av && et == at && ex == ax,
-            (
-                ExpectedState::Absent {
-                    repo: er,
-                    name: en,
-                    topology_revision: et,
-                },
-                ObservedState::Absent {
-                    repo: ar,
-                    name: an,
-                    topology_revision: at,
-                },
-            ) => er == ar && en == an && et == at,
-            (
-                ExpectedState::Checkpoint {
-                    repo: er,
-                    workspace: ew,
-                    label: el,
-                    revision: ev,
-                },
-                ObservedState::Checkpoint {
-                    repo: ar,
-                    workspace: aw,
-                    label: al,
-                    revision: av,
-                },
-            ) => er == ar && ew == aw && el == al && ev == av,
-            _ => false,
-        };
-        if !matches {
+        if expected != actual {
             return Err(Conflict::Stale {
                 index,
                 expected: Box::new(expected.clone()),
@@ -272,11 +209,11 @@ macro_rules! plan_type {
     ($name:ident) => {
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct $name {
-            expected: Vec<ExpectedState>,
+            expected: Vec<LifecycleFact>,
             operation: Operation,
         }
         impl $name {
-            pub fn expected(&self) -> &[ExpectedState] {
+            pub fn expected(&self) -> &[LifecycleFact] {
                 &self.expected
             }
             pub fn operation(&self) -> &Operation {
@@ -422,14 +359,14 @@ pub trait LifecyclePlanner: Send + Sync {
 fn destination_expected(
     source: &LifecycleWorkspace,
     destination: &Destination,
-) -> Result<ExpectedState, PlanError> {
+) -> Result<LifecycleFact, PlanError> {
     if destination.name.is_main() {
         return Err(PlanError::MainDestination);
     }
     if source.repo != destination.repo {
         return Err(PlanError::RepositoryMismatch);
     }
-    Ok(ExpectedState::Absent {
+    Ok(LifecycleFact::Absent {
         repo: destination.repo.clone(),
         name: destination.name.clone(),
         topology_revision: destination.topology_revision,
@@ -438,7 +375,7 @@ fn destination_expected(
 
 impl LifecyclePlanner for PurePlanner {
     fn plan_adopt(&self, request: AdoptRequest) -> Result<AdoptPlan, PlanError> {
-        let main = WorkspaceName::new("main").expect("fixed main name is valid");
+        let main = WorkspaceName::main();
         if !request.source_checkout.is_absolute()
             || !request.pre_cowshed_checkout.is_absolute()
             || request.source_checkout == request.pre_cowshed_checkout
@@ -446,7 +383,7 @@ impl LifecyclePlanner for PurePlanner {
             return Err(PlanError::InvalidAdoptHandoff);
         }
         Ok(AdoptPlan {
-            expected: vec![ExpectedState::Absent {
+            expected: vec![LifecycleFact::Absent {
                 repo: request.repo.clone(),
                 name: main,
                 topology_revision: request.topology_revision,
@@ -468,7 +405,7 @@ impl LifecyclePlanner for PurePlanner {
     ) -> Result<CreatePlan, PlanError> {
         let absent = destination_expected(from, &destination)?;
         Ok(CreatePlan {
-            expected: vec![ExpectedState::active(from), absent],
+            expected: vec![LifecycleFact::active(from), absent],
             operation: Operation::Create {
                 source: from.name.clone(),
                 destination: destination.name,
@@ -484,7 +421,7 @@ impl LifecyclePlanner for PurePlanner {
     ) -> Result<ForkPlan, PlanError> {
         let absent = destination_expected(from, &destination)?;
         Ok(ForkPlan {
-            expected: vec![ExpectedState::active(from), absent],
+            expected: vec![LifecycleFact::active(from), absent],
             operation: Operation::Fork {
                 source: from.name.clone(),
                 destination: destination.name,
@@ -500,7 +437,7 @@ impl LifecyclePlanner for PurePlanner {
         pin: Pin,
     ) -> Result<CheckpointPlan, PlanError> {
         Ok(CheckpointPlan {
-            expected: vec![ExpectedState::active(workspace)],
+            expected: vec![LifecycleFact::active(workspace)],
             operation: Operation::Checkpoint {
                 workspace: workspace.name.clone(),
                 label,
@@ -524,8 +461,8 @@ impl LifecyclePlanner for PurePlanner {
         }
         Ok(RestorePlan {
             expected: vec![
-                ExpectedState::active(workspace),
-                ExpectedState::Checkpoint {
+                LifecycleFact::active(workspace),
+                LifecycleFact::Checkpoint {
                     repo: workspace.repo.clone(),
                     workspace: workspace.name.clone(),
                     label: checkpoint.label.clone(),
@@ -546,7 +483,7 @@ impl LifecyclePlanner for PurePlanner {
             return Err(PlanError::MainIsPermanent);
         }
         Ok(RetirePlan {
-            expected: vec![ExpectedState::active(workspace)],
+            expected: vec![LifecycleFact::active(workspace)],
             operation: Operation::Retire {
                 workspace: workspace.name.clone(),
                 format: workspace.format,
@@ -556,10 +493,10 @@ impl LifecyclePlanner for PurePlanner {
 }
 
 pub trait ImmutablePlan: Send + Sync {
-    fn expected(&self) -> &[ExpectedState];
+    fn expected(&self) -> &[LifecycleFact];
     fn operation(&self) -> &Operation;
 }
-macro_rules! immutable_plan { ($($ty:ty),+ $(,)?) => {$ (impl ImmutablePlan for $ty { fn expected(&self) -> &[ExpectedState] { self.expected() } fn operation(&self) -> &Operation { self.operation() } })+}; }
+macro_rules! immutable_plan { ($($ty:ty),+ $(,)?) => {$ (impl ImmutablePlan for $ty { fn expected(&self) -> &[LifecycleFact] { self.expected() } fn operation(&self) -> &Operation { self.operation() } })+}; }
 immutable_plan!(
     AdoptPlan,
     CreatePlan,
@@ -904,8 +841,8 @@ pub trait LifecycleBackend: Send + Sync {
     async fn read_authoritative(
         &self,
         guard: &mut Self::Guard,
-        expected: &[ExpectedState],
-    ) -> Result<Vec<ObservedState>, Self::Error>;
+        expected: &[LifecycleFact],
+    ) -> Result<Vec<LifecycleFact>, Self::Error>;
     async fn apply(
         &self,
         guard: &mut Self::Guard,
