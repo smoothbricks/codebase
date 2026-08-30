@@ -30,8 +30,11 @@ Concrete targets come from concrete files:
 - `typecheck-tests:watch` is inferred from `tsconfig.test.json` and runs the same typecheck in watch mode.
 - `test:watch` is inferred when the package already defines an explicit Bun or Vitest `test` command. The plugin derives
   the corresponding watch command and makes it depend on `typecheck-tests`.
-- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`; workspaces with
-  `cdylib` member crates also receive the cacheable `cargo-wasm` output target.
+- A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
+  `cargo-test-compile` stages test binaries out of `target/` so `cargo-test` can run them in parallel with a per-binary
+  timeout without taking Cargo's exclusive target lock (which cannot overlap `napi-debug` or any other cargo writer on
+  the same directory). APFS test binaries get `--test-threads=1`. Workspaces with `cdylib` member crates also receive
+  the cacheable `cargo-wasm` output target.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
