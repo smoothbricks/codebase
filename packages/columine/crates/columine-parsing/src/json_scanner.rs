@@ -5,33 +5,9 @@ use crate::{
     json_parser::{JsonParser, ParserError, Token},
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum JsonScannerError {
-    InvalidJson,
-    MissingField,
-    InvalidFieldType,
-    TooManyEvents,
-    BufferOverflow,
-}
-
-impl From<JsonScannerError> for ParseError {
-    fn from(value: JsonScannerError) -> Self {
-        match value {
-            JsonScannerError::InvalidJson => Self::InvalidJson,
-            JsonScannerError::MissingField => Self::MissingField,
-            JsonScannerError::InvalidFieldType => Self::InvalidFieldType,
-            JsonScannerError::TooManyEvents => Self::TooManyEvents,
-            JsonScannerError::BufferOverflow => Self::BufferOverflow,
-        }
-    }
-}
-
 /// Parses a JSON event array into the base event-log columns
 /// (`columine_arrow::BASE_EVENT_LOG_FIELDS`: id, type, timestamp, value).
-pub fn parse_json_events(
-    input: &[u8],
-    output: &mut DynamicColumns,
-) -> Result<(), JsonScannerError> {
+pub fn parse_json_events(input: &[u8], output: &mut DynamicColumns) -> Result<(), ParseError> {
     let mut parser = JsonParser::new(input);
     parser.expect_array_begin().map_err(json_error)?;
     while !parser.is_array_end() {
@@ -39,14 +15,14 @@ pub fn parse_json_events(
     }
     match parser.next_token().map_err(json_error)? {
         Token::ArrayEnd => Ok(()),
-        _ => Err(JsonScannerError::InvalidJson),
+        _ => Err(ParseError::InvalidJson),
     }
 }
 
 fn parse_event_object(
     parser: &mut JsonParser<'_>,
     output: &mut DynamicColumns,
-) -> Result<(), JsonScannerError> {
+) -> Result<(), ParseError> {
     parser.expect_object_begin().map_err(json_error)?;
     let mut id = None;
     let mut event_type = None;
@@ -59,14 +35,14 @@ fn parse_event_object(
                 id = Some(
                     parser
                         .expect_string()
-                        .map_err(|_| JsonScannerError::InvalidFieldType)?,
+                        .map_err(|_| ParseError::InvalidFieldType)?,
                 )
             }
             "type" => {
                 event_type = Some(
                     parser
                         .expect_string()
-                        .map_err(|_| JsonScannerError::InvalidFieldType)?,
+                        .map_err(|_| ParseError::InvalidFieldType)?,
                 )
             }
             "timestamp" => timestamp_micros = Some(parse_timestamp_token(parser)?),
@@ -81,40 +57,35 @@ fn parse_event_object(
     }
     match parser.next_token().map_err(json_error)? {
         Token::ObjectEnd => {}
-        _ => return Err(JsonScannerError::InvalidJson),
+        _ => return Err(ParseError::InvalidJson),
     }
     crate::commit_base_event(
         output,
-        id.ok_or(JsonScannerError::MissingField)?.as_bytes(),
-        event_type.ok_or(JsonScannerError::MissingField)?.as_bytes(),
-        timestamp_micros.ok_or(JsonScannerError::MissingField)?,
+        id.ok_or(ParseError::MissingField)?.as_bytes(),
+        event_type.ok_or(ParseError::MissingField)?.as_bytes(),
+        timestamp_micros.ok_or(ParseError::MissingField)?,
         value.as_deref(),
     )
-    .map_err(|error| match error {
-        ParseError::TooManyEvents => JsonScannerError::TooManyEvents,
-        ParseError::BufferOverflow => JsonScannerError::BufferOverflow,
-        _ => JsonScannerError::InvalidJson,
-    })
 }
 
-fn parse_timestamp_token(parser: &mut JsonParser<'_>) -> Result<i64, JsonScannerError> {
+fn parse_timestamp_token(parser: &mut JsonParser<'_>) -> Result<i64, ParseError> {
     match parser.next_token().map_err(json_error)? {
         Token::String(value) => {
-            parse_iso8601_to_micros(&value).map_err(|_| JsonScannerError::InvalidFieldType)
+            parse_iso8601_to_micros(&value).map_err(|_| ParseError::InvalidFieldType)
         }
         Token::Number(value) => value
             .parse::<i64>()
-            .map_err(|_| JsonScannerError::InvalidFieldType)
+            .map_err(|_| ParseError::InvalidFieldType)
             .and_then(|milliseconds| {
                 milliseconds
                     .checked_mul(1_000)
-                    .ok_or(JsonScannerError::InvalidFieldType)
+                    .ok_or(ParseError::InvalidFieldType)
             }),
-        _ => Err(JsonScannerError::InvalidFieldType),
+        _ => Err(ParseError::InvalidFieldType),
     }
 }
-fn json_error(_: ParserError) -> JsonScannerError {
-    JsonScannerError::InvalidJson
+fn json_error(_: ParserError) -> ParseError {
+    ParseError::InvalidJson
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -318,7 +289,7 @@ mod tests {
     fn parse_json_events_invalid_json_returns_error() {
         assert_eq!(
             parse_json_events(b"{not valid json", &mut columns()),
-            Err(JsonScannerError::InvalidJson)
+            Err(ParseError::InvalidJson)
         );
     }
     #[test]
@@ -328,7 +299,7 @@ mod tests {
                 br#"[{"id":"id-1","timestamp":"1970-01-01T00:00:00Z"}]"#,
                 &mut columns()
             ),
-            Err(JsonScannerError::MissingField)
+            Err(ParseError::MissingField)
         );
     }
     #[test]
