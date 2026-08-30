@@ -54,6 +54,29 @@ pub enum FlatUndoOp {
     StructMapRow = 13,
 }
 
+impl FlatUndoOp {
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::MapInsert),
+            2 => Some(Self::MapUpdate),
+            3 => Some(Self::MapDelete),
+            4 => Some(Self::SetInsert),
+            5 => Some(Self::SetDelete),
+            6 => Some(Self::AggUpdate),
+            7 => Some(Self::FactInsertNew),
+            8 => Some(Self::FactInsertUpdate),
+            9 => Some(Self::FactRetract),
+            10 => Some(Self::ListAppendUndo),
+            11 => Some(Self::CountUpdate),
+            12 => Some(Self::StructMapField),
+            13 => Some(Self::StructMapRow),
+            14 => Some(Self::ScalarUpdate),
+            15 => Some(Self::StateBytes),
+            _ => None,
+        }
+    }
+}
+
 /// Field-present flag in a `STRUCT_MAP_FIELD` entry.
 pub const SMF_BIT_SET: u8 = 0x01;
 /// Row-absent flag shared by struct-map rollback entries.
@@ -117,24 +140,7 @@ impl FlatUndoEntry {
     /// or foreign segment — an operational condition for segment consumers,
     /// not a programmer bug).
     pub fn read_from(buf: &[u8; FLAT_UNDO_ENTRY_SIZE as usize]) -> Option<Self> {
-        let op = match buf[0] {
-            1 => FlatUndoOp::MapInsert,
-            2 => FlatUndoOp::MapUpdate,
-            3 => FlatUndoOp::MapDelete,
-            4 => FlatUndoOp::SetInsert,
-            5 => FlatUndoOp::SetDelete,
-            6 => FlatUndoOp::AggUpdate,
-            7 => FlatUndoOp::FactInsertNew,
-            8 => FlatUndoOp::FactInsertUpdate,
-            9 => FlatUndoOp::FactRetract,
-            10 => FlatUndoOp::ListAppendUndo,
-            11 => FlatUndoOp::CountUpdate,
-            14 => FlatUndoOp::ScalarUpdate,
-            12 => FlatUndoOp::StructMapField,
-            13 => FlatUndoOp::StructMapRow,
-            15 => FlatUndoOp::StateBytes,
-            _ => return None,
-        };
+        let op = FlatUndoOp::from_u8(buf[0])?;
         Some(Self {
             op,
             slot: buf[1],

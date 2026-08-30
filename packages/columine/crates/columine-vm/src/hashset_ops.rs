@@ -4,7 +4,7 @@
 //! `hooks::VmHooks`.
 
 use crate::hash_table::{ENTRY_NONE, FlatTable};
-use crate::hooks::{MutationOp, MutationRecord, VmHooks};
+use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
 use columine_types::types::{ChangeFlag, ErrorCode, SlotMetaOffset, SlotType, TOMBSTONE};
 
@@ -66,20 +66,8 @@ pub fn batch_set_insert(
                 hooks.append_mutation(
                     delta_mode,
                     state,
-                    MutationRecord {
-                        op: MutationOp::SetInsert,
-                        slot: slot_idx,
-                        key: elem,
-                        prev_value: 0,
-                        aux: 0,
-                    },
-                    MutationRecord {
-                        op: MutationOp::SetDelete,
-                        slot: slot_idx,
-                        key: elem,
-                        prev_value: 0,
-                        aux: 0,
-                    },
+                    MutationRecord::set_insert(slot_idx, elem),
+                    MutationRecord::set_delete(slot_idx, elem, 0),
                 );
             }
 
@@ -155,20 +143,8 @@ pub fn batch_set_remove(
             hooks.append_mutation(
                 delta_mode,
                 state,
-                MutationRecord {
-                    op: MutationOp::SetDelete,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: prev_ts_bits,
-                },
-                MutationRecord {
-                    op: MutationOp::SetInsert,
-                    slot: slot_idx,
-                    key: elem,
-                    prev_value: 0,
-                    aux: 0,
-                },
+                MutationRecord::set_delete(slot_idx, elem, prev_ts_bits),
+                MutationRecord::set_insert(slot_idx, elem),
             );
         }
         if meta.has_ttl() {

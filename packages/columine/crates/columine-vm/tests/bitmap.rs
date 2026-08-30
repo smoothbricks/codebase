@@ -7,12 +7,13 @@ use columine_vm::bitmap_ops::{
     cardinality_serialized, contains_serialized, extract_serialized, get_bitmap_storage,
     intersect_count_serialized, intersects_serialized, set_algebra,
 };
-use columine_vm::hooks::{MutationOp, MutationRecord, NoVm, VmHooks};
+use columine_vm::hooks::{MutationRecord, NoVm, VmHooks};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::minroar::MiniRoaring as RoaringBitmap;
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, EVICTION_ENTRY_SIZE, calculate_state_size, init_state,
 };
+use columine_vm::undo_log::FlatUndoOp;
 use columine_vm::vm::{Vm, find_latest_eviction_timestamp_for_key};
 use proptest::prelude::*;
 
@@ -706,11 +707,11 @@ proptest! {
         let mut bitmap = bitmap_load(&mut env, &state, storage).expect("accepted image reloads");
         for (undo, _) in hooks.mutations.iter().rev() {
             match undo.op {
-                MutationOp::SetInsert => {
+                FlatUndoOp::SetInsert => {
                     prop_assert!(bitmap.remove(undo.key));
                     hooks.ttl_by_key.remove(&undo.key);
                 }
-                MutationOp::SetDelete => {
+                FlatUndoOp::SetDelete => {
                     prop_assert!(bitmap.insert(undo.key));
                     hooks.ttl_by_key.insert(undo.key, undo.aux);
                 }
