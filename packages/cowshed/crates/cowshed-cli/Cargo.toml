@@ -25,4 +25,11 @@ tokio.workspace = true
 # reordering or dropping a key its author set. Parsing is what makes the never-clobber decision
 # honest; preservation comes from never rewriting those bytes at all — cowshed's block is appended
 # below them, and only that block is ever rewritten.
+#
+# `serde` is load-bearing and is NOT about (de)serializing our own types, so enumerating call
+# sites will mislead you: in toml 1.x the `toml::Table` and `toml::Value` types are themselves
+# behind `#[cfg(feature = "serde")]`, and sccache_client_config.rs reads the config through
+# both. Dropping the feature does not trim a feature, it deletes the types —
+# `cargo check -p cowshed-cli` then fails with "cannot find type `Table` in crate `toml`".
+# Verify with a build, not by reading usage, before touching this line.
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
