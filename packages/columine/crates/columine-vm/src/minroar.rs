@@ -645,6 +645,115 @@ impl MiniRoaring {
         Ok(MiniRoaring { keys, containers })
     }
 }
+fn scan_serialized(data: &[u8], needle: Option<u32>) -> Result<(u32, bool), InvalidFormat> {
+    let mut reader = Reader { data, pos: 0 };
+    let cookie = reader.u32()?;
+    let (container_count, run_flags) = if cookie & 0xFFFF == SERIAL_COOKIE {
+        let count = ((cookie >> 16) & 0xFFFF) as usize + 1;
+        (count, Some(reader.bytes(count.div_ceil(8))?))
+    } else if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
+        (reader.u32()? as usize, None)
+    } else {
+        return Err(InvalidFormat);
+    };
+    if container_count > 65536 {
+        return Err(InvalidFormat);
+    }
+
+    let headers_start = reader.pos;
+    let mut previous_key = None;
+    let mut cardinality = 0u64;
+    for _ in 0..container_count {
+        let key = reader.u16()?;
+        if previous_key.is_some_and(|previous| previous >= key) {
+            return Err(InvalidFormat);
+        }
+        previous_key = Some(key);
+        cardinality += u64::from(reader.u16()?) + 1;
+    }
+    if run_flags.is_none() || container_count >= NO_OFFSET_THRESHOLD {
+        reader.bytes(container_count.checked_mul(4).ok_or(InvalidFormat)?)?;
+    }
+
+    let needle_high = needle.map(|value| (value >> 16) as u16);
+    let needle_low = needle.map(|value| value as u16);
+    let mut contains = false;
+    for index in 0..container_count {
+        let header = headers_start + index * 4;
+        let key = u16::from_le_bytes([data[header], data[header + 1]]);
+        let card = u32::from(u16::from_le_bytes([data[header + 2], data[header + 3]])) + 1;
+        let is_run = run_flags.is_some_and(|flags| flags[index / 8] & (1 << (index % 8)) != 0);
+        let targets_container = needle_high == Some(key);
+
+        if is_run {
+            let run_count = usize::from(reader.u16()?);
+            let mut total = 0u32;
+            let mut previous_end = None;
+            for _ in 0..run_count {
+                let start = reader.u16()?;
+                let length = reader.u16()?;
+                let end = u32::from(start) + u32::from(length);
+                if end > u32::from(u16::MAX)
+                    || previous_end.is_some_and(|previous| u32::from(start) <= previous)
+                {
+                    return Err(InvalidFormat);
+                }
+                if targets_container
+                    && needle_low.is_some_and(|low| {
+                        u32::from(low) >= u32::from(start) && u32::from(low) <= end
+                    })
+                {
+                    contains = true;
+                }
+                previous_end = Some(end);
+                total += u32::from(length) + 1;
+            }
+            if total != card {
+                return Err(InvalidFormat);
+            }
+        } else if card as usize <= ARRAY_MAX_CARDINALITY {
+            let mut previous = None;
+            for _ in 0..card {
+                let low = reader.u16()?;
+                if previous.is_some_and(|value| value >= low) {
+                    return Err(InvalidFormat);
+                }
+                contains |= targets_container && needle_low == Some(low);
+                previous = Some(low);
+            }
+        } else {
+            let raw = reader.bytes(BITSET_SIZE_BYTES)?;
+            let mut actual = 0u32;
+            for (word_index, chunk) in raw.as_chunks::<8>().0.iter().enumerate() {
+                let word = u64::from_le_bytes(*chunk);
+                actual += word.count_ones();
+                if targets_container
+                    && let Some(low) = needle_low
+                    && usize::from(low) / 64 == word_index
+                {
+                    contains |= word & (1u64 << (low % 64)) != 0;
+                }
+            }
+            if actual != card {
+                return Err(InvalidFormat);
+            }
+        }
+    }
+    Ok((cardinality.min(u64::from(u32::MAX)) as u32, contains))
+}
+
+impl MiniRoaring {
+    /// Validate portable bytes and read cardinality without materializing
+    /// containers.
+    pub fn len_bytes(data: &[u8]) -> Result<u32, InvalidFormat> {
+        scan_serialized(data, None).map(|(cardinality, _)| cardinality)
+    }
+
+    /// Validate portable bytes and probe one value without allocating.
+    pub fn contains_bytes(data: &[u8], value: u32) -> Result<bool, InvalidFormat> {
+        scan_serialized(data, Some(value)).map(|(_, contains)| contains)
+    }
+}
 
 struct Reader<'a> {
     data: &'a [u8],
