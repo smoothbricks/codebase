@@ -21,6 +21,11 @@
   # Nx otherwise defaults to three workers. Scale to the cores available in each
   # developer shell or CI runner; explicit --parallel flags still take precedence.
   env.NX_PARALLEL = "100%";
+  # cc-rs documented form (wrapper plus driver). Not CC/CXX: xcodebuild reads
+  # those and then dies on -index-store-path. print-dev-env exports these into
+  # cowshed exec; enterShell is not in that snapshot.
+  env.HOST_CC = "sccache cc";
+  env.HOST_CXX = "sccache c++";
 
   # One toolchain for every repository and every workspace, pinned by devenv.lock
   # rather than by a rust-toolchain file. devenv resolves the channel through
@@ -236,7 +241,8 @@
     #    actually be reasoned about.
     # 8. On Darwin, drop nix CC/CXX so xcodebuild finds Xcode's clang (it supports
     #    -index-store-path); bun/node native addons find compilers through
-    #    node-gyp.
+    #    node-gyp. Host C from cc-rs is wrapped with HOST_CC/HOST_CXX set to the
+    #    documented `sccache cc` form — never CC/CXX, which xcodebuild reads.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
