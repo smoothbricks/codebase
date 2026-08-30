@@ -1,16 +1,14 @@
 use crate::args::GatewayCommand;
 use crate::launchd::{
-    COWSHED_BINARY_NAME, ExecutableInstallState, ExecutableSource, ExistingPlist, GATEWAY_LABEL,
+    COWSHED_BINARY_NAME, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE, classify_executable_source,
-    containing_mount_point, plan_executable_install, plan_executable_remove, plan_install,
-    plan_remove,
+    NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE, plan_executable_install,
+    plan_executable_remove, plan_install, plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus};
-use cowshed_core::storage::WORKSPACE_MARKER_PATH;
 use cowshed_core::{
     CowshedError, NativeGatewayInventory, Result, ValidatedHostStorage,
     validate_existing_host_storage,
@@ -582,14 +580,9 @@ pub fn emit_gateway_status<W: Write, E: Write>(
 
 /// Install `source` at the host-stable path launchd will run, and answer with that path.
 ///
-/// This is what keeps a LaunchAgent independent of wherever the user's cowshed happens to live:
-/// the plist names a copy on the volume that carries the plist itself, so the agent starts on a
-/// host that has since rebuilt, updated, or deleted the binary that installed it.
-///
-/// A binary on cowshed's own storage is refused rather than copied. That is the incident this
-/// exists for — a gateway installed from inside a workspace mount exited 78 in a loop after a
-/// reboot, with nothing left to mount what would have healed it — and a workspace's own build is
-/// not the host's cowshed.
+/// The plist names a copy on the volume that carries the plist itself, so the agent
+/// starts after the build that installed it is gone. The source may live in a workspace
+/// or the nix store: those paths are unreadable at boot, but the copy is not.
 pub fn install_host_stable_executable<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     home: &Path,
@@ -605,7 +598,6 @@ where
         // copying a file onto itself is the one publication the plan cannot express.
         return Ok(executable);
     }
-    require_durable_source(home, &executable, source)?;
     let state = observe_executable_install(&executable, source)?;
     executor
         .execute_install(&plan_executable_install(&executable, source, state))
@@ -637,8 +629,7 @@ pub fn installed_binary_is_stale(state: &ExecutableInstallState) -> bool {
 /// nothing to say: no gateway agent installed (nothing runs the binary), the bytes already
 /// match, or this IS the installed copy speaking. A stale copy is reinstalled through the same
 /// atomic plan `gateway start` uses and the agent is kickstarted so the running daemon picks the
-/// new bytes up; a source launchd could not reach at boot (a workspace-resident build) reports
-/// the drift and the durable remedy instead of installing a binary that would dangle.
+/// new bytes up. The invoking build may live on a workspace volume; the copy does not.
 pub fn refresh_gateway_binary(home: &Path) -> Result<Option<ServiceBinaryRefresh>> {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     let source = running_executable()?;
@@ -653,15 +644,6 @@ pub fn refresh_gateway_binary(home: &Path) -> Result<Option<ServiceBinaryRefresh
     let state = observe_executable_install(&executable, &source)?;
     if !installed_binary_is_stale(&state) {
         return Ok(None);
-    }
-    if require_durable_source(home, &executable, &source).is_err() {
-        return Ok(Some(ServiceBinaryRefresh::Stale {
-            service: spec.label().to_owned(),
-            remedy: format!(
-                "run cowshed setup from a build outside every workspace mount (the installed copy is {})",
-                executable.path().display()
-            ),
-        }));
     }
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     executor
@@ -678,47 +660,6 @@ pub fn refresh_gateway_binary(home: &Path) -> Result<Option<ServiceBinaryRefresh
     Ok(Some(ServiceBinaryRefresh::Refreshed {
         service: spec.label().to_owned(),
     }))
-}
-
-/// Refuse a source launchd could not reach at boot, saying which volume and why.
-///
-/// The hint names the installed copy when there is one, because that is the case an operator
-/// actually hits: a cowshed reached through a workspace-resident trampoline cannot install the
-/// agent, while the copy already on the host volume can.
-fn require_durable_source(
-    home: &Path,
-    executable: &HostStableExecutable,
-    source: &Path,
-) -> Result<()> {
-    let mount_point = containing_mount_point(source).map_err(|error| {
-        CowshedError::internal(format!(
-            "could not resolve the volume holding {}: {error}",
-            source.display()
-        ))
-    })?;
-    let observed = ExecutableSource {
-        path: source,
-        mount_point: &mount_point,
-        mount_is_workspace: fs::symlink_metadata(mount_point.join(WORKSPACE_MARKER_PATH)).is_ok(),
-    };
-    classify_executable_source(home, observed).map_err(|unstable| {
-        let hint = if fs::symlink_metadata(executable.path()).is_ok() {
-            format!("start the service from {}", executable.path().display())
-        } else {
-            format!(
-                "install {} outside every cowshed workspace and run this command from that binary",
-                executable.name()
-            )
-        };
-        CowshedError::environment_missing(
-            format!(
-                "{unstable}, so a LaunchAgent installed from it would dangle after a reboot: \
-                 launchd starts the agent before cowshed has mounted anything, and the service \
-                 exits 78 in a KeepAlive loop with nothing left to mount what would heal it"
-            ),
-            hint,
-        )
-    })
 }
 
 /// What the host has at the stable path, and whether it is already this source.
