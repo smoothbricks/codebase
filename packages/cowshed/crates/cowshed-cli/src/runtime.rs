@@ -31,8 +31,9 @@ use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
-    CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, STORE_ROOT,
-    ValidatedHostStorage, execute_host_setup, plan_host_setup,
+    APFS_CACHES_VOLUME, APFS_STORE_VOLUME, CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan,
+    HostSetupReport, MOUNT_SERVICE_PLIST, STORE_ROOT, ValidatedHostStorage, execute_host_setup,
+    plan_host_setup,
 };
 use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
@@ -2501,8 +2502,8 @@ fn host_action_evidence(action: &HostAction) -> String {
 fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (name, expected) in [
-        ("cowshed.store", Path::new(STORE_ROOT)),
-        ("cowshed.caches", Path::new(CACHES_ROOT)),
+        (APFS_STORE_VOLUME, Path::new(STORE_ROOT)),
+        (APFS_CACHES_VOLUME, Path::new(CACHES_ROOT)),
     ] {
         let action = plan.actions.iter().find(|action| {
             matches!(
@@ -2644,9 +2645,7 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
                 severity: FindingSeverity::Error,
                 message: format!("system LaunchDaemon {label} is missing, outdated, or not loaded"),
                 hint: "cowshed setup".into(),
-                path: Some(PathBuf::from(
-                    "/Library/LaunchDaemons/dev.cowshed.storage.plist",
-                )),
+                path: Some(PathBuf::from(MOUNT_SERVICE_PLIST)),
             }),
             HostAction::CreateVolume { .. }
             | HostAction::MountExisting { .. }

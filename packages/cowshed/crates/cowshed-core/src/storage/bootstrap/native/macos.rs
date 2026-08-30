@@ -19,10 +19,10 @@ use super::super::{
     APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind, ApfsVolumeProvision, BlockingLane,
     BootstrapEvidence, BootstrapExecutionError, BootstrapHost, BootstrapPlan, CanonicalRoots,
     CreatedMountState, DISKUTIL, ExistingStorage, HostCommand, HostCommandFailure,
-    HostCommandOutput, HostError, HostOperation, MountpointState, StatFsEvidence, SubstrateKind,
-    TokioBlockingLane, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeMarker, VolumeRole,
-    attest_created_apfs_info, execute_bootstrap_operation, parse_created_apfs_identifier,
-    plan_bootstrap, require_mounted_marker, select_substrate,
+    HostCommandOutput, HostError, HostOperation, MOUNT_SERVICE_PLIST, MountpointState,
+    StatFsEvidence, SubstrateKind, TokioBlockingLane, VOLUME_MARKER_FILE, ValidatedHostStorage,
+    VolumeMarker, VolumeRole, attest_created_apfs_info, execute_bootstrap_operation,
+    parse_created_apfs_identifier, plan_bootstrap, require_mounted_marker, select_substrate,
 };
 use super::shared::{
     FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan, HostSetupReport,
@@ -54,7 +54,6 @@ const MOUNT_SERVICE_LABEL: &str = "dev.cowshed.storage";
 const MOUNT_SERVICE_TARGET: &str = "system/dev.cowshed.storage";
 const MOUNT_SERVICE_DIRECTORY: &str = "/Library/Application Support/dev.cowshed";
 const MOUNT_SERVICE_SCRIPT: &str = "/Library/Application Support/dev.cowshed/mount-volumes.sh";
-const MOUNT_SERVICE_PLIST: &str = "/Library/LaunchDaemons/dev.cowshed.storage.plist";
 const AUTHORIZATION_DENIED: i32 = -60005;
 const AUTHORIZATION_CANCELED: i32 = -60006;
 

@@ -31,6 +31,9 @@ pub const APFS_CACHES_VOLUME: &str = "cowshed.caches";
 pub const STORE_ROOT: &str = "/private/cowshed/store";
 /// Machine-global rebuildable-cache volume root; see [`STORE_ROOT`] for the `$HOME` invariant.
 pub const CACHES_ROOT: &str = "/private/cowshed/caches";
+/// Where launchd reads the storage mount service from; owned here so the CLI's doctor names the
+/// same file the macOS planner installs.
+pub const MOUNT_SERVICE_PLIST: &str = "/Library/LaunchDaemons/dev.cowshed.storage.plist";
 pub const ZFS_COWSHED_ROOT: &str = "cowshed";
 pub const ZFS_STORE_CHILD: &str = "store";
 pub const ZFS_CACHES_CHILD: &str = "caches";
