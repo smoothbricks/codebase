@@ -2,6 +2,7 @@
 
 import { createRequire } from 'node:module';
 import typia from 'typia';
+import { platformDirectory } from './platform.js';
 import type { CoordinatorEndpoint } from './types.js';
 
 export interface NativeProjectHandle {
@@ -87,21 +88,11 @@ interface NativeBinary {
 }
 
 function nativeBinary(): NativeBinary {
-  switch (process.platform) {
-    case 'darwin':
-      if (process.arch === 'arm64' || process.arch === 'x64') {
-        const directory = `darwin-${process.arch}`;
-        return { directory, fileName: `cowshed.${directory}.node` };
-      }
-      break;
-    case 'linux':
-      if (process.arch === 'arm64' || process.arch === 'x64') {
-        const directory = `linux-${process.arch}-gnu`;
-        return { directory, fileName: `cowshed.${directory}.node` };
-      }
-      break;
+  const directory = platformDirectory(process.platform, process.arch);
+  if (directory === null) {
+    throw new Error(`Unsupported Cowshed native target: ${process.platform}-${process.arch}`);
   }
-  throw new Error(`Unsupported Cowshed native target: ${process.platform}-${process.arch}`);
+  return { directory, fileName: `cowshed.${directory}.node` };
 }
 
 export function loadNativeModule(): NativeModule {
