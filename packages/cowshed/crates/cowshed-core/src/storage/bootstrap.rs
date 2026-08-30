@@ -39,7 +39,7 @@ pub const ZFS_STORE_CHILD: &str = "store";
 pub const ZFS_CACHES_CHILD: &str = "caches";
 pub const ZFS_PROJECTS_CHILD: &str = "projects";
 
-const DISKUTIL: &str = "/usr/sbin/diskutil";
+pub(crate) use crate::device::DISKUTIL;
 const ZFS: &str = "/usr/sbin/zfs";
 const MARKER_VERSION: u32 = 1;
 
