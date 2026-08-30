@@ -354,78 +354,31 @@ fn installing_the_agent_binary_publishes_a_host_stable_copy_and_reuses_it() {
     fs::remove_dir_all(&home).expect("remove scratch home");
 }
 
-/// The incident: a cowshed running from inside its own store installed an agent that launchd
-/// could not reach after a reboot, and nothing was left to mount it. Refusal names the reason.
+/// A workspace or store build is a valid source of the copy. launchd runs the
+/// copy on Application Support, not the source path, so a reboot does not need
+/// that volume mounted.
 #[test]
-fn installing_from_cowshed_storage_is_refused_with_the_reboot_reason() {
-    let home = scratch_home("refusal");
+fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
+    let home = scratch_home("workspace-source");
     let source = home.join(".cowshed/mnt/acme/widget/main/target/release/cowshed");
     fs::create_dir_all(source.parent().expect("workspace directory")).expect("workspace directory");
     fs::write(&source, b"#!/bin/sh\nexit 0\n").expect("workspace binary");
 
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    let error = install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
-        .expect_err("a binary inside the store is refused");
-
-    // The message is the whole deliverable of a refusal: it has to name the volume, the
-    // consequence, and the exit code an operator will find in the log.
-    assert_eq!(error.code.as_str(), "environment-missing");
-    assert_eq!(
-        error.message,
-        format!(
-            "the binary is inside the cowshed store at {}/.cowshed, so a LaunchAgent installed \
-             from it would dangle after a reboot: launchd starts the agent before cowshed has \
-             mounted anything, and the service exits 78 in a KeepAlive loop with nothing left to \
-             mount what would heal it",
-            home.display()
-        )
-    );
-    assert_eq!(
-        error.hint,
-        "install cowshed outside every cowshed workspace and run this command from that binary"
-    );
-    // Nothing was installed, so no plist can name a path inside the store.
-    assert!(
-        fs::symlink_metadata(home.join("Library/Application Support/dev.cowshed/bin/cowshed"))
-            .is_err()
-    );
-
-    fs::remove_dir_all(&home).expect("remove scratch home");
-}
-
-/// The host this fix comes from reaches cowshed through a trampoline inside a workspace mount, so
-/// the refusal has to name the binary that can install the agent: the copy already on the host
-/// volume, which is the one path `install_host_stable_executable` accepts unconditionally.
-#[test]
-fn refusal_points_at_the_installed_copy_when_the_host_already_has_one() {
-    let home = scratch_home("refusal-installed");
-    let installed = home.join("Library/Application Support/dev.cowshed/bin/cowshed");
-    fs::create_dir_all(installed.parent().expect("bin directory")).expect("bin directory");
-    fs::write(&installed, b"#!/bin/sh\nexit 0\n").expect("installed binary");
-
-    let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    // A scratch home is on the host volume, so the store prefix is what refuses here; a real
-    // workspace mount is refused by its marker or by being mounted inside the home.
-    let store_source = home.join(".cowshed/mnt/acme/widget/main/target/debug/cowshed");
-    fs::create_dir_all(store_source.parent().expect("store directory")).expect("store directory");
-    fs::write(&store_source, b"#!/bin/sh\nexit 1\n").expect("store binary");
-    let error =
-        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &store_source)
-            .expect_err("a binary inside the store is refused");
-
-    assert_eq!(
-        error.hint,
-        format!("start the service from {}", installed.display())
-    );
-    // And that binary is accepted, so the hint is a command that works.
     let executable =
-        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &installed)
-            .expect("the installed copy installs itself");
-    assert_eq!(executable.path(), installed);
+        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
+            .expect("copy from a workspace build succeeds");
+
     assert_eq!(
-        fs::read(&installed).expect("installed bytes"),
+        executable.path(),
+        home.join("Library/Application Support/dev.cowshed/bin/cowshed")
+    );
+    assert_eq!(
+        fs::read(executable.path()).expect("installed bytes"),
         b"#!/bin/sh\nexit 0\n"
     );
+    let spec = LaunchAgentSpec::gateway(&executable).expect("valid spec");
+    assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
     fs::remove_dir_all(&home).expect("remove scratch home");
 }
