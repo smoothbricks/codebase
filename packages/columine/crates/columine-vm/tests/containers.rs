@@ -18,13 +18,86 @@ use columine_vm::hashmap_ops::{
 use columine_vm::hashset_ops::{
     batch_set_insert, batch_set_remove, bind_slot_set, single_set_insert, single_set_remove,
 };
-use columine_vm::hooks::NoVm;
+use columine_vm::hooks::{MutationRecord, NoVm, VmHooks};
 use columine_vm::meta::SlotMetaView;
 use proptest::prelude::*;
 // The `hashmap_ops::Strategy` ENUM above shadows the prelude's `Strategy`
 // TRAIT (explicit import beats glob); re-import the trait under an alias so
 // `.prop_map` resolves.
 use proptest::strategy::Strategy as PropStrategy;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Default, PartialEq)]
+struct RecordingHooks {
+    ttl_by_key: BTreeMap<u32, u64>,
+    mutations: Vec<(MutationRecord, MutationRecord)>,
+}
+
+impl VmHooks for RecordingHooks {
+    fn undo_enabled(&self) -> bool {
+        true
+    }
+
+    fn append_mutation(
+        &mut self,
+        _delta_mode: bool,
+        _state: &[u8],
+        undo: MutationRecord,
+        redo: MutationRecord,
+    ) {
+        self.mutations.push((undo, redo));
+    }
+
+    fn insert_with_ttl(
+        &mut self,
+        _state: &mut [u8],
+        _meta: &SlotMetaView,
+        key: u32,
+        ts: f64,
+    ) -> ErrorCode {
+        self.ttl_by_key.insert(key, ts.to_bits());
+        ErrorCode::Ok
+    }
+
+    fn latest_eviction_ts(&self, _state: &[u8], _meta: &SlotMetaView, key: u32) -> Option<f64> {
+        self.ttl_by_key.get(&key).copied().map(f64::from_bits)
+    }
+
+    fn remove_ttl_entries_for_key(&mut self, _state: &mut [u8], _meta: &SlotMetaView, key: u32) {
+        self.ttl_by_key.remove(&key);
+    }
+
+    fn undo_overflow(&self) -> bool {
+        false
+    }
+
+    fn force_undo_snapshot(&mut self, _state: &[u8]) {
+        unreachable!("the container differential never overflows its recording log")
+    }
+
+    fn batch_bitmap_add(
+        &mut self,
+        _delta_mode: bool,
+        _state: &mut [u8],
+        _meta: &SlotMetaView,
+        _slot_idx: u8,
+        _elems: &[u32],
+        _ts_col: Option<&[f64]>,
+    ) -> ErrorCode {
+        unreachable!("the container differential uses flat hash sets")
+    }
+
+    fn batch_bitmap_remove(
+        &mut self,
+        _delta_mode: bool,
+        _state: &mut [u8],
+        _meta: &SlotMetaView,
+        _slot_idx: u8,
+        _elems: &[u32],
+    ) {
+        unreachable!("the container differential uses flat hash sets")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test scaffolding: manual state construction with a header, one 48-byte
@@ -1111,6 +1184,156 @@ fn op_strategy() -> impl proptest::strategy::Strategy<Value = Op> {
     // Small key range forces collisions, tombstone reuse, and probe chains.
     let keys: std::ops::Range<u32> = 1..40;
     prop_oneof![keys.clone().prop_map(Op::Insert), keys.prop_map(Op::Remove),]
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TtlOp {
+    Upsert {
+        key: u32,
+        value: u32,
+        timestamp_bits: u64,
+        first: bool,
+    },
+    Remove(u32),
+}
+
+fn ttl_op_strategy() -> impl proptest::strategy::Strategy<Value = TtlOp> {
+    prop_oneof![
+        (1u32..24, any::<u32>(), any::<u64>(), any::<bool>()).prop_map(
+            |(key, value, timestamp_bits, first)| TtlOp::Upsert {
+                key,
+                value,
+                timestamp_bits,
+                first,
+            }
+        ),
+        (1u32..24).prop_map(TtlOp::Remove),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Batch-size-one and per-element mutation paths are one operation:
+    /// primary bytes, TTL index effects, and serialized undo records agree
+    /// after every step of an arbitrary sequence.
+    #[test]
+    fn single_and_batch_size_one_are_identical(
+        ops in proptest::collection::vec(ttl_op_strategy(), 1..100)
+    ) {
+        let cap = 32;
+        let mut batch_map = mk_slot_state(cap, 0x10); // HASHMAP + TTL
+        let mut single_map = batch_map.clone();
+        cmp_lane_fill(&mut batch_map, cap, f64::NEG_INFINITY.to_bits());
+        cmp_lane_fill(&mut single_map, cap, f64::NEG_INFINITY.to_bits());
+        let batch_map_meta = meta_of(&batch_map);
+        let single_map_meta = meta_of(&single_map);
+        let mut batch_map_hooks = RecordingHooks::default();
+        let mut single_map_hooks = RecordingHooks::default();
+
+        let mut batch_set = mk_slot_state(cap, 0x11); // HASHSET + TTL
+        let mut single_set = batch_set.clone();
+        let batch_set_meta = meta_of(&batch_set);
+        let single_set_meta = meta_of(&single_set);
+        let mut batch_set_hooks = RecordingHooks::default();
+        let mut single_set_hooks = RecordingHooks::default();
+
+        for op in ops {
+            match op {
+                TtlOp::Upsert { key, value, timestamp_bits, first } => {
+                    let timestamp = f64::from_bits(timestamp_bits);
+                    let strategy = if first { Strategy::First } else { Strategy::Last };
+                    let timestamp_col = timestamp.to_le_bytes();
+
+                    let batch_result = batch_map_upsert(
+                        strategy,
+                        false,
+                        &mut batch_map,
+                        &batch_map_meta,
+                        0,
+                        &[key],
+                        &[value],
+                        Some(&timestamp_col),
+                        CmpType::F64,
+                        &mut batch_map_hooks,
+                    );
+                    let single_result = single_map_upsert(
+                        strategy,
+                        false,
+                        &mut single_map,
+                        &single_map_meta,
+                        0,
+                        key,
+                        value,
+                        timestamp_bits,
+                        CmpType::F64,
+                        &mut single_map_hooks,
+                    );
+                    prop_assert_eq!(single_result, batch_result);
+
+                    let batch_result = batch_set_insert(
+                        false,
+                        &mut batch_set,
+                        &batch_set_meta,
+                        0,
+                        &[key],
+                        Some(&[timestamp]),
+                        &mut batch_set_hooks,
+                    );
+                    let single_result = single_set_insert(
+                        false,
+                        &mut single_set,
+                        &single_set_meta,
+                        0,
+                        key,
+                        timestamp,
+                        &mut single_set_hooks,
+                    );
+                    prop_assert_eq!(single_result, batch_result);
+                }
+                TtlOp::Remove(key) => {
+                    batch_map_remove(
+                        false,
+                        &mut batch_map,
+                        &batch_map_meta,
+                        0,
+                        &[key],
+                        &mut batch_map_hooks,
+                    );
+                    single_map_remove(
+                        false,
+                        &mut single_map,
+                        &single_map_meta,
+                        0,
+                        key,
+                        &mut single_map_hooks,
+                    );
+
+                    batch_set_remove(
+                        false,
+                        &mut batch_set,
+                        &batch_set_meta,
+                        0,
+                        &[key],
+                        &mut batch_set_hooks,
+                    );
+                    single_set_remove(
+                        false,
+                        &mut single_set,
+                        &single_set_meta,
+                        0,
+                        key,
+                        &mut single_set_hooks,
+                    );
+                }
+            }
+
+            prop_assert_eq!(&single_map, &batch_map);
+            prop_assert_eq!(&single_map_hooks, &batch_map_hooks);
+            prop_assert_eq!(&single_set, &batch_set);
+            prop_assert_eq!(&single_set_hooks, &batch_set_hooks);
+        }
+    }
 }
 
 proptest! {
