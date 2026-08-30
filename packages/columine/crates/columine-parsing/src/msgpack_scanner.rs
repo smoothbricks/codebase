@@ -1,6 +1,6 @@
 //! MessagePack scanner for event extraction.
 
-use crate::{EventColumns, ParseError};
+use crate::{DynamicColumns, ParseError};
 
 pub use crate::json_scanner::parse_iso8601_to_micros;
 
@@ -26,7 +26,7 @@ impl From<MsgpackScannerError> for ParseError {
 
 pub fn parse_msgpack_events(
     input: &[u8],
-    output: &mut EventColumns,
+    output: &mut DynamicColumns,
 ) -> Result<(), MsgpackScannerError> {
     if input.is_empty() {
         return Ok(());
@@ -42,7 +42,7 @@ pub fn parse_msgpack_events(
 }
 pub fn parse_msgpack_stream(
     input: &[u8],
-    output: &mut EventColumns,
+    output: &mut DynamicColumns,
 ) -> Result<(), MsgpackScannerError> {
     let mut reader = Reader::new(input);
     while !reader.at_end() {
@@ -53,7 +53,7 @@ pub fn parse_msgpack_stream(
 
 fn parse_event_map(
     reader: &mut Reader<'_>,
-    output: &mut EventColumns,
+    output: &mut DynamicColumns,
 ) -> Result<(), MsgpackScannerError> {
     let fields = reader
         .read_map_header()
@@ -113,20 +113,20 @@ fn parse_event_map(
                 .ok_or(MsgpackScannerError::InvalidMsgpack)?,
         }
     }
-    output
-        .add_event(
-            id.ok_or(MsgpackScannerError::MissingField)?.as_bytes(),
-            event_type
-                .ok_or(MsgpackScannerError::MissingField)?
-                .as_bytes(),
-            timestamp.ok_or(MsgpackScannerError::MissingField)?,
-            value.as_deref(),
-        )
-        .map_err(|error| match error {
-            ParseError::TooManyEvents => MsgpackScannerError::TooManyEvents,
-            ParseError::BufferOverflow => MsgpackScannerError::BufferOverflow,
-            _ => MsgpackScannerError::InvalidMsgpack,
-        })
+    crate::commit_base_event(
+        output,
+        id.ok_or(MsgpackScannerError::MissingField)?.as_bytes(),
+        event_type
+            .ok_or(MsgpackScannerError::MissingField)?
+            .as_bytes(),
+        timestamp.ok_or(MsgpackScannerError::MissingField)?,
+        value.as_deref(),
+    )
+    .map_err(|error| match error {
+        ParseError::TooManyEvents => MsgpackScannerError::TooManyEvents,
+        ParseError::BufferOverflow => MsgpackScannerError::BufferOverflow,
+        _ => MsgpackScannerError::InvalidMsgpack,
+    })
 }
 
 /// Minimal byte reader for the MessagePack surface used by Columine.
@@ -403,7 +403,7 @@ mod tests {
     }
     #[test]
     fn parse_msgpack_stream_single_event_with_int_timestamp() {
-        let mut c = EventColumns::new(10);
+        let mut c = crate::base_columns(10);
         parse_msgpack_stream(
             &event("abc-123", 1_705_315_800_000, Some(&[0x81, 0xa1, b'x', 1])),
             &mut c,
@@ -421,7 +421,7 @@ mod tests {
     fn parse_msgpack_stream_multiple_events_concatenated() {
         let mut input = event("id-1", 1_000, None);
         input.extend(event("id-2", 2_000, None));
-        let mut c = EventColumns::new(10);
+        let mut c = crate::base_columns(10);
         parse_msgpack_stream(&input, &mut c).unwrap();
         assert_eq!(c.count, 2);
         assert_eq!(crate::parsed_event(&c, 1).unwrap().id, "id-2");
@@ -433,7 +433,7 @@ mod tests {
         let mut input = vec![0x92];
         input.extend(first);
         input.extend(second);
-        let mut c = EventColumns::new(10);
+        let mut c = crate::base_columns(10);
         parse_msgpack_events(&input, &mut c).unwrap();
         assert_eq!(c.count, 2);
     }
@@ -449,7 +449,7 @@ mod tests {
         str_(&mut input, "timestamp");
         input.push(0xcb);
         input.extend(1500.7_f64.to_bits().to_be_bytes());
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         parse_msgpack_stream(&input, &mut c).unwrap();
         assert_eq!(
             crate::parsed_event(&c, 0).unwrap().timestamp_micros,
@@ -465,7 +465,7 @@ mod tests {
         str_(&mut input, "b");
         str_(&mut input, "timestamp");
         str_(&mut input, "1970-01-01T00:00:00Z");
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         parse_msgpack_stream(&input, &mut c).unwrap();
         assert_eq!(crate::parsed_event(&c, 0).unwrap().timestamp_micros, 0);
     }
@@ -474,7 +474,7 @@ mod tests {
         let mut input = event("id", 1_000, None);
         input[0] = 0x82;
         input.truncate(input.len() - 18);
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         assert_eq!(
             parse_msgpack_stream(&input, &mut c),
             Err(MsgpackScannerError::MissingField)
@@ -482,20 +482,20 @@ mod tests {
     }
     #[test]
     fn parse_msgpack_stream_empty_input() {
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         parse_msgpack_stream(&[], &mut c).unwrap();
         assert_eq!(c.count, 0);
     }
     #[test]
     fn parse_msgpack_events_empty_array() {
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         parse_msgpack_events(&[0x90], &mut c).unwrap();
         assert_eq!(c.count, 0);
     }
     #[test]
     fn parse_msgpack_stream_value_preserved_as_raw_msgpack() {
         let value = [0x81, 0xa1, b'x', 1];
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         parse_msgpack_stream(&event("id", 1, Some(&value)), &mut c).unwrap();
         assert_eq!(
             crate::parsed_event(&c, 0).unwrap().value.as_deref(),
@@ -504,19 +504,19 @@ mod tests {
     }
     #[test]
     fn parse_msgpack_stream_nil_value_treated_as_null() {
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         parse_msgpack_stream(&event("id", 1, Some(&[0xc0])), &mut c).unwrap();
         assert!(crate::parsed_event(&c, 0).unwrap().value.is_none());
     }
     #[test]
     fn parse_msgpack_stream_event_without_value_field() {
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         parse_msgpack_stream(&event("id", 1, None), &mut c).unwrap();
         assert!(crate::parsed_event(&c, 0).unwrap().value.is_none());
     }
     #[test]
     fn parse_msgpack_stream_invalid_input_not_a_map() {
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         assert_eq!(
             parse_msgpack_stream(&[0x01], &mut c),
             Err(MsgpackScannerError::InvalidMsgpack)
@@ -540,7 +540,7 @@ mod tests {
         str_(&mut input, "orderPlaced");
         str_(&mut input, "timestamp");
         int64(&mut input, 1_000);
-        let mut c = EventColumns::new(1);
+        let mut c = crate::base_columns(1);
         assert_eq!(
             parse_msgpack_stream(&input, &mut c),
             Err(MsgpackScannerError::InvalidMsgpack)

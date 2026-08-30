@@ -1,6 +1,6 @@
 //! Columnar event buffers and the Arrow IPC stream writer.
 //!
-//! - [`columns`]: base four-column and dynamic schema-driven storage, plus
+//! - [`columns`]: one schema-driven column store for every schema, plus
 //!   transactional variable-width reservations.
 //! - [`schema`]: TypeScript-generated schema bytes and field metadata.
 //! - [`record_batch`]: hand-emitted Dynamic RecordBatch FlatBuffers.
@@ -18,13 +18,12 @@ pub mod record_batch;
 pub mod schema;
 
 pub use columns::{
-    ColumnStorage, ColumnType, DynamicColumns, EventColumns, MAX_EVENTS_PER_BATCH,
+    ColumnStorage, ColumnType, DynamicColumns, MAX_EVENTS_PER_BATCH,
     MAX_STRING_BYTES, MAX_VALUE_BYTES, ParseError, VariableValueError, VariableValueReservation,
 };
 pub use ipc::{
     EOS_MARKER, IpcError, MIN_ARROW_OUTPUT_CAPACITY, required_arrow_ipc_len,
-    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_columns_with_schema,
-    write_arrow_ipc_from_dynamic_columns,
+    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_dynamic_columns,
 };
 pub use record_batch::{
     BufferDesc, CONTINUATION_MARKER, DynamicBodyBuilder, DynamicColumn, FieldNode, MetadataError,
@@ -32,5 +31,6 @@ pub use record_batch::{
     record_batch_metadata_size,
 };
 pub use schema::{
-    ArrowType, DynamicSchemaConfig, MAX_SCHEMA_FIELDS, SchemaError, SignalSchemaField,
+    ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, DynamicSchemaConfig,
+    MAX_SCHEMA_FIELDS, SchemaError, SignalSchemaField,
 };

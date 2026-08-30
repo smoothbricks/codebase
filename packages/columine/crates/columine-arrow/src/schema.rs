@@ -52,6 +52,36 @@ pub struct SignalSchemaField {
     pub _pad: [u8; 2],
 }
 
+/// The base event-log schema: `id`, `type`, `timestamp`, `value`, in that
+/// order. The scanners in `columine-parsing` write exactly these four columns
+/// by index, so this is the only schema they can serve.
+pub const BASE_EVENT_LOG_FIELDS: [SignalSchemaField; 4] = [
+    SignalSchemaField {
+        arrow_type: ArrowType::Utf8,
+        nullable: 0,
+        _pad: [0; 2],
+    },
+    SignalSchemaField {
+        arrow_type: ArrowType::Utf8,
+        nullable: 0,
+        _pad: [0; 2],
+    },
+    SignalSchemaField {
+        arrow_type: ArrowType::Int64,
+        nullable: 0,
+        _pad: [0; 2],
+    },
+    SignalSchemaField {
+        arrow_type: ArrowType::Binary,
+        nullable: 1,
+        _pad: [0; 2],
+    },
+];
+
+/// Field names of the base event-log schema, matching
+/// [`BASE_EVENT_LOG_FIELDS`] by index.
+pub const BASE_EVENT_LOG_NAMES: [&str; 4] = ["id", "type", "timestamp", "value"];
+
 impl SignalSchemaField {
     pub fn new(arrow_type: ArrowType, nullable: bool) -> Self {
         Self {
@@ -93,7 +123,11 @@ pub struct DynamicSchemaConfig {
     pub field_metadata: Vec<SignalSchemaField>,
     /// Logical types decoded from `schema_bytes`, in field order.
     pub logical_types: Vec<DataType>,
-    pub has_extraction_fields: bool,
+    /// True when this schema IS the base event log — the four
+    /// [`BASE_EVENT_LOG_FIELDS`] with the [`BASE_EVENT_LOG_NAMES`] when names
+    /// were supplied. The scanners write those four columns by index, so
+    /// anything else must go through schema-driven extraction.
+    pub is_base_event_log: bool,
     pub field_names: Vec<String>,
 }
 
@@ -169,8 +203,20 @@ impl DynamicSchemaConfig {
             logical_types.push(field.data_type().clone());
         }
 
+        // A field COUNT of four proved nothing: any four-field extraction
+        // schema was classified as the event log and then written with
+        // hard-coded utf8/utf8/int64/binary buffers, producing a stream whose
+        // Schema message and RecordBatch body disagreed. Identity is the four
+        // physical types, plus the names when the caller supplied them.
+        let is_base_event_log = field_metadata == BASE_EVENT_LOG_FIELDS
+            && (field_names.is_empty()
+                || field_names
+                    .iter()
+                    .zip(BASE_EVENT_LOG_NAMES)
+                    .all(|(actual, expected)| actual == expected));
+
         Ok(Self {
-            has_extraction_fields: field_metadata.len() != 4,
+            is_base_event_log,
             schema_bytes: schema_bytes.to_vec(),
             field_metadata,
             logical_types,
@@ -346,7 +392,7 @@ mod tests {
         assert_eq!(config.schema_bytes, bytes);
         assert_eq!(config.logical_types[2], DataType::Int64);
         assert_eq!(config.compute_buffer_count(), 11);
-        assert!(!config.has_extraction_fields);
+        assert!(config.is_base_event_log);
 
         let mut output = vec![0; bytes.len()];
         assert_eq!(config.write_schema_message(&mut output), bytes.len());

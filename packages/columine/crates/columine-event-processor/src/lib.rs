@@ -21,10 +21,9 @@ pub use compact::{
 };
 
 use columine_arrow::{
-    DynamicColumns, DynamicSchemaConfig, EventColumns, IpcError, MAX_VALUE_BYTES,
-    MIN_ARROW_OUTPUT_CAPACITY, MetadataLimits, MetadataStorage, required_arrow_ipc_len,
-    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_columns_with_schema,
-    write_arrow_ipc_from_dynamic_columns,
+    DynamicColumns, DynamicSchemaConfig, IpcError, MAX_VALUE_BYTES, MIN_ARROW_OUTPUT_CAPACITY,
+    MetadataLimits, MetadataStorage, required_arrow_ipc_len,
+    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_dynamic_columns,
 };
 use columine_parsing::{
     ExtractionConfig, build_extraction_config, json_extractor, json_scanner, msgpack_extractor,
@@ -141,7 +140,9 @@ pub struct EventProcessor {
     pub schema_config: DynamicSchemaConfig,
     extraction_config: Option<ExtractionConfig>,
     dynamic_columns: DynamicColumns,
-    event_columns: Option<EventColumns>,
+    /// True when the schema IS the base event log and this wiring keeps the
+    /// scanner path, so the four-column scanners can write by index.
+    use_base_scanners: bool,
     record_batch_metadata: MetadataStorage,
     pub dedup_state: Option<DedupState>,
     /// Reusable MessagePack workspace for declared Binary values and
@@ -195,10 +196,9 @@ impl EventProcessor {
             )
         };
 
-        let use_base = wiring.base_path && !schema_config.has_extraction_fields;
         Ok(Self {
+            use_base_scanners: wiring.base_path && schema_config.is_base_event_log,
             dynamic_columns: DynamicColumns::new(&schema_config.field_metadata, column_capacity),
-            event_columns: use_base.then(|| EventColumns::new(column_capacity)),
             record_batch_metadata,
             dedup_state: wiring.dedup.then(|| DedupState::new(capacity, policy)),
             extraction_config,
@@ -238,7 +238,9 @@ impl EventProcessor {
         }
         let arrow_offset = RESULT_HEADER_SIZE as u32;
 
-        if self.event_columns.is_some() {
+        // The scanners write the four base event-log columns by index, so the
+        // schema must BE that event log — not merely have four fields.
+        if self.use_base_scanners {
             return self.create_log_entry_base(input, format, output, arrow_offset);
         }
         self.create_log_entry_dynamic(input, format, output, arrow_offset)
@@ -334,7 +336,10 @@ impl EventProcessor {
         }
     }
 
-    /// BASE PATH (columine npm variant): scanners into `EventColumns`.
+    /// BASE PATH (columine npm variant): the base event-log scanners, which
+    /// write the four `BASE_EVENT_LOG_FIELDS` columns by index. Selected only
+    /// when the schema IS that event log, and it shares the one column store
+    /// and the one IPC writer with the extraction path.
     fn create_log_entry_base(
         &mut self,
         input: &[u8],
@@ -342,10 +347,7 @@ impl EventProcessor {
         output: &mut [u8],
         arrow_offset: u32,
     ) -> ResultCode {
-        let cols = self
-            .event_columns
-            .as_mut()
-            .unwrap_or_else(|| columine_types::die!("base path without event columns"));
+        let cols = &mut self.dynamic_columns;
         cols.reset();
 
         let parse_result = match format {
@@ -365,9 +367,9 @@ impl EventProcessor {
         }
 
         // No dedup in columine — all events are processed.
-        let processed = cols.count;
-        match write_arrow_ipc_from_columns_with_schema(
-            cols,
+        let processed = self.dynamic_columns.count;
+        match write_arrow_ipc_from_dynamic_columns(
+            &self.dynamic_columns,
             &self.schema_config,
             &mut output[arrow_offset as usize..],
             &mut self.record_batch_metadata,
@@ -770,11 +772,11 @@ mod tests {
     #[test]
     fn create_log_entry_columine_base_path() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        assert!(!schema.has_extraction_fields);
+        assert!(schema.is_base_event_log);
         let mut ep =
             EventProcessor::new(EpWiring::columine(), 100, CollisionPolicy::Latest, schema)
                 .unwrap();
-        assert!(ep.event_columns.is_some());
+        assert!(ep.use_base_scanners);
         let input =
             br#"[{"id":"a-1","type":"click","timestamp":100,"value":{"x":1}},{"id":"a-2","type":"view","timestamp":200}]"#;
         let mut output = vec![0u8; 64 * 1024];
@@ -952,7 +954,7 @@ mod tests {
             SignalSchemaField::new(ArrowType::Binary, true),
         ];
         let schema = schema_with_names(&fields, b"id\0value.$extra\0");
-        assert!(schema.has_extraction_fields);
+        assert!(!schema.is_base_event_log);
 
         let mut consumer_ep = EventProcessor::new(
             EpWiring::consumer_variant(),
