@@ -3,8 +3,8 @@ use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
     LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE, plan_executable_install,
-    plan_executable_remove, plan_install, plan_remove,
+    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, STABLE_BINARY_MODE,
+    plan_executable_install, plan_executable_remove, plan_install, plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
@@ -41,7 +41,6 @@ const START_DEADLINE: Duration = Duration::from_secs(180);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the wait says that it is still waiting, and on what.
 const START_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
-const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayPaths {

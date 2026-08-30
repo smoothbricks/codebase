@@ -1619,8 +1619,7 @@ fn is_unsafe_xml_control(character: char) -> bool {
     matches!(character, '\0'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{7f}')
 }
 
-fn push_xml_string(output: &mut String, value: &str) {
-    output.push_str("<string>");
+fn write_escaped(output: &mut String, value: &str) {
     for character in value.chars() {
         match character {
             '&' => output.push_str("&amp;"),
@@ -1631,20 +1630,22 @@ fn push_xml_string(output: &mut String, value: &str) {
             _ => output.push(character),
         }
     }
-    output.push_str("</string>\n");
+}
+
+fn push_xml_text(output: &mut String, tag: &str, value: &str) {
+    output.push('<');
+    output.push_str(tag);
+    output.push('>');
+    write_escaped(output, value);
+    output.push_str("</");
+    output.push_str(tag);
+    output.push_str(">\n");
+}
+
+fn push_xml_string(output: &mut String, value: &str) {
+    push_xml_text(output, "string", value);
 }
 
 fn push_xml_key(output: &mut String, value: &str) {
-    output.push_str("<key>");
-    for character in value.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '\'' => output.push_str("&apos;"),
-            '"' => output.push_str("&quot;"),
-            _ => output.push(character),
-        }
-    }
-    output.push_str("</key>\n");
+    push_xml_text(output, "key", value);
 }
