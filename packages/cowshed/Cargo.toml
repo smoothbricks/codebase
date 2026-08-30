@@ -5,7 +5,6 @@ members = [
   "crates/cowshed-cli",
   "crates/cowshed-gateway",
   "crates/cowshed-napi",
-  "crates/cowshed-escape-tests",
 ]
 
 [workspace.package]
@@ -21,7 +20,25 @@ napi-derive = "2"
 napi-build = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+# Spelled out rather than `full`, which additionally enables `rt-multi-thread` and `parking_lot`.
+# Every runtime this workspace builds is current-thread — `#[tokio::main(flavor =
+# "current_thread")]` in cowshed-cli, `Builder::new_current_thread` in cowshed-napi and the core
+# test harnesses, and `#[tokio::test]`, which is current-thread by default — so the work-stealing
+# scheduler is code nothing here reaches, and `parking_lot` only swaps tokio's internal mutex.
+# Naming what is used means a future `spawn` that genuinely needs a multi-thread scheduler fails
+# to compile instead of silently finding one.
+tokio = { version = "1", features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
 clap = { version = "4", default-features = false, features = ["std", "error-context", "usage"] }
 
 # The full lane links 27 test executables from a cold target directory. They do
