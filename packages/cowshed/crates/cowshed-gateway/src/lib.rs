@@ -13,25 +13,31 @@ mod control;
 mod interfaces;
 mod mirror;
 mod platform;
-mod policy;
 mod proxy;
-mod repo_id;
 mod repo_mirror;
 mod sim_broker;
 mod telemetry;
 mod tls;
 
-pub use actor::{Gateway, GatewayError, GatewayHandle, GatewayStatus, SessionStatus};
+pub use actor::{Gateway, GatewayError, GatewayHandle};
 pub use cache::{
     Cache, CacheBodyError, CacheConfig, CacheError, CacheKey, CacheNamespace, CachedResponse,
     DEFAULT_HIGH_WATER_BYTES, DEFAULT_LOW_WATER_BYTES, ObjectDigest, ObjectExpectation,
 };
 pub use config::{
-    CONTROL_TCP_ADDR, ConfigError, ControlTcpConfig, GatewayConfig, GatewayLimits, GatewayTimeouts,
-    MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN, MirrorCacheConfig, TOKEN_BYTES,
-    WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken,
+    CONTROL_TCP_ADDR, ControlTcpConfig, GatewayConfig, GatewayLimits, GatewayTimeouts,
+    MirrorCacheConfig,
 };
 pub use control::{ControlError, ControlFailureCode, GatewayControlClient};
+/// The control-plane data model is re-exported at this root so `cowshed_gateway::WorkspaceSession`
+/// and friends name the same items whether a caller links the daemon or only the types crate.
+pub use cowshed_gateway_types::{
+    CanonicalHost, CanonicalTarget, ConfigError, EgressGrant, EgressMode, GatewayStatus,
+    HostPattern, InvalidRepoId, MACOS_PORT_BLOCK_SIZE, MACOS_PORT_MAX, MACOS_PORT_MIN,
+    MirrorProtocol, MirrorRoute, PolicyError, ResolvedMirrorRoute, SessionStatus, TOKEN_BYTES,
+    TargetScheme, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession,
+    WorkspaceToken, normalize_path, validate_repo_id,
+};
 pub use interfaces::{
     AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, AuthorizedTarget, BoxIo,
     ConnectError, CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery,
@@ -47,11 +53,6 @@ pub use mirror::{
 pub use platform::KeychainCredentialProvider;
 #[cfg(target_os = "linux")]
 pub use platform::SystemdCredentialProvider;
-pub use policy::{
-    CanonicalHost, CanonicalTarget, EgressGrant, EgressMode, HostPattern, MirrorProtocol,
-    MirrorRoute, PolicyError, ResolvedMirrorRoute, TargetScheme, WorkspacePolicy, normalize_path,
-};
-pub use repo_id::{InvalidRepoId, validate_repo_id};
 pub use repo_mirror::{
     GATEWAY_GIT_FETCH_HELPER_ARG, GitFetchHelperError, MirrorInfo, RepoFetchOutcome, RepoFetchPlan,
     RepoMirrorError, RepoMirrorRequest, RepoTransport, run_gateway_git_fetch_helper,

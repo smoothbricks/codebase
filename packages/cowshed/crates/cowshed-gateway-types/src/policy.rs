@@ -54,7 +54,12 @@ impl HostPattern {
         }
     }
 
-    pub(crate) fn is_exact(&self) -> bool {
+    /// Whether this pattern names one host rather than a family of them.
+    ///
+    /// A wildcard grant admits hosts the operator never enumerated, so the daemon records that
+    /// distinction in its audit trail: "granted to `*.crates.io`" and "granted to `crates.io`"
+    /// are different claims about what was authorised.
+    pub fn is_exact(&self) -> bool {
         !matches!(self, Self::Wildcard(_))
     }
 }
@@ -393,7 +398,12 @@ impl WorkspacePolicy {
         Ok(())
     }
 
-    pub(crate) fn authorize<'a>(
+    /// Resolves one request against the grants, or names why it is refused.
+    ///
+    /// The single admission decision of the whole egress path: the proxy in `cowshed-gateway`
+    /// asks, and the answer is either the grant whose credentials may be injected or a
+    /// [`PolicyDenial`] carrying the operator hint to print.
+    pub fn authorize<'a>(
         &'a self,
         target: &CanonicalTarget,
         method: &Method,
@@ -441,7 +451,11 @@ impl WorkspacePolicy {
     }
 }
 
-pub(crate) fn mirror_scope_matches(path: &str, prefix: &str) -> bool {
+/// Whether an admitted prefix covers a normalized path, on label boundaries only.
+///
+/// `/pypi` must not admit `/pypilookalike`, so a bare prefix match is wrong; the daemon re-checks
+/// this after resolving a mirror route, which is why it crosses the crate boundary.
+pub fn mirror_scope_matches(path: &str, prefix: &str) -> bool {
     path == prefix
         || prefix == "/"
         || path
@@ -556,10 +570,13 @@ pub fn normalize_path(path: &str) -> Result<String, PolicyError> {
     Ok(decoded)
 }
 
-pub(crate) fn decode_percent(
-    path: &str,
-    forbidden: impl Fn(u8) -> bool,
-) -> Result<String, PolicyError> {
+/// Percent-decodes a path, refusing any escape that decodes to a `forbidden` byte.
+///
+/// Rejecting rather than re-encoding is the point: a path that smuggles `%2f` past a prefix check
+/// has two readings, and a proxy that picks one is a confused deputy. The mirror front end in
+/// `cowshed-gateway` decodes package paths through the same routine, so both sides of the
+/// boundary agree on exactly one canonical form.
+pub fn decode_percent(path: &str, forbidden: impl Fn(u8) -> bool) -> Result<String, PolicyError> {
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -593,8 +610,9 @@ fn percent_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+/// Why one request was refused, in the operator's terms.
 #[derive(Clone, Debug)]
-pub(crate) enum PolicyDenial {
+pub enum PolicyDenial {
     InvalidPath,
     NotGranted { hint: String },
 }

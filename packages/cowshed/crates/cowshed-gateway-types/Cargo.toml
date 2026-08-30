@@ -1,0 +1,17 @@
+[package]
+name = "cowshed-gateway-types"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# A leaf on purpose. `cowshed-core` depends on this crate precisely so it stops linking the
+# gateway daemon; anything async, TLS-terminating or HTTP-serving added here undoes that.
+[dependencies]
+base64 = "0.22"
+http = "1"
+idna = "1"
+serde.workspace = true
+subtle = "2"
+thiserror = "2"
+url = "2"
+zeroize = "1"

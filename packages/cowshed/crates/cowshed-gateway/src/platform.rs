@@ -5,11 +5,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::{
-    interfaces::{
-        CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
-    },
-    policy::CanonicalTarget,
+use cowshed_gateway_types::CanonicalTarget;
+
+use crate::interfaces::{
+    CredentialError, CredentialProtocol, CredentialProvider, CredentialQuery, CredentialRecord,
 };
 
 /// Reads scoped gateway credentials from macOS generic-password items.

@@ -16,11 +16,15 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use cowshed_gateway_types::{
+    EgressGrant, EgressMode, GatewayStatus, HostPattern, MirrorProtocol, MirrorRoute, WorkspaceCa,
+    WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+};
+
 use crate::{
-    actor::{GatewayError, GatewayHandle, GatewayStatus},
-    config::{CONTROL_TCP_ADDR, WorkspaceCa, WorkspaceEndpoint, WorkspaceSession, WorkspaceToken},
+    actor::{GatewayError, GatewayHandle},
+    config::CONTROL_TCP_ADDR,
     interfaces::AuditEvent,
-    policy::{EgressGrant, EgressMode, HostPattern, MirrorProtocol, MirrorRoute, WorkspacePolicy},
     repo_mirror::{MirrorInfo, RepoMirrorError, RepoMirrorHandle, RepoMirrorRequest},
     sim_broker::{
         SimBrokerError, SimBrokerHandle, SimDevice, SimInstallApproval, SimProjectConfig,

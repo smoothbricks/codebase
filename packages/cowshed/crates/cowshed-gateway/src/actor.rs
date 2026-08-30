@@ -7,7 +7,6 @@ use std::{
 };
 
 use http::{Method, StatusCode};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener},
@@ -16,19 +15,21 @@ use tokio::{
     time::timeout,
 };
 
+use cowshed_gateway_types::{
+    CanonicalHost, CanonicalTarget, ConfigError, EgressMode, GatewayStatus, MirrorProtocol,
+    PolicyDenial, SessionStatus, TargetScheme, WorkspaceEndpoint, WorkspacePolicy,
+    WorkspaceSession, WorkspaceToken, mirror_scope_matches, normalize_path,
+};
+
 use crate::{
     cache::{Cache, CacheError},
-    config::{ConfigError, ControlTcpConfig, GatewayConfig, WorkspaceEndpoint, WorkspaceSession},
+    config::{ControlTcpConfig, GatewayConfig},
     control::ControlError,
     interfaces::{
         AuditError, AuditEvent, AuditKind, AuditSink, AuditStatus, ConnectError, CredentialError,
         CredentialProvider, SystemConnector, UpstreamConnector,
     },
     mirror::{MirrorCacheStatus, MirrorService},
-    policy::{
-        CanonicalHost, CanonicalTarget, EgressMode, MirrorProtocol, PolicyDenial, TargetScheme,
-        mirror_scope_matches, normalize_path,
-    },
     proxy,
     repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRunner, XcrunSimRunner},
@@ -375,25 +376,6 @@ impl Drop for Gateway {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GatewayStatus {
-    /// Version of the daemon process that answered the control request.
-    pub version: String,
-    pub draining: bool,
-    pub sessions: Vec<SessionStatus>,
-    pub active: usize,
-    pub queued: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionStatus {
-    pub workspace_id: String,
-    pub revision: u64,
-    pub endpoint: String,
-    pub active: usize,
-    pub queued: usize,
-}
-
 pub(crate) enum Command {
     Install {
         session: WorkspaceSession,
@@ -703,8 +685,8 @@ struct SessionState {
     revision: u64,
     endpoint: WorkspaceEndpoint,
     endpoint_label: String,
-    token: crate::config::WorkspaceToken,
-    policy: crate::policy::WorkspacePolicy,
+    token: WorkspaceToken,
+    policy: WorkspacePolicy,
     signer: CaSigner,
     generation: u64,
     active: usize,
