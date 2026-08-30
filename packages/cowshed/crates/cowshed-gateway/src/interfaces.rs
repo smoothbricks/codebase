@@ -14,10 +14,9 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
-use crate::{
-    mirror::MirrorCacheStatus,
-    policy::{CanonicalHost, CanonicalTarget, MirrorProtocol, normalize_path},
-};
+use cowshed_gateway_types::{CanonicalHost, CanonicalTarget, MirrorProtocol, normalize_path};
+
+use crate::mirror::MirrorCacheStatus;
 
 pub trait GatewayIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T> GatewayIo for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {}

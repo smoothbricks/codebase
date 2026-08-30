@@ -10,13 +10,14 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
+use cowshed_gateway_types::{CanonicalTarget, MirrorProtocol, decode_percent, normalize_path};
+
 use crate::{
     cache::{
         Cache, CacheAcquire, CacheBodyError, CacheError, CacheKey, CacheNamespace, CachedResponse,
         ObjectDigest, ObjectExpectation, hex_decode, unix_ms,
     },
     interfaces::UpstreamHealth,
-    policy::{CanonicalTarget, MirrorProtocol, decode_percent, normalize_path},
 };
 
 const MAX_REDIRECTS: u8 = 5;

@@ -13,8 +13,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use cowshed_gateway_types::WorkspaceCa;
+
 use crate::{
-    config::{GatewayLimits, GatewayTimeouts, WorkspaceCa},
+    config::{GatewayLimits, GatewayTimeouts},
     interfaces::alpn_protocols,
 };
 
