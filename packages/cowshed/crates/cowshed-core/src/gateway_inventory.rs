@@ -1541,11 +1541,12 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> GatewayI
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Mutex;
 
     use crate::metadata::{
-        CheckoutLayout, METADATA_VERSION, Platform, WorkspaceInfoSnapshot, WorkspaceRole,
-        write_json,
+        CheckoutLayout, MACOS_PORT_BLOCK_MIN, METADATA_VERSION, PORT_BLOCK_SIZE, Platform,
+        WorkspaceInfoSnapshot, WorkspaceRole, write_json,
     };
     use crate::repository::{BoundIdentity, RepositoryBinding};
     use crate::storage::CheckpointLabel;
@@ -1578,10 +1579,23 @@ mod tests {
         }
     }
 
+    /// How the fixture assigns macOS port blocks.
+    ///
+    /// A fixture that gave every workspace base 40960 made the store-wide uniqueness invariant
+    /// unobservable: the second workspace in any store was already a collision, so no test could
+    /// tell a healthy multi-project store from a broken one. `Grid` is the healthy host, walking
+    /// the same aligned grid the allocator walks; `Collide` plants the fault on purpose.
+    #[derive(Clone, Copy)]
+    enum FixturePortBases {
+        Grid(u16),
+        Collide(u16),
+    }
+
     struct Fixture {
         root: PathBuf,
         storage: ValidatedHostStorage,
         checkout_layout: CheckoutLayout,
+        port_bases: Cell<FixturePortBases>,
     }
 
     impl Fixture {
@@ -1604,7 +1618,25 @@ mod tests {
                 root,
                 storage: ValidatedHostStorage::new(home, roots),
                 checkout_layout,
+                port_bases: Cell::new(FixturePortBases::Grid(MACOS_PORT_BLOCK_MIN)),
             }
+        }
+
+        /// This workspace's port block.
+        fn take_port_base(&self) -> u16 {
+            match self.port_bases.get() {
+                FixturePortBases::Grid(base) => {
+                    self.port_bases
+                        .set(FixturePortBases::Grid(base + PORT_BLOCK_SIZE));
+                    base
+                }
+                FixturePortBases::Collide(base) => base,
+            }
+        }
+
+        /// Give every workspace from here on the same block, which is the store-wide collision.
+        fn collide_port_bases(&self, base: u16) {
+            self.port_bases.set(FixturePortBases::Collide(base));
         }
 
         fn bind(&self, repo: &RepoId) {
@@ -1669,9 +1701,9 @@ mod tests {
             } else {
                 layout.workspace_mount(&name).expect("workspace mount")
             };
-            let mut grants =
-                GrantSet::closed_baseline(Some(PortBlock::new(40_960, 16).expect("port block")))
-                    .expect("grants");
+            let port_block =
+                PortBlock::new(self.take_port_base(), PORT_BLOCK_SIZE).expect("port block");
+            let mut grants = GrantSet::closed_baseline(Some(port_block)).expect("grants");
             grants.revision = revision;
             let info_snapshot =
                 (!name.is_main() || persist_main_root).then(|| WorkspaceInfoSnapshot {
@@ -1715,7 +1747,7 @@ mod tests {
                     &mount,
                     &mount,
                     Platform::Macos,
-                    Some(PortBlock::new(40_960, 16).expect("port block")),
+                    Some(port_block),
                     image.ca_private_key(),
                 )
                 .expect("credentials");
@@ -1841,9 +1873,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn attached_inventory_is_sorted_complete_and_secret_redacted() {
-        let fixture = Fixture::new("attached");
+    /// Two adopted projects, each with one mounted main, plus a repository binding planted in
+    /// every reserved store namespace so discovery has to skip them by name rather than by luck.
+    fn two_project_store(fixture: &Fixture) -> (RepoId, RepoId, Arc<FixtureSource>) {
         let repo_a = RepoId::parse("acme/alpha").expect("repo A");
         let repo_b = RepoId::parse("acme/beta").expect("repo B");
         fixture.bind(&repo_b);
@@ -1881,6 +1913,13 @@ mod tests {
             )
             .expect("invalid reserved binding");
         }
+        (repo_a, repo_b, source)
+    }
+
+    #[tokio::test]
+    async fn attached_inventory_is_sorted_complete_and_secret_redacted() {
+        let fixture = Fixture::new("attached");
+        let (repo_a, _repo_b, source) = two_project_store(&fixture);
         let inventory = NativeGatewayInventory::with_source(
             fixture.storage.clone(),
             source as Arc<dyn InventorySource>,
@@ -1905,13 +1944,46 @@ mod tests {
                 .expect("recover current main binding"),
             Some(repo_a.clone())
         );
-        let error = inventory
-            .all_reserved_port_bases()
-            .await
-            .expect_err("duplicate global port assignment");
+        // A healthy store reserves one block per workspace, so the scan reports both rather than
+        // reporting a collision. This is the positive half of the uniqueness invariant.
+        assert_eq!(
+            inventory
+                .all_reserved_port_bases()
+                .await
+                .expect("reserved port bases"),
+            BTreeSet::from([MACOS_PORT_BLOCK_MIN, MACOS_PORT_BLOCK_MIN + PORT_BLOCK_SIZE])
+        );
+    }
+
+    /// One macOS port block belongs to at most one workspace host-wide: the block is the
+    /// workspace's gateway endpoint, so two claimants means two workspaces answering on one port.
+    /// Both readers of the store refuse — the allocator's scan, and the session listing the
+    /// `RunAtLoad` gateway builds — because installing the second session is the harm.
+    #[tokio::test]
+    async fn one_port_block_claimed_twice_is_refused_by_every_store_wide_reader() {
+        let fixture = Fixture::new("duplicate-port");
+        fixture.collide_port_bases(MACOS_PORT_BLOCK_MIN);
+        let (_repo_a, _repo_b, source) = two_project_store(&fixture);
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        // The fixture hands out one block per workspace, so the collision has to be planted: both
+        // mains are reissued the first base.
         assert!(matches!(
-            error,
-            GatewayInventoryError::DuplicatePortBlock(40_960)
+            inventory
+                .all_reserved_port_bases()
+                .await
+                .expect_err("duplicate global port assignment"),
+            GatewayInventoryError::DuplicatePortBlock(MACOS_PORT_BLOCK_MIN)
+        ));
+        assert!(matches!(
+            inventory
+                .all_attached()
+                .await
+                .expect_err("a colliding endpoint must not be installed"),
+            GatewayInventoryError::DuplicatePortBlock(MACOS_PORT_BLOCK_MIN)
         ));
     }
 
@@ -2070,12 +2142,11 @@ mod tests {
         );
     }
 
-    /// A legacy direct-mount project's main volume is mounted at the adopted checkout even though
-    /// adoption predated `checkout-layout.json`. Observation materializes that now-mandatory record
-    /// before deriving any mount paths, so the gateway both serves the project and leaves future
-    /// reads explicit.
+    /// A direct-mount project's main volume is mounted at the adopted checkout rather than under
+    /// `mnt/`, and the recorded layout is what says so. Deriving mount paths from the record is the
+    /// whole point of writing it at adopt time.
     #[tokio::test]
-    async fn a_legacy_direct_mount_project_materializes_layout_and_serves_main() {
+    async fn a_direct_mount_project_serves_main_at_the_adopted_checkout() {
         let fixture = Fixture::with_checkout_layout("direct-mount", CheckoutLayout::DirectMount);
         let repo = RepoId::parse("example-org/example-app").expect("repo");
         fixture.bind(&repo);
@@ -2087,8 +2158,6 @@ mod tests {
             true,
             true,
         );
-        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
-        fs::remove_file(&layout.project().checkout_layout).expect("simulate legacy adoption");
         let (mount, path) = mounted.expect("mounted fixture");
         assert_eq!(path, fixture.root.join("checkout-example-app"));
         let source = Arc::new(FixtureSource::default());
@@ -2115,10 +2184,60 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].mount, path);
         assert_eq!(facts[0].mount_id, mount.mount_id);
-        assert_eq!(
-            layout.checkout_layout().expect("materialized layout"),
-            CheckoutLayout::DirectMount
+    }
+
+    /// An adopted project holding a main image but no `checkout-layout.json` is refused, not
+    /// inferred.
+    ///
+    /// Only the symlink layout ever creates `mnt/<owner>/<repo>/main`, so its absence is either a
+    /// legacy direct-mount adoption or a detached symlink-layout project whose mountpoint `gc`
+    /// removed. Those two answers put main in different places, and guessing wrong points every
+    /// resolver — mount, credentials, gateway session — at a path the volume is not on. The record
+    /// is the only thing that distinguishes them, so its absence is the defect to report.
+    #[tokio::test]
+    async fn an_adopted_project_with_no_layout_record_is_refused_rather_than_inferred() {
+        let fixture =
+            Fixture::with_checkout_layout("unrecorded-layout", CheckoutLayout::DirectMount);
+        let repo = RepoId::parse("example-org/example-app").expect("repo");
+        fixture.bind(&repo);
+        let (storage, mounted) = fixture.workspace(
+            &repo,
+            WorkspaceName::new("main").expect("main"),
+            "00000000000000000000000000000001",
+            3,
+            true,
+            true,
         );
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        fs::remove_file(&layout.project().checkout_layout).expect("simulate legacy adoption");
+        let (mount, path) = mounted.expect("mounted fixture");
+        let source = Arc::new(FixtureSource::default());
+        source.projects.lock().expect("source").insert(
+            repo.clone(),
+            ProjectInventoryFacts {
+                storage: vec![storage],
+                mounts: vec![mount.clone()],
+                checkpoints: Vec::new(),
+                mount_paths: BTreeMap::from([(mount.volume_key, path)]),
+            },
+        );
+        let inventory = NativeGatewayInventory::with_source(
+            fixture.storage.clone(),
+            source as Arc<dyn InventorySource>,
+        );
+
+        let error = inventory
+            .project_attached(&repo)
+            .await
+            .expect_err("an unrecorded layout is not a direct mount");
+        let message = error.to_string();
+        assert!(
+            message.contains("records no checkout layout"),
+            "the refusal must name the missing record: {message}"
+        );
+        // Nothing was materialized: a reader that cannot tell must not leave a guess behind for
+        // the next reader to trust.
+        assert!(!layout.project().checkout_layout.exists());
     }
 
     #[tokio::test]
