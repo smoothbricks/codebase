@@ -1244,6 +1244,14 @@ impl GitRepository {
             let output = self.run(["remote", "remove", remote.as_str()]).await?;
             ensure_git_success("remove inherited remote", output)?;
         }
+
+        // The working tree arrived by CoW for the same reason, and carries the same hazard one
+        // layer out: a symlink whose target climbs above the tree root was computed against
+        // main's depth, so here it lands somewhere else entirely — dangling, or silently
+        // resolving onto a directory main never meant. Restoring those is the same repair as
+        // the remotes above, and it is confined to links that escape: an in-tree link is
+        // correct at any depth already ([`crate::inherited_links`]).
+        self.restore_inherited_links(main_mount).await?;
         let main_remote = self.configure_main_remote(main_mount).await?;
 
         let mut args = vec![
@@ -1258,6 +1266,48 @@ impl GitRepository {
         let output = self.run(args).await?;
         ensure_git_success("create workspace branch", output)?;
         Ok(main_remote)
+    }
+
+    /// Re-resolve this tree's symlinks that point outside it, against the tree they came from.
+    ///
+    /// Runs at mint, where the workspace is still cowshed's: a link that escapes the root is
+    /// generated state carrying main's depth, in the same way an inherited remote carries
+    /// main's URLs, and neither is the user's yet.
+    ///
+    /// Only escaping links are rewritten. That predicate is what keeps the step affordable on
+    /// a tree whose whole value is being ready in seconds — the walk reads directory entries
+    /// and rewrites the handful of links that need it, rather than reinstalling anything.
+    ///
+    /// An escaping link whose source-tree target does not exist is refused by name rather than
+    /// repointed at a guess. It is broken in main too, and a workspace that silently resolves
+    /// it to whatever happens to sit at that path in the new tree is the failure being fixed,
+    /// not an acceptable outcome.
+    pub async fn restore_inherited_links(
+        &self,
+        source_root: &Path,
+    ) -> Result<crate::inherited_links::LinkPlan> {
+        let root = self.root.clone();
+        let source = source_root.to_path_buf();
+        let plan =
+            tokio::task::spawn_blocking(move || crate::inherited_links::restore(&root, &source))
+                .await
+                .map_err(|source| {
+                    CowshedError::integrity(
+                        format!("restoring inherited links panicked: {source}"),
+                        "retry the operation and report the failure if it repeats",
+                    )
+                })??;
+        if !plan.refusals.is_empty() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "this workspace inherited {} symlink(s) that leave the tree and cannot be re-resolved: {}",
+                    plan.refusals.len(),
+                    plan.refusal_report()
+                ),
+                "repair the link in the source checkout — for a package manager `link:` dependency, re-run its install there — then retry",
+            ));
+        }
+        Ok(plan)
     }
 
     /// Point this workspace at main's canonical mount, without ever clobbering a remote cowshed
