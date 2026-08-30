@@ -4906,6 +4906,29 @@ mod tests {
     }
 
     #[test]
+    fn serialized_checkpoint_preserves_barrier_after_a_truncated_tail() {
+        let root = temp_root("serialized-truncated-tail-barrier");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let first = store.checkpoint().unwrap().record.barrier_id;
+        let path = records_path(&root);
+        let retained_len = fs::metadata(&path).unwrap().len();
+        let second = store.checkpoint().unwrap().record.barrier_id;
+        assert_eq!((first, second), (1, 2));
+
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(retained_len + FRAME_HEADER_BYTES as u64)
+            .unwrap();
+        file.sync_data().unwrap();
+
+        let after_tail_loss = store.checkpoint().unwrap().record.barrier_id;
+        assert!(
+            after_tail_loss > second,
+            "a serialized checkpoint reused handed-out barrier {second} after recovering an incomplete tail: {after_tail_loss}",
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn handed_out_sequence_remains_monotonic_across_repair() {
         let root = temp_root("repair-sequence-watermark");
         let mut store = store_at(&root, ArtifactConfig::default());
@@ -5085,6 +5108,57 @@ mod tests {
         Ok(records)
     }
 
+    /// One step a controller can take against a records log, plus the one thing a crash can do
+    /// to it: lose the bytes of the frame that was mid-append.
+    #[derive(Clone, Copy, Debug)]
+    enum RecordsStep {
+        AppendRecord,
+        Checkpoint,
+        LoseTail,
+    }
+
+    fn records_steps() -> impl Strategy<Value = Vec<RecordsStep>> {
+        prop::collection::vec(
+            prop_oneof![
+                2 => Just(RecordsStep::AppendRecord),
+                3 => Just(RecordsStep::Checkpoint),
+                2 => Just(RecordsStep::LoseTail),
+            ],
+            1..=12,
+        )
+    }
+
+    /// Drop the final byte of the records log, which always lands inside the last frame: a frame
+    /// is at least `FRAME_OVERHEAD_BYTES` long, so recovery reaches its start with fewer bytes
+    /// remaining than the header promises and truncates the incomplete tail.
+    fn lose_records_tail(path: &Path) {
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        if metadata.len() <= RECORD_MAGIC.len() as u64 + FRAME_OVERHEAD_BYTES as u64 {
+            return;
+        }
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(metadata.len() - 1).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    fn durable_barrier_ids(path: &Path, incarnation: &WorkspaceIncarnation) -> Vec<u64> {
+        recover_records(path)
+            .unwrap()
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.record {
+                ProtectedRecord::CheckpointManifest(manifest)
+                    if manifest.origin_incarnation == *incarnation =>
+                {
+                    Some(manifest.barrier_id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -5183,6 +5257,61 @@ mod tests {
                 "N={}: durable record sequences are not gapless",
                 writer_count,
             );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// Barrier ids belong to the store, not to whatever a later recovery can still see: for
+        /// any interleaving of appends, checkpoints and lost tails, every barrier the store hands
+        /// out is strictly above every barrier it handed out before, and no durable manifest of
+        /// this incarnation carries a barrier twice.
+        #[test]
+        fn checkpoint_barriers_never_repeat_across_appends_and_lost_tails(
+            steps in records_steps(),
+        ) {
+            let root = temp_root("barrier-uniqueness");
+            let mut store = store_at(&root, ArtifactConfig::default());
+            let path = records_path(&root);
+            let mut handed_out: Vec<u64> = Vec::new();
+            let mut next_job_id = 1_u64;
+            for step in &steps {
+                match step {
+                    RecordsStep::AppendRecord => {
+                        store.append_record(valid_job_record(next_job_id)).unwrap();
+                        next_job_id += 1;
+                    }
+                    RecordsStep::Checkpoint => {
+                        let barrier = store.checkpoint().unwrap().record.barrier_id;
+                        if let Some(&previous) = handed_out.iter().max() {
+                            prop_assert!(
+                                barrier > previous,
+                                "steps={:?}: checkpoint handed out barrier {} at or below the already handed-out {}",
+                                steps,
+                                barrier,
+                                previous,
+                            );
+                        }
+                        handed_out.push(barrier);
+                    }
+                    RecordsStep::LoseTail => lose_records_tail(&path),
+                }
+            }
+            let durable = durable_barrier_ids(&path, &incarnation());
+            prop_assert_eq!(
+                durable.iter().copied().collect::<BTreeSet<_>>().len(),
+                durable.len(),
+                "steps={:?}: durable barrier ids repeat: {:?}",
+                steps,
+                durable,
+            );
+            for barrier in &durable {
+                prop_assert!(
+                    handed_out.contains(barrier),
+                    "steps={:?}: durable barrier {} was never handed out: {:?}",
+                    steps,
+                    barrier,
+                    handed_out,
+                );
+            }
             fs::remove_dir_all(root).unwrap();
         }
     }
