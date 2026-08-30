@@ -5,7 +5,8 @@ use super::dto::{
     PushReport, RebaseOptions, RemoveOptions, RemoveReport, ResizeResult, RevisionResult,
     RunSandboxMode, StdinSource, WorkspaceIncarnation, WorkspaceInfo, validate_command_argv,
 };
-use super::peer_credentials::{self, PeerCredentialsError};
+use super::frame;
+use super::peer_credentials::PeerCredentialsError;
 use super::server::MAX_BINARY_FRAME_BYTES;
 #[cfg(unix)]
 use super::server::{
@@ -885,7 +886,7 @@ fn handshake_error(message: impl Into<String>) -> CowshedError {
 
 #[cfg(unix)]
 fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
-    let peer_uid = peer_credentials::peer_uid(descriptor).map_err(|error| match error {
+    frame::verify_peer(descriptor, |error| match error {
         PeerCredentialsError::SocketTypeSizeOverflow
         | PeerCredentialsError::SocketTypeQueryFailed
         | PeerCredentialsError::NotStream => {
@@ -894,15 +895,7 @@ fn verify_peer(descriptor: &OwnedFd) -> Result<()> {
         PeerCredentialsError::PeerCredentialQueryFailed => {
             handshake_error("coordinator descriptor peer does not match the current uid")
         }
-    })?;
-    // SAFETY: geteuid has no preconditions and reads no caller-owned memory.
-    let current_uid = unsafe { libc::geteuid() };
-    if peer_uid != current_uid {
-        return Err(handshake_error(
-            "coordinator descriptor peer does not match the current uid",
-        ));
-    }
-    Ok(())
+    })
 }
 
 #[cfg(unix)]
@@ -914,38 +907,25 @@ fn fresh_nonce() -> String {
 
 #[cfg(unix)]
 async fn write_frame(stream: &mut tokio::net::UnixStream, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > MAX_HANDSHAKE_BYTES {
-        return Err(handshake_error(
-            "coordinator handshake request is too large",
-        ));
-    }
-    stream
-        .write_u32(bytes.len() as u32)
-        .await
-        .map_err(|error| handshake_error(format!("coordinator handshake write failed: {error}")))?;
-    stream
-        .write_all(bytes)
-        .await
-        .map_err(|error| handshake_error(format!("coordinator handshake write failed: {error}")))
+    frame::write_frame(
+        stream,
+        bytes,
+        MAX_HANDSHAKE_BYTES,
+        || handshake_error("coordinator handshake request is too large"),
+        |error| handshake_error(format!("coordinator handshake write failed: {error}")),
+    )
+    .await
 }
 
 #[cfg(unix)]
 async fn read_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>> {
-    let length =
-        stream.read_u32().await.map_err(|error| {
-            handshake_error(format!("coordinator handshake read failed: {error}"))
-        })? as usize;
-    if length == 0 || length > MAX_HANDSHAKE_BYTES {
-        return Err(handshake_error(
-            "coordinator handshake response has invalid length",
-        ));
-    }
-    let mut bytes = vec![0_u8; length];
-    stream
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|error| handshake_error(format!("coordinator handshake read failed: {error}")))?;
-    Ok(bytes)
+    frame::read_frame(
+        stream,
+        MAX_HANDSHAKE_BYTES,
+        || handshake_error("coordinator handshake response has invalid length"),
+        |error| handshake_error(format!("coordinator handshake read failed: {error}")),
+    )
+    .await
 }
 
 #[cfg(unix)]
