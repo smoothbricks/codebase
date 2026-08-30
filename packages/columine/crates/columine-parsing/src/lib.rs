@@ -6,6 +6,9 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
+mod cross_format;
+
 pub mod json_extractor;
 pub mod json_parser;
 pub mod json_scanner;

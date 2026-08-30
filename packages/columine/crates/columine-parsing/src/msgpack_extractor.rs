@@ -176,7 +176,27 @@ fn extract_typed_value(
                 ))
             }
         }
-        ArrowType::Int32 | ArrowType::Int64 => {
+        // The Arrow-type coercion table is one contract, shared with
+        // `json_extractor::extract_typed_value`: Int32 takes integers in i32
+        // range only; Int64 additionally takes bigint-as-string and ISO-8601
+        // instants, because a 64-bit value does not survive a JSON number.
+        // Neither truncates a float — a producer that sent 1.5 did not send
+        // an integer, and MessagePack carries the marker that proves it.
+        ArrowType::Int32 => {
+            if first == 0xc0 {
+                reader.skip_value();
+                None
+            } else if is_integer(first) {
+                let wide = reader
+                    .read_integer()
+                    .ok_or(ExtractionError::InvalidFieldType)?;
+                let narrow = i32::try_from(wide).map_err(|_| ExtractionError::InvalidFieldType)?;
+                Some(ColumnValue::Int64(i64::from(narrow)))
+            } else {
+                return Err(ExtractionError::InvalidFieldType);
+            }
+        }
+        ArrowType::Int64 => {
             if first == 0xc0 {
                 reader.skip_value();
                 None
@@ -186,23 +206,19 @@ fn extract_typed_value(
                         .read_integer()
                         .ok_or(ExtractionError::InvalidFieldType)?,
                 ))
-            } else if matches!(first, 0xca | 0xcb) {
-                Some(ColumnValue::Int64(
-                    reader
-                        .read_float()
-                        .ok_or(ExtractionError::InvalidFieldType)? as i64,
-                ))
             } else if is_string(first) {
-                let value = std::str::from_utf8(
+                let text = std::str::from_utf8(
                     reader
                         .read_string()
                         .ok_or(ExtractionError::InvalidFieldType)?,
                 )
                 .map_err(|_| ExtractionError::InvalidFieldType)?;
-                Some(ColumnValue::Int64(
-                    parse_iso8601_to_micros(value)
+                let micros = match text.parse::<i64>() {
+                    Ok(value) => value,
+                    Err(_) => parse_iso8601_to_micros(text)
                         .map_err(|_| ExtractionError::InvalidFieldType)?,
-                ))
+                };
+                Some(ColumnValue::Int64(micros))
             } else {
                 return Err(ExtractionError::InvalidFieldType);
             }
