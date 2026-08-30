@@ -939,6 +939,32 @@ pub async fn run_cli(argv: Vec<String>) -> napi::Result<i32> {
 #[cfg(test)]
 mod parity_tests {
     use cowshed_cli::args::{Command, parse_args};
+    use cowshed_core::api::StdinSource;
+
+    /// Compile-visible seam over core's `StdinSource`: every variant must name the JS wire field
+    /// that produces it, or state that it deliberately has none (`NapiExecRequest`'s `TryFrom`
+    /// maps the other direction and therefore cannot be exhaustive over core). Adding a core
+    /// variant breaks this match instead of silently becoming a mode the wire cannot express.
+    fn wire_stdin_spelling(source: &StdinSource) -> &'static str {
+        match source {
+            StdinSource::Empty => "omit stdin and stdinWorkspacePath",
+            StdinSource::Inline(_) => "stdin",
+            StdinSource::WorkspaceFile(_) => "stdinWorkspacePath",
+            StdinSource::Stream(_) => "(no wire spelling: process stdin is CLI-only)",
+        }
+    }
+
+    #[test]
+    fn every_core_stdin_variant_has_a_wire_verdict() {
+        assert_eq!(
+            wire_stdin_spelling(&StdinSource::Empty),
+            "omit stdin and stdinWorkspacePath"
+        );
+        assert_eq!(
+            wire_stdin_spelling(&StdinSource::Inline(Vec::new().into())),
+            "stdin"
+        );
+    }
 
     fn napi_export(command: &Command) -> &'static str {
         match command {

@@ -3167,6 +3167,35 @@ mod tests {
         }
     }
 
+    /// Compile-visible seam over core's `StdinSource`: every variant must name the CLI flag that
+    /// produces it (see `exec_command`, which maps the other direction and therefore cannot be
+    /// exhaustive over core). Adding a core variant breaks this match, pointing at the flag that
+    /// has to exist instead of silently becoming a mode the CLI cannot express.
+    fn cli_stdin_spelling(source: &CoreStdinSource) -> &'static str {
+        match source {
+            CoreStdinSource::Empty => "(stdin omitted)",
+            CoreStdinSource::Stream(_) => "--stdin",
+            CoreStdinSource::WorkspaceFile(_) => "--stdin-file",
+            CoreStdinSource::Inline(_) => "--stdin-base64",
+        }
+    }
+
+    #[test]
+    fn every_core_stdin_variant_has_a_cli_spelling() {
+        assert_eq!(
+            cli_stdin_spelling(&CoreStdinSource::Empty),
+            "(stdin omitted)"
+        );
+        assert_eq!(
+            cli_stdin_spelling(&CoreStdinSource::Stream(Box::pin(tokio::io::empty()))),
+            "--stdin"
+        );
+        assert_eq!(
+            cli_stdin_spelling(&CoreStdinSource::Inline(bytes::Bytes::new())),
+            "--stdin-base64"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 

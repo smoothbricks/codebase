@@ -261,6 +261,9 @@ pub struct PathArgs {
     pub no_attach: bool,
 }
 
+/// Parse-stage spelling of core's `StdinSource`: base64 still encoded, the path not yet
+/// workspace-validated, and `Empty` spelled as the absence of any flag. `exec_command` in
+/// runtime.rs owns the mapping into core; its `cli_stdin_spelling` seam pins variant coverage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StdinSource {
     Stream,
