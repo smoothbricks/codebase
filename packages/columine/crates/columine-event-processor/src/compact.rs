@@ -670,20 +670,14 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_ipc::writer::StreamWriter;
-    use arrow_schema::{DataType, Field, Schema};
     use columine_arrow::SignalSchemaField;
 
     fn schema(nullable: bool) -> DynamicSchemaConfig {
-        let schema = Schema::new(vec![Field::new("value", DataType::Utf8, nullable)]);
-        let mut bytes = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut bytes, &schema).unwrap();
-            writer.finish().unwrap();
-        }
-        bytes.truncate(bytes.len() - 8);
-        DynamicSchemaConfig::new(&bytes, &[SignalSchemaField::new(ArrowType::Utf8, nullable)])
-            .unwrap()
+        DynamicSchemaConfig::from_physical_fields(&[SignalSchemaField::new(
+            ArrowType::Utf8,
+            nullable,
+        )])
+        .unwrap()
     }
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {

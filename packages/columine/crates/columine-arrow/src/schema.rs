@@ -4,8 +4,10 @@
 //! decoded once during processor creation so the retained four-byte physical
 //! metadata cannot disagree with the logical Arrow schema copied to output.
 
-use arrow_ipc::{MessageHeader, convert::try_schema_from_ipc_buffer, root_as_message};
-use arrow_schema::DataType;
+use arrow_ipc::{
+    MessageHeader, convert::try_schema_from_ipc_buffer, root_as_message, writer::StreamWriter,
+};
+use arrow_schema::{DataType, Field, Schema};
 
 /// Maximum supported fields in one flattened schema.
 pub const MAX_SCHEMA_FIELDS: usize = 256;
@@ -40,6 +42,20 @@ impl ArrowType {
             6 => Self::Int64,
             _ => return None,
         })
+    }
+
+    /// Arrow `DataType` for this physical tag. The inverse of
+    /// `logical_type_matches` for the types this crate can emit.
+    pub fn to_data_type(self) -> DataType {
+        match self {
+            Self::Null => DataType::Null,
+            Self::Int32 => DataType::Int32,
+            Self::Float64 => DataType::Float64,
+            Self::Binary => DataType::Binary,
+            Self::Utf8 => DataType::Utf8,
+            Self::Bool => DataType::Boolean,
+            Self::Int64 => DataType::Int64,
+        }
     }
 }
 
@@ -104,6 +120,37 @@ impl SignalSchemaField {
     }
 }
 
+/// Buffer count for a schema: each field contributes per its type.
+pub fn compute_buffer_count(fields: &[SignalSchemaField]) -> u32 {
+    fields.iter().map(|field| field.buffer_count()).sum()
+}
+
+/// One continuation-prefixed IPC Schema message for `fields`.
+///
+/// Test fixtures used to restate the ArrowType→DataType match plus StreamWriter
+/// dance in three places; this is that encoder.
+pub fn schema_ipc_bytes(fields: &[SignalSchemaField]) -> Result<Vec<u8>, SchemaError> {
+    let schema_fields: Vec<Field> = fields
+        .iter()
+        .enumerate()
+        .map(|(index, metadata)| {
+            Field::new(
+                format!("field_{index}"),
+                metadata.arrow_type.to_data_type(),
+                metadata.is_nullable(),
+            )
+        })
+        .collect();
+    let mut bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, &Schema::new(schema_fields))
+            .map_err(|_| SchemaError::InvalidMessage)?;
+        writer.finish().map_err(|_| SchemaError::InvalidMessage)?;
+    }
+    bytes.truncate(bytes.len().saturating_sub(8));
+    Ok(bytes)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchemaError {
     InvalidMessage,
@@ -138,6 +185,19 @@ impl DynamicSchemaConfig {
     ) -> Result<Self, SchemaError> {
         validate_typed_metadata(field_metadata)?;
         Self::build(schema_bytes, field_metadata.to_vec(), Vec::new())
+    }
+
+    /// Synthesize an IPC Schema message from physical tags so tests do not
+    /// restate the ArrowType→DataType table.
+    pub fn from_physical_fields(fields: &[SignalSchemaField]) -> Result<Self, SchemaError> {
+        Self::new(&schema_ipc_bytes(fields)?, fields)
+    }
+
+    pub fn from_physical_fields_with_names(
+        fields: &[SignalSchemaField],
+        field_names_raw: &[u8],
+    ) -> Result<Self, SchemaError> {
+        Self::with_field_names(&schema_ipc_bytes(fields)?, fields, field_names_raw)
     }
 
     /// Decode the untrusted four-byte-per-field FFI metadata table.
@@ -225,10 +285,7 @@ impl DynamicSchemaConfig {
     }
 
     pub fn compute_buffer_count(&self) -> u32 {
-        self.field_metadata
-            .iter()
-            .map(|field| field.buffer_count())
-            .sum()
+        compute_buffer_count(&self.field_metadata)
     }
 
     pub fn schema_message_size(&self) -> usize {

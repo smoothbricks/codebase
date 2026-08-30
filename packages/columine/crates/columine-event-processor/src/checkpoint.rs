@@ -6,6 +6,7 @@
 //! serializer's explicit offsets define the required size.
 
 use crate::bloom::{CollisionPolicy, DedupState};
+use columine_arrow::align_to_8;
 
 pub const CHECKPOINT_MAGIC: u32 = 0x4348_4B50; // "CHKP"
 pub const CHECKPOINT_VERSION: u8 = 1;
@@ -13,10 +14,6 @@ pub const CHECKPOINT_VERSION: u8 = 1;
 const HEADER_SIZE: usize = 36;
 const META_SIZE: usize = 8;
 const STATS_SIZE: usize = 24;
-
-fn align_to_8(offset: usize) -> usize {
-    (offset + 7) & !7usize
-}
 
 /// Serialize dedup state; returns bytes written or `None` when the output is
 /// too small.
