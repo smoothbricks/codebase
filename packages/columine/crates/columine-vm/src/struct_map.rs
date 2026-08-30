@@ -10,7 +10,9 @@
 //! tombstones are not expected in a well-formed state.
 
 use crate::bytes;
-use crate::hash_table::{Probe, ProbeCell, find_key, find_key_pair, probe_linear};
+use crate::hash_table::{
+    Probe, ProbeCell, find_key, find_key_pair, max_load_for_cap, probe_linear,
+};
 use crate::meta::slot_meta_base;
 use columine_types::types::{
     EMPTY_KEY, SlotMetaOffset, StructFieldType, TOMBSTONE, align8, hash_key, hash_key_pair,
@@ -90,7 +92,7 @@ impl StructMapSlot {
 
     /// Maximum size before growth, using a 70% integer load factor.
     const fn max_load(&self) -> u32 {
-        self.capacity * 7 / 10
+        max_load_for_cap(self.capacity)
     }
 
     #[inline(always)]
@@ -338,7 +340,7 @@ impl StructMap2Slot {
     }
 
     const fn max_load(&self) -> u32 {
-        self.capacity * 7 / 10
+        max_load_for_cap(self.capacity)
     }
 
     #[inline(always)]
