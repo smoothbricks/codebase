@@ -11,7 +11,6 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use git2::{AutotagOption, FetchOptions, RemoteCallbacks, RemoteRedirect};
 use http::{Method, Request, header};
 use http_body_util::Empty;
 use hyper::client::conn::{http1, http2};
@@ -297,6 +296,7 @@ struct HelperRequestOut<'a> {
     remote: &'a str,
     destination: &'a Path,
     allowed_root: &'a Path,
+    git_executable: &'a Path,
     credential: Option<HelperCredentialOut<'a>>,
 }
 
@@ -314,6 +314,7 @@ struct HelperRequest {
     remote: String,
     destination: PathBuf,
     allowed_root: PathBuf,
+    git_executable: PathBuf,
     credential: Option<HelperCredential>,
 }
 
@@ -372,6 +373,10 @@ async fn run_fetch_helper(
     plan: RepoFetchPlan,
 ) -> Result<RepoFetchOutcome, RepoMirrorError> {
     validate_helper_executable(executable)?;
+    let git = resolve_git_executable().ok_or(RepoMirrorError::HelperUnavailable)?;
+    if !validate_git_executable(&git) {
+        return Err(RepoMirrorError::HelperUnavailable);
+    }
     let allowed_root = plan
         .destination
         .parent()
@@ -388,6 +393,7 @@ async fn run_fetch_helper(
         remote: &plan.remote,
         destination: &plan.destination,
         allowed_root,
+        git_executable: &git,
         credential,
     };
     let encoded =
@@ -485,10 +491,13 @@ pub fn run_gateway_git_fetch_helper() -> Result<(), GitFetchHelperError> {
     }
     let request: HelperRequest =
         serde_json::from_slice(&bytes).map_err(|_| GitFetchHelperError::InvalidProtocol)?;
-    if request.version != 1 || !validate_helper_destination(&request) {
+    if request.version != 1
+        || !validate_helper_destination(&request)
+        || !validate_git_executable(&request.git_executable)
+    {
         return Err(GitFetchHelperError::InvalidProtocol);
     }
-    let response = match fetch_git2_helper(request) {
+    let response = match fetch_with_git(request) {
         Ok(head) => HelperResponse {
             ok: true,
             head,
@@ -548,59 +557,111 @@ fn validate_helper_destination(request: &HelperRequest) -> bool {
         && std::fs::read_dir(&destination).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-fn fetch_git2_helper(mut request: HelperRequest) -> Result<Option<String>, ()> {
-    let repository = git2::Repository::init_bare(&request.destination).map_err(|_| ())?;
-    {
-        let mut config = repository.config().map_err(|_| ())?;
-        config.set_bool("core.bare", true).map_err(|_| ())?;
-        config
-            .set_str("core.hooksPath", "/dev/null")
-            .map_err(|_| ())?;
-        config
-            .set_str("protocol.file.allow", "never")
-            .map_err(|_| ())?;
-        config
-            .set_str("protocol.ext.allow", "never")
-            .map_err(|_| ())?;
-        config
-            .set_bool("http.followRedirects", false)
-            .map_err(|_| ())?;
+fn resolve_git_executable() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+}
+
+fn validate_git_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !path.is_absolute() {
+        return false;
     }
-    let mut remote = repository
-        .remote_anonymous(&request.remote)
-        .map_err(|_| ())?;
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(|_, _, _| Err(git2::Error::from_str("interactive credentials disabled")));
-    let mut fetch = FetchOptions::new();
-    fetch.remote_callbacks(callbacks);
-    fetch.follow_redirects(RemoteRedirect::None);
-    fetch.download_tags(AutotagOption::All);
-    fetch.prune(git2::FetchPrune::On);
-    let header = request.credential.take().map(|credential| {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+fn git_command(git: &Path, extra_header: Option<&Zeroizing<String>>) -> std::process::Command {
+    let mut command = std::process::Command::new(git);
+    command.env_clear();
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command.env("GIT_CONFIG_SYSTEM", "/dev/null");
+    if let Some(directory) = git.parent() {
+        command.env("PATH", directory);
+    }
+    command.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "protocol.file.allow=never",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "http.followRedirects=false",
+    ]);
+    if let Some(header) = extra_header {
+        command.arg("-c");
+        command.arg(format!("http.extraHeader={}", header.as_str()));
+    }
+    command
+}
+
+/// Isolated fetch: same lockdown as the old libgit2 helper, via PATH git.
+///
+/// The helper process is env-cleared, so the parent passes an absolute `git`
+/// path in the request. Interactive prompts stay off; file/ext protocols and
+/// HTTP redirects stay denied.
+fn fetch_with_git(mut request: HelperRequest) -> Result<Option<String>, ()> {
+    let extra_header = request.credential.take().map(|credential| {
         Zeroizing::new(format!(
             "{}: {}",
             credential.header_name, credential.header_value
         ))
     });
-    if let Some(header) = header.as_ref() {
-        fetch.custom_headers(&[header.as_str()]);
-    }
-    remote
-        .fetch(
-            &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"],
-            Some(&mut fetch),
-            None,
-        )
+    let git = &request.git_executable;
+    let destination = &request.destination;
+    let init = git_command(git, extra_header.as_ref())
+        .args(["init", "--bare", "--template="])
+        .arg(destination)
+        .status()
         .map_err(|_| ())?;
-    Ok(repository.references().ok().and_then(|mut references| {
-        references.find_map(|reference| {
-            let reference = reference.ok()?;
-            if !reference.is_branch() {
-                return None;
-            }
-            reference.target().map(|oid| oid.to_string())
-        })
-    }))
+    if !init.success() {
+        return Err(());
+    }
+    let fetch = git_command(git, extra_header.as_ref())
+        .arg("-C")
+        .arg(destination)
+        .args([
+            "fetch",
+            "--prune",
+            "--tags",
+            "--",
+            request.remote.as_str(),
+            "+refs/heads/*:refs/heads/*",
+            "+refs/tags/*:refs/tags/*",
+        ])
+        .status()
+        .map_err(|_| ())?;
+    if !fetch.success() {
+        return Err(());
+    }
+    let output = git_command(git, None)
+        .arg("-C")
+        .arg(destination)
+        .args([
+            "for-each-ref",
+            "--format=%(objectname)",
+            "--sort=refname",
+            "refs/heads",
+        ])
+        .output()
+        .map_err(|_| ())?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(std::str::from_utf8(&output.stdout)
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned))
 }
 
 #[derive(Clone)]
