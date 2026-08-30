@@ -243,6 +243,7 @@ function align8(n: number): number {
  * parse-backend's compactStatusCode): a status outside the enum means the TS
  * ErrorCode mirror and the WASM binary disagree — a contract violation, so it
  * throws a teaching error instead of manufacturing a bogus enum member.
+ * Discriminants must match columine-types ErrorCode (`types.rs`).
  */
 function vmErrorCode(status: number): ErrorCode {
   switch (status) {
@@ -260,6 +261,8 @@ function vmErrorCode(status: number): ErrorCode {
       return ErrorCode.ARENA_OVERFLOW;
     case ErrorCode.INVALID_KEY:
       return ErrorCode.INVALID_KEY;
+    case ErrorCode.COLUMN_UNDERRUN:
+      return ErrorCode.COLUMN_UNDERRUN;
     default:
       throw new Error(
         `WASM VM returned unknown status ${status}: the TypeScript ErrorCode enum is out of sync ` +
