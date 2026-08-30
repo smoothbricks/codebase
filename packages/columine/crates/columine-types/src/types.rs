@@ -361,6 +361,14 @@ pub struct EvictionEntry {
     pub value: u32,
 }
 
+/// Wire size of one eviction-index entry. Layout math uses this name rather
+/// than restating `size_of::<EvictionEntry>()` at every TTL buffer site.
+pub const EVICTION_ENTRY_SIZE: u32 = size_of::<EvictionEntry>() as u32;
+
+/// Capacity of the per-slot evicted-entry ring. Closed bound, independent of
+/// the slot's live capacity, so growth copies a known number of entries.
+pub const EVICTED_BUFFER_CAP: u32 = 1024;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConditionTreeState {
