@@ -19,7 +19,7 @@ import {
   listCargoWorkspacePackages,
   nextestConfigRelPath,
 } from './cargo-workspace.js';
-import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET } from './cross-check-policy.js';
+import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 const BUILD_OUTPUT_TARGET_PATTERN = /-(?:js|web|html|css|android|native|napi|bun|wasm)$/;
@@ -414,10 +414,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
         cache: true,
         inputs: CARGO_INPUTS,
         options: {
-          commands: [
-            'cargo fmt --all --check',
-            'cargo clippy --workspace --all-targets --target-dir target/cargo-lint -- -D warnings',
-          ],
+          commands: ['cargo fmt --all --check', CARGO_LINT_CLIPPY_COMMAND],
           cwd: projectRoot,
           parallel: false,
         },
