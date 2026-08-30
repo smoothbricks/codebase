@@ -64,8 +64,16 @@ impl SpanSource for SpanBuffer {
         self.dynamic_message_at(row)
     }
 
+    fn package_name(&self) -> Option<&str> {
+        self.source().map(|source| source.package_name)
+    }
+
     fn package_file(&self) -> Option<&str> {
-        self.callsite().map(|(file, _)| file)
+        self.source().map(|source| source.package_file)
+    }
+
+    fn git_sha(&self) -> Option<&str> {
+        self.source().and_then(|source| source.git_sha)
     }
 
     fn line_number(&self, row: usize) -> u32 {

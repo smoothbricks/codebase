@@ -194,7 +194,7 @@ impl ArrowTraceQuery {
         ) else {
             return Ok(None);
         };
-        Ok(Some((trace, thread, span)))
+        Ok(Some((trace.to_owned(), thread, span)))
     }
 
     fn parent_key(batch: &RecordBatch, row: usize) -> Result<Option<SpanKey>, ArrowError> {
@@ -205,51 +205,48 @@ impl ArrowTraceQuery {
         ) else {
             return Ok(None);
         };
-        Ok(Some((trace, thread, span)))
+        Ok(Some((trace.to_owned(), thread, span)))
     }
 }
 
-fn str_at(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>, ArrowError> {
-    let idx = batch.schema().index_of(name)?;
-    let col = batch.column(idx);
-    if col.is_null(row) {
+fn str_at<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+    row: usize,
+) -> Result<Option<&'a str>, ArrowError> {
+    let idx = batch.schema_ref().index_of(name)?;
+    let column = batch.column(idx);
+    if column.is_null(row) {
         return Ok(None);
     }
-    match col.data_type() {
-        DataType::Dictionary(key, value) => {
-            if **value != DataType::Utf8 {
-                return Err(type_error(name, "a Utf8 dictionary", col.data_type()));
+    match column.data_type() {
+        DataType::Dictionary(key, value) if **value == DataType::Utf8 => match **key {
+            DataType::UInt8 => {
+                let dictionary = column.as_dictionary::<UInt8Type>();
+                let values = dictionary
+                    .values()
+                    .as_string_opt::<i32>()
+                    .ok_or_else(|| type_error(name, "a Utf8 dictionary", column.data_type()))?;
+                Ok(Some(values.value(dictionary.keys().value(row) as usize)))
             }
-            let (key_index, is_null) = match **key {
-                DataType::UInt8 => {
-                    let dict = col.as_dictionary::<UInt8Type>();
-                    (dict.keys().value(row) as usize, dict.keys().is_null(row))
-                }
-                DataType::UInt32 => {
-                    let dict = col.as_dictionary::<UInt32Type>();
-                    (dict.keys().value(row) as usize, dict.keys().is_null(row))
-                }
-                _ => {
-                    return Err(type_error(
-                        name,
-                        "a dictionary keyed by UInt8 or UInt32",
-                        col.data_type(),
-                    ));
-                }
-            };
-            if is_null {
-                return Ok(None);
+            DataType::UInt32 => {
+                let dictionary = column.as_dictionary::<UInt32Type>();
+                let values = dictionary
+                    .values()
+                    .as_string_opt::<i32>()
+                    .ok_or_else(|| type_error(name, "a Utf8 dictionary", column.data_type()))?;
+                Ok(Some(values.value(dictionary.keys().value(row) as usize)))
             }
-            let values = match **key {
-                DataType::UInt8 => col.as_dictionary::<UInt8Type>().values().clone(),
-                _ => col.as_dictionary::<UInt32Type>().values().clone(),
-            };
-            let strings = values
-                .as_string_opt::<i32>()
-                .ok_or_else(|| type_error(name, "a Utf8 dictionary", col.data_type()))?;
-            Ok(Some(strings.value(key_index).to_string()))
+            _ => Err(type_error(
+                name,
+                "a dictionary keyed by UInt8 or UInt32",
+                column.data_type(),
+            )),
+        },
+        DataType::Dictionary(_, _) => {
+            Err(type_error(name, "a Utf8 dictionary", column.data_type()))
         }
-        DataType::Utf8 => Ok(Some(col.as_string::<i32>().value(row).to_string())),
+        DataType::Utf8 => Ok(Some(column.as_string::<i32>().value(row))),
         other => Err(type_error(name, "Utf8 or a Utf8 dictionary", other)),
     }
 }
@@ -315,7 +312,7 @@ fn column_equals(
     want: &ColumnValue,
 ) -> Result<bool, ArrowError> {
     Ok(match want {
-        ColumnValue::Str(s) => str_at(batch, name, row)?.as_deref() == Some(s.as_str()),
+        ColumnValue::Str(s) => str_at(batch, name, row)? == Some(s.as_str()),
         ColumnValue::U64(v) => u64_at(batch, name, row)? == Some(*v),
         ColumnValue::I64(v) => i64_at(batch, name, row)? == Some(*v),
         ColumnValue::F64(v) => f64_at(batch, name, row)? == Some(*v),
@@ -325,7 +322,7 @@ fn column_equals(
 
 fn row_matches(batch: &RecordBatch, row: usize, selector: &Selector) -> Result<bool, ArrowError> {
     if let Some(template) = &selector.template
-        && str_at(batch, "message", row)?.as_deref() != Some(template.as_str())
+        && str_at(batch, "message", row)? != Some(template.as_str())
     {
         return Ok(false);
     }

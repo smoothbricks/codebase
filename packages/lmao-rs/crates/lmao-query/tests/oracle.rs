@@ -147,7 +147,8 @@ fn build_batch(specs: &[SpanSpec]) -> RecordBatch {
     }
 
     let roots: Vec<MockSpan> = nodes.into_iter().flatten().collect();
-    convert_span_trees(&roots, &StableVocabularyCatalog::EMPTY).expect("fixture converts")
+    let empty_catalog = StableVocabularyCatalog::EMPTY;
+    convert_span_trees(&roots, &empty_catalog).expect("fixture converts")
 }
 
 // ---------------------------------------------------------------------------

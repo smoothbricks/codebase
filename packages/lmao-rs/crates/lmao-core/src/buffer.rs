@@ -33,6 +33,14 @@ pub const COMPLETION_ROW: usize = 1;
 /// First appendable log row.
 pub const FIRST_LOG_ROW: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceMetadata {
+    pub package_name: &'static str,
+    pub package_file: &'static str,
+    pub git_sha: Option<&'static str>,
+    pub line: u32,
+}
+
 /// One span's columnar buffer. SoA: parallel timestamp/packed-header arrays plus
 /// lazily-created attribute columns (todo: generated per-schema by `lmao-macros`).
 #[derive(Debug)]
@@ -47,8 +55,8 @@ pub struct SpanBuffer {
     /// Dynamic span names and log messages only. Static vocabulary paths leave
     /// this column untouched so it remains lazy and unallocated.
     messages: StrColumn,
-    /// Callsite of the `span!` invocation (file is 'static via `file!()`).
-    callsite: Option<(&'static str, u32)>,
+    /// Source attribution captured by `span!`.
+    source: Option<SourceMetadata>,
     /// Overflow chain: same identity, appended when this buffer fills (`01b2`).
     overflow: Option<Box<SpanBuffer>>,
     /// Child spans, walked depth-first pre-order at Arrow conversion (`01k`).
@@ -115,7 +123,7 @@ impl SpanBuffer {
             headers,
             line_numbers,
             messages: StrColumn::new(),
-            callsite: None,
+            source: None,
             overflow: None,
             children: Vec::new(),
         }
@@ -126,14 +134,14 @@ impl SpanBuffer {
         self.messages.get(0)
     }
 
-    /// Record the `span!` callsite (`file!()`, `line!()`).
-    pub fn set_callsite(&mut self, file: &'static str, line: u32) {
-        self.callsite = Some((file, line));
-        self.line_numbers[0] = line;
+    /// Record the `span!` source attribution.
+    pub fn set_source(&mut self, source: SourceMetadata) {
+        self.line_numbers[0] = source.line;
+        self.source = Some(source);
     }
 
-    pub fn callsite(&self) -> Option<(&'static str, u32)> {
-        self.callsite
+    pub fn source(&self) -> Option<SourceMetadata> {
+        self.source
     }
 
     /// Attach a finished/running child span (walked depth-first pre-order at
@@ -212,7 +220,7 @@ impl SpanBuffer {
                 headers: vec![0u32; target.capacity],
                 line_numbers: vec![0u32; target.capacity],
                 messages: StrColumn::new(),
-                callsite: None,
+                source: None,
                 overflow: None,
                 children: Vec::new(),
             }));
