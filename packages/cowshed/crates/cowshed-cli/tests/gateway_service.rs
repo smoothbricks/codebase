@@ -372,6 +372,14 @@ fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
         fs::read(executable.path()).expect("installed bytes"),
         b"#!/bin/sh\nexit 0\n"
     );
+    assert_eq!(
+        fs::symlink_metadata(executable.path())
+            .expect("installed metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        STABLE_BINARY_MODE
+    );
     let spec = LaunchAgentSpec::gateway(&executable).expect("valid spec");
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
