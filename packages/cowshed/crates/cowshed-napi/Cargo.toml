@@ -8,7 +8,6 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-cowshed-cli = { path = "../cowshed-cli" }
 cowshed-core.workspace = true
 libc = "0.2"
 napi.workspace = true
@@ -18,3 +17,11 @@ serde_json.workspace = true
 
 [build-dependencies]
 napi-build.workspace = true
+
+# The addon links the capability client, never the CLI. `cli.ts` runs the packaged `cowshed`
+# binary, so an in-process copy of the CLI inside the cdylib was a second implementation of the
+# same verbs that also dragged clap and toml into every Node process loading the addon. It stays a
+# dev-dependency because the parity tests assert that every CLI verb names the capability export
+# it corresponds to, and that assertion has to see `cowshed_cli::args`.
+[dev-dependencies]
+cowshed-cli = { path = "../cowshed-cli" }

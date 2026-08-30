@@ -77,7 +77,6 @@ interface NativeModule {
   coordinatorEndpoint(descriptor: number): CoordinatorEndpoint;
   openProject(endpoint: CoordinatorEndpoint, path: string): Promise<NativeProjectHandle>;
   connectCoordinator(endpoint: CoordinatorEndpoint, path: string): Promise<NativeCoordinatorHandle>;
-  runCli(argv: readonly string[]): Promise<number>;
 }
 
 const assertNativeModule = typia.createAssert<NativeModule>();
