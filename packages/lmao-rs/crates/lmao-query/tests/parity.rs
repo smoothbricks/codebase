@@ -66,19 +66,47 @@ fn fixture_batch() -> RecordBatch {
 #[test]
 fn arrow_scan_answers_the_fixture() {
     let q = ArrowTraceQuery::new(vec![fixture_batch()]);
-    assert_eq!(q.count(&Selector::template("cache {key} hit")), 2);
-    assert_eq!(q.count(&Selector::template("handle-request")), 2);
-    assert!(q.never(&Selector::template("never-logged {x}")));
+    assert_eq!(
+        q.count(&Selector::template("cache {key} hit"))
+            .expect("valid template selector"),
+        2
+    );
+    assert_eq!(
+        q.count(&Selector::template("handle-request"))
+            .expect("valid template selector"),
+        2
+    );
+    assert!(
+        q.never(&Selector::template("never-logged {x}"))
+            .expect("valid template selector")
+    );
     // db-query rows are children of handle-request spans.
-    assert!(q.all_children_of(
-        &Selector::template("db-query"),
-        &Selector::template("handle-request"),
-    ));
+    assert!(
+        q.all_children_of(
+            &Selector::template("db-query"),
+            &Selector::template("handle-request"),
+        )
+        .expect("valid parentage selectors")
+    );
     // handle-request roots are NOT children of db-query.
-    assert!(!q.all_children_of(
-        &Selector::template("handle-request"),
-        &Selector::template("db-query"),
-    ));
+    assert!(
+        !q.all_children_of(
+            &Selector::template("handle-request"),
+            &Selector::template("db-query"),
+        )
+        .expect("valid parentage selectors")
+    );
+}
+
+#[test]
+fn unknown_column_is_a_query_error() {
+    let q = ArrowTraceQuery::new(vec![fixture_batch()]);
+    let selector = Selector::default().with("missing_column", 1_u64);
+
+    let error = q
+        .count(&selector)
+        .expect_err("a selector column absent from every batch must fail");
+    assert!(error.to_string().contains("missing_column"), "{error}");
 }
 
 #[test]
@@ -140,8 +168,18 @@ fn stable_and_dynamic_vocabulary_have_query_and_archive_parity() {
         ("span name", Selector::template("query-span"), 1),
         ("absent", Selector::template("never emitted"), 0),
     ] {
-        assert_eq!(dynamic_query.count(&selector), expected, "dynamic {name}");
-        assert_eq!(static_query.count(&selector), expected, "static {name}");
+        assert_eq!(
+            dynamic_query
+                .count(&selector)
+                .expect("valid dynamic selector"),
+            expected,
+            "dynamic {name}"
+        );
+        assert_eq!(
+            static_query.count(&selector).expect("valid static selector"),
+            expected,
+            "static {name}"
+        );
     }
     assert_eq!(
         build_trace_chunk_envelope("archive://fixture", &dynamic_batch),
