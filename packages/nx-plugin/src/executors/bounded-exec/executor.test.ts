@@ -235,11 +235,19 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
     };
 
+    // `trap "" TERM` is a shell builtin, so the ignore disposition is in place
+    // within a few ms of `sh` starting and is inherited by `sleep`. The previous
+    // `node -e "process.on('SIGTERM', ...)"` needed p50 27.8ms just to reach
+    // handler-installed, against a 50ms timeout — 1.8x margin on an idle
+    // 18-core host, and none at all on a loaded or 3-core runner. When SIGTERM
+    // arrives first the child dies on the default disposition, the run settles,
+    // and the SIGKILL branch never executes, so `calls` is ['SIGTERM'] and the
+    // assertion below fails for a reason that has nothing to do with escalation.
     const result = await runBoundedExec(
       {
-        command: 'node -e "process.on(\'SIGTERM\', () => {}); setTimeout(() => {}, 5000)"',
-        timeoutMs: 50,
-        killAfterMs: 10,
+        command: 'sh -c \'trap "" TERM; sleep 5\'',
+        timeoutMs: 250,
+        killAfterMs: 50,
       },
       workspace.context,
       killer,
