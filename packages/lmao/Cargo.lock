@@ -576,6 +576,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lmao-ffi-dylib"
+version = "0.0.1"
+dependencies = [
+ "lmao-core",
+]
+
+[[package]]
 name = "lmao-macros"
 version = "0.0.1"
 dependencies = [
