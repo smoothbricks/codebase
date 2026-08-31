@@ -24,7 +24,10 @@ use crate::gateway_service::{
 use crate::launchd::RemovalOutcome;
 use crate::output::Output;
 use crate::sccache_client_config::{self, ConfigChange, ConfigOutcome, ConfigReport, SharedStore};
-use crate::sccache_service::{derived_capacity, remove_stale_socket, sccache_launch_agent};
+use crate::sccache_nix::{self, BuildOutcome, BuildRefusal};
+use crate::sccache_service::{
+    derived_capacity, remove_stale_socket, sccache_launch_agent, start_service,
+};
 use async_trait::async_trait;
 use cowshed_core::api::EmptyResult;
 use cowshed_core::metadata::ImageFormat;
@@ -118,6 +121,79 @@ pub struct HostArtifactRemoval {
     pub outcome: RemovalOutcome,
 }
 
+/// What `setup --sccache` did about the patched sccache.
+///
+/// `NotRequested` is a first-class arm rather than an `Option`: sccache is opt-in because not every
+/// cowshed user writes Rust, so "the operator did not ask" is the normal outcome and must never
+/// render as a failure. Every other arm names either the store path that is now installed or the
+/// reason nothing is, so no arm can be reported as something it is not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SccacheInstall {
+    /// No `--sccache` on the command line. Nothing was built and nothing is claimed.
+    NotRequested,
+    /// Built, rooted, and the daemon answered its socket.
+    Running { program: PathBuf, gc_root: PathBuf },
+    /// Built and rooted, but the daemon did not come up. The store path is still installed, so the
+    /// program and the reason are both reported: this is a launchd problem, not a build problem.
+    NotRunning {
+        program: PathBuf,
+        gc_root: PathBuf,
+        reason: String,
+    },
+    /// Nothing was installed. Carries the flake it would have built and why it did not.
+    Unavailable {
+        flake: PathBuf,
+        refusal: BuildRefusal,
+    },
+}
+
+impl SccacheInstall {
+    /// The one line `setup` prints, or nothing at all when nobody asked.
+    fn phrase(&self) -> Option<String> {
+        match self {
+            Self::NotRequested => None,
+            Self::Running { program, gc_root } => Some(format!(
+                "sccache: {} is installed and answering; nix GC root {}",
+                program.display(),
+                gc_root.display()
+            )),
+            Self::NotRunning {
+                program,
+                gc_root,
+                reason,
+            } => Some(format!(
+                "sccache: {} is installed and rooted at {}, but the daemon did not start — {reason}",
+                program.display(),
+                gc_root.display()
+            )),
+            Self::Unavailable { flake, refusal } => Some(refusal.phrase(flake)),
+        }
+    }
+
+    /// The failure a caller must not exit 0 over.
+    ///
+    /// An operator who passed `--sccache` and did not get sccache has to hear it from the exit
+    /// status as well as from the line above, or a scripted setup reports a host as ready when the
+    /// thing it was asked to install is absent. The storage transaction is unaffected: this is
+    /// returned only after every volume row and every other outcome has been rendered.
+    fn failure(&self) -> Option<CowshedError> {
+        match self {
+            Self::NotRequested | Self::Running { .. } => None,
+            Self::NotRunning { reason, .. } => Some(CowshedError::environment_missing(
+                format!("the sccache daemon did not start: {reason}"),
+                "cowshed sccache status",
+            )),
+            Self::Unavailable { flake, refusal } => {
+                let finding = refusal.finding(flake);
+                Some(CowshedError::environment_missing(
+                    finding.message,
+                    finding.hint,
+                ))
+            }
+        }
+    }
+}
+
 impl HostArtifactRemoval {
     pub fn new(what: impl Into<String>, outcome: RemovalOutcome) -> Self {
         Self {
@@ -160,6 +236,12 @@ pub trait HostSetup: Send {
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport>;
     /// Record the host session mount root. Refused while any session workspace is attached.
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf>;
+    /// Build the patched sccache from cowshed's own flake, root it, and start its agent.
+    ///
+    /// Called only for `setup --sccache`; a default run never touches nix. Required rather than
+    /// default-provided because there is no honest default: a host that silently answered
+    /// "nothing to do" would report a successful install of something it never built.
+    async fn install_sccache(&mut self) -> Result<SccacheInstall>;
     /// Reconcile installed host-service binaries with the build running this repair.
     ///
     /// Default-empty so test hosts modelling only the volume flows stay valid; the native host
@@ -284,17 +366,23 @@ impl HostSetup for NativeHostSetup {
         }
     }
 
-    /// Remove both agents, then both binaries.
+    /// Remove both agents, then the cowshed binary copy and sccache's nix GC root.
     ///
     /// Order is load-bearing: the gateway agent is `KeepAlive`, so deleting the binary while its
-    /// agent is still loaded leaves launchd respawning a path that no longer resolves.
+    /// agent is still loaded leaves launchd respawning a path that no longer resolves. sccache is
+    /// the same hazard with a different mechanism — releasing its root while the agent is loaded
+    /// makes the store path it runs eligible for the next collection — so the root goes after the
+    /// agent, never before.
+    ///
+    /// Releasing the root is all teardown does about sccache's binary: the store path itself is
+    /// nix's to reclaim, and deleting anything under `/nix/store` is not cowshed's business.
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>> {
         let (gateway_binary, gateway_agent) = gateway_launch_agent(&self.home)?;
-        let (sccache_binary, sccache_agent, sccache_socket) = sccache_launch_agent(&self.home)?;
+        let (sccache_agent, sccache_root, sccache_socket) = sccache_launch_agent(&self.home)?;
         let removals = vec![
             HostArtifactRemoval::new(
                 format!("{} agent", gateway_agent.label()),
-                remove_launch_agent(&gateway_agent)?,
+                remove_launch_agent(gateway_agent.target())?,
             ),
             HostArtifactRemoval::new(
                 format!("{} agent", sccache_agent.label()),
@@ -305,8 +393,8 @@ impl HostSetup for NativeHostSetup {
                 remove_host_stable_executable(&gateway_binary)?,
             ),
             HostArtifactRemoval::new(
-                "installed sccache binary",
-                remove_host_stable_executable(&sccache_binary)?,
+                "sccache nix GC root",
+                remove_gc_root(&sccache_root)?,
             ),
         ];
         remove_stale_socket(&sccache_socket)?;
@@ -343,6 +431,43 @@ impl HostSetup for NativeHostSetup {
         sccache_client_config::apply(&path, &SharedStore::new(directory, capacity))
     }
 
+    /// Build the flake, root the result, and start the agent on that store path.
+    ///
+    /// Storage first, deliberately: the daemon's cache lives on the caches volume, and starting a
+    /// server over an unmounted mountpoint would grow a cache on the boot disk underneath it. The
+    /// caller only reaches this on a run whose volumes came up, so the failure here is genuinely
+    /// about nix or launchd rather than about storage.
+    async fn install_sccache(&mut self) -> Result<SccacheInstall> {
+        let flake = sccache_nix::flake_directory()?;
+        let program = match sccache_nix::build(&self.home, &flake)? {
+            BuildOutcome::Installed(program) => program,
+            BuildOutcome::Refused(refusal) => {
+                return Ok(SccacheInstall::Unavailable { flake, refusal });
+            }
+        };
+        let gc_root = program.gc_root().to_path_buf();
+        let installed = program.program().to_path_buf();
+        // `start_service` writes the plist naming this store path and waits for the socket. A
+        // daemon that does not come up is reported with the program still named: the build
+        // succeeded and is rooted, so pointing the reader at nix would aim them at the wrong layer.
+        match start_service(None).await {
+            Ok(status) if status.running => Ok(SccacheInstall::Running {
+                program: installed,
+                gc_root,
+            }),
+            Ok(_) => Ok(SccacheInstall::NotRunning {
+                program: installed,
+                gc_root,
+                reason: "the agent is loaded but its socket does not answer".to_owned(),
+            }),
+            Err(error) => Ok(SccacheInstall::NotRunning {
+                program: installed,
+                gc_root,
+                reason: error.message,
+            }),
+        }
+    }
+
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf> {
         let storage = validate_existing_host_storage(&self.home).await?;
         let attached = NativeGatewayInventory::new(storage.clone())
@@ -362,6 +487,25 @@ impl HostSetup for NativeHostSetup {
         let config = execute_mount_root_change(&plan).map_err(host_config_error)?;
         Ok(config.mount_root().to_path_buf())
     }
+}
+
+/// Release the indirect nix GC root cowshed registered for sccache.
+///
+/// Unlinking the symlink is the whole of it: nix keeps indirect roots as symlinks under
+/// `/nix/var/nix/gcroots/auto` pointing back at this path, and a root whose target is gone is
+/// dropped by the next collection. Nothing under `/nix/store` is touched — that store path may be
+/// shared with a profile, another flake, or another user, and deleting it is nix's decision.
+///
+/// `symlink_metadata`, never `metadata`: a root pointing at an already-collected store path is a
+/// dangling symlink, and following it would report the root as absent and leave it behind.
+fn remove_gc_root(root: &Path) -> Result<RemovalOutcome> {
+    if fs::symlink_metadata(root).is_err() {
+        return Ok(RemovalOutcome::AlreadyAbsent);
+    }
+    fs::remove_file(root).map_err(|error| {
+        CowshedError::internal(format!("could not remove {}: {error}", root.display()))
+    })?;
+    Ok(RemovalOutcome::Removed)
 }
 
 /// How many workspaces one project holds: its published session images plus its `main`.
@@ -429,7 +573,7 @@ where
     if args.uninstall {
         return uninstall(setup, args.force, json, output).await;
     }
-    repair(setup, json, output).await
+    repair(setup, args.sccache, json, output).await
 }
 
 async fn set_mount_root<S, W, E>(
@@ -478,7 +622,12 @@ fn host_config_error(error: HostConfigError) -> CowshedError {
     }
 }
 
-async fn repair<S, W, E>(setup: &mut S, json: bool, output: &mut Output<W, E>) -> Result<i32>
+async fn repair<S, W, E>(
+    setup: &mut S,
+    sccache_requested: bool,
+    json: bool,
+    output: &mut Output<W, E>,
+) -> Result<i32>
 where
     S: HostSetup,
     W: Write + Send,
@@ -511,6 +660,13 @@ where
         Some(_) => Vec::new(),
         None => setup.refresh_host_services().await?,
     };
+    // Opt-in, and last: sccache's daemon caches onto the caches volume, so building and starting it
+    // before the volumes are up would grow a cache on the boot disk under an empty mountpoint. A
+    // run that stopped partway never reaches it at all.
+    let sccache_install = match (&failure, sccache_requested) {
+        (None, true) => setup.install_sccache().await?,
+        _ => SccacheInstall::NotRequested,
+    };
     if json {
         // The frozen envelope has no partial state, so a failed run answers `ok:false` and the
         // per-action detail goes to stderr — where progress belongs with `--json` anyway. Silently
@@ -521,12 +677,14 @@ where
                 // On stderr, so the frozen stdout envelope stays frozen and a conflict a person
                 // has to resolve still reaches them in a scripted run.
                 emit_sccache_client(sccache.as_ref(), output)?;
+                emit_sccache_install(&sccache_install, output)?;
             }
             Some(_) => render_repair(
                 &plan,
                 &report,
                 mains.as_ref(),
                 sccache.as_ref(),
+                &sccache_install,
                 &services,
                 output,
             )?,
@@ -537,6 +695,7 @@ where
             &report,
             mains.as_ref(),
             sccache.as_ref(),
+            &sccache_install,
             &services,
             output,
         )?;
@@ -555,6 +714,12 @@ where
         WorkspaceCensus::Counted { workspaces: 0, .. }
     ) {
         output.hint("cowshed adopt").map_err(output_error)?;
+    }
+    // Last, after every row and every hint: the operator sees the whole host before the reason
+    // this exits non-zero. Someone who asked for sccache and did not get it must not read exit 0
+    // as "installed" — the storage transaction succeeded, and that is exactly what the rows say.
+    if let Some(failure) = sccache_install.failure() {
+        return Err(failure);
     }
     Ok(0)
 }
@@ -819,6 +984,7 @@ fn render_repair<W: Write, E: Write>(
     report: &HostSetupReport,
     mains: Option<&MainMounts>,
     sccache: Option<&ConfigReport>,
+    sccache_install: &SccacheInstall,
     services: &[ServiceBinaryRefresh],
     output: &mut Output<W, E>,
 ) -> Result<()> {
@@ -844,21 +1010,34 @@ fn render_repair<W: Write, E: Write>(
     // Before the status line, which is the last thing a reader sees and is a claim about the whole
     // host rather than about one file.
     emit_sccache_client(sccache, output)?;
+    emit_sccache_install(sccache_install, output)?;
+    // An exhaustive match, not an `if let`: an outcome this module does not render is an outcome
+    // the host silently kept to itself, which is the one thing a repair report must never do.
     for refresh in services {
-        if let ServiceBinaryRefresh::Refreshed { service } = refresh {
-            output
-                .guidance(&format!(
-                    "{service} ran a stale binary; refreshed and restarted"
-                ))
-                .map_err(output_error)?;
+        let line = match refresh {
+            ServiceBinaryRefresh::Refreshed { service } => {
+                Some(format!("{service} ran a stale binary; refreshed and restarted"))
+            }
+            ServiceBinaryRefresh::Refused {
+                service, reason, ..
+            } => Some(format!("{service} still runs its installed binary: {reason}")),
+            // Its remedy is a hint below the status line, where every other next step lives.
+            ServiceBinaryRefresh::Stale { .. } => None,
+        };
+        if let Some(line) = line {
+            output.guidance(&line).map_err(output_error)?;
         }
     }
     output
         .guidance(&repair_status(plan, report, mains, services))
         .map_err(output_error)?;
     for refresh in services {
-        if let ServiceBinaryRefresh::Stale { remedy, .. } = refresh {
-            output.hint(remedy).map_err(output_error)?;
+        match refresh {
+            ServiceBinaryRefresh::Stale { remedy, .. }
+            | ServiceBinaryRefresh::Refused { remedy, .. } => {
+                output.hint(remedy).map_err(output_error)?;
+            }
+            ServiceBinaryRefresh::Refreshed { .. } => {}
         }
     }
     Ok(())
@@ -872,6 +1051,21 @@ fn emit_sccache_client<W: Write, E: Write>(
         output
             .guidance(&sccache_client_phrase(report))
             .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+/// What `setup --sccache` did, in one line, and nothing at all when nobody asked for it.
+///
+/// Unsuppressible guidance rather than a hint: the store path is the identity of the daemon this
+/// host will run, and a reader who cannot see which one was installed cannot tell a fresh build
+/// from a no-op.
+fn emit_sccache_install<W: Write, E: Write>(
+    install: &SccacheInstall,
+    output: &mut Output<W, E>,
+) -> Result<()> {
+    if let Some(phrase) = install.phrase() {
+        output.guidance(&phrase).map_err(output_error)?;
     }
     Ok(())
 }

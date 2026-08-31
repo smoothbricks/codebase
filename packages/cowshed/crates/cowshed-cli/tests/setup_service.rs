@@ -14,8 +14,10 @@ use cowshed_cli::output::Output;
 use cowshed_cli::sccache_client_config::{
     ConfigChange, ConfigConflict, ConfigOutcome, ConfigReport,
 };
+use cowshed_cli::sccache_nix::BuildRefusal;
 use cowshed_cli::setup_service::{
-    HostArtifactRemoval, HostSetup, MainMounts, WorkspaceCensus, dispatch as setup_dispatch,
+    HostArtifactRemoval, HostSetup, MainMounts, SccacheInstall, WorkspaceCensus,
+    dispatch as setup_dispatch,
 };
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::bootstrap::{
@@ -46,6 +48,9 @@ struct FakeHost {
     /// What reconciling the installed service binaries found, so the drift sentences are
     /// provable without launchd or a real installed copy.
     services: Vec<ServiceBinaryRefresh>,
+    /// What `setup --sccache` found, so the opt-in rows and the non-zero exit are provable without
+    /// nix, a flake, or launchd.
+    sccache_install: SccacheInstall,
 }
 
 /// A setup plan whose `non_destructive` is derived exactly the way core derives it — no
@@ -118,6 +123,12 @@ impl Default for FakeHost {
             execute_error: None,
             mount_root_error: None,
             services: Vec::new(),
+            sccache_install: SccacheInstall::Running {
+                program: PathBuf::from("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
+                gc_root: PathBuf::from(
+                    "/Users/dev/Library/Application Support/dev.cowshed/nix/sccache",
+                ),
+            },
         }
     }
 }
@@ -175,6 +186,11 @@ impl HostSetup for FakeHost {
         Ok(self.sccache.clone())
     }
 
+    async fn install_sccache(&mut self) -> Result<SccacheInstall> {
+        self.events.push(String::from("install-sccache"));
+        Ok(self.sccache_install.clone())
+    }
+
     async fn configure_mount_root(&mut self, mount_root: &std::path::Path) -> Result<PathBuf> {
         self.events
             .push(format!("configure-mount-root:{}", mount_root.display()));
@@ -189,16 +205,25 @@ const REPAIR: SetupArgs = SetupArgs {
     uninstall: false,
     force: false,
     mount_root: None,
+    sccache: false,
+};
+const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
+    uninstall: false,
+    force: false,
+    mount_root: None,
+    sccache: true,
 };
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: false,
     mount_root: None,
+    sccache: false,
 };
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: true,
     mount_root: None,
+    sccache: false,
 };
 
 struct Streams {
@@ -1523,6 +1548,7 @@ async fn setup_mount_root_prints_the_configured_path() {
         uninstall: false,
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
+        sccache: false,
     };
     let streams = run(&mut host, args, false, false).await;
     assert_eq!(streams.exit, 0);
@@ -1545,6 +1571,7 @@ async fn setup_mount_root_json_is_empty_success() {
         uninstall: false,
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
+        sccache: false,
     };
     let streams = run(&mut host, args, true, false).await;
     assert_eq!(streams.exit, 0);
@@ -1564,6 +1591,7 @@ async fn setup_mount_root_refuses_while_workspaces_are_attached() {
         uninstall: false,
         force: false,
         mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
+        sccache: false,
     };
     let error = refusal(&mut host, args).await;
     assert_eq!(error.code, ErrorCode::Conflict);
@@ -1744,5 +1772,133 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "refresh-services",
             "census"
         ]
+    );
+}
+
+/// sccache is opt-in. A default `setup` must not build a nix flake, must not require nix to be
+/// installed, and must not print a line about a service the caller never asked for.
+#[tokio::test]
+async fn a_default_setup_never_touches_sccache_at_all() {
+    let mut host = FakeHost::default();
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(
+        !host.events.contains(&String::from("install-sccache")),
+        "a default setup asked the host to install sccache: {:?}",
+        host.events
+    );
+    assert!(
+        !streams.stderr.contains("nix"),
+        "a default setup mentioned nix: {}",
+        streams.stderr
+    );
+}
+
+/// The opt-in path: the store path and its GC root are both named, because the store path is the
+/// identity of the daemon this host now runs and the root is the only reason it survives
+/// `nix store gc`. A reader who cannot see both cannot tell a pinned install from a doomed one.
+#[tokio::test]
+async fn the_optin_names_the_store_path_and_its_gc_root() {
+    let mut host = FakeHost::default();
+    let streams = run(&mut host, REPAIR_WITH_SCCACHE, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams
+            .stderr
+            .contains("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("Application Support/dev.cowshed/nix/sccache"),
+        "{}",
+        streams.stderr
+    );
+    // Last of the host's work: the daemon caches onto the caches volume, so it is built and started
+    // only after the volumes are up.
+    let install = host
+        .events
+        .iter()
+        .position(|event| event == "install-sccache")
+        .expect("the opt-in asks the host to install sccache");
+    let execute = host
+        .events
+        .iter()
+        .position(|event| event == "execute")
+        .expect("storage is executed");
+    assert!(
+        execute < install,
+        "sccache was built before the volumes came up: {:?}",
+        host.events
+    );
+}
+
+/// A host that asked for sccache and has no nix: the storage rows are still printed, the missing
+/// prerequisite is named with the remedy, and the command does NOT exit 0 — a scripted setup that
+/// read exit 0 here would report a host as ready without the thing it was told to install.
+#[tokio::test]
+async fn a_host_without_nix_is_told_so_and_still_repairs_storage() {
+    let mut host = FakeHost::default();
+    host.sccache_install = SccacheInstall::Unavailable {
+        flake: PathBuf::from("/opt/cowshed/nix/sccache"),
+        refusal: BuildRefusal::NixMissing,
+    };
+
+    let (streams, error) = failing_run(&mut host, REPAIR_WITH_SCCACHE, false).await;
+
+    assert_eq!(error.code.as_str(), "environment-missing");
+    assert!(
+        error.message.contains("nix is not on PATH"),
+        "{}",
+        error.message
+    );
+    assert!(error.hint.contains("cowshed setup --sccache"), "{}", error.hint);
+    assert_ne!(streams.exit, 0, "a missing prerequisite must not exit 0");
+    // The rest of setup ran and reported: aborting on the opt-in would strand a host whose volumes
+    // this very command just repaired.
+    assert!(
+        streams.stderr.contains("/etc/fstab"),
+        "the storage rows are missing: {}",
+        streams.stderr
+    );
+    assert!(
+        streams
+            .stderr
+            .contains("nix is not on PATH, so /opt/cowshed/nix/sccache could not be built"),
+        "{}",
+        streams.stderr
+    );
+    assert!(
+        host.events.contains(&String::from("configure-sccache-client")),
+        "the run stopped early: {:?}",
+        host.events
+    );
+}
+
+/// A build that succeeded and a daemon that did not start is a launchd problem, not a nix one: the
+/// store path stays named so nobody re-runs the build looking for the fault.
+#[tokio::test]
+async fn a_rooted_build_whose_daemon_never_answered_points_at_launchd() {
+    let mut host = FakeHost::default();
+    host.sccache_install = SccacheInstall::NotRunning {
+        program: PathBuf::from("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
+        gc_root: PathBuf::from("/Users/dev/Library/Application Support/dev.cowshed/nix/sccache"),
+        reason: String::from("the agent is loaded but its socket does not answer"),
+    };
+
+    let (streams, error) = failing_run(&mut host, REPAIR_WITH_SCCACHE, false).await;
+
+    assert_eq!(error.code.as_str(), "environment-missing");
+    assert_eq!(error.hint, "cowshed sccache status");
+    assert!(
+        streams
+            .stderr
+            .contains("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache is installed and rooted"),
+        "{}",
+        streams.stderr
     );
 }

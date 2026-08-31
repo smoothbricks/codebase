@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use cowshed_cli::args::{Command, GatewayCommand, parse_args};
 use cowshed_cli::gateway_service::{
     GatewayDrain, GatewayPaths, activate_launch_agent, drain_after_shutdown, emit_gateway_status,
-    install_host_stable_executable,
+    install_host_stable_executable, refuse_unsupervisable_build, restore_previous_executable,
+    retain_previous_executable,
 };
 use cowshed_cli::launchd::{
     COWSHED_BINARY_NAME, CommandStatus, HostStableExecutable, InstallOutcome, LaunchAgentSpec,
@@ -85,7 +86,7 @@ fn launch_agent_activation_bootstraps_only_when_not_loaded() {
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
+    activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::NoChange)
         .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(command.argv.len(), 2);
@@ -100,7 +101,7 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
+    activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::NoChange)
         .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(command.argv.len(), 2);
@@ -113,7 +114,7 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
     ))]);
     let mut executor = LaunchdExecutor::new((), command);
     assert!(
-        activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::NoChange)
+        activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::NoChange)
             .is_err()
     );
 }
@@ -135,7 +136,7 @@ fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, &launch_spec(), InstallOutcome::Changed)
+    activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::Changed)
         .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(
@@ -384,4 +385,98 @@ fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
     fs::remove_dir_all(&home).expect("remove scratch home");
+}
+
+/// The incident this rule exists for: a `setup` run from `target/debug/cowshed` copied a 94 MB
+/// debug build over a host's supervised gateway and then failed on `launchctl kickstart`, leaving
+/// the host with a debug binary and no loaded agent. A debug build carries `debug_assertions`, so
+/// under a `KeepAlive` agent it is a respawn loop rather than merely a large file.
+#[test]
+fn a_debug_build_is_never_installed_as_the_supervised_binary() {
+    let source = PathBuf::from("/Users/dev/checkout/target/debug/cowshed");
+
+    let error = refuse_unsupervisable_build(source.clone(), true)
+        .expect_err("a debug build must not be supervised");
+    assert_eq!(error.code.as_str(), "conflict");
+    assert!(
+        error.message.contains("is a debug build"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains(source.to_str().expect("utf-8")),
+        "the refusal must name the build it refused; got {}",
+        error.message
+    );
+    assert!(error.hint.contains("--release"), "{}", error.hint);
+
+    // A release build is accepted unchanged: the guard is a gate, not a transformation.
+    assert_eq!(
+        refuse_unsupervisable_build(source.clone(), false).expect("a release build is supervisable"),
+        source
+    );
+}
+
+/// A failed activation must leave the host exactly as it was found. The retained hard link is what
+/// makes that possible: it keeps the old inode alive through the atomic rename that replaces the
+/// path, so the restore reads the exact bytes launchd was running rather than a re-copy.
+#[test]
+fn a_failed_activation_restores_the_binary_it_replaced() {
+    let home = scratch_home("rollback");
+    let executable =
+        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).expect("host-stable path");
+    fs::create_dir_all(executable.directory()).expect("bin directory");
+
+    // Nothing installed yet: there is nothing to retain and nothing to roll back to, which is a
+    // first install rather than a regression.
+    assert_eq!(
+        retain_previous_executable(&executable).expect("retain on an empty host"),
+        None
+    );
+
+    fs::write(executable.path(), b"the supervised release build\n").expect("installed binary");
+    let original = fs::symlink_metadata(executable.path()).expect("installed").ino();
+    let retained = retain_previous_executable(&executable)
+        .expect("retain succeeds")
+        .expect("an installed binary is retained");
+    // A hard link, not a copy: same inode, so retaining costs nothing whatever the binary's size.
+    assert_eq!(
+        fs::symlink_metadata(&retained).expect("retained").ino(),
+        original
+    );
+
+    // The install replaces the path the way `plan_executable_install` does — a temporary beside it,
+    // then a rename — so the old inode survives only via the retained link. `write` in place would
+    // truncate the very bytes the link points at, which is exactly why the plan renames.
+    let temporary = executable.directory().join(".cowshed.incoming");
+    fs::write(&temporary, b"a debug build nobody asked for\n").expect("replacement");
+    fs::rename(&temporary, executable.path()).expect("atomic replacement");
+    assert_ne!(
+        fs::symlink_metadata(executable.path()).expect("replaced").ino(),
+        original
+    );
+
+    let sentence = restore_previous_executable(&executable, &retained);
+    assert!(
+        sentence.contains("as it was found"),
+        "the rollback has to say the host is unchanged; got {sentence}"
+    );
+    assert_eq!(
+        fs::read(executable.path()).expect("restored bytes"),
+        b"the supervised release build\n"
+    );
+    assert!(
+        fs::symlink_metadata(&retained).is_err(),
+        "the retained link is consumed by the restore"
+    );
+
+    // A rollback that cannot happen is reported, never silently swallowed: the caller's own
+    // failure plus this sentence are the host's actual state.
+    let sentence = restore_previous_executable(&executable, &home.join("never-retained"));
+    assert!(
+        sentence.contains("could NOT be restored"),
+        "got {sentence}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
 }

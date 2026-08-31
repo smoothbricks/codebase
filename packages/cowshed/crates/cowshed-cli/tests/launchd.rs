@@ -12,7 +12,7 @@ use cowshed_cli::launchd::{
     LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdError, LaunchdExecutor,
     LaunchdFilesystem, LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE,
     PRIVATE_PLIST_MODE, ProcessType, SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE,
-    ServiceLifecycle, plan_executable_install, plan_install, plan_remove,
+    ServiceLifecycle, StoreBackedProgram, plan_executable_install, plan_install, plan_remove,
 };
 use cowshed_core::metadata::ImageCapacity;
 
@@ -21,6 +21,14 @@ const HOME: &str = "/Users/cowshed-test";
 const EXECUTABLE: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/cowshed";
 const BINARY_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin";
 const SUPPORT_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support/dev.cowshed";
+/// The nix GC root `cowshed setup --sccache` registers, and the store path it pins. The sccache
+/// agent names the store path, so the plist carries the build's own content hash rather than a
+/// symlink a later build could repoint under a loaded agent.
+const SCCACHE_GC_ROOT: &str =
+    "/Users/cowshed-test/Library/Application Support/dev.cowshed/nix/sccache";
+const SCCACHE_STORE_PATH: &str = "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed";
+const SCCACHE_PROGRAM: &str =
+    "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed/bin/sccache";
 
 fn cowshed_binary() -> HostStableExecutable {
     HostStableExecutable::new(Path::new(HOME), COWSHED_BINARY_NAME).unwrap()
@@ -28,6 +36,16 @@ fn cowshed_binary() -> HostStableExecutable {
 
 fn gateway() -> LaunchAgentSpec {
     LaunchAgentSpec::gateway(&cowshed_binary()).unwrap()
+}
+
+fn sccache_program() -> StoreBackedProgram {
+    StoreBackedProgram::new(
+        Path::new(HOME),
+        Path::new(SCCACHE_GC_ROOT),
+        Path::new(SCCACHE_STORE_PATH),
+        SCCACHE_BINARY_NAME,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -112,7 +130,7 @@ fn generic_run_at_load_definition_is_immutable_and_escapes_plist_strings() {
 #[test]
 fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     let spec = LaunchAgentSpec::sccache(
-        &HostStableExecutable::new(Path::new(HOME), SCCACHE_BINARY_NAME).unwrap(),
+        &sccache_program(),
         Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
         Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
         ImageCapacity::from_gibibytes(40),
@@ -164,7 +182,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
         "  <string>dev.cowshed.sccache</string>\n",
         "  <key>ProgramArguments</key>\n",
         "  <array>\n",
-        "    <string>/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/sccache</string>\n",
+        "    <string>/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed/bin/sccache</string>\n",
         "  </array>\n",
         "  <key>RunAtLoad</key>\n",
         "  <true/>\n",
@@ -213,7 +231,7 @@ fn sccache_definition_runs_a_foreground_uds_server_via_environment() {
     // Socket and cache paths are validated like every other launchd path.
     assert!(matches!(
         LaunchAgentSpec::sccache(
-            &HostStableExecutable::new(Path::new(HOME), SCCACHE_BINARY_NAME).unwrap(),
+            &sccache_program(),
             Path::new("relative.sock"),
             Path::new("/Users/cowshed-test/.cowshed/caches/sccache"),
             ImageCapacity::from_gibibytes(40),
@@ -329,9 +347,9 @@ fn update_and_remove_plans_are_deterministic_and_filesystem_only() {
         ]
     ));
 
-    assert!(plan_remove(&spec, false).is_noop());
+    assert!(plan_remove(spec.target(), false).is_noop());
     assert_eq!(
-        plan_remove(&spec, true).operations(),
+        plan_remove(spec.target(), true).operations(),
         [
             Mutation::RemoveFile {
                 path: PathBuf::from(
@@ -686,7 +704,7 @@ fn sync_failure_rolls_back_temp_while_create_and_remove_failures_stop_immediatel
         ]
     ));
 
-    let remove = plan_remove(&spec, true);
+    let remove = plan_remove(spec.target(), true);
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::failing(FilesystemOperation::RemoveFile),
         FakeCommand::default(),
@@ -706,12 +724,12 @@ fn remove_execution_is_durable_and_absent_remove_is_idempotent() {
     let mut executor = LaunchdExecutor::new(FakeFilesystem::default(), FakeCommand::default());
 
     assert_eq!(
-        executor.execute_install(&plan_remove(&spec, true)).unwrap(),
+        executor.execute_install(&plan_remove(spec.target(), true)).unwrap(),
         InstallOutcome::Changed
     );
     assert_eq!(
         executor
-            .execute_install(&plan_remove(&spec, false))
+            .execute_install(&plan_remove(spec.target(), false))
             .unwrap(),
         InstallOutcome::NoChange
     );
@@ -730,9 +748,9 @@ fn remove_execution_is_durable_and_absent_remove_is_idempotent() {
 fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
     let spec = gateway();
     let plans = [
-        ControlPlan::bootstrap(501, &spec),
-        ControlPlan::bootout(501, &spec),
-        ControlPlan::kickstart(501, &spec),
+        ControlPlan::bootstrap(501, spec.target()),
+        ControlPlan::bootout(501, spec.target()),
+        ControlPlan::kickstart(501, spec.target()),
     ];
     let outputs = [
         Ok(LaunchctlOutput {
@@ -806,7 +824,7 @@ fn control_plans_execute_only_exact_unprivileged_launchctl_argv() {
 #[test]
 fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying() {
     let spec = gateway();
-    let plan = ControlPlan::kickstart(502, &spec);
+    let plan = ControlPlan::kickstart(502, spec.target());
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
         FakeCommand::with_outputs([Ok(LaunchctlOutput {
@@ -835,7 +853,7 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
         ))]),
     );
     assert!(matches!(
-        executor.execute_control(&ControlPlan::bootstrap(502, &spec)),
+        executor.execute_control(&ControlPlan::bootstrap(502, spec.target())),
         Err(ControlExecutionError::Unavailable {
             action: ControlAction::Bootstrap,
             source,
@@ -851,7 +869,7 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
         })]),
     );
     assert!(matches!(
-        executor.execute_control(&ControlPlan::bootout(502, &spec)),
+        executor.execute_control(&ControlPlan::bootout(502, spec.target())),
         Err(ControlExecutionError::Rejected {
             action: ControlAction::Bootout,
             status: CommandStatus::Terminated,
@@ -863,7 +881,7 @@ fn control_executor_classifies_exit_signal_and_spawn_failures_without_retrying()
 #[test]
 fn print_status_uses_fixed_target_and_maps_loaded_and_absent_idempotently() {
     let spec = gateway();
-    let plan = ControlPlan::print(503, &spec);
+    let plan = ControlPlan::print(503, spec.target());
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
         FakeCommand::with_outputs([
@@ -896,7 +914,7 @@ fn print_status_uses_fixed_target_and_maps_loaded_and_absent_idempotently() {
         }
     );
     assert!(matches!(
-        executor.execute_status(&ControlPlan::bootstrap(503, &spec)),
+        executor.execute_status(&ControlPlan::bootstrap(503, spec.target())),
         Err(ControlExecutionError::InvalidStatusPlan {
             action: ControlAction::Bootstrap,
         })
@@ -916,7 +934,7 @@ fn print_status_uses_fixed_target_and_maps_loaded_and_absent_idempotently() {
 #[test]
 fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
     let spec = gateway();
-    let plan = ControlPlan::print(504, &spec);
+    let plan = ControlPlan::print(504, spec.target());
     let mut executor = LaunchdExecutor::new(
         FakeFilesystem::default(),
         FakeCommand::with_outputs([Ok(LaunchctlOutput {
@@ -951,12 +969,19 @@ fn print_status_keeps_signal_and_spawn_failures_operationally_typed() {
     ));
 }
 
-/// The type is the guarantee: a spec can only be built from a path under
-/// `~/Library/Application Support/dev.cowshed/bin`, so no caller can bake a checkout, a nix
-/// store path, or a workspace image into a plist. Both agents are checked because both are
-/// installed by a binary that may itself be running from anywhere.
+/// The type is the guarantee, and each agent has its own.
+///
+/// The gateway plist can only be built from a path under
+/// `~/Library/Application Support/dev.cowshed/bin`, so no caller can bake a checkout or a
+/// workspace image into it — the binary installing it may itself be running from anywhere.
+///
+/// The sccache plist can only be built from a [`StoreBackedProgram`], which derives the program
+/// from the store path its GC root pins. That is why the plist names
+/// `/nix/store/…/bin/sccache` and never the out-link: a store path carries the build's own hash,
+/// so a rebuild changes the plist and boots the old server out, where a repointed symlink would
+/// leave launchd starting a different binary at the next restart under an unchanged definition.
 #[test]
-fn every_agent_plist_names_only_the_host_stable_binary() {
+fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     let cowshed = cowshed_binary();
     assert_eq!(cowshed.path(), Path::new(EXECUTABLE));
     assert_eq!(cowshed.directory(), Path::new(BINARY_DIRECTORY));
@@ -964,7 +989,14 @@ fn every_agent_plist_names_only_the_host_stable_binary() {
     assert_eq!(cowshed.home(), Path::new(HOME));
     assert_eq!(cowshed.name(), "cowshed");
 
-    let sccache = HostStableExecutable::new(Path::new(HOME), SCCACHE_BINARY_NAME).unwrap();
+    let sccache = sccache_program();
+    assert_eq!(sccache.program(), Path::new(SCCACHE_PROGRAM));
+    assert_eq!(sccache.gc_root(), Path::new(SCCACHE_GC_ROOT));
+    assert!(
+        sccache.program().starts_with(SCCACHE_STORE_PATH),
+        "the program must live inside the store path the root pins"
+    );
+
     let specs = [
         LaunchAgentSpec::gateway(&cowshed).unwrap(),
         LaunchAgentSpec::sccache(
@@ -976,14 +1008,15 @@ fn every_agent_plist_names_only_the_host_stable_binary() {
         )
         .unwrap(),
     ];
-    for (spec, expected) in specs.iter().zip([
-        EXECUTABLE,
-        "/Users/cowshed-test/Library/Application Support/dev.cowshed/bin/sccache",
-    ]) {
+    for (spec, expected) in specs.iter().zip([EXECUTABLE, SCCACHE_PROGRAM]) {
         assert_eq!(spec.executable(), Path::new(expected));
         assert_eq!(spec.program_arguments().next(), Some(expected));
         let plist = String::from_utf8(spec.plist_bytes()).unwrap();
         assert!(plist.contains(&format!("  <array>\n    <string>{expected}</string>\n")));
+        assert!(
+            !plist.contains(SCCACHE_GC_ROOT),
+            "no plist may name the mutable out-link"
+        );
     }
 }
 

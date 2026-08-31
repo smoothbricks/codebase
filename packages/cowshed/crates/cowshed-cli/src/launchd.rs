@@ -26,6 +26,7 @@ pub const LIBRARY_DIRECTORY: &str = "Library";
 pub const APPLICATION_SUPPORT: &str = "Application Support";
 pub const STABLE_SUPPORT_DIRECTORY: &str = "dev.cowshed";
 pub const STABLE_BINARY_DIRECTORY: &str = "bin";
+pub const LAUNCH_AGENTS_DIRECTORY: &str = "LaunchAgents";
 
 /// A binary path launchd can still reach after a reboot.
 ///
@@ -91,6 +92,99 @@ impl HostStableExecutable {
     }
 }
 
+/// A program launchd runs straight out of the nix store, and the GC root that keeps it there.
+///
+/// Deliberately *not* a [`HostStableExecutable`]: nothing is copied. The plist names the resolved
+/// store path, which carries the build's own content hash, so a different build is a different
+/// plist — and rewriting a plist is what boots the old server out. Naming the `--out-link` symlink
+/// instead would let a later `nix build` repoint it and leave launchd starting a different binary
+/// at the next restart, which is precisely the client/server version mismatch that reads as a
+/// broken toolchain rather than as a stale daemon.
+///
+/// The root is carried *with* the program because it is the only reason that path survives
+/// `nix store gc`. The program is derived from the rooted store path rather than passed beside it:
+/// that makes "the program the plist names lives inside the store path this root pins" true by
+/// construction, so a root pinning some other build cannot be mistaken for a pin on this one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreBackedProgram {
+    home: PathBuf,
+    program: PathBuf,
+    gc_root: PathBuf,
+}
+
+impl StoreBackedProgram {
+    /// `rooted_store_path` must be what `gc_root` resolves to; the caller reads the link.
+    pub fn new(
+        home: &Path,
+        gc_root: &Path,
+        rooted_store_path: &Path,
+        name: &str,
+    ) -> Result<Self, LaunchdError> {
+        validate_canonical_absolute_path("home", home)?;
+        validate_canonical_absolute_path("gc-root", gc_root)?;
+        validate_canonical_absolute_path("store-path", rooted_store_path)?;
+        validate_binary_name(name)?;
+        let program = rooted_store_path.join(STABLE_BINARY_DIRECTORY).join(name);
+        Ok(Self {
+            home: home.to_path_buf(),
+            program,
+            gc_root: gc_root.to_path_buf(),
+        })
+    }
+
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    pub fn gc_root(&self) -> &Path {
+        &self.gc_root
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+}
+
+/// A launchctl control target: the label, and the plist path that defines it.
+///
+/// Split out of [`LaunchAgentSpec`] because `stop` and `status` are not definitions. They have to
+/// reach the agent `start` installed even when the program it names is gone — a store-backed
+/// sccache whose GC root was deleted and collected is exactly that state, and it is a state
+/// `doctor` must be able to report rather than one that makes the control verbs unconstructible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchAgentTarget {
+    label: String,
+    plist_path: PathBuf,
+}
+
+impl LaunchAgentTarget {
+    pub fn new(home: &Path, label: &str) -> Result<Self, LaunchdError> {
+        validate_canonical_absolute_path("home", home)?;
+        validate_label(label)?;
+        Ok(Self {
+            label: label.to_owned(),
+            plist_path: home
+                .join(LIBRARY_DIRECTORY)
+                .join(LAUNCH_AGENTS_DIRECTORY)
+                .join(format!("{label}.plist")),
+        })
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn plist_path(&self) -> &Path {
+        &self.plist_path
+    }
+
+    pub fn launch_agents_directory(&self) -> &Path {
+        self.plist_path
+            .parent()
+            .expect("validated plist paths always have a parent")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceLifecycle {
     /// Start at login and restart whenever the service exits.
@@ -121,13 +215,12 @@ impl ProcessType {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchAgentSpec {
-    label: String,
+    target: LaunchAgentTarget,
     executable: PathBuf,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     lifecycle: ServiceLifecycle,
     process_type: ProcessType,
-    plist_path: PathBuf,
     standard_error_path: PathBuf,
 }
 
@@ -140,7 +233,8 @@ impl LaunchAgentSpec {
     ) -> Result<Self, LaunchdError> {
         validate_arguments(&arguments)?;
         Self::assemble(
-            executable,
+            executable.home(),
+            executable.path(),
             label.into(),
             arguments,
             Vec::new(),
@@ -150,8 +244,13 @@ impl LaunchAgentSpec {
         )
     }
 
+    /// `home` and `program` are primitives here, but every public constructor above reaches this
+    /// through a type that has already proved its program outlives the build that installed it —
+    /// [`HostStableExecutable`] for a cowshed-owned copy, [`StoreBackedProgram`] for a GC-rooted
+    /// store path. Nothing else can name a service executable.
     fn assemble(
-        executable: &HostStableExecutable,
+        home: &Path,
+        program: &Path,
         label: String,
         arguments: Vec<String>,
         environment: Vec<(String, String)>,
@@ -159,30 +258,23 @@ impl LaunchAgentSpec {
         process_type: ProcessType,
         standard_error_file: &str,
     ) -> Result<Self, LaunchdError> {
-        validate_label(&label)?;
         validate_environment(&environment)?;
-
-        let home = executable.home();
-        let plist_path = home
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{label}.plist"));
+        let target = LaunchAgentTarget::new(home, &label)?;
         // launchd creates StandardErrorPath before the gateway can remount
         // ~/.cowshed. Keep this on Data so reboot cannot mask the store volume.
         let standard_error_path = home
-            .join("Library")
+            .join(LIBRARY_DIRECTORY)
             .join("Logs")
             .join("cowshed")
             .join(standard_error_file);
 
         Ok(Self {
-            label,
-            executable: executable.path().to_path_buf(),
+            target,
+            executable: program.to_path_buf(),
             arguments,
             environment,
             lifecycle,
             process_type,
-            plist_path,
             standard_error_path,
         })
     }
@@ -198,9 +290,10 @@ impl LaunchAgentSpec {
 
     /// The host-owned sccache server agent.
     ///
-    /// launchd runs the sccache binary itself — a host-stable copy of it, since the daemon has to
-    /// outlive the devenv profile or nix store path it came from. Server mode is selected entirely
-    /// through the environment (`SCCACHE_START_SERVER=1` combined with any CLI
+    /// launchd runs the sccache binary itself, straight out of the nix store path
+    /// `cowshed setup --sccache` built and rooted ([`StoreBackedProgram`] carries both, and states
+    /// why the plist names the store path rather than the out-link). Server mode is selected
+    /// entirely through the environment (`SCCACHE_START_SERVER=1` combined with any CLI
     /// argument is a parse error in sccache), so this is the one agent with an
     /// empty argv tail. `SCCACHE_NO_DAEMON=1` keeps the server in the
     /// foreground under launchd's supervision, `SCCACHE_IDLE_TIMEOUT=0`
@@ -227,7 +320,7 @@ impl LaunchAgentSpec {
     ///
     /// All source-verified against sccache 0.17.
     pub fn sccache(
-        executable: &HostStableExecutable,
+        program: &StoreBackedProgram,
         server_socket: &Path,
         cache_directory: &Path,
         cache_capacity: ImageCapacity,
@@ -248,7 +341,8 @@ impl LaunchAgentSpec {
             ("SCCACHE_BASEDIRS".to_owned(), path_string(base_directory)),
         ];
         Self::assemble(
-            executable,
+            program.home(),
+            program.program(),
             SCCACHE_LABEL.to_owned(),
             Vec::new(),
             environment,
@@ -259,7 +353,12 @@ impl LaunchAgentSpec {
     }
 
     pub fn label(&self) -> &str {
-        &self.label
+        self.target.label()
+    }
+
+    /// The launchctl control target this definition installs, for `stop` and `status`.
+    pub fn target(&self) -> &LaunchAgentTarget {
+        &self.target
     }
 
     pub fn executable(&self) -> &Path {
@@ -283,13 +382,11 @@ impl LaunchAgentSpec {
     }
 
     pub fn plist_path(&self) -> &Path {
-        &self.plist_path
+        self.target.plist_path()
     }
 
     pub fn launch_agents_directory(&self) -> &Path {
-        self.plist_path
-            .parent()
-            .expect("validated plist paths always have a parent")
+        self.target.launch_agents_directory()
     }
 
     pub fn standard_error_path(&self) -> &Path {
@@ -315,7 +412,7 @@ impl LaunchAgentSpec {
             "  <key>Label</key>\n",
             "  ",
         ));
-        push_xml_string(&mut plist, &self.label);
+        push_xml_string(&mut plist, self.label());
         plist.push_str("  <key>ProgramArguments</key>\n  <array>\n");
         for argument in self.program_arguments() {
             plist.push_str("    ");
@@ -483,8 +580,12 @@ pub fn plan_install(spec: &LaunchAgentSpec, state: InstallState<'_>) -> InstallP
     InstallPlan { operations }
 }
 
-pub fn plan_remove(spec: &LaunchAgentSpec, installed: bool) -> InstallPlan {
-    let operations = plan_remove_file(spec.plist_path(), spec.launch_agents_directory(), installed);
+pub fn plan_remove(target: &LaunchAgentTarget, installed: bool) -> InstallPlan {
+    let operations = plan_remove_file(
+        target.plist_path(),
+        target.launch_agents_directory(),
+        installed,
+    );
 
     InstallPlan { operations }
 }
@@ -930,44 +1031,44 @@ pub struct ControlPlan {
 }
 
 impl ControlPlan {
-    pub fn bootstrap(uid: u32, spec: &LaunchAgentSpec) -> Self {
+    pub fn bootstrap(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Bootstrap,
             arguments: vec![
                 OsString::from("bootstrap"),
                 OsString::from(gui_domain(uid)),
-                spec.plist_path().as_os_str().to_owned(),
+                target.plist_path().as_os_str().to_owned(),
             ],
         }
     }
 
-    pub fn bootout(uid: u32, spec: &LaunchAgentSpec) -> Self {
+    pub fn bootout(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Bootout,
             arguments: vec![
                 OsString::from("bootout"),
-                OsString::from(service_target(uid, spec.label())),
+                OsString::from(service_target(uid, target.label())),
             ],
         }
     }
 
-    pub fn kickstart(uid: u32, spec: &LaunchAgentSpec) -> Self {
+    pub fn kickstart(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Kickstart,
             arguments: vec![
                 OsString::from("kickstart"),
                 OsString::from("-k"),
-                OsString::from(service_target(uid, spec.label())),
+                OsString::from(service_target(uid, target.label())),
             ],
         }
     }
 
-    pub fn print(uid: u32, spec: &LaunchAgentSpec) -> Self {
+    pub fn print(uid: u32, target: &LaunchAgentTarget) -> Self {
         Self {
             action: ControlAction::Print,
             arguments: vec![
                 OsString::from("print"),
-                OsString::from(service_target(uid, spec.label())),
+                OsString::from(service_target(uid, target.label())),
             ],
         }
     }
