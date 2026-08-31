@@ -32,7 +32,7 @@ import {
   CARGO_LINT_CLIPPY_COMMAND,
   cargoFrozen,
 } from './cross-check-policy.js';
-import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
+import { PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
 export { CARGO_TEST_COMPILE_TARGET };
 
@@ -74,6 +74,23 @@ function hostPlatformTargetNames(targetNames: Iterable<string>, hostPlatform: Na
       // on it directly, so the aggregate stays a list of outputs.
       (name) => name.endsWith(suffix) && !name.startsWith(NAPI_TOOLCHAIN_TARGET_PREFIX),
     )
+    .sort();
+}
+
+/**
+ * The reserved suffixes name targets that EMIT an artifact, and the `build`
+ * aggregate is a list of those. Handing Nx the raw `*-<family>` globs let it
+ * match on suffix alone, and one namespace collides by construction: a
+ * per-crate cargo test runner is named `cargo-test-<crate>`, so any crate whose
+ * name ends in an output family — `*-napi`, `*-wasm`, `*-native`, `*-js` — put
+ * its RUNNER in the aggregate. The runners are one serialized chain, so a
+ * single such crate made `build` pull an entire cargo test suite. Expanding the
+ * families here instead of delegating to Nx's matcher keeps the plugin's own
+ * `cargo-test-` namespace out of the aggregate however a crate is named.
+ */
+function buildOutputTargetNames(targetNames: Iterable<string>): string[] {
+  return [...new Set(targetNames)]
+    .filter((name) => BUILD_OUTPUT_TARGET_PATTERN.test(name) && !name.startsWith(`${CARGO_TEST_TARGET}-`))
     .sort();
 }
 
@@ -715,6 +732,27 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     }
   }
 
+  // Every host-platform target is a `napi build`, i.e. another cargo writer on
+  // the package's default `target/`, and so is the `cargo-napi` host build that
+  // stands in when no declared triple serves this host. `build` lists them
+  // beside cargo-test-compile, so without this edge they would be Nx siblings on
+  // one flocked directory; with it Nx compiles the test binaries first and the
+  // release builds follow.
+  const cargoWriterNames = [
+    ...hostPlatformTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)], hostPlatform),
+    ...('cargo-napi' in targets ? ['cargo-napi'] : []),
+  ];
+  if (targets[CARGO_TEST_COMPILE_TARGET]) {
+    for (const name of cargoWriterNames) {
+      const target = targets[name];
+      if (target === undefined) continue;
+      const dependsOn = target.dependsOn ?? [];
+      if (!dependsOn.includes(CARGO_TEST_COMPILE_TARGET)) {
+        target.dependsOn = [...dependsOn, CARGO_TEST_COMPILE_TARGET];
+      }
+    }
+  }
+
   // No `outputs`, deliberately: this aggregate runs no command, so every file
   // under dist belongs to the concrete target that emitted it. Claiming
   // `{projectRoot}/dist` here would cache the children's bytes a second time
@@ -729,10 +767,20 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     targets.build = {
       executor: 'nx:noop',
       cache: true,
+      // `cargo-napi` is both an output family and a serialized cargo writer, so
+      // the two sources overlap; the Set keeps one edge per target while holding
+      // the order the families are listed in.
       dependsOn: [
-        '^build',
-        ...BUILD_OUTPUT_DEPENDENCIES,
-        ...hostPlatformTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)], hostPlatform),
+        ...new Set([
+          '^build',
+          // Compiling the test executables is build work: it is unbounded and
+          // cacheable, while every RUNNER is a bounded-exec target reached only
+          // through the `test` aggregate. That split is what keeps a cold cargo
+          // workspace's compile time out of the bounded test window.
+          ...(targets[CARGO_TEST_COMPILE_TARGET] ? [CARGO_TEST_COMPILE_TARGET] : []),
+          ...buildOutputTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
+          ...cargoWriterNames,
+        ]),
       ],
     };
   }
