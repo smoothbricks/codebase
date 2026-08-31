@@ -2,9 +2,8 @@
 
 use crate::msgpack_scanner::Reader;
 use crate::{
-    ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind,
-    SignalSchemaField, json_extractor::ExtractionError,
-    json_scanner::parse_iso8601_to_micros,
+    ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind, SignalSchemaField,
+    json_extractor::ExtractionError, json_scanner::parse_iso8601_to_micros,
 };
 
 /// Extracts either a concatenated MessagePack map stream or an array of maps.
@@ -242,7 +241,8 @@ fn extract_typed_value(
                 )
                 .map_err(|_| ExtractionError::InvalidFieldType)?;
                 Some(ColumnValue::UInt(
-                    text.parse().map_err(|_| ExtractionError::InvalidFieldType)?,
+                    text.parse()
+                        .map_err(|_| ExtractionError::InvalidFieldType)?,
                 ))
             } else {
                 return Err(ExtractionError::InvalidFieldType);

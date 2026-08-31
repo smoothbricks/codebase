@@ -462,11 +462,22 @@ mod tests {
     // test "DynamicColumn constructors"
     #[test]
     fn dynamic_column_constructors() {
-        let col = DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &[], &[]);
+        let col = DynamicColumn::variable(
+            0,
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            None,
+            &[],
+            &[],
+        );
         assert_eq!(col.field_idx, 0);
         assert_eq!(col.field.arrow_type, ArrowType::Utf8);
         assert!(!col.field.is_nullable());
-        let int_col = DynamicColumn::fixed(2, SignalSchemaField::new(ArrowType::Int64, false), None, &[]);
+        let int_col = DynamicColumn::fixed(
+            2,
+            SignalSchemaField::new(ArrowType::Int64, false),
+            None,
+            &[],
+        );
         // The tag is authoritative for the column's Arrow type.
         assert_eq!(int_col.field.arrow_type, ArrowType::Int64);
         assert!(int_col.offsets.is_none());
@@ -480,7 +491,17 @@ mod tests {
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0]; // [0, 5] as u32 LE
         let data = b"hello";
-        assert!(builder.add_column(DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets, data), 1, 0));
+        assert!(builder.add_column(
+            DynamicColumn::variable(
+                0,
+                SignalSchemaField::new(ArrowType::Utf8, false),
+                None,
+                &offsets,
+                data
+            ),
+            1,
+            0
+        ));
         assert_eq!(builder.buffer_descs().len(), 3);
         assert_eq!(builder.buffer_descs()[0].length, 0); // empty validity
         assert_eq!(builder.buffer_descs()[1].length, 8); // offsets
@@ -497,7 +518,16 @@ mod tests {
         let mut metadata = MetadataStorage::for_counts(1, 2, MetadataLimits::default()).unwrap();
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let data = 12345i64.to_le_bytes();
-        assert!(builder.add_column(DynamicColumn::fixed(0, SignalSchemaField::new(ArrowType::Int64, false), None, &data), 1, 0));
+        assert!(builder.add_column(
+            DynamicColumn::fixed(
+                0,
+                SignalSchemaField::new(ArrowType::Int64, false),
+                None,
+                &data
+            ),
+            1,
+            0
+        ));
         assert_eq!(builder.buffer_descs().len(), 2);
         assert_eq!(builder.buffer_descs()[0].length, 0);
         assert_eq!(builder.buffer_descs()[1].length, 8);
@@ -511,14 +541,30 @@ mod tests {
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0];
         assert!(builder.add_column(
-            DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets, b"hello"),
+            DynamicColumn::variable(
+                0,
+                SignalSchemaField::new(ArrowType::Utf8, false),
+                None,
+                &offsets,
+                b"hello"
+            ),
             1,
             0
         ));
         // 0 (empty validity) + 8 (offsets) + 8 (padded data) = 16.
         assert_eq!(builder.body_length(), 16);
         let offsets2 = [0, 0, 0, 0, 3, 0, 0, 0];
-        assert!(builder.add_column(DynamicColumn::variable(1, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets2, b"abc"), 1, 0));
+        assert!(builder.add_column(
+            DynamicColumn::variable(
+                1,
+                SignalSchemaField::new(ArrowType::Utf8, false),
+                None,
+                &offsets2,
+                b"abc"
+            ),
+            1,
+            0
+        ));
         assert_eq!(builder.buffer_descs()[4].offset, 16);
     }
 
@@ -533,7 +579,13 @@ mod tests {
         let data = [0u8; 8];
         for field_idx in 0..80 {
             assert!(builder.add_column(
-                DynamicColumn::variable(field_idx, SignalSchemaField::new(ArrowType::Binary, true), Some(&validity), &offsets, &data),
+                DynamicColumn::variable(
+                    field_idx,
+                    SignalSchemaField::new(ArrowType::Binary, true),
+                    Some(&validity),
+                    &offsets,
+                    &data
+                ),
                 1,
                 0
             ));
@@ -568,7 +620,13 @@ mod tests {
         let mut builder = DynamicBodyBuilder::new(&mut body_buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0];
         assert!(builder.add_column(
-            DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets, b"hello"),
+            DynamicColumn::variable(
+                0,
+                SignalSchemaField::new(ArrowType::Utf8, false),
+                None,
+                &offsets,
+                b"hello"
+            ),
             1,
             0
         ));
@@ -597,22 +655,49 @@ mod tests {
             let mut builder = DynamicBodyBuilder::new(&mut output[body_start..], &mut metadata);
             let id_offsets = [0, 0, 0, 0, 7, 0, 0, 0];
             assert!(builder.add_column(
-                DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &id_offsets, b"test-id"),
+                DynamicColumn::variable(
+                    0,
+                    SignalSchemaField::new(ArrowType::Utf8, false),
+                    None,
+                    &id_offsets,
+                    b"test-id"
+                ),
                 1,
                 0
             ));
             let type_offsets = [0, 0, 0, 0, 5, 0, 0, 0];
             assert!(builder.add_column(
-                DynamicColumn::variable(1, SignalSchemaField::new(ArrowType::Utf8, false), None, &type_offsets, b"click"),
+                DynamicColumn::variable(
+                    1,
+                    SignalSchemaField::new(ArrowType::Utf8, false),
+                    None,
+                    &type_offsets,
+                    b"click"
+                ),
                 1,
                 0
             ));
             let ts = 1_705_315_800_000_000_i64.to_le_bytes();
-            assert!(builder.add_column(DynamicColumn::fixed(2, SignalSchemaField::new(ArrowType::Int64, false), None, &ts), 1, 0));
+            assert!(builder.add_column(
+                DynamicColumn::fixed(
+                    2,
+                    SignalSchemaField::new(ArrowType::Int64, false),
+                    None,
+                    &ts
+                ),
+                1,
+                0
+            ));
             let value_offsets = [0u8; 8];
             let validity = [0u8];
             assert!(builder.add_column(
-                DynamicColumn::variable(3, SignalSchemaField::new(ArrowType::Binary, true), Some(&validity), &value_offsets, b""),
+                DynamicColumn::variable(
+                    3,
+                    SignalSchemaField::new(ArrowType::Binary, true),
+                    Some(&validity),
+                    &value_offsets,
+                    b""
+                ),
                 1,
                 1
             ));

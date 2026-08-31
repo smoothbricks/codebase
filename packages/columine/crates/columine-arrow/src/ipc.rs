@@ -494,7 +494,12 @@ mod tests {
             &mut metadata,
             |index| match index {
                 0 => Ok(DynamicColumn::fixed(0, fields[0], None, &i32_data)),
-                1 => Ok(DynamicColumn::fixed(1, fields[1], Some(&validity), &f64_data)),
+                1 => Ok(DynamicColumn::fixed(
+                    1,
+                    fields[1],
+                    Some(&validity),
+                    &f64_data,
+                )),
                 2 => Ok(DynamicColumn::fixed(2, fields[2], None, &i64_data)),
                 3 => Ok(DynamicColumn::variable(
                     3,
@@ -510,7 +515,12 @@ mod tests {
                     &utf8_offsets,
                     "αz".as_bytes(),
                 )),
-                5 => Ok(DynamicColumn::fixed(5, fields[5], Some(&validity), &bool_data)),
+                5 => Ok(DynamicColumn::fixed(
+                    5,
+                    fields[5],
+                    Some(&validity),
+                    &bool_data,
+                )),
                 6 => Ok(DynamicColumn::fixed(6, fields[6], None, &[])),
                 _ => Err(IpcError::InvalidColumn),
             },

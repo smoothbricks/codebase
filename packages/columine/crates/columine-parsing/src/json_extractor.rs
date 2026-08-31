@@ -368,13 +368,9 @@ fn extract_json_event_open(
             .expect_field_name()
             .map_err(|_| ExtractionError::InvalidJson)?;
         if let Some(lookup) = config.field_map.get(&name) {
-            if let Err(err) = extract_typed_value(
-                parser,
-                lookup.field,
-                columns,
-                lookup.column,
-                diagnostic,
-            ) {
+            if let Err(err) =
+                extract_typed_value(parser, lookup.field, columns, lookup.column, diagnostic)
+            {
                 // Fill in diagnostic context that the typed-value failure did
                 // not set at its source.
                 if diagnostic.field_index == NO_FIELD {
