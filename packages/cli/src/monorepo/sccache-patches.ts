@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -68,9 +68,7 @@ export function validateSccachePatches(root: string): number {
       continue;
     }
     if (!present.has(name)) {
-      failures += report(
-        `${SCCACHE_FLAKE_DIR}/${SCCACHE_FLAKE}: references ./${name}, which is not there`,
-      );
+      failures += report(`${SCCACHE_FLAKE_DIR}/${SCCACHE_FLAKE}: references ./${name}, which is not there`);
     }
   }
   return failures;

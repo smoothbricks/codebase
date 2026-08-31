@@ -2,10 +2,9 @@ use crate::args::GatewayCommand;
 use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable, LaunchAgentSpec,
-    LaunchAgentTarget,
-    LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
-    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, kickstart_hint,
-    plan_executable_install, plan_executable_remove, plan_install, plan_remove,
+    LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
+    NativeFilesystem, NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome,
+    kickstart_hint, plan_executable_install, plan_executable_remove, plan_install, plan_remove,
 };
 use crate::output::Output;
 use async_trait::async_trait;
@@ -306,8 +305,7 @@ where
     // The candidate path is derived first because the plist has to name it before the agent can be
     // activated, and the install-then-activate pair is what has to be undoable as a whole.
     let source = supervisable_running_executable()?;
-    let candidate =
-        HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let candidate = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     let spec = LaunchAgentSpec::gateway(&candidate).map_err(launchd_error)?;
     let observed = inspect_install_state(&spec)?;
     let plan = plan_install(
@@ -484,7 +482,10 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = matches!(
         executor
-            .execute_status(&crate::launchd::ControlPlan::print(effective_uid(), spec.target()))
+            .execute_status(&crate::launchd::ControlPlan::print(
+                effective_uid(),
+                spec.target()
+            ))
             .map_err(launchd_error)?,
         LaunchdServiceStatus::Loaded { .. }
     );
@@ -833,8 +834,15 @@ where
         Err(error) => Err(match retained {
             Some(retained) => {
                 let rollback = restore_previous_executable(&executable, &retained);
-                record_installed_source(&executable, Path::new("restored after a failed activation"));
-                CowshedError::new(error.code, format!("{}; {rollback}", error.message), error.hint)
+                record_installed_source(
+                    &executable,
+                    Path::new("restored after a failed activation"),
+                );
+                CowshedError::new(
+                    error.code,
+                    format!("{}; {rollback}", error.message),
+                    error.hint,
+                )
             }
             // Nothing to roll back to: this host had no installed binary before the run, so the
             // new copy is not a regression and deleting it would only hide the failed activation.

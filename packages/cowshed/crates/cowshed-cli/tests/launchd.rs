@@ -26,7 +26,8 @@ const SUPPORT_DIRECTORY: &str = "/Users/cowshed-test/Library/Application Support
 /// symlink a later build could repoint under a loaded agent.
 const SCCACHE_GC_ROOT: &str =
     "/Users/cowshed-test/Library/Application Support/dev.cowshed/nix/sccache";
-const SCCACHE_STORE_PATH: &str = "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed";
+const SCCACHE_STORE_PATH: &str =
+    "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed";
 const SCCACHE_PROGRAM: &str =
     "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed/bin/sccache";
 
@@ -724,7 +725,9 @@ fn remove_execution_is_durable_and_absent_remove_is_idempotent() {
     let mut executor = LaunchdExecutor::new(FakeFilesystem::default(), FakeCommand::default());
 
     assert_eq!(
-        executor.execute_install(&plan_remove(spec.target(), true)).unwrap(),
+        executor
+            .execute_install(&plan_remove(spec.target(), true))
+            .unwrap(),
         InstallOutcome::Changed
     );
     assert_eq!(

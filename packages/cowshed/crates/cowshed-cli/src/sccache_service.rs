@@ -253,7 +253,10 @@ pub(crate) async fn service_status() -> Result<SccacheStatus> {
     let target = control_target(&home)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = match executor
-        .execute_status(&crate::launchd::ControlPlan::print(effective_uid(), &target))
+        .execute_status(&crate::launchd::ControlPlan::print(
+            effective_uid(),
+            &target,
+        ))
         .map_err(launchd_error)?
     {
         LaunchdServiceStatus::Loaded { .. } => true,

@@ -224,6 +224,20 @@ pub struct LaunchAgentSpec {
     standard_error_path: PathBuf,
 }
 
+/// Everything that varies between one agent definition and another.
+///
+/// A value rather than a positional argument list: the two constructors below differ in six of
+/// these fields at once, and six adjacent positional parameters of overlapping types is how a
+/// definition ends up with the wrong log file or the wrong QoS band.
+struct AgentDefinition {
+    label: String,
+    arguments: Vec<String>,
+    environment: Vec<(String, String)>,
+    lifecycle: ServiceLifecycle,
+    process_type: ProcessType,
+    standard_error_file: &'static str,
+}
+
 impl LaunchAgentSpec {
     pub fn new_user(
         executable: &HostStableExecutable,
@@ -235,12 +249,14 @@ impl LaunchAgentSpec {
         Self::assemble(
             executable.home(),
             executable.path(),
-            label.into(),
-            arguments,
-            Vec::new(),
-            lifecycle,
-            ProcessType::Background,
-            "daemon-stderr.log",
+            AgentDefinition {
+                label: label.into(),
+                arguments,
+                environment: Vec::new(),
+                lifecycle,
+                process_type: ProcessType::Background,
+                standard_error_file: "daemon-stderr.log",
+            },
         )
     }
 
@@ -251,13 +267,16 @@ impl LaunchAgentSpec {
     fn assemble(
         home: &Path,
         program: &Path,
-        label: String,
-        arguments: Vec<String>,
-        environment: Vec<(String, String)>,
-        lifecycle: ServiceLifecycle,
-        process_type: ProcessType,
-        standard_error_file: &str,
+        definition: AgentDefinition,
     ) -> Result<Self, LaunchdError> {
+        let AgentDefinition {
+            label,
+            arguments,
+            environment,
+            lifecycle,
+            process_type,
+            standard_error_file,
+        } = definition;
         validate_environment(&environment)?;
         let target = LaunchAgentTarget::new(home, &label)?;
         // launchd creates StandardErrorPath before the gateway can remount
@@ -343,12 +362,14 @@ impl LaunchAgentSpec {
         Self::assemble(
             program.home(),
             program.program(),
-            SCCACHE_LABEL.to_owned(),
-            Vec::new(),
-            environment,
-            ServiceLifecycle::KeepAlive,
-            ProcessType::Standard,
-            "sccache-stderr.log",
+            AgentDefinition {
+                label: SCCACHE_LABEL.to_owned(),
+                arguments: Vec::new(),
+                environment,
+                lifecycle: ServiceLifecycle::KeepAlive,
+                process_type: ProcessType::Standard,
+                standard_error_file: "sccache-stderr.log",
+            },
         )
     }
 
