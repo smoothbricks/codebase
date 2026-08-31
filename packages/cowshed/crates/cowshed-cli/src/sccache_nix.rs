@@ -15,8 +15,18 @@
 //! 2. **The plist names the resolved store path, not the out-link.** A store path carries its own
 //!    content hash, so a different build is a different plist, and rewriting a plist is what boots
 //!    the old server out. Naming the symlink instead would let a later build repoint it and leave
-//!    launchd starting a different binary at the next restart — exactly the client/server version
-//!    mismatch that surfaces as `sccache rustc -vV` dying on SIGTERM rather than as a stale daemon.
+//!    launchd starting a different binary at the next restart, under a definition nobody changed.
+//!
+//! What that buys is one supervised server, and the thing being contended is the SOCKET, not a
+//! version string. A unix bind unlinks the path first (sccache 0.17.0, server.rs:510-514), so any
+//! client that auto-starts a server takes the LaunchAgent's socket over from it;
+//! `connect_or_start_server` (commands.rs:310-348) does that on ConnectionRefused, TimedOut, or
+//! NotFound. It never does it because of a version disagreement — `ServerInfo.version`
+//! (server.rs:2147, 2203-2206) is only reported, a mismatch appears merely as a hint on a bincode
+//! failure in `request_stats`, and Shutdown is reachable only from the explicit StopServer verb.
+//! The `-cowshed` version suffix is therefore provenance and nothing more: it tells an operator
+//! which build is answering. The property that keeps clients off each other's servers is that
+//! exactly one server is supervised at a path they all reach.
 //!
 //! sccache is opt-in because not every cowshed user writes Rust: a default `setup` neither builds
 //! this flake nor requires nix. A host that asks for it and has no nix gets a named prerequisite,

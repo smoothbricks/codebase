@@ -103,8 +103,13 @@ where
 /// The program comes from the nix GC root `cowshed setup --sccache` registered, never from `PATH`.
 /// launchd hands a LaunchAgent none of the user's `PATH`, so a name would only ever have resolved
 /// because a person happened to run this from a shell that had sccache in it — which is how a host
-/// with sccache installed all along reported "sccache is not on PATH" on every boot, and how a
-/// devenv upgrade could silently substitute a different build under a running server.
+/// with sccache installed all along reported "sccache is not on PATH" on every boot.
+///
+/// It is also how this host came to supervise a HALF-patched sccache: the recorded path named
+/// `/nix/store/…-sccache-0.17.0` (rust-basedir-cwd, no singleflight) while every client from the
+/// repository shell was `0.17.0-cowshed` with both. Nothing detected that, because nothing in
+/// sccache compares the two: the daemon simply served a different key space than its clients
+/// assumed. A store path resolved through a GC root cannot drift from the build it names.
 pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheStatus> {
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
