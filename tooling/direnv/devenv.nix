@@ -56,13 +56,14 @@ in {
       pkgs.openssl
     ];
 
-  # Devenv's Rust module exports CC=clang/CXX=clang++ on Linux for its Clang
-  # linker driver. The raw Clang above then wins PATH resolution and bypasses
-  # the Nix wrapper's libc include paths. Pin host builds to the wrapper;
-  # N-API cross builds still select raw Clang through TARGET_CC/TARGET_CXX.
+  # Nix's setup hooks replace generic CC/CXX after `env` is applied, leaving
+  # cc-rs with bare clang and therefore no Nix libc include path.
+  # cc-rs probes target-specific names before generic ones, so pin
+  # the native Linux target to the wrapper at the precedence point it honors.
+  # N-API cross targets use their own target-specific compiler variables.
   env = lib.optionalAttrs pkgs.stdenv.isLinux {
-    CC = "${pkgs.stdenv.cc}/bin/cc";
-    CXX = "${pkgs.stdenv.cc}/bin/c++";
+    CC_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/cc";
+    CXX_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/c++";
   };
 
   # Use system Xcode for iOS simulator, signing, and instruments.
