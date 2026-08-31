@@ -148,21 +148,61 @@ fn grant(host: &str, port: u16) -> EgressGrant {
         .expect("valid path")
 }
 
+/// A temporary directory every cowshed private-root check accepts.
+///
+/// `create_dir` masks 0o777 with the process umask, so a permissive umask yields a group- and
+/// world-writable directory. Every gateway root check refuses one — correctly, because a directory
+/// a stranger can write is a directory a stranger can swap a socket or a cache entry into — so the
+/// mode is set explicitly here rather than inherited from the environment.
+///
+/// The mode is then read back and asserted. That is what keeps a permissive umask, or a temp
+/// strategy that hands back a directory this fixture did not create, from resurfacing as a bare
+/// `InvalidInput` raised deep inside `Gateway::start`, which names neither the path nor the mode.
+fn secure_fixture_dir(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(name);
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir(&path)
+        .unwrap_or_else(|error| panic!("create fixture directory {}: {error}", path.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap_or_else(
+            |error| panic!("restrict fixture directory {}: {error}", path.display()),
+        );
+        let metadata = std::fs::symlink_metadata(&path)
+            .unwrap_or_else(|error| panic!("lstat fixture directory {}: {error}", path.display()));
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "fixture directory {} must be a real directory, got {:?}",
+            path.display(),
+            metadata.file_type()
+        );
+        assert_eq!(
+            metadata.uid(),
+            unsafe { libc::geteuid() },
+            "fixture directory {} must be owned by the test process",
+            path.display()
+        );
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "fixture directory {} is mode {mode:04o}, not 0700: it is group- or other-writable and \
+             every gateway private-root check will refuse it",
+            path.display()
+        );
+    }
+    path
+}
+
 fn test_config() -> GatewayConfig {
     static NEXT_CACHE: AtomicUsize = AtomicUsize::new(0);
-    let cache_root = std::env::temp_dir().join(format!(
+    let cache_root = secure_fixture_dir(&format!(
         "cowshed-gateway-cache-{}-{}",
         std::process::id(),
         NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&cache_root);
-    std::fs::create_dir(&cache_root).expect("create pre-existing mirror cache root");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700))
-            .expect("secure mirror cache root");
-    }
     let config = GatewayConfig {
         timeouts: GatewayTimeouts {
             request_headers: Duration::from_secs(2),
@@ -268,15 +308,7 @@ fn basic_absolute_request(host: &str, port: u16, credential: &str, path: &str) -
 
 #[tokio::test]
 async fn arrow_audit_sink_publishes_durable_single_batch_segments() {
-    let root = std::env::temp_dir().join(format!("cowshed-gateway-audit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir(&root).expect("provision audit root");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-            .expect("secure audit root");
-    }
+    let root = secure_fixture_dir(&format!("cowshed-gateway-audit-{}", std::process::id()));
     let sink =
         ArrowAuditSink::start(ArrowAuditConfig::new(root.clone()).expect("audit configuration"))
             .expect("start Arrow sink");
