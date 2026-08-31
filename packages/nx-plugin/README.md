@@ -43,12 +43,16 @@ Concrete targets come from concrete files:
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
   and a stale `N` can only make a target slow — never drop a test. Omitting the key means one target, as before.
-- Tests that a `nextest.toml` test-group serializes are lifted out of the hash into `cargo-test-<package>-serial`, and
-  the shards run the complement. A test-group only holds within one nextest run, so leaving grouped tests to the hash
-  would scatter them across shards and dissolve the mutex. The pin is derived by reading the groups back out of
-  `nextest.toml`, so declaring a group there is the whole change. Only a sharded crate gets one — an unsharded crate
+- Tests that a `nextest.toml` override singles out are lifted out of the hash into `cargo-test-<package>-exceptions`,
+  and the shards run the complement. An override marks a class that does not behave like the rest of the suite, and each
+  kind breaks a shard differently: a `test-group` only holds within one nextest run, so leaving its members to the hash
+  would scatter them across runs and dissolve the mutex; a raised `slow-timeout` marks a test whose cost is not the
+  suite's, such as a compile-fail test that rustc's a fixture for 25.6s on a cold target directory against 1.8s warm —
+  and every CI runner is cold. One target holds both classes, not one each: they occupy different threads, so its wall
+  is the max of the classes rather than their sum. The pin is derived by reading the overrides back out of
+  `nextest.toml`, so declaring one there is the whole change. Only a sharded crate gets this target — an unsharded crate
   already runs its whole suite in a single process — and it passes on an empty set, which is the correct answer for a
-  platform where the grouped tests are `cfg`-ed out.
+  platform where the singled-out tests are `cfg`-ed out.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
