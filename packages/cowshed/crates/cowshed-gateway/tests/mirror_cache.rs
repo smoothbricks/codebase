@@ -1311,14 +1311,30 @@ fn gateway_mirror_cache_config_requires_a_preexisting_real_root() {
     ));
 }
 
-#[test]
-fn production_cache_root_is_fixed_beneath_the_cache_volume() {
-    let fixture = TestRoot::new();
-    let root = std::fs::canonicalize(fixture.path()).expect("canonical fixture root");
+/// A git helper whose mode this fixture owns.
+///
+/// `current_exe()` cannot serve here: the linker writes the test binary as 0o777 masked by the
+/// umask of whoever ran the build, so a fixture pointing at it inherits a mode from the builder's
+/// environment and `validate_git_helper_executable` then accepts or refuses it depending on a shell
+/// setting the test never mentions.
+fn git_helper(path: PathBuf, mode: u32) -> PathBuf {
+    std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write git helper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("set git helper mode");
+    }
+    path
+}
+
+/// A host layout `validate_host_cache_layout` accepts, so a test can vary one part and know that
+/// part is what the verdict came from. Idempotent: callers reuse one root across cases.
+fn production_layout(root: &Path, helper: PathBuf) -> GatewayConfig {
     let store = root.join("store");
     let cache_volume = root.join("caches");
     let fixed = cache_volume.join("mirror");
-    std::fs::create_dir(&store).expect("store root");
+    std::fs::create_dir_all(&store).expect("store root");
     std::fs::create_dir_all(&fixed).expect("create fixed cache root");
     #[cfg(unix)]
     {
@@ -1326,13 +1342,20 @@ fn production_cache_root_is_fixed_beneath_the_cache_volume() {
         std::fs::set_permissions(&fixed, std::fs::Permissions::from_mode(0o700))
             .expect("secure fixed cache root");
     }
-    let mut config = GatewayConfig {
+    GatewayConfig {
         control_socket: Some(store.join("gateway.sock")),
         production_cache_volume: Some(cache_volume),
-        git_helper_executable: Some(std::env::current_exe().expect("current test executable")),
+        git_helper_executable: Some(helper),
         mirror_cache: MirrorCacheConfig::new(fixed),
         ..GatewayConfig::default()
-    };
+    }
+}
+
+#[test]
+fn production_cache_root_is_fixed_beneath_the_cache_volume() {
+    let fixture = TestRoot::new();
+    let root = std::fs::canonicalize(fixture.path()).expect("canonical fixture root");
+    let mut config = production_layout(&root, git_helper(root.join("git-helper"), 0o700));
     config
         .validate_host_cache_layout()
         .expect("fixed production cache layout");
@@ -1342,4 +1365,52 @@ fn production_cache_root_is_fixed_beneath_the_cache_volume() {
         config.validate_host_cache_layout(),
         Err(ConfigError::InvalidProductionCacheRoot)
     ));
+}
+
+/// The gateway spawns this binary, so whoever can rewrite it between validation and spawn chooses
+/// what the gateway runs. Each way of losing that exclusivity is refused, and the refusal is
+/// reached only because the surrounding layout is otherwise valid.
+#[test]
+fn git_helper_executable_must_be_private_and_owner_executable() {
+    let fixture = TestRoot::new();
+    let root = std::fs::canonicalize(fixture.path()).expect("canonical fixture root");
+
+    // One arm each: 0o770 sets group write and nothing else the check objects to, 0o702 sets other
+    // write, 0o600 is private but not owner-executable. A mode like 0o750 would pass, correctly --
+    // group read and execute are not the hazard, group write is.
+    for (case, helper) in [
+        (
+            "group-writable",
+            git_helper(root.join("group-writable"), 0o770),
+        ),
+        (
+            "other-writable",
+            git_helper(root.join("other-writable"), 0o702),
+        ),
+        (
+            "not executable",
+            git_helper(root.join("not-executable"), 0o600),
+        ),
+        ("relative", PathBuf::from("git-helper")),
+    ] {
+        assert!(
+            matches!(
+                production_layout(&root, helper).validate_host_cache_layout(),
+                Err(ConfigError::InvalidGitHelperExecutable)
+            ),
+            "a {case} git helper must be refused"
+        );
+    }
+
+    let link = root.join("linked");
+    std::os::unix::fs::symlink(git_helper(root.join("real"), 0o700), &link)
+        .expect("link a private helper");
+    assert!(matches!(
+        production_layout(&root, link).validate_host_cache_layout(),
+        Err(ConfigError::InvalidGitHelperExecutable)
+    ));
+
+    production_layout(&root, git_helper(root.join("git-helper"), 0o700))
+        .validate_host_cache_layout()
+        .expect("a private, owner-executable helper is accepted");
 }
