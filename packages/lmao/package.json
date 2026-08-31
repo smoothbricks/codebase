@@ -142,7 +142,14 @@
   "files": [
     "dist",
     "src",
-    "!**/*.tsbuildinfo"
+    "crates/**/*.rs",
+    "crates/**/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/config.toml",
+    "justfile",
+    "!**/*.tsbuildinfo",
+    "!crates/**/target/**"
   ],
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",
