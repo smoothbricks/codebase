@@ -33,7 +33,7 @@ function validNxJson(): Record<string, unknown> {
 
 function validTargetDefaults(): Record<string, unknown> {
   return {
-    build: { cache: true, outputs: ['{projectRoot}/dist'] },
+    build: { cache: true },
     clean: { executor: '@smoothbricks/nx-plugin:clean-outputs', cache: false },
   };
 }
@@ -162,43 +162,31 @@ describe('pure core: checkWorkspaceConfig', () => {
       namedInputs: validNamedInputs(),
     });
     expect(issues.some((i) => i.message.includes('build.cache must be true'))).toBe(true);
-    expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(true);
-  });
-
-  it('accepts additional project-root dist siblings in build outputs', () => {
-    const issues = checkWorkspaceConfig({
-      plugins: validPlugins(),
-      targetDefaults: {
-        ...validTargetDefaults(),
-        build: { cache: true, outputs: ['{projectRoot}/dist', '{projectRoot}/dist-node'] },
-      },
-      namedInputs: validNamedInputs(),
-    });
     expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(false);
   });
 
-  it('rejects build outputs missing the canonical dist tree', () => {
+  it('rejects a build outputs default that would clobber the inferred aggregate', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
       targetDefaults: {
         ...validTargetDefaults(),
-        build: { cache: true, outputs: ['{projectRoot}/dist-node'] },
+        build: { cache: true, outputs: ['{projectRoot}/dist'] },
       },
       namedInputs: validNamedInputs(),
     });
-    expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(true);
+    expect(issues.some((i) => i.message.includes('targetDefaults.build.outputs must not be set'))).toBe(true);
   });
 
-  it('rejects build outputs outside the project-root dist family', () => {
+  it('rejects a build dependsOn default that would clobber the inferred aggregate', () => {
     const issues = checkWorkspaceConfig({
       plugins: validPlugins(),
       targetDefaults: {
         ...validTargetDefaults(),
-        build: { cache: true, outputs: ['{projectRoot}/dist', '{workspaceRoot}/out'] },
+        build: { cache: true, dependsOn: ['^build'] },
       },
       namedInputs: validNamedInputs(),
     });
-    expect(issues.some((i) => i.message.includes('build.outputs'))).toBe(true);
+    expect(issues.some((i) => i.message.includes('targetDefaults.build.dependsOn must not be set'))).toBe(true);
   });
 
   it('detects missing sharedGlobals', () => {
@@ -220,7 +208,7 @@ describe('pure core: applyWorkspaceConfig', () => {
     expect(applyWorkspaceConfig(nxJson)).toBe(false);
   });
 
-  it('preserves valid extra dist siblings in build outputs', () => {
+  it('strips a build outputs default so the inferred aggregate claims nothing', () => {
     const nxJson = {
       ...validNxJson(),
       targetDefaults: {
@@ -228,22 +216,22 @@ describe('pure core: applyWorkspaceConfig', () => {
         build: { cache: true, outputs: ['{projectRoot}/dist', '{projectRoot}/dist-node'] },
       },
     };
-    expect(applyWorkspaceConfig(nxJson)).toBe(false);
+    expect(applyWorkspaceConfig(nxJson)).toBe(true);
     const build = expectRecord(expectRecord(nxJson.targetDefaults).build);
-    expect(build.outputs).toEqual(['{projectRoot}/dist', '{projectRoot}/dist-node']);
+    expect(build).toEqual({ cache: true });
   });
 
-  it('resets invalid build outputs to the canonical dist tree', () => {
+  it('strips a build dependsOn default so the inferred host-aware edge survives', () => {
     const nxJson = {
       ...validNxJson(),
       targetDefaults: {
         ...validTargetDefaults(),
-        build: { cache: true, outputs: ['{workspaceRoot}/out'] },
+        build: { cache: true, dependsOn: ['^build'] },
       },
     };
     expect(applyWorkspaceConfig(nxJson)).toBe(true);
     const build = expectRecord(expectRecord(nxJson.targetDefaults).build);
-    expect(build.outputs).toEqual(['{projectRoot}/dist']);
+    expect(build).toEqual({ cache: true });
   });
 
   it('fixes missing plugins', () => {
@@ -391,17 +379,14 @@ describe('Tree: applyWorkspaceConfigTree', () => {
     const tree = createTreeWithEmptyWorkspace();
     writeJson(tree, 'nx.json', {
       plugins: validPlugins(),
-      targetDefaults: { build: { cache: false } },
+      targetDefaults: { build: { cache: false, outputs: ['{projectRoot}/dist'] } },
       namedInputs: validNamedInputs(),
     });
 
     expect(applyWorkspaceConfigTree(tree)).toBe(true);
 
     const nxJson = readJson(tree, 'nx.json');
-    expect(expectRecord(nxJson.targetDefaults).build).toEqual({
-      cache: true,
-      outputs: ['{projectRoot}/dist'],
-    });
+    expect(expectRecord(nxJson.targetDefaults).build).toEqual({ cache: true });
     expect(expectRecord(nxJson.targetDefaults).clean).toEqual({
       executor: '@smoothbricks/nx-plugin:clean-outputs',
       cache: false,
