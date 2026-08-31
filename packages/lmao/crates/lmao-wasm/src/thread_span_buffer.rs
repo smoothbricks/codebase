@@ -312,6 +312,19 @@ pub extern "C" fn thread_span_buffer_free(handle: u32) {
     });
 }
 
+/// Release every row and span on a handle, keeping its interned vocabulary.
+/// Returns 0 on success and a non-zero status for an unknown handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_reset(handle: u32) -> i32 {
+    match with_handle(handle, |buffer| {
+        buffer.reset();
+        Ok(())
+    }) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn thread_span_buffer_intern(handle: u32, ptr: *const u8, len: usize) -> u32 {
     let Some(bytes) = (unsafe { bytes(ptr, len) }) else {
