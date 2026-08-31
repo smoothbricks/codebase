@@ -140,6 +140,8 @@ function writeLogs(context: object, kind: MessageKind, count: number): void {
 async function makeScenario(kind: MessageKind, logCount: number, topology: Topology): Promise<Scenario> {
   const capacity = topology === 'overflow-capacity' ? 8 : 64;
   const hint = runtimeHint(kind, capacity);
+  const compileMetadata =
+    kind === 'dynamic' ? { runtimeHint: hint } : { runtimeHint: hint, localMessageDictionary: TEMPLATE_BINDING };
   const leaf = OP_CONTEXT.defineOp(
     `${kind}-${logCount}-${topology}-leaf`,
     (ctx) => {
@@ -147,7 +149,7 @@ async function makeScenario(kind: MessageKind, logCount: number, topology: Topol
       return ctx.ok(null).message('leaf-complete');
     },
     undefined,
-    { runtimeHint: hint },
+    compileMetadata,
   );
   const middle = OP_CONTEXT.defineOp(
     `${kind}-${logCount}-${topology}-middle`,
@@ -158,7 +160,7 @@ async function makeScenario(kind: MessageKind, logCount: number, topology: Topol
       return ctx.ok(null).message('middle-complete');
     },
     undefined,
-    { runtimeHint: hint },
+    compileMetadata,
   );
   const rootOp = OP_CONTEXT.defineOp(
     `${kind}-${logCount}-${topology}-root`,
@@ -171,7 +173,7 @@ async function makeScenario(kind: MessageKind, logCount: number, topology: Topol
       return ctx.ok(null).message('root-complete');
     },
     undefined,
-    { runtimeHint: hint },
+    compileMetadata,
   );
   const tracer = new TestTracer(OP_CONTEXT, { bufferStrategy: new JsBufferStrategy(), createTraceRoot });
   const result = await tracer.trace(`root-${kind}-${logCount}-${topology}`, rootOp);
