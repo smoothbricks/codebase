@@ -117,7 +117,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       [
         'let ticks = 0;',
         'const timer = setInterval(() => {',
-        '  console.log(`tick ${++ticks}`);',
+        '  console.log("tick " + ++ticks);',
         '  if (ticks === 6) {',
         '    clearInterval(timer);',
         '  }',
@@ -144,7 +144,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       [
         'let ticks = 0;',
         'const timer = setInterval(() => {',
-        '  console.error(`tick ${++ticks}`);',
+        '  console.error("tick " + ++ticks);',
         '  if (ticks === 5) {',
         '    clearInterval(timer);',
         '  }',
