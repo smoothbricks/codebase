@@ -1,3 +1,11 @@
+export {
+  bindThreadSpanBuffer,
+  isThreadSpanBufferWasmExports,
+  THREAD_SPAN_BUFFER_OK,
+  type ThreadSpanBufferBinding,
+  type ThreadSpanBufferHandle,
+  type ThreadSpanBufferWasmExports,
+} from './lib/wasm/threadSpanBuffer.js';
 export { WasmBufferStrategy, type WasmBufferStrategyOptions } from './lib/wasm/WasmBufferStrategy.js';
 export {
   createWasmAllocator,
