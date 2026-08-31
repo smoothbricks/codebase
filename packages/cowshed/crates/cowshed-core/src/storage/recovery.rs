@@ -138,7 +138,19 @@ impl LifecycleIntentJournal {
                 ));
             }
         };
-        journal.validate()?;
+        journal.validate().map_err(|error| {
+            let project = path.parent().unwrap_or(path);
+            CowshedError::new(
+                error.code,
+                format!(
+                    "invalid lifecycle intent journal for project {} in {}: {}",
+                    project.display(),
+                    path.display(),
+                    error.message
+                ),
+                error.hint,
+            )
+        })?;
         Ok(journal)
     }
 
@@ -236,7 +248,7 @@ impl LifecycleIntentJournal {
             if record.operation.target() != workspace {
                 return Err(CowshedError::integrity(
                     format!(
-                        "lifecycle intent key {workspace} disagrees with target {}",
+                        "lifecycle intent record {workspace} disagrees with target {}",
                         record.operation.target()
                     ),
                     "repair the lifecycle intent journal, then reopen cowshed",
@@ -258,7 +270,7 @@ impl LifecycleIntentJournal {
             );
             if !valid_completion {
                 return Err(CowshedError::integrity(
-                    format!("lifecycle intent for {workspace} has an incompatible completion"),
+                    format!("lifecycle intent record {workspace} has an incompatible completion"),
                     "repair the lifecycle intent journal, then reopen cowshed",
                 ));
             }

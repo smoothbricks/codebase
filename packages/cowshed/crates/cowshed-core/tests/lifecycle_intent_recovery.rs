@@ -290,3 +290,38 @@ fn killed_fork_reopens_reconciles_and_retries_exactly_once() {
 fn killed_remove_reopens_reconciles_and_retries_exactly_once() {
     crash_then_recover("remove");
 }
+
+#[test]
+fn malformed_record_names_its_project_and_record() {
+    let root = TestRoot::new("malformed");
+    let project = root.path().join("acme/widget");
+    fs::create_dir_all(&project).expect("create project fixture");
+    let path = project.join(LIFECYCLE_INTENTS_FILE);
+    fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "entries": {
+                "raven": {
+                    "operation": {
+                        "kind": "fork",
+                        "source": "main",
+                        "destination": "owl"
+                    }
+                }
+            }
+        }"#,
+    )
+    .expect("write malformed journal fixture");
+
+    let error = LifecycleIntentJournal::load(&path).unwrap_err();
+    assert_eq!(
+        error.message,
+        format!(
+            "invalid lifecycle intent journal for project {} in {}: lifecycle intent record \
+             raven disagrees with target owl",
+            project.display(),
+            path.display()
+        )
+    );
+}
