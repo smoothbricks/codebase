@@ -68,6 +68,7 @@ import {
   type CallsitePlan,
   getPhysicalLayoutPlan,
   type PhysicalLayoutPlan,
+  resolveCallsitePlanBackend,
   sealCallsitePlan,
 } from './physicalLayoutPlan.js';
 import { type AnyResult, Err, Ok, type Result } from './result.js';
@@ -708,8 +709,12 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     _line: number,
     name: string,
     overrides: Record<string, unknown>,
-    callsitePlan: CallsitePlan<B['logBinding']['logSchema'], OpContextOf<B>>,
+    definedCallsitePlan: CallsitePlan<B['logBinding']['logSchema'], OpContextOf<B>>,
   ): SpanContextInstance<OpContextOf<B>> {
+    // Ops seal their plan at define time, before any tracer exists; discharge
+    // that deferred backend decision against this tracer's strategy, once per
+    // (plan, backend) — never per call.
+    const callsitePlan = resolveCallsitePlanBackend(definedCallsitePlan, this.physicalLayoutPlan.backendKind);
     // Extract trace_id from overrides if present
     const traceId: TraceId = isValidTraceId(overrides.trace_id) ? overrides.trace_id : generateTraceId();
     const schema = callsitePlan.schema;

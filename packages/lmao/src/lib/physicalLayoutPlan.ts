@@ -446,6 +446,56 @@ const THREAD_BUFFER_APPENDERS: PhysicalAppenders = Object.freeze({
   },
 });
 
+/** Rebound plans, one per (define-time plan, tracer backend) — decided once. */
+const REBOUND_CALLSITE_PLANS = new WeakMap<object, Map<PhysicalBackendKind, unknown>>();
+
+/**
+ * Resolve a define-time callsite plan against the tracer's physical backend.
+ *
+ * Ops seal their plan when they are defined, before any tracer exists, so the
+ * plan is built with `'strategy-selected'` — a deferred decision this function
+ * discharges exactly once per (plan, backend). Only the fields that key on the
+ * backend move: the appenders, the log-append primitive, and the Arrow
+ * exposure. Everything else — generated classes, dictionaries, layout — is
+ * backend-independent and shared by identity.
+ */
+export function resolveCallsitePlanBackend<T extends LogSchema, Ctx extends OpContext<T>>(
+  plan: CallsitePlan<T, Ctx>,
+  backendKind: PhysicalBackendKind,
+): CallsitePlan<T, Ctx> {
+  if (backendKind === 'strategy-selected' || backendKind === plan.backendKind) return plan;
+  const byBackend = REBOUND_CALLSITE_PLANS.get(plan) ?? new Map<PhysicalBackendKind, unknown>();
+  REBOUND_CALLSITE_PLANS.set(plan, byBackend);
+  const cached = byBackend.get(backendKind);
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- the map slot is only ever written below with a rebound copy of this exact plan type.
+  if (cached !== undefined) return cached as CallsitePlan<T, Ctx>;
+  const { metadata, ...bare } = plan;
+  const rebound = Object.freeze({
+    ...bare,
+    backendKind,
+    appendLogEntry:
+      backendKind === 'thread-buffer'
+        ? THREAD_APPEND_LOG_ENTRY
+        : plan.messagePhysicalLayout === 'packed'
+          ? PACKED_APPEND_LOG_ENTRY
+          : SPLIT_APPEND_LOG_ENTRY,
+    appenders:
+      backendKind === 'thread-buffer'
+        ? THREAD_BUFFER_APPENDERS
+        : APPENDERS_BY_MESSAGE_LAYOUT[`${plan.messageLayoutFamily}:${plan.messagePhysicalLayout}`],
+    arrowExposure:
+      backendKind === 'wasm'
+        ? WASM_ARROW_EXPOSURE_BY_LAYOUT[plan.messagePhysicalLayout]
+        : JS_ARROW_EXPOSURE_BY_LAYOUT[plan.messagePhysicalLayout],
+  });
+  const sealed: CallsitePlan<T, Ctx> = Object.freeze({
+    ...rebound,
+    metadata: Object.freeze({ ...metadata, _physicalLayoutPlan: rebound }),
+  });
+  byBackend.set(backendKind, sealed);
+  return sealed;
+}
+
 const EMPTY_LOCAL_MESSAGE_DICTIONARY: readonly number[] = Object.freeze([]);
 const NO_LOCAL_MESSAGE = (_globalDenseIndex: number): number => 0;
 
