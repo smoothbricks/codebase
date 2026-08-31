@@ -10,7 +10,7 @@ import type { RemapDescriptor } from '../logBinding.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import { decodeVocabularyMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
-import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_EXCEPTION, THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
+import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 import { getThreadId } from '../threadId.js';
@@ -324,10 +324,10 @@ export class ThreadSpanView {
   end(entryType: number): void {
     if (!this.opened) this.openSpan(this._spanName ?? 'span');
     const timestamp = this._traceRoot._timestampNow(this._traceRoot);
-    const status =
-      entryType === ENTRY_TYPE_SPAN_ERR || entryType === ENTRY_TYPE_SPAN_EXCEPTION
-        ? this.binding.endErr(this.spanId, timestamp)
-        : this.binding.endOk(this.spanId, timestamp);
+    // The tracer's entry type goes through verbatim. Folding EXCEPTION onto
+    // the error path recorded a thrown bug as a handled failure, which is the
+    // one distinction the completion taxonomy exists to make.
+    const status = this.binding.end(this.spanId, entryType, timestamp);
     if (status !== THREAD_SPAN_BUFFER_OK) throw new Error('thread_span_buffer_end failed');
     this.timestamp[1] = timestamp;
     this.entry_type[1] = entryType;

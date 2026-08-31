@@ -666,6 +666,19 @@ impl ThreadSpanBuffer {
             .ended = true;
         Ok(())
     }
+    /// Complete a span with the tracer's own entry type.
+    ///
+    /// `end_err` cannot express `SpanException`: collapsing a throw onto
+    /// `SpanErr` erases the distinction between a handled failure and a bug,
+    /// which is the whole point of the completion taxonomy.
+    pub fn end(
+        &mut self,
+        span_id: u32,
+        entry_type: EntryType,
+        timestamp: i64,
+    ) -> Result<(), ThreadBufferError> {
+        self.complete(span_id, entry_type, timestamp)
+    }
     pub fn end_ok(&mut self, span_id: u32, timestamp: i64) -> Result<(), ThreadBufferError> {
         self.complete(span_id, EntryType::SpanOk, timestamp)
     }
