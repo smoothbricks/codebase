@@ -76,11 +76,18 @@ const utf8Decoder = new TextDecoder();
 export async function createThreadSpanBufferRuntime(options?: {
   initialPages?: number;
   maxPages?: number;
+  /**
+   * Pre-compiled allocator.wasm. Bundled environments (Expo web) cannot
+   * resolve the artifact relative to import.meta.url, so the consumer that
+   * knows where the artifact ships supplies the compiled module — the same
+   * contract createWasmAllocatorSync already offers on the allocator side.
+   */
+  module?: WebAssembly.Module;
 }): Promise<ThreadSpanBufferRuntime> {
   const initialPages = Math.max(options?.initialPages ?? MIN_INITIAL_PAGES, MIN_INITIAL_PAGES);
   const maxPages = Math.max(options?.maxPages ?? DEFAULT_MAX_PAGES, initialPages);
   const memory = new WebAssembly.Memory({ initial: initialPages, maximum: maxPages });
-  const module = await getWasmModule();
+  const module = options?.module ?? (await getWasmModule());
   const instance = await WebAssembly.instantiate(module, {
     env: {
       memory,

@@ -685,6 +685,23 @@ impl ThreadSpanBuffer {
     pub fn end_err(&mut self, span_id: u32, timestamp: i64) -> Result<(), ThreadBufferError> {
         self.complete(span_id, EntryType::SpanErr, timestamp)
     }
+    /// Store a span's terminal message on its reserved completion row.
+    ///
+    /// The js-heap lane writes result/error text into row 1 rather than
+    /// appending a row; this is the same contract for the shared row store, so
+    /// the two lanes produce the same row count for the same trace.
+    pub fn set_completion_message(
+        &mut self,
+        span_id: u32,
+        message: TextInput<'_>,
+    ) -> Result<(), ThreadBufferError> {
+        let message = self.cell(message)?;
+        let capacity = self.capacity;
+        let record = self.record(span_id)?;
+        let (block, row) = self.block_at_mut(record.completion_row as usize)?;
+        block.messages.set(row, capacity, message);
+        Ok(())
+    }
     pub fn append_log(
         &mut self,
         span_id: u32,

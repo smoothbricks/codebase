@@ -77,6 +77,8 @@ import { walkSpanTree } from './traceTopology.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 import type { VocabularyGeneration } from './vocabularyRegistry.js';
+import { convertThreadViewToArrowTable } from './wasm/convertThreadBuffer.js';
+import { isThreadSpanView } from './wasm/threadSpanView.js';
 
 const DictBuilder = DictionaryBuilder;
 const F64Array = Float64Array;
@@ -1269,6 +1271,13 @@ export function convertSpanTreeToArrowTable(
   periodStartNs?: bigint,
   borrowChunks = false,
 ): Table {
+  // A thread-lane view stores rows in the native row store, not in JS-heap
+  // columns; walking it as a JS tree reads empty lanes. Its converter reads
+  // the store through the runtime, and the whole logical tree shares one
+  // buffer, so the root view is the complete input.
+  if (isThreadSpanView(rootBuffer)) {
+    return convertThreadViewToArrowTable(rootBuffer);
+  }
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 0: Collect ALL unique schema fields from ALL buffers in the tree
   // Per specs/lmao/01k_tree_walker_and_arrow_conversion.md - child spans may have different schemas

@@ -100,6 +100,10 @@ describe('thread span buffer ABI', () => {
         calls.push(`scope:${handle}:${spanId}:${ordinal}:${kind}:${value}`);
         return THREAD_SPAN_BUFFER_OK;
       },
+      thread_span_buffer_set_completion_message: (handle, spanId, messagePtr, messageLen) => {
+        calls.push(`completion-message:${handle}:${spanId}:${messagePtr}:${messageLen}`);
+        return THREAD_SPAN_BUFFER_OK;
+      },
       thread_span_buffer_intern: (handle, ptr, len) => {
         calls.push(`intern:${handle}:${ptr}:${len}`);
         return 9;
