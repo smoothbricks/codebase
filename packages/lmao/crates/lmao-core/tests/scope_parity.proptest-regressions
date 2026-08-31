@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 155c0fc6c1273a08e1317d7a1309d1eac2fee22e20ff48b24ab57bb26af1c64b # shrinks to setup = [("gamma", None)], victim_index = 2
+cc e3a67af294e5c6fe1e8cecc7c128f5002dc2a4c69f4fe8cade75ce9f2bb59b4f # shrinks to updates = [[("gamma", Some(Number(0.0)))], [("gamma", None)]]
+cc 940dc14d6f103929c7350073c751c07309670b250d9e79efaaa17c1ddec403a2 # shrinks to before = [], after = [[("delta", Some(Number(0.0)))], [("delta", None)]]
+cc 3a43f2b424fc569b52d55392790a1fa5d5ad2fab34b3592ccf78de6ab5ac1a36 # shrinks to updates = [[("gamma", Some(Number(0.0)))], [("gamma", None)]]
+cc ce921b8a587837768683096ddc5dcdffbbf5261a292ef87b08b2d35e10ade461 # shrinks to writes = [None, None, None, None, None, None, None, None, Some(0)], scope = Some(1)

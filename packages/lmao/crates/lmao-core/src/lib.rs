@@ -17,6 +17,7 @@ pub mod entry_type;
 pub mod identity;
 pub mod packed_header;
 pub mod result;
+pub mod scope;
 pub mod tuning;
 
 pub use buffer::{SourceMetadata, SpanBuffer};
@@ -34,4 +35,5 @@ pub use packed_header::{
     vocabulary_id_from_header,
 };
 pub use result::{RetryPolicy, SpanOutcome, Transient};
+pub use scope::{ScopeEntry, ScopeValue, SpanScope, report_scope_mismatch};
 pub use tuning::{CapacityRatchet, DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY};
