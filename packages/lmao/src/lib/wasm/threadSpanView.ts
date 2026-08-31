@@ -8,7 +8,6 @@
 
 import type { RemapDescriptor } from '../logBinding.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
-import { decodeVocabularyMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
@@ -181,13 +180,13 @@ export class ThreadSpanView {
    *
    * Generated loggers resolve a compile-time template to a local u16 id and
    * store it here instead of a string. Without this lane the write landed on
-   * `undefined` and threw, so the lane's own best case — a message that never
+   * `undefined` and threw, so the lane's best case — a message that never
    * needs encoding — was the one path it could not take.
    *
-   * The id is an index into the callsite's local dictionary, whose entries are
-   * dense vocabulary indices; resolving one yields the same string the dynamic
-   * path would have produced, which the intern cache then answers without
-   * crossing or encoding.
+   * The id indexes the callsite's local dictionary, whose entries are dense
+   * vocabulary indices, and the row store speaks that vocabulary directly.
+   * So the dense index crosses as an integer: no decode to a string, no
+   * intern, no scratch page, nothing for the boundary to copy.
    *
    * Typed as Uint16Array to satisfy the SpanBuffer contract: this lane is a
    * write sink with indexed-set semantics, not storage, and nothing reads it.
@@ -196,19 +195,31 @@ export class ThreadSpanView {
     const existing = this._laneStore[LANE_MESSAGE_IDS];
     if (existing !== undefined) return existing as Uint16Array;
     const lane = laneProxy((index, value) => {
-      this.commitLog(index, this.resolveLocalMessage(Number(value)));
+      this.commitStaticLog(index, this.denseVocabularyIndex(Number(value)));
     }) as unknown as Uint16Array;
     this._laneStore[LANE_MESSAGE_IDS] = lane;
     return lane;
   }
 
-  private resolveLocalMessage(localMessageId: number): string {
-    const dictionary = this._opMetadata._physicalLayoutPlan?.localMessageDictionary;
-    const denseIndex = dictionary?.[localMessageId - 1];
+  private denseVocabularyIndex(localMessageId: number): number {
+    const denseIndex = this._opMetadata._physicalLayoutPlan?.localMessageDictionary?.[localMessageId - 1];
     if (denseIndex === undefined) {
       throw new Error(`Missing local message dictionary entry ${localMessageId}`);
     }
-    return decodeVocabularyMessage(this._vocabularyGeneration, denseIndex);
+    return denseIndex;
+  }
+
+  private commitStaticLog(fakeIndex: number, denseIndex: number): void {
+    if (this.fakeToReal.get(fakeIndex) !== undefined) return;
+    if (!this.opened) this.openSpan(this._spanName ?? 'span');
+    const entryType = this.pendingEntryType ?? 8;
+    this.pendingEntryType = undefined;
+    const timestamp = this._traceRoot._timestampNow(this._traceRoot);
+    const packed = this.binding.appendLogStatic(this.spanId, entryType, denseIndex, timestamp, this.pendingLine);
+    if (packed === 0n) throw new Error('thread_span_buffer_append_log_static failed');
+    const row = Number(packed & 0xffffffffn);
+    this.fakeToReal.set(fakeIndex, row);
+    this.lastRow = row;
   }
 
   get error_code_values(): unknown[] {
