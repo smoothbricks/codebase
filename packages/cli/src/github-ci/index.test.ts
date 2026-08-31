@@ -10,6 +10,7 @@ import {
   expandNxTargetRuns,
   githubCiNxDeploy,
   githubCiNxRunMany,
+  githubCommitStatusesWritable,
   nxRunManyArgs,
   nxRunManyBatchArgs,
   nxSmartArgs,
@@ -33,6 +34,30 @@ const projects: ProjectTargets[] = [
   { project: 'desktop', root: 'packages/desktop', targets: ['build-macos', 'package-macos', 'test'] },
   { project: 'mobile', root: 'packages/mobile', targets: ['build-ios'] },
 ];
+
+describe('GitHub commit status permissions', () => {
+  it('skips only positively identified fork pull requests', () => {
+    const pullRequestEnvironment = {
+      GITHUB_EVENT_NAME: 'pull_request',
+      GITHUB_REPOSITORY: 'owner/repo',
+    };
+
+    expect(
+      githubCommitStatusesWritable(pullRequestEnvironment, {
+        pull_request: { head: { repo: { full_name: 'fork/repo' } } },
+      }),
+    ).toBe(false);
+    expect(
+      githubCommitStatusesWritable(pullRequestEnvironment, {
+        pull_request: { head: { repo: { full_name: 'owner/repo' } } },
+      }),
+    ).toBe(true);
+    expect(githubCommitStatusesWritable(pullRequestEnvironment, undefined)).toBe(true);
+    expect(
+      githubCommitStatusesWritable({ GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'owner/repo' }, undefined),
+    ).toBe(true);
+  });
+});
 
 describe('GitHub CI Nx target expansion', () => {
   it('groups an exact target with only projects that own it', () => {

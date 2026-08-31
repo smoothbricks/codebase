@@ -788,6 +788,10 @@ async function postGithubStatus(name: string, state: string, description: string
   if (!repository || !sha) {
     return;
   }
+  if (!githubCommitStatusesWritable(process.env, readGithubActionsEvent(process.env))) {
+    console.log(`Skipping GitHub commit status ${name}=${state}: fork pull requests receive a read-only GITHUB_TOKEN.`);
+    return;
+  }
   const targetUrl = await getGithubStepUrl(step);
   const args = [
     'api',
@@ -827,4 +831,19 @@ async function getGithubStepUrl(step: string): Promise<string | null> {
   return step
     ? `https://github.com/${repository}/actions/runs/${runId}/job/${jobId}#step:${step}:1`
     : `https://github.com/${repository}/actions/runs/${runId}/job/${jobId}`;
+}
+
+export function githubCommitStatusesWritable(
+  environment: NodeJS.ProcessEnv,
+  event: GithubActionsEventPayload | undefined,
+): boolean {
+  if (environment.GITHUB_EVENT_NAME !== 'pull_request') {
+    return true;
+  }
+  const repository = environment.GITHUB_REPOSITORY;
+  const headRepository = event?.pull_request?.head?.repo?.full_name;
+  // GitHub downgrades GITHUB_TOKEN to read-only for fork pull_request jobs. Only a
+  // positively identified fork is skipped: incomplete payloads still attempt the
+  // write and preserve the API error instead of silently hiding a permissions fault.
+  return !repository || !headRepository || headRepository === repository;
 }
