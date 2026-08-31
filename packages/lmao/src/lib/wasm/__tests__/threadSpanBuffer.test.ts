@@ -21,6 +21,10 @@ describe('thread span buffer ABI', () => {
       thread_span_buffer_free: (handle) => {
         calls.push(`free:${handle}`);
       },
+      thread_span_buffer_reset: (handle) => {
+        calls.push(`reset:${handle}`);
+        return THREAD_SPAN_BUFFER_OK;
+      },
       thread_span_buffer_open_span: (
         handle,
         tracePtr,
