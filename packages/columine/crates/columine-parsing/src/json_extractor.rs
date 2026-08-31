@@ -4,6 +4,7 @@ use crate::{
     ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind,
     SignalSchemaField,
     json_parser::{JsonParser, Token},
+    validate::{SemanticSchema, encode_path_segment},
 };
 use columine_arrow::VariableValueReservation;
 
@@ -34,6 +35,8 @@ pub mod diagnostic_stage {
     /// Compact CPB1 validation. Distinct from [`COLUMN`] so a compact
     /// `BAD_HEADER` (detail 1) cannot be read as `INVALID_JSON`.
     pub const COMPACT: u8 = 6;
+    /// Semantic payload validation before extraction/deduplication.
+    pub const VALIDATION: u8 = 7;
 }
 
 /// Diagnostic detail bytes (`ExtractionDiagnostic.Detail` — order is ABI,
@@ -48,6 +51,8 @@ pub mod diagnostic_detail {
     pub const TOO_MANY_FIELDS: u8 = 5;
     pub const TOO_MANY_EVENTS: u8 = 6;
     pub const OUT_OF_MEMORY: u8 = 7;
+    /// A semantic schema-layer payload violation.
+    pub const PAYLOAD_VIOLATION: u8 = 8;
 }
 
 /// Compact validation details, namespaced by [`diagnostic_stage::COMPACT`].
@@ -367,10 +372,26 @@ fn extract_json_event_open(
         let name = parser
             .expect_field_name()
             .map_err(|_| ExtractionError::InvalidJson)?;
-        if let Some(lookup) = config.field_map.get(&name) {
-            if let Err(err) =
-                extract_typed_value(parser, lookup.field, columns, lookup.column, diagnostic)
-            {
+        if let Some(lookup) = config.lookup_field(&name) {
+            let payload_name = name.strip_prefix("value.").unwrap_or(&name);
+            let capture_schema = config
+                .semantic_field_schema(&name)
+                .filter(|_| config.is_open_payload_path(payload_name));
+            let extraction_result = match (capture_schema, extra.as_mut()) {
+                (Some(schema), Some(extra_writer)) => {
+                    let mut path = vec![payload_name.to_owned()];
+                    extract_typed_value_with_capture(
+                        parser,
+                        lookup.field,
+                        columns,
+                        lookup.column,
+                        diagnostic,
+                        Some((extra_writer, &mut extra_count, &mut path, schema)),
+                    )
+                }
+                _ => extract_typed_value(parser, lookup.field, columns, lookup.column, diagnostic),
+            };
+            if let Err(err) = extraction_result {
                 // Fill in diagnostic context that the typed-value failure did
                 // not set at its source.
                 if diagnostic.field_index == NO_FIELD {
@@ -408,7 +429,8 @@ fn extract_json_event_open(
                     )
                 })?;
             }
-            writer.write_string(&name).map_err(|err| {
+            let path_key = encode_path_segment(&name);
+            writer.write_string(&path_key).map_err(|err| {
                 msgpack_failure(
                     diagnostic,
                     fallback as u32,
@@ -489,6 +511,22 @@ pub(crate) fn extract_typed_value(
     columns: &mut DynamicColumns,
     column: usize,
     diagnostic: &mut ExtractionDiagnostic,
+) -> Result<(), ExtractionError> {
+    extract_typed_value_with_capture(parser, field, columns, column, diagnostic, None)
+}
+
+fn extract_typed_value_with_capture(
+    parser: &mut JsonParser<'_>,
+    field: SignalSchemaField,
+    columns: &mut DynamicColumns,
+    column: usize,
+    diagnostic: &mut ExtractionDiagnostic,
+    capture: Option<(
+        &mut MsgpackValueWriter<'_>,
+        &mut u32,
+        &mut Vec<String>,
+        &SemanticSchema,
+    )>,
 ) -> Result<(), ExtractionError> {
     let arrow_type = field.arrow_type;
     let token = parser
@@ -639,9 +677,24 @@ pub(crate) fn extract_typed_value(
                 let mut writer = MsgpackValueWriter::new_column(columns, res).map_err(|err| {
                     direct_msgpack_failure(diagnostic, column as u32, actual, row, err)
                 })?;
-                writer.write_value(parser, token).map_err(|err| {
-                    direct_msgpack_failure(diagnostic, column as u32, actual, row, err)
-                })?;
+                if let Some((extra, extra_count, path, semantic_schema)) = capture {
+                    writer
+                        .write_value_filtered(
+                            parser,
+                            token,
+                            semantic_schema,
+                            path,
+                            extra,
+                            extra_count,
+                        )
+                        .map_err(|err| {
+                            direct_msgpack_failure(diagnostic, column as u32, actual, row, err)
+                        })?;
+                } else {
+                    writer.write_value(parser, token).map_err(|err| {
+                        direct_msgpack_failure(diagnostic, column as u32, actual, row, err)
+                    })?;
+                }
                 let written = writer.offset();
                 res.commit(columns, written).map_err(|err| {
                     variable_value_failure(diagnostic, column as u32, arrow_type, actual, row, err)
@@ -763,6 +816,13 @@ fn variable_write_error(error: columine_arrow::VariableValueError) -> Extraction
     }
 }
 
+fn encode_path_segments(path: &[String]) -> String {
+    path.iter()
+        .map(|segment| encode_path_segment(segment))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn append(
     columns: &mut DynamicColumns,
     column: usize,
@@ -774,7 +834,7 @@ fn append(
     })
 }
 
-/// Destination for encoded MessagePack bytes: the reusable `$extra` workspace
+/// Destination for encoded MessagePack bytes: the reusable undeclared-carrier workspace
 /// or a variable-width column reservation that grows in place to its limit.
 pub(crate) enum MsgpackSink<'a> {
     Slice(&'a mut [u8]),
@@ -868,6 +928,69 @@ impl<'a> MsgpackValueWriter<'a> {
             Token::ObjectBegin => self.write_object(parser),
             Token::ArrayBegin => self.write_array(parser),
             Token::ObjectEnd | Token::ArrayEnd => Err(ExtractionError::InvalidJson),
+        }
+    }
+
+    pub(crate) fn write_value_filtered(
+        &mut self,
+        parser: &mut JsonParser<'_>,
+        token: Token,
+        schema: &SemanticSchema,
+        path: &mut Vec<String>,
+        extra: &mut MsgpackValueWriter<'_>,
+        extra_count: &mut u32,
+    ) -> Result<(), ExtractionError> {
+        match schema {
+            SemanticSchema::Object { fields, open } if token == Token::ObjectBegin => {
+                let header = self.offset;
+                self.reserve_map32()?;
+                let mut count = 0_u32;
+                while !parser.is_object_end() {
+                    let name = parser
+                        .expect_field_name()
+                        .map_err(|_| ExtractionError::InvalidJson)?;
+                    let known = fields.iter().find(|(field, _)| field == &name);
+                    let value = parser
+                        .next_token()
+                        .map_err(|_| ExtractionError::InvalidJson)?;
+                    if let Some((_, child_schema)) = known {
+                        self.write_string(&name)?;
+                        path.push(name);
+                        self.write_value_filtered(
+                            parser,
+                            value,
+                            child_schema,
+                            path,
+                            extra,
+                            extra_count,
+                        )?;
+                        path.pop();
+                        count += 1;
+                    } else if *open {
+                        path.push(name);
+                        if *extra_count == 0 {
+                            extra.reserve_map32()?;
+                        }
+                        extra.write_string(&encode_path_segments(path))?;
+                        extra.write_value(parser, value)?;
+                        *extra_count += 1;
+                        path.pop();
+                    } else {
+                        self.write_string(&name)?;
+                        self.write_value(parser, value)?;
+                        count += 1;
+                    }
+                }
+                parser
+                    .next_token()
+                    .map_err(|_| ExtractionError::InvalidJson)?;
+                self.buf()[header + 1..header + 5].copy_from_slice(&count.to_be_bytes());
+                Ok(())
+            }
+            SemanticSchema::Optional(inner) | SemanticSchema::Nullable(inner) => {
+                self.write_value_filtered(parser, token, inner, path, extra, extra_count)
+            }
+            _ => self.write_value(parser, token),
         }
     }
     fn write_object(&mut self, parser: &mut JsonParser<'_>) -> Result<(), ExtractionError> {
@@ -1167,7 +1290,7 @@ mod tests {
         let mut work = [0; 1024];
         extract_json_events(
             br#"[{"id":"1","count":42}]"#,
-            &config(&fields, &["id", "value.$extra"]),
+            &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
             &mut c,
             &mut work,
             &mut ExtractionDiagnostic::default(),
@@ -1197,7 +1320,10 @@ mod tests {
         let json = format!(r#"[{{"id":"1","type":"order","timestamp":1000,{extra_fields}}}]"#);
         extract_json_events(
             json.as_bytes(),
-            &config(&fields, &["id", "type", "timestamp", "value.$extra"]),
+            &config(
+                &fields,
+                &["id", "type", "timestamp", crate::UNDECLARED_COLUMN_NAME],
+            ),
             &mut c,
             &mut work,
             &mut ExtractionDiagnostic::default(),
@@ -1218,7 +1344,7 @@ mod tests {
         assert_eq!(
             extract_json_events(
                 br#"[{"id":"1","type":"order","timestamp":1000,"extra":"abcdefghijklmnopqrstuvwxyz"}]"#,
-                &config(&fields, &["id", "type", "timestamp", "value.$extra"]),
+                &config(&fields, &["id", "type", "timestamp", crate::UNDECLARED_COLUMN_NAME]),
                 &mut c,
                 &mut work,
                 &mut ExtractionDiagnostic::default()
@@ -1237,7 +1363,7 @@ mod tests {
         ];
         let mut c = DynamicColumns::new(&fields, 10);
         let mut work = [0; 1024];
-        assert_eq!(extract_json_events(br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#,&config(&fields,&["id","type","timestamp","orderId","value.$extra"]),&mut c,&mut work,&mut ExtractionDiagnostic::default()).unwrap(),2);
+        assert_eq!(extract_json_events(br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#,&config(&fields,&["id","type","timestamp","orderId",crate::UNDECLARED_COLUMN_NAME]),&mut c,&mut work,&mut ExtractionDiagnostic::default()).unwrap(),2);
     }
     #[test]
     fn extract_json_events_with_undeclared_fields() {
@@ -1253,7 +1379,7 @@ mod tests {
         assert_eq!(
             extract_json_events(
                 br#"[{"id":"1","type":"order","timestamp":1000,"orderId":"A","extra":"ignored"},{"id":"2","type":"order","timestamp":2000,"orderId":"B"}]"#,
-                &config(&fields, &["id", "type", "timestamp", "orderId", "value.$extra"]),
+                &config(&fields, &["id", "type", "timestamp", "orderId", crate::UNDECLARED_COLUMN_NAME]),
                 &mut c,
                 &mut work,
                 &mut ExtractionDiagnostic::default()
@@ -1348,8 +1474,8 @@ mod tests {
             Ok(1)
         );
     }
-    /// The $extra writer is lazy: a tiny work buffer is fine as long as every
-    /// field is declared.
+    /// The undeclared-carrier writer is lazy: a tiny work buffer is fine as
+    /// long as every field is declared.
     #[test]
     fn extract_json_events_tiny_work_buffer_ok_without_undeclared_fields() {
         let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
@@ -1358,7 +1484,7 @@ mod tests {
         assert_eq!(
             extract_json_events(
                 br#"[{"id":"1"}]"#,
-                &config(&fields, &["id", "value.$extra"]),
+                &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
                 &mut c,
                 &mut work,
                 &mut ExtractionDiagnostic::default()
@@ -1385,5 +1511,43 @@ mod tests {
             Err(ExtractionError::InvalidFieldType)
         );
         assert_eq!(c.count(), 0);
+    }
+
+    #[test]
+    fn nested_open_object_captures_path_keyed_unknown_without_typed_leak() {
+        let fields = [field(ArrowType::Binary), field(ArrowType::Binary)];
+        let schemas = crate::validate::parse_schema_envelope(
+            br#"{"order":{"kind":"object","fields":{"user":{"kind":"object","fields":{"id":{"kind":"string"}},"open":true}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &["value.user", crate::UNDECLARED_COLUMN_NAME],
+            Some(&schemas),
+        )
+        .unwrap();
+        let mut columns = DynamicColumns::new(&fields, 1);
+        let mut work = [0; 512];
+        extract_json_events(
+            br#"[{"user":{"id":"u","nickname":"n"}}]"#,
+            &config,
+            &mut columns,
+            &mut work,
+            &mut ExtractionDiagnostic::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            columns.cell(0, 0),
+            Some(ColumnValue::Binary(vec![
+                0xdf, 0, 0, 0, 1, 0xa2, b'i', b'd', 0xa1, b'u'
+            ]))
+        );
+        assert_eq!(
+            columns.cell(1, 0),
+            Some(ColumnValue::Binary(vec![
+                0xdf, 0, 0, 0, 1, 0xad, b'u', b's', b'e', b'r', b'.', b'n', b'i', b'c', b'k', b'n',
+                b'a', b'm', b'e', 0xa1, b'n'
+            ]))
+        );
     }
 }
