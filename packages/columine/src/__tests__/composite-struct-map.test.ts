@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'bun:test';
+import { beforeAll, describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import {
+  type ColumineBackend,
   type ColumnInput,
   ErrorCode,
   HEADER_SIZE,
@@ -47,8 +48,17 @@ function columns(...values: readonly Uint32Array[]): ColumnInput[] {
 }
 
 describe('StructMap2 public WASM readers', () => {
+  // One backend for the file: every test loads its own programs and states, so
+  // nothing is shared across them but the module instance. `ColumineBackend`
+  // exposes no disposal — the instance is reclaimed with the test process — so
+  // there is nothing for an `afterAll` to release.
+  let backend: ColumineBackend;
+
+  beforeAll(async () => {
+    backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
+  });
+
   it('reduces pair rows and restores checkpoint bytes with point lookup and iteration', async () => {
-    const backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
     const getRow = backend.structMap2GetRow;
     const entries = backend.structMap2Entries;
     const upsert = await backend.loadProgram(reducer([Opcode.BATCH_STRUCT_MAP2_UPSERT_LAST, 0, 0, 1, 2, 2, 0, 3, 1]));
@@ -103,7 +113,6 @@ describe('StructMap2 public WASM readers', () => {
 
   it('executes strict signed i64x2 max in the built WASM dispatcher', async () => {
     expect(Opcode.BATCH_STRUCT_MAP2_UPSERT_MAX_I64X2).toBe(0x87);
-    const backend = await createColumineWasmBackend(readFileSync(WASM_PATH));
     const getRow = backend.structMap2GetRow;
     const max = await backend.loadProgram(
       reducer(
