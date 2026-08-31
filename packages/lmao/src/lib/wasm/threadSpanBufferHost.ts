@@ -42,6 +42,8 @@ export interface ThreadSpanBufferRuntime {
   readonly exports: ThreadSpanBufferModuleExports;
   writeUtf8(text: string): { ptr: number; len: number };
   intern(binding: ThreadSpanBufferBinding, text: string): number;
+  /** Live intern-cache counters: a hit crosses nothing and encodes nothing. */
+  readonly internStats: { readonly hits: number; readonly misses: number };
   createBinding(threadId: bigint, capacity: number, schema: LogSchema): ThreadSpanBufferBinding;
   readUtf8(ptr: number, len: number): string;
   rowCount(binding: ThreadSpanBufferBinding): number;
@@ -96,20 +98,30 @@ export async function createThreadSpanBufferRuntime(options?: {
   let scratchPtr = grown * WASM_PAGE;
   let scratchLen = WASM_PAGE;
 
+  // One view over the scratch page, re-derived only when the page moves.
+  // `memory.grow` detaches every view onto `memory.buffer`, so `ensureScratch`
+  // is the single place allowed to replace it.
+  let scratchView = new Uint8Array(memory.buffer, scratchPtr, scratchLen);
+
   const ensureScratch = (len: number): void => {
-    if (len <= scratchLen) return;
-    const pages = Math.ceil(len / WASM_PAGE);
-    const next = memory.grow(pages);
-    if (next < 0) throw new Error('failed to grow WASM scratch');
-    scratchPtr = next * WASM_PAGE;
-    scratchLen = pages * WASM_PAGE;
+    if (len <= scratchLen && scratchView.byteLength !== 0) return;
+    if (len > scratchLen) {
+      const pages = Math.ceil(len / WASM_PAGE);
+      const next = memory.grow(pages);
+      if (next < 0) throw new Error('failed to grow WASM scratch');
+      scratchPtr = next * WASM_PAGE;
+      scratchLen = pages * WASM_PAGE;
+    }
+    scratchView = new Uint8Array(memory.buffer, scratchPtr, scratchLen);
   };
 
   const writeUtf8 = (text: string): { ptr: number; len: number } => {
-    const bytes = utf8.encode(text);
-    ensureScratch(bytes.length);
-    new Uint8Array(memory.buffer, scratchPtr, bytes.length).set(bytes);
-    return { ptr: scratchPtr, len: bytes.length };
+    // Worst case for UTF-8 is 3 bytes per UTF-16 code unit; surrogate pairs
+    // are 2 units producing 4 bytes, so the bound holds. Encoding straight
+    // into linear memory avoids the intermediate array `encode()` returns.
+    ensureScratch(text.length * 3);
+    const written = utf8.encodeInto(text, scratchView).written;
+    return { ptr: scratchPtr, len: written };
   };
 
   const readUtf8 = (ptr: number, len: number): string => {
@@ -117,10 +129,32 @@ export async function createThreadSpanBufferRuntime(options?: {
     return utf8Decoder.decode(new Uint8Array(memory.buffer, ptr, len));
   };
 
+  /**
+   * Vocabulary ids are stable for a handle's lifetime — `ThreadSpanBuffer::intern`
+   * returns the existing id for a value it has already seen — so caching the
+   * mapping JS-side is exact, not an approximation. A hit costs one Map lookup
+   * and crosses nothing; a miss pays one encode plus one crossing, once per
+   * distinct string rather than once per row.
+   */
+  const internCaches = new WeakMap<ThreadSpanBufferBinding, Map<string, number>>();
+  const internStats = { hits: 0, misses: 0 };
+
   const intern = (binding: ThreadSpanBufferBinding, text: string): number => {
+    let cache = internCaches.get(binding);
+    if (cache === undefined) {
+      cache = new Map<string, number>();
+      internCaches.set(binding, cache);
+    }
+    const cached = cache.get(text);
+    if (cached !== undefined) {
+      internStats.hits += 1;
+      return cached;
+    }
+    internStats.misses += 1;
     const payload = writeUtf8(text);
     const id = binding.intern(payload.ptr, payload.len);
     if (id === 0) throw new Error('thread span buffer intern failed');
+    cache.set(text, id);
     return id;
   };
 
@@ -159,6 +193,7 @@ export async function createThreadSpanBufferRuntime(options?: {
     exports,
     writeUtf8,
     intern,
+    internStats,
     createBinding,
     readUtf8,
     rowCount: (binding) => exports.thread_span_buffer_row_count(binding.handle),
