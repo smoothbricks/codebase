@@ -12,8 +12,6 @@ import { defineLogSchema } from '../src/lib/schema/defineLogSchema.js';
 import { ThreadBufferStrategy } from '../src/lib/ThreadBufferStrategy.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
-import type { AnySpanBuffer } from '../src/lib/types.js';
-import { requireThreadSpanView } from '../src/lib/wasm/threadSpanView.js';
 
 const schema = defineLogSchema({ n: S.number() });
 const context = defineOpContext({ logSchema: schema });
