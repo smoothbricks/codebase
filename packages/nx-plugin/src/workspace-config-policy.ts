@@ -186,38 +186,34 @@ function validateBuildTargetDefault(
   if (build?.cache !== true) {
     issues.push({ path: nxJsonPath, message: 'targetDefaults.build.cache must be true' });
   }
-  // dependsOn is owned by the inference plugin: the inferred aggregate carries
-  // the output families PLUS this host's platform-suffixed binary targets, and
-  // Nx gives targetDefaults precedence over inferred values — a static list
-  // here would clobber the host-aware edge on every project.
-  if (build !== null && 'dependsOn' in build) {
-    issues.push({
-      path: nxJsonPath,
-      message: 'targetDefaults.build.dependsOn must not be set; @smoothbricks/nx-plugin infers build dependencies',
-    });
+  // dependsOn and outputs are both owned by the inference plugin, and Nx gives
+  // targetDefaults precedence over inferred values, so anything set here lands
+  // on every project regardless of what inference knows about that project.
+  //
+  // dependsOn: the inferred aggregate carries the output families PLUS this
+  // host's platform-suffixed binary targets; a static list here would clobber
+  // the host-aware edge.
+  //
+  // outputs: `build` is an `nx:noop` aggregate that runs no command and writes
+  // no file — every artifact under dist belongs to the concrete target that
+  // emitted it. A workspace-wide `{projectRoot}/dist` makes the aggregate claim
+  // its children's trees, which caches those bytes a second time under the
+  // aggregate's hash and, worse, makes `github-ci nx-run-many
+  // --collect-outputs` attribute to `build` every file that happens to sit
+  // under dist: artifacts of platform targets the collect deliberately
+  // excluded, and stale artifacts of a target that did not run at all. The
+  // publish workflow then applies two collected trees that both claim the same
+  // platform binary and `apply-outputs` rejects the overlap. A project whose
+  // `build` genuinely emits files declares its own outputs in package.json,
+  // where the claim is scoped to the project that can honour it.
+  for (const property of ['dependsOn', 'outputs'] as const) {
+    if (build !== null && property in build) {
+      issues.push({
+        path: nxJsonPath,
+        message: `targetDefaults.build.${property} must not be set; @smoothbricks/nx-plugin infers the build aggregate`,
+      });
+    }
   }
-  const outputs = build?.outputs;
-  if (!isValidBuildOutputs(outputs)) {
-    issues.push({
-      path: nxJsonPath,
-      message:
-        'targetDefaults.build.outputs must contain "{projectRoot}/dist" and only "{projectRoot}/dist-<suffix>" siblings (e.g. "{projectRoot}/dist-node")',
-    });
-  }
-}
-
-/**
- * Build outputs must include the canonical dist tree; additional project-root
- * dist siblings (dist-node, dist-test, …) are legitimate secondary outputs a
- * repo may aggregate into `build` — the policy pins outputs under the project
- * root's dist family, not the exact array.
- */
-function isValidBuildOutputs(outputs: unknown): outputs is string[] {
-  return (
-    Array.isArray(outputs) &&
-    outputs.includes('{projectRoot}/dist') &&
-    outputs.every((output) => typeof output === 'string' && /^\{projectRoot\}\/dist(-[\w.-]+)?$/.test(output))
-  );
 }
 
 function validateCleanTargetDefault(
@@ -281,14 +277,11 @@ function applyBuildTargetDefault(nxJson: Record<string, unknown>): boolean {
   const targetDefaults = getOrCreateRecord(nxJson, 'targetDefaults');
   const build = getOrCreateRecord(targetDefaults, 'build');
   let changed = setBooleanProperty(build, 'cache', true);
-  // Reset only invalid outputs: valid extra dist siblings (dist-node, …) are a
-  // repo decision the fixer must not clobber.
-  if (!isValidBuildOutputs(build.outputs)) {
-    changed = setStringArrayProperty(build, 'outputs', ['{projectRoot}/dist']) || changed;
-  }
-  if ('dependsOn' in build) {
-    delete build.dependsOn;
-    changed = true;
+  for (const property of ['dependsOn', 'outputs'] as const) {
+    if (property in build) {
+      delete build[property];
+      changed = true;
+    }
   }
   return changed;
 }

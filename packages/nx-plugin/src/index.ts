@@ -685,6 +685,16 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     }
   }
 
+  // No `outputs`, deliberately: this aggregate runs no command, so every file
+  // under dist belongs to the concrete target that emitted it. Claiming
+  // `{projectRoot}/dist` here would cache the children's bytes a second time
+  // under the aggregate's hash, and would make `smoo github-ci nx-run-many
+  // --collect-outputs` attribute to `build` whatever sits under dist — including
+  // platform-target artifacts the collect excludes on purpose and stale
+  // artifacts of targets that never ran. Two collected trees then claim one
+  // binary and `apply-outputs` rejects the overlap. `lint` and `test` are
+  // aggregates on the same terms. Same reason nx.json must not put `outputs` in
+  // targetDefaults.build (see validateBuildTargetDefault).
   if (hasOrdinaryBuildOutputTarget) {
     targets.build = {
       executor: 'nx:noop',
