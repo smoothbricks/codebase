@@ -4,6 +4,10 @@
 //! parent and a parent that is a symlink. These cases are constructed here rather than
 //! inferred from the happy-path fixture.
 
+#[cfg(target_os = "linux")]
+#[path = "control_parent_probe/linux.rs"]
+mod linux;
+
 use std::{
     io,
     net::Ipv4Addr,
@@ -88,7 +92,7 @@ fn probe_config() -> GatewayConfig {
         std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o700))
             .expect("secure probe cache root");
     }
-    GatewayConfig {
+    let config = GatewayConfig {
         timeouts: GatewayTimeouts {
             request_headers: Duration::from_secs(2),
             connect: Duration::from_secs(1),
@@ -101,7 +105,13 @@ fn probe_config() -> GatewayConfig {
         },
         mirror_cache: MirrorCacheConfig::new(cache_root),
         ..GatewayConfig::default()
-    }
+    };
+    #[cfg(target_os = "linux")]
+    let config = GatewayConfig {
+        data_socket_root: Some(linux::socket_root()),
+        ..config
+    };
+    config
 }
 
 fn secure_root(tag: &str) -> std::path::PathBuf {
