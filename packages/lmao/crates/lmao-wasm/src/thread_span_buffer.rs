@@ -14,6 +14,8 @@ const INVALID_INPUT: u8 = 2;
 const UNKNOWN_SPAN: u8 = 3;
 const INVALID_COLUMN: u8 = 4;
 const EXHAUSTED: u8 = 5;
+const MIN_CAPACITY: u32 = 8;
+const MAX_CAPACITY: u32 = 1024;
 
 const SPAN_START: u8 = 1;
 const SPAN_OK: u8 = 2;
@@ -282,7 +284,7 @@ fn decode_trace(ptr: *const u8, len: usize) -> Result<Vec<u8>, u8> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn thread_span_buffer_new(thread_id: u64, capacity: u32) -> u32 {
-    if capacity < 2 {
+    if !capacity.is_power_of_two() || !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
         return 0;
     }
     HANDLES.with(|handles| {
@@ -499,10 +501,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_capacity_without_a_start_and_completion_pair() {
+    fn new_accepts_only_core_capacity_domain() {
         reset_handles();
         assert_eq!(thread_span_buffer_new(7, 0), 0);
         assert_eq!(thread_span_buffer_new(7, 1), 0);
+        assert_eq!(thread_span_buffer_new(7, 12), 0);
+        assert_eq!(thread_span_buffer_new(7, 2048), 0);
+
+        let minimum = thread_span_buffer_new(7, MIN_CAPACITY);
+        assert_ne!(minimum, 0);
+        thread_span_buffer_free(minimum);
+        let maximum = thread_span_buffer_new(7, MAX_CAPACITY);
+        assert_ne!(maximum, 0);
+        thread_span_buffer_free(maximum);
     }
 
     #[test]
