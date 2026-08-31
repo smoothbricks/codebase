@@ -253,6 +253,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // targets are declared package-locally, never derived from crate metadata.
       expect(Object.keys(targets).sort()).toEqual([
         'bench',
+        'cargo-fetch',
         'cargo-lint',
         'cargo-lint-cross',
         'cargo-sweep',
@@ -269,6 +270,21 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cwd: 'packages/ferris',
       });
       expect(targets['cargo-sweep']?.cache).toBe(false);
+      // Never cached: the download lands in CARGO_HOME, so a cache hit would
+      // report success over a registry that still cannot resolve the lockfile.
+      expect(targets['cargo-fetch']?.cache).toBe(false);
+      expect(targets['cargo-fetch']?.options).toEqual({
+        commands: ['cargo fetch --locked'],
+        cwd: 'packages/ferris',
+        parallel: false,
+      });
+      // Every frozen cargo command carries the edge, not just the head of the
+      // serialization chain: offline cargo fails at resolution, so each one
+      // needs the locked graph downloaded whether or not the chain runs first.
+      for (const name of ['cargo-test-compile', 'cargo-lint', CARGO_CROSS_LINT_TARGET, 'mutation', 'bench']) {
+        expect(targets[name]?.dependsOn).toContain('cargo-fetch');
+      }
+      expect(targets['cargo-sweep']?.dependsOn).toBeUndefined();
       expect(targets['cargo-test-compile']?.executor).toBe('nx:run-commands');
       expect(targets['cargo-test-compile']?.options).toMatchObject({
         command: 'cargo --frozen test --workspace --no-run',
@@ -276,8 +292,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets['cargo-test']?.executor).toBe('nx:noop');
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
-      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-test-compile']);
-      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-test-ferris-core']);
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-ferris-core']);
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
         /^cargo --frozen nextest run --package ferris-core --user-config-file none --config-file /,
       );
@@ -331,8 +347,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         workspace: false,
         packages: ['ferris-wasm'],
       });
-      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-test-compile']);
-      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-test-ferris-core']);
+      expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
+      expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-ferris-core']);
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
     } finally {
       await workspace.cleanup();
@@ -366,7 +382,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-wasm']).toMatchObject({
         executor: 'nx:run-commands',
         cache: true,
-        dependsOn: ['^build'],
+        dependsOn: ['cargo-fetch', '^build'],
         inputs: [
           '{projectRoot}/**/*.rs',
           '{projectRoot}/**/Cargo.toml',
@@ -387,6 +403,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           cwd: 'packages/git-do',
           parallel: false,
         },
+      });
+      // A wasm-bindgen crate in a nested Cargo workspace still needs its locked
+      // graph downloaded, and the project root is not a member of it, so the
+      // fetch names the crate manifest instead of relying on cwd.
+      expect(targets['cargo-fetch']?.options).toEqual({
+        commands: ['cargo fetch --locked --manifest-path crates/git-do/Cargo.toml'],
+        cwd: 'packages/git-do',
+        parallel: false,
       });
       expect(targets['tsc-js']?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
       expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
@@ -536,7 +560,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         },
       });
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
-      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['napi-debug']);
+      // cargo-fetch survives the napi-debug re-route: the per-crate runner is
+      // itself a frozen cargo command, so its precondition is its own edge and
+      // not something it inherits from cargo-test-compile's position.
+      expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['cargo-fetch', 'napi-debug']);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
         /^cargo --frozen nextest run --package cowshed-napi --user-config-file none --config-file /,
       );
@@ -675,7 +702,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const cargoTestCompile = resolveDeclaredOverInferred(targets, declared, 'cargo-test-compile');
       expect(cargoTestCompile?.executor).toBe('nx:run-commands');
+      // A replacing array drops every inferred edge, cargo-fetch included: the
+      // package now owns ordering the locked fetch ahead of its frozen compile.
       expect(cargoTestCompile?.dependsOn).toEqual(['cargo-wasm']);
+      expect(targets['cargo-test-compile']?.dependsOn).toEqual(['cargo-fetch']);
       expect(cargoTestCompile?.options).toMatchObject({
         command: 'cargo --frozen test --workspace --no-run',
       });
@@ -719,7 +749,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The spread expands exactly once, against the single inferred base this
       // plugin emits — re-implementing the overlay here would double it.
       const cargoTest = resolveDeclaredOverInferred(targets, declared, 'cargo-test');
-      expect(cargoTest?.dependsOn).toEqual(['cargo-test-compile', 'cargo-wasm']);
+      expect(cargoTest?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile', 'cargo-wasm']);
       expect(cargoTest?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
     } finally {
       await workspace.cleanup();
