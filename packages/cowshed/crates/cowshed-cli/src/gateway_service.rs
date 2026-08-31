@@ -179,6 +179,14 @@ where
     daemon.drain().await
 }
 
+/// How long to wait for `launchctl bootout` to actually finish.
+///
+/// launchd tears a service down asynchronously. Five seconds is generous for a process that has
+/// already been sent its termination signal and short enough that a genuinely wedged agent is
+/// reported rather than waited on.
+const BOOTOUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const BOOTOUT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 fn launch_agent_is_loaded<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     uid: u32,
@@ -229,6 +237,18 @@ where
     Ok(())
 }
 
+/// Boot the agent out and wait until launchd agrees it is gone.
+///
+/// The wait is the point. `launchctl bootout` returns before the service has finished tearing down,
+/// so a caller that immediately re-reads the load state can still see it loaded and take the
+/// "already loaded, kickstart it" branch — where `launchctl kickstart` answers 37, "operation
+/// already in progress", because the bootout it raced is still running. Observed twice on this
+/// host: a `setup` run failed on exactly that 37 and left the gateway agent unloaded, because the
+/// bootout had in fact succeeded.
+///
+/// Bounded and then given up on: an agent that will not leave the loaded state within the deadline
+/// is a launchd problem this function cannot fix, and returning the bootout's own error is more
+/// use than blocking. `Ok` when launchd never had it loaded, which is the common case.
 pub fn deactivate_launch_agent<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     uid: u32,
@@ -237,14 +257,32 @@ pub fn deactivate_launch_agent<F, C>(
 where
     C: LaunchctlCommand,
 {
-    if launch_agent_is_loaded(executor, uid, target)?
-        && let Err(error) =
-            executor.execute_control(&crate::launchd::ControlPlan::bootout(uid, target))
-        && launch_agent_is_loaded(executor, uid, target)?
-    {
-        return Err(launchd_error(error));
+    if !launch_agent_is_loaded(executor, uid, target)? {
+        return Ok(());
     }
-    Ok(())
+    let booted_out = executor.execute_control(&crate::launchd::ControlPlan::bootout(uid, target));
+    let deadline = std::time::Instant::now() + BOOTOUT_DEADLINE;
+    loop {
+        if !launch_agent_is_loaded(executor, uid, target)? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            // Still loaded after the deadline. If the bootout itself reported a failure, that is
+            // the honest explanation; otherwise say what was observed rather than inventing a cause.
+            return Err(match booted_out {
+                Err(error) => launchd_error(error),
+                Ok(_) => CowshedError::environment_missing(
+                    format!(
+                        "{} was booted out but launchd still reports it loaded after {}s",
+                        target.label(),
+                        BOOTOUT_DEADLINE.as_secs()
+                    ),
+                    kickstart_hint(uid, target.label()),
+                ),
+            });
+        }
+        std::thread::sleep(BOOTOUT_POLL_INTERVAL);
+    }
 }
 
 pub async fn dispatch<W, E>(
@@ -838,9 +876,26 @@ where
                     &executable,
                     Path::new("restored after a failed activation"),
                 );
+                // Restoring the bytes is not enough: the failure that brought us here is a failed
+                // activation, so the agent is very likely unloaded, and a host with the right
+                // binary and no supervisor is still degraded. The plist is unchanged and names the
+                // restored path, so `NoChange` bootstraps it if launchd no longer holds it.
+                let reloaded = match activate_launch_agent(
+                    executor,
+                    effective_uid(),
+                    spec.target(),
+                    InstallOutcome::NoChange,
+                ) {
+                    Ok(()) => format!("{} is loaded again", spec.label()),
+                    Err(reload) => format!(
+                        "{} could NOT be reloaded ({})",
+                        spec.label(),
+                        reload.message
+                    ),
+                };
                 CowshedError::new(
                     error.code,
-                    format!("{}; {rollback}", error.message),
+                    format!("{}; {rollback}; {reloaded}", error.message),
                     error.hint,
                 )
             }

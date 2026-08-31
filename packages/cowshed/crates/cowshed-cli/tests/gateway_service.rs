@@ -138,16 +138,24 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
 /// has to be booted out and bootstrapped again or a later kickstart restarts the old program —
 /// the path the rewrite exists to stop naming. Bootstrap starts `RunAtLoad`; kickstart after
 /// that is a race (launchctl 37).
+///
+/// The launchctl sequence is print(loaded), bootout, print(gone) to confirm the bootout actually
+/// finished, print(gone) again from the activation, then bootstrap. That confirming probe is what
+/// stops the caller taking the kickstart branch against a teardown still in progress.
 #[test]
 fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
-    let command = RecordingLaunchctl::new([
-        Ok(LaunchctlOutput::success()),
-        Ok(LaunchctlOutput::success()),
+    let not_loaded = || {
         Ok(LaunchctlOutput {
             status: CommandStatus::ExitCode(3),
             stdout: Vec::new(),
             stderr: b"not loaded".to_vec(),
-        }),
+        })
+    };
+    let command = RecordingLaunchctl::new([
+        Ok(LaunchctlOutput::success()),
+        Ok(LaunchctlOutput::success()),
+        not_loaded(),
+        not_loaded(),
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
@@ -165,7 +173,7 @@ fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
             .iter()
             .map(|argv| argv[0].to_str().expect("utf-8 argv"))
             .collect::<Vec<_>>(),
-        ["print", "bootout", "print", "bootstrap"]
+        ["print", "bootout", "print", "print", "bootstrap"]
     );
 }
 
