@@ -1,0 +1,191 @@
+/**
+ * Opaque-handle ABI for the shared per-thread span buffer.
+ *
+ * WASM uses a numeric slot token rather than exposing a Rust pointer to JS. The
+ * binding owns the token and forwards row writes without recreating a SpanBuffer
+ * or an Arrow converter in TypeScript. Dynamic text is addressed in the WASM
+ * linear memory; `intern` turns it into a stable handle-local vocabulary id.
+ */
+
+import { isRecord } from '@smoothbricks/validation';
+
+/** Numeric token returned by `thread_span_buffer_new`; zero is never a handle. */
+export type ThreadSpanBufferHandle = number;
+
+/** Successful status returned by fallible row-write exports. */
+export const THREAD_SPAN_BUFFER_OK = 0;
+
+/** Raw exports supplied by `allocator.wasm` for the shared-buffer ABI. */
+export interface ThreadSpanBufferWasmExports {
+  thread_span_buffer_new(threadId: bigint, capacity: number): ThreadSpanBufferHandle;
+  thread_span_buffer_free(handle: ThreadSpanBufferHandle): void;
+  thread_span_buffer_open_span(
+    handle: ThreadSpanBufferHandle,
+    tracePtr: number,
+    traceLen: number,
+    parentThreadId: bigint,
+    parentSpanId: number,
+    nameVocab: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  thread_span_buffer_open_span_dynamic(
+    handle: ThreadSpanBufferHandle,
+    tracePtr: number,
+    traceLen: number,
+    parentThreadId: bigint,
+    parentSpanId: number,
+    namePtr: number,
+    nameLen: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  thread_span_buffer_end_ok(handle: ThreadSpanBufferHandle, spanId: number, timestamp: bigint): number;
+  thread_span_buffer_end_err(handle: ThreadSpanBufferHandle, spanId: number, timestamp: bigint): number;
+  thread_span_buffer_append_log(
+    handle: ThreadSpanBufferHandle,
+    spanId: number,
+    entryType: number,
+    messageVocab: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  thread_span_buffer_append_log_dynamic(
+    handle: ThreadSpanBufferHandle,
+    spanId: number,
+    entryType: number,
+    messagePtr: number,
+    messageLen: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  thread_span_buffer_write_attr(
+    handle: ThreadSpanBufferHandle,
+    row: number,
+    ordinal: number,
+    kind: number,
+    value: bigint,
+  ): number;
+  thread_span_buffer_write_tag(
+    handle: ThreadSpanBufferHandle,
+    spanId: number,
+    ordinal: number,
+    kind: number,
+    value: bigint,
+  ): number;
+  thread_span_buffer_set_scope(
+    handle: ThreadSpanBufferHandle,
+    spanId: number,
+    ordinal: number,
+    kind: number,
+    value: bigint,
+  ): number;
+  thread_span_buffer_intern(handle: ThreadSpanBufferHandle, ptr: number, len: number): number;
+}
+
+/** A handle-bound writer. Construction is cold; each method is one ABI call. */
+export interface ThreadSpanBufferBinding {
+  readonly handle: ThreadSpanBufferHandle;
+  free(): void;
+  openSpan(
+    tracePtr: number,
+    traceLen: number,
+    parentThreadId: bigint,
+    parentSpanId: number,
+    nameVocab: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  openSpanDynamic(
+    tracePtr: number,
+    traceLen: number,
+    parentThreadId: bigint,
+    parentSpanId: number,
+    namePtr: number,
+    nameLen: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  endOk(spanId: number, timestamp: bigint): number;
+  endErr(spanId: number, timestamp: bigint): number;
+  appendLog(spanId: number, entryType: number, messageVocab: number, timestamp: bigint, line: number): bigint;
+  appendLogDynamic(
+    spanId: number,
+    entryType: number,
+    messagePtr: number,
+    messageLen: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  writeAttr(row: number, ordinal: number, kind: number, value: bigint): number;
+  writeTag(spanId: number, ordinal: number, kind: number, value: bigint): number;
+  setScope(spanId: number, ordinal: number, kind: number, value: bigint): number;
+  intern(ptr: number, len: number): number;
+}
+
+/** Validate the complete batch ABI before wiring it into a WASM instance. */
+export function isThreadSpanBufferWasmExports(value: unknown): value is ThreadSpanBufferWasmExports {
+  if (!isRecord(value)) return false;
+  return (
+    typeof Reflect.get(value, 'thread_span_buffer_new') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_free') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_open_span') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_open_span_dynamic') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_end_ok') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_end_err') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_append_log') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_append_log_dynamic') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_write_attr') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_write_tag') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_set_scope') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_intern') === 'function'
+  );
+}
+
+/** Bind one opaque handle without copying or adapting the row layout. */
+export function bindThreadSpanBuffer(
+  value: unknown,
+  handle: ThreadSpanBufferHandle,
+): ThreadSpanBufferBinding | undefined {
+  if (!isThreadSpanBufferWasmExports(value)) return undefined;
+  return {
+    handle,
+    free: () => value.thread_span_buffer_free(handle),
+    openSpan: (tracePtr, traceLen, parentThreadId, parentSpanId, nameVocab, timestamp, line) =>
+      value.thread_span_buffer_open_span(
+        handle,
+        tracePtr,
+        traceLen,
+        parentThreadId,
+        parentSpanId,
+        nameVocab,
+        timestamp,
+        line,
+      ),
+    openSpanDynamic: (tracePtr, traceLen, parentThreadId, parentSpanId, namePtr, nameLen, timestamp, line) =>
+      value.thread_span_buffer_open_span_dynamic(
+        handle,
+        tracePtr,
+        traceLen,
+        parentThreadId,
+        parentSpanId,
+        namePtr,
+        nameLen,
+        timestamp,
+        line,
+      ),
+    endOk: (spanId, timestamp) => value.thread_span_buffer_end_ok(handle, spanId, timestamp),
+    endErr: (spanId, timestamp) => value.thread_span_buffer_end_err(handle, spanId, timestamp),
+    appendLog: (spanId, entryType, messageVocab, timestamp, line) =>
+      value.thread_span_buffer_append_log(handle, spanId, entryType, messageVocab, timestamp, line),
+    appendLogDynamic: (spanId, entryType, messagePtr, messageLen, timestamp, line) =>
+      value.thread_span_buffer_append_log_dynamic(handle, spanId, entryType, messagePtr, messageLen, timestamp, line),
+    writeAttr: (row, ordinal, kind, attributeValue) =>
+      value.thread_span_buffer_write_attr(handle, row, ordinal, kind, attributeValue),
+    writeTag: (spanId, ordinal, kind, attributeValue) =>
+      value.thread_span_buffer_write_tag(handle, spanId, ordinal, kind, attributeValue),
+    setScope: (spanId, ordinal, kind, attributeValue) =>
+      value.thread_span_buffer_set_scope(handle, spanId, ordinal, kind, attributeValue),
+    intern: (ptr, len) => value.thread_span_buffer_intern(handle, ptr, len),
+  };
+}
