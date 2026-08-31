@@ -4,13 +4,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
+import type { CreateNodesContextV2, CreateNodesV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
-import { createNodesV2 } from './index.js';
+import { createNodesV2, createNodesV2ForPlatform } from './index.js';
 import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
 
 const [, inferTargets] = createNodesV2;
@@ -507,9 +507,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
               'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
           },
         });
-        expect(targets['cargo-napi']?.options?.env).toEqual(
-          process.platform === 'linux' ? { CC: 'cc', CXX: 'c++' } : undefined,
-        );
       } else {
         expect(targets['cargo-napi']).toBeUndefined();
       }
@@ -539,6 +536,37 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/linux-x64-gnu',
         env: { TARGET_CC: 'clang', TARGET_CXX: 'clang++' },
       });
+
+      // Exercise both host branches explicitly: this suite usually runs on
+      // Darwin, but Linux's native compiler selection is the contract at risk.
+      const linuxX64Targets = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('linux', 'x64'),
+      );
+      expect(linuxX64Targets['napi-x64-linux']?.options?.command).not.toContain('--use-napi-cross');
+      expect(linuxX64Targets['napi-x64-linux']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
+      expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toBeUndefined();
+      expect(linuxX64Targets['napi-toolchain-x64-linux']).toBeUndefined();
+      expect(linuxX64Targets['napi-arm64-linux']?.options?.command).toContain('--use-napi-cross');
+      expect(linuxX64Targets['napi-arm64-linux']?.options?.env).toEqual({
+        TARGET_CC: 'clang',
+        TARGET_CXX: 'clang++',
+      });
+      expect(linuxX64Targets['napi-debug']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
+
+      const darwinArm64Targets = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('darwin', 'arm64'),
+      );
+      expect(darwinArm64Targets['napi-x64-linux']?.options?.command).toContain('--use-napi-cross');
+      expect(darwinArm64Targets['napi-x64-linux']?.options?.env).toEqual({
+        TARGET_CC: 'clang',
+        TARGET_CXX: 'clang++',
+      });
+      expect(darwinArm64Targets['napi-x64-linux']?.dependsOn).toEqual(['napi-toolchain-x64-linux']);
+      expect(darwinArm64Targets['napi-debug']?.options?.env).toBeUndefined();
       // The aggregate build pulls in exactly the HOST's platform-suffixed
       // targets (publish still owns foreign platforms).
       const hostNapiTargets = [
@@ -579,9 +607,6 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
             'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir .cache/native-debug',
         },
       });
-      expect(targets['napi-debug']?.options?.env).toEqual(
-        process.platform === 'linux' ? { CC: 'cc', CXX: 'c++' } : undefined,
-      );
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
       // cargo-fetch survives the napi-debug re-route: the per-crate runner is
       // itself a frozen cargo command, so its precondition is its own edge and
@@ -897,16 +922,22 @@ interface WorkspaceFixture {
   cleanup(): Promise<void>;
 }
 
-async function inferProject(workspace: WorkspaceFixture, packageJsonPath: string) {
-  const result = await inferTargets([packageJsonPath], undefined, workspace.context);
+async function inferProject(
+  workspace: WorkspaceFixture,
+  packageJsonPath: string,
+  createNodes: CreateNodesV2 = createNodesV2,
+) {
+  const [, infer] = createNodes;
+  const result = await infer([packageJsonPath], undefined, workspace.context);
   return result[0]?.[1].projects?.[dirname(packageJsonPath)];
 }
 
 async function inferProjectTargets(
   workspace: WorkspaceFixture,
   packageJsonPath: string,
+  createNodes?: CreateNodesV2,
 ): Promise<Record<string, TargetConfiguration>> {
-  return (await inferProject(workspace, packageJsonPath))?.targets ?? {};
+  return (await inferProject(workspace, packageJsonPath, createNodes))?.targets ?? {};
 }
 
 /**
