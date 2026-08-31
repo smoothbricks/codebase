@@ -1,0 +1,248 @@
+[
+  {
+    "name": "greeting-42-declared-string",
+    "schema": { "kind": "object", "fields": { "greeting": { "kind": "string" } } },
+    "value": { "greeting": 42 },
+    "verdict": "refuse",
+    "path": "value.greeting",
+    "expected": "string",
+    "observed": "number"
+  },
+  {
+    "name": "string-wrong-number",
+    "schema": { "kind": "string" },
+    "value": 1,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "string",
+    "observed": "number"
+  },
+  {
+    "name": "number-wrong-boolean",
+    "schema": { "kind": "number" },
+    "value": true,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "number",
+    "observed": "boolean"
+  },
+  {
+    "name": "boolean-wrong-string",
+    "schema": { "kind": "boolean" },
+    "value": "true",
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "boolean",
+    "observed": "string"
+  },
+  {
+    "name": "binary-wrong-string",
+    "schema": { "kind": "binary" },
+    "value": "bytes",
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "binary",
+    "observed": "string"
+  },
+  {
+    "name": "bigint-wrong-number",
+    "schema": { "kind": "bigint" },
+    "value": 1,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "bigint",
+    "observed": "number"
+  },
+  {
+    "name": "i32-wrong-boolean",
+    "schema": { "kind": "i32" },
+    "value": true,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "i32",
+    "observed": "boolean"
+  },
+  {
+    "name": "u32-wrong-string",
+    "schema": { "kind": "u32" },
+    "value": "1",
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "u32",
+    "observed": "string"
+  },
+  {
+    "name": "array-wrong-object",
+    "schema": { "kind": "array", "item": { "kind": "string" } },
+    "value": {},
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "array",
+    "observed": "object"
+  },
+  {
+    "name": "object-wrong-array",
+    "schema": { "kind": "object", "fields": {} },
+    "value": [],
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "object",
+    "observed": "array"
+  },
+  {
+    "name": "union-no-exact-variant",
+    "schema": { "kind": "union", "variants": [{ "kind": "string" }, { "kind": "number" }] },
+    "value": true,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "exactly one union variant",
+    "observed": "boolean"
+  },
+  {
+    "name": "map-wrong-array",
+    "schema": { "kind": "map", "key": { "kind": "string" }, "value": { "kind": "i32" } },
+    "value": [],
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "map",
+    "observed": "array"
+  },
+  {
+    "name": "record-wrong-array",
+    "schema": { "kind": "record", "value": { "kind": "string" } },
+    "value": [],
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "record",
+    "observed": "array"
+  },
+  {
+    "name": "optional-present-null-is-not-nullable",
+    "schema": { "kind": "optional", "value": { "kind": "string" } },
+    "value": null,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "string",
+    "observed": "null"
+  },
+  {
+    "name": "nullable-wrong-number",
+    "schema": { "kind": "nullable", "value": { "kind": "string" } },
+    "value": 1,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "string",
+    "observed": "number"
+  },
+  {
+    "name": "enum-membership",
+    "schema": { "kind": "enum", "variants": ["draft", "sent"] },
+    "value": "queued",
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "enum {draft, sent}",
+    "observed": "string"
+  },
+  {
+    "name": "missing-required",
+    "schema": { "kind": "object", "fields": { "greeting": { "kind": "string" } } },
+    "value": {},
+    "verdict": "refuse",
+    "path": "value.greeting",
+    "expected": "string",
+    "observed": "absent"
+  },
+  {
+    "name": "missing-optional-ok",
+    "schema": { "kind": "object", "fields": { "greeting": { "kind": "optional", "value": { "kind": "string" } } } },
+    "value": {},
+    "verdict": "accept"
+  },
+  {
+    "name": "unknown-closed-teaching",
+    "schema": { "kind": "object", "fields": { "greeting": { "kind": "string" } } },
+    "value": { "greeting": "hello", "bogus_field": true },
+    "verdict": "refuse",
+    "path": "value.bogus_field",
+    "expected": "not declared (declared: greeting); declare the enclosing object open — S.object({…}, { open: true }) — to capture undeclared keys into value.$undeclared",
+    "observed": "undeclared"
+  },
+  {
+    "name": "unknown-open-root-capture",
+    "schema": { "kind": "object", "fields": { "greeting": { "kind": "string" } }, "open": true },
+    "value": { "greeting": "hello", "bogus_field": true },
+    "verdict": "capture",
+    "capture_key": "bogus_field"
+  },
+  {
+    "name": "unknown-nested-open-capture",
+    "schema": {
+      "kind": "object",
+      "fields": { "user": { "kind": "object", "fields": { "id": { "kind": "string" } }, "open": true } }
+    },
+    "value": { "user": { "id": "u1", "nickname": "n" } },
+    "verdict": "capture",
+    "capture_key": "user.nickname"
+  },
+  {
+    "name": "dot-key-escaping",
+    "schema": { "kind": "object", "fields": {} },
+    "value": { "literal.dot": 1 },
+    "verdict": "refuse",
+    "path": "value.literal%2Edot",
+    "expected": "not declared (declared: ); declare the enclosing object open — S.object({…}, { open: true }) — to capture undeclared keys into value.$undeclared",
+    "observed": "undeclared"
+  },
+  {
+    "name": "percent-key-escaping",
+    "schema": { "kind": "object", "fields": {} },
+    "value": { "a%b": 1 },
+    "verdict": "refuse",
+    "path": "value.a%25b",
+    "expected": "not declared (declared: ); declare the enclosing object open — S.object({…}, { open: true }) — to capture undeclared keys into value.$undeclared",
+    "observed": "undeclared"
+  },
+  { "name": "i32-min-edge", "schema": { "kind": "i32" }, "value": -2147483648, "verdict": "accept" },
+  { "name": "i32-max-edge", "schema": { "kind": "i32" }, "value": 2147483647, "verdict": "accept" },
+  {
+    "name": "i32-bound-overflow",
+    "schema": { "kind": "i32" },
+    "value": 2147483648,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "i32",
+    "observed": "number"
+  },
+  { "name": "u32-zero-edge", "schema": { "kind": "u32" }, "value": 0, "verdict": "accept" },
+  { "name": "u32-max-edge", "schema": { "kind": "u32" }, "value": 4294967295, "verdict": "accept" },
+  {
+    "name": "u32-bound-overflow",
+    "schema": { "kind": "u32" },
+    "value": 4294967296,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "u32",
+    "observed": "number"
+  },
+  {
+    "name": "enum-accepted",
+    "schema": { "kind": "enum", "variants": ["draft", "sent"] },
+    "value": "sent",
+    "verdict": "accept"
+  },
+  {
+    "name": "record-passthrough",
+    "schema": { "kind": "record", "value": { "kind": "string" } },
+    "value": { "first": "a", "second": "b" },
+    "verdict": "accept"
+  },
+  {
+    "name": "finite-number-bound",
+    "schema": { "kind": "number" },
+    "value": 1e9999,
+    "verdict": "refuse",
+    "path": "value",
+    "expected": "finite number",
+    "observed": "number"
+  }
+]
