@@ -400,6 +400,36 @@ describe('collected Nx outputs', () => {
     });
   });
 
+  // The publish workflow collects `build` in one step and the platform targets
+  // in another, so a target whose declared output tree swallows a sibling's
+  // tree only collides once the two artifacts meet at apply time. Neither
+  // collect can see the other, so this refusal is the only thing standing
+  // between two producers of one path and a silently overwritten binary.
+  it('rejects one path claimed by two targets collected into separate trees', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject, temp }) => {
+      outputProject.targets = ['aggregate-linux', 'binary-linux'];
+      outputProject.targetOutputs = new Map([
+        ['aggregate-linux', ['{projectRoot}/dist']],
+        ['binary-linux', ['{projectRoot}/dist/bin']],
+      ]);
+      await mkdir(join(root, 'packages/app/dist/bin'), { recursive: true });
+      await writeFile(join(root, 'packages/app/dist/bin/app'), 'one binary, two claimants');
+
+      const platformArtifact = join(temp, 'artifact-platform');
+      await collectNxOutputs(root, artifact, [{ target: 'aggregate-linux', projects: [outputProject] }], SOURCE_SHA);
+      await collectNxOutputs(
+        root,
+        platformArtifact,
+        [{ target: 'binary-linux', projects: [outputProject] }],
+        SOURCE_SHA,
+      );
+
+      await expect(
+        applyCollectedOutputs(root, [artifact, platformArtifact], SOURCE_SHA, [outputProject]),
+      ).rejects.toThrow('Output collision across collected trees');
+    });
+  });
+
   it('collects declared files and applies a verified overlay', async () => {
     await withOutputFixture(async ({ root, artifact, outputProject }) => {
       const source = join(root, 'packages/app/dist/result.bin');
