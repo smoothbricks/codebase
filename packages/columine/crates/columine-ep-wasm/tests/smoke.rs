@@ -423,6 +423,8 @@ fn creation_failures_name_their_cause() {
         CreateFailure::SchemaNullability as u32
     );
 
+    // Two names for a four-field schema.
+    let short_names = b"id\0type\0";
     assert_eq!(
         unsafe {
             ep_create_with_schema_and_names(
@@ -431,8 +433,8 @@ fn creation_failures_name_their_cause() {
                 SCHEMA_BYTES.len() as u32,
                 meta_ptr,
                 4,
-                b"id\0type\0".as_ptr(),
-                8,
+                short_names.as_ptr(),
+                short_names.len() as u32,
             )
         },
         CreateFailure::SchemaFieldNames as u32
