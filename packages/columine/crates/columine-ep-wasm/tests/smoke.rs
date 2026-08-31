@@ -392,9 +392,12 @@ fn creation_failures_name_their_cause() {
         CreateFailure::SchemaFieldCount as u32
     );
 
-    // A physical tag byte outside the ArrowType enum.
+    // A physical tag byte outside the ArrowType enum. Derived from the table
+    // rather than typed: this used to be a literal 9, which stopped being an
+    // invalid tag the moment the plane set grew past it and turned this into a
+    // test of UInt8 instead.
     let mut bad_tags = [0u8; 16];
-    bad_tags[0] = 9;
+    bad_tags[0] = ArrowType::ALL.len() as u8;
     assert_eq!(
         create(&SCHEMA_BYTES, bad_tags.as_ptr(), 4),
         CreateFailure::SchemaFieldMetadata as u32
