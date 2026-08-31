@@ -584,6 +584,64 @@ describe('cargo-test reachability policy', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('counts every shard of a sharded crate as covering that crate exactly once', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cargo-reach-shard-'));
+    try {
+      await writeJson(join(root, 'package.json'), { name: '@scope/root', private: true, workspaces: ['packages/*'] });
+      await writeJson(join(root, 'packages/rusty/package.json'), { name: 'rusty', nx: { name: 'rusty' } });
+      await mkdir(join(root, 'packages/rusty/crates/core'), { recursive: true });
+      await writeFile(join(root, 'packages/rusty/Cargo.toml'), '[workspace]\nmembers = ["crates/core"]\n');
+      await writeFile(
+        join(root, 'packages/rusty/crates/core/Cargo.toml'),
+        '[package]\nname = "rusty-core"\n\n[package.metadata.smoothbricks.test]\nshards = 2\n',
+      );
+
+      const sharded: ResolvedProjectTargets = {
+        root: 'packages/rusty',
+        targets: new Set([
+          'test',
+          'cargo-test',
+          'cargo-test-compile',
+          'cargo-test-rusty-core-shard1',
+          'cargo-test-rusty-core-shard2',
+        ]),
+        targetDependencies: new Map([
+          ['test', ['cargo-test']],
+          ['cargo-test', ['cargo-test-rusty-core-shard1', 'cargo-test-rusty-core-shard2']],
+          ['cargo-test-rusty-core-shard1', ['cargo-test-compile']],
+          ['cargo-test-rusty-core-shard2', ['cargo-test-rusty-core-shard1']],
+        ]),
+        targetExecutors: new Map([
+          ['test', 'nx:noop'],
+          ['cargo-test', 'nx:noop'],
+          ['cargo-test-compile', 'nx:run-commands'],
+          ['cargo-test-rusty-core-shard1', BOUNDED_TEST_EXECUTOR],
+          ['cargo-test-rusty-core-shard2', BOUNDED_TEST_EXECUTOR],
+        ]),
+        targetOptions: new Map<string, Record<string, unknown>>([
+          ['cargo-test-compile', { command: 'cargo --frozen test --workspace --no-run' }],
+          [
+            'cargo-test-rusty-core-shard1',
+            { command: "cargo --frozen nextest run --workspace -E 'package(rusty-core)' --partition hash:1/2" },
+          ],
+          [
+            'cargo-test-rusty-core-shard2',
+            { command: "cargo --frozen nextest run --workspace -E 'package(rusty-core)' --partition hash:2/2" },
+          ],
+        ]),
+      };
+      // Shards collapse to their crate: two targets cover one member without
+      // reading as an extra member the workspace does not have.
+      expect(
+        checkWorkspaceCargoTestReachabilityPolicy(root, {
+          resolvedTargetsByProject: new Map([['rusty', sharded]]),
+        }),
+      ).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 function resolvedAggregateProject(): ResolvedProjectTargets {

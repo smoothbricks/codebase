@@ -39,6 +39,16 @@ Concrete targets come from concrete files:
   bounded window. Those runs are chained so two cargos never share `target/`; `napi-debug` sits on that chain after
   compile. Clippy uses `--target-dir target/cargo-lint` so lint can overlap tests. Workspaces with `cdylib` member
   crates also receive the cacheable `cargo-wasm` output target.
+- A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
+  `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
+  shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
+  and a stale `N` can only make a target slow — never drop a test. Omitting the key means one target, as before.
+- Tests that a `nextest.toml` test-group serializes are lifted out of the hash into `cargo-test-<package>-serial`, and
+  the shards run the complement. A test-group only holds within one nextest run, so leaving grouped tests to the hash
+  would scatter them across shards and dissolve the mutex. The pin is derived by reading the groups back out of
+  `nextest.toml`, so declaring a group there is the whole change. Only a sharded crate gets one — an unsharded crate
+  already runs its whole suite in a single process — and it passes on an empty set, which is the correct answer for a
+  platform where the grouped tests are `cfg`-ed out.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling

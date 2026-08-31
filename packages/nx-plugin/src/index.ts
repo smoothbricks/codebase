@@ -15,11 +15,13 @@ import { parse as parseToml } from 'smol-toml';
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import {
   CARGO_TEST_COMPILE_TARGET,
+  CARGO_TEST_SERIAL_SUFFIX,
   CARGO_TEST_TARGET,
   cargoPackageTestInputs,
   cargoTestPackageTargetName,
   listCargoWorkspacePackages,
   nextestConfigRelPath,
+  serializedTestFilter,
 } from './cargo-workspace.js';
 import {
   CARGO_CROSS_LINT_COMMAND,
@@ -210,15 +212,33 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
 const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.meta.url));
 
 /**
+ * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
+ * gets one per shard plus one for the tests a nextest test-group serializes.
+ *
  * `--workspace -E 'package(X)'` rather than `--package X`. A filterset selects
  * what RUNS; `--package` also re-resolves FEATURES for that crate alone, which
  * fingerprints differently from the `cargo test --workspace --no-run` that
  * `cargo-test-compile` already paid for, so cargo rebuilds the divergent half
  * inside the bounded window. Measured on a hosted 3-core macOS runner that
- * rebuild was 57.9s of a 120s budget — the tests were then killed with 264 of
- * 836 still to run while nothing was wrong with any of them. The two forms
- * select the same tests; only the filterset reuses the compile target's
- * artifacts.
+ * rebuild was 57.9s of a 120s budget — the tests were killed with 264 still to
+ * run while nothing was wrong with them. The two forms select the same tests;
+ * only the filterset reuses the compile target's artifacts.
+ *
+ * A test-group is scoped to one nextest RUN, so sharding would dissolve it:
+ * grouped tests landing in different shards are different processes with no
+ * mutual exclusion. The serialized set is therefore lifted OUT of the hash and
+ * pinned whole to its own target, and the shards run the complement. That makes
+ * the group's coverage a property of the split rather than of how the hash
+ * happened to fall — renaming a test cannot scatter the group.
+ *
+ * The two filtersets are exact complements, so their union is the crate whatever
+ * either one matches; an empty serialized set (every real-APFS test is
+ * `cfg(target_os = "macos")`, so on Linux there are none) costs coverage
+ * nothing, which is why that target may pass having run zero tests.
+ *
+ * Pieces chain rather than fan out, like the crates do: cargo flocks one
+ * `target/`, and chaining keeps even the pinned group from overlapping the
+ * shards on a machine-wide resource.
  */
 async function addPerPackageCargoTestTargets(
   targets: Record<string, TargetConfiguration>,
@@ -231,26 +251,45 @@ async function addPerPackageCargoTestTargets(
     return [];
   }
   const configFile = nextestConfigRelPath(workspaceRoot, projectRoot, PLUGIN_NEXTEST_CONFIG);
+  const serialized = serializedTestFilter(PLUGIN_NEXTEST_CONFIG);
   const packageTargetNames: string[] = [];
   let previous = CARGO_TEST_COMPILE_TARGET;
   for (const pkg of packages) {
-    const targetName = cargoTestPackageTargetName(pkg.name);
-    packageTargetNames.push(targetName);
-    targets[targetName] = {
-      executor: '@smoothbricks/nx-plugin:bounded-exec',
-      cache: true,
-      inputs: await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir),
-      dependsOn: [previous],
-      options: {
-        command: cargoFrozen(
-          `nextest run --workspace -E 'package(${pkg.name})' --user-config-file none --config-file ${configFile}`,
-        ),
-        cwd: projectRoot,
-        timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
-        killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
-      },
+    const inputs = await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir);
+    const sharded = pkg.testShards > 1;
+    const pin = sharded && serialized !== null ? serialized : null;
+    const addTarget = (piece: string | undefined, selector: string, extra: string) => {
+      const targetName = cargoTestPackageTargetName(pkg.name, piece);
+      packageTargetNames.push(targetName);
+      targets[targetName] = {
+        executor: '@smoothbricks/nx-plugin:bounded-exec',
+        cache: true,
+        inputs,
+        dependsOn: [previous],
+        options: {
+          command: cargoFrozen(
+            `nextest run --workspace -E '${selector}'${extra} --user-config-file none --config-file ${configFile}`,
+          ),
+          cwd: projectRoot,
+          timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
+          killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
+        },
+      };
+      previous = targetName;
     };
-    previous = targetName;
+    const shardable = pin === null ? `package(${pkg.name})` : `package(${pkg.name}) and not (${pin})`;
+    for (let index = 1; index <= pkg.testShards; index += 1) {
+      // nextest hashes the test name, so a shard holds the same tests whatever
+      // else the filterset selects and whatever tests are added later.
+      addTarget(
+        sharded ? `shard${index}` : undefined,
+        shardable,
+        sharded ? ` --partition hash:${index}/${pkg.testShards}` : '',
+      );
+    }
+    if (pin !== null) {
+      addTarget(CARGO_TEST_SERIAL_SUFFIX, `package(${pkg.name}) and (${pin})`, ' --no-tests=pass');
+    }
   }
   return packageTargetNames;
 }
