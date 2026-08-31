@@ -294,8 +294,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-ferris-core', 'cargo-test-ferris-wasm']);
       expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
       expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-ferris-core']);
+      // `--workspace -E 'package(...)'`, never `--package`: the filterset picks
+      // the same tests without re-resolving features, so the run reuses what
+      // cargo-test-compile built instead of rebuilding inside the bound.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --package ferris-core --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --workspace -E 'package\(ferris-core\)' --user-config-file none --config-file /,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toEqual([
         '{projectRoot}/Cargo.toml',
@@ -339,13 +342,17 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       const targets = await inferProjectTargets(workspace, 'packages/ferris/package.json');
 
+      // Scoped by filterset over a workspace build: one crate runs, and the
+      // build stays the one cargo-test-compile already paid for.
       expect(cargoPackageSelection(String(targets['cargo-test-ferris-core']?.options?.command ?? ''))).toEqual({
-        workspace: false,
-        packages: ['ferris-core'],
+        workspaceBuild: true,
+        packageFlags: [],
+        filtered: ['ferris-core'],
       });
       expect(cargoPackageSelection(String(targets['cargo-test-ferris-wasm']?.options?.command ?? ''))).toEqual({
-        workspace: false,
-        packages: ['ferris-wasm'],
+        workspaceBuild: true,
+        packageFlags: [],
+        filtered: ['ferris-wasm'],
       });
       expect(targets['cargo-test-ferris-core']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
       expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-ferris-core']);
@@ -565,7 +572,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // not something it inherits from cargo-test-compile's position.
       expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['cargo-fetch', 'napi-debug']);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --package cowshed-napi --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --workspace -E 'package\(cowshed-napi\)' --user-config-file none --config-file /,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -813,21 +820,35 @@ function resolveDeclaredOverInferred(
 }
 
 /**
- * `--workspace` selects every member; `--package` names a crate. Both together
- * is the defect: nextest keeps the workspace set and the package flag does not
- * narrow it. A per-crate target is scoped iff it names exactly one package and
- * does not also select the workspace.
+ * How a cargo test command is scoped to one crate, split into the three facts
+ * that can independently go wrong.
+ *
+ * `--workspace` must be present: it makes the build fingerprint-identical to
+ * `cargo-test-compile`'s, so the bounded run reuses those artifacts. Narrowing
+ * must come from the nextest filterset, which selects what RUNS without
+ * changing what is BUILT. `--package` narrows too, but it re-resolves that
+ * crate's features, diverges from the workspace build, and rebuilds inside the
+ * bounded window — 57.9s of a 120s budget on a hosted 3-core macOS runner — so
+ * its presence is a regression even though it selects the same tests.
  */
-function cargoPackageSelection(command: string): { workspace: boolean; packages: string[] } {
+function cargoPackageSelection(command: string): {
+  workspaceBuild: boolean;
+  packageFlags: string[];
+  filtered: string[];
+} {
   const tokens = command.split(/\s+/);
-  const packages: string[] = [];
+  const packageFlags: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i] === '--package' || tokens[i] === '-p') {
       const name = tokens[i + 1];
       if (name !== undefined && name.length > 0) {
-        packages.push(name);
+        packageFlags.push(name);
       }
     }
   }
-  return { workspace: tokens.includes('--workspace'), packages };
+  return {
+    workspaceBuild: tokens.includes('--workspace'),
+    packageFlags,
+    filtered: [...command.matchAll(/\bpackage\(([^)]+)\)/g)].map((match) => match[1] as string),
+  };
 }
