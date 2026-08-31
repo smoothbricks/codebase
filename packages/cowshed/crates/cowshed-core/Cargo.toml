@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# This crate's 836 tests are 150.9s of serial work — 80.7s of it in the lib
+# binary alone — against a 120s bounded Nx target. On a 3-core hosted macOS
+# runner (~1.85x this machine, measured on a matched 572-test subset) one target
+# is ~102s: it fits only if nothing goes slightly wrong, and in CI it did not.
+# Three shards put the worst at ~21s locally, ~39s hosted. Membership is by
+# nextest's hash of the test name, so new tests spread themselves.
+[package.metadata.smoothbricks.test]
+shards = 3
+
 [[bin]]
 name = "apfs-benchmark"
 path = "src/bin/apfs_benchmark.rs"
