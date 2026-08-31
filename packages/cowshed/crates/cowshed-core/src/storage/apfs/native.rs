@@ -4195,15 +4195,37 @@ where
                             )
                         })?;
                         sync_parent_path(&canonical)?;
-                    } else if canonical_companion.exists() {
-                        return Err(ApfsStorageError::MarkerMismatch(format!(
-                            "canonical metadata and CA companion have no publication image: canonical_image={}, canonical_sidecar={}, canonical_companion={}, staged_image={}",
-                            canonical.display(),
-                            canonical_sidecar.display(),
-                            canonical_companion.display(),
-                            staged.display()
-                        )));
+                    } else if restore_recovery_fact_path(&canonical).exists() {
+                        // The one reading of this state that is not "the payload is gone": a
+                        // restore is in flight, its undo generation under `checkpoints/` still
+                        // holds the old image, and the restore pass below owns that decision — it
+                        // fails closed naming the canonical, staged, fact, and undo artifacts.
+                        // Leave every artifact for it rather than deciding here with less
+                        // evidence.
+                        continue;
                     } else {
+                        // A canonical sidecar with no canonical image and no staged image names a
+                        // workspace whose payload does not exist. The image is the only artifact
+                        // here that carries data, and both spellings that reach this branch — a
+                        // publication that died before renaming its image in, and a retirement
+                        // that already moved the image to the trash — agree there is nothing left
+                        // to recover. That absence is decidable rather than ambiguous: the
+                        // sidecar and the image are siblings in one directory, so a pass that can
+                        // read the sidecar can see the image is gone.
+                        //
+                        // Refusing here instead was over-broad in the worst direction. This pass
+                        // is store-wide and runs before every lifecycle operation, so one
+                        // workspace's orphaned metadata failed every verb on every *other*
+                        // workspace — including the `rm` that would have cleared it — while
+                        // preserving nothing: a grants sidecar and a per-workspace CA key are
+                        // derived artifacts that the next publication regenerates, and neither is
+                        // reachable again once the image they describe is gone.
+                        //
+                        // Companion before sidecar. This loop finds work by enumerating sidecars,
+                        // so a crash after removing the sidecar would strand a private CA key no
+                        // later pass ever visits, while a crash after removing the companion
+                        // leaves the sidecar that brings the next pass straight back here.
+                        Self::remove_companion(&canonical)?;
                         fs::remove_file(&canonical_sidecar).map_err(|error| {
                             io_error(
                                 "remove orphan canonical metadata",
