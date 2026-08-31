@@ -10,7 +10,7 @@ use columine_arrow::{
 };
 use columine_event_processor::{
     COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, COMPACT_DIAGNOSTIC_STAGE,
-    COMPACT_HEADER_SIZE, CreateFailure, RESULT_HEADER_SIZE, ResultCode,
+    COMPACT_HEADER_SIZE, CreateFailure, RESULT_HEADER_SIZE, ResultCode, WASM_EVENT_CAPACITY,
 };
 
 const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");
@@ -88,6 +88,13 @@ fn parse_backend_ts_compact_abi_matches_rust() {
         ts_const(&source, "MAX_EVENTS_PER_BATCH"),
         u64::from(MAX_EVENTS_PER_BATCH)
     );
+    // Distinct quantities: a rowCount ceiling and an allocation size. Sharing
+    // one number made every handle allocate the whole 65536-row column plane.
+    assert_eq!(
+        ts_const(&source, "EP_EVENT_CAPACITY"),
+        u64::from(WASM_EVENT_CAPACITY)
+    );
+    assert_ne!(WASM_EVENT_CAPACITY, MAX_EVENTS_PER_BATCH);
     assert_eq!(ts_const(&source, "MAX_FIELDS"), MAX_SCHEMA_FIELDS as u64);
     assert_eq!(
         ts_const(&source, "MAX_VARIABLE_DATA_BYTES"),
