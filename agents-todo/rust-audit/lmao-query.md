@@ -1,10 +1,10 @@
 # lmao-query
 
-Scope: `packages/lmao-rs/crates/lmao-query/Cargo.toml` (25), `src/lib.rs` (94), `src/arrow_backend.rs` (145),
+Scope: `packages/lmao/crates/lmao-query/Cargo.toml` (25), `src/lib.rs` (94), `src/arrow_backend.rs` (145),
 `src/sqlite_backend.rs` (177), `src/datafusion_backend.rs` (93). Additionally read for TESTS / SSOT greps:
 `tests/parity.rs` (248); `packages/lmao/src/lib/sqlite/sqlite-common.ts`;
-`packages/lmao/src/lib/testing/trace-query.ts`; `packages/lmao-rs/crates/lmao-arrow/src/convert.rs` (schema names only);
-`packages/lmao-rs/Cargo.lock`; `packages/lmao-rs/justfile`.
+`packages/lmao/src/lib/testing/trace-query.ts`; `packages/lmao/crates/lmao-arrow/src/convert.rs` (schema names only);
+`packages/lmao/Cargo.lock`; `packages/lmao/justfile`.
 
 ## Summary
 
@@ -13,7 +13,7 @@ Scope: `packages/lmao-rs/crates/lmao-query/Cargo.toml` (25), `src/lib.rs` (94), 
   unused by any other crate, and never compiled by `cargo test --workspace`.
 - `rusqlite` `features=["bundled"]` compiles SQLite from C for a parity shim. Test-suite traces go through TS
   `bun:sqlite` / `DEFAULT_TRACE_DB_PATH`, not this crate. `rusqlite`/`libsqlite3-sys` appear only in
-  `packages/lmao-rs/Cargo.lock` (not cowshed/columine) — bundled SQLite is compiled at most once, and only if
+  `packages/lmao/Cargo.lock` (not cowshed/columine) — bundled SQLite is compiled at most once, and only if
   `--features sqlite`.
 - Live schema split: Arrow column `timestamp` vs SQLite `timestamp_ns`. Parity tests translate the name rather than
   sharing one schema.
@@ -24,7 +24,7 @@ Scope: `packages/lmao-rs/crates/lmao-query/Cargo.toml` (25), `src/lib.rs` (94), 
 
 ### F1 — HIGH — DEP-BLOAT — Drop the DataFusion backend
 
-Evidence: `packages/lmao-rs/crates/lmao-query/Cargo.toml:12-21`
+Evidence: `packages/lmao/crates/lmao-query/Cargo.toml:12-21`
 
 ```toml
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
@@ -36,13 +36,13 @@ sqlite = ["dep:rusqlite"]
 datafusion = ["dep:datafusion", "dep:tokio"]
 ```
 
-`packages/lmao-rs/Cargo.lock:583-630` (`datafusion` 47.0.0 pulls `arrow`, `datafusion-datasource-csv`,
+`packages/lmao/Cargo.lock:583-630` (`datafusion` 47.0.0 pulls `arrow`, `datafusion-datasource-csv`,
 `datafusion-datasource-json`, `object_store`, `sqlparser`, `uuid`, `tempfile`, `regex`, `chrono`, plus 26 sibling
-`datafusion-*` crates at 47.0.0). Workspace policy at `packages/lmao-rs/Cargo.toml:23-26` is Arrow subcrates only, not
-the `arrow` umbrella; DataFusion is what puts `arrow` 55.2.0 + `arrow-csv`/`arrow-json` in the lock.
+`datafusion-*` crates at 47.0.0). Workspace policy at `packages/lmao/Cargo.toml:23-26` is Arrow subcrates only, not the
+`arrow` umbrella; DataFusion is what puts `arrow` 55.2.0 + `arrow-csv`/`arrow-json` in the lock.
 
-`packages/lmao-rs/crates/lmao-query/src/datafusion_backend.rs:22-32,74-77` — the whole backend is `SessionContext` +
-string SQL for the same `count` the Arrow scan already does, plus a current-thread tokio runtime:
+`packages/lmao/crates/lmao-query/src/datafusion_backend.rs:22-32,74-77` — the whole backend is `SessionContext` + string
+SQL for the same `count` the Arrow scan already does, plus a current-thread tokio runtime:
 
 ```rust
 let table = MemTable::try_new(first.schema(), vec![batches.clone()])?;
@@ -72,11 +72,11 @@ Verdict: **DROP**.
 
 ### F2 — HIGH — DEP-BLOAT — Drop bundled rusqlite; the sink is TS bun:sqlite
 
-Evidence: `packages/lmao-rs/crates/lmao-query/Cargo.toml:12,20` (`rusqlite` 0.37, `features = ["bundled"]`).
+Evidence: `packages/lmao/crates/lmao-query/Cargo.toml:12,20` (`rusqlite` 0.37, `features = ["bundled"]`).
 `libsqlite3-sys` 0.35.0 in `Cargo.lock:1684-1693` depends on `cc` / `pkg-config` / `vcpkg` (the compile-SQLite-from-C
 path).
 
-`packages/lmao-rs/crates/lmao-query/src/lib.rs:7-8` and `src/sqlite_backend.rs:1-2` claim `.cache/trace-results.db` /
+`packages/lmao/crates/lmao-query/src/lib.rs:7-8` and `src/sqlite_backend.rs:1-2` claim `.cache/trace-results.db` /
 `SQLiteTracer` parity. Production path is TS:
 
 - `packages/lmao/src/lib/sqlite/trace-db-path.ts` owns `DEFAULT_TRACE_DB_PATH`
@@ -85,8 +85,8 @@ path).
   / `testTree`)
 
 No Rust caller opens that path through `SqliteTraceQuery::open`. `sqlite_backend` is only constructed in
-`tests/parity.rs:186-218` under `cfg(feature = "sqlite")`. `packages/lmao-rs/justfile:5-6` is `cargo test --workspace`
-with no `--features sqlite`.
+`tests/parity.rs:186-218` under `cfg(feature = "sqlite")`. `packages/lmao/justfile:5-6` is `cargo test --workspace` with
+no `--features sqlite`.
 
 Problem: compiling C SQLite into a 177-line optional module that default CI never builds, to re-query a table the
 TypeScript writer already owns. Precedent in this repo: `git2` was removed because PATH `git` was enough. Here the
@@ -109,7 +109,7 @@ Verdict: **DROP**. Do not replace with `sqlite3` on PATH inside this crate.
 
 ### F3 — HIGH — SSOT — Arrow `timestamp` vs SQLite `timestamp_ns` (live divergence)
 
-Evidence: Arrow schema `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:52-63`
+Evidence: Arrow schema `packages/lmao/crates/lmao-arrow/src/convert.rs:52-63`
 
 ```rust
 Field::new("timestamp", DataType::Int64, false),
@@ -118,10 +118,10 @@ Field::new("trace_id", dict_type(DataType::UInt32), false),
 Field::new("parent_span_id", DataType::UInt32, true),
 ```
 
-SQLite DDL `packages/lmao-rs/crates/lmao-query/src/sqlite_backend.rs:28-36` and TS
+SQLite DDL `packages/lmao/crates/lmao-query/src/sqlite_backend.rs:28-36` and TS
 `packages/lmao/src/lib/sqlite/sqlite-common.ts:10-16` use `timestamp_ns`. Parity tests paper over it:
 
-`packages/lmao-rs/crates/lmao-query/tests/parity.rs:86-97`
+`packages/lmao/crates/lmao-query/tests/parity.rs:86-97`
 
 ```rust
 /// The Arrow backend uses lmao-arrow column names; SQLite/DataFusion-over-sqlite-shape
@@ -155,7 +155,7 @@ the (to-be-deleted) SQLite adapter. Cross-slice: lmao-arrow `trace_schema`, TS `
 
 ### F4 — HIGH — STRUCTURE — SQL backends turn operational failure into “never happened”
 
-Evidence: `packages/lmao-rs/crates/lmao-query/src/sqlite_backend.rs:144-175`
+Evidence: `packages/lmao/crates/lmao-query/src/sqlite_backend.rs:144-175`
 
 ```rust
 fn query_count(&self, sql: &str, params: &[rusqlite::types::Value]) -> usize {
@@ -169,7 +169,7 @@ fn query_count(&self, sql: &str, params: &[rusqlite::types::Value]) -> usize {
 self.query_count(&sql, &params) == 0  // all_children_of
 ```
 
-`packages/lmao-rs/crates/lmao-query/src/datafusion_backend.rs:31,74-91`
+`packages/lmao/crates/lmao-query/src/datafusion_backend.rs:31,74-91`
 
 ```rust
 .build()
@@ -195,7 +195,7 @@ Cost/Risk: trait change on `TraceQuery` — only this crate implements it.
 
 ### F5 — MEDIUM — SSOT — `SPANS_DDL` is a hand restatement of TS `SPANS_TABLE_INIT_SQL`
 
-Evidence: `packages/lmao-rs/crates/lmao-query/src/sqlite_backend.rs:28-41`
+Evidence: `packages/lmao/crates/lmao-query/src/sqlite_backend.rs:28-41`
 
 ```rust
 pub const SPANS_DDL: &str = "
@@ -228,8 +228,8 @@ Cost/Risk: none if F2 lands.
 
 ### F6 — MEDIUM — TESTS — sqlite/datafusion parity never runs on the workspace test command
 
-Evidence: `packages/lmao-rs/justfile:5-6` `cargo test --workspace`.
-`packages/lmao-rs/crates/lmao-query/tests/parity.rs:186-222`
+Evidence: `packages/lmao/justfile:5-6` `cargo test --workspace`.
+`packages/lmao/crates/lmao-query/tests/parity.rs:186-222`
 
 ```rust
 #[cfg(feature = "sqlite")]
@@ -241,7 +241,7 @@ fn sqlite_backend_parity() { ... }
 fn datafusion_backend_parity() { ... }
 ```
 
-`Cargo.toml` `default = []`. No nx/CI invocation enables these features (grep of `.github` and `packages/lmao-rs` for
+`Cargo.toml` `default = []`. No nx/CI invocation enables these features (grep of `.github` and `packages/lmao` for
 `--features sqlite` / `datafusion` is empty). `datafusion_backend_parity` does not call `never` (sqlite parity does).
 `selectors()` timestamp case is the only typed constraint besides `span_id`/`trace_id`, and it depends on F3’s
 translator.
@@ -257,8 +257,8 @@ Cost/Risk: none.
 
 ### F7 — MEDIUM — DUPLICATION — two SQL `where_clause` builders for one selector
 
-Evidence: `packages/lmao-rs/crates/lmao-query/src/sqlite_backend.rs:116-141` (parameterized `message = ?` + quoted
-ident) vs `src/datafusion_backend.rs:45-70` (interpolated `message = '...'` + `escape`).
+Evidence: `packages/lmao/crates/lmao-query/src/sqlite_backend.rs:116-141` (parameterized `message = ?` + quoted ident)
+vs `src/datafusion_backend.rs:45-70` (interpolated `message = '...'` + `escape`).
 
 `all_children_of` SQL is copied (`sqlite_backend.rs:168-173`, `datafusion_backend.rs:83-87`) with the same `NOT EXISTS`
 / `p.span_id = c.parent_span_id` shape.
@@ -272,7 +272,7 @@ Cost/Risk: none if those backends go.
 
 ### F8 — MEDIUM — STRUCTURE — `load_batches` addresses Arrow columns by ordinal
 
-Evidence: `packages/lmao-rs/crates/lmao-query/src/sqlite_backend.rs:76-83`
+Evidence: `packages/lmao/crates/lmao-query/src/sqlite_backend.rs:76-83`
 
 ```rust
 let ts = batch.column(0).as_primitive::<Int64Type>();
@@ -298,7 +298,7 @@ Cost/Risk: lmao-arrow schema changes.
 
 ### F9 — LOW — SSOT — crate comments restate `.cache/trace-results.db`
 
-Evidence: `packages/lmao-rs/crates/lmao-query/src/lib.rs:8`, `src/sqlite_backend.rs:2`. AGENTS.md / CLAUDE.md:
+Evidence: `packages/lmao/crates/lmao-query/src/lib.rs:8`, `src/sqlite_backend.rs:2`. AGENTS.md / CLAUDE.md:
 `DEFAULT_TRACE_DB_PATH` owns the path; never restate the literal except the CI glob.
 
 Problem: the forbidden literal is in this crate, and the crate never opens the file.
@@ -309,7 +309,7 @@ Cost/Risk: none.
 
 ### F10 — LOW — COPIES — per-row `to_string` + repeated `schema().index_of` on the Arrow scan
 
-Evidence: `packages/lmao-rs/crates/lmao-query/src/arrow_backend.rs:34-54,68-77,103-142`.
+Evidence: `packages/lmao/crates/lmao-query/src/arrow_backend.rs:34-54,68-77,103-142`.
 
 `dict_str_value` returns `Option<String>` (`value(key).to_string()`). `row_matches` allocates that String to compare to
 `selector.template`. `column_equals` for `Str` calls `dict_str_value` again (second `index_of` + second copy).
@@ -345,8 +345,7 @@ Cost/Risk: local to `arrow_backend.rs`.
 - **Feature gating of the heavy deps:** `default = []`, both backends `optional = true`. Default
   `cargo test --workspace` does not compile rusqlite or DataFusion. The bloat is lockfile + anyone who flips the
   feature, not the default artifact.
-- **Bundled SQLite twice:** not in this monorepo today. Only `packages/lmao-rs/Cargo.lock` has
-  `rusqlite`/`libsqlite3-sys`.
+- **Bundled SQLite twice:** not in this monorepo today. Only `packages/lmao/Cargo.lock` has `rusqlite`/`libsqlite3-sys`.
 - **`unsafe`:** none. No `cfg(target_os)` arms.
 - **God files / 100-line functions:** largest impl body is `load_batches` (~67 lines). 94/145/177/93-line modules.
 - **Arrow tests that do run:** `arrow_scan_answers_the_fixture` and

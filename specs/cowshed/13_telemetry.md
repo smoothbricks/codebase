@@ -3,21 +3,21 @@
 cowshed's observability is **distributed tracing into Arrow columns**, not a text logfile. Every lifecycle operation,
 every job, and every gateway request is a span; spans carry W3C trace context across cowshed's boundaries; and the spans
 flush as Arrow record batches that are queryable, assertable, and cheap to retain. The substrate is **lmao**
-(`packages/lmao-rs` / `packages/lmao`) — a spans-first tracer with deterministic Arrow encoding, arena-backed buffers,
-and a tracer-agnostic query surface (`lmao-query`). There is no OTel collector and no telemetry daemon; OTLP export, if
-ever wanted, is a projection from the Arrow store.
+(`packages/lmao`) — a spans-first tracer with deterministic Arrow encoding, arena-backed buffers, and a tracer-agnostic
+query surface (`lmao-query`). There is no OTel collector and no telemetry daemon; OTLP export, if ever wanted, is a
+projection from the Arrow store.
 
 ## Why lmao, not text logs
 
 Text logs record _that_ things happened. Columns make cowshed's behavior a **dataset**: the same artifact answers
 debugging (span waterfalls), security (audit joins), testing (trace assertions), and fleet ops (SLOs from real usage).
 lmao is the right substrate specifically because it is trace-first and **deterministic** — with an injected `Clock` and
-`Entropy` it emits bit-identical trace bytes for a given `(build, seed, config)` (see `packages/lmao-rs`), which is what
+`Entropy` it emits bit-identical trace bytes for a given `(build, seed, config)` (see `packages/lmao`), which is what
 makes golden trace fixtures and the assertion surface below possible.
 
-**Dependency honesty**: lmao-rs is today a pinned-API scaffold (hot paths unimplemented; port order
-arena→core→arrow→macros→wasm→query). cowshed Phase 1 codes against the pinned `lmao-core`/`lmao-arrow` APIs; the
-overhead gates arrive with the port. Sequencing lives in the kickoff.
+**Dependency honesty**: lmao's Rust crates (`packages/lmao/crates`) are today a pinned-API scaffold (hot paths
+unimplemented; port order arena→core→arrow→macros→wasm→query). cowshed Phase 1 codes against the pinned
+`lmao-core`/`lmao-arrow` APIs; the overhead gates arrive with the port. Sequencing lives in the kickoff.
 
 ## Trace context propagation
 
@@ -107,15 +107,15 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   that lineage is what authorizes records an ancestor wrote into a cloned image.
 - **Authority is the host inventory.** What workspaces exist, which incarnation each is, which are retired, which
   lineage an image carries, and which port block and grants belong to a workspace are read from the images and mounts
-  under `/private/cowshed/store/`, the per-workspace grants files, and the controller lock. No log is replayed for any of these
-  decisions; a controller that opens a project reads the inventory once and starts.
+  under `/private/cowshed/store/`, the per-workspace grants files, and the controller lock. No log is replayed for any
+  of these decisions; a controller that opens a project reads the inventory once and starts.
 - **Controller audit records** — every controller act (workspace introduced/retired, job admission and terminal state,
   checkpoint, fork, restore) is emitted as one typed `ControllerCommitment` record to an audit sink. The records carry
   existence, lifecycle/status, a writer-local order, lineage, byte counts, and expected hashes; they never contain
   inline output, a protected artifact path, a redirect source, or any other raw stdout/stderr payload duplication.
   **Nothing reads them for a decision.** The sink is selected when the project opens (`COWSHED_CONTINUITY_AUDIT`):
-  `arrow` (default for the standalone CLI) writes sealed per-writer segments under `/private/cowshed/store/telemetry/`, `off`
-  discards, and a supervising runtime injects its own sink through `ProjectRuntime::open_existing_with_audit`
+  `arrow` (default for the standalone CLI) writes sealed per-writer segments under `/private/cowshed/store/telemetry/`,
+  `off` discards, and a supervising runtime injects its own sink through `ProjectRuntime::open_existing_with_audit`
   (Containium routes the same records into PTMCART). A sink that refuses a record is a `doctor` finding (`audit-sink`),
   never a reason to fail the act it describes.
 - **Arrow audit segments** — one Arrow IPC batch containing one row per segment at
@@ -132,8 +132,8 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   acts, each acknowledged by the sink before the next; the short-timer one-batch crash window applies to diagnostic
   events; gateway decision boundaries retain the flush policy below.
 - **The one text-file survivor** — `~/Library/Logs/cowshed/daemon-stderr.log`, the launchd `StandardErrorPath` target,
-  exists only for crashes before tracer initialization. It lives off the `/private/cowshed/store` mountpoint so reboot remount
-  cannot be masked. `doctor` flags it when non-empty.
+  exists only for crashes before tracer initialization. It lives off the `/private/cowshed/store` mountpoint so reboot
+  remount cannot be masked. `doctor` flags it when non-empty.
 
 `StreamInfo` is the shared content descriptor:
 

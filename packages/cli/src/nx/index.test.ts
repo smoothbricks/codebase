@@ -89,7 +89,7 @@ describe('Nx helper output formatting', () => {
           'rust-wasm': {
             dependsOn: [
               'prepare',
-              { target: 'cargo-wasm', projects: ['lmao-rs'] },
+              { target: 'cargo-wasm', projects: ['lmao'] },
               { target: 'build', projects: 'dependencies' },
             ],
           },

@@ -1,15 +1,15 @@
 # lmao-core
 
-Scope: `packages/lmao-rs/crates/lmao-core/Cargo.toml` (26), `src/lib.rs` (34), `src/entry_type.rs` (82),
+Scope: `packages/lmao/crates/lmao-core/Cargo.toml` (26), `src/lib.rs` (34), `src/entry_type.rs` (82),
 `src/packed_header.rs` (122), `src/identity.rs` (124), `src/clock.rs` (191), `src/columns.rs` (217), `src/buffer.rs`
 (289), `src/context.rs` (310), `src/result.rs` (102), `src/tuning.rs` (95) — 10 files, 1566 lines. Also read (TESTS axis
 / benches / example): `tests/alloc_gate.rs` (142), `tests/properties.rs` (238), `benches/overhead.rs` (49),
 `benches/hot_path.rs` (273), `examples/jcode_tracer.rs` (143). Doctrine: BYPRODUCT-ENGINEERING.md, PERFORMANCE-HANDBOOK
 §4.1/§4.2/§4.2b, §7.10bb, §7.1–7.2, §7.12. Targeted greps: `packages/lmao/src/lib/schema/systemSchema.ts`,
 `packages/lmao/src/lib/capacityTuning.ts`, `packages/lmao/src/lib/types.ts`,
-`packages/lmao/src/lib/physicalLayoutPlan.ts`, `packages/lmao-rs/crates/lmao-arrow/src/convert.rs`,
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs`, `packages/lmao-rs/Cargo.lock` `lmao-core` stanza, `AGENTS.md`
-entry-type section.
+`packages/lmao/src/lib/physicalLayoutPlan.ts`, `packages/lmao/crates/lmao-arrow/src/convert.rs`,
+`packages/lmao/crates/lmao-arena/src/raw.rs`, `packages/lmao/Cargo.lock` `lmao-core` stanza, `AGENTS.md` entry-type
+section.
 
 ## Summary
 
@@ -34,7 +34,7 @@ entry-type section.
 
 ### F1 — HIGH — SSOT — EntryType 1..=24 is a hand copy of the TS table
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/entry_type.rs:1-38`
+Evidence: `packages/lmao/crates/lmao-core/src/entry_type.rs:1-38`
 
 ```
 //! The 24 entry types, aligned exactly with the TypeScript runtime mapping.
@@ -65,7 +65,7 @@ generator, then delete copies.
 
 ### F2 — HIGH — SSOT — Capacity ratchet copied from TS; sample threshold already diverged
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/tuning.rs:8-21,50-58`
+Evidence: `packages/lmao/crates/lmao-core/src/tuning.rs:8-21,50-58`
 
 ```
 //! grow  ×2 when utilization > 1.5
@@ -102,7 +102,7 @@ way.
 
 ### F3 — HIGH — TESTS — overhead.rs cannot measure the gates it claims
 
-Evidence: `packages/lmao-rs/crates/lmao-core/benches/overhead.rs:1-8,26-45`
+Evidence: `packages/lmao/crates/lmao-core/benches/overhead.rs:1-8,26-45`
 
 ```
 //! Placeholder bench harness for the overhead gates
@@ -129,7 +129,7 @@ this binary is invalid.
 
 ### F4 — MEDIUM — SSOT — Packed header high-24: VocabularyId vs TS denseIndex+1
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/packed_header.rs:1-10,88-96`
+Evidence: `packages/lmao/crates/lmao-core/src/packed_header.rs:1-10,88-96`
 
 ```
 //! Packed native row headers: low 8 bits are [`EntryType`], high 24 bits are a
@@ -154,7 +154,7 @@ messages.
 
 ### F5 — MEDIUM — TESTS — hot_path.rs cells miss the production kernel
 
-Evidence: `packages/lmao-rs/crates/lmao-core/benches/hot_path.rs:7-11,100-114,125-137`
+Evidence: `packages/lmao/crates/lmao-core/benches/hot_path.rs:7-11,100-114,125-137`
 
 ```
 //! - "Warm: Trace with tags" -> tag_write_f64_proxy ...
@@ -181,7 +181,7 @@ dict-build to `lmao-arrow` or drop it. Cost/Risk: bench-only. `alloc_gate.rs` re
 
 ### F6 — MEDIUM — COPIES — SpanContext::start Arc-allocates the span name on every start write
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/context.rs:132-144`
+Evidence: `packages/lmao/crates/lmao-core/src/context.rs:132-144`
 
 ```
 pub fn start(..., name: &str) -> Self {
@@ -202,7 +202,7 @@ allocate — verified by reading `append_dynamic`/`write_row`. Fix: `start`/`spa
 
 ### F7 — MEDIUM — DUPLICATION — buffer.rs restates capacity bounds as literals
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/buffer.rs:97`
+Evidence: `packages/lmao/crates/lmao-core/src/buffer.rs:97`
 
 ```
 debug_assert!(capacity.is_power_of_two() && (8..=1024).contains(&capacity));
@@ -217,7 +217,7 @@ intended ratchet range with no signal. If F2 changes 1024, this literal will rot
 
 ### F8 — LOW — COPIES — per-event `dyn Clock` and double overflow walk
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/buffer.rs:169-175,197-216,228-243`
+Evidence: `packages/lmao/crates/lmao-core/src/buffer.rs:169-175,197-216,228-243`
 
 ```
 let row = self.append_header(pack_dynamic(entry_type), anchor, clock);
@@ -257,7 +257,7 @@ Evidence:
 
 ### F10 — LOW — DEP-BLOAT — tokio pulled with default features for one example
 
-Evidence: `packages/lmao-rs/crates/lmao-core/Cargo.toml:9-15`
+Evidence: `packages/lmao/crates/lmao-core/Cargo.toml:9-15`
 
 ```
 [dependencies]
@@ -269,7 +269,7 @@ lmao-macros = { path = "../lmao-macros" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 ```
 
-`packages/lmao-rs/Cargo.lock:1729-1737`: `lmao-core` depends on criterion, lmao-macros, proptest, tokio only. Problem:
+`packages/lmao/Cargo.lock:1729-1737`: `lmao-core` depends on criterion, lmao-macros, proptest, tokio only. Problem:
 shipped lib is zero-dep — correct, and those four dev-deps earn their weight (property tests, benches, schema
 bench/example, async identity demo). Tokio is load-bearing for `jcode_tracer.rs`; do not shell out. Missing
 `default-features = false` still pulls the default extra crates into the example graph (net/fs/io-util depending on
@@ -279,14 +279,14 @@ Cost/Risk: example-only compile. Confirm the example still builds with that set.
 
 ## Cross-slice questions
 
-- `packages/lmao-rs/crates/lmao-arena/src/raw.rs:86-89` restates `ENTRY_TYPE_SPAN_START..=EXCEPTION` as `u8` constants.
+- `packages/lmao/crates/lmao-arena/src/raw.rs:86-89` restates `ENTRY_TYPE_SPAN_START..=EXCEPTION` as `u8` constants.
   Should that crate depend on `lmao-core::EntryType` or is the WASM arena forbidden from that dep? (arena slice)
-- `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:21-46` restates kebab `ENTRY_TYPE_NAMES` as `[&str; 24]` (no unused
+- `packages/lmao/crates/lmao-arrow/src/convert.rs:21-46` restates kebab `ENTRY_TYPE_NAMES` as `[&str; 24]` (no unused
   index 0) and indexes with `entry_type - 1` (`:253`). TS indexes by discriminant. Confirm which dictionary key space
   Arrow flush must emit. (arrow slice)
 - `lmao-arrow` `split_packed_header` treats high-24 as a global vocabulary id (Rust encoding). TS packed writes
   `denseIndex+1`. Which word is the interop ABI? (arrow / TS layout slices)
-- `packages/lmao-rs/crates/lmao-timestamp-proof/src/layout.rs:9-12` restates 1..=4 again. (timestamp-proof slice)
+- `packages/lmao/crates/lmao-timestamp-proof/src/layout.rs:9-12` restates 1..=4 again. (timestamp-proof slice)
 - TS system columns `error_code`, `retry_attempt`, `retry_delay_ms`, `exception_stack`, `ff_value`, `uint64_value`
   (`systemSchema.ts:54-63,80-144`) do not exist on `lmao-core::SpanBuffer` (only `timestamps`, `headers`,
   `line_numbers`, `messages`). Does `lmao-macros` generate them? This crate has no snake_case column-name table. (macros

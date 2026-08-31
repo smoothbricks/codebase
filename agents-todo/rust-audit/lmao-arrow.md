@@ -1,12 +1,12 @@
 # lmao-arrow
 
-Scope: `packages/lmao-rs/crates/lmao-arrow/src/lib.rs` (53), `dict.rs` (577), `convert.rs` (317), `archive.rs` (155),
+Scope: `packages/lmao/crates/lmao-arrow/src/lib.rs` (53), `dict.rs` (577), `convert.rs` (317), `archive.rs` (155),
 `source.rs` (136); `Cargo.toml` (23); `benches/flush.rs` (120); `tests/convert.rs` (168), `tests/properties.rs` (646).
 Doctrine: BYPRODUCT-ENGINEERING.md, PERFORMANCE-HANDBOOK §4.1 / §7 / §7.12. Neighbour peeks (duplication only):
-`packages/lmao-rs/Cargo.toml`, `packages/lmao-rs/Cargo.lock` (arrow-array 55.2.0), `packages/columine/Cargo.toml`,
+`packages/lmao/Cargo.toml`, `packages/lmao/Cargo.lock` (arrow-array 55.2.0), `packages/columine/Cargo.toml`,
 `packages/columine/crates/columine-arrow/{Cargo.toml,src/lib.rs,src/schema.rs:1-83}`,
 `packages/cowshed/crates/cowshed-core/Cargo.toml`, `packages/cowshed/crates/cowshed-gateway/Cargo.toml`,
-`packages/lmao-rs/crates/lmao-core/src/{entry_type.rs,packed_header.rs,identity.rs,buffer.rs}`,
+`packages/lmao/crates/lmao-core/src/{entry_type.rs,packed_header.rs,identity.rs,buffer.rs}`,
 `packages/lmao/src/lib/{schema/systemSchema.ts,arrow/vocabularyDictionary.ts,archive/chunkEnvelope.ts,convertToArrow.ts}`,
 `specs/lmao/{01f_arrow_table_structure.md,01t_trace_archive_pipeline.md}`.
 
@@ -30,7 +30,7 @@ Doctrine: BYPRODUCT-ENGINEERING.md, PERFORMANCE-HANDBOOK §4.1 / §7 / §7.12. N
 
 ### F1 — HIGH — SSOT — `trace_schema` is not the 01f / TS system table
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:52-63`
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:52-63`
 
 ```rust
 pub fn trace_schema() -> Arc<Schema> {
@@ -62,7 +62,7 @@ Add the missing attribution columns when `SpanSource` can supply them; rename `l
 
 ### F2 — HIGH — SSOT — `ENTRY_TYPE_NAMES` restated; dictionary layout already diverged
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:21-46,253,286-288`
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:21-46,253,286-288`
 
 ```rust
 pub const ENTRY_TYPE_NAMES: [&str; 24] = [
@@ -91,7 +91,7 @@ flips if slot 0 is restored. `lmao-core` becomes the SSOT; this crate only consu
 
 ### F3 — HIGH — SSOT — archive envelope identity does not match TS (comment is false)
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/archive.rs:21-62`
+Evidence: `packages/lmao/crates/lmao-arrow/src/archive.rs:21-62`
 
 ```rust
 /// `fnv1a64` over the canonicalized content descriptor (`file_ref`, refs, row
@@ -119,7 +119,7 @@ retries as new chunks. Tests in `tests/properties.rs:633-645` pin the Rust-only 
 
 ### F4 — HIGH — SSOT — Arrow 55 vs 56 across workspaces; do not merge the crates
 
-Evidence: `packages/lmao-rs/Cargo.toml:23-27` and `packages/lmao-rs/crates/lmao-arrow/Cargo.toml:11-13`
+Evidence: `packages/lmao/Cargo.toml:23-27` and `packages/lmao/crates/lmao-arrow/Cargo.toml:11-13`
 
 ```toml
 arrow-array = "55"
@@ -130,20 +130,20 @@ arrow-ipc = "55"
 
 `packages/columine/Cargo.toml:20-22` pins the same crates at `"56"` with `default-features = false`.
 `packages/cowshed/crates/cowshed-core/Cargo.toml:14-17` and `cowshed-gateway/Cargo.toml:9-11` depend on arrow-* `"56"`.
-Lock: `packages/lmao-rs/Cargo.lock` `arrow-array` `55.2.0`. `columine-arrow` public surface
+Lock: `packages/lmao/Cargo.lock` `arrow-array` `55.2.0`. `columine-arrow` public surface
 (`packages/columine/crates/columine-arrow/src/lib.rs:1-35`) is `EventColumns` / `DynamicColumns` plus a hand-emitted IPC
 writer (`write_arrow_ipc_from_borrowed_columns`). Prod deps are `arrow-ipc` + `arrow-schema` only; `arrow-array` is a
 dev-dep. This crate’s job is SpanBuffer-tree → `RecordBatch` via `arrow-array`. Problem: Version skew is real SSOT
 drift. Merging the libraries is not: different input (span trees vs event column bytes), different output (arrow-rs
 `RecordBatch` vs raw IPC), different schema (lmao 01f vs columine dynamic IPC schema). A wrong “one crate”
-recommendation would couple unrelated flush kernels. Fix: Keep three crates. Bump `packages/lmao-rs` workspace arrow-*
-to 56 with `default-features = false`, matching columine. Do not route lmao flush through `columine-arrow` or vice
-versa. Cost/Risk: `lmao-query` (arrow-array 55, datafusion 47) must move with the pin. [INFERENCE] datafusion 47’s arrow
-major may force a datafusion bump — confirm in the lmao-query slice.
+recommendation would couple unrelated flush kernels. Fix: Keep three crates. Bump `packages/lmao` workspace arrow-* to
+56 with `default-features = false`, matching columine. Do not route lmao flush through `columine-arrow` or vice versa.
+Cost/Risk: `lmao-query` (arrow-array 55, datafusion 47) must move with the pin. [INFERENCE] datafusion 47’s arrow major
+may force a datafusion bump — confirm in the lmao-query slice.
 
 ### F5 — HIGH — COPIES — entry-type UTF-8 dictionary and `Schema` rebuilt every flush
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:286-301` and `dict.rs:311-376`
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:286-301` and `dict.rs:311-376`
 
 ```rust
 Arc::new(StringArray::from_iter_values(ENTRY_TYPE_NAMES)) as ArrayRef,
@@ -171,7 +171,7 @@ batch-local). Cost/Risk: Schema OnceLock must die if F1 changes fields. Slice ge
 
 ### F6 — MEDIUM — COPIES — pass 2 re-derives pass 1 proofs; first-seen map double-hashes
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:167-214,252-273` and `dict.rs:387-395`
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:167-214,252-273` and `dict.rs:387-395`
 
 ```rust
 let (entry_type, vocabulary_id) = split_packed_header(buffer.packed_header(row));
@@ -199,7 +199,7 @@ Slightly larger pass-1 scratch; deletes the `expect` invariant comments on pass 
 
 ### F7 — MEDIUM — SSOT — packed-header unpack restated beside `lmao-core`
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:134-145`
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:134-145`
 
 ```rust
 fn required_vocabulary_kind(entry_type: u8) -> Option<StableVocabularyKind> {
@@ -226,7 +226,7 @@ move it with the function.
 
 ### F8 — MEDIUM — DEP-BLOAT — arrow default features pull chrono/chrono-tz
 
-Evidence: `packages/lmao-rs/Cargo.toml:24-27` (no `default-features = false`) vs lock `packages/lmao-rs/Cargo.lock`
+Evidence: `packages/lmao/Cargo.toml:24-27` (no `default-features = false`) vs lock `packages/lmao/Cargo.lock`
 `arrow-array 55.2.0` dependencies: `chrono`, `chrono-tz`, `half`, `num`, `ahash`, `hashbrown 0.15.5`. Columine’s pin
 (`packages/columine/Cargo.toml:20-22`) turns defaults off. This crate uses
 `arrow_array::{Array, DictionaryArray, RecordBatch, StringArray, *Array}`,
@@ -240,7 +240,7 @@ the crate is in-process and needs typed `RecordBatch` errors. Cost/Risk: Same as
 
 ### F9 — MEDIUM — TESTS — skip-green pyarrow oracle; bench controls are a different kernel
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/tests/convert.rs:128-166` and `benches/flush.rs:37-46`
+Evidence: `packages/lmao/crates/lmao-arrow/tests/convert.rs:128-166` and `benches/flush.rs:37-46`
 
 ```rust
 if !probe.map(|o| o.status.success()).unwrap_or(false) {
@@ -276,7 +276,7 @@ away. Bench numbers are not comparable to the quoted 5.8 µs SipHash vs 3.3 µs 
 
 ### F10 — LOW — STRUCTURE — flush function is the file; archive uses positional columns; `Option` swallowed
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:148-317` (170 lines), `archive.rs:36-37,74-80`,
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:148-317` (170 lines), `archive.rs:36-37,74-80`,
 `source.rs:45-50`
 
 ```rust

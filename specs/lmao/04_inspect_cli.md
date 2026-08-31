@@ -1,10 +1,10 @@
 # Inspection CLI (`lmao-inspect`) <a id="smoo/lmao!n/inspect-cli"></a>
 
 > **Implementation status (unbuilt).** This spec defines a small, generic, local-first inspection binary over
-> `lmao-query` (spec 02's tracer-agnostic selector surface; the Rust port lives in
-> `packages/lmao-rs/crates/lmao-query`). It exists because every lmao consumer (cowshed, deterministic simulation runs,
-> jcode) otherwise grows its own ad-hoc log reader. It is **not** the Inspector (spec 03) — no UI, no server; a terminal
-> tool for Arrow segment files on local disk.
+> `lmao-query` (spec 02's tracer-agnostic selector surface; the Rust port lives in `packages/lmao/crates/lmao-query`).
+> It exists because every lmao consumer (cowshed, deterministic simulation runs, jcode) otherwise grows its own ad-hoc
+> log reader. It is **not** the Inspector (spec 03) — no UI, no server; a terminal tool for Arrow segment files on local
+> disk.
 
 ## Scope
 
