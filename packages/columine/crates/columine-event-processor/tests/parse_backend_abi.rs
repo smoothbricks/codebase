@@ -119,7 +119,7 @@ fn parse_backend_ts_compact_abi_matches_rust() {
     );
     assert_eq!(ts_const(&source, "RESULT_OK"), ResultCode::Ok as u64);
     assert_eq!(ts_kind_tag(&source, "null"), ArrowType::Null as u8);
-    assert_eq!(ts_kind_tag(&source, "u32"), ArrowType::Int32 as u8);
+    assert_eq!(ts_kind_tag(&source, "i32"), ArrowType::Int32 as u8);
     assert_eq!(ts_kind_tag(&source, "f64"), ArrowType::Float64 as u8);
     assert_eq!(ts_kind_tag(&source, "binary"), ArrowType::Binary as u8);
     assert_eq!(ts_kind_tag(&source, "utf8"), ArrowType::Utf8 as u8);

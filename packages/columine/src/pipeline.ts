@@ -35,10 +35,14 @@ export interface ParseConfig extends EncodedArrowSchema {
   readonly fieldNames?: readonly string[];
 }
 
-/** A physical Arrow column accepted by Compact. */
+/**
+ * A physical Arrow column accepted by Compact. `kind` names the physical
+ * plane, and each plane's element type is the one the native encoder reads:
+ * plane `i32` is signed, so its buffer is an `Int32Array`.
+ */
 export type CompactColumn =
   | { readonly kind: 'null' }
-  | { readonly kind: 'u32'; readonly data: Uint32Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'i32'; readonly data: Int32Array; readonly validity?: Uint8Array }
   | { readonly kind: 'f64'; readonly data: Float64Array; readonly validity?: Uint8Array }
   | { readonly kind: 'i64'; readonly data: BigInt64Array; readonly validity?: Uint8Array }
   | { readonly kind: 'bool'; readonly data: Uint8Array; readonly validity?: Uint8Array }

@@ -3,27 +3,27 @@ import {
   binary,
   bool,
   float64,
+  int32,
   int64,
   nullType,
   tableFromArrays,
   tableFromIPC,
   tableToIPC,
-  uint32,
   utf8,
 } from '@uwdata/flechette';
 
-import { CompactEncodingError, loadParseBackend } from '../parse-backend.js';
+import { EventProcessorCreateError, loadParseBackend } from '../parse-backend.js';
 import type { CompactBatch, CompactColumn, EncodedArrowSchema } from '../pipeline.js';
 
 const ROW_COUNT = 300;
-const FIELD_NAMES = ['all_null', 'u32_value', 'f64_value', 'i64_value', 'bool_value', 'binary_value', 'utf8_value'];
+const FIELD_NAMES = ['all_null', 'i32_value', 'f64_value', 'i64_value', 'bool_value', 'binary_value', 'utf8_value'];
 const NULL_ROWS: readonly number[] = [0, 7, 8, 9, 257];
 
 function schemaMessage(): EncodedArrowSchema {
   const table = tableFromArrays(
     {
       all_null: [null],
-      u32_value: [0],
+      i32_value: [0],
       f64_value: [0],
       i64_value: [0n],
       bool_value: [false],
@@ -33,7 +33,7 @@ function schemaMessage(): EncodedArrowSchema {
     {
       types: {
         all_null: nullType(),
-        u32_value: uint32(),
+        i32_value: int32(),
         f64_value: float64(),
         i64_value: int64(),
         bool_value: bool(),
@@ -124,13 +124,15 @@ function variableColumn(values: readonly (Uint8Array | null)[]): {
 }
 
 function mixedBatch(schema: EncodedArrowSchema): CompactBatch {
-  const u32Backing = new Uint32Array(ROW_COUNT + 2);
-  const u32Values = u32Backing.subarray(1, ROW_COUNT + 1);
+  const i32Backing = new Int32Array(ROW_COUNT + 2);
+  const i32Values = i32Backing.subarray(1, ROW_COUNT + 1);
   for (let row = 0; row < ROW_COUNT; row += 1) {
-    u32Values[row] = row;
+    i32Values[row] = row;
   }
-  u32Values[1] = 0xffff_ffff;
-  u32Values[2] = 0x8000_0000;
+  // The signed boundaries of the plane, which an unsigned reader would report
+  // as 4294967295 and 2147483648.
+  i32Values[1] = -1;
+  i32Values[2] = -2_147_483_648;
 
   const f64Backing = new Float64Array(ROW_COUNT + 2);
   const f64Values = f64Backing.subarray(1, ROW_COUNT + 1);
@@ -167,7 +169,7 @@ function mixedBatch(schema: EncodedArrowSchema): CompactBatch {
 
   const columns: readonly CompactColumn[] = [
     { kind: 'null' },
-    { kind: 'u32', data: u32Values, validity: nullableValidity(ROW_COUNT) },
+    { kind: 'i32', data: i32Values, validity: nullableValidity(ROW_COUNT) },
     { kind: 'f64', data: f64Values, validity: nullableValidity(ROW_COUNT) },
     { kind: 'i64', data: i64Values, validity: nullableValidity(ROW_COUNT) },
     { kind: 'bool', data: boolValues, validity: nullableValidity(ROW_COUNT) },
@@ -206,12 +208,12 @@ describe('Compact real event_processor.wasm', () => {
     expect(table.schema.fields.map((field) => field.name)).toEqual(FIELD_NAMES);
     expect(table.schema.fields.map((field) => field.nullable)).toEqual(new Array(7).fill(true));
     expect(table.schema.fields.map((field) => field.type.typeId)).toEqual([1, 2, 3, 2, 6, 4, 5]);
-    expect(getAt(table.schema.fields, 1, 'schema field').type).toMatchObject({ bitWidth: 32, signed: false });
+    expect(getAt(table.schema.fields, 1, 'schema field').type).toMatchObject({ bitWidth: 32, signed: true });
     expect(getAt(table.schema.fields, 3, 'schema field').type).toMatchObject({ bitWidth: 64, signed: true });
 
     expect(columns.all_null).toEqual(new Array(ROW_COUNT).fill(null));
     for (const row of NULL_ROWS) {
-      expect(columns.u32_value[row]).toBeNull();
+      expect(columns.i32_value[row]).toBeNull();
       expect(columns.f64_value[row]).toBeNull();
       expect(columns.i64_value[row]).toBeNull();
       expect(columns.bool_value[row]).toBeNull();
@@ -219,8 +221,8 @@ describe('Compact real event_processor.wasm', () => {
       expect(columns.utf8_value[row]).toBeNull();
     }
 
-    expect(columns.u32_value[1]).toBe(0xffff_ffff);
-    expect(columns.u32_value[2]).toBe(0x8000_0000);
+    expect(columns.i32_value[1]).toBe(-1);
+    expect(columns.i32_value[2]).toBe(-2_147_483_648);
     expect(Number.isNaN(columns.f64_value[1])).toBe(true);
     expect(columns.f64_value[2]).toBe(Number.POSITIVE_INFINITY);
     expect(Object.is(columns.f64_value[3], -0)).toBe(true);
@@ -238,7 +240,7 @@ describe('Compact real event_processor.wasm', () => {
       schema: encodedSchema,
       columns: [
         { kind: 'null' },
-        { kind: 'u32', data: new Uint32Array() },
+        { kind: 'i32', data: new Int32Array() },
         { kind: 'f64', data: new Float64Array() },
         { kind: 'i64', data: new BigInt64Array() },
         { kind: 'bool', data: new Uint8Array() },
@@ -252,9 +254,15 @@ describe('Compact real event_processor.wasm', () => {
     expect(table.schema.fields.map((field) => field.type.typeId)).toEqual([1, 2, 3, 2, 6, 4, 5]);
   });
 
+  // Its own backend: the refusal happens while creating the handle, so sharing
+  // one would clear the cached handle the other tests reuse. The assertion
+  // names the exact cause, so a creation failure for any OTHER reason — a
+  // capacity refusal, a malformed schema message, an exhausted handle table —
+  // fails this test instead of satisfying it.
   it('rejects metadata that disagrees with the real logical Arrow schema', async () => {
     const mismatchBackend = await loadParseBackend();
     const fieldMetadata = encodedSchema.fieldMetadata.slice();
+    // Field 1's physical tag becomes Float64 while schemaBytes still says Int32.
     fieldMetadata[4] = 2;
     try {
       mismatchBackend.encode({
@@ -272,12 +280,12 @@ describe('Compact real event_processor.wasm', () => {
       });
       throw new Error('expected native schema validation to reject mismatched metadata');
     } catch (error) {
-      expect(error).toBeInstanceOf(CompactEncodingError);
-      if (!(error instanceof CompactEncodingError)) {
+      expect(error).toBeInstanceOf(EventProcessorCreateError);
+      if (!(error instanceof EventProcessorCreateError)) {
         throw error;
       }
-      expect(error.status).toBe(7);
-      expect(error.code).toBe('SCHEMA_MISMATCH');
+      expect(error.code).toBe('SCHEMA_TYPE_MISMATCH');
+      expect(error.status).toBe(0x8000_0007);
     } finally {
       mismatchBackend.dispose();
     }
