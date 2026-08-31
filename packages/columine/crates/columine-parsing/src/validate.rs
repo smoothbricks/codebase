@@ -118,16 +118,6 @@ impl JsonValue {
         }
     }
 
-    /// Parse one MessagePack value using the extraction crate's reader.
-    pub(crate) fn parse_msgpack(input: &[u8]) -> Result<Self, ValueParseError> {
-        let mut reader = Reader::new(input);
-        let value = parse_msgpack_value(&mut reader, 0)?;
-        if reader.at_end() {
-            Ok(value)
-        } else {
-            Err(ValueParseError::InvalidMsgpack)
-        }
-    }
     pub fn object(fields: Vec<(String, JsonValue)>) -> Self {
         Self::Object(fields)
     }

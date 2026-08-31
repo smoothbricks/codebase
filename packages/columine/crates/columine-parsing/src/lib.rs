@@ -204,9 +204,6 @@ impl ExtractionConfig {
         self.open_paths.iter().any(|open| open == path)
     }
 
-    pub(crate) fn has_declared_payload_path(&self, path: &str) -> bool {
-        self.field_map.contains_key(path) || self.field_map.contains_key(&format!("value.{path}"))
-    }
     pub(crate) fn semantic_field_schema(
         &self,
         name: &str,
