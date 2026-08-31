@@ -433,16 +433,21 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
     .unwrap_or(0)
 }
 
+/// Complete a span with the caller's entry type.
+///
+/// Replaces the end_ok/end_err pair: two entry points could only express two
+/// of the completion types, so a thrown exception arrived as a handled error.
 #[unsafe(no_mangle)]
-pub extern "C" fn thread_span_buffer_end_ok(handle: u32, span_id: u32, timestamp: i64) -> u8 {
-    with_handle(handle, |buffer| buffer.end_ok(span_id, timestamp))
-        .map(|()| STATUS_OK)
-        .unwrap_or(STATUS_ERROR)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn thread_span_buffer_end_err(handle: u32, span_id: u32, timestamp: i64) -> u8 {
-    with_handle(handle, |buffer| buffer.end_err(span_id, timestamp))
+pub extern "C" fn thread_span_buffer_end(
+    handle: u32,
+    span_id: u32,
+    entry_type: u8,
+    timestamp: i64,
+) -> u8 {
+    let Some(entry_type) = EntryType::from_u8(entry_type) else {
+        return STATUS_ERROR;
+    };
+    with_handle(handle, |buffer| buffer.end(span_id, entry_type, timestamp))
         .map(|()| STATUS_OK)
         .unwrap_or(STATUS_ERROR)
 }
@@ -800,11 +805,14 @@ mod tests {
             let row = thread_span_buffer_append_log(handle, parent_id, 5, name_id, timestamp, 2);
             assert_ne!(row, 0);
         }
-        assert_eq!(thread_span_buffer_end_ok(handle, parent_id, 20), STATUS_OK);
+        assert_eq!(
+            thread_span_buffer_end(handle, parent_id, EntryType::SpanOk as u8, 20),
+            STATUS_OK
+        );
         assert_eq!(unsafe { thread_span_buffer_intern(0, trace, trace_len) }, 0);
         thread_span_buffer_free(handle);
         assert_eq!(
-            thread_span_buffer_end_ok(handle, parent_id, 21),
+            thread_span_buffer_end(handle, parent_id, EntryType::SpanOk as u8, 21),
             STATUS_ERROR
         );
     }

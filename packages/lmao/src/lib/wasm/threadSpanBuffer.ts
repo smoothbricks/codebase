@@ -62,8 +62,7 @@ export interface ThreadSpanBufferWasmExports {
     timestamp: bigint,
     line: number,
   ): bigint;
-  thread_span_buffer_end_ok(handle: ThreadSpanBufferHandle, spanId: number, timestamp: bigint): number;
-  thread_span_buffer_end_err(handle: ThreadSpanBufferHandle, spanId: number, timestamp: bigint): number;
+  thread_span_buffer_end(handle: ThreadSpanBufferHandle, spanId: number, entryType: number, timestamp: bigint): number;
   thread_span_buffer_append_log(
     handle: ThreadSpanBufferHandle,
     spanId: number,
@@ -146,8 +145,8 @@ export interface ThreadSpanBufferBinding {
     timestamp: bigint,
     line: number,
   ): bigint;
-  endOk(spanId: number, timestamp: bigint): number;
-  endErr(spanId: number, timestamp: bigint): number;
+  /** Complete a span with the tracer's own entry type. */
+  end(spanId: number, entryType: number, timestamp: bigint): number;
   appendLog(spanId: number, entryType: number, messageOrdinal: number, timestamp: bigint, line: number): bigint;
   appendLogStatic(spanId: number, entryType: number, messageId: number, timestamp: bigint, line: number): bigint;
   appendLogDynamic(
@@ -175,8 +174,7 @@ export function isThreadSpanBufferWasmExports(value: unknown): value is ThreadSp
     typeof Reflect.get(value, 'thread_span_buffer_open_span') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span_static') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span_dynamic') === 'function' &&
-    typeof Reflect.get(value, 'thread_span_buffer_end_ok') === 'function' &&
-    typeof Reflect.get(value, 'thread_span_buffer_end_err') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_end') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_append_log') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_append_log_static') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_append_log_dynamic') === 'function' &&
@@ -230,8 +228,7 @@ export function bindThreadSpanBuffer(
         timestamp,
         line,
       ),
-    endOk: (spanId, timestamp) => value.thread_span_buffer_end_ok(handle, spanId, timestamp),
-    endErr: (spanId, timestamp) => value.thread_span_buffer_end_err(handle, spanId, timestamp),
+    end: (spanId, entryType, timestamp) => value.thread_span_buffer_end(handle, spanId, entryType, timestamp),
     appendLog: (spanId, entryType, messageOrdinal, timestamp, line) =>
       value.thread_span_buffer_append_log(handle, spanId, entryType, messageOrdinal, timestamp, line),
     appendLogStatic: (spanId, entryType, messageId, timestamp, line) =>
