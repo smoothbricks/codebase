@@ -13,6 +13,7 @@ import {
   applyPublicPackageDefaults,
   applyWorkspaceDependencyDefaults,
   type ResolvedProjectTargets,
+  validateNoStaleTestOutput,
   validateNxProjectNames,
   validateNxReleaseConfig,
   validatePublicPackageMetadata,
@@ -108,7 +109,8 @@ const packs: MonorepoPack[] = [
         validateNxReleaseConfig(ctx.root) +
         validateBunLockfileVersions(ctx.root) +
         (await validateNxSync(ctx.root, ctx.verbose === true)) +
-        validateTestFileLocations(ctx.root)
+        validateTestFileLocations(ctx.root) +
+        validateNoStaleTestOutput(ctx.root)
       );
     },
   },

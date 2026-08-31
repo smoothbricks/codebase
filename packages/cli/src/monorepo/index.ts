@@ -18,6 +18,7 @@ import {
   applyPublicPackageDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
+  validateNoStaleTestOutput,
   validateNxProjectNames,
   validateNxReleaseConfig,
   validatePublicPackageMetadata,
@@ -126,6 +127,7 @@ export async function checkManagedFiles(root: string, options: { warn?: boolean 
     validatePublicTags(root) +
     validatePublicPackageMetadata(root) +
     validateTestFileLocations(root) +
+    validateNoStaleTestOutput(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargets }) +
     validateDevenvModuleImport(root) +
     validateCargoCachePolicy(root) +
