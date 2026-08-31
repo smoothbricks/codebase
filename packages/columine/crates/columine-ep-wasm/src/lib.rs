@@ -30,6 +30,12 @@ pub const VERSION: u32 = 2;
 /// capacity; the requested capacity is honored now. A sanity ceiling guards
 /// against unreasonable requests corrupting the address space. Requests above
 /// it are refused with [`CreateFailure::Capacity`], never a bare 0.
+///
+/// It is a guard, not a guarantee. The column plane a capacity implies scales
+/// with schema width, so a request well under this ceiling can still exhaust
+/// linear memory — and a wasm allocation failure aborts, so it surfaces as a
+/// trap in the host rather than as any [`CreateFailure`] code. Measured: 32
+/// utf8 columns create at capacity 61440 and trap at 61932.
 pub const MAX_EVENT_CAPACITY: u32 = 1 << 20;
 
 struct EpInstance {

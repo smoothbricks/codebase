@@ -97,7 +97,28 @@ const MIN_WORKSPACE_BYTES = 256 * 1024;
 const FIXED_LAYOUT_OVERHEAD_BYTES = 64 * 1024;
 const MAX_BATCH_INPUT_BYTES = 64 * 1024 * 1024;
 const MAX_BATCH_OUTPUT_BYTES = 64 * 1024 * 1024;
+/**
+ * Ceiling for `batch.rowCount`, a VALIDATION limit: the native
+ * `MAX_EVENTS_PER_BATCH` clamp in columine-arrow. Nothing is allocated for it.
+ */
 const MAX_EVENTS_PER_BATCH = 65_536;
+
+/**
+ * Event capacity passed to `ep_create_*`, an ALLOCATION SIZE: the native
+ * `WASM_EVENT_CAPACITY`. It cannot be `MAX_EVENTS_PER_BATCH` — the native
+ * `DynamicColumns::new` allocates the whole column plane eagerly, at
+ * `min(MAX_VARIABLE_DATA_BYTES, capacity * 128)` data bytes plus
+ * `(capacity + 1) * 4` offset bytes per variable-width column. Measured
+ * against the shipped artifact: one utf8 column at capacity 65536 grows the
+ * wasm heap 8.06 MiB and the seven-field compact schema needs 26.06 MiB, where
+ * the same schema at 256 needs 0.10 MiB; past roughly 32 variable-width
+ * columns the eager plane exceeds the artifact's 256 MiB memory maximum and
+ * the allocator traps. Rows beyond it are not lost: `encode` hands the native
+ * compact path a caller-owned batch of up to `MAX_EVENTS_PER_BATCH` rows
+ * without touching the parse plane.
+ */
+const EP_EVENT_CAPACITY = 256;
+
 const MAX_FIELDS = 256;
 const MAX_VARIABLE_DATA_BYTES = 16 * 1024 * 1024;
 const MIN_COMPACT_ARROW_CAPACITY = 4 * 1024;
@@ -947,7 +968,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         handle = requireEpHandle(
           fieldNamesBuffer
             ? wasm.ep_create_with_schema_and_names(
-                MAX_EVENTS_PER_BATCH,
+                EP_EVENT_CAPACITY,
                 layout.schemaOffset,
                 config.schemaBytes.length,
                 layout.fieldMetaOffset,
@@ -956,7 +977,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
                 fieldNamesBuffer.length,
               )
             : wasm.ep_create_with_schema(
-                MAX_EVENTS_PER_BATCH,
+                EP_EVENT_CAPACITY,
                 layout.schemaOffset,
                 config.schemaBytes.length,
                 layout.fieldMetaOffset,
@@ -1040,7 +1061,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         memory.set(batch.schema.fieldMetadata, layout.fieldMetaOffset);
         handle = requireEpHandle(
           wasm.ep_create_with_schema(
-            MAX_EVENTS_PER_BATCH,
+            EP_EVENT_CAPACITY,
             layout.schemaOffset,
             batch.schema.schemaBytes.length,
             layout.fieldMetaOffset,
