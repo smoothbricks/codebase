@@ -10,6 +10,7 @@
  */
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
+import { LOG_STAMP_REFRESH, type StampCache } from './coarseClock.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import { createTraceId, type TraceId } from './traceId.js';
@@ -33,20 +34,46 @@ const textEncoder = new TextEncoder();
 
 //#region smoo/lmao!n/trace-root-timestamps #node
 /**
- * TraceRoot - Node.js implementation.
- *
- * Stores anchor data in _system ArrayBuffer and writes timestamps directly from JS.
+ * Fresh stamp: one clock read, the monotonic guard, and it seeds the row cache
+ * so the log rows that follow reuse this read. Span boundaries and the public
+ * `getTimestampNanos()` both land here, so durations never coarsen. This is
+ * also the injectable seam — `process.hrtime.bigint` is read through the global
+ * on every call, never captured, so a substituted clock stays deterministic.
  */
-function nextTimestamp(root: TraceRoot): Nanoseconds {
+function boundaryTimestamp(root: TraceRoot): Nanoseconds {
   let timestamp = root._epochHrtimeOffset + process.hrtime.bigint();
   if (timestamp <= root._lastTimestampNanos) timestamp = root._lastTimestampNanos + 1n;
   root._lastTimestampNanos = timestamp;
+  root._stampCache = timestamp;
+  root._stampReads = LOG_STAMP_REFRESH;
   return Nanoseconds.unsafe(timestamp);
+}
+
+/**
+ * Log-row stamp: the cached read, refreshed every {@link LOG_STAMP_REFRESH}
+ * rows. Rows in one block share a stamp — row order, not stamp distinctness,
+ * is authoritative for ordering — which is what drops the clock read, the epoch
+ * add and the monotonic guard from the marginal row.
+ *
+ * The refreshing row spends one unit of the new budget itself, so exactly
+ * {@link LOG_STAMP_REFRESH} rows ever share one stamp. Without that the row
+ * that forces the read would ride its own fresh value AND grant a full budget
+ * to the next sixteen, making the real bound seventeen and the constant a lie.
+ */
+function logTimestamp(root: TraceRoot): Nanoseconds {
+  const reads = root._stampReads;
+  if (reads === 0) {
+    const fresh = boundaryTimestamp(root);
+    root._stampReads = LOG_STAMP_REFRESH - 1;
+    return fresh;
+  }
+  root._stampReads = reads - 1;
+  return Nanoseconds.unsafe(root._stampCache);
 }
 
 const timestampNow: TimestampNowPrimitive = (traceRoot) => {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Node primitive table is only installed on TraceRoot.node instances.
-  return nextTimestamp(traceRoot as TraceRoot);
+  return boundaryTimestamp(traceRoot as TraceRoot);
 };
 
 const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) => {
@@ -54,7 +81,7 @@ const appendLogEntry: TimestampAppendPrimitive = (traceRoot, buffer, entryType) 
   if (entryTypes === undefined) throw new TypeError('Split timestamp appender requires entry_type storage');
   const idx = buffer._writeIndex;
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Node primitive table is only installed on TraceRoot.node instances.
-  buffer.timestamp[idx] = nextTimestamp(traceRoot as TraceRoot);
+  buffer.timestamp[idx] = logTimestamp(traceRoot as TraceRoot);
   entryTypes[idx] = entryType;
   buffer._writeIndex = idx + 1;
   return idx;
@@ -64,7 +91,7 @@ const writeSpanStartPrimitive: SpanStartPrimitive = (traceRoot, buffer, spanName
   const entryTypes = buffer.entry_type;
   if (entryTypes === undefined) throw new TypeError('Split span-start appender requires entry_type storage');
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Node primitive table is only installed on TraceRoot.node instances.
-  buffer.timestamp[0] = nextTimestamp(traceRoot as TraceRoot);
+  buffer.timestamp[0] = boundaryTimestamp(traceRoot as TraceRoot);
   entryTypes[0] = ENTRY_TYPE_SPAN_START;
   if (buffer.message_values) buffer.message(0, spanName);
   entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
@@ -76,12 +103,12 @@ const writeSpanEndPrimitive: SpanEndPrimitive = (traceRoot, buffer, entryType) =
   const entryTypes = buffer.entry_type;
   if (entryTypes === undefined) throw new TypeError('Split span-end appender requires entry_type storage');
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Node primitive table is only installed on TraceRoot.node instances.
-  buffer.timestamp[1] = nextTimestamp(traceRoot as TraceRoot);
+  buffer.timestamp[1] = boundaryTimestamp(traceRoot as TraceRoot);
   entryTypes[1] = entryType;
   buffer._sealStatsChain();
 };
 
-export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T> {
+export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>, StampCache {
   /**
    * Raw backing buffer containing anchor timestamps and trace_id.
    */
@@ -108,6 +135,9 @@ export class TraceRoot<T extends LogSchema = LogSchema> implements ITraceRoot<T>
   /** Epoch offset makes each exact timestamp one clock read plus one BigInt addition. */
   readonly _epochHrtimeOffset: bigint;
   _lastTimestampNanos = 0n;
+  _stampCache = 0n;
+  /** Zero so the first log row of a trace forces a fresh read, never a stale zero. */
+  _stampReads = 0;
 
   constructor(
     trace_id: TraceId,
