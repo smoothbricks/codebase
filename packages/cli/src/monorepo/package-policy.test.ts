@@ -19,6 +19,7 @@ import {
   applyNxProjectNameDefaults,
   applyWorkspaceDependencyDefaults,
   listValidCommitScopes,
+  validateNoStaleTestOutput,
   validateNxProjectNames,
   validateNxReleaseConfig,
   validateRootPackagePolicy,
@@ -230,6 +231,35 @@ describe('test file location policy', () => {
       expect(validateTestFileLocations(root)).toBe(2);
       expect(errors.join('\n')).toContain('scripts/helper.test.ts');
       expect(errors.join('\n')).toContain('stray.spec.tsx');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('stale test output policy', () => {
+  afterEach(() => {
+    console.error = originalConsoleError;
+  });
+
+  it('fails a package holding dist-test and names the removal', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [
+        { dir: 'app', name: '@smoothbricks/app' },
+        { dir: 'lib', name: '@smoothbricks/lib' },
+      ],
+    });
+    try {
+      expect(validateNoStaleTestOutput(root)).toBe(0);
+
+      // Emitted output, not a config: tsconfig.test.json is noEmit, so nothing
+      // should have written this and the loader walks it regardless of gitignore.
+      await writeSource(join(root, 'packages/app/dist-test/monorepo/index.js'));
+      const errors = captureConsoleErrors();
+      expect(validateNoStaleTestOutput(root)).toBe(1);
+      expect(errors.join('\n')).toContain('packages/app/dist-test');
+      expect(errors.join('\n')).toContain('rm -rf packages/app/dist-test');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
