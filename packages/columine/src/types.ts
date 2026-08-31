@@ -193,7 +193,7 @@ export interface StructMap2RowRef {
   readonly rowOffset: number;
 }
 
-/** Lossless scalar slot value. Empty is explicit rather than overloaded as zero. */
+/** Lossless reducer-VM scalar slot value (`AggType::SCALAR_*`), not a CompactColumn plane. Empty is explicit rather than overloaded as zero. */
 export type ScalarValue =
   | { readonly kind: 'empty' }
   | { readonly kind: 'u32'; readonly value: number }

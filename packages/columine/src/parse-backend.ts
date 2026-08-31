@@ -144,7 +144,26 @@ const COMPACT_KIND_TAG = {
   utf8: 4,
   bool: 5,
   i64: 6,
+  i8: 7,
+  i16: 8,
+  u8: 9,
+  u16: 10,
+  u32: 11,
+  u64: 12,
+  f16: 13,
+  f32: 14,
+  decimal128: 15,
+  decimal256: 16,
+  largeBinary: 17,
+  largeUtf8: 18,
+  fixedSizeBinary: 19,
+  intervalYearMonth: 20,
+  intervalDayTime: 21,
+  intervalMonthDayNano: 22,
 } as const satisfies Record<CompactColumn['kind'], number>;
+
+const COMPACT_MAX_KIND_TAG = Math.max(...Object.values(COMPACT_KIND_TAG));
+const MAX_FIXED_SIZE_BINARY_WIDTH = Math.floor(MAX_VARIABLE_DATA_BYTES / MAX_EVENTS_PER_BATCH);
 
 const COMPACT_STATUS_CODE = {
   1: 'INVALID_HANDLE',
@@ -191,7 +210,7 @@ const EP_CREATE_FAILURE_DETAIL = {
   SCHEMA_MESSAGE: 'schemaBytes is not one continuation-prefixed Arrow IPC Schema message',
   SCHEMA_TOO_MANY_FIELDS: `the schema declares more than ${MAX_FIELDS} fields`,
   SCHEMA_FIELD_COUNT: 'schemaBytes and fieldMetadata declare different field counts',
-  SCHEMA_FIELD_METADATA: 'a fieldMetadata entry is not a valid [type, nullable, 0, 0] descriptor',
+  SCHEMA_FIELD_METADATA: 'a fieldMetadata entry is not a valid [tag, nullable, typeParam u16 LE] descriptor',
   SCHEMA_TYPE_MISMATCH: "a fieldMetadata physical tag disagrees with that field's logical Arrow type in schemaBytes",
   SCHEMA_NULLABILITY: 'a field nullability flag disagrees with schemaBytes, or a Null field is non-nullable',
   SCHEMA_FIELD_NAMES: 'the field-name blob is malformed or does not carry one name per field',
@@ -352,7 +371,8 @@ interface CompactColumnPlan {
   readonly validity: CompactBufferPlan | null;
   readonly offsets: CompactBufferPlan | null;
   readonly data: CompactBufferPlan | null;
-  readonly dataElementBytes: 1 | 4 | 8;
+  readonly dataElementBytes: 1 | 2 | 4 | 8;
+  readonly offsetElementBytes: 4 | 8;
 }
 
 interface CompactMemoryLayout {
@@ -537,28 +557,45 @@ function validateValidity(
 }
 
 function validateVariableColumn(
-  column: Extract<CompactColumn, { kind: 'binary' | 'utf8' }>,
+  column: Extract<CompactColumn, { kind: 'binary' | 'utf8' | 'largeBinary' | 'largeUtf8' }>,
   validity: Uint8Array | undefined,
   rowCount: number,
   fieldIndex: number,
 ): void {
-  assertUint32Array(column.offsets, `columns[${fieldIndex}].offsets`);
+  const large = column.kind === 'largeBinary' || column.kind === 'largeUtf8';
+  if (large) {
+    if (!(column.offsets instanceof BigInt64Array)) {
+      throw new TypeError(`columns[${fieldIndex}].offsets must be a BigInt64Array`);
+    }
+  } else {
+    assertUint32Array(column.offsets, `columns[${fieldIndex}].offsets`);
+  }
+  const offsets = column.offsets;
   assertUint8Array(column.data, `columns[${fieldIndex}].data`);
-  if (column.offsets.length !== rowCount + 1) {
+  if (offsets.length !== rowCount + 1) {
     throw new RangeError(`columns[${fieldIndex}].offsets must contain exactly rowCount + 1 entries`);
   }
   if (column.data.byteLength > MAX_VARIABLE_DATA_BYTES) {
     throw new RangeError(`columns[${fieldIndex}].data exceeds the ${MAX_VARIABLE_DATA_BYTES}-byte variable-data limit`);
   }
-  if (column.offsets[0] !== 0) {
+
+  const offsetAt = (index: number): bigint => {
+    if (offsets instanceof BigInt64Array) {
+      return requiredArrayValue(offsets, index, `columns[${fieldIndex}].offsets`);
+    }
+    return BigInt(requiredArrayValue(offsets, index, `columns[${fieldIndex}].offsets`));
+  };
+  const dataLength = BigInt(column.data.byteLength);
+  if (offsetAt(0) !== 0n) {
     throw new RangeError(`columns[${fieldIndex}].offsets must start at zero`);
   }
 
-  const decoder = column.kind === 'utf8' ? new TextDecoder('utf-8', { fatal: true }) : null;
-  let previous = 0;
+  const decoder =
+    column.kind === 'utf8' || column.kind === 'largeUtf8' ? new TextDecoder('utf-8', { fatal: true }) : null;
+  let previous = 0n;
   for (let row = 0; row < rowCount; row += 1) {
-    const next = requiredArrayValue(column.offsets, row + 1, `columns[${fieldIndex}].offsets`);
-    if (next < previous || next > column.data.byteLength) {
+    const next = offsetAt(row + 1);
+    if (next < previous || next > dataLength) {
       throw new RangeError(`columns[${fieldIndex}].offsets must be monotonic and within data`);
     }
     const valid = validity === undefined || validityBitIsSet(validity, row);
@@ -567,15 +604,36 @@ function validateVariableColumn(
     }
     if (valid && decoder !== null) {
       try {
-        decoder.decode(column.data.subarray(previous, next));
+        decoder.decode(column.data.subarray(Number(previous), Number(next)));
       } catch {
         throw new TypeError(`columns[${fieldIndex}] row ${row} is not valid UTF-8`);
       }
     }
     previous = next;
   }
-  if (previous !== column.data.byteLength) {
+  if (previous !== dataLength) {
     throw new RangeError(`columns[${fieldIndex}] final offset must equal data.byteLength`);
+  }
+}
+
+function validateFixedValues(
+  data: ArrayBufferView & { readonly length: number },
+  ctor: new (length: number) => ArrayBufferView,
+  fieldIndex: number,
+  expectedValues: number,
+): void {
+  if (!(data instanceof ctor)) {
+    const article = ctor.name === 'Int32Array' || ctor.name === 'Int8Array' || ctor.name === 'Int16Array' ? 'an' : 'a';
+    throw new TypeError(`columns[${fieldIndex}].data must be ${article} ${ctor.name}`);
+  }
+  if (data.length !== expectedValues) {
+    throw new RangeError(`columns[${fieldIndex}].data must contain exactly ${expectedValues} values`);
+  }
+}
+
+function validateFixedBytes(data: Uint8Array, fieldIndex: number, expectedBytes: number): void {
+  if (data.byteLength !== expectedBytes) {
+    throw new RangeError(`columns[${fieldIndex}].data must contain exactly ${expectedBytes} bytes`);
   }
 }
 
@@ -612,13 +670,24 @@ function validateCompactBatch(batch: CompactBatch): void {
     const metadataOffset = fieldIndex * 4;
     const tag = requiredArrayValue(metadata, metadataOffset, 'fieldMetadata');
     const nullableByte = requiredArrayValue(metadata, metadataOffset + 1, 'fieldMetadata');
-    if (tag > COMPACT_KIND_TAG.i64) {
-      throw new TypeError(`fieldMetadata field ${fieldIndex} has unknown physical type ${tag}`);
+    const typeParam =
+      requiredArrayValue(metadata, metadataOffset + 2, 'fieldMetadata') |
+      (requiredArrayValue(metadata, metadataOffset + 3, 'fieldMetadata') << 8);
+    if (tag > COMPACT_MAX_KIND_TAG) {
+      throw new TypeError(
+        `fieldMetadata field ${fieldIndex} has unknown physical type ${tag} (max ${COMPACT_MAX_KIND_TAG})`,
+      );
     }
     if (nullableByte !== 0 && nullableByte !== 1) {
       throw new TypeError(`fieldMetadata field ${fieldIndex} nullable byte must be zero or one`);
     }
-    if (metadata[metadataOffset + 2] !== 0 || metadata[metadataOffset + 3] !== 0) {
+    if (tag === COMPACT_KIND_TAG.fixedSizeBinary) {
+      if (typeParam < 1 || typeParam > MAX_FIXED_SIZE_BINARY_WIDTH) {
+        throw new RangeError(
+          `fieldMetadata field ${fieldIndex} FixedSizeBinary width must be in 1..${MAX_FIXED_SIZE_BINARY_WIDTH}`,
+        );
+      }
+    } else if (typeParam !== 0) {
       throw new TypeError(`fieldMetadata field ${fieldIndex} padding bytes must be zero`);
     }
 
@@ -642,44 +711,78 @@ function validateCompactBatch(batch: CompactBatch): void {
     }
 
     const validity = validateValidity(column.validity, nullable, batch.rowCount, fieldIndex);
+    const rows = batch.rowCount;
     switch (column.kind) {
-      case 'i32':
-        if (!(column.data instanceof Int32Array)) {
-          throw new TypeError(`columns[${fieldIndex}].data must be an Int32Array`);
-        }
-        if (column.data.length !== batch.rowCount) {
-          throw new RangeError(`columns[${fieldIndex}].data must contain exactly rowCount values`);
-        }
+      case 'i8':
+        validateFixedValues(column.data, Int8Array, fieldIndex, rows);
         break;
-      case 'f64':
-        if (!(column.data instanceof Float64Array)) {
-          throw new TypeError(`columns[${fieldIndex}].data must be a Float64Array`);
-        }
-        if (column.data.length !== batch.rowCount) {
-          throw new RangeError(`columns[${fieldIndex}].data must contain exactly rowCount values`);
-        }
+      case 'u8':
+        validateFixedValues(column.data, Uint8Array, fieldIndex, rows);
+        break;
+      case 'i16':
+        validateFixedValues(column.data, Int16Array, fieldIndex, rows);
+        break;
+      case 'u16':
+      case 'f16':
+        validateFixedValues(column.data, Uint16Array, fieldIndex, rows);
+        break;
+      case 'i32':
+      case 'intervalYearMonth':
+        validateFixedValues(column.data, Int32Array, fieldIndex, rows);
+        break;
+      case 'u32':
+        validateFixedValues(column.data, Uint32Array, fieldIndex, rows);
+        break;
+      case 'f32':
+        validateFixedValues(column.data, Float32Array, fieldIndex, rows);
+        break;
+      case 'intervalDayTime':
+        validateFixedValues(column.data, Int32Array, fieldIndex, rows * 2);
         break;
       case 'i64':
-        if (!(column.data instanceof BigInt64Array)) {
-          throw new TypeError(`columns[${fieldIndex}].data must be a BigInt64Array`);
-        }
-        if (column.data.length !== batch.rowCount) {
-          throw new RangeError(`columns[${fieldIndex}].data must contain exactly rowCount values`);
-        }
+        validateFixedValues(column.data, BigInt64Array, fieldIndex, rows);
+        break;
+      case 'u64':
+        validateFixedValues(column.data, BigUint64Array, fieldIndex, rows);
+        break;
+      case 'f64':
+        validateFixedValues(column.data, Float64Array, fieldIndex, rows);
         break;
       case 'bool': {
         assertUint8Array(column.data, `columns[${fieldIndex}].data`);
-        const expectedLength = Math.ceil(batch.rowCount / 8);
+        const expectedLength = Math.ceil(rows / 8);
         if (column.data.byteLength !== expectedLength) {
           throw new RangeError(`columns[${fieldIndex}].data must contain exactly ${expectedLength} bitmap bytes`);
         }
-        validateTrailingBits(column.data, batch.rowCount, `columns[${fieldIndex}].data`);
+        validateTrailingBits(column.data, rows, `columns[${fieldIndex}].data`);
         break;
       }
+      case 'decimal128':
+        assertUint8Array(column.data, `columns[${fieldIndex}].data`);
+        validateFixedBytes(column.data, fieldIndex, rows * 16);
+        break;
+      case 'decimal256':
+        assertUint8Array(column.data, `columns[${fieldIndex}].data`);
+        validateFixedBytes(column.data, fieldIndex, rows * 32);
+        break;
+      case 'intervalMonthDayNano':
+        assertUint8Array(column.data, `columns[${fieldIndex}].data`);
+        validateFixedBytes(column.data, fieldIndex, rows * 16);
+        break;
+      case 'fixedSizeBinary':
+        assertUint8Array(column.data, `columns[${fieldIndex}].data`);
+        validateFixedBytes(column.data, fieldIndex, rows * typeParam);
+        break;
       case 'binary':
       case 'utf8':
-        validateVariableColumn(column, validity, batch.rowCount, fieldIndex);
+      case 'largeBinary':
+      case 'largeUtf8':
+        validateVariableColumn(column, validity, rows, fieldIndex);
         break;
+      default: {
+        const _exhaustive: never = column;
+        throw new TypeError(`columns[${fieldIndex}] has unhandled kind ${String((_exhaustive as CompactColumn).kind)}`);
+      }
     }
   }
 }
@@ -715,23 +818,48 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
     const validity = planBuffer(validitySource, `columns[${index}].validity`, true);
     let offsets: CompactBufferPlan | null = null;
     let data: CompactBufferPlan | null = null;
-    let dataElementBytes: 1 | 4 | 8 = 1;
+    let dataElementBytes: 1 | 2 | 4 | 8 = 1;
+    let offsetElementBytes: 4 | 8 = 4;
 
     switch (column.kind) {
       case 'null':
         break;
+      case 'i8':
+      case 'u8':
+        bufferCount += 2;
+        data = planBuffer(typedArrayBytes(column.data), `columns[${index}].data`);
+        break;
+      case 'bool':
+        bufferCount += 2;
+        data = planBuffer(column.data, `columns[${index}].data`);
+        break;
+      case 'i16':
+      case 'u16':
+      case 'f16':
+        bufferCount += 2;
+        dataElementBytes = 2;
+        data = planBuffer(typedArrayBytes(column.data), `columns[${index}].data`);
+        break;
       case 'i32':
+      case 'u32':
+      case 'f32':
+      case 'intervalYearMonth':
+      case 'intervalDayTime':
         bufferCount += 2;
         dataElementBytes = 4;
         data = planBuffer(typedArrayBytes(column.data), `columns[${index}].data`);
         break;
-      case 'f64':
       case 'i64':
+      case 'u64':
+      case 'f64':
         bufferCount += 2;
         dataElementBytes = 8;
         data = planBuffer(typedArrayBytes(column.data), `columns[${index}].data`);
         break;
-      case 'bool':
+      case 'decimal128':
+      case 'decimal256':
+      case 'fixedSizeBinary':
+      case 'intervalMonthDayNano':
         bufferCount += 2;
         data = planBuffer(column.data, `columns[${index}].data`);
         break;
@@ -741,6 +869,17 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
         offsets = planBuffer(typedArrayBytes(column.offsets), `columns[${index}].offsets`);
         data = planBuffer(column.data, `columns[${index}].data`);
         break;
+      case 'largeBinary':
+      case 'largeUtf8':
+        bufferCount += 3;
+        offsetElementBytes = 8;
+        offsets = planBuffer(typedArrayBytes(column.offsets), `columns[${index}].offsets`);
+        data = planBuffer(column.data, `columns[${index}].data`);
+        break;
+      default: {
+        const _exhaustive: never = column;
+        throw new TypeError(`unhandled CompactColumn kind ${String((_exhaustive as CompactColumn).kind)}`);
+      }
     }
 
     columns.push({
@@ -749,6 +888,7 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
       offsets,
       data,
       dataElementBytes,
+      offsetElementBytes,
     });
   }
 
@@ -809,7 +949,7 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
   };
 }
 
-function copyLittleEndian(memory: Uint8Array, offset: number, source: Uint8Array, elementBytes: 1 | 4 | 8): void {
+function copyLittleEndian(memory: Uint8Array, offset: number, source: Uint8Array, elementBytes: 1 | 2 | 4 | 8): void {
   if (HOST_IS_LITTLE_ENDIAN || elementBytes === 1) {
     memory.set(source, offset);
     return;
@@ -852,7 +992,12 @@ function writeCompactBatch(memoryBuffer: ArrayBuffer, layout: CompactMemoryLayou
       memory.set(column.validity.source, layout.batchOffset + column.validity.offset);
     }
     if (column.offsets !== null) {
-      copyLittleEndian(memory, layout.batchOffset + column.offsets.offset, column.offsets.source, 4);
+      copyLittleEndian(
+        memory,
+        layout.batchOffset + column.offsets.offset,
+        column.offsets.source,
+        column.offsetElementBytes,
+      );
     }
     if (column.data !== null) {
       copyLittleEndian(memory, layout.batchOffset + column.data.offset, column.data.source, column.dataElementBytes);

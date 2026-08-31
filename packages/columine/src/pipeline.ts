@@ -26,7 +26,11 @@ import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from '
 export interface EncodedArrowSchema {
   /** One complete framed Arrow IPC Schema message. */
   readonly schemaBytes: Uint8Array;
-  /** Four bytes per field: [physicalType, nullable ? 1 : 0, 0, 0]. */
+  /**
+   * Four bytes per field: `[tag u8, nullable u8, typeParam u16 LE]`.
+   * `typeParam` is the FixedSizeBinary byte width for tag 19 and must be 0
+   * for every other tag.
+   */
   readonly fieldMetadata: Uint8Array;
 }
 
@@ -36,16 +40,27 @@ export interface ParseConfig extends EncodedArrowSchema {
 }
 
 /**
- * A physical Arrow column accepted by Compact. `kind` names the physical
- * plane, and each plane's element type is the one the native encoder reads:
- * plane `i32` is signed, so its buffer is an `Int32Array`.
+ * A physical Arrow column accepted by Compact.
+ *
+ * Nested and dictionary-encoded types (List, LargeList, FixedSizeList, Struct,
+ * Union, Map, RunEndEncoded, Dictionary) are excluded: the retained-metadata
+ * contract encodes at most three buffers per field (`max_buffers =
+ * MAX_SCHEMA_FIELDS * 3`). Nested types need a different layout contract, not
+ * another enum arm.
+ *
+ * `kind` names the physical plane and each arm's typed array is the carrier
+ * that plane's encoder reads — a kind/carrier disagreement cannot be
+ * expressed. Date32/Time32 ride `i32`; Date64/Time64/Timestamp/Duration ride
+ * `i64`. Interval does not: its elements are not scalars.
+ *
+ * `f16` carries raw IEEE-754 half bits in a `Uint16Array` (Float16Array is
+ * not baseline). `intervalDayTime` is two `i32` values per row (days,
+ * milliseconds), so `data.length === rowCount * 2`.
  */
 export type CompactColumn =
   | { readonly kind: 'null' }
   | { readonly kind: 'i32'; readonly data: Int32Array; readonly validity?: Uint8Array }
   | { readonly kind: 'f64'; readonly data: Float64Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'i64'; readonly data: BigInt64Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'bool'; readonly data: Uint8Array; readonly validity?: Uint8Array }
   | {
       readonly kind: 'binary';
       readonly offsets: Uint32Array;
@@ -57,7 +72,35 @@ export type CompactColumn =
       readonly offsets: Uint32Array;
       readonly data: Uint8Array;
       readonly validity?: Uint8Array;
-    };
+    }
+  | { readonly kind: 'bool'; readonly data: Uint8Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'i64'; readonly data: BigInt64Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'i8'; readonly data: Int8Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'i16'; readonly data: Int16Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'u8'; readonly data: Uint8Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'u16'; readonly data: Uint16Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'u32'; readonly data: Uint32Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'u64'; readonly data: BigUint64Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'f16'; readonly data: Uint16Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'f32'; readonly data: Float32Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'decimal128'; readonly data: Uint8Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'decimal256'; readonly data: Uint8Array; readonly validity?: Uint8Array }
+  | {
+      readonly kind: 'largeBinary';
+      readonly offsets: BigInt64Array;
+      readonly data: Uint8Array;
+      readonly validity?: Uint8Array;
+    }
+  | {
+      readonly kind: 'largeUtf8';
+      readonly offsets: BigInt64Array;
+      readonly data: Uint8Array;
+      readonly validity?: Uint8Array;
+    }
+  | { readonly kind: 'fixedSizeBinary'; readonly data: Uint8Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'intervalYearMonth'; readonly data: Int32Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'intervalDayTime'; readonly data: Int32Array; readonly validity?: Uint8Array }
+  | { readonly kind: 'intervalMonthDayNano'; readonly data: Uint8Array; readonly validity?: Uint8Array };
 
 /** One complete record batch for Compact encoding. */
 export interface CompactBatch {
