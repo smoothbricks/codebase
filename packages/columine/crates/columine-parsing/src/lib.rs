@@ -90,9 +90,7 @@ pub fn parsed_event(columns: &DynamicColumns, row: u32) -> Option<ParsedEvent> {
     Some(ParsedEvent {
         id: text(base_column::ID)?,
         event_type: text(base_column::TYPE)?,
-        timestamp_micros: columns
-            .get_column(base_column::TIMESTAMP)?
-            .read_int(row)?,
+        timestamp_micros: columns.get_column(base_column::TIMESTAMP)?.read_int(row)?,
         value: (!columns.is_null(base_column::VALUE, row))
             .then(|| {
                 columns

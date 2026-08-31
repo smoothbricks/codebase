@@ -368,7 +368,6 @@ impl ColumnStorage {
     }
 }
 
-
 /// Errors surfaced by the transactional variable-width writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VariableValueError {
@@ -927,7 +926,8 @@ mod tests {
     // test "ColumnStorage configured maximum and reset retain grown allocation"
     #[test]
     fn column_storage_configured_maximum() {
-        let mut col = ColumnStorage::with_variable_limit(PlaneKind::Bytes { offset_width: 4 }, 2, 1024);
+        let mut col =
+            ColumnStorage::with_variable_limit(PlaneKind::Bytes { offset_width: 4 }, 2, 1024);
         col.ensure_variable_capacity(1024).unwrap();
         assert_eq!(col.data_capacity(), 1024);
         for _ in 0..20 {
@@ -1004,5 +1004,76 @@ mod tests {
             cols.reserve_binary_value(0).unwrap_err(),
             VariableValueError::InvalidFieldType
         );
+    }
+
+    #[test]
+    fn binary16_conversion_handles_the_hard_cases() {
+        // Exact halves survive both directions.
+        for value in [0.0f32, -0.0, 1.0, -2.0, 1.5, 2048.0, 65504.0, -65504.0] {
+            let bits = f16_bits_from_f32(value);
+            assert_eq!(
+                f32_from_f16_bits(bits),
+                value,
+                "{value} is exactly representable in binary16"
+            );
+        }
+
+        // 65504 is the largest half; anything above it saturates to infinity
+        // rather than wrapping to a small number.
+        assert!(f32_from_f16_bits(f16_bits_from_f32(65520.0)).is_infinite());
+        assert!(f32_from_f16_bits(f16_bits_from_f32(f32::MAX)).is_infinite());
+        assert_eq!(f16_bits_from_f32(f32::NEG_INFINITY), 0xfc00);
+
+        // NaN must stay NaN. Rounding a NaN payload down to zero would turn it
+        // into infinity, which is a different value and not a rounder one.
+        assert!(f32_from_f16_bits(f16_bits_from_f32(f32::NAN)).is_nan());
+
+        // Subnormals: 2^-24 is the smallest, 2^-25 is exactly halfway to zero
+        // and ties to even (zero), and 2^-26 rounds to zero outright.
+        let smallest = 2.0f32.powi(-24);
+        assert_eq!(f32_from_f16_bits(f16_bits_from_f32(smallest)), smallest);
+        assert_eq!(f32_from_f16_bits(f16_bits_from_f32(2.0f32.powi(-25))), 0.0);
+        assert_eq!(f32_from_f16_bits(f16_bits_from_f32(2.0f32.powi(-26))), 0.0);
+        // Just over halfway rounds up to the smallest subnormal.
+        assert_eq!(
+            f32_from_f16_bits(f16_bits_from_f32(2.0f32.powi(-25) * 1.5)),
+            smallest
+        );
+        // A binary32 subnormal is far below the binary16 range.
+        assert_eq!(
+            f32_from_f16_bits(f16_bits_from_f32(f32::MIN_POSITIVE / 2.0)),
+            0.0
+        );
+
+        // Ties to even at full precision: 2049 sits exactly between the halves
+        // 2048 and 2050, and the even one wins.
+        assert_eq!(f32_from_f16_bits(f16_bits_from_f32(2049.0)), 2048.0);
+        assert_eq!(f32_from_f16_bits(f16_bits_from_f32(2051.0)), 2052.0);
+
+        // Rounding up out of the significand carries into the exponent.
+        assert_eq!(f32_from_f16_bits(f16_bits_from_f32(2047.9)), 2048.0);
+    }
+
+    #[test]
+    fn storage_is_sized_by_the_plane_and_not_by_a_flat_estimate() {
+        // The regression this exists for: every column used to reserve either
+        // eight bytes per row or the 128-byte variable-width estimate, so a
+        // one-byte plane cost what an eight-byte one did.
+        let capacity = 1_024u32;
+        for (kind, expected) in [
+            (PlaneKind::SignedInt { width: 1 }, 1_024),
+            (PlaneKind::SignedInt { width: 2 }, 2_048),
+            (PlaneKind::UnsignedInt { width: 4 }, 4_096),
+            (PlaneKind::Float { width: 2 }, 2_048),
+            (PlaneKind::FixedBytes { width: 32 }, 32_768),
+            (PlaneKind::Bool, 128),
+            (PlaneKind::Empty, 0),
+            // The only kind that still estimates, because it is the only kind
+            // whose per-row cost the schema does not state.
+            (PlaneKind::Text { offset_width: 4 }, 131_072),
+        ] {
+            let storage = ColumnStorage::new(kind, capacity);
+            assert_eq!(storage.data_capacity(), expected, "{kind:?}");
+        }
     }
 }

@@ -145,7 +145,10 @@ impl ArrowType {
     /// second copy of 23 numbers is a second copy that can be wrong. Called
     /// once per field per schema, so the scan is not on any hot path.
     pub fn from_u8(value: u8) -> Option<Self> {
-        Self::ALL.iter().copied().find(|plane| *plane as u8 == value)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|plane| *plane as u8 == value)
     }
 }
 
@@ -806,7 +809,11 @@ mod tests {
         }
         let highest = ArrowType::ALL.len() as u8;
         for value in highest..=u8::MAX {
-            assert_eq!(ArrowType::from_u8(value), None, "tag {value} is not a plane");
+            assert_eq!(
+                ArrowType::from_u8(value),
+                None,
+                "tag {value} is not a plane"
+            );
         }
     }
 
