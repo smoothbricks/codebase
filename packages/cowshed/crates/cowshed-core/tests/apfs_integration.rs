@@ -192,28 +192,34 @@ impl Drop for ChurnGuard {
     }
 }
 
+/// One `#[test]` per image format, deliberately not a loop over both.
+///
+/// Each format drives a complete, independent substrate lifecycle — adopt, mount, 128 MiB
+/// write, clone under writer churn, checkpoint, restore, stats, retire, reclaim, GC, detach —
+/// and each is bounded by the harness's PER-TEST deadline. Running both inside one test spent
+/// 27.4s of a 30s budget on an idle host (Sparse 14.8s + Asif 10.6s), leaving 8.6% headroom, so
+/// ordinary host variance read as a test failure. Split, each scenario answers for its own wall
+/// time against the whole budget, and a format that regresses names itself instead of being one
+/// of two suspects behind a single timeout.
+///
+/// These two share the host's APFS driver and Disk Arbitration, so they are serialized against
+/// each other by the `real-apfs` nextest test group rather than by living in one test body.
+/// Neither format is optional: a missing capability is a failure, never a skip.
 #[test]
-fn real_apfs_substrate_lifecycle() {
-    let formats = [ImageFormat::Sparse, ImageFormat::Asif];
-    let mut completed = Vec::new();
-    for format in formats {
-        match run_format(format) {
-            Ok(evidence) => {
-                eprintln!("APFS {format:?}: {evidence}");
-                completed.push(format);
-            }
-            Err(error) => panic!("required APFS {format:?} capability failed: {error}"),
-        }
+fn real_apfs_sparse_substrate_lifecycle() {
+    run_lifecycle(ImageFormat::Sparse);
+}
+
+#[test]
+fn real_apfs_asif_substrate_lifecycle() {
+    run_lifecycle(ImageFormat::Asif);
+}
+
+fn run_lifecycle(format: ImageFormat) {
+    match run_format(format) {
+        Ok(evidence) => eprintln!("APFS {format:?}: {evidence}"),
+        Err(error) => panic!("required APFS {format:?} capability failed: {error}"),
     }
-    assert!(
-        !completed.is_empty(),
-        "at least one APFS image format must complete"
-    );
-    assert_eq!(
-        completed.len(),
-        formats.len(),
-        "both APFS image formats must complete"
-    );
 }
 
 fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
@@ -264,7 +270,14 @@ fn run_format(format: ImageFormat) -> Result<String, Box<dyn Error>> {
 
     let started = Instant::now();
     let result: Result<String, Box<dyn Error>> = runtime.block_on(async {
-        let repo = RepoId::parse(&format!("cowshed/itest-{}", std::process::id()))?;
+        // Format-distinct, matching the per-format `IntegrationRoot`: the two lifecycle tests
+        // share a pid, so a pid-only identity would give both the same StorageLayout keys and
+        // the same (human-facing) volume label, leaving per-format evidence ambiguous to read.
+        let repo = RepoId::parse(&format!(
+            "cowshed/itest-{}-{}",
+            std::process::id(),
+            format.extension()
+        ))?;
         let adopt = substrate.plan_adopt(AdoptRequest {
             repo: repo.clone(),
             format,
