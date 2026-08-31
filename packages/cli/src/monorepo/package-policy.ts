@@ -1,4 +1,4 @@
-import { type Dirent, readdirSync, readFileSync } from 'node:fs';
+import { type Dirent, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import {
   applyWorkspaceBoundedTestTargetPolicy,
@@ -367,6 +367,38 @@ export function validateTestFileLocations(root: string): number {
       );
       failures++;
     }
+  }
+  return failures;
+}
+
+/**
+ * No package may hold a `dist-test/` directory.
+ *
+ * `tsconfig.test.json` is `noEmit`, and the typecheck-test policy already refuses an
+ * `outDir` of `dist-test` and a `tsBuildInfoFile` under it, so a `dist-test/` on disk
+ * is either output from a configuration since corrected or something emitting outside
+ * that policy. Neither is ignorable, because the cost is paid by readers rather than
+ * by the emitter: the test loader's ignore list is a hardcoded set of directory NAMES
+ * that holds `dist` and not `dist-test`, so every file underneath is walked and hashed
+ * on each project load. `target/` reaching 50k files in one package is the same shape
+ * at a size that already hurt. A gitignore entry cannot substitute for this check —
+ * the loader walks the filesystem, not the index.
+ */
+export function validateNoStaleTestOutput(root: string): number {
+  let failures = 0;
+  for (const pkg of getWorkspacePackages(root)) {
+    const relativeOutput = join(pkg.path, 'dist-test');
+    let present = false;
+    try {
+      present = statSync(join(root, relativeOutput)).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!present) continue;
+    console.error(
+      `${pkg.projectName}: ${relativeOutput}/ is walked and hashed on every project load because the loader's ignore list only skips the name "dist"; tsconfig.test.json is noEmit, so remove it: rm -rf ${relativeOutput}`,
+    );
+    failures++;
   }
   return failures;
 }
