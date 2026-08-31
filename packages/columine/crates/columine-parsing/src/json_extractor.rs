@@ -1,7 +1,8 @@
 //! JSON extraction and typed-column diagnostics.
 
 use crate::{
-    ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, ParseError,
+    ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind,
+    SignalSchemaField,
     json_parser::{JsonParser, Token},
 };
 use columine_arrow::VariableValueReservation;
@@ -369,7 +370,7 @@ fn extract_json_event_open(
         if let Some(lookup) = config.field_map.get(&name) {
             if let Err(err) = extract_typed_value(
                 parser,
-                lookup.arrow_type,
+                lookup.field,
                 columns,
                 lookup.column,
                 diagnostic,
@@ -380,7 +381,7 @@ fn extract_json_event_open(
                     diagnostic.field_index = lookup.column as u16;
                 }
                 if diagnostic.expected_type == 0 {
-                    diagnostic.expected_type = lookup.arrow_type as u8;
+                    diagnostic.expected_type = lookup.field.arrow_type as u8;
                 }
                 diagnostic.row_index = columns.count.min(u16::MAX as u32) as u16;
                 diagnostic.complete(&err);
@@ -462,7 +463,7 @@ fn extract_json_event_open(
                 let bytes = writer.finish_map32(extra_count)?;
                 // Append directly from the workspace slice; no intermediate
                 // materialization is needed.
-                if let Err(err) = columns.append_binary(column as u32, bytes) {
+                if let Err(err) = columns.append_variable(column as u32, bytes) {
                     return Err(column_failure(
                         diagnostic,
                         column as u32,
@@ -480,20 +481,28 @@ fn extract_json_event_open(
     Ok(())
 }
 
+/// Coerce one JSON value into one column.
+///
+/// The table is per plane KIND, not per plane: twenty-three planes reduce to
+/// eight coercions because the plane's width does the narrowing. Adding a
+/// plane to an existing kind needs no change here, and adding a kind will not
+/// compile until it does.
 pub(crate) fn extract_typed_value(
     parser: &mut JsonParser<'_>,
-    arrow_type: ArrowType,
+    field: SignalSchemaField,
     columns: &mut DynamicColumns,
     column: usize,
     diagnostic: &mut ExtractionDiagnostic,
 ) -> Result<(), ExtractionError> {
+    let arrow_type = field.arrow_type;
     let token = parser
         .next_token()
         .map_err(|_| ExtractionError::InvalidJson)?;
     let actual = json_value_type_of(&token);
     let row = columns.count;
-    let value = match arrow_type {
-        ArrowType::Utf8 => match token {
+    let kind = field.plane_kind();
+    let value = match kind {
+        PlaneKind::Text { .. } => match token {
             Token::String(value) => Some(ColumnValue::Utf8(value)),
             Token::Null => None,
             _ => {
@@ -506,33 +515,24 @@ pub(crate) fn extract_typed_value(
                 ));
             }
         },
-        // Typed event schemas keep Int32 strict (integer JSON numbers only).
-        // Int64 accepts bigint-as-string and ISO timestamps because JSON cannot
-        // represent the full range losslessly; decimal numbers remain invalid.
-        ArrowType::Int32 => match token {
-            Token::Number(value) => Some(ColumnValue::Int64(i64::from(
-                value.parse::<i32>().map_err(|_| {
-                    invalid_number(diagnostic, column as u32, arrow_type, actual, row)
-                })?,
-            ))),
-            Token::Null => None,
-            _ => {
-                return Err(invalid_field_type(
-                    diagnostic,
-                    column as u32,
-                    arrow_type,
-                    actual,
-                    row,
-                ));
-            }
-        },
-        ArrowType::Int64 => match token {
-            Token::Number(value) => {
-                Some(ColumnValue::Int64(value.parse::<i64>().map_err(|_| {
-                    invalid_number(diagnostic, column as u32, arrow_type, actual, row)
-                })?))
-            }
-            Token::String(value) => Some(ColumnValue::Int64(
+        // Integer planes take integer JSON numbers only, range-checked to the
+        // plane's width: a producer that sent 1.5 did not send an integer, and
+        // a producer that sent 300 did not send an i8. The eight-byte planes
+        // additionally take a string, because a 64-bit value does not survive
+        // a JSON number — for the signed plane that string may also be an
+        // ISO-8601 instant, which is how every temporal type on that plane is
+        // written.
+        PlaneKind::SignedInt { width } => match token {
+            Token::Number(value) => Some(ColumnValue::Int(
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|parsed| kind.holds_int(*parsed))
+                    .ok_or_else(|| {
+                        invalid_number(diagnostic, column as u32, arrow_type, actual, row)
+                    })?,
+            )),
+            Token::String(value) if width == 8 => Some(ColumnValue::Int(
                 value
                     .parse()
                     .or_else(|_| parse_timestamp_to_micros(&value).ok_or(()))
@@ -551,8 +551,34 @@ pub(crate) fn extract_typed_value(
                 ));
             }
         },
-        ArrowType::Float64 => match token {
-            Token::Number(value) => Some(ColumnValue::Float64(value.parse().map_err(|_| {
+        PlaneKind::UnsignedInt { width } => match token {
+            Token::Number(value) => Some(ColumnValue::UInt(
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|parsed| kind.holds_uint(*parsed))
+                    .ok_or_else(|| {
+                        invalid_number(diagnostic, column as u32, arrow_type, actual, row)
+                    })?,
+            )),
+            Token::String(value) if width == 8 => {
+                Some(ColumnValue::UInt(value.parse().map_err(|_| {
+                    invalid_number(diagnostic, column as u32, arrow_type, actual, row)
+                })?))
+            }
+            Token::Null => None,
+            _ => {
+                return Err(invalid_field_type(
+                    diagnostic,
+                    column as u32,
+                    arrow_type,
+                    actual,
+                    row,
+                ));
+            }
+        },
+        PlaneKind::Float { .. } => match token {
+            Token::Number(value) => Some(ColumnValue::Float(value.parse().map_err(|_| {
                 invalid_number(diagnostic, column as u32, arrow_type, actual, row)
             })?)),
             Token::Null => None,
@@ -566,7 +592,7 @@ pub(crate) fn extract_typed_value(
                 ));
             }
         },
-        ArrowType::Bool => match token {
+        PlaneKind::Bool => match token {
             Token::True => Some(ColumnValue::Bool(true)),
             Token::False => Some(ColumnValue::Bool(false)),
             Token::Null => None,
@@ -580,7 +606,27 @@ pub(crate) fn extract_typed_value(
                 ));
             }
         },
-        ArrowType::Binary => match token {
+        // JSON has no byte type, so an exactly-width plane takes hex: a string
+        // of exactly `2 * width` hex digits. Hex over base64 because its length
+        // pins the byte count with no padding left to interpret.
+        PlaneKind::FixedBytes { width } => match token {
+            Token::String(value) => Some(ColumnValue::FixedBytes(
+                decode_fixed_hex(&value, width).ok_or_else(|| {
+                    invalid_field_type(diagnostic, column as u32, arrow_type, actual, row)
+                })?,
+            )),
+            Token::Null => None,
+            _ => {
+                return Err(invalid_field_type(
+                    diagnostic,
+                    column as u32,
+                    arrow_type,
+                    actual,
+                    row,
+                ));
+            }
+        },
+        PlaneKind::Bytes { .. } => match token {
             Token::Null => None,
             token @ (Token::String(_)
             | Token::Number(_)
@@ -616,7 +662,7 @@ pub(crate) fn extract_typed_value(
                 ));
             }
         },
-        ArrowType::Null => {
+        PlaneKind::Empty => {
             // Null columns still consume a container value so the token stream
             // stays coherent; this is especially important for nested objects
             // and arrays.
@@ -648,6 +694,30 @@ pub(crate) fn extract_typed_value(
         }
         err
     })
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode a hex string into exactly `width` bytes, or `None` when the string
+/// is not exactly `2 * width` hex digits.
+fn decode_fixed_hex(text: &str, width: u32) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if bytes.len() != width as usize * 2 {
+        return None;
+    }
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Some(hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?))
+        .collect()
 }
 
 /// Record an invalid field-type diagnostic.
@@ -950,7 +1020,7 @@ mod tests {
         let mut p = JsonParser::new(json);
         extract_typed_value(
             &mut p,
-            kind,
+            field(kind),
             &mut c,
             0,
             &mut ExtractionDiagnostic::default(),
@@ -965,7 +1035,7 @@ mod tests {
         let mut p = JsonParser::new(json);
         extract_typed_value(
             &mut p,
-            kind,
+            field(kind),
             &mut c,
             0,
             &mut ExtractionDiagnostic::default(),
@@ -1037,14 +1107,14 @@ mod tests {
     fn extract_typed_value_number_to_int64() {
         assert_eq!(
             one_value(b"42", ArrowType::Int32).cell(0, 0),
-            Some(ColumnValue::Int64(42))
+            Some(ColumnValue::Int(42))
         );
     }
     #[test]
     fn extract_typed_value_number_to_float64() {
         assert_eq!(
             one_value(b"99.99", ArrowType::Float64).cell(0, 0),
-            Some(ColumnValue::Float64(99.99))
+            Some(ColumnValue::Float(99.99))
         );
     }
     #[test]

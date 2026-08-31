@@ -18,7 +18,7 @@ pub mod record_batch;
 pub mod schema;
 
 pub use columns::{
-    ColumnStorage, ColumnType, DynamicColumns, MAX_EVENTS_PER_BATCH, MAX_STRING_BYTES,
+    ColumnStorage, DynamicColumns, MAX_EVENTS_PER_BATCH, MAX_STRING_BYTES,
     MAX_VALUE_BYTES, ParseError, VariableValueError, VariableValueReservation,
 };
 pub use ipc::{
@@ -31,6 +31,7 @@ pub use record_batch::{
     record_batch_metadata_size,
 };
 pub use schema::{
+    MAX_FIXED_SIZE_BINARY_WIDTH, PlaneKind, logical_schema_ipc_bytes,
     ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, DynamicSchemaConfig, MAX_SCHEMA_FIELDS,
     SchemaError, SignalSchemaField, compute_buffer_count, schema_ipc_bytes,
 };

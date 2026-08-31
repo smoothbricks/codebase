@@ -4,7 +4,7 @@
 //! FlatBuffer library or intermediate model is needed. The emitted bytes are
 //! the contract consumed by Flechette and arrow-js, so every offset is explicit.
 
-use crate::schema::{ArrowType, MAX_SCHEMA_FIELDS, SignalSchemaField};
+use crate::schema::{MAX_SCHEMA_FIELDS, PlaneKind, SignalSchemaField};
 
 pub use crate::schema::compute_buffer_count;
 
@@ -97,116 +97,54 @@ impl MetadataStorage {
 }
 
 /// One column's borrowed buffers for RecordBatch encoding (`DynamicColumn`).
+///
+/// Carries the whole field descriptor rather than a bare tag, so the column
+/// knows its own plane kind — including the `FixedSizeBinary` byte width — and
+/// cannot disagree with itself about nullability.
 #[derive(Clone, Copy, Debug)]
 pub struct DynamicColumn<'a> {
     /// Field index in schema.
     pub field_idx: u32,
-    pub arrow_type: ArrowType,
-    pub nullable: bool,
+    pub field: SignalSchemaField,
     /// Validity bitmap (None => empty validity buffer per Flechette).
     pub validity: Option<&'a [u8]>,
-    /// Data buffer (empty for Null type).
+    /// Data buffer (empty for the Null plane).
     pub data: &'a [u8],
-    /// Offsets buffer (variable-length types only).
+    /// Offsets buffer (variable-width planes only).
     pub offsets: Option<&'a [u8]>,
 }
 
 impl<'a> DynamicColumn<'a> {
-    pub fn utf8(
+    /// A fixed-width, bit-packed, or empty column: validity plus data.
+    pub fn fixed(
         field_idx: u32,
-        nullable: bool,
+        field: SignalSchemaField,
+        validity: Option<&'a [u8]>,
+        data: &'a [u8],
+    ) -> Self {
+        Self {
+            field_idx,
+            field,
+            validity,
+            data,
+            offsets: None,
+        }
+    }
+
+    /// A variable-width column: validity, offsets, then the byte payload.
+    pub fn variable(
+        field_idx: u32,
+        field: SignalSchemaField,
         validity: Option<&'a [u8]>,
         offsets: &'a [u8],
         data: &'a [u8],
     ) -> Self {
         Self {
             field_idx,
-            arrow_type: ArrowType::Utf8,
-            nullable,
+            field,
             validity,
             data,
             offsets: Some(offsets),
-        }
-    }
-
-    pub fn binary(
-        field_idx: u32,
-        nullable: bool,
-        validity: Option<&'a [u8]>,
-        offsets: &'a [u8],
-        data: &'a [u8],
-    ) -> Self {
-        Self {
-            field_idx,
-            arrow_type: ArrowType::Binary,
-            nullable,
-            validity,
-            data,
-            offsets: Some(offsets),
-        }
-    }
-
-    pub fn int32(
-        field_idx: u32,
-        nullable: bool,
-        validity: Option<&'a [u8]>,
-        data: &'a [u8],
-    ) -> Self {
-        Self {
-            field_idx,
-            arrow_type: ArrowType::Int32,
-            nullable,
-            validity,
-            data,
-            offsets: None,
-        }
-    }
-
-    pub fn int64(
-        field_idx: u32,
-        nullable: bool,
-        validity: Option<&'a [u8]>,
-        data: &'a [u8],
-    ) -> Self {
-        Self {
-            field_idx,
-            arrow_type: ArrowType::Int64,
-            nullable,
-            validity,
-            data,
-            offsets: None,
-        }
-    }
-
-    pub fn float64(
-        field_idx: u32,
-        nullable: bool,
-        validity: Option<&'a [u8]>,
-        data: &'a [u8],
-    ) -> Self {
-        Self {
-            field_idx,
-            arrow_type: ArrowType::Float64,
-            nullable,
-            validity,
-            data,
-            offsets: None,
-        }
-    }
-
-    pub fn boolean(
-        field_idx: u32,
-        nullable: bool,
-        validity: Option<&'a [u8]>,
-        data: &'a [u8],
-    ) -> Self {
-        Self {
-            field_idx,
-            arrow_type: ArrowType::Bool,
-            nullable,
-            validity,
-            data,
-            offsets: None,
         }
     }
 }
@@ -252,7 +190,7 @@ impl<'a> DynamicBodyBuilder<'a> {
 
         // Arrow Null arrays have a field node but no buffers, including no
         // validity bitmap. Nullness is carried entirely by `null_count`.
-        if column.arrow_type == ArrowType::Null {
+        if column.field.plane_kind() == PlaneKind::Empty {
             return column.validity.is_none()
                 && column.offsets.is_none()
                 && column.data.is_empty()
@@ -269,18 +207,18 @@ impl<'a> DynamicBodyBuilder<'a> {
             return false;
         }
 
-        match column.arrow_type {
-            ArrowType::Utf8 | ArrowType::Binary => {
-                // Offsets buffer (required for variable-length).
+        // Offsets belong to exactly the variable-width planes. Emitting the
+        // wrong count here would produce a body whose buffer vector disagrees
+        // with the Schema message, which is unreadable rather than merely
+        // wrong, so a mismatched shape fails instead of being copied.
+        match column.field.plane_kind().offset_width() {
+            Some(_) => {
                 let Some(offsets) = column.offsets else {
                     return false;
                 };
                 self.add_buffer(offsets) && self.add_buffer(column.data)
             }
-            ArrowType::Int32 | ArrowType::Int64 | ArrowType::Float64 | ArrowType::Bool => {
-                self.add_buffer(column.data)
-            }
-            ArrowType::Null => false,
+            None => column.offsets.is_none() && self.add_buffer(column.data),
         }
     }
 
@@ -524,13 +462,13 @@ mod tests {
     // test "DynamicColumn constructors"
     #[test]
     fn dynamic_column_constructors() {
-        let col = DynamicColumn::utf8(0, false, None, &[], &[]);
+        let col = DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &[], &[]);
         assert_eq!(col.field_idx, 0);
-        assert_eq!(col.arrow_type, ArrowType::Utf8);
-        assert!(!col.nullable);
-        let int_col = DynamicColumn::int64(2, false, None, &[]);
+        assert_eq!(col.field.arrow_type, ArrowType::Utf8);
+        assert!(!col.field.is_nullable());
+        let int_col = DynamicColumn::fixed(2, SignalSchemaField::new(ArrowType::Int64, false), None, &[]);
         // The tag is authoritative for the column's Arrow type.
-        assert_eq!(int_col.arrow_type, ArrowType::Int64);
+        assert_eq!(int_col.field.arrow_type, ArrowType::Int64);
         assert!(int_col.offsets.is_none());
     }
 
@@ -542,7 +480,7 @@ mod tests {
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0]; // [0, 5] as u32 LE
         let data = b"hello";
-        assert!(builder.add_column(DynamicColumn::utf8(0, false, None, &offsets, data), 1, 0));
+        assert!(builder.add_column(DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets, data), 1, 0));
         assert_eq!(builder.buffer_descs().len(), 3);
         assert_eq!(builder.buffer_descs()[0].length, 0); // empty validity
         assert_eq!(builder.buffer_descs()[1].length, 8); // offsets
@@ -559,7 +497,7 @@ mod tests {
         let mut metadata = MetadataStorage::for_counts(1, 2, MetadataLimits::default()).unwrap();
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let data = 12345i64.to_le_bytes();
-        assert!(builder.add_column(DynamicColumn::int64(0, false, None, &data), 1, 0));
+        assert!(builder.add_column(DynamicColumn::fixed(0, SignalSchemaField::new(ArrowType::Int64, false), None, &data), 1, 0));
         assert_eq!(builder.buffer_descs().len(), 2);
         assert_eq!(builder.buffer_descs()[0].length, 0);
         assert_eq!(builder.buffer_descs()[1].length, 8);
@@ -573,14 +511,14 @@ mod tests {
         let mut builder = DynamicBodyBuilder::new(&mut buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0];
         assert!(builder.add_column(
-            DynamicColumn::utf8(0, false, None, &offsets, b"hello"),
+            DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets, b"hello"),
             1,
             0
         ));
         // 0 (empty validity) + 8 (offsets) + 8 (padded data) = 16.
         assert_eq!(builder.body_length(), 16);
         let offsets2 = [0, 0, 0, 0, 3, 0, 0, 0];
-        assert!(builder.add_column(DynamicColumn::utf8(1, false, None, &offsets2, b"abc"), 1, 0));
+        assert!(builder.add_column(DynamicColumn::variable(1, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets2, b"abc"), 1, 0));
         assert_eq!(builder.buffer_descs()[4].offset, 16);
     }
 
@@ -595,7 +533,7 @@ mod tests {
         let data = [0u8; 8];
         for field_idx in 0..80 {
             assert!(builder.add_column(
-                DynamicColumn::binary(field_idx, true, Some(&validity), &offsets, &data),
+                DynamicColumn::variable(field_idx, SignalSchemaField::new(ArrowType::Binary, true), Some(&validity), &offsets, &data),
                 1,
                 0
             ));
@@ -630,7 +568,7 @@ mod tests {
         let mut builder = DynamicBodyBuilder::new(&mut body_buffer, &mut metadata);
         let offsets = [0, 0, 0, 0, 5, 0, 0, 0];
         assert!(builder.add_column(
-            DynamicColumn::utf8(0, false, None, &offsets, b"hello"),
+            DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &offsets, b"hello"),
             1,
             0
         ));
@@ -659,22 +597,22 @@ mod tests {
             let mut builder = DynamicBodyBuilder::new(&mut output[body_start..], &mut metadata);
             let id_offsets = [0, 0, 0, 0, 7, 0, 0, 0];
             assert!(builder.add_column(
-                DynamicColumn::utf8(0, false, None, &id_offsets, b"test-id"),
+                DynamicColumn::variable(0, SignalSchemaField::new(ArrowType::Utf8, false), None, &id_offsets, b"test-id"),
                 1,
                 0
             ));
             let type_offsets = [0, 0, 0, 0, 5, 0, 0, 0];
             assert!(builder.add_column(
-                DynamicColumn::utf8(1, false, None, &type_offsets, b"click"),
+                DynamicColumn::variable(1, SignalSchemaField::new(ArrowType::Utf8, false), None, &type_offsets, b"click"),
                 1,
                 0
             ));
             let ts = 1_705_315_800_000_000_i64.to_le_bytes();
-            assert!(builder.add_column(DynamicColumn::int64(2, false, None, &ts), 1, 0));
+            assert!(builder.add_column(DynamicColumn::fixed(2, SignalSchemaField::new(ArrowType::Int64, false), None, &ts), 1, 0));
             let value_offsets = [0u8; 8];
             let validity = [0u8];
             assert!(builder.add_column(
-                DynamicColumn::binary(3, true, Some(&validity), &value_offsets, b""),
+                DynamicColumn::variable(3, SignalSchemaField::new(ArrowType::Binary, true), Some(&validity), &value_offsets, b""),
                 1,
                 1
             ));

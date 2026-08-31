@@ -10,7 +10,7 @@ use crate::record_batch::{
     DynamicBodyBuilder, DynamicColumn, MetadataStorage, compute_buffer_count,
     encode_record_batch_dynamic, record_batch_metadata_size,
 };
-use crate::schema::{ArrowType, DynamicSchemaConfig};
+use crate::schema::{DynamicSchemaConfig, PlaneKind, SignalSchemaField};
 
 pub const EOS_MARKER: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
 pub const MIN_ARROW_OUTPUT_CAPACITY: usize = 4096;
@@ -35,43 +35,44 @@ fn checked_add_aligned(total: &mut usize, length: usize) -> Result<(), IpcError>
     Ok(())
 }
 
+/// Byte length this column contributes to the 8-aligned IPC body, after
+/// checking that its shape is the one its plane declares.
 fn validate_column_shape(
     index: usize,
-    expected: ArrowType,
-    nullable: bool,
+    field: SignalSchemaField,
     column: DynamicColumn<'_>,
 ) -> Result<usize, IpcError> {
+    let nullable = field.is_nullable();
+    // One comparison for the whole descriptor: plane, nullability and the
+    // `FixedSizeBinary` width all have to be the ones the schema declared.
     if column.field_idx as usize != index
-        || column.arrow_type != expected
-        || column.nullable != nullable
+        || column.field != field
         || (!nullable && column.validity.is_some())
     {
         return Err(IpcError::InvalidColumn);
     }
 
-    if expected == ArrowType::Null {
+    let kind = field.plane_kind();
+    if kind == PlaneKind::Empty {
         if column.validity.is_some() || column.offsets.is_some() || !column.data.is_empty() {
             return Err(IpcError::InvalidColumn);
         }
         return Ok(0);
     }
 
+    // An offsets buffer belongs to exactly the variable-width kinds: present
+    // for them, absent for everything else. Accepting a stray offsets buffer
+    // would emit a buffer the Schema message never declared.
+    if kind.offset_width().is_some() != column.offsets.is_some() {
+        return Err(IpcError::InvalidColumn);
+    }
+
     let mut body_length = 0usize;
     checked_add_aligned(&mut body_length, column.validity.map_or(0, <[u8]>::len))?;
-    match expected {
-        ArrowType::Utf8 | ArrowType::Binary => {
-            let offsets = column.offsets.ok_or(IpcError::InvalidColumn)?;
-            checked_add_aligned(&mut body_length, offsets.len())?;
-            checked_add_aligned(&mut body_length, column.data.len())?;
-        }
-        ArrowType::Int32 | ArrowType::Int64 | ArrowType::Float64 | ArrowType::Bool => {
-            if column.offsets.is_some() {
-                return Err(IpcError::InvalidColumn);
-            }
-            checked_add_aligned(&mut body_length, column.data.len())?;
-        }
-        ArrowType::Null => return Err(IpcError::InvalidColumn),
+    if let Some(offsets) = column.offsets {
+        checked_add_aligned(&mut body_length, offsets.len())?;
     }
+    checked_add_aligned(&mut body_length, column.data.len())?;
     Ok(body_length)
 }
 
@@ -87,12 +88,7 @@ where
     for (index, field) in schema_config.field_metadata.iter().enumerate() {
         let column = column_at(index)?;
         body_length = body_length
-            .checked_add(validate_column_shape(
-                index,
-                field.arrow_type,
-                field.is_nullable(),
-                column,
-            )?)
+            .checked_add(validate_column_shape(index, *field, column)?)
             .ok_or(IpcError::SizeOverflow)?;
     }
     let field_count =
@@ -233,75 +229,27 @@ fn dynamic_column<'a>(
     schema: &DynamicSchemaConfig,
     index: usize,
 ) -> Result<DynamicColumn<'a>, IpcError> {
-    let field = schema
+    let field = *schema
         .field_metadata
         .get(index)
         .ok_or(IpcError::InvalidColumn)?;
     let column = columns.columns.get(index).ok_or(IpcError::InvalidColumn)?;
     let field_index = u32::try_from(index).map_err(|_| IpcError::InvalidColumn)?;
+
+    // The Null plane contributes a field node and nothing else, not even a
+    // validity bitmap, so it does not take the nullable column's validity.
+    if field.plane_kind() == PlaneKind::Empty {
+        return Ok(DynamicColumn::fixed(field_index, field, None, &[]));
+    }
+
     let validity = field
         .is_nullable()
         .then(|| column.validity_bytes(columns.count));
-    match field.arrow_type {
-        ArrowType::Utf8 => Ok(DynamicColumn::utf8(
-            field_index,
-            field.is_nullable(),
-            validity,
-            column
-                .offsets_bytes(columns.count)
-                .ok_or(IpcError::InvalidColumn)?,
-            column.data_bytes().ok_or(IpcError::InvalidColumn)?,
-        )),
-        ArrowType::Binary => Ok(DynamicColumn::binary(
-            field_index,
-            field.is_nullable(),
-            validity,
-            column
-                .offsets_bytes(columns.count)
-                .ok_or(IpcError::InvalidColumn)?,
-            column.data_bytes().ok_or(IpcError::InvalidColumn)?,
-        )),
-        ArrowType::Int32 => Ok(DynamicColumn::int32(
-            field_index,
-            field.is_nullable(),
-            validity,
-            column
-                .fixed_i32_bytes(columns.count)
-                .ok_or(IpcError::InvalidColumn)?,
-        )),
-        ArrowType::Int64 => Ok(DynamicColumn::int64(
-            field_index,
-            field.is_nullable(),
-            validity,
-            column
-                .fixed_i64_bytes(columns.count)
-                .ok_or(IpcError::InvalidColumn)?,
-        )),
-        ArrowType::Float64 => Ok(DynamicColumn::float64(
-            field_index,
-            field.is_nullable(),
-            validity,
-            column
-                .fixed_f64_bytes(columns.count)
-                .ok_or(IpcError::InvalidColumn)?,
-        )),
-        ArrowType::Bool => Ok(DynamicColumn::boolean(
-            field_index,
-            field.is_nullable(),
-            validity,
-            column
-                .bool_bytes(columns.count)
-                .ok_or(IpcError::InvalidColumn)?,
-        )),
-        ArrowType::Null => Ok(DynamicColumn {
-            field_idx: field_index,
-            arrow_type: ArrowType::Null,
-            nullable: true,
-            validity: None,
-            data: &[],
-            offsets: None,
-        }),
-    }
+    let data = column.value_bytes(columns.count);
+    Ok(match column.offsets_bytes(columns.count) {
+        Some(offsets) => DynamicColumn::variable(field_index, field, validity, offsets, data),
+        None => DynamicColumn::fixed(field_index, field, validity, data),
+    })
 }
 
 fn dynamic_null_count(columns: &DynamicColumns, index: usize) -> i64 {
@@ -370,15 +318,15 @@ mod tests {
 
         let mut columns = DynamicColumns::new(&fields, 8);
         assert!(columns.begin_row());
-        columns.append_utf8(0, b"id-1").unwrap();
-        columns.append_utf8(1, b"click").unwrap();
-        columns.append_int64(2, 100).unwrap();
-        columns.append_binary(3, b"v1").unwrap();
+        columns.append_variable(0, b"id-1").unwrap();
+        columns.append_variable(1, b"click").unwrap();
+        columns.append_int(2, 100).unwrap();
+        columns.append_variable(3, b"v1").unwrap();
         columns.end_row();
         assert!(columns.begin_row());
-        columns.append_utf8(0, b"id-2").unwrap();
-        columns.append_utf8(1, b"view").unwrap();
-        columns.append_int64(2, 200).unwrap();
+        columns.append_variable(0, b"id-2").unwrap();
+        columns.append_variable(1, b"view").unwrap();
+        columns.append_int(2, 200).unwrap();
         columns.append_null(3).unwrap();
         columns.end_row();
 
@@ -453,9 +401,9 @@ mod tests {
         let config = DynamicSchemaConfig::new(&schema_bytes(&fields), &fields).unwrap();
         let mut cols = DynamicColumns::new(&fields, 4);
         assert!(cols.begin_row());
-        cols.append_utf8(0, b"row-1").unwrap();
-        cols.append_int64(1, 7).unwrap();
-        cols.append_float64(2, 1.5).unwrap();
+        cols.append_variable(0, b"row-1").unwrap();
+        cols.append_int(1, 7).unwrap();
+        cols.append_float(2, 1.5).unwrap();
         cols.append_null(3).unwrap();
         cols.end_row();
 
@@ -545,32 +493,25 @@ mod tests {
             &mut output,
             &mut metadata,
             |index| match index {
-                0 => Ok(DynamicColumn::int32(0, false, None, &i32_data)),
-                1 => Ok(DynamicColumn::float64(1, true, Some(&validity), &f64_data)),
-                2 => Ok(DynamicColumn::int64(2, false, None, &i64_data)),
-                3 => Ok(DynamicColumn::binary(
+                0 => Ok(DynamicColumn::fixed(0, fields[0], None, &i32_data)),
+                1 => Ok(DynamicColumn::fixed(1, fields[1], Some(&validity), &f64_data)),
+                2 => Ok(DynamicColumn::fixed(2, fields[2], None, &i64_data)),
+                3 => Ok(DynamicColumn::variable(
                     3,
-                    true,
+                    fields[3],
                     Some(&validity),
                     &binary_offsets,
                     &[0, 1],
                 )),
-                4 => Ok(DynamicColumn::utf8(
+                4 => Ok(DynamicColumn::variable(
                     4,
-                    true,
+                    fields[4],
                     Some(&validity),
                     &utf8_offsets,
                     "αz".as_bytes(),
                 )),
-                5 => Ok(DynamicColumn::boolean(5, true, Some(&validity), &bool_data)),
-                6 => Ok(DynamicColumn {
-                    field_idx: 6,
-                    arrow_type: ArrowType::Null,
-                    nullable: true,
-                    validity: None,
-                    data: &[],
-                    offsets: None,
-                }),
+                5 => Ok(DynamicColumn::fixed(5, fields[5], Some(&validity), &bool_data)),
+                6 => Ok(DynamicColumn::fixed(6, fields[6], None, &[])),
                 _ => Err(IpcError::InvalidColumn),
             },
             |index| match index {

@@ -237,6 +237,18 @@ impl<'a> Reader<'a> {
             _ => None,
         }
     }
+    /// Decode an integer as unsigned.
+    ///
+    /// `0xcf` carries a `u64`, which [`Reader::read_integer`] rejects above
+    /// `i64::MAX` because it cannot name it. The unsigned planes can, so they
+    /// read it here. A negative integer is not an unsigned value and fails.
+    pub(crate) fn read_unsigned_integer(&mut self) -> Option<u64> {
+        if *self.input.get(self.pos)? == 0xcf {
+            self.take()?;
+            return self.read_be_u64();
+        }
+        u64::try_from(self.read_integer()?).ok()
+    }
     pub(crate) fn read_float(&mut self) -> Option<f64> {
         let byte = self.take()?;
         match byte {

@@ -7,91 +7,268 @@
 use arrow_ipc::{
     MessageHeader, convert::try_schema_from_ipc_buffer, root_as_message, writer::StreamWriter,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{
+    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
+    DataType, Field, IntervalUnit, Schema, TimeUnit,
+};
+
+use crate::columns::{MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES};
 
 /// Maximum supported fields in one flattened schema.
 pub const MAX_SCHEMA_FIELDS: usize = 256;
 
-/// Arrow type identifiers matching the TypeScript `ArrowType` enum.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub enum ArrowType {
+/// Largest declared byte width of a `FixedSizeBinary` field.
+///
+/// Derived, not chosen. A fixed-width column allocates `capacity * width`
+/// eagerly, so this is the width at which one fixed-size-binary column costs
+/// exactly what one variable-width column is allowed to retain. A wider field
+/// would let a schema out-allocate a budget it was never granted.
+pub const MAX_FIXED_SIZE_BINARY_WIDTH: u16 = (MAX_VALUE_BYTES / MAX_EVENTS_PER_BATCH) as u16;
+
+/// Declares the plane table once: the [`ArrowType`] enum with its frozen tag
+/// discriminants, and [`ArrowType::ALL`]. Generating the list together with
+/// the enum is what stops the two from drifting — there is no second place to
+/// forget a plane.
+macro_rules! arrow_planes {
+    ($( $(#[$attr:meta])* $variant:ident = $tag:literal, )+) => {
+        /// Arrow physical planes, matching the TypeScript `COMPACT_KIND_TAG`
+        /// table byte for byte.
+        ///
+        /// A *plane* is one memory layout: a value width, a signedness, and a
+        /// buffer count. Several logical Arrow types share a plane when they
+        /// are byte-identical and read back through the same accessor — Date32
+        /// and Time32 ride the four-byte signed plane, Date64, Time64,
+        /// Timestamp and Duration ride the eight-byte signed plane.
+        /// `logical_type_matches` is what keeps that sharing honest: a plane
+        /// admits exactly its own logical types and rejects every other type
+        /// of the same width.
+        ///
+        /// Tag values are the wire ABI shared with `parse-backend.ts` and are
+        /// frozen: they are baked into the shipped `dist/event_processor.wasm`
+        /// and into every persisted fixture. New planes append; nothing
+        /// renumbers.
+        ///
+        /// # Nested and dictionary-encoded types are excluded
+        ///
+        /// List, LargeList, FixedSizeList, Struct, Union, Map, RunEndEncoded
+        /// and Dictionary are deliberately absent and must not be added as
+        /// further arms. The retained-metadata contract encodes at most three
+        /// buffers per field — [`PlaneKind::buffer_count`] returns at most 3
+        /// and `MetadataLimits::default()` sizes its buffer table as
+        /// `MAX_SCHEMA_FIELDS * 3` — because every plane here is validity plus
+        /// at most offsets plus data. A nested type owns child fields with
+        /// their own buffers and their own field nodes, and a dictionary type
+        /// owns a second message carrying the dictionary body. Both need a
+        /// different layout contract: a recursive field descriptor and a
+        /// per-field buffer budget. Adding one as an `ArrowType` arm would
+        /// silently overflow the buffer table, not extend it.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(u8)]
+        pub enum ArrowType {
+            $( $(#[$attr])* $variant = $tag, )+
+        }
+
+        impl ArrowType {
+            /// Every plane, ascending by tag. Generated from the same table as
+            /// the enum, so it cannot fall behind it.
+            pub const ALL: &'static [ArrowType] = &[ $( ArrowType::$variant, )+ ];
+        }
+    };
+}
+
+arrow_planes! {
+    /// No values: one field node, zero buffers, every row null.
     Null = 0,
-    /// One signed 32-bit value per row. The logical schema must be Int32:
-    /// every writer of this plane narrows through `i32`, so admitting UInt32
-    /// would declare a domain no producer can fill and no reader can name.
+    /// The four-byte signed plane: one little-endian `i32` per row. Carries
+    /// Int32, Date32 (days since epoch) and Time32 (seconds or milliseconds
+    /// since midnight), which are byte-identical and told apart by the logical
+    /// schema. UInt32, Float32 and Interval(YearMonth) are the same width but
+    /// have their own planes, so they are rejected here.
     Int32 = 1,
+    /// One little-endian IEEE-754 `binary64` per row.
     Float64 = 2,
+    /// Opaque bytes behind 32-bit monotone offsets.
     Binary = 3,
+    /// UTF-8 validated bytes behind 32-bit monotone offsets.
     Utf8 = 4,
+    /// One bit per row, Arrow LSB-first.
     Bool = 5,
-    /// One signed 64-bit value per row; Timestamp uses this physical layout.
+    /// The eight-byte signed plane: one little-endian `i64` per row. Carries
+    /// Int64, Date64, Time64, Timestamp and Duration.
     Int64 = 6,
+    /// One little-endian `i8` per row.
+    Int8 = 7,
+    /// One little-endian `i16` per row.
+    Int16 = 8,
+    /// One `u8` per row.
+    UInt8 = 9,
+    /// One little-endian `u16` per row.
+    UInt16 = 10,
+    /// One little-endian `u32` per row. Distinct from [`ArrowType::Int32`]
+    /// because the widening read differs: `0xFFFF_FFFF` is 4294967295 here and
+    /// -1 there, and no width check can tell those apart.
+    UInt32 = 11,
+    /// One little-endian `u64` per row.
+    UInt64 = 12,
+    /// One little-endian IEEE-754 `binary16` per row, stored as its raw bits.
+    Float16 = 13,
+    /// One little-endian IEEE-754 `binary32` per row.
+    Float32 = 14,
+    /// Sixteen little-endian two's-complement bytes per row.
+    Decimal128 = 15,
+    /// Thirty-two little-endian two's-complement bytes per row.
+    Decimal256 = 16,
+    /// Opaque bytes behind 64-bit monotone offsets.
+    LargeBinary = 17,
+    /// UTF-8 validated bytes behind 64-bit monotone offsets.
+    LargeUtf8 = 18,
+    /// The one parameterized plane: `SignalSchemaField::type_param` bytes per
+    /// row, bounded by [`MAX_FIXED_SIZE_BINARY_WIDTH`].
+    FixedSizeBinary = 19,
+    /// One little-endian `i32` month count per row.
+    IntervalYearMonth = 20,
+    /// Eight bytes per row: little-endian `i32` days then `i32` milliseconds.
+    IntervalDayTime = 21,
+    /// Sixteen bytes per row: little-endian `i32` months, `i32` days, `i64`
+    /// nanoseconds.
+    IntervalMonthDayNano = 22,
+    // Nested and dictionary-encoded types do NOT belong here. See the
+    // `ArrowType` doc comment: the retained-metadata contract encodes at most
+    // three buffers per field, and a nested or dictionary type needs a
+    // different layout contract rather than another arm.
 }
 
 impl ArrowType {
     /// Decode a physical type byte without constructing an invalid enum.
+    ///
+    /// Derived from [`ArrowType::ALL`] rather than restating the tag table: a
+    /// second copy of 23 numbers is a second copy that can be wrong. Called
+    /// once per field per schema, so the scan is not on any hot path.
     pub fn from_u8(value: u8) -> Option<Self> {
-        Some(match value {
-            0 => Self::Null,
-            1 => Self::Int32,
-            2 => Self::Float64,
-            3 => Self::Binary,
-            4 => Self::Utf8,
-            5 => Self::Bool,
-            6 => Self::Int64,
-            _ => return None,
-        })
-    }
-
-    /// Arrow `DataType` for this physical tag. The inverse of
-    /// `logical_type_matches` for the types this crate can emit.
-    pub fn to_data_type(self) -> DataType {
-        match self {
-            Self::Null => DataType::Null,
-            Self::Int32 => DataType::Int32,
-            Self::Float64 => DataType::Float64,
-            Self::Binary => DataType::Binary,
-            Self::Utf8 => DataType::Utf8,
-            Self::Bool => DataType::Boolean,
-            Self::Int64 => DataType::Int64,
-        }
+        Self::ALL.iter().copied().find(|plane| *plane as u8 == value)
     }
 }
 
-/// Four-byte physical field descriptor: `[type, nullable, 0, 0]`.
+/// What one cell of a plane is, and therefore how the plane is stored.
+///
+/// This is the single per-plane classification: storage sizing, Arrow buffer
+/// count, IPC buffer shape, producer range checks and reader widening all
+/// derive from it, so a plane is described in one place instead of five.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaneKind {
+    /// No cells and no buffers.
+    Empty,
+    /// One bit per row, Arrow LSB-first.
+    Bool,
+    /// Signed two's-complement integer, `width` little-endian bytes per row.
+    SignedInt { width: u32 },
+    /// Unsigned integer, `width` little-endian bytes per row.
+    UnsignedInt { width: u32 },
+    /// IEEE-754 binary float, `width` little-endian bytes per row.
+    Float { width: u32 },
+    /// Opaque fixed-size value, `width` bytes per row: decimals, the interval
+    /// units that are not a single scalar, and fixed-size binary. The plane
+    /// does not interpret the bytes; the logical type does.
+    FixedBytes { width: u32 },
+    /// UTF-8 validated bytes behind `offset_width`-byte monotone offsets.
+    Text { offset_width: u32 },
+    /// Opaque bytes behind `offset_width`-byte monotone offsets.
+    Bytes { offset_width: u32 },
+}
+
+impl PlaneKind {
+    /// Bytes of value storage per row, or `None` for the bit-packed,
+    /// variable-width and empty kinds, which do not have one.
+    pub fn value_width(self) -> Option<u32> {
+        match self {
+            Self::SignedInt { width }
+            | Self::UnsignedInt { width }
+            | Self::Float { width }
+            | Self::FixedBytes { width } => Some(width),
+            Self::Empty | Self::Bool | Self::Text { .. } | Self::Bytes { .. } => None,
+        }
+    }
+
+    /// Byte width of one offset entry, or `None` for the kinds without an
+    /// offsets buffer.
+    pub fn offset_width(self) -> Option<u32> {
+        match self {
+            Self::Text { offset_width } | Self::Bytes { offset_width } => Some(offset_width),
+            Self::Empty
+            | Self::Bool
+            | Self::SignedInt { .. }
+            | Self::UnsignedInt { .. }
+            | Self::Float { .. }
+            | Self::FixedBytes { .. } => None,
+        }
+    }
+
+    /// Arrow IPC buffers this kind contributes: validity, then offsets when
+    /// the values are variable-width, then data.
+    ///
+    /// The maximum is 3, and `MetadataLimits::default()` depends on that.
+    pub fn buffer_count(self) -> u32 {
+        match self {
+            Self::Empty => 0,
+            Self::Text { .. } | Self::Bytes { .. } => 3,
+            Self::Bool
+            | Self::SignedInt { .. }
+            | Self::UnsignedInt { .. }
+            | Self::Float { .. }
+            | Self::FixedBytes { .. } => 2,
+        }
+    }
+
+    /// Does `value` fit this kind's signed storage? `false` for every kind
+    /// that does not hold signed integers.
+    ///
+    /// The producers ask this before building a cell so an out-of-range number
+    /// is reported as a bad number where it was read, and `append_int` asks it
+    /// again so no caller can bypass the check. One rule, two callers.
+    pub fn holds_int(self, value: i64) -> bool {
+        let Self::SignedInt { width } = self else {
+            return false;
+        };
+        // An eight-byte plane holds every `i64`, and computing its bound would
+        // overflow the shift.
+        width >= 8 || {
+            let limit = 1i64 << (width * 8 - 1);
+            value >= -limit && value < limit
+        }
+    }
+
+    /// Does `value` fit this kind's unsigned storage? `false` for every kind
+    /// that does not hold unsigned integers.
+    pub fn holds_uint(self, value: u64) -> bool {
+        let Self::UnsignedInt { width } = self else {
+            return false;
+        };
+        width >= 8 || value < 1u64 << (width * 8)
+    }
+}
+
+/// Four-byte physical field descriptor: `[type, nullable, type_param u16 LE]`.
+///
+/// `type_param` is the `FixedSizeBinary` byte width and must be zero for every
+/// other plane. It exists so the physical descriptor alone determines the
+/// layout of every plane: a fixed-size-binary field without a width is not
+/// representable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct SignalSchemaField {
     pub arrow_type: ArrowType,
     pub nullable: u8,
-    pub _pad: [u8; 2],
+    pub type_param: u16,
 }
 
 /// The base event-log schema: `id`, `type`, `timestamp`, `value`, in that
 /// order. The scanners in `columine-parsing` write exactly these four columns
 /// by index, so this is the only schema they can serve.
 pub const BASE_EVENT_LOG_FIELDS: [SignalSchemaField; 4] = [
-    SignalSchemaField {
-        arrow_type: ArrowType::Utf8,
-        nullable: 0,
-        _pad: [0; 2],
-    },
-    SignalSchemaField {
-        arrow_type: ArrowType::Utf8,
-        nullable: 0,
-        _pad: [0; 2],
-    },
-    SignalSchemaField {
-        arrow_type: ArrowType::Int64,
-        nullable: 0,
-        _pad: [0; 2],
-    },
-    SignalSchemaField {
-        arrow_type: ArrowType::Binary,
-        nullable: 1,
-        _pad: [0; 2],
-    },
+    SignalSchemaField::new(ArrowType::Utf8, false),
+    SignalSchemaField::new(ArrowType::Utf8, false),
+    SignalSchemaField::new(ArrowType::Int64, false),
+    SignalSchemaField::new(ArrowType::Binary, true),
 ];
 
 /// Field names of the base event-log schema, matching
@@ -99,11 +276,22 @@ pub const BASE_EVENT_LOG_FIELDS: [SignalSchemaField; 4] = [
 pub const BASE_EVENT_LOG_NAMES: [&str; 4] = ["id", "type", "timestamp", "value"];
 
 impl SignalSchemaField {
-    pub fn new(arrow_type: ArrowType, nullable: bool) -> Self {
+    pub const fn new(arrow_type: ArrowType, nullable: bool) -> Self {
         Self {
             arrow_type,
-            nullable: u8::from(nullable),
-            _pad: [0; 2],
+            nullable: nullable as u8,
+            type_param: 0,
+        }
+    }
+
+    /// A `FixedSizeBinary` field of `byte_width` bytes per row. The width is
+    /// validated when the schema is built, not here, so that a bad width fails
+    /// as a schema error rather than a panic.
+    pub const fn new_fixed_size_binary(byte_width: u16, nullable: bool) -> Self {
+        Self {
+            arrow_type: ArrowType::FixedSizeBinary,
+            nullable: nullable as u8,
+            type_param: byte_width,
         }
     }
 
@@ -111,11 +299,89 @@ impl SignalSchemaField {
         self.nullable == 1
     }
 
-    pub fn buffer_count(self) -> u32 {
+    /// Physical layout of this field. Total: `FixedSizeBinary` resolves its
+    /// per-field byte width from `type_param`, so no caller has to know that
+    /// one plane is parameterized.
+    pub fn plane_kind(self) -> PlaneKind {
         match self.arrow_type {
-            ArrowType::Null => 0,
-            ArrowType::Utf8 | ArrowType::Binary => 3,
-            ArrowType::Int32 | ArrowType::Int64 | ArrowType::Float64 | ArrowType::Bool => 2,
+            ArrowType::Null => PlaneKind::Empty,
+            ArrowType::Bool => PlaneKind::Bool,
+            ArrowType::Int8 => PlaneKind::SignedInt { width: 1 },
+            ArrowType::Int16 => PlaneKind::SignedInt { width: 2 },
+            ArrowType::Int32 | ArrowType::IntervalYearMonth => PlaneKind::SignedInt { width: 4 },
+            ArrowType::Int64 => PlaneKind::SignedInt { width: 8 },
+            ArrowType::UInt8 => PlaneKind::UnsignedInt { width: 1 },
+            ArrowType::UInt16 => PlaneKind::UnsignedInt { width: 2 },
+            ArrowType::UInt32 => PlaneKind::UnsignedInt { width: 4 },
+            ArrowType::UInt64 => PlaneKind::UnsignedInt { width: 8 },
+            ArrowType::Float16 => PlaneKind::Float { width: 2 },
+            ArrowType::Float32 => PlaneKind::Float { width: 4 },
+            ArrowType::Float64 => PlaneKind::Float { width: 8 },
+            ArrowType::IntervalDayTime => PlaneKind::FixedBytes { width: 8 },
+            ArrowType::Decimal128 | ArrowType::IntervalMonthDayNano => {
+                PlaneKind::FixedBytes { width: 16 }
+            }
+            ArrowType::Decimal256 => PlaneKind::FixedBytes { width: 32 },
+            ArrowType::FixedSizeBinary => PlaneKind::FixedBytes {
+                width: u32::from(self.type_param),
+            },
+            ArrowType::Utf8 => PlaneKind::Text { offset_width: 4 },
+            ArrowType::LargeUtf8 => PlaneKind::Text { offset_width: 8 },
+            ArrowType::Binary => PlaneKind::Bytes { offset_width: 4 },
+            ArrowType::LargeBinary => PlaneKind::Bytes { offset_width: 8 },
+        }
+    }
+
+    pub fn buffer_count(self) -> u32 {
+        self.plane_kind().buffer_count()
+    }
+
+    /// Canonical Arrow `DataType` for this field: the logical type a schema
+    /// synthesized from physical tags declares.
+    ///
+    /// Planes shared by several logical types return their canonical one
+    /// (Int32 for the four-byte signed plane), and the parameterized logical
+    /// types return the representative that spans the whole plane
+    /// (`Decimal128(38, 0)` is the widest legal Decimal128).
+    pub fn to_data_type(self) -> DataType {
+        match self.arrow_type {
+            ArrowType::Null => DataType::Null,
+            ArrowType::Bool => DataType::Boolean,
+            ArrowType::Int8 => DataType::Int8,
+            ArrowType::Int16 => DataType::Int16,
+            ArrowType::Int32 => DataType::Int32,
+            ArrowType::Int64 => DataType::Int64,
+            ArrowType::UInt8 => DataType::UInt8,
+            ArrowType::UInt16 => DataType::UInt16,
+            ArrowType::UInt32 => DataType::UInt32,
+            ArrowType::UInt64 => DataType::UInt64,
+            ArrowType::Float16 => DataType::Float16,
+            ArrowType::Float32 => DataType::Float32,
+            ArrowType::Float64 => DataType::Float64,
+            ArrowType::Decimal128 => DataType::Decimal128(DECIMAL128_MAX_PRECISION, 0),
+            ArrowType::Decimal256 => DataType::Decimal256(DECIMAL256_MAX_PRECISION, 0),
+            ArrowType::Binary => DataType::Binary,
+            ArrowType::LargeBinary => DataType::LargeBinary,
+            ArrowType::FixedSizeBinary => DataType::FixedSizeBinary(i32::from(self.type_param)),
+            ArrowType::Utf8 => DataType::Utf8,
+            ArrowType::LargeUtf8 => DataType::LargeUtf8,
+            ArrowType::IntervalYearMonth => DataType::Interval(IntervalUnit::YearMonth),
+            ArrowType::IntervalDayTime => DataType::Interval(IntervalUnit::DayTime),
+            ArrowType::IntervalMonthDayNano => DataType::Interval(IntervalUnit::MonthDayNano),
+        }
+    }
+
+    /// Physical-metadata self-consistency: `type_param` is the
+    /// `FixedSizeBinary` byte width and must be zero for every other plane.
+    fn param_is_valid(self) -> bool {
+        match self.arrow_type {
+            // The only parameterized plane. Every other plane's layout is
+            // fully determined by its tag, so a nonzero param there is a
+            // producer bug, not a wider field.
+            ArrowType::FixedSizeBinary => {
+                (1..=MAX_FIXED_SIZE_BINARY_WIDTH).contains(&self.type_param)
+            }
+            _ => self.type_param == 0,
         }
     }
 }
@@ -125,30 +391,38 @@ pub fn compute_buffer_count(fields: &[SignalSchemaField]) -> u32 {
     fields.iter().map(|field| field.buffer_count()).sum()
 }
 
-/// One continuation-prefixed IPC Schema message for `fields`.
+/// One continuation-prefixed IPC Schema message for explicit logical fields.
 ///
-/// Test fixtures used to restate the ArrowType→DataType match plus StreamWriter
-/// dance in three places; this is that encoder.
-pub fn schema_ipc_bytes(fields: &[SignalSchemaField]) -> Result<Vec<u8>, SchemaError> {
-    let schema_fields: Vec<Field> = fields
-        .iter()
-        .enumerate()
-        .map(|(index, metadata)| {
-            Field::new(
-                format!("field_{index}"),
-                metadata.arrow_type.to_data_type(),
-                metadata.is_nullable(),
-            )
-        })
-        .collect();
+/// The physical-tag encoder below and every caller that needs a non-canonical
+/// logical type — Date32 on the four-byte plane, Timestamp on the eight-byte
+/// plane — share this one StreamWriter dance.
+pub fn logical_schema_ipc_bytes(fields: Vec<Field>) -> Result<Vec<u8>, SchemaError> {
     let mut bytes = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut bytes, &Schema::new(schema_fields))
+        let mut writer = StreamWriter::try_new(&mut bytes, &Schema::new(fields))
             .map_err(|_| SchemaError::InvalidMessage)?;
         writer.finish().map_err(|_| SchemaError::InvalidMessage)?;
     }
     bytes.truncate(bytes.len().saturating_sub(8));
     Ok(bytes)
+}
+
+/// One continuation-prefixed IPC Schema message for `fields`, using each
+/// plane's canonical logical type.
+pub fn schema_ipc_bytes(fields: &[SignalSchemaField]) -> Result<Vec<u8>, SchemaError> {
+    logical_schema_ipc_bytes(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(index, metadata)| {
+                Field::new(
+                    format!("field_{index}"),
+                    metadata.to_data_type(),
+                    metadata.is_nullable(),
+                )
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,7 +526,7 @@ impl DynamicSchemaConfig {
             .zip(field_metadata.iter())
             .enumerate()
         {
-            if !logical_type_matches(metadata.arrow_type, field.data_type()) {
+            if !logical_type_matches(*metadata, field.data_type()) {
                 return Err(SchemaError::TypeMismatch { field_index });
             }
             if field.is_nullable() != metadata.is_nullable()
@@ -323,16 +597,88 @@ fn decode_schema_message(bytes: &[u8]) -> Result<arrow_schema::Schema, SchemaErr
     try_schema_from_ipc_buffer(bytes).map_err(|_| SchemaError::InvalidMessage)
 }
 
-fn logical_type_matches(physical: ArrowType, logical: &DataType) -> bool {
-    match physical {
+/// Does `logical` name a type this plane can actually store?
+///
+/// Physical width agreeing is NOT the test. Every logical Arrow type belongs
+/// to exactly one plane, so a plane rejects every other type of its own width:
+/// UInt32 is not admitted on the four-byte signed plane and Float32 is not
+/// admitted on either, because reading those bytes back through the wrong
+/// plane produces a different number, not a different name.
+fn logical_type_matches(field: SignalSchemaField, logical: &DataType) -> bool {
+    match field.arrow_type {
         ArrowType::Null => matches!(logical, DataType::Null),
-        ArrowType::Int32 => matches!(logical, DataType::Int32),
-        ArrowType::Float64 => matches!(logical, DataType::Float64),
-        ArrowType::Binary => matches!(logical, DataType::Binary),
-        ArrowType::Utf8 => matches!(logical, DataType::Utf8),
         ArrowType::Bool => matches!(logical, DataType::Boolean),
-        ArrowType::Int64 => matches!(logical, DataType::Int64 | DataType::Timestamp(_, _)),
+        ArrowType::Int8 => matches!(logical, DataType::Int8),
+        ArrowType::Int16 => matches!(logical, DataType::Int16),
+        // The four-byte signed plane. Date32 counts days since the epoch and
+        // Time32 counts seconds or milliseconds since midnight; both are a
+        // little-endian `i32` and are told apart by the logical schema, not by
+        // the tag. Arrow restricts Time32 to Second and Millisecond, so a
+        // Time32 in microseconds is not a legal Arrow type and is rejected
+        // here rather than accepted because it happens to be four bytes.
+        ArrowType::Int32 => matches!(
+            logical,
+            DataType::Int32
+                | DataType::Date32
+                | DataType::Time32(TimeUnit::Second | TimeUnit::Millisecond)
+        ),
+        // The eight-byte signed plane, same rule. Date64 counts milliseconds
+        // since the epoch, Time64 counts microseconds or nanoseconds since
+        // midnight (the only two units Arrow allows for it), and Timestamp and
+        // Duration carry their unit — and Timestamp its zone — in the logical
+        // type where a reader can see it.
+        ArrowType::Int64 => matches!(
+            logical,
+            DataType::Int64
+                | DataType::Date64
+                | DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
+                | DataType::Timestamp(_, _)
+                | DataType::Duration(_)
+        ),
+        ArrowType::UInt8 => matches!(logical, DataType::UInt8),
+        ArrowType::UInt16 => matches!(logical, DataType::UInt16),
+        ArrowType::UInt32 => matches!(logical, DataType::UInt32),
+        ArrowType::UInt64 => matches!(logical, DataType::UInt64),
+        ArrowType::Float16 => matches!(logical, DataType::Float16),
+        ArrowType::Float32 => matches!(logical, DataType::Float32),
+        ArrowType::Float64 => matches!(logical, DataType::Float64),
+        ArrowType::Decimal128 => matches!(
+            logical,
+            DataType::Decimal128(precision, scale)
+                if decimal_fits(*precision, *scale, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE)
+        ),
+        ArrowType::Decimal256 => matches!(
+            logical,
+            DataType::Decimal256(precision, scale)
+                if decimal_fits(*precision, *scale, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE)
+        ),
+        ArrowType::Binary => matches!(logical, DataType::Binary),
+        ArrowType::LargeBinary => matches!(logical, DataType::LargeBinary),
+        // The declared byte width has to agree with the physical descriptor:
+        // the column store sizes this plane from `type_param`, so a logical
+        // FixedSizeBinary(32) over a 16-byte plane would read past every row.
+        ArrowType::FixedSizeBinary => {
+            *logical == DataType::FixedSizeBinary(i32::from(field.type_param))
+        }
+        ArrowType::Utf8 => matches!(logical, DataType::Utf8),
+        ArrowType::LargeUtf8 => matches!(logical, DataType::LargeUtf8),
+        ArrowType::IntervalYearMonth => {
+            matches!(logical, DataType::Interval(IntervalUnit::YearMonth))
+        }
+        ArrowType::IntervalDayTime => matches!(logical, DataType::Interval(IntervalUnit::DayTime)),
+        ArrowType::IntervalMonthDayNano => {
+            matches!(logical, DataType::Interval(IntervalUnit::MonthDayNano))
+        }
     }
+}
+
+/// Does a decimal of this precision and scale fit the plane's storage width?
+///
+/// Bounds come from the `DECIMAL*_MAX_*` constants arrow-schema publishes, so
+/// `Decimal128(50, 0)` — which does not fit 128 bits — is rejected rather than
+/// stored as sixteen bytes that cannot hold it.
+fn decimal_fits(precision: u8, scale: i8, max_precision: u8, max_scale: i8) -> bool {
+    precision >= 1 && precision <= max_precision && scale >= -max_scale && scale <= max_scale
 }
 
 fn validate_typed_metadata(fields: &[SignalSchemaField]) -> Result<(), SchemaError> {
@@ -340,7 +686,7 @@ fn validate_typed_metadata(fields: &[SignalSchemaField]) -> Result<(), SchemaErr
         return Err(SchemaError::TooManyFields);
     }
     for (field_index, field) in fields.iter().enumerate() {
-        if field.nullable > 1 || field._pad != [0; 2] {
+        if field.nullable > 1 || !field.param_is_valid() {
             return Err(SchemaError::InvalidFieldMetadata { field_index });
         }
     }
@@ -360,10 +706,15 @@ fn decode_field_metadata(bytes: &[u8]) -> Result<Vec<SignalSchemaField>, SchemaE
         let Some(arrow_type) = ArrowType::from_u8(raw[0]) else {
             return Err(SchemaError::InvalidFieldMetadata { field_index });
         };
-        if raw[1] > 1 || raw[2] != 0 || raw[3] != 0 {
+        let field = SignalSchemaField {
+            arrow_type,
+            nullable: raw[1],
+            type_param: u16::from_le_bytes([raw[2], raw[3]]),
+        };
+        if raw[1] > 1 || !field.param_is_valid() {
             return Err(SchemaError::InvalidFieldMetadata { field_index });
         }
-        fields.push(SignalSchemaField::new(arrow_type, raw[1] == 1));
+        fields.push(field);
     }
     Ok(fields)
 }
@@ -425,8 +776,15 @@ mod tests {
 
     #[test]
     fn field_metadata_layout_and_discriminants_are_stable() {
+        // Four bytes on the wire is the ABI. Alignment is two because the
+        // fourth and third bytes are one `u16` type_param, and nothing casts a
+        // byte slice to this struct — `decode_field_metadata` reads the four
+        // bytes explicitly.
         assert_eq!(core::mem::size_of::<SignalSchemaField>(), 4);
-        assert_eq!(core::mem::align_of::<SignalSchemaField>(), 1);
+        assert_eq!(core::mem::align_of::<SignalSchemaField>(), 2);
+
+        // The seven original tags are frozen: they are baked into the shipped
+        // wasm and into persisted fixtures.
         for (value, expected) in [
             (0, ArrowType::Null),
             (1, ArrowType::Int32),
@@ -439,7 +797,17 @@ mod tests {
             assert_eq!(expected as u8, value);
             assert_eq!(ArrowType::from_u8(value), Some(expected));
         }
-        assert_eq!(ArrowType::from_u8(7), None);
+
+        // `ALL` is the whole table, ascending and gapless, and `from_u8` is
+        // exactly its inverse.
+        for (index, plane) in ArrowType::ALL.iter().enumerate() {
+            assert_eq!(*plane as u8 as usize, index);
+            assert_eq!(ArrowType::from_u8(index as u8), Some(*plane));
+        }
+        let highest = ArrowType::ALL.len() as u8;
+        for value in highest..=u8::MAX {
+            assert_eq!(ArrowType::from_u8(value), None, "tag {value} is not a plane");
+        }
     }
 
     #[test]
