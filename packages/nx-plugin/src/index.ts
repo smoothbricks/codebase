@@ -24,6 +24,9 @@ import {
 import {
   CARGO_CROSS_LINT_COMMAND,
   CARGO_CROSS_LINT_TARGET,
+  CARGO_FETCH_COMMAND,
+  CARGO_FETCH_TARGET,
+  CARGO_FROZEN_PREFIX,
   CARGO_LINT_CLIPPY_COMMAND,
   cargoFrozen,
 } from './cross-check-policy.js';
@@ -525,6 +528,75 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       cache: false,
       options: { command: 'cargo sweep --time 7', cwd: projectRoot },
     };
+  }
+
+  // Every `cargoFrozen` command needs a registry cache holding the whole locked
+  // graph, and offline cargo checks that at RESOLUTION — so a dev-dependency no
+  // build ever downloaded takes down `cargo --frozen build` just as surely as
+  // `cargo --frozen test`. On an ephemeral runner the only thing that had been
+  // populating that cache was a preceding NON-frozen `napi build`, which
+  // downloads normal dependencies and never dev-dependencies; a workspace no
+  // platform target reaches got nothing at all. `cargo-fetch` states the
+  // precondition instead of inheriting it from another target's side effects.
+  //
+  // Derived from the command text rather than a curated list of target names:
+  // the fact that makes a target need this is that it runs frozen cargo, so a
+  // frozen target added later is covered without anyone remembering to. The edge
+  // goes on EVERY frozen target, not just the head of the serialization chain,
+  // so re-routing that chain cannot strip a surviving target's precondition.
+  //
+  // A package that REPLACES one of these `dependsOn` lists drops the edge with
+  // it (see the merge rules above) and gets its cold-cache failure back; `"..."`
+  // keeps it.
+  const frozenCargoManifests = new Set<string>();
+  if (isCargoWorkspace) {
+    frozenCargoManifests.add('Cargo.toml');
+  }
+  if (inferCargoWasm && cargoWasmConfig) {
+    // A wasm-bindgen crate can sit in a nested Cargo workspace the project root
+    // is not a member of, so its graph is a second fetch, not the same one.
+    frozenCargoManifests.add(cargoWasmConfig.manifestPath);
+  }
+  if (frozenCargoManifests.size > 0) {
+    targets[CARGO_FETCH_TARGET] = {
+      executor: 'nx:run-commands',
+      // The download lands in CARGO_HOME, outside the workspace: a cache hit
+      // would skip work a cold registry still needs — same reason
+      // napi-toolchain-* is uncached. Nothing here is a workspace output, so
+      // there is nothing for Nx to restore in its place.
+      cache: false,
+      options: {
+        commands: [...frozenCargoManifests]
+          .sort()
+          .map((manifestPath) =>
+            manifestPath === 'Cargo.toml'
+              ? CARGO_FETCH_COMMAND
+              : `${CARGO_FETCH_COMMAND} --manifest-path ${manifestPath}`,
+          ),
+        cwd: projectRoot,
+        // Two fetches into one CARGO_HOME contend on its package-cache flock;
+        // serializing here spends the wait in Nx instead of inside cargo.
+        parallel: false,
+      },
+    };
+    for (const [name, target] of Object.entries(targets)) {
+      if (name === CARGO_FETCH_TARGET) {
+        continue;
+      }
+      const command: unknown = target.options?.command;
+      const commands: unknown = target.options?.commands;
+      const text = [
+        typeof command === 'string' ? command : '',
+        ...(Array.isArray(commands) ? commands.filter((entry) => typeof entry === 'string') : []),
+      ].join('\n');
+      if (!text.includes(CARGO_FROZEN_PREFIX)) {
+        continue;
+      }
+      const dependsOn = target.dependsOn ?? [];
+      if (!dependsOn.includes(CARGO_FETCH_TARGET)) {
+        target.dependsOn = [CARGO_FETCH_TARGET, ...dependsOn];
+      }
+    }
   }
 
   // Cargo flocks the package's default `target/`. Writers that share it must

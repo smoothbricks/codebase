@@ -49,13 +49,57 @@ export function withProjectCargoHome(homeRel: string, command: string): string {
 }
 
 /**
+ * The prefix `cargoFrozen` writes. Exported so target inference can recognize
+ * the commands whose precondition `CARGO_FETCH_TARGET` supplies without
+ * re-spelling the flag; a second copy would silently stop matching.
+ */
+export const CARGO_FROZEN_PREFIX = 'cargo --frozen ';
+
+/**
  * `--frozen` is cargo's `--locked` + `--offline`. Cargo.lock and the registry
  * cache are inputs: inferred cargo must not rewrite the lockfile or fetch.
  * The flag sits on `cargo` so nextest sees a cargo-level option, not its own.
+ *
+ * The registry cache being an INPUT is a precondition, and offline cargo
+ * enforces it at RESOLUTION, before it selects a single target: an offline
+ * registry source only reports packages already downloaded, so one absent
+ * member of the lockfile's graph makes the whole workspace unresolvable with
+ * `no matching package named <dep> found`. The failure therefore has nothing to
+ * do with which targets a command builds — `build`, `check`, `test --lib` and
+ * `test --no-run` all fail identically on a dependency only a bench needs — and
+ * narrowing a command's target selection cannot cure it.
+ *
+ * Dev- and bench-only dependencies are the exposed class. A build downloads the
+ * normal dependency graph, so on a runner that builds before it tests those are
+ * warm by accident; nothing downloads a dev-dependency until something compiles
+ * a test target, and by then `--frozen` refuses to. `CARGO_FETCH_TARGET` below
+ * turns that accident into a stated dependency.
  */
 export function cargoFrozen(args: string): string {
-  return `cargo --frozen ${args}`;
+  return `${CARGO_FROZEN_PREFIX}${args}`;
 }
+
+/**
+ * Nx target name. Downloads one Cargo workspace's locked dependency graph so
+ * every `cargoFrozen` command in that workspace can resolve offline. No colons,
+ * per the repo's target-naming rule, and outside the `-js`/`-napi`/`-wasm` and
+ * platform-suffix families so no aggregate sweeps it up.
+ */
+export const CARGO_FETCH_TARGET = 'cargo-fetch';
+
+/**
+ * `--locked` rather than bare `cargo fetch`: this downloads exactly the graph
+ * Cargo.lock pins and fails loudly on a stale lockfile. Without it a fetch could
+ * re-resolve and hand `--frozen` a cache built from a different graph than the
+ * lockfile names, which is the guarantee `--frozen` exists to give.
+ *
+ * `fetch` and nothing else, because fetching is the only act that needs the
+ * network; every compile downstream stays frozen.
+ *
+ * No `--target`: with no triple named cargo fetches every target's
+ * dependencies, so one run also covers `CARGO_CROSS_LINT_TARGET`'s Linux triple.
+ */
+export const CARGO_FETCH_COMMAND = 'cargo fetch --locked';
 
 /**
  * Clippy rather than `cargo check`, and `-D warnings`, because that is exactly
