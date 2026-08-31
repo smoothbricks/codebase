@@ -26,7 +26,6 @@ pub mod packed_header;
 pub mod result;
 pub mod scope;
 pub mod thread_buffer;
-#[cfg(feature = "ffi")]
 pub mod thread_ffi;
 pub mod tuning;
 
@@ -51,7 +50,6 @@ pub use thread_buffer::{
     AttributeValue, ColumnValue, ColumnValueKind, ColumnValueRef, FlushWindow, ThreadBufferError,
     ThreadSpanBuffer,
 };
-#[cfg(feature = "ffi")]
 pub use thread_ffi::ThreadSpanBufferHandle;
 pub use thread_kinds::{
     ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,

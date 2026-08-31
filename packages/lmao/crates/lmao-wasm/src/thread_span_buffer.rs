@@ -14,7 +14,7 @@ use std::{collections::HashSet, str};
 use lmao_core::{
     ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
     ATTRIBUTE_KIND_UINT64, ColumnValue, ColumnValueRef, EntryType, FieldMeta, FieldStrategy,
-    ScopeValue, SharedStr, ThreadBufferError, ThreadSpanBuffer, TraceId, VocabularyId,
+    ScopeValue, TextInput, ThreadBufferError, ThreadSpanBuffer, TraceId, VocabularyId,
 };
 
 const STATUS_OK: u8 = 0;
@@ -257,9 +257,12 @@ fn trace_id(ptr: *const u8, len: usize) -> Option<TraceId> {
     TraceId::new(value).ok()
 }
 
-fn shared_string(ptr: *const u8, len: usize) -> Option<SharedStr> {
+/// Borrow caller bytes as dynamic text for the arena's intern path. Nothing is
+/// copied here: `ThreadSpanBuffer::cell` interns the value, so the copy is per
+/// distinct string, not per call.
+fn dynamic_text<'a>(ptr: *const u8, len: usize) -> Option<TextInput<'a>> {
     let bytes = unsafe { bytes(ptr, len) }?;
-    ThreadSpanBuffer::shared_utf8(bytes).ok()
+    std::str::from_utf8(bytes).ok().map(TextInput::Dynamic)
 }
 
 fn write_value(buffer: &mut ThreadSpanBuffer, row: u32, ordinal: u16, kind: u8, value: u64) -> u8 {
@@ -272,7 +275,7 @@ fn write_value(buffer: &mut ThreadSpanBuffer, row: u32, ordinal: u16, kind: u8, 
         .unwrap_or(STATUS_ERROR)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_new(thread_id: u64, capacity: u32) -> u32 {
     let Some(capacity) = valid_capacity(capacity) else {
         return 0;
@@ -284,7 +287,7 @@ pub extern "C" fn thread_span_buffer_new(thread_id: u64, capacity: u32) -> u32 {
 ///
 /// Each field is `[kind:u8][name_len:u8][name bytes]`; enum fields append
 /// `[variant_count:u16 LE]` and `[len:u8][variant bytes]` for each variant.
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_new_with_schema(
     thread_id: u64,
     capacity: u32,
@@ -300,7 +303,7 @@ pub unsafe extern "C" fn thread_span_buffer_new_with_schema(
     allocate_handle(thread_id, capacity, fields)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_free(handle: u32) {
     if handle == 0 {
         return;
@@ -314,7 +317,7 @@ pub extern "C" fn thread_span_buffer_free(handle: u32) {
 
 /// Release every row and span on a handle, keeping its interned vocabulary.
 /// Returns 0 on success and a non-zero status for an unknown handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_reset(handle: u32) -> i32 {
     match with_handle(handle, |buffer| {
         buffer.reset();
@@ -325,7 +328,7 @@ pub extern "C" fn thread_span_buffer_reset(handle: u32) -> i32 {
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_intern(handle: u32, ptr: *const u8, len: usize) -> u32 {
     let Some(bytes) = (unsafe { bytes(ptr, len) }) else {
         return 0;
@@ -333,7 +336,7 @@ pub unsafe extern "C" fn thread_span_buffer_intern(handle: u32, ptr: *const u8, 
     with_handle(handle, |buffer| buffer.intern_utf8(bytes)).unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span(
     handle: u32,
     trace_ptr: *const u8,
@@ -364,7 +367,7 @@ pub unsafe extern "C" fn thread_span_buffer_open_span(
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span_static(
     handle: u32,
     trace_ptr: *const u8,
@@ -398,7 +401,7 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_static(
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
     handle: u32,
     trace_ptr: *const u8,
@@ -413,7 +416,7 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
     let Some(trace_id) = trace_id(trace_ptr, trace_len) else {
         return 0;
     };
-    let Some(name) = shared_string(name_ptr, name_len) else {
+    let Some(name) = dynamic_text(name_ptr, name_len) else {
         return 0;
     };
     with_handle(handle, |buffer| {
@@ -437,7 +440,7 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
 ///
 /// Replaces the end_ok/end_err pair: two entry points could only express two
 /// of the completion types, so a thrown exception arrived as a handled error.
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_end(
     handle: u32,
     span_id: u32,
@@ -452,7 +455,7 @@ pub extern "C" fn thread_span_buffer_end(
         .unwrap_or(STATUS_ERROR)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_append_log(
     handle: u32,
     span_id: u32,
@@ -472,7 +475,7 @@ pub extern "C" fn thread_span_buffer_append_log(
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_append_log_static(
     handle: u32,
     span_id: u32,
@@ -494,7 +497,7 @@ pub extern "C" fn thread_span_buffer_append_log_static(
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     handle: u32,
     span_id: u32,
@@ -507,7 +510,7 @@ pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     let Some(entry_type) = EntryType::from_u8(entry_type) else {
         return 0;
     };
-    let Some(message) = shared_string(message_ptr, message_len) else {
+    let Some(message) = dynamic_text(message_ptr, message_len) else {
         return 0;
     };
     with_handle(handle, |buffer| {
@@ -517,7 +520,7 @@ pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_write_attr(
     handle: u32,
     row: u32,
@@ -531,7 +534,7 @@ pub extern "C" fn thread_span_buffer_write_attr(
     .unwrap_or(STATUS_ERROR)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_write_tag(
     handle: u32,
     span_id: u32,
@@ -549,7 +552,7 @@ pub extern "C" fn thread_span_buffer_write_tag(
     .unwrap_or(STATUS_ERROR)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_set_scope(
     handle: u32,
     span_id: u32,
@@ -578,7 +581,16 @@ pub extern "C" fn thread_span_buffer_set_scope(
             ColumnValue::Number(value) => ScopeValue::Number(value),
             ColumnValue::Uint64(value) => ScopeValue::Uint64(value),
             ColumnValue::Boolean(value) => ScopeValue::Boolean(value),
-            ColumnValue::Text(value) => ScopeValue::Text(value),
+            // A scope value outlives the arena's next clear, so the ordinal is
+            // resolved and owned here; set_scope is a per-span boundary, not a
+            // per-row path.
+            ColumnValue::Text(value) => ScopeValue::Text(
+                buffer
+                    .interned(value)
+                    .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?
+                    .to_owned()
+                    .into(),
+            ),
             ColumnValue::Enum(value) => ScopeValue::EnumIndex(value),
         };
         let update = [(field.name, Some(scope_value))];
@@ -618,7 +630,7 @@ fn encode_attr(buffer: &mut ThreadSpanBuffer, row: usize, ordinal: u16) -> Optio
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_row_count(handle: u32) -> u32 {
     with_handle(handle, |buffer| {
         u32::try_from(buffer.row_count())
@@ -627,7 +639,7 @@ pub extern "C" fn thread_span_buffer_row_count(handle: u32) -> u32 {
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_materialize_scope(
     handle: u32,
     start_row: u32,
@@ -642,7 +654,7 @@ pub extern "C" fn thread_span_buffer_materialize_scope(
     .unwrap_or(STATUS_ERROR)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_read_timestamp(handle: u32, row: u32) -> i64 {
     with_handle(handle, |buffer| {
         buffer
@@ -652,7 +664,7 @@ pub extern "C" fn thread_span_buffer_read_timestamp(handle: u32, row: u32) -> i6
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_read_span_id(handle: u32, row: u32) -> u32 {
     with_handle(handle, |buffer| {
         buffer
@@ -662,7 +674,7 @@ pub extern "C" fn thread_span_buffer_read_span_id(handle: u32, row: u32) -> u32 
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_read_header(handle: u32, row: u32) -> u32 {
     with_handle(handle, |buffer| {
         buffer
@@ -672,7 +684,7 @@ pub extern "C" fn thread_span_buffer_read_header(handle: u32, row: u32) -> u32 {
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_read_parent_span_id(handle: u32, row: u32) -> u32 {
     with_handle(handle, |buffer| {
         buffer
@@ -682,7 +694,7 @@ pub extern "C" fn thread_span_buffer_read_parent_span_id(handle: u32, row: u32) 
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_read_parent_thread_id(handle: u32, row: u32) -> u64 {
     with_handle(handle, |buffer| {
         buffer
@@ -692,7 +704,7 @@ pub extern "C" fn thread_span_buffer_read_parent_thread_id(handle: u32, row: u32
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_read_line(handle: u32, row: u32) -> u32 {
     with_handle(handle, |buffer| {
         buffer
@@ -705,7 +717,7 @@ pub extern "C" fn thread_span_buffer_read_line(handle: u32, row: u32) -> u32 {
 /// Copy the row's trace id into `out_ptr`. Returns the UTF-8 length; zero is
 /// failure. When `out_len` is too small the length is still returned and nothing
 /// is written, so the caller can grow scratch and retry.
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_trace_id(
     handle: u32,
     row: u32,
@@ -721,7 +733,7 @@ pub unsafe extern "C" fn thread_span_buffer_read_trace_id(
     .unwrap_or(0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_message(
     handle: u32,
     row: u32,
@@ -737,7 +749,7 @@ pub unsafe extern "C" fn thread_span_buffer_read_message(
 
 /// Write kind and scalar value for a present attribute. STATUS_ERROR means
 /// the cell is null or the row/ordinal is invalid.
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_attr(
     handle: u32,
     row: u32,
@@ -762,7 +774,7 @@ pub unsafe extern "C" fn thread_span_buffer_read_attr(
     .unwrap_or(STATUS_ERROR)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_interned(
     handle: u32,
     ordinal: u32,
