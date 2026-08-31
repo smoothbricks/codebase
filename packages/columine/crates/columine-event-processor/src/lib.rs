@@ -60,6 +60,60 @@ pub enum ResultCode {
     SchemaMismatch = 7,
 }
 
+/// Why an `ep_create_*` call produced no handle (u32 values are ABI).
+///
+/// Handles occupy 1..=255, so any other return value is a failure and these
+/// name which one. Every cause used to collapse into a bare `0`: a schema type
+/// mismatch was indistinguishable from a capacity refusal, from a null
+/// pointer, and from an exhausted handle table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CreateFailure {
+    /// Null pointer, or a field count whose metadata length overflows.
+    BadRequest = 0x8000_0001,
+    /// `capacity == 0` or above the instance ceiling.
+    Capacity = 0x8000_0002,
+    /// `schema_bytes` is not one continuation-prefixed IPC Schema message.
+    SchemaMessage = 0x8000_0003,
+    /// More schema fields than `columine_arrow::MAX_SCHEMA_FIELDS`.
+    SchemaTooManyFields = 0x8000_0004,
+    /// A four-byte physical descriptor is not a valid `[type, nullable, 0, 0]`.
+    SchemaFieldMetadata = 0x8000_0005,
+    /// The schema message and the physical metadata table disagree on width.
+    SchemaFieldCount = 0x8000_0006,
+    /// A physical tag disagrees with that field's logical Arrow type.
+    SchemaTypeMismatch = 0x8000_0007,
+    /// A field's nullability disagrees, or a Null field is non-nullable.
+    SchemaNullability = 0x8000_0008,
+    /// The field-name blob is malformed or not one name per field.
+    SchemaFieldNames = 0x8000_0009,
+    /// Retained-metadata or extraction-config limits refused the schema.
+    Init = 0x8000_000a,
+    /// All 255 handle slots are in use.
+    HandlesExhausted = 0x8000_000b,
+}
+
+impl From<columine_arrow::SchemaError> for CreateFailure {
+    fn from(error: columine_arrow::SchemaError) -> Self {
+        use columine_arrow::SchemaError as E;
+        match error {
+            E::InvalidMessage => Self::SchemaMessage,
+            E::TooManyFields => Self::SchemaTooManyFields,
+            E::InvalidFieldMetadata { .. } => Self::SchemaFieldMetadata,
+            E::FieldCountMismatch { .. } => Self::SchemaFieldCount,
+            E::TypeMismatch { .. } => Self::SchemaTypeMismatch,
+            E::NullabilityMismatch { .. } => Self::SchemaNullability,
+            E::InvalidFieldNames => Self::SchemaFieldNames,
+        }
+    }
+}
+
+impl From<EpInitError> for CreateFailure {
+    fn from(_: EpInitError) -> Self {
+        Self::Init
+    }
+}
+
 /// Result header size (`ResultHeader`, 32 bytes: code u32 | arrow_ipc_offset
 /// u32 | arrow_ipc_len u32 | events_processed u32 | duplicates_filtered u32 |
 /// reserved [12]u8). Written as explicit LE bytes; layout pinned by test.
@@ -165,10 +219,9 @@ impl EventProcessor {
         Self::with_column_capacity(wiring, capacity, capacity, policy, schema_config)
     }
 
-    /// Init with a batch-column capacity distinct from the dedup capacity.
-    /// The wasm configuration caps columns at `WASM_EVENT_CAPACITY` (256) to
-    /// fit linear memory while the bloom filter uses the caller's full
-    /// `capacity`; native columns use the requested capacity.
+    /// Init with a batch-column capacity distinct from the dedup capacity:
+    /// the bloom filter uses the caller's full `capacity` while the column
+    /// plane is sized independently.
     pub fn with_column_capacity(
         wiring: EpWiring,
         capacity: u32,

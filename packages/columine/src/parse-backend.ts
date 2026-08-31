@@ -130,6 +130,123 @@ const COMPACT_STATUS_CODE = {
   7: 'SCHEMA_MISMATCH',
 } as const;
 
+/**
+ * Highest handle the wasm handle table can hand out: `HANDLES` is 256 slots
+ * and slot 0 is reserved. Every return value outside `1..EP_MAX_HANDLE` is an
+ * `EP_CREATE_FAILURE` code.
+ */
+const EP_MAX_HANDLE = 255;
+
+/**
+ * `ep_create_*` failure codes — the `CreateFailure` enum in
+ * columine-event-processor, pinned by `parse_backend_abi.rs`.
+ *
+ * Creation used to answer every distinct refusal with a bare `0`, so a schema
+ * type mismatch read exactly like a capacity refusal, a null pointer, and an
+ * exhausted handle table.
+ */
+const EP_CREATE_FAILURE = {
+  2147483649: 'BAD_REQUEST',
+  2147483650: 'CAPACITY',
+  2147483651: 'SCHEMA_MESSAGE',
+  2147483652: 'SCHEMA_TOO_MANY_FIELDS',
+  2147483653: 'SCHEMA_FIELD_METADATA',
+  2147483654: 'SCHEMA_FIELD_COUNT',
+  2147483655: 'SCHEMA_TYPE_MISMATCH',
+  2147483656: 'SCHEMA_NULLABILITY',
+  2147483657: 'SCHEMA_FIELD_NAMES',
+  2147483658: 'INIT',
+  2147483659: 'HANDLES_EXHAUSTED',
+} as const;
+
+const EP_CREATE_FAILURE_DETAIL = {
+  BAD_REQUEST: 'a null pointer or an overflowing field count reached the wasm export',
+  CAPACITY: 'the requested event capacity is zero or above the instance ceiling',
+  SCHEMA_MESSAGE: 'schemaBytes is not one continuation-prefixed Arrow IPC Schema message',
+  SCHEMA_TOO_MANY_FIELDS: `the schema declares more than ${MAX_FIELDS} fields`,
+  SCHEMA_FIELD_COUNT: 'schemaBytes and fieldMetadata declare different field counts',
+  SCHEMA_FIELD_METADATA: 'a fieldMetadata entry is not a valid [type, nullable, 0, 0] descriptor',
+  SCHEMA_TYPE_MISMATCH: "a fieldMetadata physical tag disagrees with that field's logical Arrow type in schemaBytes",
+  SCHEMA_NULLABILITY: 'a field nullability flag disagrees with schemaBytes, or a Null field is non-nullable',
+  SCHEMA_FIELD_NAMES: 'the field-name blob is malformed or does not carry one name per field',
+  INIT: 'retained-metadata or extraction-config limits refused the schema',
+  HANDLES_EXHAUSTED: `all ${EP_MAX_HANDLE} EventProcessor handle slots are in use`,
+} as const satisfies Record<(typeof EP_CREATE_FAILURE)[keyof typeof EP_CREATE_FAILURE], string>;
+
+export type EventProcessorCreateErrorCode =
+  | (typeof EP_CREATE_FAILURE)[keyof typeof EP_CREATE_FAILURE]
+  | 'UNKNOWN_FAILURE';
+
+function epCreateFailureCode(status: number): EventProcessorCreateErrorCode {
+  switch (status) {
+    case 0x8000_0001:
+      return EP_CREATE_FAILURE[0x8000_0001];
+    case 0x8000_0002:
+      return EP_CREATE_FAILURE[0x8000_0002];
+    case 0x8000_0003:
+      return EP_CREATE_FAILURE[0x8000_0003];
+    case 0x8000_0004:
+      return EP_CREATE_FAILURE[0x8000_0004];
+    case 0x8000_0005:
+      return EP_CREATE_FAILURE[0x8000_0005];
+    case 0x8000_0006:
+      return EP_CREATE_FAILURE[0x8000_0006];
+    case 0x8000_0007:
+      return EP_CREATE_FAILURE[0x8000_0007];
+    case 0x8000_0008:
+      return EP_CREATE_FAILURE[0x8000_0008];
+    case 0x8000_0009:
+      return EP_CREATE_FAILURE[0x8000_0009];
+    case 0x8000_000a:
+      return EP_CREATE_FAILURE[0x8000_000a];
+    case 0x8000_000b:
+      return EP_CREATE_FAILURE[0x8000_000b];
+    default:
+      return 'UNKNOWN_FAILURE';
+  }
+}
+
+/**
+ * `ep_create_with_schema[_and_names]` produced no handle.
+ *
+ * Deliberately not a {@link CompactEncodingError}: a handle that was never
+ * created cannot have produced a compact status or diagnostic, and reporting
+ * creation failures as `SCHEMA_MISMATCH` (status 7) made a real regression
+ * indistinguishable from the mismatch an encode is supposed to detect.
+ */
+export class EventProcessorCreateError extends Error {
+  readonly code: EventProcessorCreateErrorCode;
+
+  constructor(
+    readonly status: number,
+    context: string,
+  ) {
+    const code = epCreateFailureCode(status);
+    const detail =
+      code === 'UNKNOWN_FAILURE'
+        ? 'the wasm export returned no known handle or failure code'
+        : EP_CREATE_FAILURE_DETAIL[code];
+    super(`${context}: ${code} (0x${status.toString(16)}) — ${detail}`);
+    this.name = 'EventProcessorCreateError';
+    this.code = code;
+  }
+}
+
+/**
+ * A handle, or the named reason there is none.
+ *
+ * `returned` arrives as the wasm i32 JavaScript sees, i.e. sign-extended:
+ * every `CreateFailure` code has bit 31 set, so `0x8000_0007` reaches here as
+ * `-2147483641`. Reinterpret as unsigned before decoding.
+ */
+function requireEpHandle(returned: number, context: string): number {
+  const handle = returned >>> 0;
+  if (handle >= 1 && handle <= EP_MAX_HANDLE) {
+    return handle;
+  }
+  throw new EventProcessorCreateError(handle, context);
+}
+
 export type CompactEncodingErrorCode =
   | (typeof COMPACT_STATUS_CODE)[keyof typeof COMPACT_STATUS_CODE]
   | 'UNKNOWN_STATUS';
@@ -822,26 +939,26 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
           memory.set(fieldNamesBuffer, layout.fieldNamesOffset);
         }
         const fieldCount = config.fieldMetadata.length / 4;
-        handle = fieldNamesBuffer
-          ? wasm.ep_create_with_schema_and_names(
-              MAX_EVENTS_PER_BATCH,
-              layout.schemaOffset,
-              config.schemaBytes.length,
-              layout.fieldMetaOffset,
-              fieldCount,
-              layout.fieldNamesOffset,
-              fieldNamesBuffer.length,
-            )
-          : wasm.ep_create_with_schema(
-              MAX_EVENTS_PER_BATCH,
-              layout.schemaOffset,
-              config.schemaBytes.length,
-              layout.fieldMetaOffset,
-              fieldCount,
-            );
-        if (handle === 0) {
-          throw new Error('Failed to create EventProcessor — ep_create_with_schema returned 0');
-        }
+        handle = requireEpHandle(
+          fieldNamesBuffer
+            ? wasm.ep_create_with_schema_and_names(
+                MAX_EVENTS_PER_BATCH,
+                layout.schemaOffset,
+                config.schemaBytes.length,
+                layout.fieldMetaOffset,
+                fieldCount,
+                layout.fieldNamesOffset,
+                fieldNamesBuffer.length,
+              )
+            : wasm.ep_create_with_schema(
+                MAX_EVENTS_PER_BATCH,
+                layout.schemaOffset,
+                config.schemaBytes.length,
+                layout.fieldMetaOffset,
+                fieldCount,
+              ),
+          'parse could not create an EventProcessor',
+        );
         cacheHandle(handle, config, fieldNamesBuffer);
       }
 
@@ -916,16 +1033,16 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         const memory = new Uint8Array(wasm.memory.buffer);
         memory.set(batch.schema.schemaBytes, layout.schemaOffset);
         memory.set(batch.schema.fieldMetadata, layout.fieldMetaOffset);
-        handle = wasm.ep_create_with_schema(
-          MAX_EVENTS_PER_BATCH,
-          layout.schemaOffset,
-          batch.schema.schemaBytes.length,
-          layout.fieldMetaOffset,
-          batch.columns.length,
+        handle = requireEpHandle(
+          wasm.ep_create_with_schema(
+            MAX_EVENTS_PER_BATCH,
+            layout.schemaOffset,
+            batch.schema.schemaBytes.length,
+            layout.fieldMetaOffset,
+            batch.columns.length,
+          ),
+          'encode could not create an EventProcessor',
         );
-        if (handle === 0) {
-          throw new CompactEncodingError(7, null, 'ep_compact schema handle creation failed');
-        }
         cacheHandle(handle, batch.schema, null);
       }
 
