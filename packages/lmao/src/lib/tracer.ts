@@ -110,7 +110,7 @@ export interface TracerOptions<
 
   /**
    * Factory for creating platform-specific TraceRoot instances.
-   * Import from '@smoothbricks/lmao/node' or '@smoothbricks/lmao/es'.
+   * Import from '@smoothbricks/lmao/node', '/es', or '/react-native'.
    */
   createTraceRoot: TraceRootFactory<T>;
 
