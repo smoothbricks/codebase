@@ -38,12 +38,13 @@ import type { SpanContextClass } from './spanContext.js';
 import { consumeSpanStartedAtAllocation, type TimestampAppendPrimitive } from './traceRoot.js';
 import type { AnySpanBuffer } from './types.js';
 import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
+import { requireThreadSpanView } from './wasm/threadSpanView.js';
 import { createWasmLayoutTemplate, type WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 
 export const PHYSICAL_LAYOUT_VERSION = 1;
 
 /** Concrete backends may bind the same physical schema to distinct immutable plans. */
-export type PhysicalBackendKind = 'strategy-selected' | 'js-heap' | 'wasm';
+export type PhysicalBackendKind = 'strategy-selected' | 'js-heap' | 'wasm' | 'thread-buffer';
 
 /** Canonical schema-ordered eager column selection for generated storage and cache identity. */
 export interface EagerColumnDescriptor {
@@ -430,6 +431,21 @@ const APPENDERS_BY_MESSAGE_LAYOUT: Readonly<Record<string, PhysicalAppenders>> =
   'dynamic-only:packed': packedAppenders('dynamic-only'),
 });
 
+const THREAD_APPEND_LOG_ENTRY: TimestampAppendPrimitive = (_traceRoot, buffer, entryType) =>
+  requireThreadSpanView(buffer).beginLog(entryType);
+
+const THREAD_BUFFER_APPENDERS: PhysicalAppenders = Object.freeze({
+  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
+    requireThreadSpanView(buffer).openSpan(name);
+  },
+  writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
+    requireThreadSpanView(buffer).end(entryType);
+  },
+  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
+    return requireThreadSpanView(buffer).beginLog(entryType);
+  },
+});
+
 const EMPTY_LOCAL_MESSAGE_DICTIONARY: readonly number[] = Object.freeze([]);
 const NO_LOCAL_MESSAGE = (_globalDenseIndex: number): number => 0;
 
@@ -500,8 +516,16 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     TagWriterClass,
     ResultWriterClass,
     clock: TRACE_ROOT_CLOCK,
-    appendLogEntry: messagePhysicalLayout === 'packed' ? PACKED_APPEND_LOG_ENTRY : SPLIT_APPEND_LOG_ENTRY,
-    appenders: APPENDERS_BY_MESSAGE_LAYOUT[`${messageLayoutFamily}:${messagePhysicalLayout}`],
+    appendLogEntry:
+      backendKind === 'thread-buffer'
+        ? THREAD_APPEND_LOG_ENTRY
+        : messagePhysicalLayout === 'packed'
+          ? PACKED_APPEND_LOG_ENTRY
+          : SPLIT_APPEND_LOG_ENTRY,
+    appenders:
+      backendKind === 'thread-buffer'
+        ? THREAD_BUFFER_APPENDERS
+        : APPENDERS_BY_MESSAGE_LAYOUT[`${messageLayoutFamily}:${messagePhysicalLayout}`],
     localMessageDictionary,
     vocabularyGeneration,
     arrowExposure:

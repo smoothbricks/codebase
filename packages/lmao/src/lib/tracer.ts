@@ -303,7 +303,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       0,
       this.SpanContextClass,
       undefined,
-      'strategy-selected',
+      options.bufferStrategy.physicalBackend ?? 'strategy-selected',
       userContextKeys.join('\u0000'),
     );
 

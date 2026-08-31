@@ -56,6 +56,7 @@ import {
 } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import type { AnySpanBuffer, LogBinding, SpanBuffer } from './types.js';
+import { isThreadSpanView } from './wasm/threadSpanView.js';
 
 // Note: TraceRoot.writeSpanStart() is used instead of direct timestamp writes.
 // The platform-specific TraceRoot (traceRoot.es.ts or traceRoot.node.ts) handles
@@ -870,9 +871,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // Regular functions close over constructor args directly - no property lookups
       // Using regular function (not arrow) allows destructuring while closing over args
       if (hasScope) {
-        if (!spanLogger) throw new TypeError('SpanContext scope capability requires a logger');
         this.setScope = (attributes: ScopeUpdate<Ctx['logSchema']> | null): void => {
           spanLogger._setScope(attributes ?? {});
+          if (isThreadSpanView(this._spanBuffer)) {
+            this._spanBuffer.syncScope(attributes ?? {});
+          }
         };
       }
 
@@ -1108,6 +1111,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
     // =========================================================================
 
     _appendWriterEntry(entryType: number): number {
+      if (isThreadSpanView(this._buffer)) {
+        return this._buffer.beginLog(entryType);
+      }
       if (this._buffer._writeIndex >= this._buffer._capacity) {
         this._buffer = this._buffer.getOrCreateOverflow();
         this._spanLogger._prefillScopedAttributesOn(this._buffer);
@@ -1171,6 +1177,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
         callsitePlan.SpanBufferClass,
       );
       const childBuffer = createdBuffer;
+      if (isThreadSpanView(childBuffer)) {
+        childBuffer.pendingLine = line;
+      }
       childBuffer._remapDescriptor = callsitePlan.remapDescriptor ?? undefined;
       callsitePlan.appenders.writeSpanStart(childBuffer, name);
       childBuffer.line(0, line);
