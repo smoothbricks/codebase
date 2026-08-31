@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ProjectTargets } from '../nx/index.js';
+import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { expandNxTargetDependencyRuns, expandNxTargetRuns } from './index.js';
 import { applyCollectedOutputs, collectNxOutputs } from './outputs.js';
 
@@ -27,7 +27,6 @@ function cowshedShapedProject(): ProjectTargets {
       ['napi-x64-linux', ['napi-toolchain-x64-linux']],
     ]),
     targetOutputs: new Map([
-      ['build', ['{projectRoot}/dist']],
       ['tsc-js', ['{projectRoot}/dist/ts']],
       ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']],
       ['cli-arm64-linux', ['{projectRoot}/dist/bin/linux-arm64-gnu']],
@@ -92,12 +91,39 @@ describe('publish collect containment probe', () => {
     const build = expandNxTargetRuns([project], { targets: 'build', projects: 'cowshed' });
     const buildClosure = expandNxTargetDependencyRuns(build.runs);
     expect(build.runs.map((run) => run.target)).toEqual(['build']);
-    expect(buildClosure.map((run) => run.target).sort()).toEqual(['build', 'tsc-js']);
+    expect(buildClosure.map((run) => run.target).sort()).toEqual(['tsc-js']);
   });
 
-  it('reproduces apply collision when build dist contains the linux platform binary', async () => {
+  it('applies build and linux trees together once the aggregate claims no dist', async () => {
     await withProbeRepo(async ({ root, buildArtifact, linuxArtifact }) => {
       const project = cowshedShapedProject();
+      const buildRuns = expandNxTargetDependencyRuns(
+        expandNxTargetRuns([project], { targets: 'build', projects: 'cowshed' }).runs,
+      );
+      const linuxRuns = expandNxTargetDependencyRuns(
+        expandNxTargetRuns([project], { targets: '*-linux', projects: 'cowshed' }).runs,
+      );
+
+      const buildManifest = await collectNxOutputs(root, buildArtifact, buildRuns, SOURCE_SHA);
+      const linuxManifest = await collectNxOutputs(root, linuxArtifact, linuxRuns, SOURCE_SHA);
+
+      const linuxBin = 'packages/cowshed/dist/bin/linux-x64-gnu/cowshed';
+      expect(buildManifest.files.some((file) => file.target === 'build')).toBe(false);
+      expect(buildManifest.files.map((file) => `${file.target}:${file.path}`)).toEqual([
+        'tsc-js:packages/cowshed/dist/ts/cli.js',
+      ]);
+      expect(linuxManifest.files.some((file) => file.path === linuxBin && file.target === 'cli-x64-linux')).toBe(true);
+
+      await expect(
+        applyCollectedOutputs(root, [buildArtifact, linuxArtifact], SOURCE_SHA, [project]),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  it('still refuses apply when a leftover aggregate output swallows the platform binary', async () => {
+    await withProbeRepo(async ({ root, buildArtifact, linuxArtifact }) => {
+      const project = cowshedShapedProject();
+      project.targetOutputs?.set('build', ['{projectRoot}/dist']);
       const buildRuns = expandNxTargetDependencyRuns(
         expandNxTargetRuns([project], { targets: 'build', projects: 'cowshed' }).runs,
       );
@@ -179,5 +205,60 @@ describe('publish collect containment probe', () => {
         applyCollectedOutputs(root, [macosArmArtifact, linuxArtifact], SOURCE_SHA, [project]),
       ).resolves.toBeUndefined();
     });
+  });
+});
+
+describe('publish collect containment probe against the resolved graph', () => {
+  it('collects cowshed tsc-js and macos platform trees without overlap', async () => {
+    const root = join(import.meta.dir, '../../../..');
+    const projects = await readProjectTargets(root);
+    const cowshed = projects.find((project) => project.project === 'cowshed');
+    expect(cowshed?.targetOutputs?.get('build')).toBeUndefined();
+    expect(cowshed?.targetOutputs?.get('tsc-js')).toEqual(['{projectRoot}/dist/ts']);
+
+    const buildRuns = expandNxTargetDependencyRuns(
+      expandNxTargetRuns(projects, { targets: 'build', projects: 'cowshed' }).runs,
+    );
+    const macosRuns = expandNxTargetDependencyRuns(
+      expandNxTargetRuns(projects, { targets: '*-macos', projects: 'cowshed' }).runs,
+    );
+    expect(buildRuns.some((run) => run.target === 'build')).toBe(false);
+    expect(buildRuns.some((run) => run.target === 'tsc-js' && run.projects[0]?.project === 'cowshed')).toBe(true);
+
+    const temp = await mkdtemp(join(tmpdir(), 'containment-real-graph-'));
+    const buildArtifact = join(temp, 'rb');
+    const macosArtifact = join(temp, 'mp');
+    const applyRoot = join(temp, 'apply');
+    try {
+      const buildManifest = await collectNxOutputs(root, buildArtifact, buildRuns, SOURCE_SHA);
+      const macosManifest = await collectNxOutputs(root, macosArtifact, macosRuns, SOURCE_SHA);
+
+      const tsFiles = buildManifest.files.filter(
+        (file) =>
+          file.project === 'cowshed' && file.target === 'tsc-js' && file.path.startsWith('packages/cowshed/dist/ts/'),
+      );
+      expect(buildManifest.files.some((file) => file.project === 'cowshed' && file.target === 'build')).toBe(false);
+      expect(tsFiles).toHaveLength(19);
+      expect(buildRuns.map((run) => run.target).sort()).toContain('tsc-js');
+      expect(buildRuns.map((run) => run.target).sort()).not.toContain('build');
+      expect(
+        buildManifest.files.some((file) => file.path.includes('/dist/bin/') || file.path.includes('/dist/native/')),
+      ).toBe(false);
+
+      const macosBins = macosManifest.files.filter((file) => file.path.includes('/dist/bin/'));
+      const macosNative = macosManifest.files.filter((file) => file.path.includes('/dist/native/'));
+      expect(macosBins.map((file) => file.path).sort()).toEqual([
+        'packages/cowshed/dist/bin/darwin-arm64/cowshed',
+        'packages/cowshed/dist/bin/darwin-x64/cowshed',
+      ]);
+      expect(macosNative).toHaveLength(4);
+      expect(macosManifest.files).toHaveLength(6);
+
+      await mkdir(applyRoot, { recursive: true });
+      await applyCollectedOutputs(applyRoot, [buildArtifact, macosArtifact], SOURCE_SHA, projects);
+      expect((await stat(join(applyRoot, 'packages/cowshed/dist/bin/darwin-arm64/cowshed'))).mode & 0o777).toBe(0o755);
+    } finally {
+      await rm(temp, { recursive: true, force: true });
+    }
   });
 });
