@@ -14,3 +14,29 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter = 'test(/compile_fail|fail_to_compile/)'
 slow-timeout = { period = "180s", terminate-after = 1 }
+
+# Tests that drive the host's REAL APFS stack — creating, attaching, mounting and
+# detaching actual disk images — contend on a single machine-wide serialization
+# point: Disk Arbitration and the APFS driver. Measured on this host, a read-only
+# `diskutil apfs list -plist` costs 0.7s idle at 33 attached images but up to
+# 14.4s while another process is attaching/detaching. Run in parallel these tests
+# manufacture exactly that contention for each other, so each one's wall time
+# becomes a function of how many siblings happen to be mid-attach — a test whose
+# verdict depends on that is measuring the scheduler, not the code.
+#
+# `max-threads = 1` makes the group a mutex across the WHOLE run (groups are
+# run-wide, not per-binary, so the lib unit tests and the apfs_integration binary
+# serialize against each other as intended). The other ~830 tests stay parallel.
+#
+# This bounds contention; it does NOT grant more time. The per-test deadline above
+# is unchanged and each of these tests is expected to fit it on its own merits.
+# Membership is by name: `real_apfs_*` is the class marker, so a new real-APFS
+# test joins the group by being named for what it touches. A bare `real_*` filter
+# would be wrong here — unrelated `real_*` tests exist in columine-arrow,
+# cowshed-cli and cowshed-gateway that touch no disk image at all.
+[test-groups]
+real-apfs = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/real_apfs_/)'
+test-group = 'real-apfs'
