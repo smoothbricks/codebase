@@ -12,10 +12,6 @@ use crate::entry_type::EntryType;
 use crate::identity::TraceId;
 use crate::packed_header::VocabularyId;
 use crate::thread_buffer::{ColumnValue, ThreadSpanBuffer};
-use crate::{
-    ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
-    ATTRIBUTE_KIND_UINT64,
-};
 use std::sync::Arc;
 
 /// Opaque pointer type used by native and Wasm callers.
@@ -382,21 +378,8 @@ pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     packed_row(span_id, row)
 }
 
-fn decode_value(kind: u8, value: u64) -> Option<ColumnValue> {
-    match kind {
-        ATTRIBUTE_KIND_NUMBER => Some(ColumnValue::Number(f64::from_bits(value))),
-        ATTRIBUTE_KIND_UINT64 => Some(ColumnValue::Uint64(value)),
-        ATTRIBUTE_KIND_BOOLEAN => (value <= 1).then_some(ColumnValue::Boolean(value != 0)),
-        // The ABI already passes text by intern ordinal, so the row store takes
-        // the integer straight through — no string is reconstructed here.
-        ATTRIBUTE_KIND_TEXT => Some(ColumnValue::Text(u32::try_from(value).ok()?)),
-        ATTRIBUTE_KIND_ENUM => Some(ColumnValue::Enum(u16::try_from(value).ok()?)),
-        _ => None,
-    }
-}
-
 fn write_value(buffer: &mut ThreadSpanBuffer, row: u32, ordinal: u16, kind: u8, value: u64) -> u8 {
-    let Some(value) = decode_value(kind, value) else {
+    let Some(value) = buffer.decode_abi_value(kind, value) else {
         return 1;
     };
     buffer.write_attr(row, ordinal, value).is_err() as u8
@@ -459,7 +442,7 @@ pub unsafe extern "C" fn thread_span_buffer_set_scope(
     let Some(field) = buffer.schema_fields().get(index) else {
         return 1;
     };
-    let Some(value) = decode_value(kind, value) else {
+    let Some(value) = buffer.decode_abi_value(kind, value) else {
         return 1;
     };
     let scope_value = match value {
@@ -484,6 +467,7 @@ pub unsafe extern "C" fn thread_span_buffer_set_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ATTRIBUTE_KIND_NUMBER;
     use crate::columns::{FieldMeta, FieldStrategy};
 
     static FIELDS: &[FieldMeta] = &[FieldMeta::new("answer", FieldStrategy::Number)];

@@ -8,6 +8,10 @@
  */
 
 import { isRecord } from '@smoothbricks/validation';
+import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
+
+export { THREAD_ATTRIBUTE_KINDS };
+export type ThreadAttributeKind = (typeof THREAD_ATTRIBUTE_KINDS)[number]['discriminant'];
 
 /** Numeric token returned by `thread_span_buffer_new`; zero is never a handle. */
 export type ThreadSpanBufferHandle = number;
@@ -18,14 +22,31 @@ export const THREAD_SPAN_BUFFER_OK = 0;
 /** Raw exports supplied by `allocator.wasm` for the shared-buffer ABI. */
 export interface ThreadSpanBufferWasmExports {
   thread_span_buffer_new(threadId: bigint, capacity: number): ThreadSpanBufferHandle;
+  thread_span_buffer_new_with_schema(
+    threadId: bigint,
+    capacity: number,
+    fieldsPtr: number,
+    fieldsLen: number,
+  ): ThreadSpanBufferHandle;
   thread_span_buffer_free(handle: ThreadSpanBufferHandle): void;
+  thread_span_buffer_intern(handle: ThreadSpanBufferHandle, ptr: number, len: number): number;
   thread_span_buffer_open_span(
     handle: ThreadSpanBufferHandle,
     tracePtr: number,
     traceLen: number,
     parentThreadId: bigint,
     parentSpanId: number,
-    nameVocab: number,
+    nameOrdinal: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  thread_span_buffer_open_span_static(
+    handle: ThreadSpanBufferHandle,
+    tracePtr: number,
+    traceLen: number,
+    parentThreadId: bigint,
+    parentSpanId: number,
+    nameId: number,
     timestamp: bigint,
     line: number,
   ): bigint;
@@ -46,7 +67,15 @@ export interface ThreadSpanBufferWasmExports {
     handle: ThreadSpanBufferHandle,
     spanId: number,
     entryType: number,
-    messageVocab: number,
+    messageOrdinal: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  thread_span_buffer_append_log_static(
+    handle: ThreadSpanBufferHandle,
+    spanId: number,
+    entryType: number,
+    messageId: number,
     timestamp: bigint,
     line: number,
   ): bigint;
@@ -63,24 +92,23 @@ export interface ThreadSpanBufferWasmExports {
     handle: ThreadSpanBufferHandle,
     row: number,
     ordinal: number,
-    kind: number,
+    kind: ThreadAttributeKind,
     value: bigint,
   ): number;
   thread_span_buffer_write_tag(
     handle: ThreadSpanBufferHandle,
     spanId: number,
     ordinal: number,
-    kind: number,
+    kind: ThreadAttributeKind,
     value: bigint,
   ): number;
   thread_span_buffer_set_scope(
     handle: ThreadSpanBufferHandle,
     spanId: number,
     ordinal: number,
-    kind: number,
+    kind: ThreadAttributeKind,
     value: bigint,
   ): number;
-  thread_span_buffer_intern(handle: ThreadSpanBufferHandle, ptr: number, len: number): number;
 }
 
 /** A handle-bound writer. Construction is cold; each method is one ABI call. */
@@ -92,7 +120,16 @@ export interface ThreadSpanBufferBinding {
     traceLen: number,
     parentThreadId: bigint,
     parentSpanId: number,
-    nameVocab: number,
+    nameOrdinal: number,
+    timestamp: bigint,
+    line: number,
+  ): bigint;
+  openSpanStatic(
+    tracePtr: number,
+    traceLen: number,
+    parentThreadId: bigint,
+    parentSpanId: number,
+    nameId: number,
     timestamp: bigint,
     line: number,
   ): bigint;
@@ -108,7 +145,8 @@ export interface ThreadSpanBufferBinding {
   ): bigint;
   endOk(spanId: number, timestamp: bigint): number;
   endErr(spanId: number, timestamp: bigint): number;
-  appendLog(spanId: number, entryType: number, messageVocab: number, timestamp: bigint, line: number): bigint;
+  appendLog(spanId: number, entryType: number, messageOrdinal: number, timestamp: bigint, line: number): bigint;
+  appendLogStatic(spanId: number, entryType: number, messageId: number, timestamp: bigint, line: number): bigint;
   appendLogDynamic(
     spanId: number,
     entryType: number,
@@ -117,9 +155,9 @@ export interface ThreadSpanBufferBinding {
     timestamp: bigint,
     line: number,
   ): bigint;
-  writeAttr(row: number, ordinal: number, kind: number, value: bigint): number;
-  writeTag(spanId: number, ordinal: number, kind: number, value: bigint): number;
-  setScope(spanId: number, ordinal: number, kind: number, value: bigint): number;
+  writeAttr(row: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
+  writeTag(spanId: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
+  setScope(spanId: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
   intern(ptr: number, len: number): number;
 }
 
@@ -128,17 +166,19 @@ export function isThreadSpanBufferWasmExports(value: unknown): value is ThreadSp
   if (!isRecord(value)) return false;
   return (
     typeof Reflect.get(value, 'thread_span_buffer_new') === 'function' &&
-    typeof Reflect.get(value, 'thread_span_buffer_free') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_new_with_schema') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_intern') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_open_span_static') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span_dynamic') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_end_ok') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_end_err') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_append_log') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_append_log_static') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_append_log_dynamic') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_write_attr') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_write_tag') === 'function' &&
-    typeof Reflect.get(value, 'thread_span_buffer_set_scope') === 'function' &&
-    typeof Reflect.get(value, 'thread_span_buffer_intern') === 'function'
+    typeof Reflect.get(value, 'thread_span_buffer_set_scope') === 'function'
   );
 }
 
@@ -151,14 +191,25 @@ export function bindThreadSpanBuffer(
   return {
     handle,
     free: () => value.thread_span_buffer_free(handle),
-    openSpan: (tracePtr, traceLen, parentThreadId, parentSpanId, nameVocab, timestamp, line) =>
+    openSpan: (tracePtr, traceLen, parentThreadId, parentSpanId, nameOrdinal, timestamp, line) =>
       value.thread_span_buffer_open_span(
         handle,
         tracePtr,
         traceLen,
         parentThreadId,
         parentSpanId,
-        nameVocab,
+        nameOrdinal,
+        timestamp,
+        line,
+      ),
+    openSpanStatic: (tracePtr, traceLen, parentThreadId, parentSpanId, nameId, timestamp, line) =>
+      value.thread_span_buffer_open_span_static(
+        handle,
+        tracePtr,
+        traceLen,
+        parentThreadId,
+        parentSpanId,
+        nameId,
         timestamp,
         line,
       ),
@@ -176,8 +227,10 @@ export function bindThreadSpanBuffer(
       ),
     endOk: (spanId, timestamp) => value.thread_span_buffer_end_ok(handle, spanId, timestamp),
     endErr: (spanId, timestamp) => value.thread_span_buffer_end_err(handle, spanId, timestamp),
-    appendLog: (spanId, entryType, messageVocab, timestamp, line) =>
-      value.thread_span_buffer_append_log(handle, spanId, entryType, messageVocab, timestamp, line),
+    appendLog: (spanId, entryType, messageOrdinal, timestamp, line) =>
+      value.thread_span_buffer_append_log(handle, spanId, entryType, messageOrdinal, timestamp, line),
+    appendLogStatic: (spanId, entryType, messageId, timestamp, line) =>
+      value.thread_span_buffer_append_log_static(handle, spanId, entryType, messageId, timestamp, line),
     appendLogDynamic: (spanId, entryType, messagePtr, messageLen, timestamp, line) =>
       value.thread_span_buffer_append_log_dynamic(handle, spanId, entryType, messagePtr, messageLen, timestamp, line),
     writeAttr: (row, ordinal, kind, attributeValue) =>
