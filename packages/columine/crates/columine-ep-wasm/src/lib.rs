@@ -83,9 +83,6 @@ fn new_instance(
     capacity: u32,
     schema_config: DynamicSchemaConfig,
 ) -> Result<Box<EpInstance>, CreateFailure> {
-    if capacity == 0 || capacity > MAX_EVENT_CAPACITY {
-        return Err(CreateFailure::Capacity);
-    }
     let column_capacity = capacity;
     // Columine has no deduplication, so the policy argument is unused on this
     // path; `Latest` satisfies the shared core signature.
@@ -152,6 +149,34 @@ unsafe fn wire_schema(
         .map_err(CreateFailure::from)
 }
 
+/// The whole creation pipeline, in refusal order: the scalar precondition
+/// first, then the caller's pointers and schema, then the instance, then a
+/// slot. Capacity is checked before the schema is decoded because decoding is
+/// wasted work for a request that can never succeed, and because a caller who
+/// got the capacity wrong should hear about that rather than about the schema.
+unsafe fn create_handle(
+    capacity: u32,
+    schema_ptr: *const u8,
+    schema_len: u32,
+    field_meta_ptr: *const u8,
+    field_count: u32,
+    field_names: Option<(*const u8, u32)>,
+) -> Result<u32, CreateFailure> {
+    if capacity == 0 || capacity > MAX_EVENT_CAPACITY {
+        return Err(CreateFailure::Capacity);
+    }
+    let config = unsafe {
+        wire_schema(
+            schema_ptr,
+            schema_len,
+            field_meta_ptr,
+            field_count,
+            field_names,
+        )
+    }?;
+    alloc_handle(new_instance(capacity, config)?)
+}
+
 /// Collapse the creation outcome onto the single u32 the ABI returns. Every
 /// export funnels through here so no path can invent an unnamed failure.
 fn create_result(result: Result<u32, CreateFailure>) -> u32 {
@@ -173,11 +198,16 @@ pub unsafe extern "C" fn ep_create_with_schema(
     field_meta_ptr: *const u8,
     field_count: u32,
 ) -> u32 {
-    create_result(
-        unsafe { wire_schema(schema_ptr, schema_len, field_meta_ptr, field_count, None) }
-            .and_then(|config| new_instance(capacity, config))
-            .and_then(alloc_handle),
-    )
+    create_result(unsafe {
+        create_handle(
+            capacity,
+            schema_ptr,
+            schema_len,
+            field_meta_ptr,
+            field_count,
+            None,
+        )
+    })
 }
 
 /// Primary path: field names enable extraction for `value.*` schemas.
@@ -193,19 +223,16 @@ pub unsafe extern "C" fn ep_create_with_schema_and_names(
     field_names_ptr: *const u8,
     field_names_len: u32,
 ) -> u32 {
-    create_result(
-        unsafe {
-            wire_schema(
-                schema_ptr,
-                schema_len,
-                field_meta_ptr,
-                field_count,
-                Some((field_names_ptr, field_names_len)),
-            )
-        }
-        .and_then(|config| new_instance(capacity, config))
-        .and_then(alloc_handle),
-    )
+    create_result(unsafe {
+        create_handle(
+            capacity,
+            schema_ptr,
+            schema_len,
+            field_meta_ptr,
+            field_count,
+            Some((field_names_ptr, field_names_len)),
+        )
+    })
 }
 
 /// Parse `input_len` bytes at `input_ptr`; write `[ResultHeader][Arrow IPC]`
