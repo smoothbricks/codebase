@@ -13,10 +13,16 @@
 export type {
   CompactDiagnostic,
   CompactEncodingErrorCode,
+  EventProcessorCreateErrorCode,
   EventProcessorWasmExports,
   ParseCompactBackend,
 } from './parse-backend.js';
-export { CompactEncodingError, createParseCompactWasmBackend, loadParseBackend } from './parse-backend.js';
+export {
+  CompactEncodingError,
+  createParseCompactWasmBackend,
+  EventProcessorCreateError,
+  loadParseBackend,
+} from './parse-backend.js';
 // Pipeline composition API
 export type {
   ColumineStages,

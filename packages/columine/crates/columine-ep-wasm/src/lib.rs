@@ -18,7 +18,7 @@
 
 use columine_arrow::schema::DynamicSchemaConfig;
 use columine_event_processor::{
-    CollisionPolicy, CompactValidationError, EpWiring, EventProcessor, InputFormat,
+    CollisionPolicy, CompactValidationError, CreateFailure, EpWiring, EventProcessor, InputFormat,
     RESULT_HEADER_SIZE, ResultCode, ResultDiagnostic, write_compact_result_header,
 };
 
@@ -28,8 +28,9 @@ pub const VERSION: u32 = 2;
 /// Capacity honesty (post-parity): the earlier implementation silently
 /// clamped every wasm instance to 256 events regardless of the requested
 /// capacity; the requested capacity is honored now. A sanity ceiling guards
-/// against unreasonable requests corrupting the address space.
-const MAX_EVENT_CAPACITY: u32 = 1 << 20;
+/// against unreasonable requests corrupting the address space. Requests above
+/// it are refused with [`CreateFailure::Capacity`], never a bare 0.
+pub const MAX_EVENT_CAPACITY: u32 = 1 << 20;
 
 struct EpInstance {
     ep: EventProcessor,
@@ -50,7 +51,7 @@ fn handles() -> &'static mut [Option<Box<EpInstance>>; 256] {
 /// Handle 0 is the creation-failure sentinel and is permanently reserved.
 /// Keeping it out of the allocation ring makes every successful creation
 /// unambiguous, including after the ring wraps during long-lived use.
-fn alloc_handle(ep: Box<EpInstance>) -> Option<u32> {
+fn alloc_handle(ep: Box<EpInstance>) -> Result<u32, CreateFailure> {
     let table = handles();
     #[allow(static_mut_refs)]
     let next = unsafe { &mut NEXT_HANDLE };
@@ -59,10 +60,10 @@ fn alloc_handle(ep: Box<EpInstance>) -> Option<u32> {
         if table[idx as usize].is_none() {
             table[idx as usize] = Some(ep);
             *next = if idx == 255 { 1 } else { idx + 1 };
-            return Some(idx);
+            return Ok(idx);
         }
     }
-    None
+    Err(CreateFailure::HandlesExhausted)
 }
 
 fn get_processor(handle: u32) -> Option<&'static mut EpInstance> {
@@ -72,9 +73,12 @@ fn get_processor(handle: u32) -> Option<&'static mut EpInstance> {
     handles()[handle as usize].as_deref_mut()
 }
 
-fn new_instance(capacity: u32, schema_config: DynamicSchemaConfig) -> Option<Box<EpInstance>> {
+fn new_instance(
+    capacity: u32,
+    schema_config: DynamicSchemaConfig,
+) -> Result<Box<EpInstance>, CreateFailure> {
     if capacity == 0 || capacity > MAX_EVENT_CAPACITY {
-        return None;
+        return Err(CreateFailure::Capacity);
     }
     let column_capacity = capacity;
     // Columine has no deduplication, so the policy argument is unused on this
@@ -85,9 +89,8 @@ fn new_instance(capacity: u32, schema_config: DynamicSchemaConfig) -> Option<Box
         column_capacity,
         CollisionPolicy::Latest,
         schema_config,
-    )
-    .ok()?;
-    Some(Box::new(EpInstance { ep }))
+    )?;
+    Ok(Box::new(EpInstance { ep }))
 }
 
 // =============================================================================
@@ -106,8 +109,56 @@ pub extern "C" fn ep_destroy(handle: u32) {
     }
 }
 
+/// Validate the caller's pointer triple and decode the retained schema.
+/// `field_names` is `None` on the no-names path.
+unsafe fn wire_schema(
+    schema_ptr: *const u8,
+    schema_len: u32,
+    field_meta_ptr: *const u8,
+    field_count: u32,
+    field_names: Option<(*const u8, u32)>,
+) -> Result<DynamicSchemaConfig, CreateFailure> {
+    let field_meta_len = (field_count as usize)
+        .checked_mul(4)
+        .ok_or(CreateFailure::BadRequest)?;
+    if schema_ptr.is_null() || (field_meta_len != 0 && field_meta_ptr.is_null()) {
+        return Err(CreateFailure::BadRequest);
+    }
+    let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ptr, schema_len as usize) };
+    let field_meta: &[u8] = if field_meta_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(field_meta_ptr, field_meta_len) }
+    };
+    let Some((names_ptr, names_len)) = field_names else {
+        return DynamicSchemaConfig::from_wire(schema_bytes, field_meta)
+            .map_err(CreateFailure::from);
+    };
+    if names_len != 0 && names_ptr.is_null() {
+        return Err(CreateFailure::BadRequest);
+    }
+    let names: &[u8] = if names_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(names_ptr, names_len as usize) }
+    };
+    DynamicSchemaConfig::from_wire_with_field_names(schema_bytes, field_meta, names)
+        .map_err(CreateFailure::from)
+}
+
+/// Collapse the creation outcome onto the single u32 the ABI returns. Every
+/// export funnels through here so no path can invent an unnamed failure.
+fn create_result(result: Result<u32, CreateFailure>) -> u32 {
+    match result {
+        Ok(handle) => handle,
+        Err(failure) => failure as u32,
+    }
+}
+
 /// No field names: export-compatibility path (JSON keys cannot be matched to
-/// columns, so `ep_create_log_entry` will refuse). Returns handle (0 = error).
+/// columns, so `ep_create_log_entry` will refuse).
+///
+/// Returns a handle in `1..=255`, or a [`CreateFailure`] code.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ep_create_with_schema(
     capacity: u32,
@@ -116,29 +167,16 @@ pub unsafe extern "C" fn ep_create_with_schema(
     field_meta_ptr: *const u8,
     field_count: u32,
 ) -> u32 {
-    let Some(field_meta_len) = (field_count as usize).checked_mul(4) else {
-        return 0;
-    };
-    if schema_ptr.is_null() || (field_meta_len != 0 && field_meta_ptr.is_null()) {
-        return 0;
-    }
-    let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ptr, schema_len as usize) };
-    let field_meta = if field_meta_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(field_meta_ptr, field_meta_len) }
-    };
-    let Ok(config) = DynamicSchemaConfig::from_wire(schema_bytes, field_meta) else {
-        return 0;
-    };
-    let Some(instance) = new_instance(capacity, config) else {
-        return 0;
-    };
-    alloc_handle(instance).unwrap_or(0)
+    create_result(
+        unsafe { wire_schema(schema_ptr, schema_len, field_meta_ptr, field_count, None) }
+            .and_then(|config| new_instance(capacity, config))
+            .and_then(alloc_handle),
+    )
 }
 
 /// Primary path: field names enable extraction for `value.*` schemas.
-/// Returns handle (0 = error).
+///
+/// Returns a handle in `1..=255`, or a [`CreateFailure`] code.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ep_create_with_schema_and_names(
     capacity: u32,
@@ -149,35 +187,19 @@ pub unsafe extern "C" fn ep_create_with_schema_and_names(
     field_names_ptr: *const u8,
     field_names_len: u32,
 ) -> u32 {
-    let Some(field_meta_len) = (field_count as usize).checked_mul(4) else {
-        return 0;
-    };
-    if schema_ptr.is_null()
-        || (field_meta_len != 0 && field_meta_ptr.is_null())
-        || (field_names_len != 0 && field_names_ptr.is_null())
-    {
-        return 0;
-    }
-    let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ptr, schema_len as usize) };
-    let field_meta = if field_meta_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(field_meta_ptr, field_meta_len) }
-    };
-    let field_names = if field_names_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(field_names_ptr, field_names_len as usize) }
-    };
-    let Ok(config) =
-        DynamicSchemaConfig::from_wire_with_field_names(schema_bytes, field_meta, field_names)
-    else {
-        return 0;
-    };
-    let Some(instance) = new_instance(capacity, config) else {
-        return 0;
-    };
-    alloc_handle(instance).unwrap_or(0)
+    create_result(
+        unsafe {
+            wire_schema(
+                schema_ptr,
+                schema_len,
+                field_meta_ptr,
+                field_count,
+                Some((field_names_ptr, field_names_len)),
+            )
+        }
+        .and_then(|config| new_instance(capacity, config))
+        .and_then(alloc_handle),
+    )
 }
 
 /// Parse `input_len` bytes at `input_ptr`; write `[ResultHeader][Arrow IPC]`

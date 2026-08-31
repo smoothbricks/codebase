@@ -10,7 +10,7 @@ use columine_arrow::{
 };
 use columine_event_processor::{
     COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, COMPACT_DIAGNOSTIC_STAGE,
-    COMPACT_HEADER_SIZE, RESULT_HEADER_SIZE, ResultCode,
+    COMPACT_HEADER_SIZE, CreateFailure, RESULT_HEADER_SIZE, ResultCode,
 };
 
 const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");
@@ -65,6 +65,22 @@ fn ts_kind_tag(source: &str, kind: &str) -> u8 {
         .unwrap_or_else(|error| panic!("COMPACT_KIND_TAG.{kind}: {error}"))
 }
 
+/// Read the `EP_CREATE_FAILURE` decoder table, which is keyed by ABI code:
+/// find the line naming `code`, then parse the hex key that precedes it.
+fn ts_create_failure(source: &str, code: &str) -> u32 {
+    let block_start = source
+        .find("const EP_CREATE_FAILURE = {")
+        .expect("EP_CREATE_FAILURE not declared");
+    let block = &source[block_start..];
+    let needle = format!(": '{code}',");
+    let end = block
+        .find(&needle)
+        .unwrap_or_else(|| panic!("EP_CREATE_FAILURE.{code} missing"));
+    let key = block[..end].rsplit('\n').next().unwrap_or_default().trim();
+    u32::try_from(parse_int(key))
+        .unwrap_or_else(|error| panic!("EP_CREATE_FAILURE.{code}: {error}"))
+}
+
 #[test]
 fn parse_backend_ts_compact_abi_matches_rust() {
     let source = read();
@@ -109,6 +125,28 @@ fn parse_backend_ts_compact_abi_matches_rust() {
     assert_eq!(ts_kind_tag(&source, "utf8"), ArrowType::Utf8 as u8);
     assert_eq!(ts_kind_tag(&source, "bool"), ArrowType::Bool as u8);
     assert_eq!(ts_kind_tag(&source, "i64"), ArrowType::Int64 as u8);
+}
+
+/// The host decodes these codes into distinct diagnostics, so a code that
+/// moves on one side only puts the wrong cause in the error message.
+#[test]
+fn parse_backend_ts_create_failures_match_rust() {
+    let source = read();
+    for (name, failure) in [
+        ("BAD_REQUEST", CreateFailure::BadRequest),
+        ("CAPACITY", CreateFailure::Capacity),
+        ("SCHEMA_MESSAGE", CreateFailure::SchemaMessage),
+        ("SCHEMA_TOO_MANY_FIELDS", CreateFailure::SchemaTooManyFields),
+        ("SCHEMA_FIELD_METADATA", CreateFailure::SchemaFieldMetadata),
+        ("SCHEMA_FIELD_COUNT", CreateFailure::SchemaFieldCount),
+        ("SCHEMA_TYPE_MISMATCH", CreateFailure::SchemaTypeMismatch),
+        ("SCHEMA_NULLABILITY", CreateFailure::SchemaNullability),
+        ("SCHEMA_FIELD_NAMES", CreateFailure::SchemaFieldNames),
+        ("INIT", CreateFailure::Init),
+        ("HANDLES_EXHAUSTED", CreateFailure::HandlesExhausted),
+    ] {
+        assert_eq!(ts_create_failure(&source, name), failure as u32, "{name}");
+    }
 }
 
 #[test]
