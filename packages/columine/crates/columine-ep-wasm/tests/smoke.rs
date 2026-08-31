@@ -8,11 +8,11 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use columine_arrow::schema::{ArrowType, SignalSchemaField};
 use columine_ep_wasm::{
-    ep_compact, ep_create_log_entry, ep_create_with_schema, ep_create_with_schema_and_names,
-    ep_destroy, ep_version,
+    MAX_EVENT_CAPACITY, ep_compact, ep_create_log_entry, ep_create_with_schema,
+    ep_create_with_schema_and_names, ep_destroy, ep_version,
 };
 use columine_event_processor::{
-    COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, ResultCode,
+    COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, CreateFailure, ResultCode,
     read_result_header,
 };
 use std::io::Cursor;
@@ -27,20 +27,24 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn ipc_schema_bytes(fields: Vec<Field>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, &Schema::new(fields)).unwrap();
+        writer.finish().unwrap();
+    }
+    // Drop the EOS marker: the create ABI takes the Schema message alone.
+    bytes.truncate(bytes.len() - 8);
+    bytes
+}
+
 static SCHEMA_BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| {
-    let schema = Schema::new(vec![
+    ipc_schema_bytes(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("type", DataType::Utf8, false),
         Field::new("timestamp", DataType::Int64, false),
         Field::new("value", DataType::Binary, true),
-    ]);
-    let mut bytes = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut bytes, &schema).unwrap();
-        writer.finish().unwrap();
-    }
-    bytes.truncate(bytes.len() - 8);
-    bytes
+    ])
 });
 
 fn base_fields() -> [SignalSchemaField; 4] {
@@ -322,11 +326,110 @@ fn handle_zero_is_reserved_and_full_table_creation_fails() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), 255);
-    assert_eq!(create_processor(1), 0, "a full handle table must refuse");
+    assert_eq!(
+        create_processor(1),
+        CreateFailure::HandlesExhausted as u32,
+        "a full handle table must say so, not return a bare 0"
+    );
 
     for handle in handles {
         ep_destroy(handle);
     }
+}
+
+/// Every refusal used to be a bare `0`, so a schema `TypeMismatch` was
+/// indistinguishable from a capacity refusal — the ambiguity that let a real
+/// regression sit behind a green test. Each cause must name itself.
+#[test]
+fn creation_failures_name_their_cause() {
+    let _serial = serial();
+    let fields = base_fields();
+    let meta_ptr = fields.as_ptr().cast::<u8>();
+    let names = b"id\0type\0timestamp\0value\0";
+
+    let create = |schema: &[u8], meta: *const u8, count: u32| unsafe {
+        ep_create_with_schema(256, schema.as_ptr(), schema.len() as u32, meta, count)
+    };
+
+    assert_eq!(create_processor(0), CreateFailure::Capacity as u32);
+    assert_eq!(
+        create_processor(MAX_EVENT_CAPACITY + 1),
+        CreateFailure::Capacity as u32
+    );
+
+    assert_eq!(
+        unsafe { ep_create_with_schema(256, std::ptr::null(), 0, meta_ptr, 4) },
+        CreateFailure::BadRequest as u32
+    );
+    assert_eq!(
+        unsafe {
+            ep_create_with_schema_and_names(
+                256,
+                SCHEMA_BYTES.as_ptr(),
+                SCHEMA_BYTES.len() as u32,
+                meta_ptr,
+                4,
+                std::ptr::null(),
+                names.len() as u32,
+            )
+        },
+        CreateFailure::BadRequest as u32
+    );
+
+    assert_eq!(
+        create(b"not a schema msg", meta_ptr, 4),
+        CreateFailure::SchemaMessage as u32
+    );
+    assert_eq!(
+        create(&SCHEMA_BYTES, meta_ptr, 3),
+        CreateFailure::SchemaFieldCount as u32
+    );
+
+    // A physical tag byte outside the ArrowType enum.
+    let mut bad_tags = [0u8; 16];
+    bad_tags[0] = 9;
+    assert_eq!(
+        create(&SCHEMA_BYTES, bad_tags.as_ptr(), 4),
+        CreateFailure::SchemaFieldMetadata as u32
+    );
+
+    // The regression this test exists for: tag 1 names the signed Int32
+    // plane, so a UInt32 logical column does not match it and the refusal
+    // must say TypeMismatch rather than a bare 0.
+    let unsigned = ipc_schema_bytes(vec![Field::new("value", DataType::UInt32, true)]);
+    let signed = ipc_schema_bytes(vec![Field::new("value", DataType::Int32, true)]);
+    let int32_meta = [SignalSchemaField::new(ArrowType::Int32, true)];
+    assert_eq!(
+        create(&unsigned, int32_meta.as_ptr().cast(), 1),
+        CreateFailure::SchemaTypeMismatch as u32
+    );
+    let handle = create(&signed, int32_meta.as_ptr().cast(), 1);
+    assert!(
+        (1..=255).contains(&handle),
+        "the signed twin must create: {handle:#x}"
+    );
+    ep_destroy(handle);
+
+    let non_null_meta = [SignalSchemaField::new(ArrowType::Int32, false)];
+    assert_eq!(
+        create(&signed, non_null_meta.as_ptr().cast(), 1),
+        CreateFailure::SchemaNullability as u32
+    );
+
+    assert_eq!(
+        unsafe {
+            ep_create_with_schema_and_names(
+                256,
+                SCHEMA_BYTES.as_ptr(),
+                SCHEMA_BYTES.len() as u32,
+                meta_ptr,
+                4,
+                b"id\0type\0".as_ptr(),
+                8,
+            )
+        },
+        CreateFailure::SchemaFieldNames as u32
+    );
 }
 
 #[test]
