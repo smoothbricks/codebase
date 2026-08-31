@@ -287,6 +287,10 @@ pub extern "C" fn thread_span_buffer_new(thread_id: u64, capacity: u32) -> u32 {
 ///
 /// Each field is `[kind:u8][name_len:u8][name bytes]`; enum fields append
 /// `[variant_count:u16 LE]` and `[len:u8][variant bytes]` for each variant.
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_new_with_schema(
     thread_id: u64,
@@ -328,6 +332,10 @@ pub extern "C" fn thread_span_buffer_reset(handle: u32) -> i32 {
     }
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_intern(handle: u32, ptr: *const u8, len: usize) -> u32 {
     let Some(bytes) = (unsafe { bytes(ptr, len) }) else {
@@ -336,6 +344,10 @@ pub unsafe extern "C" fn thread_span_buffer_intern(handle: u32, ptr: *const u8, 
     with_handle(handle, |buffer| buffer.intern_utf8(bytes)).unwrap_or(0)
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span(
     handle: u32,
@@ -367,6 +379,10 @@ pub unsafe extern "C" fn thread_span_buffer_open_span(
     .unwrap_or(0)
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span_static(
     handle: u32,
@@ -401,6 +417,10 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_static(
     .unwrap_or(0)
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
     handle: u32,
@@ -497,6 +517,10 @@ pub extern "C" fn thread_span_buffer_append_log_static(
     .unwrap_or(0)
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     handle: u32,
@@ -717,6 +741,10 @@ pub extern "C" fn thread_span_buffer_read_line(handle: u32, row: u32) -> u32 {
 /// Copy the row's trace id into `out_ptr`. Returns the UTF-8 length; zero is
 /// failure. When `out_len` is too small the length is still returned and nothing
 /// is written, so the caller can grow scratch and retry.
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_trace_id(
     handle: u32,
@@ -733,6 +761,10 @@ pub unsafe extern "C" fn thread_span_buffer_read_trace_id(
     .unwrap_or(0)
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_message(
     handle: u32,
@@ -749,6 +781,10 @@ pub unsafe extern "C" fn thread_span_buffer_read_message(
 
 /// Write kind and scalar value for a present attribute. STATUS_ERROR means
 /// the cell is null or the row/ordinal is invalid.
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_attr(
     handle: u32,
@@ -774,6 +810,10 @@ pub unsafe extern "C" fn thread_span_buffer_read_attr(
     .unwrap_or(STATUS_ERROR)
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_read_interned(
     handle: u32,
