@@ -179,19 +179,41 @@ fn scope_inheritance_cost_does_not_grow_with_children() {
         );
         // Warmup outside the measurement, same shape, so the allocator's first-touch
         // costs are never attributed to inheritance.
-        let _ = trace.span(TextInput::Static("warmup"), None, 16, |ctx| {
-            ctx.set_scope(scope);
-            ctx.child(TextInput::Static("kid"), 16, |_| Ok::<_, ()>(()))
-        });
+        let _ = trace.__span(
+            TextInput::Static("warmup"),
+            None,
+            16,
+            lmao_core::SourceMetadata::UNATTRIBUTED,
+            |ctx| {
+                ctx.set_scope(scope);
+                ctx.__child(
+                    TextInput::Static("kid"),
+                    16,
+                    lmao_core::SourceMetadata::UNATTRIBUTED,
+                    |_| Ok::<_, ()>(()),
+                )
+            },
+        );
 
         let before = allocations();
-        let _ = trace.span(TextInput::Static("measured"), None, 16, |ctx| {
-            ctx.set_scope(scope);
-            for _ in 0..children {
-                ctx.child(TextInput::Static("kid"), 16, |_| Ok::<_, ()>(()))?;
-            }
-            Ok::<_, ()>(())
-        });
+        let _ = trace.__span(
+            TextInput::Static("measured"),
+            None,
+            16,
+            lmao_core::SourceMetadata::UNATTRIBUTED,
+            |ctx| {
+                ctx.set_scope(scope);
+                for _ in 0..children {
+                    ctx.__child(
+                        TextInput::Static("kid"),
+                        16,
+                        lmao_core::SourceMetadata::UNATTRIBUTED,
+                        |_| Ok::<_, ()>(()),
+                    )?;
+                }
+                Ok::<_, ()>(())
+            },
+        );
         allocations() - before
     }
 
@@ -243,29 +265,35 @@ fn reading_scope_is_alloc_free() {
         1,
         Arc::new(FixedClock),
     );
-    let _ = trace.span(TextInput::Static("op"), None, 16, |ctx| {
-        ctx.set_scope(&[
-            ("alpha", Some(ScopeValue::Uint64(7))),
-            ("beta", Some(ScopeValue::Number(1.0))),
-        ]);
+    let _ = trace.__span(
+        TextInput::Static("op"),
+        None,
+        16,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            ctx.set_scope(&[
+                ("alpha", Some(ScopeValue::Uint64(7))),
+                ("beta", Some(ScopeValue::Number(1.0))),
+            ]);
 
-        let before = allocations();
-        let mut found = 0usize;
-        for _ in 0..1000 {
-            if let Some(scope) = ctx.scope() {
-                found += usize::from(scope.get("alpha").is_some());
-                found += usize::from(scope.get("missing").is_some());
+            let before = allocations();
+            let mut found = 0usize;
+            for _ in 0..1000 {
+                if let Some(scope) = ctx.scope() {
+                    found += usize::from(scope.get("alpha").is_some());
+                    found += usize::from(scope.get("missing").is_some());
+                }
             }
-        }
-        assert_eq!(
-            found, 1000,
-            "the binary search must actually be finding things"
-        );
-        assert_eq!(
-            allocations() - before,
-            0,
-            "scope lookup must be a pure read",
-        );
-        Ok::<_, ()>(())
-    });
+            assert_eq!(
+                found, 1000,
+                "the binary search must actually be finding things"
+            );
+            assert_eq!(
+                allocations() - before,
+                0,
+                "scope lookup must be a pure read",
+            );
+            Ok::<_, ()>(())
+        },
+    );
 }

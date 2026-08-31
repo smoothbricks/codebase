@@ -72,14 +72,17 @@ impl TraceContext {
     /// Start a span and hand its context to `f`; row 1 is completed from the
     /// returned `Result`. Returns `(body result, finished buffer)` — the caller
     /// attaches the buffer to its parent or hands it to the flush pipeline.
-    pub fn span<T, E>(
+    #[doc(hidden)]
+    pub fn __span<T, E>(
         &self,
         name: TextInput<'_>,
         parent: Option<Arc<SpanIdentity>>,
         capacity: usize,
+        source: SourceMetadata,
         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
     ) -> (Result<T, E>, SpanBuffer) {
         let mut ctx = SpanContext::start(self, self.identity(parent), capacity, name);
+        ctx.set_source(source);
         let out = f(&mut ctx);
         let buf = ctx.finish(match &out {
             Ok(_) => SpanOutcome::Ok,
@@ -93,18 +96,20 @@ impl TraceContext {
     /// separate spans sharing the parent) and `sleep` receives the policy delay —
     /// inject `std::thread::sleep`, `tokio::time::sleep` via a bridge, or a no-op
     /// in a deterministic simulation.
-    pub fn span_with_retry<T, E>(
+    #[doc(hidden)]
+    pub fn __span_with_retry<T, E>(
         &self,
         name: TextInput<'_>,
         parent: Option<Arc<SpanIdentity>>,
         capacity: usize,
+        source: SourceMetadata,
         mut sleep: impl FnMut(u64),
         mut f: impl FnMut(&mut SpanContext<'_>) -> Result<T, Transient<E>>,
     ) -> (Result<T, Transient<E>>, Vec<SpanBuffer>) {
         let mut attempts = Vec::new();
         let mut attempt = 0u32;
         loop {
-            let (out, buf) = self.span(name, parent.clone(), capacity, &mut f);
+            let (out, buf) = self.__span(name, parent.clone(), capacity, source, &mut f);
             attempts.push(buf);
             match out {
                 Ok(v) => return (Ok(v), attempts),
@@ -147,8 +152,9 @@ impl<'t> SpanContext<'t> {
 
     /// Append a log entry with its format-string template. Returns the row for
     /// schema-generated typed-value writers to target.
+    #[doc(hidden)]
     #[inline]
-    pub fn log(&mut self, level: EntryType, template: &'static str, line: u32) -> usize {
+    pub fn __log(&mut self, level: EntryType, template: &'static str, line: u32) -> usize {
         debug_assert!(matches!(
             level,
             EntryType::Trace
@@ -174,7 +180,7 @@ impl<'t> SpanContext<'t> {
     }
 
     /// The buffer being written — schema wrappers use this plus the row indices
-    /// returned by [`Self::log`] to place typed values.
+    /// returned by the log macro to place typed values.
     pub fn buffer_mut(&mut self) -> &mut SpanBuffer {
         &mut self.buf
     }
@@ -210,14 +216,17 @@ impl<'t> SpanContext<'t> {
     /// `01i`'s snapshot semantics, and it is why the child is built here rather than
     /// delegated to [`TraceContext::span`] — the scope has to be in place before the
     /// body runs, since the body may create grandchildren.
-    pub fn child<T, E>(
+    #[doc(hidden)]
+    pub fn __child<T, E>(
         &mut self,
         name: TextInput<'_>,
         capacity: usize,
+        source: SourceMetadata,
         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
         let identity = self.trace.identity(Some(self.identity()));
         let mut ctx = SpanContext::start(self.trace, identity, capacity, name);
+        ctx.set_source(source);
         ctx.buf.inherit_scope(self.buf.scope_handle());
         let out = f(&mut ctx);
         let child = ctx.finish(match &out {
@@ -267,17 +276,29 @@ mod tests {
     #[test]
     fn span_completes_ok_and_err_from_result() {
         let t = trace();
-        let (out, buf) = t.span(TextInput::Static("op-a"), None, 8, |ctx| {
-            ctx.log(EntryType::Info, "step {n}", 42);
-            Ok::<_, ()>(1)
-        });
+        let (out, buf) = t.__span(
+            TextInput::Static("op-a"),
+            None,
+            8,
+            SourceMetadata::UNATTRIBUTED,
+            |ctx| {
+                ctx.__log(EntryType::Info, "step {n}", 42);
+                Ok::<_, ()>(1)
+            },
+        );
         assert_eq!(out, Ok(1));
         assert_eq!(buf.entry_type_at(1), Some(EntryType::SpanOk));
         assert_eq!(buf.dynamic_name(), Some("op-a"));
         assert_eq!(buf.dynamic_message_at(2), Some("step {n}"));
         assert_eq!(buf.line_at(2), 42);
 
-        let (out, buf) = t.span(TextInput::Static("op-b"), None, 8, |_| Err::<(), _>("boom"));
+        let (out, buf) = t.__span(
+            TextInput::Static("op-b"),
+            None,
+            8,
+            SourceMetadata::UNATTRIBUTED,
+            |_| Err::<(), _>("boom"),
+        );
         assert!(out.is_err());
         assert_eq!(buf.entry_type_at(1), Some(EntryType::SpanErr));
     }
@@ -285,9 +306,20 @@ mod tests {
     #[test]
     fn children_nest_and_share_trace_id() {
         let t = trace();
-        let (_, buf) = t.span(TextInput::Static("parent"), None, 8, |ctx| {
-            ctx.child(TextInput::Static("kid"), 8, |_| Ok::<_, ()>(()))
-        });
+        let (_, buf) = t.__span(
+            TextInput::Static("parent"),
+            None,
+            8,
+            SourceMetadata::UNATTRIBUTED,
+            |ctx| {
+                ctx.__child(
+                    TextInput::Static("kid"),
+                    8,
+                    SourceMetadata::UNATTRIBUTED,
+                    |_| Ok::<_, ()>(()),
+                )
+            },
+        );
         assert_eq!(buf.children().len(), 1);
         let kid = &buf.children()[0];
         assert!(kid.identity.is_child_of(&buf.identity));
@@ -299,10 +331,11 @@ mod tests {
         let t = trace();
         let mut calls = 0;
         let mut slept = Vec::new();
-        let (out, attempts) = t.span_with_retry(
+        let (out, attempts) = t.__span_with_retry(
             TextInput::Static("flaky"),
             None,
             8,
+            SourceMetadata::UNATTRIBUTED,
             |ms| slept.push(ms),
             |_| {
                 calls += 1;
@@ -324,10 +357,11 @@ mod tests {
     #[test]
     fn retry_exhaustion_returns_last_error() {
         let t = trace();
-        let (out, attempts) = t.span_with_retry(
+        let (out, attempts) = t.__span_with_retry(
             TextInput::Static("doomed"),
             None,
             8,
+            SourceMetadata::UNATTRIBUTED,
             |_| {},
             |_| Err::<(), _>(Transient::fixed("nope", 2, 1)),
         );

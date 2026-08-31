@@ -292,18 +292,29 @@ proptest! {
             expected = ts_set_scope(&expected, update);
         }
 
-        let (_, root) = t.span(TextInput::Static("parent"), None, 8, |ctx| {
+        let (_, root) = t.__span(
+            TextInput::Static("parent"),
+            None,
+            8,
+            lmao_core::SourceMetadata::UNATTRIBUTED,
+            |ctx| {
             for update in &before {
                 ctx.set_scope(update);
             }
             // The child snapshots here, by reference.
-            ctx.child(TextInput::Static("kid"), 8, |_| Ok::<_, ()>(()))?;
+                ctx.__child(
+                    TextInput::Static("kid"),
+                    8,
+                    lmao_core::SourceMetadata::UNATTRIBUTED,
+                    |_| Ok::<_, ()>(()),
+                )?;
             // Everything from here on must be invisible to that child.
             for update in &after {
                 ctx.set_scope(update);
             }
             Ok::<_, ()>(())
-        });
+            },
+        );
 
         let kid = &root.children()[0];
         prop_assert_eq!(
@@ -327,12 +338,28 @@ proptest! {
         let t = trace();
         let expected = ts_set_scope(&BTreeMap::new(), &update);
 
-        let (_, root) = t.span(TextInput::Static("parent"), None, 8, |ctx| {
-            ctx.child(TextInput::Static("before"), 8, |_| Ok::<_, ()>(()))?;
+        let (_, root) = t.__span(
+            TextInput::Static("parent"),
+            None,
+            8,
+            lmao_core::SourceMetadata::UNATTRIBUTED,
+            |ctx| {
+                ctx.__child(
+                    TextInput::Static("before"),
+                    8,
+                    lmao_core::SourceMetadata::UNATTRIBUTED,
+                    |_| Ok::<_, ()>(()),
+                )?;
             ctx.set_scope(&update);
-            ctx.child(TextInput::Static("after"), 8, |_| Ok::<_, ()>(()))?;
+                ctx.__child(
+                    TextInput::Static("after"),
+                    8,
+                    lmao_core::SourceMetadata::UNATTRIBUTED,
+                    |_| Ok::<_, ()>(()),
+                )?;
             Ok::<_, ()>(())
-        });
+            },
+        );
 
         prop_assert!(observed(root.children()[0].scope()).is_empty());
         prop_assert_eq!(observed(root.children()[1].scope()), expected);
@@ -344,12 +371,28 @@ proptest! {
         let t = trace();
         let expected = ts_set_scope(&BTreeMap::new(), &update);
 
-        let (_, root) = t.span(TextInput::Static("root"), None, 8, |ctx| {
+        let (_, root) = t.__span(
+            TextInput::Static("root"),
+            None,
+            8,
+            lmao_core::SourceMetadata::UNATTRIBUTED,
+            |ctx| {
             ctx.set_scope(&update);
-            ctx.child(TextInput::Static("mid"), 8, |mid| {
-                mid.child(TextInput::Static("leaf"), 8, |_| Ok::<_, ()>(()))
-            })
-        });
+                ctx.__child(
+                    TextInput::Static("mid"),
+                    8,
+                    lmao_core::SourceMetadata::UNATTRIBUTED,
+                    |mid| {
+                        mid.__child(
+                            TextInput::Static("leaf"),
+                            8,
+                            lmao_core::SourceMetadata::UNATTRIBUTED,
+                            |_| Ok::<_, ()>(()),
+                        )
+                    },
+                )
+            },
+        );
 
         let leaf = &root.children()[0].children()[0];
         prop_assert_eq!(observed(leaf.scope()), expected);
@@ -438,15 +481,21 @@ define_log_schema!(pub ParitySchema {
 #[test]
 fn generated_fill_scope_places_values_like_the_spec_table() {
     let t = trace();
-    let (_, span) = t.span(TextInput::Static("processOrder"), None, 8, |ctx| {
-        ctx.set_scope(&[
-            ParitySchema::scope_route(Some("processing".into())),
-            ParitySchema::scope_hits(Some(1.0)),
-        ]);
-        ctx.log(EntryType::Info, "step 1", 1);
-        ctx.log(EntryType::Info, "step 2", 2);
-        Ok::<_, ()>(())
-    });
+    let (_, span) = t.__span(
+        TextInput::Static("processOrder"),
+        None,
+        8,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            ctx.set_scope(&[
+                ParitySchema::scope_route(Some("processing".into())),
+                ParitySchema::scope_hits(Some(1.0)),
+            ]);
+            ctx.__log(EntryType::Info, "step 1", 1);
+            ctx.__log(EntryType::Info, "step 2", 2);
+            Ok::<_, ()>(())
+        },
+    );
 
     let mut traced = ParitySchema::from_span(span);
     traced.tag_route(TextInput::Static("started")); // row 0 direct write
@@ -489,10 +538,16 @@ fn generated_fill_scope_places_values_like_the_spec_table() {
 #[test]
 fn generated_fill_scope_handles_enum_fields() {
     let t = trace();
-    let (_, span) = t.span(TextInput::Static("op"), None, 8, |ctx| {
-        ctx.set_scope(&[ParitySchema::scope_outcome(Some(2)).expect("in-range index")]);
-        Ok::<_, ()>(())
-    });
+    let (_, span) = t.__span(
+        TextInput::Static("op"),
+        None,
+        8,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            ctx.set_scope(&[ParitySchema::scope_outcome(Some(2)).expect("in-range index")]);
+            Ok::<_, ()>(())
+        },
+    );
     let mut traced = ParitySchema::from_span(span);
     traced.fill_scope();
     assert_eq!(traced.get_outcome(0), Some("timeout"));
@@ -512,15 +567,21 @@ fn enum_scope_constructor_refuses_an_out_of_range_index() {
 #[test]
 fn overflow_chain_shares_one_scope() {
     let t = trace();
-    let (_, span) = t.span(TextInput::Static("overflowing"), None, 8, |ctx| {
-        // Capacity 8 with rows 0..1 reserved: 6 appends fill it, the 7th overflows.
-        for _ in 0..7 {
-            ctx.log(EntryType::Info, "filler", 0);
-        }
-        // Scope set AFTER the overflow buffer already exists.
-        ctx.set_scope(&[ParitySchema::scope_route(Some("late".into()))]);
-        Ok::<_, ()>(())
-    });
+    let (_, span) = t.__span(
+        TextInput::Static("overflowing"),
+        None,
+        8,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            // Capacity 8 with rows 0..1 reserved: 6 appends fill it, the 7th overflows.
+            for _ in 0..7 {
+                ctx.__log(EntryType::Info, "filler", 0);
+            }
+            // Scope set AFTER the overflow buffer already exists.
+            ctx.set_scope(&[ParitySchema::scope_route(Some("late".into()))]);
+            Ok::<_, ()>(())
+        },
+    );
 
     let overflow = span
         .overflow()
@@ -539,10 +600,16 @@ fn overflow_chain_shares_one_scope() {
 #[test]
 fn unknown_scope_fields_are_ignored() {
     let t = trace();
-    let (_, span) = t.span(TextInput::Static("op"), None, 8, |ctx| {
-        ctx.set_scope(&[("not_a_column", Some(ScopeValue::Uint64(1)))]);
-        Ok::<_, ()>(())
-    });
+    let (_, span) = t.__span(
+        TextInput::Static("op"),
+        None,
+        8,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            ctx.set_scope(&[("not_a_column", Some(ScopeValue::Uint64(1)))]);
+            Ok::<_, ()>(())
+        },
+    );
     let mut traced = ParitySchema::from_span(span);
     assert_eq!(traced.fill_scope(), 0);
     assert_eq!(traced.attribute_bytes(), 0);
@@ -556,9 +623,15 @@ fn unknown_scope_fields_are_ignored() {
 #[should_panic(expected = "expects ScopeValue::Number")]
 fn mismatched_scope_variant_panics_in_debug() {
     let t = trace();
-    let (_, span) = t.span(TextInput::Static("op"), None, 8, |ctx| {
-        ctx.set_scope(&[("hits", Some(ScopeValue::Boolean(true)))]);
-        Ok::<_, ()>(())
-    });
+    let (_, span) = t.__span(
+        TextInput::Static("op"),
+        None,
+        8,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            ctx.set_scope(&[("hits", Some(ScopeValue::Boolean(true)))]);
+            Ok::<_, ()>(())
+        },
+    );
     ParitySchema::from_span(span).fill_scope();
 }

@@ -1,8 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const REVISION_ENV: &str = "LMAO_GIT_REVISION";
 
 fn main() {
     let manifest_dir =
@@ -25,6 +28,7 @@ fn main() {
     generate_thread_schema(&schema_path);
     generate_thread_kinds(&schema_path);
     generate_tuning_constants(&tuning_path);
+    generate_source_git(package_root, &manifest_dir);
 }
 
 fn generate_entry_types(path: &Path) {
@@ -252,4 +256,142 @@ fn rust_variant(name: &str) -> String {
 fn write_generated(name: &str, contents: String) {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     fs::write(out.join(name), contents).expect("write generated Rust binding");
+}
+
+fn generate_source_git(package_root: &Path, manifest_dir: &Path) {
+    println!("cargo:rerun-if-env-changed={REVISION_ENV}");
+    let Some(repo_dir) =
+        git_output(manifest_dir, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
+    else {
+        write_source_git(&BTreeMap::new(), None);
+        return;
+    };
+    track_git_state(&repo_dir);
+
+    let requested = env::var(REVISION_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let revision = match requested {
+        Some(requested) => Some(
+            git_output(
+                &repo_dir,
+                &["rev-parse", "--verify", &format!("{requested}^{{commit}}")],
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "{REVISION_ENV} does not name a commit in {}: {requested}",
+                    repo_dir.display()
+                )
+            }),
+        ),
+        None => git_output(&repo_dir, &["rev-parse", "HEAD"]),
+    };
+
+    let mut rust_files = Vec::new();
+    collect_rust_files(&package_root.join("crates"), &mut rust_files);
+    rust_files.sort();
+    let mut source_shas = BTreeMap::new();
+    if let Some(revision) = revision.as_deref() {
+        for source in rust_files {
+            println!("cargo:rerun-if-changed={}", source.display());
+            let Some(repo_relative) = relative_utf8(&source, &repo_dir) else {
+                continue;
+            };
+            let Some(sha) = git_output(
+                &repo_dir,
+                &["rev-list", "-1", revision, "--", repo_relative],
+            ) else {
+                continue;
+            };
+            if sha.is_empty() {
+                continue;
+            }
+            add_source_alias(&mut source_shas, &source, &repo_dir, &sha);
+            add_source_alias(&mut source_shas, &source, package_root, &sha);
+            add_source_alias(&mut source_shas, &source, manifest_dir, &sha);
+        }
+    }
+    write_source_git(&source_shas, revision.as_deref());
+}
+
+fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+    {
+        let path = entry
+            .unwrap_or_else(|error| panic!("read entry under {}: {error}", dir.display()))
+            .path();
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("target") {
+                continue;
+            }
+            collect_rust_files(&path, files);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn add_source_alias(entries: &mut BTreeMap<String, String>, source: &Path, base: &Path, sha: &str) {
+    if let Some(alias) = relative_utf8(source, base) {
+        entries.insert(alias.to_owned(), sha.to_owned());
+    }
+}
+
+fn relative_utf8<'a>(path: &'a Path, base: &Path) -> Option<&'a str> {
+    path.strip_prefix(base).ok()?.to_str()
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_owned())
+}
+
+fn track_git_state(repo_dir: &Path) {
+    let Some(head_path) = git_path(repo_dir, "HEAD") else {
+        return;
+    };
+    println!("cargo:rerun-if-changed={}", head_path.display());
+    if let Ok(head) = fs::read_to_string(&head_path)
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+        && let Some(reference_path) = git_path(repo_dir, reference)
+    {
+        println!("cargo:rerun-if-changed={}", reference_path.display());
+    }
+    if let Some(packed_refs) = git_path(repo_dir, "packed-refs") {
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
+}
+
+fn git_path(repo_dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(git_output(repo_dir, &["rev-parse", "--git-path", name])?);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repo_dir.join(path)
+    })
+}
+
+fn write_source_git(entries: &BTreeMap<String, String>, revision: Option<&str>) {
+    println!(
+        "cargo:rustc-env=LMAO_GIT_REVISION={}",
+        revision.unwrap_or_default()
+    );
+    let mut generated = String::from(
+        "#[doc(hidden)]\n#[inline(always)]\npub fn source_git_sha(file: &str) -> Option<&'static str> {\n    match file {\n",
+    );
+    for (file, sha) in entries {
+        writeln!(generated, "        {file:?} => Some({sha:?}),")
+            .expect("writing to String cannot fail");
+    }
+    generated.push_str("        _ => None,\n    }\n}\n");
+    write_generated("source_git.rs", generated);
 }
