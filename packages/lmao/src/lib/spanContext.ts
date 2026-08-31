@@ -36,6 +36,7 @@ import { TransientError } from './errors/Transient.js';
 import type { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import type { CallsitePlan, PhysicalLayoutPlan } from './physicalLayoutPlan.js';
+import { resolveCallsitePlanBackend } from './physicalLayoutPlan.js';
 import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import {
   RUNTIME_HINT_DEPS,
@@ -1165,14 +1166,20 @@ export function createSpanContextClass<Ctx extends OpContext>(
       childCtx: SpanContextInstance<Ctx>,
       line: number,
       name: string | number,
-      callsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
-      opMetadata: OpMetadata,
+      definedCallsitePlan: CallsitePlan<Ctx['logSchema'], Ctx>,
+      _opMetadata: OpMetadata,
     ): SpanContextInstance<Ctx> {
+      // Child ops seal their plan at define time; resolve it against the
+      // parent's already-resolved backend, once per (plan, backend). The
+      // buffer carries the RESOLVED plan's metadata: writeSpanEndEntry reads
+      // its lifecycle appenders from `buffer._opMetadata._physicalLayoutPlan`,
+      // so define-time metadata would end the span through the wrong lane.
+      const callsitePlan = resolveCallsitePlanBackend(definedCallsitePlan, this._physicalLayoutPlan.backendKind);
       const childSchema = callsitePlan.schema;
       const createdBuffer = this._spanBuffer._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
         this._spanBuffer,
         this._spanBuffer._opMetadata,
-        opMetadata,
+        callsitePlan.metadata,
         callsitePlan.capacityTier,
         childSchema,
         callsitePlan.SpanBufferClass,
