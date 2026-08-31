@@ -369,7 +369,9 @@ pub fn pinning_findings(home: &Path, plist: &Path) -> Vec<Finding> {
             );
         }
     };
-    let program = target.join(STABLE_BINARY_DIRECTORY).join(SCCACHE_BINARY_NAME);
+    let program = target
+        .join(STABLE_BINARY_DIRECTORY)
+        .join(SCCACHE_BINARY_NAME);
     if !program.is_file() {
         return unpinned(
             format!(
@@ -518,8 +520,7 @@ mod tests {
         );
 
         // And a plist that does name it is healthy.
-        std::fs::write(&plist, format!("<plist>{}</plist>", installed.display()))
-            .expect("plist");
+        std::fs::write(&plist, format!("<plist>{}</plist>", installed.display())).expect("plist");
         assert!(pinning_findings(&home, &plist).is_empty());
 
         let _ = std::fs::remove_dir_all(&home);

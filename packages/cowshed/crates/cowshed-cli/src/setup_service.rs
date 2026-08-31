@@ -392,10 +392,7 @@ impl HostSetup for NativeHostSetup {
                 "installed cowshed binary",
                 remove_host_stable_executable(&gateway_binary)?,
             ),
-            HostArtifactRemoval::new(
-                "sccache nix GC root",
-                remove_gc_root(&sccache_root)?,
-            ),
+            HostArtifactRemoval::new("sccache nix GC root", remove_gc_root(&sccache_root)?),
         ];
         remove_stale_socket(&sccache_socket)?;
         Ok(removals)
@@ -1015,12 +1012,14 @@ fn render_repair<W: Write, E: Write>(
     // the host silently kept to itself, which is the one thing a repair report must never do.
     for refresh in services {
         let line = match refresh {
-            ServiceBinaryRefresh::Refreshed { service } => {
-                Some(format!("{service} ran a stale binary; refreshed and restarted"))
-            }
+            ServiceBinaryRefresh::Refreshed { service } => Some(format!(
+                "{service} ran a stale binary; refreshed and restarted"
+            )),
             ServiceBinaryRefresh::Refused {
                 service, reason, ..
-            } => Some(format!("{service} still runs its installed binary: {reason}")),
+            } => Some(format!(
+                "{service} still runs its installed binary: {reason}"
+            )),
             // Its remedy is a hint below the status line, where every other next step lives.
             ServiceBinaryRefresh::Stale { .. } => None,
         };

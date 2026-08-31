@@ -1842,10 +1842,12 @@ async fn the_optin_names_the_store_path_and_its_gc_root() {
 /// read exit 0 here would report a host as ready without the thing it was told to install.
 #[tokio::test]
 async fn a_host_without_nix_is_told_so_and_still_repairs_storage() {
-    let mut host = FakeHost::default();
-    host.sccache_install = SccacheInstall::Unavailable {
-        flake: PathBuf::from("/opt/cowshed/nix/sccache"),
-        refusal: BuildRefusal::NixMissing,
+    let mut host = FakeHost {
+        sccache_install: SccacheInstall::Unavailable {
+            flake: PathBuf::from("/opt/cowshed/nix/sccache"),
+            refusal: BuildRefusal::NixMissing,
+        },
+        ..FakeHost::default()
     };
 
     let (streams, error) = failing_run(&mut host, REPAIR_WITH_SCCACHE, false).await;
@@ -1856,7 +1858,11 @@ async fn a_host_without_nix_is_told_so_and_still_repairs_storage() {
         "{}",
         error.message
     );
-    assert!(error.hint.contains("cowshed setup --sccache"), "{}", error.hint);
+    assert!(
+        error.hint.contains("cowshed setup --sccache"),
+        "{}",
+        error.hint
+    );
     assert_ne!(streams.exit, 0, "a missing prerequisite must not exit 0");
     // The rest of setup ran and reported: aborting on the opt-in would strand a host whose volumes
     // this very command just repaired.
@@ -1873,7 +1879,8 @@ async fn a_host_without_nix_is_told_so_and_still_repairs_storage() {
         streams.stderr
     );
     assert!(
-        host.events.contains(&String::from("configure-sccache-client")),
+        host.events
+            .contains(&String::from("configure-sccache-client")),
         "the run stopped early: {:?}",
         host.events
     );
@@ -1883,11 +1890,15 @@ async fn a_host_without_nix_is_told_so_and_still_repairs_storage() {
 /// store path stays named so nobody re-runs the build looking for the fault.
 #[tokio::test]
 async fn a_rooted_build_whose_daemon_never_answered_points_at_launchd() {
-    let mut host = FakeHost::default();
-    host.sccache_install = SccacheInstall::NotRunning {
-        program: PathBuf::from("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
-        gc_root: PathBuf::from("/Users/dev/Library/Application Support/dev.cowshed/nix/sccache"),
-        reason: String::from("the agent is loaded but its socket does not answer"),
+    let mut host = FakeHost {
+        sccache_install: SccacheInstall::NotRunning {
+            program: PathBuf::from("/nix/store/abc-sccache-0.17.0-cowshed/bin/sccache"),
+            gc_root: PathBuf::from(
+                "/Users/dev/Library/Application Support/dev.cowshed/nix/sccache",
+            ),
+            reason: String::from("the agent is loaded but its socket does not answer"),
+        },
+        ..FakeHost::default()
     };
 
     let (streams, error) = failing_run(&mut host, REPAIR_WITH_SCCACHE, false).await;

@@ -86,8 +86,13 @@ fn launch_agent_activation_bootstraps_only_when_not_loaded() {
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::NoChange)
-        .expect("activation succeeds");
+    activate_launch_agent(
+        &mut executor,
+        501,
+        launch_spec().target(),
+        InstallOutcome::NoChange,
+    )
+    .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(command.argv.len(), 2);
     assert_eq!(command.argv[0][0], "print");
@@ -101,8 +106,13 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::NoChange)
-        .expect("activation succeeds");
+    activate_launch_agent(
+        &mut executor,
+        501,
+        launch_spec().target(),
+        InstallOutcome::NoChange,
+    )
+    .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(command.argv.len(), 2);
     assert_eq!(command.argv[0][0], "print");
@@ -114,8 +124,13 @@ fn launch_agent_activation_is_idempotent_and_propagates_spawn_failure() {
     ))]);
     let mut executor = LaunchdExecutor::new((), command);
     assert!(
-        activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::NoChange)
-            .is_err()
+        activate_launch_agent(
+            &mut executor,
+            501,
+            launch_spec().target(),
+            InstallOutcome::NoChange
+        )
+        .is_err()
     );
 }
 
@@ -136,8 +151,13 @@ fn a_changed_plist_reloads_the_agent_instead_of_kickstarting_the_old_program() {
         Ok(LaunchctlOutput::success()),
     ]);
     let mut executor = LaunchdExecutor::new((), command);
-    activate_launch_agent(&mut executor, 501, launch_spec().target(), InstallOutcome::Changed)
-        .expect("activation succeeds");
+    activate_launch_agent(
+        &mut executor,
+        501,
+        launch_spec().target(),
+        InstallOutcome::Changed,
+    )
+    .expect("activation succeeds");
     let (_, command) = executor.into_parts();
     assert_eq!(
         command
@@ -412,7 +432,8 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
 
     // A release build is accepted unchanged: the guard is a gate, not a transformation.
     assert_eq!(
-        refuse_unsupervisable_build(source.clone(), false).expect("a release build is supervisable"),
+        refuse_unsupervisable_build(source.clone(), false)
+            .expect("a release build is supervisable"),
         source
     );
 }
@@ -435,7 +456,9 @@ fn a_failed_activation_restores_the_binary_it_replaced() {
     );
 
     fs::write(executable.path(), b"the supervised release build\n").expect("installed binary");
-    let original = fs::symlink_metadata(executable.path()).expect("installed").ino();
+    let original = fs::symlink_metadata(executable.path())
+        .expect("installed")
+        .ino();
     let retained = retain_previous_executable(&executable)
         .expect("retain succeeds")
         .expect("an installed binary is retained");
@@ -452,7 +475,9 @@ fn a_failed_activation_restores_the_binary_it_replaced() {
     fs::write(&temporary, b"a debug build nobody asked for\n").expect("replacement");
     fs::rename(&temporary, executable.path()).expect("atomic replacement");
     assert_ne!(
-        fs::symlink_metadata(executable.path()).expect("replaced").ino(),
+        fs::symlink_metadata(executable.path())
+            .expect("replaced")
+            .ino(),
         original
     );
 
@@ -473,10 +498,7 @@ fn a_failed_activation_restores_the_binary_it_replaced() {
     // A rollback that cannot happen is reported, never silently swallowed: the caller's own
     // failure plus this sentence are the host's actual state.
     let sentence = restore_previous_executable(&executable, &home.join("never-retained"));
-    assert!(
-        sentence.contains("could NOT be restored"),
-        "got {sentence}"
-    );
+    assert!(sentence.contains("could NOT be restored"), "got {sentence}");
 
     let _ = fs::remove_dir_all(&home);
 }
