@@ -82,6 +82,10 @@ const nativeSymbols = {
     args: [FFIType.ptr, FFIType.ptr, FFIType.u64],
     returns: FFIType.u32,
   },
+  thread_span_buffer_set_completion_message: {
+    args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.u64],
+    returns: FFIType.u8,
+  },
   thread_span_buffer_open_span: {
     args: [FFIType.ptr, FFIType.ptr, FFIType.u64, FFIType.u64, FFIType.u32, FFIType.u32, FFIType.i64, FFIType.u32],
     returns: FFIType.u64,
@@ -254,6 +258,13 @@ export function bindThreadSpanBuffer(handle: ThreadSpanBufferHandle): ThreadSpan
       library.symbols.thread_span_buffer_write_tag(BigInt(handle), spanId, ordinal, kind, value),
     setScope: (spanId, ordinal, kind, value) =>
       library.symbols.thread_span_buffer_set_scope(BigInt(handle), spanId, ordinal, kind, value),
+    setCompletionMessage: (spanId, messagePtr, messageLen) =>
+      library.symbols.thread_span_buffer_set_completion_message(
+        BigInt(handle),
+        spanId,
+        BigInt(messagePtr),
+        BigInt(messageLen),
+      ),
     intern: (addressOrText: number | string, length?: number): number => {
       if (typeof addressOrText === 'string') return internText(binding, addressOrText);
       if (length === undefined) return 0;

@@ -503,6 +503,30 @@ pub unsafe extern "C" fn thread_span_buffer_end(
     buffer.end(span_id, entry_type, timestamp).is_err() as u8
 }
 
+/// Store a span's terminal message on its reserved completion row.
+/// # Safety
+/// `handle` must be a live uniquely owned handle. The byte range must be
+/// readable for the duration of this call; a null pointer is valid only with
+/// zero length.
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
+pub unsafe extern "C" fn thread_span_buffer_set_completion_message(
+    handle: *mut ThreadSpanBufferHandle,
+    span_id: u32,
+    message_ptr: *const u8,
+    message_len: usize,
+) -> u8 {
+    let Some(buffer) = as_buffer(handle) else {
+        return 1;
+    };
+    let Some(message) = (unsafe { parse_text(message_ptr, message_len) }) else {
+        return 1;
+    };
+    match buffer.set_completion_message(span_id, TextInput::Dynamic(message)) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

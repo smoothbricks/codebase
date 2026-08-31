@@ -102,6 +102,12 @@ export interface ThreadSpanBufferWasmExports {
     kind: ThreadAttributeKind,
     value: bigint,
   ): number;
+  thread_span_buffer_set_completion_message(
+    handle: ThreadSpanBufferHandle,
+    spanId: number,
+    messagePtr: number,
+    messageLen: number,
+  ): number;
   thread_span_buffer_set_scope(
     handle: ThreadSpanBufferHandle,
     spanId: number,
@@ -163,6 +169,8 @@ export interface ThreadSpanBufferBinding {
   writeTag(spanId: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
   setScope(spanId: number, ordinal: number, kind: ThreadAttributeKind | 0, value: bigint): number;
   intern(ptr: number, len: number): number;
+  /** Store the span's terminal message on its reserved completion row. */
+  setCompletionMessage(spanId: number, messagePtr: number, messageLen: number): number;
 }
 
 /** Validate the complete batch ABI before wiring it into a WASM instance. */
@@ -182,7 +190,8 @@ export function isThreadSpanBufferWasmExports(value: unknown): value is ThreadSp
     typeof Reflect.get(value, 'thread_span_buffer_append_log_dynamic') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_write_attr') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_write_tag') === 'function' &&
-    typeof Reflect.get(value, 'thread_span_buffer_set_scope') === 'function'
+    typeof Reflect.get(value, 'thread_span_buffer_set_scope') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_set_completion_message') === 'function'
   );
 }
 
@@ -244,5 +253,7 @@ export function bindThreadSpanBuffer(
     setScope: (spanId, ordinal, kind, attributeValue) =>
       value.thread_span_buffer_set_scope(handle, spanId, ordinal, kind, attributeValue),
     intern: (ptr, len) => value.thread_span_buffer_intern(handle, ptr, len),
+    setCompletionMessage: (spanId, messagePtr, messageLen) =>
+      value.thread_span_buffer_set_completion_message(handle, spanId, messagePtr, messageLen),
   };
 }

@@ -22,7 +22,10 @@ import { attributeKindForSchemaType, isThreadSystemColumn, schemaAttributeOrdina
 import { THREAD_SPAN_BUFFER_OK, type ThreadAttributeKind, type ThreadSpanBufferBinding } from './threadSpanBuffer.js';
 import type { ThreadSpanBufferRuntime } from './threadSpanBufferHost.js';
 
-export const THREAD_SPAN_VIEW = Symbol('thread-span-view');
+// Registered, not unique: a process can hold two copies of this module (src
+// and dist through a package boundary), and a view minted by one copy must
+// still satisfy the other's guard. The brand is the contract, not the module.
+export const THREAD_SPAN_VIEW = Symbol.for('@smoothbricks/lmao/thread-span-view');
 const EMPTY_SCOPE: Readonly<Record<string, unknown>> = Object.freeze({});
 
 const KIND_NUMBER = THREAD_ATTRIBUTE_KINDS[0].discriminant;
@@ -454,6 +457,10 @@ export class ThreadSpanView {
     const kind = this.kinds.get(name);
     if (ordinal === undefined || kind === undefined) return this;
     if (value === null || value === undefined) return this;
+    // A tag can be the span's first write (ctx.tag before any log). The row
+    // store refuses writes against a span it has not opened, so opening here
+    // mirrors commitLog's lazy open rather than making order significant.
+    if (!this.opened) this.openSpan(this._spanName ?? 'span');
     const scalar = this.encodeValue(name, kind, value);
     const status = this.binding.writeTag(this.spanId, ordinal, kind, scalar);
     if (status !== THREAD_SPAN_BUFFER_OK) throw new Error(`thread_span_buffer_write_tag failed for ${name}`);
@@ -489,6 +496,16 @@ export class ThreadSpanView {
   message(pos: number, val: string): this {
     if (pos === 0 && !this.opened) {
       this._spanName = val;
+      return this;
+    }
+    if (pos === 1) {
+      // Terminal result/error text lands on the reserved completion row, the
+      // same contract as the js-heap lane's row 1 — never as an appended row,
+      // or the two lanes disagree on row count for the same trace.
+      if (!this.opened) this.openSpan(this._spanName ?? 'span');
+      const payload = this.runtime.writeUtf8(val);
+      const status = this.binding.setCompletionMessage(this.spanId, payload.ptr, payload.len);
+      if (status !== THREAD_SPAN_BUFFER_OK) throw new Error('thread_span_buffer_set_completion_message failed');
       return this;
     }
     this.message_values[pos] = val;
@@ -566,10 +583,29 @@ export class ThreadSpanView {
   }
 
   physicalRow(index: number): number {
+    // Fakes 0/1 are the lifecycle pair; they are structural, never entries in
+    // the log-row map, which tests and stamp accounting read as logs-only.
+    if (index === 0) return this.startRow;
+    if (index === 1) return this.completionRow;
     return this.fakeToReal.get(index) ?? index;
   }
 
   private commitLog(fakeIndex: number, message: string): void {
+    if (fakeIndex === 1) {
+      // Terminal result/error text lands on the reserved completion row — the
+      // js-heap lane's row-1 contract — never as an appended row, or the two
+      // lanes disagree on row count for the same trace.
+      if (!this.opened) this.openSpan(this._spanName ?? 'span');
+      const payload = this.runtime.writeUtf8(message);
+      const status = this.binding.setCompletionMessage(this.spanId, payload.ptr, payload.len);
+      if (status !== THREAD_SPAN_BUFFER_OK) throw new Error('thread_span_buffer_set_completion_message failed');
+      return;
+    }
+    if (fakeIndex === 0) {
+      // Row 0's message is the span name, written at open.
+      if (!this.opened) this._spanName = message;
+      return;
+    }
     const existing = this.fakeToReal.get(fakeIndex);
     if (existing !== undefined) return;
     if (!this.opened) this.openSpan(this._spanName ?? 'span');

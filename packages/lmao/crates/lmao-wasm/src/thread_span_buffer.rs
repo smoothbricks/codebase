@@ -544,6 +544,27 @@ pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     .unwrap_or(0)
 }
 
+/// # Safety
+/// `handle` must be a token previously returned by a live `thread_span_buffer_new*`
+/// export, and every pointer/length pair must name a readable byte range for the
+/// duration of the call; null pointers are valid only with zero lengths.
+#[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
+pub unsafe extern "C" fn thread_span_buffer_set_completion_message(
+    handle: u32,
+    span_id: u32,
+    message_ptr: *const u8,
+    message_len: usize,
+) -> u8 {
+    let Some(message) = dynamic_text(message_ptr, message_len) else {
+        return STATUS_ERROR;
+    };
+    with_handle(handle, |buffer| {
+        buffer.set_completion_message(span_id, message)
+    })
+    .map(|()| STATUS_OK)
+    .unwrap_or(STATUS_ERROR)
+}
+
 #[cfg_attr(target_family = "wasm", unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_write_attr(
     handle: u32,
