@@ -15,5 +15,5 @@ name = "allocator"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-lmao-core = { workspace = true, default-features = false }
+lmao-core = { workspace = true }
 lmao-arena = { workspace = true }
