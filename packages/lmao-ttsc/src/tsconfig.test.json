@@ -1,0 +1,13 @@
+{
+  "//": "Runtime-transform project for @ttsc/unplugin's nearest-tsconfig discovery, mirroring packages/cowshed/src/tsconfig.test.json. @ttsc/unplugin proves a generation by walking EVERY directory under the resolved config's directory twice and rejecting the result when any directory's membership or signature moved (project/directory-membership-changed); those terms are not scoped to the files that were actually compiled. Resolving to the package root put plugin/, plugin/host and plugin/driver inside that walk, and the go-build and go-test targets run with cwd {projectRoot}/plugin, so a concurrent Nx task writing Go artifacts invalidated a generation that had nothing to do with it — the target was Nx-flagged FLAKY on that alone, with no test failing. Rooting the transform project here confines the walk to source, which no target writes to during a run.",
+  "extends": "../tsconfig.test.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "rootDir": "."
+  },
+  "include": ["./**/*.ts", "./**/*.tsx"]
+}
