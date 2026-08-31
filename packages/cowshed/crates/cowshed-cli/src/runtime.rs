@@ -2948,6 +2948,24 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
             path: None,
         }),
     }
+    // Whether the agent still has a program to run, which the status above cannot answer: a loaded
+    // agent whose store path was collected looks identical to a healthy one until launchd next
+    // tries to exec it, which may be a reboot away.
+    match crate::sccache_service::control_target(&home) {
+        Ok(target) => diagnosis
+            .findings
+            .extend(crate::sccache_nix::pinning_findings(
+                &home,
+                target.plist_path(),
+            )),
+        Err(error) => diagnosis.findings.push(Finding {
+            code: "sccache-agent".into(),
+            severity: FindingSeverity::Error,
+            message: error.message,
+            hint: error.hint,
+            path: None,
+        }),
+    }
     if diagnosis.storage_ready {
         // One registry traversal supplies both findings. Besides avoiding redundant I/O, this
         // guarantees one diagnostic per skipped registry entry rather than one per derived view.
