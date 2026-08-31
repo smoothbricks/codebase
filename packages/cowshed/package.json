@@ -170,11 +170,10 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "dependsOn": [
-          "typecheck-tests",
-          "cargo-test"
+          "typecheck-tests"
         ],
         "options": {
-          "comment": "Runs from source under the typia transform because the validators under test are the point; cargo-test is a dependency because it proves wire-fixtures.json is still what cowshed-core serializes.",
+          "comment": "Runs from source under the typia transform because the validators under test are the point. Deliberately does NOT depend on cargo-test: wire-fixtures.json is a checked-in file this test reads with readFileSync, produced by no cargo target, and the Rust half (the_committed_wire_corpus_is_what_core_serializes in crates/cowshed-napi/src/wire_contract.rs) pulls the same file in via include_str! so it cannot go stale behind an up-to-date build. The edge expressed 'do not call TS green if Rust disagrees', which cowshed:test already gets by depending on both legs; as a dependsOn it only meant an unrelated Rust failure deleted this target from the run.",
           "command": "bun test --config=../bunfig.toml --timeout=30000 wire-contract.test.ts",
           "cwd": "{projectRoot}/src",
           "timeoutMs": 120000,
