@@ -8,7 +8,6 @@ export {
   type ThreadSpanBufferHandle,
   type ThreadSpanBufferWasmExports,
 } from './lib/wasm/threadSpanBuffer.js';
-export { WasmBufferStrategy, type WasmBufferStrategyOptions } from './lib/wasm/WasmBufferStrategy.js';
 export {
   createWasmAllocator,
   createWasmAllocatorSync,
@@ -18,12 +17,3 @@ export {
   type WasmAllocator,
   type WasmAllocatorOptions,
 } from './lib/wasm/wasmAllocator.js';
-export {
-  isWasmSpanBufferInstance,
-  type WasmSpanBufferInstance,
-} from './lib/wasm/wasmSpanBuffer.js';
-export {
-  createWasmTraceRoot,
-  createWasmTraceRootFactory,
-  WasmTraceRoot,
-} from './lib/wasm/wasmTraceRoot.js';
