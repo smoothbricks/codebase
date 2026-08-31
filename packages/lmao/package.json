@@ -134,6 +134,11 @@
       "import": "./dist/ts/lib/testing/vitest-harness.js",
       "default": "./dist/ts/lib/testing/vitest-harness.js"
     },
+    "./bun/thread-ffi": {
+      "bun": "./src/bun/threadSpanBufferFfi.ts",
+      "development": "./src/bun/threadSpanBufferFfi.ts",
+      "default": "./dist/ts/bun/threadSpanBufferFfi.js"
+    },
     "./bun/preload": {
       "bun": "./src/bun/preload.ts",
       "development": "./src/bun/preload.ts",
@@ -237,7 +242,8 @@
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "dependsOn": [
           "...",
-          "cargo-test"
+          "cargo-test",
+          "cargo-thread-ffi"
         ],
         "options": {
           "command": "bun test --timeout=30000",
@@ -268,6 +274,29 @@
         ],
         "options": {
           "command": "just wasm",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "cargo-thread-ffi": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "dependsOn": [
+          "^build"
+        ],
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml"
+        ],
+        "outputs": [
+          "{projectRoot}/target/release/liblmao_ffi_dylib.dylib",
+          "{projectRoot}/target/release/liblmao_ffi_dylib.so",
+          "{projectRoot}/target/release/lmao_ffi_dylib.dll"
+        ],
+        "options": {
+          "command": "cargo build -p lmao-ffi-dylib --release",
           "cwd": "{projectRoot}"
         }
       }
