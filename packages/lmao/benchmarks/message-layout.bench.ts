@@ -90,9 +90,11 @@ function defineFamilyPlan(
   familyBits: number,
   capacity: number,
 ): CallsitePlan<typeof RUNTIME_SCHEMA, RuntimeContext> {
-  return CONTEXT.defineOp(`message-layout-${family}-${capacity}`, (ctx) => ctx.ok(null), undefined, {
-    runtimeHint: familyHint(familyBits, capacity),
-  }).callsitePlan;
+  const runtimeHint = familyHint(familyBits, capacity);
+  const compileMetadata =
+    family === 'dynamic-only' ? { runtimeHint } : { runtimeHint, localMessageDictionary: TEMPLATE_BINDING };
+  return CONTEXT.defineOp(`message-layout-${family}-${capacity}`, (ctx) => ctx.ok(null), undefined, compileMetadata)
+    .callsitePlan;
 }
 
 function createWorkload(capacity: number, staticRatio: number): Workload {
@@ -125,10 +127,11 @@ function selectedFamily(staticRatio: number): MessageLayoutFamily {
   return 'mixed';
 }
 
-function requireHeaderLane(buffer: AnySpanBuffer): Uint32Array {
-  const headers = buffer._logHeaders;
-  if (headers === undefined) throw new Error(`${buffer._messageLayoutFamily} buffer omitted its required header lane`);
-  return headers;
+function requireMessageIdLane(buffer: AnySpanBuffer): Uint16Array {
+  const messageIds = buffer._messageIds;
+  if (messageIds === undefined)
+    throw new Error(`${buffer._messageLayoutFamily} buffer omitted its required message ID lane`);
+  return messageIds;
 }
 
 function requireMessageLane(buffer: AnySpanBuffer): (unknown | undefined)[] {
@@ -146,6 +149,9 @@ function createPlannedBuffer(
   if (plan.capacityTier !== capacity) {
     throw new Error(`${label}: CallsitePlan capacity ${String(plan.capacityTier)} did not match ${capacity}`);
   }
+  if (plan.messagePhysicalLayout !== 'current') {
+    throw new Error(`${label}: benchmark requires the current message layout, received ${plan.messagePhysicalLayout}`);
+  }
   const traceRoot = createTraceRoot(createTraceId(`message-layout-${label}-${capacity}`), TRACER);
   return createSpanBuffer(RUNTIME_SCHEMA, traceRoot, plan.metadata, capacity, plan.SpanBufferClass);
 }
@@ -159,9 +165,9 @@ function writeWorkload(
   let checksum = 2_166_136_261;
   for (let repetition = 0; repetition < repetitions; repetition++) {
     buffer._writeIndex = 0;
-    const headers = buffer._logHeaders;
+    const messageIds = buffer._messageIds;
     const references = buffer.message_values;
-    headers?.fill(0);
+    messageIds?.fill(0);
     if (references !== undefined) {
       for (let row = 0; row < references.length; row++) Reflect.deleteProperty(references, row);
     }
@@ -174,7 +180,9 @@ function writeWorkload(
           const ordinal = workload.templateOrdinals[row];
           const denseIndex = ordinal === undefined ? undefined : TEMPLATE_BINDING[ordinal];
           if (denseIndex === undefined) throw new RangeError(`Missing dense template binding for row ${row}`);
-          requireHeaderLane(buffer)[row] = ((denseIndex << 8) | ENTRY_TYPE_INFO) >>> 0;
+          const localId = plan.encodeLocalMessage(denseIndex);
+          if (localId === 0) throw new RangeError(`Missing local template binding for row ${row}`);
+          requireMessageIdLane(buffer)[row] = localId;
         } else {
           requireMessageLane(buffer)[row] = message;
         }
@@ -203,7 +211,7 @@ function persistentCounts(buffer: AnySpanBuffer): PersistentCounts {
   const entryTypes = buffer.entry_type;
   if (entryTypes === undefined) throw new Error('Message layout requires the entry_type lane');
   const arrays: ArrayBufferView[] = [buffer.timestamp, entryTypes];
-  if (buffer._logHeaders !== undefined) arrays.push(buffer._logHeaders);
+  if (buffer._messageIds !== undefined) arrays.push(buffer._messageIds);
   let referenceSlots = 0;
   if (buffer.message_values !== undefined) referenceSlots += buffer.message_values.length;
   const uniqueBuffers = new Set<ArrayBufferLike>(arrays.map((view) => view.buffer));
