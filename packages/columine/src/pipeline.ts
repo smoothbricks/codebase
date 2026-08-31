@@ -15,6 +15,7 @@
  *   stages.undo.rollback(state, token);
  */
 
+import type { CompactColumn } from './compact-column.generated.js';
 import type { ParseCompactBackend } from './parse-backend.js';
 import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
 
@@ -57,50 +58,7 @@ export interface ParseConfig extends EncodedArrowSchema {
  * not baseline). `intervalDayTime` is two `i32` values per row (days,
  * milliseconds), so `data.length === rowCount * 2`.
  */
-export type CompactColumn =
-  | { readonly kind: 'null' }
-  | { readonly kind: 'i32'; readonly data: Int32Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'f64'; readonly data: Float64Array; readonly validity?: Uint8Array }
-  | {
-      readonly kind: 'binary';
-      readonly offsets: Uint32Array;
-      readonly data: Uint8Array;
-      readonly validity?: Uint8Array;
-    }
-  | {
-      readonly kind: 'utf8';
-      readonly offsets: Uint32Array;
-      readonly data: Uint8Array;
-      readonly validity?: Uint8Array;
-    }
-  | { readonly kind: 'bool'; readonly data: Uint8Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'i64'; readonly data: BigInt64Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'i8'; readonly data: Int8Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'i16'; readonly data: Int16Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'u8'; readonly data: Uint8Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'u16'; readonly data: Uint16Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'u32'; readonly data: Uint32Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'u64'; readonly data: BigUint64Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'f16'; readonly data: Uint16Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'f32'; readonly data: Float32Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'decimal128'; readonly data: Uint8Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'decimal256'; readonly data: Uint8Array; readonly validity?: Uint8Array }
-  | {
-      readonly kind: 'largeBinary';
-      readonly offsets: BigInt64Array;
-      readonly data: Uint8Array;
-      readonly validity?: Uint8Array;
-    }
-  | {
-      readonly kind: 'largeUtf8';
-      readonly offsets: BigInt64Array;
-      readonly data: Uint8Array;
-      readonly validity?: Uint8Array;
-    }
-  | { readonly kind: 'fixedSizeBinary'; readonly data: Uint8Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'intervalYearMonth'; readonly data: Int32Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'intervalDayTime'; readonly data: Int32Array; readonly validity?: Uint8Array }
-  | { readonly kind: 'intervalMonthDayNano'; readonly data: Uint8Array; readonly validity?: Uint8Array };
+export type { CompactColumn };
 
 /** One complete record batch for Compact encoding. */
 export interface CompactBatch {
