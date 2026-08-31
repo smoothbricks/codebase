@@ -53,6 +53,11 @@ pub mod diagnostic_detail {
     pub const OUT_OF_MEMORY: u8 = 7;
     /// A semantic schema-layer payload violation.
     pub const PAYLOAD_VIOLATION: u8 = 8;
+    /// One event spelled its payload both ways (a nested `value` object AND
+    /// top-level `value.<field>` keys). Refused because the validator judges
+    /// the nested form: two spellings in one event would let the judged bytes
+    /// and the stored bytes diverge.
+    pub const MIXED_PAYLOAD_SPELLING: u8 = 9;
 }
 
 /// Compact validation details, namespaced by [`diagnostic_stage::COMPACT`].
@@ -368,98 +373,76 @@ fn extract_json_event_open(
     // needs to be encoded.
     let mut extra = MsgpackValueWriter::new(work_buffer);
     let mut extra_count = 0;
+    let mut saw_nested_value = false;
+    let mut saw_flat_value_key = false;
     while !parser.is_object_end() {
         let name = parser
             .expect_field_name()
             .map_err(|_| ExtractionError::InvalidJson)?;
-        if let Some(lookup) = config.lookup_field(&name) {
-            let payload_name = name.strip_prefix("value.").unwrap_or(&name);
-            let capture_schema = config
-                .semantic_field_schema(&name)
-                .filter(|_| config.is_open_payload_path(payload_name));
-            let extraction_result = match (capture_schema, extra.as_mut()) {
-                (Some(schema), Some(extra_writer)) => {
-                    let mut path = vec![payload_name.to_owned()];
-                    extract_typed_value_with_capture(
-                        parser,
-                        lookup.field,
-                        columns,
-                        lookup.column,
-                        diagnostic,
-                        Some((extra_writer, &mut extra_count, &mut path, schema)),
-                    )
-                }
-                _ => extract_typed_value(parser, lookup.field, columns, lookup.column, diagnostic),
-            };
-            if let Err(err) = extraction_result {
-                // Fill in diagnostic context that the typed-value failure did
-                // not set at its source.
-                if diagnostic.field_index == NO_FIELD {
-                    diagnostic.field_index = lookup.column as u16;
-                }
-                if diagnostic.expected_type == 0 {
-                    diagnostic.expected_type = lookup.field.arrow_type as u8;
-                }
-                diagnostic.row_index = columns.count.min(u16::MAX as u32) as u16;
-                diagnostic.complete(&err);
-                return Err(err);
-            }
-            columns.columns_seen[lookup.column] = true;
-        } else if let Some(fallback) = config.fallback_column {
-            let row = columns.count;
-            let Some(writer) = extra.as_mut() else {
-                diagnostic.set(
-                    diagnostic_stage::MSGPACK,
-                    diagnostic_detail::BUFFER_OVERFLOW,
-                    fallback as u16,
-                    ArrowType::Binary as u8,
-                    json_value_type::UNKNOWN,
-                    row,
-                );
-                return Err(ExtractionError::BufferOverflow);
-            };
-            if extra_count == 0 {
-                writer.reserve_map32().map_err(|err| {
-                    msgpack_failure(
-                        diagnostic,
-                        fallback as u32,
-                        json_value_type::UNKNOWN,
-                        row,
-                        err,
-                    )
-                })?;
-            }
-            let path_key = encode_path_segment(&name);
-            writer.write_string(&path_key).map_err(|err| {
-                msgpack_failure(
-                    diagnostic,
-                    fallback as u32,
-                    json_value_type::STRING,
-                    row,
-                    err,
-                )
-            })?;
-            let Ok(token) = parser.next_token() else {
-                diagnostic.set(
-                    diagnostic_stage::JSON,
-                    diagnostic_detail::INVALID_JSON,
-                    fallback as u16,
-                    ArrowType::Binary as u8,
-                    json_value_type::UNKNOWN,
-                    row,
-                );
-                return Err(ExtractionError::InvalidJson);
-            };
-            let actual = json_value_type_of(&token);
-            writer
-                .write_value(parser, token)
-                .map_err(|err| msgpack_failure(diagnostic, fallback as u32, actual, row, err))?;
-            extra_count += 1;
-        } else {
-            parser
-                .skip_value()
-                .map_err(|_| ExtractionError::InvalidJson)?;
+        if saw_nested_value && name.starts_with("value.")
+            || saw_flat_value_key && name == "value" && config.has_value_fields
+        {
+            diagnostic.set(
+                diagnostic_stage::JSON,
+                diagnostic_detail::MIXED_PAYLOAD_SPELLING,
+                NO_FIELD,
+                0,
+                json_value_type::UNKNOWN,
+                columns.count,
+            );
+            return Err(ExtractionError::InvalidJson);
         }
+        saw_flat_value_key |= name.starts_with("value.");
+        // The nested-envelope descent: an ingest event carries its payload as
+        // one nested `value` object, and each member resolves against its
+        // `value.<member>` column. One spelling PER EVENT — mixing the nested
+        // object with top-level `value.<field>` keys is refused above, because
+        // the validator judges the nested form and two spellings in one event
+        // would let the judged bytes and the stored bytes diverge. A
+        // non-object `value` (an op result's unwrapped scalar) and a pure
+        // system schema keep the plain member handling below.
+        if name == "value"
+            && config.has_value_fields
+            && matches!(parser.peek_token(), Ok(Token::ObjectBegin))
+        {
+            saw_nested_value = true;
+            parser
+                .expect_object_begin()
+                .map_err(|_| ExtractionError::InvalidJson)?;
+            let mut column_name = String::with_capacity(32);
+            while !parser.is_object_end() {
+                let member = parser
+                    .expect_field_name()
+                    .map_err(|_| ExtractionError::InvalidJson)?;
+                column_name.clear();
+                column_name.push_str("value.");
+                column_name.push_str(&member);
+                extract_named_member(
+                    parser,
+                    config,
+                    columns,
+                    diagnostic,
+                    &mut extra,
+                    &mut extra_count,
+                    &column_name,
+                    &member,
+                )?;
+            }
+            parser
+                .next_token()
+                .map_err(|_| ExtractionError::InvalidJson)?;
+            continue;
+        }
+        extract_named_member(
+            parser,
+            config,
+            columns,
+            diagnostic,
+            &mut extra,
+            &mut extra_count,
+            &name,
+            &name,
+        )?;
     }
     parser
         .next_token()
@@ -497,6 +480,124 @@ fn extract_json_event_open(
     }
     columns.end_row();
     Ok(())
+}
+
+/// Handle one named member of the event or its nested payload: a declared
+/// column extracts typed (with deep carrier capture below open paths), an
+/// unknown member captures into the bounded carrier when one is declared, and
+/// otherwise the value is skipped. `column_name` is the column-map spelling
+/// (`value.<member>` inside the payload); `payload_name` is the payload-
+/// relative path segment the carrier and open-path checks key on.
+///
+/// A member literally named after the carrier column routes to CAPTURE, never
+/// to the carrier's own cell: the carrier is a projection artifact, and a
+/// caller must not be able to write it directly.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one seam, two call shapes: top-level and payload descent"
+)]
+fn extract_named_member(
+    parser: &mut JsonParser<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    diagnostic: &mut ExtractionDiagnostic,
+    extra: &mut Option<MsgpackValueWriter<'_>>,
+    extra_count: &mut u32,
+    column_name: &str,
+    payload_name: &str,
+) -> Result<(), ExtractionError> {
+    let lookup = config
+        .lookup_field(column_name)
+        .filter(|lookup| Some(lookup.column) != config.fallback_column);
+    if let Some(lookup) = lookup {
+        let capture_schema = config
+            .semantic_field_schema(column_name)
+            .filter(|_| config.is_open_payload_path(payload_name));
+        let extraction_result = match (capture_schema, extra.as_mut()) {
+            (Some(schema), Some(extra_writer)) => {
+                let mut path = vec![payload_name.to_owned()];
+                extract_typed_value_with_capture(
+                    parser,
+                    lookup.field,
+                    columns,
+                    lookup.column,
+                    diagnostic,
+                    Some((extra_writer, extra_count, &mut path, schema)),
+                )
+            }
+            _ => extract_typed_value(parser, lookup.field, columns, lookup.column, diagnostic),
+        };
+        if let Err(err) = extraction_result {
+            // Fill in diagnostic context that the typed-value failure did
+            // not set at its source.
+            if diagnostic.field_index == NO_FIELD {
+                diagnostic.field_index = lookup.column as u16;
+            }
+            if diagnostic.expected_type == 0 {
+                diagnostic.expected_type = lookup.field.arrow_type as u8;
+            }
+            diagnostic.row_index = columns.count.min(u16::MAX as u32) as u16;
+            diagnostic.complete(&err);
+            return Err(err);
+        }
+        columns.columns_seen[lookup.column] = true;
+        return Ok(());
+    }
+    if let Some(fallback) = config.fallback_column {
+        let row = columns.count;
+        let Some(writer) = extra.as_mut() else {
+            diagnostic.set(
+                diagnostic_stage::MSGPACK,
+                diagnostic_detail::BUFFER_OVERFLOW,
+                fallback as u16,
+                ArrowType::Binary as u8,
+                json_value_type::UNKNOWN,
+                row,
+            );
+            return Err(ExtractionError::BufferOverflow);
+        };
+        if *extra_count == 0 {
+            writer.reserve_map32().map_err(|err| {
+                msgpack_failure(
+                    diagnostic,
+                    fallback as u32,
+                    json_value_type::UNKNOWN,
+                    row,
+                    err,
+                )
+            })?;
+        }
+        let path_key = encode_path_segment(payload_name);
+        writer.write_string(&path_key).map_err(|err| {
+            msgpack_failure(
+                diagnostic,
+                fallback as u32,
+                json_value_type::STRING,
+                row,
+                err,
+            )
+        })?;
+        let Ok(token) = parser.next_token() else {
+            diagnostic.set(
+                diagnostic_stage::JSON,
+                diagnostic_detail::INVALID_JSON,
+                fallback as u16,
+                ArrowType::Binary as u8,
+                json_value_type::UNKNOWN,
+                row,
+            );
+            return Err(ExtractionError::InvalidJson);
+        };
+        let actual = json_value_type_of(&token);
+        writer
+            .write_value(parser, token)
+            .map_err(|err| msgpack_failure(diagnostic, fallback as u32, actual, row, err))?;
+        *extra_count += 1;
+        return Ok(());
+    }
+    parser
+        .skip_value()
+        .map_err(|_| ExtractionError::InvalidJson)
 }
 
 /// Coerce one JSON value into one column.
@@ -1410,6 +1511,102 @@ mod tests {
         );
         assert_eq!(c.columns[0].read_variable(0), Some(b"v".as_slice()));
         assert_eq!(c.columns[64].read_variable(0), Some(b"w".as_slice()));
+    }
+    #[test]
+    fn extract_json_events_descends_a_nested_value_envelope() {
+        // The ingest wire shape: system members top-level, the payload one
+        // nested object. Each payload member resolves its `value.<member>`
+        // column exactly as the flattened spelling would have.
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let mut c = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 128];
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"s1","value":{"note":"hello"}}]"#,
+                &config(&fields, &["id", "value.note"]),
+                &mut c,
+                &mut work,
+                &mut ExtractionDiagnostic::default()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(c.columns[0].read_variable(0), Some(b"s1".as_slice()));
+        assert_eq!(c.columns[1].read_variable(0), Some(b"hello".as_slice()));
+    }
+    #[test]
+    fn extract_json_events_captures_nested_unknowns_payload_relative() {
+        // An unknown payload member captures under its payload-relative key,
+        // not under a `value.`-prefixed spelling.
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
+        let mut c = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 128];
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"s1","value":{"bogus":7}}]"#,
+                &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
+                &mut c,
+                &mut work,
+                &mut ExtractionDiagnostic::default()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.cell(1, 0),
+            Some(ColumnValue::Binary(vec![
+                0xdf, 0, 0, 0, 1, 0xa5, b'b', b'o', b'g', b'u', b's', 7
+            ]))
+        );
+    }
+    #[test]
+    fn extract_json_events_refuses_a_mixed_payload_spelling() {
+        // Nested `value` object plus a top-level `value.<field>` key in one
+        // event: the validator judges the nested form, so a second spelling
+        // would let the judged bytes and the stored bytes diverge.
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let mut c = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 128];
+        let mut diagnostic = ExtractionDiagnostic::default();
+        assert!(
+            extract_json_events(
+                br#"[{"value":{"note":"a"},"value.note":"b"}]"#,
+                &config(&fields, &["id", "value.note"]),
+                &mut c,
+                &mut work,
+                &mut diagnostic
+            )
+            .is_err()
+        );
+        assert_eq!(diagnostic.stage, diagnostic_stage::JSON);
+        assert_eq!(diagnostic.detail, diagnostic_detail::MIXED_PAYLOAD_SPELLING);
+    }
+    #[test]
+    fn extract_json_events_never_writes_the_carrier_from_a_payload_member() {
+        // A caller spelling `$undeclared` inside the payload must not write
+        // the carrier cell directly: the member routes to capture like any
+        // other unknown, so the carrier stays a projection artifact.
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
+        let mut c = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 128];
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"s1","value":{"$undeclared":9}}]"#,
+                &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
+                &mut c,
+                &mut work,
+                &mut ExtractionDiagnostic::default()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.cell(1, 0),
+            Some(ColumnValue::Binary(vec![
+                0xdf, 0, 0, 0, 1, 0xab, b'$', b'u', b'n', b'd', b'e', b'c', b'l', b'a', b'r', b'e',
+                b'd', 9
+            ]))
+        );
     }
     #[test]
     fn binary_column_serializes_object_to_typed_msgpack() {

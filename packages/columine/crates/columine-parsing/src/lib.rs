@@ -194,6 +194,9 @@ pub struct ExtractionConfig {
     /// Relative payload paths whose object schemas opt into capture.
     pub(crate) open_paths: Vec<String>,
     pub(crate) semantic_schemas: Option<crate::validate::SemanticSchemaSet>,
+    /// Whether any column names a `value.<field>` payload path — the arming
+    /// condition for the nested-envelope descent in the extractors.
+    pub(crate) has_value_fields: bool,
 }
 
 impl ExtractionConfig {
@@ -324,6 +327,11 @@ pub fn build_extraction_config_with_semantic_schemas(
             .ok_or(ConfigError::InvalidPresenceField)?;
         presence_entries.push((presence_column, source.column));
     }
+    // The nested-envelope descent arms only for schemas that declare payload
+    // columns: a pure system schema has no `value.<field>` names, and its
+    // `value` member (an op result's unwrapped scalar, say) must keep its
+    // undeclared handling instead of being walked as a payload object.
+    let has_value_fields = field_map.keys().any(|name| name.starts_with("value."));
     Ok(ExtractionConfig {
         field_entries,
         field_map,
@@ -331,6 +339,7 @@ pub fn build_extraction_config_with_semantic_schemas(
         presence_entries,
         open_paths,
         semantic_schemas: semantic_schemas.cloned(),
+        has_value_fields,
     })
 }
 
