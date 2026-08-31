@@ -357,6 +357,13 @@ fn creation_failures_name_their_cause() {
         CreateFailure::Capacity as u32
     );
 
+    // Refusal order: a request that can never succeed is refused on its
+    // scalar precondition, not on whatever the schema decoder finds first.
+    assert_eq!(
+        unsafe { ep_create_with_schema(0, b"not a schema msg".as_ptr(), 16, meta_ptr, 4) },
+        CreateFailure::Capacity as u32
+    );
+
     assert_eq!(
         unsafe { ep_create_with_schema(256, std::ptr::null(), 0, meta_ptr, 4) },
         CreateFailure::BadRequest as u32
