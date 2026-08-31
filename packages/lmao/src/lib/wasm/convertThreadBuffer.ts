@@ -3,8 +3,19 @@
  * match lmao-arrow's system ∪ schema batch (scope materialized at flush).
  */
 
-import type { Table } from '@uwdata/flechette';
-import { float64, TimeUnit, tableFromColumns, timestamp, uint32, uint64, utf8 } from '@uwdata/flechette';
+import type { Column, Table } from '@uwdata/flechette';
+import {
+  columnFromArray,
+  columnFromValues,
+  float64,
+  TimeUnit,
+  tableFromColumns,
+  timestamp,
+  uint32,
+  uint64,
+  utf8,
+} from '@uwdata/flechette';
+import { makeArrowColumn } from '../arrow/flechette.js';
 import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
 import { schemaAttributeOrdinals } from './schemaBlob.js';
 import type { ThreadSpanView } from './threadSpanView.js';
@@ -47,15 +58,28 @@ export function convertThreadViewToArrowTable(view: ThreadSpanView): Table {
     messages[row] = message.length === 0 ? null : message;
   }
 
-  const columns: Record<string, unknown> = {
-    timestamp: { type: timestamp(TimeUnit.NANOSECOND), data: timestamps },
-    trace_id: traceIds,
-    thread_id: { type: uint64(), data: new BigUint64Array(rowCount).fill(view.thread_id) },
-    span_id: { type: uint32(), data: spanIds },
-    parent_span_id: { type: uint32(), data: parentSpanIds },
-    entry_type: { type: uint32(), data: Uint32Array.from(headers, (header) => header & 0xff) },
-    line: { type: uint32(), data: lines },
-    message: messages,
+  // tableFromColumns needs Column values; a bare `{ type, data }` descriptor
+  // has no `length`, which made every non-empty flush on this lane throw
+  // "All columns must have the same length" before it produced a row.
+  const columns: Record<string, Column<unknown>> = {
+    // flechette's value builder multiplies by a unit factor, which throws on
+    // BigInt input, so nanosecond timestamps are handed over as raw values.
+    timestamp: makeArrowColumn({
+      type: timestamp(TimeUnit.NANOSECOND),
+      length: rowCount,
+      nullCount: 0,
+      values: timestamps,
+    }),
+    trace_id: columnFromArray(traceIds, utf8()),
+    thread_id: columnFromArray(new BigUint64Array(rowCount).fill(view.thread_id), uint64()),
+    span_id: columnFromArray(spanIds, uint32()),
+    parent_span_id: columnFromArray(parentSpanIds, uint32()),
+    entry_type: columnFromArray(
+      Uint32Array.from(headers, (header) => header & 0xff),
+      uint32(),
+    ),
+    line: columnFromArray(lines, uint32()),
+    message: columnFromArray(messages, utf8()),
   };
 
   const ordinals = schemaAttributeOrdinals(view._logSchema);
@@ -82,10 +106,10 @@ export function convertThreadViewToArrowTable(view: ThreadSpanView): Table {
         const value = values[row];
         data[row] = typeof value === 'number' ? value : 0;
       }
-      columns[name] = { type: float64(), data };
-    } else {
-      columns[name] = values;
+      columns[name] = columnFromArray(data, float64());
+      continue;
     }
+    columns[name] = columnFromValues(values);
   }
 
   return tableFromColumns(columns);
