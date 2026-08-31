@@ -194,47 +194,53 @@ impl<T: Copy + Default> NumColumn<T> {
     /// cost. Scope is normally set for a whole span and direct writes are sparse, so
     /// the all-zero byte is the common case by a wide margin.
     pub fn fill_unset(&mut self, rows: usize, capacity: usize, value: T) -> usize {
-        if rows == 0 {
+        self.fill_unset_range(0, rows, capacity, value)
+    }
+
+    /// Fill every null slot in `start..end` with `value`, returning how many
+    /// cells were filled. Scope materialization uses this range form because a
+    /// thread buffer interleaves rows from multiple spans; filling from zero
+    /// would incorrectly apply one span's scope to its neighbours.
+    pub fn fill_unset_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        capacity: usize,
+        value: T,
+    ) -> usize {
+        if start >= end {
             return 0;
         }
         let buf = self
             .buf
             .get_or_insert_with(|| Box::new(ColumnBuf::new(capacity)));
         debug_assert!(
-            rows <= buf.values.len(),
+            end <= buf.values.len(),
             "fill range exceeds column capacity"
         );
 
         let mut filled = 0usize;
-        let whole_bytes = rows >> 3;
-        for byte in 0..whole_bytes {
+        let first_byte = start >> 3;
+        let last_byte = (end - 1) >> 3;
+        for byte in first_byte..=last_byte {
+            let lo = if byte == first_byte { start & 7 } else { 0 };
+            let hi = if byte == last_byte {
+                ((end - 1) & 7) + 1
+            } else {
+                8
+            };
             let validity = buf.validity[byte];
-            if validity == u8::MAX {
+            if lo == 0 && hi == 8 && validity == 0 {
+                let base = byte << 3;
+                buf.values[base..base + 8].fill(value);
+                buf.validity[byte] = u8::MAX;
+                filled += 8;
                 continue;
             }
-            let base = byte << 3;
-            if validity == 0 {
-                buf.values[base..base + 8].fill(value);
-                filled += 8;
-            } else {
-                for bit in 0..8 {
-                    if validity & (1 << bit) == 0 {
-                        buf.values[base + bit] = value;
-                        filled += 1;
-                    }
-                }
-            }
-            buf.validity[byte] = u8::MAX;
-        }
-
-        let tail = rows & 7;
-        if tail != 0 {
-            let base = whole_bytes << 3;
-            let validity = buf.validity[whole_bytes];
-            for bit in 0..tail {
+            for bit in lo..hi {
                 if validity & (1 << bit) == 0 {
-                    buf.values[base + bit] = value;
-                    buf.validity[whole_bytes] |= 1 << bit;
+                    buf.values[(byte << 3) + bit] = value;
+                    buf.validity[byte] |= 1 << bit;
                     filled += 1;
                 }
             }
@@ -299,17 +305,29 @@ impl StrColumn {
     /// `None` IS the null here, so there is no bitmap to consult and the slot's own
     /// emptiness is the authority on whether a direct write happened.
     pub fn fill_unset(&mut self, rows: usize, capacity: usize, value: &SharedStr) -> usize {
-        if rows == 0 {
+        self.fill_unset_range(0, rows, capacity, value)
+    }
+
+    /// Fill every null slot in `start..end` with `value`, preserving direct
+    /// writes outside this range. This is used when one thread buffer
+    /// interleaves rows from spans with different scope snapshots.
+    pub fn fill_unset_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        capacity: usize,
+        value: &SharedStr,
+    ) -> usize {
+        if start >= end {
             return 0;
         }
         let buf = self
             .buf
             .get_or_insert_with(|| vec![None; capacity].into_boxed_slice());
-        debug_assert!(rows <= buf.len(), "fill range exceeds column capacity");
+        debug_assert!(end <= buf.len(), "fill range exceeds column capacity");
         let mut filled = 0usize;
-        for slot in buf[..rows].iter_mut() {
+        for slot in &mut buf[start..end] {
             if slot.is_none() {
-                // Static values copy a pointer pair; dynamic ones bump an Arc.
                 *slot = Some(value.clone());
                 filled += 1;
             }

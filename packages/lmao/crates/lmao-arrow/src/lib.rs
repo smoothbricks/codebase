@@ -18,6 +18,7 @@ mod convert;
 mod dict;
 mod ipc;
 mod source;
+mod thread_convert;
 
 // Arrow types cross this crate's public API — `RecordBatch` is returned,
 // `ArrayRef` and `DataType` appear in signatures — so a caller must compile
@@ -55,6 +56,7 @@ pub use dict::{
 };
 pub use ipc::{read_single_batch, write_ipc_stream};
 pub use source::{MockSpan, SpanSource, walk_pre_order};
+pub use thread_convert::{convert_thread_buffer, convert_thread_span_buffer};
 
 #[cfg(test)]
 mod tests {
