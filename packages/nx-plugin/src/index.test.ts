@@ -8,7 +8,7 @@ import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-ex
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
 import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
-import { serializedTestFilter } from './cargo-workspace.js';
+import { exceptionalTestFilter } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2 } from './index.js';
 import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
@@ -638,7 +638,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
-  it('shards a crate around its serialized group rather than through it', async () => {
+  it('shards a crate around the tests nextest.toml singles out, not through them', async () => {
     const workspace = await createWorkspace();
     try {
       await workspace.write('packages/rusty/package.json', '{"name":"rusty"}\n');
@@ -656,27 +656,29 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-small']?.options?.command).toMatch(
         /nextest run --workspace -E 'package\(small\)' --user-config-file none/,
       );
-      // The shards partition the crate MINUS the serialized group, i of N. The
-      // group is lifted out because a test-group only holds within one nextest
-      // run, so a hash that scattered it across shards would dissolve it.
-      const serialized = serializedTestFilter(fileURLToPath(new URL('../nextest.toml', import.meta.url)));
-      if (serialized === null) {
-        throw new Error('nextest.toml declares no test-group; this test asserts the pin that protects one');
+      // The shards partition the crate MINUS the classes nextest.toml singles
+      // out, i of N. Those are lifted out because a test-group only holds
+      // within one nextest run, and because a test carrying a raised
+      // slow-timeout costs what the suite does not — the compile-fail test
+      // rustc's a fixture for 25.6s on a cold target dir against 1.8s warm.
+      const exceptional = exceptionalTestFilter(fileURLToPath(new URL('../nextest.toml', import.meta.url)));
+      if (exceptional === null) {
+        throw new Error('nextest.toml declares no overrides; this test asserts the pin that protects them');
       }
       for (const index of [1, 2, 3]) {
         expect(targets[`cargo-test-big-shard${index}`]?.options?.command).toContain(
-          `--workspace -E 'package(big) and not (${serialized})' --partition hash:${index}/3`,
+          `--workspace -E 'package(big) and not (${exceptional})' --partition hash:${index}/3`,
         );
         expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       }
       // Exact complement of the shards' filterset, so the union is the crate.
-      expect(targets['cargo-test-big-serial']?.options?.command).toContain(
-        `--workspace -E 'package(big) and (${serialized})' --no-tests=pass`,
+      expect(targets['cargo-test-big-exceptions']?.options?.command).toContain(
+        `--workspace -E 'package(big) and (${exceptional})' --no-tests=pass`,
       );
-      expect(targets['cargo-test-big-serial']?.options?.command).not.toContain('--partition');
-      expect(targets['cargo-test-big-serial']?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
+      expect(targets['cargo-test-big-exceptions']?.options?.command).not.toContain('--partition');
+      expect(targets['cargo-test-big-exceptions']?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       // An unsharded crate needs no pin: its whole suite is already one run.
-      expect(targets['cargo-test-small-serial']).toBeUndefined();
+      expect(targets['cargo-test-small-exceptions']).toBeUndefined();
       expect(targets['cargo-test-big']).toBeUndefined();
       // Every piece reaches the aggregate, and they chain rather than fan out:
       // cargo flocks one target/, and chaining also stops the pinned group
@@ -685,18 +687,18 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         'cargo-test-big-shard1',
         'cargo-test-big-shard2',
         'cargo-test-big-shard3',
-        'cargo-test-big-serial',
+        'cargo-test-big-exceptions',
         'cargo-test-small',
       ]);
       expect(targets['cargo-test-big-shard1']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
       expect(targets['cargo-test-big-shard2']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard1']);
       expect(targets['cargo-test-big-shard3']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard2']);
-      expect(targets['cargo-test-big-serial']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard3']);
-      expect(targets['cargo-test-small']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-serial']);
+      expect(targets['cargo-test-big-exceptions']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard3']);
+      expect(targets['cargo-test-small']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-exceptions']);
       // Pieces of one crate share its inputs: they are one suite, split only to
       // fit the bound, so any change to the crate invalidates all of them.
       expect(targets['cargo-test-big-shard2']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
-      expect(targets['cargo-test-big-serial']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
+      expect(targets['cargo-test-big-exceptions']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
     } finally {
       await workspace.cleanup();
     }
