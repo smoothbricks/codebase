@@ -195,28 +195,40 @@ export class ThreadSpanView {
     const existing = this._laneStore[LANE_MESSAGE_IDS];
     if (existing !== undefined) return existing as Uint16Array;
     const lane = laneProxy((index, value) => {
-      this.commitStaticLog(index, this.denseVocabularyIndex(Number(value)));
+      this.commitStaticLog(index, this.vocabularyIdFor(Number(value)));
     }) as unknown as Uint16Array;
     this._laneStore[LANE_MESSAGE_IDS] = lane;
     return lane;
   }
 
-  private denseVocabularyIndex(localMessageId: number): number {
+  /**
+   * Wire form of a callsite's local message id.
+   *
+   * `VocabularyId` is 1..=0x00ffffff, because 0 in a packed header means "this
+   * row's message is dynamic" — which is why readers decode with
+   * `encodedDenseIndex - 1`. Dense indices are 0-based, so the wire value is
+   * one more than the dictionary entry.
+   */
+  private vocabularyIdFor(localMessageId: number): number {
     const denseIndex = this._opMetadata._physicalLayoutPlan?.localMessageDictionary?.[localMessageId - 1];
     if (denseIndex === undefined) {
       throw new Error(`Missing local message dictionary entry ${localMessageId}`);
     }
-    return denseIndex;
+    return denseIndex + 1;
   }
 
-  private commitStaticLog(fakeIndex: number, denseIndex: number): void {
+  private commitStaticLog(fakeIndex: number, vocabularyId: number): void {
     if (this.fakeToReal.get(fakeIndex) !== undefined) return;
     if (!this.opened) this.openSpan(this._spanName ?? 'span');
     const entryType = this.pendingEntryType ?? 8;
     this.pendingEntryType = undefined;
     const timestamp = this._traceRoot._timestampNow(this._traceRoot);
-    const packed = this.binding.appendLogStatic(this.spanId, entryType, denseIndex, timestamp, this.pendingLine);
-    if (packed === 0n) throw new Error('thread_span_buffer_append_log_static failed');
+    const packed = this.binding.appendLogStatic(this.spanId, entryType, vocabularyId, timestamp, this.pendingLine);
+    if (packed === 0n) {
+      throw new Error(
+        `thread_span_buffer_append_log_static rejected vocabulary id ${vocabularyId} for entry type ${entryType}`,
+      );
+    }
     const row = Number(packed & 0xffffffffn);
     this.fakeToReal.set(fakeIndex, row);
     this.lastRow = row;
