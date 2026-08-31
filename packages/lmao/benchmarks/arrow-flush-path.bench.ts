@@ -25,6 +25,7 @@ import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
 import { iterateSpanTree } from '../src/lib/traceTopology.js';
 import type { AnySpanBuffer, SpanBuffer } from '../src/lib/types.js';
+import { registerThreadBufferLane } from './threadBufferLane.js';
 import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
 const MESSAGE_KINDS: readonly MessageKind[] = Object.freeze(['static', 'dynamic', 'mixed']);
@@ -611,4 +612,5 @@ for (const [profile, topology] of stringSelections) {
   registerStringScenario(scenario, chunks);
 }
 
+await registerThreadBufferLane('arrow-flush-path', 50);
 await run({ format: FORMAT, colors: FORMAT === 'mitata', throw: true });

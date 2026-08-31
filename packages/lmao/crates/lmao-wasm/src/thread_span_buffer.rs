@@ -744,6 +744,24 @@ pub unsafe extern "C" fn thread_span_buffer_read_attr(
     .unwrap_or(STATUS_ERROR)
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_read_interned(
+    handle: u32,
+    ordinal: u32,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> u32 {
+    with_handle(handle, |buffer| {
+        let value = buffer
+            .interned(ordinal)
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(
+                u16::try_from(ordinal).unwrap_or(u16::MAX),
+            ))?;
+        Ok(copy_out(out_ptr, out_len, value.as_bytes()))
+    })
+    .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +915,57 @@ mod tests {
             thread_span_buffer_write_tag(handle, span_id, ordinal, ATTRIBUTE_KIND_ENUM, 2),
             STATUS_ERROR
         );
+        thread_span_buffer_free(handle);
+    }
+
+    #[test]
+    fn set_scope_after_overflow_fills_latest_value() {
+        HANDLES.with(|handles| handles.borrow_mut().clear());
+        let blob = {
+            let mut blob = vec![ATTRIBUTE_KIND_TEXT, 4];
+            blob.extend_from_slice(b"user");
+            blob
+        };
+        let handle = unsafe { thread_span_buffer_new_with_schema(7, 8, blob.as_ptr(), blob.len()) };
+        assert_ne!(handle, 0);
+        let (span_id, _start) = open_named(handle, "root");
+        let name_id = 1;
+        for timestamp in 11..22 {
+            assert_ne!(
+                thread_span_buffer_append_log(handle, span_id, 8, name_id, timestamp, 2),
+                0
+            );
+        }
+        let rows = thread_span_buffer_row_count(handle);
+        assert!(rows > 8);
+        let ordinal = u16::try_from(SYSTEM_COLUMN_COUNT).expect("system prefix fits u16");
+        let (user, user_len) = bytes("late");
+        let user_id = unsafe { thread_span_buffer_intern(handle, user, user_len) };
+        assert_ne!(user_id, 0);
+        assert_eq!(
+            thread_span_buffer_set_scope(
+                handle,
+                span_id,
+                ordinal,
+                ATTRIBUTE_KIND_TEXT,
+                u64::from(user_id)
+            ),
+            STATUS_OK
+        );
+        assert_eq!(
+            thread_span_buffer_materialize_scope(handle, 0, rows),
+            STATUS_OK
+        );
+        let mut kind = 0u8;
+        let mut value = 0u64;
+        assert_eq!(
+            unsafe {
+                thread_span_buffer_read_attr(handle, rows - 1, ordinal, &mut kind, &mut value)
+            },
+            STATUS_OK
+        );
+        assert_eq!(kind, ATTRIBUTE_KIND_TEXT);
+        assert_eq!(value, u64::from(user_id));
         thread_span_buffer_free(handle);
     }
 }

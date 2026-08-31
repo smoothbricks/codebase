@@ -15,6 +15,7 @@ import type { SpanBufferStats } from './spanBufferStats.js';
 import { getThreadId } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
+import { convertThreadViewToArrowTable } from './wasm/convertThreadBuffer.js';
 import type { ThreadSpanBufferBinding } from './wasm/threadSpanBuffer.js';
 import { createThreadSpanBufferRuntime, type ThreadSpanBufferRuntime } from './wasm/threadSpanBufferHost.js';
 import { createThreadSpanView, isThreadSpanView, requireThreadSpanView } from './wasm/threadSpanView.js';
@@ -115,6 +116,7 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {
+    if (isThreadSpanView(buffer)) return convertThreadViewToArrowTable(buffer);
     return convertSpanTreeToArrowTable(buffer);
   }
 

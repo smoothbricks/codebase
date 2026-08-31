@@ -32,6 +32,7 @@ export interface ThreadSpanBufferReadExports {
   thread_span_buffer_read_trace_id(handle: number, row: number, outPtr: number, outLen: number): number;
   thread_span_buffer_read_message(handle: number, row: number, outPtr: number, outLen: number): number;
   thread_span_buffer_read_attr(handle: number, row: number, ordinal: number, outKind: number, outValue: number): number;
+  thread_span_buffer_read_interned(handle: number, ordinal: number, outPtr: number, outLen: number): number;
 }
 
 export type ThreadSpanBufferModuleExports = ThreadSpanBufferWasmExports & ThreadSpanBufferReadExports;
@@ -51,6 +52,9 @@ export interface ThreadSpanBufferRuntime {
   readLine(binding: ThreadSpanBufferBinding, row: number): number;
   readTraceId(binding: ThreadSpanBufferBinding, row: number): string;
   readMessage(binding: ThreadSpanBufferBinding, row: number): string;
+  materializeScope(binding: ThreadSpanBufferBinding, startRow: number, rowCount: number): void;
+  readAttr(binding: ThreadSpanBufferBinding, row: number, ordinal: number): { kind: number; value: bigint } | undefined;
+  readInterned(binding: ThreadSpanBufferBinding, ordinal: number): string;
 }
 
 function isThreadSpanBufferModuleExports(value: unknown): value is ThreadSpanBufferModuleExports {
@@ -165,5 +169,28 @@ export async function createThreadSpanBufferRuntime(options?: {
     readLine: (binding, row) => exports.thread_span_buffer_read_line(binding.handle, row),
     readTraceId: (binding, row) => copyString(exports.thread_span_buffer_read_trace_id, binding, row),
     readMessage: (binding, row) => copyString(exports.thread_span_buffer_read_message, binding, row),
+    materializeScope: (binding, startRow, rowCount) => {
+      if (exports.thread_span_buffer_materialize_scope(binding.handle, startRow, rowCount) !== 0) {
+        throw new Error('thread_span_buffer_materialize_scope failed');
+      }
+    },
+    readAttr: (binding, row, ordinal) => {
+      ensureScratch(16);
+      const kindPtr = scratchPtr;
+      const valuePtr = (scratchPtr + 8) & ~7;
+      const status = exports.thread_span_buffer_read_attr(binding.handle, row, ordinal, kindPtr, valuePtr);
+      if (status !== 0) return undefined;
+      const view = new DataView(memory.buffer);
+      return { kind: view.getUint8(kindPtr), value: view.getBigUint64(valuePtr, true) };
+    },
+    readInterned: (binding, ordinal) => {
+      const needed = exports.thread_span_buffer_read_interned(binding.handle, ordinal, scratchPtr, scratchLen);
+      if (needed === 0) return '';
+      if (needed > scratchLen) {
+        ensureScratch(needed);
+        exports.thread_span_buffer_read_interned(binding.handle, ordinal, scratchPtr, scratchLen);
+      }
+      return readUtf8(scratchPtr, needed);
+    },
   };
 }
