@@ -17,26 +17,27 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 
 # Tests that drive the host's REAL APFS stack — creating, attaching, mounting and
 # detaching actual disk images — contend on a single machine-wide serialization
-# point: Disk Arbitration and the APFS driver. Measured on this host, a read-only
-# `diskutil apfs list -plist` costs 0.7s idle at 33 attached images but up to
-# 14.4s while another process is attaching/detaching. Run in parallel these tests
-# manufacture exactly that contention for each other, so each one's wall time
-# becomes a function of how many siblings happen to be mid-attach — a test whose
-# verdict depends on that is measuring the scheduler, not the code.
+# point: Disk Arbitration and the APFS driver, not on CPU. Measured on this host,
+# a read-only `diskutil apfs list -plist` costs 0.7s idle at 33 attached images
+# but up to 14.4s while another process is attaching/detaching. A test whose
+# verdict depends on how many siblings happen to be mid-attach is measuring the
+# scheduler, not the code.
 #
-# `max-threads = 1` makes the group a mutex across the WHOLE run (groups are
-# run-wide, not per-binary, so the lib unit tests and the apfs_integration binary
-# serialize against each other as intended). The other ~830 tests stay parallel.
+# `threads-required` reserves the WHOLE run's thread budget, so each of these runs
+# with no other test in flight. Mutual exclusion between them follows for free,
+# which is why there is no test group here: a group with `max-threads = 1` would
+# stop them contending with EACH OTHER while leaving the other ~830 tests free to
+# saturate the same disk, and that was measured to be insufficient — a run where a
+# real-APFS test overran also overran an unrelated `job_artifact` test, i.e. the
+# suite was starving itself. `num-test-threads` rather than `num-cpus` so the
+# reservation still means "everything" under an explicit `--test-threads`.
 #
 # This bounds contention; it does NOT grant more time. The per-test deadline above
 # is unchanged and each of these tests is expected to fit it on its own merits.
 # Membership is by name: `real_apfs_*` is the class marker, so a new real-APFS
-# test joins the group by being named for what it touches. A bare `real_*` filter
-# would be wrong here — unrelated `real_*` tests exist in columine-arrow,
-# cowshed-cli and cowshed-gateway that touch no disk image at all.
-[test-groups]
-real-apfs = { max-threads = 1 }
-
+# test opts in by being named for what it touches. A bare `real_*` filter would be
+# wrong here — unrelated `real_*` tests exist in columine-arrow, cowshed-cli and
+# cowshed-gateway that touch no disk image at all.
 [[profile.default.overrides]]
 filter = 'test(/real_apfs_/)'
-test-group = 'real-apfs'
+threads-required = 'num-test-threads'
