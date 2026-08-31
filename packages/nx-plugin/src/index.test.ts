@@ -11,10 +11,8 @@ import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import { exceptionalTestFilter } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2, createNodesV2ForPlatform } from './index.js';
-import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
 
 const [, inferTargets] = createNodesV2;
-const buildOutputDependencies = ['^build', ...BUILD_OUTPUT_DEPENDENCIES];
 
 describe('@smoothbricks/nx-plugin inferred targets', () => {
   it('names standalone package projects from package metadata', async () => {
@@ -109,7 +107,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]);
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
-      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.build?.dependsOn).toEqual(['^build', 'tsc-js']);
       // An `nx:noop` aggregate writes no file, so it must claim none: a
       // `{projectRoot}/dist` claim here would double-cache its children's bytes
       // and make `github-ci nx-run-many --collect-outputs` attribute every file
@@ -206,7 +204,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['tsc-js']).toBeUndefined();
       expect(targets['tsdown-js']).toBeUndefined();
       expect(targets.build?.executor).toBe('nx:noop');
-      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.build?.dependsOn).toEqual(['^build', 'tsdown-js']);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
     } finally {
       await workspace.cleanup();
@@ -234,9 +232,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(targets.build).toBeUndefined();
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
-      expect(BUILD_OUTPUT_DEPENDENCIES).not.toContain('*-ios');
-      expect(BUILD_OUTPUT_DEPENDENCIES).not.toContain('*-macos');
-      expect(BUILD_OUTPUT_DEPENDENCIES).not.toContain('*-linux');
+      // No ordinary aggregate above is the whole assertion: a platform suffix
+      // is not an output family, so `bundle-ios`/`-macos`/`-linux` give this
+      // project nothing for `build` to aggregate — only a `clean` to own their
+      // outputs.
     } finally {
       await workspace.cleanup();
     }
@@ -431,7 +430,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(targets['tsc-js']?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
       expect(targets.typecheck?.dependsOn).toEqual(['^*-js', 'cargo-wasm']);
-      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-wasm', 'tsc-js']);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       // A nested crate manifest is enough for output inference, but not for
       // workspace-wide cargo-test/lint policy.
@@ -482,41 +481,50 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(targets['cargo-wasm']).toBeUndefined();
       expect(targets['tsc-js']?.outputs).toEqual(['{projectRoot}/dist/ts']);
-      // Match the production host suffix so both native-platform and dedicated
-      // cargo-napi host-provider regimes are covered on every runner.
+      // This fixture declares all four supported triples, so on EVERY supported
+      // runner the host's own triple is present and native: the host provider is
+      // that platform target and `cargo-napi` is never inferred. Tying the native
+      // regime to `-macos` asserted a macOS-only model and failed on Linux with
+      // zero host providers found. The dedicated `cargo-napi` regime is covered
+      // below against a platform no declared triple can serve, which reaches it
+      // on every runner instead of only on Linux.
       const hostOs = process.platform === 'darwin' ? 'macos' : process.platform === 'linux' ? 'linux' : null;
       const hostArch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : null;
       const hostSuffix = hostOs !== null && hostArch !== null ? `-${hostArch}-${hostOs}` : null;
-      const hostPlatformNapiTarget = hostSuffix === null ? null : `napi${hostSuffix}`;
-      const nativeHostProvider = hostPlatformNapiTarget?.endsWith('-macos') ? hostPlatformNapiTarget : null;
-      const hostProvider = nativeHostProvider ?? 'cargo-napi';
-      const hostProviders = ['cargo-napi', nativeHostProvider].filter(
-        (name): name is string => name !== null && targets[name] !== undefined,
+      expect(hostSuffix).not.toBeNull();
+      expect(targets[`napi${hostSuffix}`]).toBeDefined();
+      expect(targets['cargo-napi']).toBeUndefined();
+
+      // A platform outside NAPI_TARGET_CONVENTIONS leaves no native host target,
+      // which is precisely the condition that infers the dedicated host build.
+      const unservedHostTargets = await inferProjectTargets(
+        workspace,
+        'packages/cowshed/package.json',
+        createNodesV2ForPlatform('win32', 'x64'),
       );
-      expect(hostProviders).toHaveLength(1);
-      expect(hostProviders[0]).toBe(hostProvider);
-      if (hostProvider === 'cargo-napi') {
-        expect(targets['cargo-napi']).toMatchObject({
-          executor: 'nx:run-commands',
-          cache: true,
-          dependsOn: ['^build'],
-          outputs: ['{projectRoot}/dist/native/host'],
-          options: {
-            cwd: 'packages/cowshed',
-            command:
-              'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
-          },
-        });
-      } else {
-        expect(targets['cargo-napi']).toBeUndefined();
-      }
+      expect(unservedHostTargets['cargo-napi']).toMatchObject({
+        executor: 'nx:run-commands',
+        cache: true,
+        // The dedicated host build is another cargo writer on the default
+        // `target/`, and `build` lists it beside cargo-test-compile.
+        dependsOn: ['^build', 'cargo-test-compile'],
+        outputs: ['{projectRoot}/dist/native/host'],
+        options: {
+          cwd: 'packages/cowshed',
+          command:
+            'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
+        },
+      });
+      expect(unservedHostTargets.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'cargo-napi', 'tsc-js']);
       expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64']);
       expect(targets['napi-arm64-macos']?.options).toMatchObject({
         command:
           'napi build --release --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/darwin-arm64',
       });
       expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
-      expect(targets['napi-arm64-macos']?.dependsOn).toBeUndefined();
+      expect(targets['napi-arm64-macos']?.dependsOn).toEqual(
+        hostSuffix === '-arm64-macos' ? ['cargo-test-compile'] : undefined,
+      );
       expect(targets['napi-toolchain-arm64-linux']).toEqual({
         executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
         cache: false,
@@ -546,7 +554,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       expect(linuxX64Targets['napi-x64-linux']?.options?.command).not.toContain('--use-napi-cross');
       expect(linuxX64Targets['napi-x64-linux']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
-      expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toBeUndefined();
+      expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toEqual(['cargo-test-compile']);
       expect(linuxX64Targets['napi-toolchain-x64-linux']).toBeUndefined();
       expect(linuxX64Targets['napi-arm64-linux']?.options?.command).toContain('--use-napi-cross');
       expect(linuxX64Targets['napi-arm64-linux']?.options?.env).toEqual({
@@ -579,7 +587,19 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]
         .filter((name) => hostSuffix !== null && name.endsWith(hostSuffix))
         .sort();
-      expect(targets.build?.dependsOn).toEqual([...buildOutputDependencies, ...hostNapiTargets]);
+      // Compiling the test executables is the only cargo-test work the build
+      // aggregate owns; every RUNNER is reached through `test`. On a supported
+      // host `cargo-napi` is not inferred, so `tsc-js` is the whole output
+      // family here.
+      expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'tsc-js', ...hostNapiTargets]);
+      // Crate `cowshed-napi` names its bounded runner `cargo-test-cowshed-napi`,
+      // which the retired `*-napi` output-family glob matched on suffix alone.
+      // The runners are one serialized chain, so that single edge put the whole
+      // cargo test suite inside `nx run-many -t build`.
+      expect(targets['cargo-test-cowshed-napi']).toBeDefined();
+      for (const dependency of targets.build?.dependsOn ?? []) {
+        expect(String(dependency).startsWith('cargo-test-')).toBe(dependency === 'cargo-test-compile');
+      }
       const platformBuildDependencies = (targets.build?.dependsOn ?? []).filter(
         (dependency): dependency is string =>
           typeof dependency === 'string' && /-(?:arm64|x64)-(?:macos|linux)$/.test(dependency),
@@ -665,10 +685,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // The declared target stays the only cargo-wasm: inference never emits a
       // duplicate for Nx to merge, even with a cdylib *-wasm member crate present.
       expect(targets['cargo-wasm']).toBeUndefined();
-      // Its *-wasm output-family name feeds the aggregate build and clean.
-      expect(buildOutputDependencies).toContain('*-wasm');
+      // Its declared *-wasm output-family name feeds the aggregate build and
+      // clean by concrete name, and the cargo workspace's test-executable
+      // compilation comes with it.
       expect(targets.build?.executor).toBe('nx:noop');
-      expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'cargo-wasm']);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
     } finally {
       await workspace.cleanup();
