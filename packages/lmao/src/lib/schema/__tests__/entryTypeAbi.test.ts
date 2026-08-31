@@ -51,12 +51,17 @@ describe('entry-type ABI', () => {
 
   for (const [tag, name] of FROZEN_ENTRY_TYPES) {
     it(`keeps ${name} at ${tag}`, () => {
-      expect(ENTRY_TYPE_NAMES[tag]).toBe(name);
+      // Widened deliberately: the table is a const tuple, so its element type is
+      // a union of the very literals under test and `toBe` would only accept a
+      // member of it — which would make the assertion vacuous.
+      const actual: string | undefined = ENTRY_TYPE_NAMES[tag];
+      expect(actual).toBe(name);
     });
   }
 
   it('declares no entry beyond the frozen set without extending it', () => {
     // Appending is allowed; this fails only when the pin was not extended too.
-    expect(ENTRY_TYPE_NAMES.length).toBe(FROZEN_ENTRY_TYPES.length + 1);
+    const declared: number = ENTRY_TYPE_NAMES.length;
+    expect(declared).toBe(FROZEN_ENTRY_TYPES.length + 1);
   });
 });
