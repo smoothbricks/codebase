@@ -44,6 +44,11 @@ fn string_dictionary(values: &[Option<&str>]) -> (Vec<u32>, NullBuffer, StringAr
         let next = u32::try_from(dictionary.len()).expect("attribute dictionary exceeds u32");
         dictionary.entry(value).or_insert(next);
     }
+    // The dictionary vector is lexically sorted, so row keys must use those
+    // sorted positions rather than the values' first-seen positions.
+    for (index, ordinal) in dictionary.values_mut().enumerate() {
+        *ordinal = u32::try_from(index).expect("attribute dictionary exceeds u32");
+    }
     let mut keys = Vec::with_capacity(values.len());
     let mut valid = BooleanBufferBuilder::new(values.len());
     for value in values {

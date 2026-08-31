@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lmao_core::{Clock, FieldStrategy, SpanBuffer, SpanIdentity, TraceAnchor, TraceId};
+use lmao_core::{Clock, FieldStrategy, SpanBuffer, SpanIdentity, TextInput, TraceAnchor, TraceId};
 use lmao_macros::define_log_schema;
 
 define_log_schema!(pub FullSchema {
@@ -33,14 +33,15 @@ fn main() {
         trace_id: TraceId::new("macro-fixture").unwrap(),
         parent: None,
     });
-    let span = SpanBuffer::start_dynamic(identity, 8, "fixture".into(), &anchor, &clock);
+    let span =
+        SpanBuffer::start_dynamic(identity, 8, TextInput::Static("fixture"), &anchor, &clock);
     let mut schema = FullSchema::from_span(span);
     schema
         .tag_latency(1.0)
         .tag_count(2)
         .tag_hit(true)
-        .tag_route("route")
-        .tag_detail("detail");
+        .tag_route(TextInput::Static("route"))
+        .tag_detail(TextInput::Static("detail"));
     schema.tag_method(1).unwrap();
     assert_eq!(schema.get_latency(0), Some(1.0));
     assert_eq!(schema.get_count(0), Some(2));

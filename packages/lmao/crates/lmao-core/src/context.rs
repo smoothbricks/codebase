@@ -19,9 +19,9 @@
 //! work within a single thread of execution", `01b4`) maps to a poll-segment, and
 //! cross-thread parentage is explicitly supported.
 
+use crate::arena::TextInput;
 use crate::buffer::{SourceMetadata, SpanBuffer};
 use crate::clock::{Clock, TraceAnchor};
-use crate::columns::SharedStr;
 use crate::entry_type::EntryType;
 use crate::identity::{SpanIdentity, TraceId, next_span_id};
 use crate::result::{SpanOutcome, Transient};
@@ -74,7 +74,7 @@ impl TraceContext {
     /// attaches the buffer to its parent or hands it to the flush pipeline.
     pub fn span<T, E>(
         &self,
-        name: impl Into<SharedStr>,
+        name: TextInput<'_>,
         parent: Option<Arc<SpanIdentity>>,
         capacity: usize,
         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
@@ -95,17 +95,16 @@ impl TraceContext {
     /// in a deterministic simulation.
     pub fn span_with_retry<T, E>(
         &self,
-        name: impl Into<SharedStr>,
+        name: TextInput<'_>,
         parent: Option<Arc<SpanIdentity>>,
         capacity: usize,
         mut sleep: impl FnMut(u64),
         mut f: impl FnMut(&mut SpanContext<'_>) -> Result<T, Transient<E>>,
     ) -> (Result<T, Transient<E>>, Vec<SpanBuffer>) {
-        let name = name.into();
         let mut attempts = Vec::new();
         let mut attempt = 0u32;
         loop {
-            let (out, buf) = self.span(name.clone(), parent.clone(), capacity, &mut f);
+            let (out, buf) = self.span(name, parent.clone(), capacity, &mut f);
             attempts.push(buf);
             match out {
                 Ok(v) => return (Ok(v), attempts),
@@ -135,15 +134,9 @@ impl<'t> SpanContext<'t> {
         trace: &'t TraceContext,
         identity: Arc<SpanIdentity>,
         capacity: usize,
-        name: impl Into<SharedStr>,
+        name: TextInput<'_>,
     ) -> Self {
-        let buf = SpanBuffer::start_dynamic(
-            identity,
-            capacity,
-            name.into(),
-            &trace.anchor,
-            trace.clock(),
-        );
+        let buf = SpanBuffer::start_dynamic(identity, capacity, name, &trace.anchor, trace.clock());
         Self { trace, buf }
     }
 
@@ -166,7 +159,7 @@ impl<'t> SpanContext<'t> {
         ));
         self.buf.append_dynamic(
             level,
-            Some(SharedStr::Static(template)),
+            Some(TextInput::Static(template)),
             line,
             &self.trace.anchor,
             self.trace.clock(),
@@ -219,7 +212,7 @@ impl<'t> SpanContext<'t> {
     /// body runs, since the body may create grandchildren.
     pub fn child<T, E>(
         &mut self,
-        name: impl Into<SharedStr>,
+        name: TextInput<'_>,
         capacity: usize,
         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
@@ -274,7 +267,7 @@ mod tests {
     #[test]
     fn span_completes_ok_and_err_from_result() {
         let t = trace();
-        let (out, buf) = t.span("op-a", None, 8, |ctx| {
+        let (out, buf) = t.span(TextInput::Static("op-a"), None, 8, |ctx| {
             ctx.log(EntryType::Info, "step {n}", 42);
             Ok::<_, ()>(1)
         });
@@ -284,7 +277,7 @@ mod tests {
         assert_eq!(buf.dynamic_message_at(2), Some("step {n}"));
         assert_eq!(buf.line_at(2), 42);
 
-        let (out, buf) = t.span("op-b", None, 8, |_| Err::<(), _>("boom"));
+        let (out, buf) = t.span(TextInput::Static("op-b"), None, 8, |_| Err::<(), _>("boom"));
         assert!(out.is_err());
         assert_eq!(buf.entry_type_at(1), Some(EntryType::SpanErr));
     }
@@ -292,8 +285,8 @@ mod tests {
     #[test]
     fn children_nest_and_share_trace_id() {
         let t = trace();
-        let (_, buf) = t.span("parent", None, 8, |ctx| {
-            ctx.child("kid", 8, |_| Ok::<_, ()>(()))
+        let (_, buf) = t.span(TextInput::Static("parent"), None, 8, |ctx| {
+            ctx.child(TextInput::Static("kid"), 8, |_| Ok::<_, ()>(()))
         });
         assert_eq!(buf.children().len(), 1);
         let kid = &buf.children()[0];
@@ -307,7 +300,7 @@ mod tests {
         let mut calls = 0;
         let mut slept = Vec::new();
         let (out, attempts) = t.span_with_retry(
-            "flaky",
+            TextInput::Static("flaky"),
             None,
             8,
             |ms| slept.push(ms),
@@ -332,7 +325,7 @@ mod tests {
     fn retry_exhaustion_returns_last_error() {
         let t = trace();
         let (out, attempts) = t.span_with_retry(
-            "doomed",
+            TextInput::Static("doomed"),
             None,
             8,
             |_| {},

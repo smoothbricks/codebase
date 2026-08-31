@@ -5,27 +5,34 @@
 //! parentage is carried as `(parent_thread_id, parent_span_id)` values, so a
 //! child remains linkable after its parent has completed or after a flush.
 
+use crate::arena::{ArenaFull, StringArena, TextInput};
 use crate::columns::{
     BoolColumn, EnumColumn, F64Column, FieldMeta, FieldStrategy, NumColumn, SharedStr, StrColumn,
     U64Column,
 };
 use crate::entry_type::EntryType;
 use crate::identity::{SpanIdentity, TraceId};
-use crate::packed_header::{MAX_VOCABULARY_ID, VocabularyId, pack_dynamic, pack_static};
+use crate::packed_header::{VocabularyId, pack_dynamic, pack_static};
 use crate::scope::{ScopeEntry, ScopeValue, SpanScope};
-use crate::tuning::{MAX_CAPACITY, MIN_CAPACITY};
+use crate::tuning::{MAX_CAPACITY, MAX_STRING_ARENA_BYTES, MIN_CAPACITY};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::thread_schema::SYSTEM_COLUMN_COUNT;
 
 /// A row-targeted schema attribute value.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Copy` and allocation-free: `Text` carries the intern ordinal
+/// [`ThreadSpanBuffer::intern`] issued, not a string, so handing a value to the
+/// row store neither allocates nor touches a refcount. Callers holding bytes
+/// intern once and then write integers, which is the shape the ABI already
+/// takes — `intern` then `writeAttr`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnValue {
     Number(f64),
     Uint64(u64),
     Boolean(bool),
-    Text(SharedStr),
+    Text(u32),
     Enum(u16),
 }
 
@@ -83,18 +90,16 @@ impl AttributeColumn {
         &mut self,
         row: usize,
         capacity: usize,
-        value: ColumnValue,
+        value: ColumnCell,
         ordinal: u16,
         strategy: FieldStrategy,
     ) -> Result<(), ThreadBufferError> {
         match (self, value) {
-            (Self::Number(column), ColumnValue::Number(value)) => column.set(row, capacity, value),
-            (Self::Uint64(column), ColumnValue::Uint64(value)) => column.set(row, capacity, value),
-            (Self::Boolean(column), ColumnValue::Boolean(value)) => {
-                column.set(row, capacity, value)
-            }
-            (Self::Text(column), ColumnValue::Text(value)) => column.set(row, capacity, value),
-            (Self::Enum(column), ColumnValue::Enum(value)) => {
+            (Self::Number(column), ColumnCell::Number(value)) => column.set(row, capacity, value),
+            (Self::Uint64(column), ColumnCell::Uint64(value)) => column.set(row, capacity, value),
+            (Self::Boolean(column), ColumnCell::Boolean(value)) => column.set(row, capacity, value),
+            (Self::Text(column), ColumnCell::Text(value)) => column.set(row, capacity, value),
+            (Self::Enum(column), ColumnCell::Enum(value)) => {
                 if let FieldStrategy::Enum(values) = strategy
                     && usize::from(value) >= values.len()
                 {
@@ -117,40 +122,71 @@ impl AttributeColumn {
         Ok(())
     }
 
-    fn get(&self, row: usize) -> Option<ColumnValueRef<'_>> {
+    fn get<'a>(&self, row: usize, arena: &'a StringArena) -> Option<ColumnValueRef<'a>> {
         match self {
             Self::Number(column) => column.get(row).map(ColumnValueRef::Number),
             Self::Uint64(column) => column.get(row).map(ColumnValueRef::Uint64),
             Self::Boolean(column) => column.get(row).map(ColumnValueRef::Boolean),
-            Self::Text(column) => column.get(row).map(ColumnValueRef::Text),
+            Self::Text(column) => column.get(row, arena).map(ColumnValueRef::Text),
             Self::Enum(column) => column.get(row).map(ColumnValueRef::Enum),
         }
     }
 
+    /// Fill unset slots in `start..end`. Scope materialization is the only
+    /// caller, and it has already resolved its text into this store's arena, so
+    /// this shares [`Self::set`]'s cell type rather than matching `ScopeValue`
+    /// a second time.
     fn fill_range(
         &mut self,
         start: usize,
         end: usize,
         capacity: usize,
-        value: &ScopeValue,
+        value: ColumnCell,
     ) -> Result<usize, ()> {
         match (self, value) {
-            (Self::Number(column), ScopeValue::Number(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, *value))
-            }
-            (Self::Uint64(column), ScopeValue::Uint64(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, *value))
-            }
-            (Self::Boolean(column), ScopeValue::Boolean(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, *value))
-            }
-            (Self::Text(column), ScopeValue::Text(value)) => {
+            (Self::Number(column), ColumnCell::Number(value)) => {
                 Ok(column.fill_unset_range(start, end, capacity, value))
             }
-            (Self::Enum(column), ScopeValue::EnumIndex(value)) => {
-                Ok(column.fill_unset_range(start, end, capacity, *value))
+            (Self::Uint64(column), ColumnCell::Uint64(value)) => {
+                Ok(column.fill_unset_range(start, end, capacity, value))
+            }
+            (Self::Boolean(column), ColumnCell::Boolean(value)) => {
+                Ok(column.fill_unset_range(start, end, capacity, value))
+            }
+            (Self::Text(column), ColumnCell::Text(value)) => {
+                Ok(column.fill_unset_range(start, end, capacity, value))
+            }
+            (Self::Enum(column), ColumnCell::Enum(value)) => {
+                Ok(column.fill_unset_range(start, end, capacity, value))
             }
             _ => Err(()),
+        }
+    }
+}
+
+/// A [`ColumnValue`] whose text has been resolved to the cell the column stores.
+///
+/// The split is the input/storage split: a caller names text by intern ordinal
+/// or by `&str`, the store names it by [`SharedStr`]. Resolution happens once,
+/// at the buffer boundary, where the arena is in scope.
+#[derive(Debug, Clone, Copy)]
+enum ColumnCell {
+    Number(f64),
+    Uint64(u64),
+    Boolean(bool),
+    Text(SharedStr),
+    Enum(u16),
+}
+
+impl ColumnCell {
+    #[inline]
+    const fn kind(self) -> ColumnValueKind {
+        match self {
+            Self::Number(_) => ColumnValueKind::Number,
+            Self::Uint64(_) => ColumnValueKind::Uint64,
+            Self::Boolean(_) => ColumnValueKind::Boolean,
+            Self::Text(_) => ColumnValueKind::Text,
+            Self::Enum(_) => ColumnValueKind::Enum,
         }
     }
 }
@@ -261,8 +297,11 @@ pub enum ThreadBufferError {
         expected: ColumnValueKind,
         actual: ColumnValueKind,
     },
-    VocabularyOverflow,
     InvalidUtf8,
+    /// The string arena is at its byte budget. Distinct-string cardinality, not
+    /// row count, is what reaches this; the caller's answer is to flush and
+    /// reset rather than to keep writing.
+    StringArenaFull(ArenaFull),
 }
 
 impl std::fmt::Display for ThreadBufferError {
@@ -288,10 +327,8 @@ impl std::fmt::Display for ThreadBufferError {
                 f,
                 "attribute column {ordinal} expects {expected:?}, got {actual:?}"
             ),
-            Self::VocabularyOverflow => {
-                f.write_str("thread vocabulary exceeds the packed u24 range")
-            }
             Self::InvalidUtf8 => f.write_str("dynamic thread-buffer string is not valid UTF-8"),
+            Self::StringArenaFull(full) => write!(f, "thread {full}"),
         }
     }
 }
@@ -308,8 +345,11 @@ pub struct ThreadSpanBuffer {
     next_span_id: u32,
     spans: HashMap<u32, SpanRecord>,
     scopes: HashMap<u32, Option<SpanScope>>,
-    interned: Vec<Arc<str>>,
-    intern_lookup: HashMap<Arc<str>, u32>,
+    /// Every dynamic string this thread has written, stored once, contiguous.
+    /// Replaces a `Vec<Arc<str>>` plus a `HashMap<Arc<str>, u32>` — two
+    /// structures that between them allocated an `Arc` per distinct value and
+    /// needed an owned key to answer a lookup.
+    arena: StringArena,
 }
 
 impl ThreadSpanBuffer {
@@ -327,8 +367,7 @@ impl ThreadSpanBuffer {
             next_span_id: 1,
             spans: HashMap::with_capacity(capacity / 2),
             scopes: HashMap::with_capacity(capacity / 2),
-            interned: Vec::new(),
-            intern_lookup: HashMap::with_capacity(capacity),
+            arena: StringArena::new(MAX_STRING_ARENA_BYTES),
         };
         buffer.blocks.push(ThreadSpanBlock::new(capacity, fields));
         buffer
@@ -350,42 +389,47 @@ impl ThreadSpanBuffer {
         self.fields
     }
 
-    /// Intern a dynamic string once. The returned ordinal is stable for this buffer's entire life and survives overflow blocks.
+    /// Intern a dynamic string once. The returned ordinal is stable for this
+    /// buffer's entire life, survives overflow blocks, and is never reused: the
+    /// arena is append-only and is never compacted, so a consumer may cache on
+    /// it. Reclaiming arena bytes is a whole-buffer reset, never a renumbering.
+    ///
+    /// A repeat costs one hash of the incoming bytes plus one slice comparison
+    /// and allocates nothing. This used to be a linear scan bounded by a
+    /// ceiling, because a `HashMap<Arc<str>, _>` needs an owned key to look one
+    /// up — a consequence of storing `Arc<str>`, and gone with it.
     pub fn intern(&mut self, value: &str) -> Result<u32, ThreadBufferError> {
-        if let Some(&id) = self.intern_lookup.get(value) {
-            return Ok(id);
-        }
-        let next = self
-            .interned
-            .len()
-            .checked_add(1)
-            .and_then(|value| u32::try_from(value).ok())
-            .filter(|value| *value <= MAX_VOCABULARY_ID)
-            .ok_or(ThreadBufferError::VocabularyOverflow)?;
-        let value: Arc<str> = Arc::from(value);
-        self.interned.push(Arc::clone(&value));
-        self.intern_lookup.insert(value, next);
-        Ok(next)
+        self.arena
+            .intern(value)
+            .map_err(ThreadBufferError::StringArenaFull)
     }
     #[inline]
     pub fn interned(&self, ordinal: u32) -> Option<&str> {
-        ordinal
-            .checked_sub(1)
-            .and_then(|index| usize::try_from(index).ok())
-            .and_then(|index| self.interned.get(index))
-            .map(AsRef::as_ref)
+        self.arena.get(ordinal)
     }
-    fn interned_shared(&self, ordinal: u32) -> Option<SharedStr> {
-        ordinal
-            .checked_sub(1)
-            .and_then(|index| usize::try_from(index).ok())
-            .and_then(|index| self.interned.get(index))
-            .map(|value| SharedStr::from(Arc::clone(value)))
+    /// Backing bytes for this buffer's dynamic strings. The flush pass reads
+    /// cells through this rather than through per-row string copies.
+    #[inline]
+    pub fn arena(&self) -> &StringArena {
+        &self.arena
     }
-    /// Borrow the intern table's Arc-backed value for a warmed ABI attribute
-    /// write; cloning the handle does not allocate.
-    pub fn interned_shared_value(&self, ordinal: u32) -> Option<SharedStr> {
-        self.interned_shared(ordinal)
+    /// The cell a previously issued ordinal names.
+    #[inline]
+    fn interned_cell(&self, ordinal: u32) -> Option<SharedStr> {
+        self.arena.handle(ordinal).map(SharedStr::Arena)
+    }
+    /// Resolve caller text into a cell, interning a dynamic value.
+    #[inline]
+    fn cell(&mut self, text: TextInput<'_>) -> Result<SharedStr, ThreadBufferError> {
+        match text {
+            TextInput::Static(value) => Ok(SharedStr::Static(value)),
+            TextInput::Dynamic(value) => {
+                let ordinal = self.intern(value)?;
+                Ok(self
+                    .interned_cell(ordinal)
+                    .expect("intern just issued this ordinal"))
+            }
+        }
     }
     fn ensure_rows(&mut self, count: usize) {
         if self
@@ -427,10 +471,11 @@ impl ThreadSpanBuffer {
         trace_id: TraceId,
         parent_thread_id: u64,
         parent_span_id: u32,
-        name: SharedStr,
+        name: TextInput<'_>,
         timestamp: i64,
         line: u32,
     ) -> Result<u32, ThreadBufferError> {
+        let name = self.cell(name)?;
         let span_id = self.allocate_span_id();
         self.open_rows(OpenInput {
             span_id,
@@ -478,18 +523,21 @@ impl ThreadSpanBuffer {
         line: u32,
     ) -> Result<u32, ThreadBufferError> {
         let name = self
-            .interned_shared(name)
+            .interned_cell(name)
             .ok_or(ThreadBufferError::InvalidColumnOrdinal(
                 u16::try_from(name).unwrap_or(u16::MAX),
             ))?;
-        self.open_span(
+        let span_id = self.allocate_span_id();
+        self.open_rows(OpenInput {
+            span_id,
             trace_id,
             parent_thread_id,
             parent_span_id,
-            name,
+            start_header: pack_dynamic(EntryType::SpanStart),
+            name: Some(name),
             timestamp,
             line,
-        )
+        })
     }
     fn open_rows(&mut self, input: OpenInput) -> Result<u32, ThreadBufferError> {
         // Append each row independently so a pair crossing an overflow boundary
@@ -588,10 +636,11 @@ impl ThreadSpanBuffer {
         &mut self,
         span_id: u32,
         entry_type: EntryType,
-        message: Option<SharedStr>,
+        message: Option<TextInput<'_>>,
         line: u32,
         timestamp: i64,
     ) -> Result<u32, ThreadBufferError> {
+        let message = message.map(|text| self.cell(text)).transpose()?;
         let record = self.record(span_id)?;
         let start_row = record.start_row as usize;
         let (block, local) = self.block_at(start_row)?;
@@ -621,11 +670,41 @@ impl ThreadSpanBuffer {
         timestamp: i64,
     ) -> Result<u32, ThreadBufferError> {
         let message =
-            self.interned_shared(message)
+            self.interned_cell(message)
                 .ok_or(ThreadBufferError::InvalidColumnOrdinal(
                     u16::try_from(message).unwrap_or(u16::MAX),
                 ))?;
-        self.append_log(span_id, entry_type, Some(message), line, timestamp)
+        self.append_log_cell(span_id, entry_type, Some(message), line, timestamp)
+    }
+    /// Shared tail of the message-carrying appends: everything after the caller's
+    /// text has become a cell in this buffer's arena.
+    fn append_log_cell(
+        &mut self,
+        span_id: u32,
+        entry_type: EntryType,
+        message: Option<SharedStr>,
+        line: u32,
+        timestamp: i64,
+    ) -> Result<u32, ThreadBufferError> {
+        let record = self.record(span_id)?;
+        let start_row = record.start_row as usize;
+        let (block, local) = self.block_at(start_row)?;
+        let trace_id = block.trace_ids[local]
+            .as_ref()
+            .expect("span start always carries trace id")
+            .clone();
+        let parent_thread_id = block.parent_thread_ids[local];
+        let parent_span_id = block.parent_span_ids[local];
+        Ok(self.append_row(RowInput {
+            timestamp,
+            trace_id,
+            header: pack_dynamic(entry_type),
+            span_id,
+            parent_thread_id,
+            parent_span_id,
+            message,
+            line,
+        }))
     }
     pub fn append_log_static(
         &mut self,
@@ -670,9 +749,31 @@ impl ThreadSpanBuffer {
             .get(index)
             .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?
             .strategy;
+        // Resolve the caller's intern ordinal into a cell BEFORE borrowing the
+        // block: the arena and the blocks are disjoint fields, but only the
+        // sequencing makes that visible to the borrow checker.
+        let value = self.column_cell(value, ordinal)?;
         let capacity = self.capacity;
         let (block, local) = self.block_at_mut(row as usize)?;
         block.attributes[index].set(local, capacity, value, ordinal, strategy)
+    }
+    /// Turn a caller-supplied [`ColumnValue`] into the cell a column stores.
+    #[inline]
+    fn column_cell(
+        &self,
+        value: ColumnValue,
+        ordinal: u16,
+    ) -> Result<ColumnCell, ThreadBufferError> {
+        Ok(match value {
+            ColumnValue::Number(value) => ColumnCell::Number(value),
+            ColumnValue::Uint64(value) => ColumnCell::Uint64(value),
+            ColumnValue::Boolean(value) => ColumnCell::Boolean(value),
+            ColumnValue::Enum(value) => ColumnCell::Enum(value),
+            ColumnValue::Text(intern_ordinal) => ColumnCell::Text(
+                self.interned_cell(intern_ordinal)
+                    .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?,
+            ),
+        })
     }
     /// Row-0 convenience matching `tag`: the row is looked up by span ID.
     pub fn write_tag(
@@ -726,18 +827,41 @@ impl ThreadSpanBuffer {
             let scope = self.scopes.get(&span_id).cloned().flatten();
             if let Some(scope) = scope {
                 let fields = self.fields;
-                let block = &mut self.blocks[block_index];
-                let local_end = if run_end == block_end && run_end.is_multiple_of(self.capacity) {
-                    self.capacity
+                let capacity = self.capacity;
+                let local_end = if run_end == block_end && run_end.is_multiple_of(capacity) {
+                    capacity
                 } else {
-                    run_end % self.capacity
+                    run_end % capacity
                 };
+                // Split the borrow: a scope's text has to be interned into this
+                // store's arena before it can become a cell, and the fill needs
+                // the block. They are disjoint fields; naming them makes that
+                // visible to the borrow checker.
+                let Self { blocks, arena, .. } = self;
+                let block = &mut blocks[block_index];
                 for (name, value) in scope.iter() {
                     let Some(index) = fields.iter().position(|field| field.name == name) else {
                         continue;
                     };
-                    match block.attributes[index].fill_range(local, local_end, self.capacity, value)
-                    {
+                    // Interned ONCE per fill, not once per row: a scope value
+                    // covers a run of rows and they all share the cell.
+                    let cell = match value {
+                        ScopeValue::Number(value) => ColumnCell::Number(*value),
+                        ScopeValue::Uint64(value) => ColumnCell::Uint64(*value),
+                        ScopeValue::Boolean(value) => ColumnCell::Boolean(*value),
+                        ScopeValue::EnumIndex(value) => ColumnCell::Enum(*value),
+                        // A `'static` scope value never enters the arena, so
+                        // vocabulary scope stays as free here as it is at write.
+                        ScopeValue::Text(Cow::Borrowed(text)) => {
+                            ColumnCell::Text(SharedStr::Static(text))
+                        }
+                        ScopeValue::Text(Cow::Owned(text)) => ColumnCell::Text(SharedStr::Arena(
+                            arena
+                                .intern_str(text)
+                                .map_err(ThreadBufferError::StringArenaFull)?,
+                        )),
+                    };
+                    match block.attributes[index].fill_range(local, local_end, capacity, cell) {
                         Ok(count) => filled += count,
                         Err(()) => crate::scope::report_scope_mismatch(
                             name,
@@ -810,16 +934,14 @@ impl ThreadSpanBuffer {
     }
     #[inline]
     pub fn dynamic_message_at(&self, row: usize) -> Option<&str> {
-        self.block_at(row)
-            .ok()
-            .and_then(|(block, local)| block.messages.get(local))
+        let (block, local) = self.block_at(row).ok()?;
+        block.messages.get(local, &self.arena)
     }
     #[inline]
     pub fn attribute_at(&self, row: usize, ordinal: u16) -> Option<ColumnValueRef<'_>> {
         let index = usize::from(ordinal).checked_sub(SYSTEM_COLUMN_COUNT)?;
-        self.block_at(row)
-            .ok()
-            .and_then(|(block, local)| block.attributes.get(index)?.get(local))
+        let (block, local) = self.block_at(row).ok()?;
+        block.attributes.get(index)?.get(local, &self.arena)
     }
     #[inline]
     pub fn is_span_open(&self, span_id: u32) -> bool {
@@ -851,9 +973,10 @@ impl ThreadSpanBuffer {
         let value = std::str::from_utf8(bytes).map_err(|_| ThreadBufferError::InvalidUtf8)?;
         self.intern(value)
     }
-    pub fn shared_utf8(bytes: &[u8]) -> Result<SharedStr, ThreadBufferError> {
-        let value = std::str::from_utf8(bytes).map_err(|_| ThreadBufferError::InvalidUtf8)?;
-        Ok(SharedStr::from(Arc::<str>::from(value)))
+    /// Validate caller bytes as UTF-8 without interning them. Used by the ABI
+    /// where a refusal must be reported before any store state is touched.
+    pub fn utf8(bytes: &[u8]) -> Result<&str, ThreadBufferError> {
+        std::str::from_utf8(bytes).map_err(|_| ThreadBufferError::InvalidUtf8)
     }
     pub fn identity_at(&self, row: usize) -> Option<SpanIdentity> {
         let trace_id = TraceId::new(self.trace_id_at(row)?.to_owned()).ok()?;

@@ -12,7 +12,7 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lmao_core::clock::{Clock, SystemClock, TraceAnchor};
-use lmao_core::{EntryType, SpanBuffer, SpanIdentity, TraceId};
+use lmao_core::{EntryType, SpanBuffer, SpanIdentity, TextInput, TraceId};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -214,10 +214,16 @@ fn bench_schema_tag_write(c: &mut Criterion) {
 
     let fixed = FixedClock;
     let anchor = TraceAnchor::capture(&fixed);
-    let span = SpanBuffer::start_dynamic(identity(), 64, "benchmark".into(), &anchor, &fixed);
+    let span = SpanBuffer::start_dynamic(
+        identity(),
+        64,
+        TextInput::Static("benchmark"),
+        &anchor,
+        &fixed,
+    );
     let mut buf = BenchSchema::from_span(span);
     // warm all three columns
-    buf.tag_latency(0.0).tag_route("warm");
+    buf.tag_latency(0.0).tag_route(TextInput::Static("warm"));
     buf.tag_outcome(0).unwrap();
     let route: std::sync::Arc<str> = "GET /api/v1/sessions".into();
 
@@ -231,9 +237,9 @@ fn bench_schema_tag_write(c: &mut Criterion) {
             buf.tag_outcome(black_box(1)).unwrap();
         })
     });
-    c.bench_function("schema_tag_write_category_arc", |b| {
+    c.bench_function("schema_tag_write_category_arena", |b| {
         b.iter(|| {
-            buf.tag_route(route.clone());
+            buf.tag_route(TextInput::Dynamic(route.as_ref()));
         })
     });
     let _ = fixed.wall_nanos();
