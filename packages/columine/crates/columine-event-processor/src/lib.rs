@@ -112,6 +112,26 @@ pub enum CreateFailure {
     HandlesExhausted = 0x8000_000b,
 }
 
+impl CreateFailure {
+    /// Every handle-creation failure, ascending by code. The codes are one
+    /// contiguous block, which `parse_backend_ts_create_failures_match_rust`
+    /// checks, so a variant missing from this list shows up as a short block
+    /// there and as a surplus entry in the TypeScript decoder table.
+    pub const ALL: &'static [CreateFailure] = &[
+        Self::BadRequest,
+        Self::Capacity,
+        Self::SchemaMessage,
+        Self::SchemaTooManyFields,
+        Self::SchemaFieldMetadata,
+        Self::SchemaFieldCount,
+        Self::SchemaTypeMismatch,
+        Self::SchemaNullability,
+        Self::SchemaFieldNames,
+        Self::Init,
+        Self::HandlesExhausted,
+    ];
+}
+
 impl From<columine_arrow::SchemaError> for CreateFailure {
     fn from(error: columine_arrow::SchemaError) -> Self {
         use columine_arrow::SchemaError as E;

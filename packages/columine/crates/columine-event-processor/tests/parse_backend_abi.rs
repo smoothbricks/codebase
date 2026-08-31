@@ -49,20 +49,89 @@ fn parse_int(literal: &str) -> u64 {
     }
 }
 
-fn ts_kind_tag(source: &str, kind: &str) -> u8 {
-    let block_start = source
-        .find("const COMPACT_KIND_TAG = {")
-        .expect("COMPACT_KIND_TAG not declared");
-    let block = &source[block_start..];
-    let needle = format!("{kind}: ");
-    let start = block
-        .find(&needle)
-        .unwrap_or_else(|| panic!("COMPACT_KIND_TAG.{kind} missing"));
-    let rest = &block[start + needle.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits
-        .parse()
-        .unwrap_or_else(|error| panic!("COMPACT_KIND_TAG.{kind}: {error}"))
+/// The TypeScript `COMPACT_KIND_TAG` key for one plane.
+///
+/// Wildcard-free ON PURPOSE, and that is the whole point of this harness.
+/// The audit used to list the tags by hand, which is how a Rust change could
+/// narrow tag 1 to a signed plane while TypeScript kept calling it unsigned
+/// and nothing failed. Adding an `ArrowType` variant without naming its
+/// TypeScript kind here does not fail an assertion — it fails to COMPILE.
+fn ts_kind(plane: ArrowType) -> &'static str {
+    match plane {
+        ArrowType::Null => "null",
+        ArrowType::Int32 => "i32",
+        ArrowType::Float64 => "f64",
+        ArrowType::Binary => "binary",
+        ArrowType::Utf8 => "utf8",
+        ArrowType::Bool => "bool",
+        ArrowType::Int64 => "i64",
+        ArrowType::Int8 => "i8",
+        ArrowType::Int16 => "i16",
+        ArrowType::UInt8 => "u8",
+        ArrowType::UInt16 => "u16",
+        ArrowType::UInt32 => "u32",
+        ArrowType::UInt64 => "u64",
+        ArrowType::Float16 => "f16",
+        ArrowType::Float32 => "f32",
+        ArrowType::Decimal128 => "decimal128",
+        ArrowType::Decimal256 => "decimal256",
+        ArrowType::LargeBinary => "largeBinary",
+        ArrowType::LargeUtf8 => "largeUtf8",
+        ArrowType::FixedSizeBinary => "fixedSizeBinary",
+        ArrowType::IntervalYearMonth => "intervalYearMonth",
+        ArrowType::IntervalDayTime => "intervalDayTime",
+        ArrowType::IntervalMonthDayNano => "intervalMonthDayNano",
+    }
+}
+
+/// The TypeScript `EP_CREATE_FAILURE` name for one handle-creation failure.
+/// Wildcard-free for the same reason as [`ts_kind`].
+fn ts_create_failure_name(failure: CreateFailure) -> &'static str {
+    match failure {
+        CreateFailure::BadRequest => "BAD_REQUEST",
+        CreateFailure::Capacity => "CAPACITY",
+        CreateFailure::SchemaMessage => "SCHEMA_MESSAGE",
+        CreateFailure::SchemaTooManyFields => "SCHEMA_TOO_MANY_FIELDS",
+        CreateFailure::SchemaFieldMetadata => "SCHEMA_FIELD_METADATA",
+        CreateFailure::SchemaFieldCount => "SCHEMA_FIELD_COUNT",
+        CreateFailure::SchemaTypeMismatch => "SCHEMA_TYPE_MISMATCH",
+        CreateFailure::SchemaNullability => "SCHEMA_NULLABILITY",
+        CreateFailure::SchemaFieldNames => "SCHEMA_FIELD_NAMES",
+        CreateFailure::Init => "INIT",
+        CreateFailure::HandlesExhausted => "HANDLES_EXHAUSTED",
+    }
+}
+
+/// Every `key: <decimal>,` entry of the `COMPACT_KIND_TAG` object literal, in
+/// source order.
+///
+/// A line inside the braces that is not an entry PANICS rather than being
+/// skipped: an audit that silently ignores what it cannot read is an audit
+/// that passes when the table is broken.
+fn ts_kind_tags(source: &str) -> Vec<(String, u8)> {
+    const OPENER: &str = "const COMPACT_KIND_TAG = {";
+    let block_start = source.find(OPENER).expect("COMPACT_KIND_TAG not declared");
+    let body_start = block_start + OPENER.len();
+    let body_end = body_start
+        + source[body_start..]
+            .find('}')
+            .expect("COMPACT_KIND_TAG is not closed");
+    source[body_start..body_end]
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_end_matches(',');
+            if line.is_empty() {
+                return None;
+            }
+            let (key, value) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("COMPACT_KIND_TAG entry is not `key: number`: {line}"));
+            let tag = value.trim().parse::<u8>().unwrap_or_else(|error| {
+                panic!("COMPACT_KIND_TAG.{key} is not a u8 literal: {error}")
+            });
+            Some((key.trim().to_owned(), tag))
+        })
+        .collect()
 }
 
 /// Read the `EP_CREATE_FAILURE` decoder table, which is keyed by ABI code:
@@ -125,35 +194,95 @@ fn parse_backend_ts_compact_abi_matches_rust() {
         COMPACT_DESCRIPTOR_SIZE as u64
     );
     assert_eq!(ts_const(&source, "RESULT_OK"), ResultCode::Ok as u64);
-    assert_eq!(ts_kind_tag(&source, "null"), ArrowType::Null as u8);
-    assert_eq!(ts_kind_tag(&source, "i32"), ArrowType::Int32 as u8);
-    assert_eq!(ts_kind_tag(&source, "f64"), ArrowType::Float64 as u8);
-    assert_eq!(ts_kind_tag(&source, "binary"), ArrowType::Binary as u8);
-    assert_eq!(ts_kind_tag(&source, "utf8"), ArrowType::Utf8 as u8);
-    assert_eq!(ts_kind_tag(&source, "bool"), ArrowType::Bool as u8);
-    assert_eq!(ts_kind_tag(&source, "i64"), ArrowType::Int64 as u8);
+}
+
+/// The plane table is the seam between the two implementations, so the audit
+/// is set equality and not a hand-written list of assertions.
+///
+/// Adding a plane on ONE side only fails here: a Rust variant with no
+/// TypeScript entry, or a TypeScript entry Rust does not know about, both
+/// break the comparison. The Rust half is additionally compile-checked by
+/// `ts_kind`, which has no wildcard arm.
+#[test]
+fn parse_backend_ts_kind_table_is_exactly_the_rust_plane_table() {
+    let source = read();
+    let declared = ts_kind_tags(&source);
+    let expected: Vec<(String, u8)> = ArrowType::ALL
+        .iter()
+        .map(|plane| (ts_kind(*plane).to_owned(), *plane as u8))
+        .collect();
+    assert_eq!(
+        declared, expected,
+        "COMPACT_KIND_TAG must be exactly the Rust plane table, in tag order"
+    );
+
+    // Two planes claiming one TypeScript kind would make the comparison above
+    // pass while the host decoded one of them as the other.
+    let mut names: Vec<&str> = ArrowType::ALL.iter().map(|plane| ts_kind(*plane)).collect();
+    let plane_count = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        plane_count,
+        "two planes share a TypeScript kind"
+    );
+
+    // The host's bounds check must be a DERIVED maximum. It used to be
+    // `tag > COMPACT_KIND_TAG.i64`, which silently rejected every plane
+    // appended after Int64 — the exact failure this table is meant to prevent.
+    assert!(
+        source.contains("COMPACT_MAX_KIND_TAG"),
+        "parse-backend.ts must derive a maximum plane tag"
+    );
+    assert!(
+        !source.contains("tag > COMPACT_KIND_TAG."),
+        "the plane bounds check must not name one plane's tag as the maximum"
+    );
+    let highest = declared
+        .iter()
+        .map(|(_, tag)| *tag)
+        .max()
+        .expect("at least one plane");
+    assert_eq!(
+        usize::from(highest) + 1,
+        plane_count,
+        "plane tags must be a gapless block from zero"
+    );
 }
 
 /// The host decodes these codes into distinct diagnostics, so a code that
 /// moves on one side only puts the wrong cause in the error message.
+///
+/// Exhaustive the same way the plane table is: a twelfth `CreateFailure`
+/// cannot be added without naming it in `ts_create_failure_name`, or this does
+/// not compile.
 #[test]
 fn parse_backend_ts_create_failures_match_rust() {
     let source = read();
-    for (name, failure) in [
-        ("BAD_REQUEST", CreateFailure::BadRequest),
-        ("CAPACITY", CreateFailure::Capacity),
-        ("SCHEMA_MESSAGE", CreateFailure::SchemaMessage),
-        ("SCHEMA_TOO_MANY_FIELDS", CreateFailure::SchemaTooManyFields),
-        ("SCHEMA_FIELD_METADATA", CreateFailure::SchemaFieldMetadata),
-        ("SCHEMA_FIELD_COUNT", CreateFailure::SchemaFieldCount),
-        ("SCHEMA_TYPE_MISMATCH", CreateFailure::SchemaTypeMismatch),
-        ("SCHEMA_NULLABILITY", CreateFailure::SchemaNullability),
-        ("SCHEMA_FIELD_NAMES", CreateFailure::SchemaFieldNames),
-        ("INIT", CreateFailure::Init),
-        ("HANDLES_EXHAUSTED", CreateFailure::HandlesExhausted),
-    ] {
-        assert_eq!(ts_create_failure(&source, name), failure as u32, "{name}");
+    for (index, failure) in CreateFailure::ALL.iter().enumerate() {
+        // One contiguous block from 0x8000_0001, so a variant missing from
+        // `ALL` shortens the block instead of hiding.
+        assert_eq!(*failure as u32, 0x8000_0001 + index as u32);
+        assert_eq!(
+            ts_create_failure(&source, ts_create_failure_name(*failure)),
+            *failure as u32,
+            "{failure:?}"
+        );
     }
+
+    // And the TypeScript table declares no code Rust does not raise.
+    let declared = source
+        .split("const EP_CREATE_FAILURE = {")
+        .nth(1)
+        .expect("EP_CREATE_FAILURE not declared")
+        .split('}')
+        .next()
+        .expect("EP_CREATE_FAILURE is not closed")
+        .lines()
+        .filter(|line| line.contains(": '"))
+        .count();
+    assert_eq!(declared, CreateFailure::ALL.len());
 }
 
 #[test]
