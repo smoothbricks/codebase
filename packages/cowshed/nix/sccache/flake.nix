@@ -55,12 +55,22 @@
         pkgs = nixpkgs.legacyPackages.${system};
         inherit (pkgs) lib;
 
-        # The version suffix is the patch set's name in the one place every client and server can
-        # see it. sccache's client/server handshake compares `CARGO_PKG_VERSION`: on a mismatch the
-        # client stops the old server and starts its own, which is a clear, recoverable event. With
-        # both builds reporting a bare "0.17.0" a NEW client meeting an OLD server instead trips the
-        # changed single-flight protocol and dies on `sccache rustc -vV` with SIGTERM, which reads as
-        # a broken toolchain rather than as a stale binary.
+        # The version suffix is PROVENANCE, not a mechanism. It is the one place `sccache --version`
+        # and `--show-stats` can tell an operator which build is answering, and that is all it does.
+        #
+        # An earlier version of this comment claimed sccache's client/server handshake compares
+        # CARGO_PKG_VERSION and stops the old server on a mismatch. That is false, read against
+        # mozilla/sccache 0.17.0: `connect_or_start_server` (commands.rs:310-348) connects, and only
+        # starts a server on ConnectionRefused, TimedOut, or NotFound; `ServerInfo.version` is
+        # merely reported (server.rs:2147, 2203-2206); a mismatch surfaces only as a hint attached
+        # to a bincode failure in `request_stats`; and Shutdown is reachable only from the explicit
+        # StopServer verb. No version string causes any server to stop.
+        #
+        # What actually contends is the socket. A unix bind UNLINKS the path first
+        # (server.rs:510-514), so ANY client that auto-starts a server steals the LaunchAgent's
+        # socket — whatever either side calls itself. That is the failure a pinned plist naming a
+        # GC-rooted store path prevents, and it is prevented by there being one supervised server
+        # for clients to find, not by a name.
         suffix = "cowshed";
 
         # 1. rust-basedir-cwd: SCCACHE_BASEDIRS normalization extended to Rust cache keys, plus
