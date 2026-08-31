@@ -17,6 +17,7 @@ import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
 import { iterateSpanTree } from '../src/lib/traceTopology.js';
 import type { SpanBuffer } from '../src/lib/types.js';
+import { registerThreadBufferLane } from './threadBufferLane.js';
 
 type WorkloadName = 'steady' | 'burst' | 'overflow' | 'idle-after-burst';
 
@@ -272,4 +273,5 @@ for (const workload of selected) {
 const output = `${telemetry.join('\n')}\n`;
 if (cli.json) process.stderr.write(output);
 else process.stdout.write(output);
+await registerThreadBufferLane('span-pooling', 32);
 await run({ format: cli.json ? 'json' : 'mitata', colors: !cli.json, throw: true });

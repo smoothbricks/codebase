@@ -6,6 +6,7 @@ import { createTraceRoot as createNodeTraceRoot, type TraceRoot as NodeTraceRoot
 import type { AnySpanBuffer } from '../src/lib/types.js';
 import { WasmBufferStrategy } from '../src/lib/wasm/WasmBufferStrategy.js';
 import { createWasmTraceRoot } from '../src/lib/wasm/wasmTraceRoot.js';
+import { registerThreadBufferLane } from './threadBufferLane.js';
 
 const QUICK = process.argv.includes('--quick');
 const ROWS = QUICK ? 32 : 256;
@@ -220,5 +221,6 @@ summary(() => {
 });
 
 const format = process.argv.includes('--json') ? 'json' : process.argv.includes('--markdown') ? 'markdown' : 'mitata';
+await registerThreadBufferLane('timestamps', 32);
 await run({ format, colors: format === 'mitata' });
 wasmStrategy.releaseBuffer(wasmBuffer);

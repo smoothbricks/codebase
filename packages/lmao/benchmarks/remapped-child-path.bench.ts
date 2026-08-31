@@ -15,6 +15,7 @@ import { createChildSpanBuffer, createSpanBuffer } from '../src/lib/spanBuffer.j
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { iterateSpanChildren } from '../src/lib/traceTopology.js';
 import type { AnySpanBuffer } from '../src/lib/types.js';
+import { registerThreadBufferLane } from './threadBufferLane.js';
 
 const QUICK = process.argv.includes('--quick');
 const JSON_OUTPUT = process.argv.includes('--json');
@@ -391,4 +392,5 @@ for (const workload of workloads) {
   summary(() => registerTraversalGroup(workload));
 }
 
+await registerThreadBufferLane('remapped-child-path', 8);
 await run({ format: MITATA_FORMAT, throw: true });

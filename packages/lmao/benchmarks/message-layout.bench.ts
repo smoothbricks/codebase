@@ -21,6 +21,7 @@ import { createTraceId } from '../src/lib/traceId.js';
 import { createTraceRoot } from '../src/lib/traceRoot.node.js';
 import { TestTracer } from '../src/lib/tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../src/lib/types.js';
+import { registerThreadBufferLane } from './threadBufferLane.js';
 import { registerBenchmarkVocabulary } from './vocabularyFixture.js';
 
 const CAPACITIES: readonly number[] = Object.freeze([8, 64, 1024]);
@@ -291,4 +292,5 @@ for (const capacity of CAPACITIES) {
 if (!process.argv.includes('--no-metadata')) {
   console.error(`message-layout persistent metadata: ${JSON.stringify(persistentMetadata)}`);
 }
+await registerThreadBufferLane('message-layout', 32);
 await run({ format: FORMAT, colors: FORMAT !== 'json' && FORMAT !== 'quiet', throw: true });
