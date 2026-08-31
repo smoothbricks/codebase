@@ -522,9 +522,11 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'napi build --release --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/darwin-arm64',
       });
       expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
-      expect(targets['napi-arm64-macos']?.dependsOn).toEqual(
-        hostSuffix === '-arm64-macos' ? ['cargo-test-compile'] : undefined,
-      );
+      // No cargo-test-compile edge here, on ANY host: a platform target's
+      // dependency closure may only reach its own family
+      // (`validatePlatformTargetDependencies`), so this pair serializes on
+      // cargo's flock rather than on a graph edge.
+      expect(targets['napi-arm64-macos']?.dependsOn).toBeUndefined();
       // A macOS triple never gets a cross toolchain: `usesNapiCross` is
       // `family === 'linux' && target !== host`, so the family decides this one
       // and no host can change it.
@@ -544,7 +546,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       );
       expect(linuxX64Targets['napi-x64-linux']?.options?.command).not.toContain('--use-napi-cross');
       expect(linuxX64Targets['napi-x64-linux']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
-      expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toEqual(['cargo-test-compile']);
+      expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toBeUndefined();
       expect(linuxX64Targets['napi-toolchain-x64-linux']).toBeUndefined();
       expect(linuxX64Targets['napi-arm64-linux']?.options?.command).toContain('--use-napi-cross');
       expect(linuxX64Targets['napi-arm64-linux']?.options?.env).toEqual({

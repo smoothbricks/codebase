@@ -732,24 +732,34 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
     }
   }
 
-  // Every host-platform target is a `napi build`, i.e. another cargo writer on
-  // the package's default `target/`, and so is the `cargo-napi` host build that
-  // stands in when no declared triple serves this host. `build` lists them
-  // beside cargo-test-compile, so without this edge they would be Nx siblings on
-  // one flocked directory; with it Nx compiles the test binaries first and the
-  // release builds follow.
-  const cargoWriterNames = [
-    ...hostPlatformTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)], hostPlatform),
-    ...('cargo-napi' in targets ? ['cargo-napi'] : []),
-  ];
-  if (targets[CARGO_TEST_COMPILE_TARGET]) {
-    for (const name of cargoWriterNames) {
-      const target = targets[name];
-      if (target === undefined) continue;
-      const dependsOn = target.dependsOn ?? [];
-      if (!dependsOn.includes(CARGO_TEST_COMPILE_TARGET)) {
-        target.dependsOn = [...dependsOn, CARGO_TEST_COMPILE_TARGET];
-      }
+  // `build` lists cargo-test-compile beside the host's platform binaries, and
+  // every one of those is a `napi build` — another cargo writer on the package's
+  // default `target/`, which cargo flocks.
+  //
+  // Only `cargo-napi` gets the ordering edge. A platform-suffixed target may NOT
+  // have one: `validatePlatformTargetDependencies` (package-target-policy.ts:674)
+  // walks each platform target's dependency closure and refuses any member of a
+  // different family, because the publish flow builds and collects one platform
+  // at a time — a `*-macos` collect that reached a familyless sibling would drag
+  // in work the macOS runner has no business doing. `cargo-napi` carries no
+  // platform suffix, so it is not scanned and the edge is legal there.
+  //
+  // The platform binaries therefore stay Nx siblings of cargo-test-compile and
+  // serialize on cargo's flock instead of on a graph edge. That is the same
+  // arrangement `cli-<arch>-<os>` and `napi-<arch>-<os>` already have with each
+  // other — both `napi build --release` on one target dir — so this adds a third
+  // participant to an existing wait, not a new hazard. The flock makes them wait;
+  // it does not corrupt anything, and these are unbounded `nx:run-commands`
+  // targets, so the wait is not charged against a test budget.
+  const cargoWriterNames = hostPlatformTargetNames(
+    [...Object.keys(declaredTargets), ...Object.keys(targets)],
+    hostPlatform,
+  );
+  const cargoNapi = targets['cargo-napi'];
+  if (cargoNapi && targets[CARGO_TEST_COMPILE_TARGET]) {
+    const dependsOn = cargoNapi.dependsOn ?? [];
+    if (!dependsOn.includes(CARGO_TEST_COMPILE_TARGET)) {
+      cargoNapi.dependsOn = [...dependsOn, CARGO_TEST_COMPILE_TARGET];
     }
   }
 
