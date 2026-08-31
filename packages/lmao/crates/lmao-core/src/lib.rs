@@ -12,12 +12,20 @@
 pub mod buffer;
 pub mod clock;
 pub mod columns;
+pub mod thread_schema {
+    include!(concat!(env!("OUT_DIR"), "/thread_schema.rs"));
+}
+pub mod thread_kinds {
+    include!(concat!(env!("OUT_DIR"), "/thread_kinds.rs"));
+}
 pub mod context;
 pub mod entry_type;
 pub mod identity;
 pub mod packed_header;
 pub mod result;
 pub mod scope;
+pub mod thread_buffer;
+pub mod thread_ffi;
 pub mod tuning;
 
 pub use buffer::{SourceMetadata, SpanBuffer};
@@ -36,4 +44,14 @@ pub use packed_header::{
 };
 pub use result::{RetryPolicy, SpanOutcome, Transient};
 pub use scope::{ScopeEntry, ScopeValue, SpanScope, report_scope_mismatch};
+pub use thread_buffer::{
+    AttributeValue, ColumnValue, ColumnValueKind, ColumnValueRef, FlushWindow, ThreadBufferError,
+    ThreadSpanBuffer,
+};
+pub use thread_ffi::ThreadSpanBufferHandle;
+pub use thread_kinds::{
+    ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
+    ATTRIBUTE_KIND_UINT64, AttributeKind,
+};
+pub use thread_schema::{SYSTEM_COLUMN_COUNT, SYSTEM_COLUMNS, SystemColumnKind, SystemColumnMeta};
 pub use tuning::{CapacityRatchet, DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY};

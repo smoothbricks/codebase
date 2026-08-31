@@ -77,6 +77,37 @@ export const RESERVED_SYSTEM_COLUMN_NAMES = new Set([
   'entry_type',
 ]);
 
+/**
+ * Physical system columns in their canonical Arrow order. This table is the
+ * SSoT consumed by lmao-core's build script; schema attributes begin at the
+ * generated `SYSTEM_COLUMN_COUNT` ordinal.
+ */
+export const THREAD_SYSTEM_COLUMNS = [
+  { name: 'timestamp', kind: 'timestamp_ns', nullable: false },
+  { name: 'trace_id', kind: 'dictionary_u32', nullable: false },
+  { name: 'thread_id', kind: 'u64', nullable: false },
+  { name: 'span_id', kind: 'u32', nullable: false },
+  { name: 'parent_thread_id', kind: 'u64', nullable: true },
+  { name: 'parent_span_id', kind: 'u32', nullable: true },
+  { name: 'entry_type', kind: 'dictionary_u8', nullable: false },
+  { name: 'package_name', kind: 'dictionary_u32', nullable: true },
+  { name: 'package_file', kind: 'dictionary_u32', nullable: true },
+  { name: 'git_sha', kind: 'dictionary_u32', nullable: true },
+  { name: 'message', kind: 'dictionary_u32', nullable: true },
+  { name: 'line', kind: 'u32', nullable: false },
+] as const;
+/**
+ * Scalar kind tags crossing the native row-write ABI. Keep this table in lock
+ * step with `FieldStrategy`; lmao-core's build script generates Rust constants.
+ */
+export const THREAD_ATTRIBUTE_KINDS = [
+  { name: 'number', discriminant: 1 },
+  { name: 'uint64', discriminant: 2 },
+  { name: 'boolean', discriminant: 3 },
+  { name: 'text', discriminant: 4 },
+  { name: 'enum', discriminant: 5 },
+] as const;
+
 const systemSchemaFields: SystemSchemaFieldTypes = {
   /**
    * Unified message column - serves different purposes based on entry type.

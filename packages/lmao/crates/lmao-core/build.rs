@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -21,6 +22,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", tuning_path.display());
 
     generate_entry_types(&schema_path);
+    generate_thread_schema(&schema_path);
+    generate_thread_kinds(&schema_path);
     generate_tuning_constants(&tuning_path);
 }
 
@@ -81,6 +84,130 @@ fn generate_entry_types(path: &Path) {
     );
 
     write_generated("entry_type.rs", output);
+}
+
+fn generate_thread_schema(path: &Path) {
+    let source = fs::read_to_string(path).expect("read TypeScript system-column SSOT");
+    let table = source
+        .split_once("export const THREAD_SYSTEM_COLUMNS = [")
+        .expect("THREAD_SYSTEM_COLUMNS declaration")
+        .1
+        .split_once("] as const;")
+        .expect("THREAD_SYSTEM_COLUMNS terminator")
+        .0;
+    let mut columns = Vec::new();
+    for line in table
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("{ name:"))
+    {
+        let name = line
+            .split_once("name: '")
+            .and_then(|(_, tail)| tail.split_once('\''))
+            .map(|(name, _)| name)
+            .expect("system column name");
+        let kind = line
+            .split_once("kind: '")
+            .and_then(|(_, tail)| tail.split_once('\''))
+            .map(|(kind, _)| kind)
+            .expect("system column kind");
+        let nullable = line.contains("nullable: true");
+        columns.push((name, kind, nullable));
+    }
+    assert!(!columns.is_empty(), "system-column table must not be empty");
+
+    let mut output = String::from(
+        "// Generated from packages/lmao/src/lib/schema/systemSchema.ts by build.rs.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n\
+         pub enum SystemColumnKind {\n",
+    );
+    let kinds: BTreeSet<_> = columns.iter().map(|(_, kind, _)| *kind).collect();
+    for kind in kinds {
+        writeln!(output, "    {},", rust_system_column_kind(kind)).unwrap();
+    }
+    output.push_str(
+        "}\n\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n\
+         pub struct SystemColumnMeta {\n\
+             pub name: &'static str,\n\
+             pub kind: SystemColumnKind,\n\
+             pub nullable: bool,\n\
+         }\n\n\
+         pub const SYSTEM_COLUMNS: &[SystemColumnMeta] = &[\n",
+    );
+    for (name, kind, nullable) in &columns {
+        writeln!(
+            output,
+            "    SystemColumnMeta {{ name: {name:?}, kind: SystemColumnKind::{}, nullable: {nullable} }},",
+            rust_system_column_kind(kind)
+        )
+        .unwrap();
+    }
+    output.push_str("];\n\npub const SYSTEM_COLUMN_COUNT: usize = SYSTEM_COLUMNS.len();\n");
+    write_generated("thread_schema.rs", output);
+}
+
+fn rust_system_column_kind(kind: &str) -> &'static str {
+    match kind {
+        "timestamp_ns" => "TimestampNanosecond",
+        "dictionary_u32" => "DictionaryU32",
+        "dictionary_u8" => "DictionaryU8",
+        "u64" => "U64",
+        "u32" => "U32",
+        other => panic!("unknown system column kind {other}"),
+    }
+}
+fn generate_thread_kinds(path: &Path) {
+    let source = fs::read_to_string(path).expect("read ThreadSpanBuffer ABI kind SSOT");
+    let table = source
+        .split_once("export const THREAD_ATTRIBUTE_KINDS = [")
+        .expect("THREAD_ATTRIBUTE_KINDS declaration")
+        .1
+        .split_once("] as const;")
+        .expect("THREAD_ATTRIBUTE_KINDS terminator")
+        .0;
+    let mut kinds = Vec::new();
+    for line in table
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("{ name:"))
+    {
+        let name = line
+            .split_once("name: '")
+            .and_then(|(_, tail)| tail.split_once('\''))
+            .map(|(name, _)| name)
+            .expect("attribute ABI kind name");
+        let discriminant = line
+            .split_once("discriminant: ")
+            .and_then(|(_, tail)| tail.split_once('}'))
+            .and_then(|(value, _)| value.trim().parse::<u8>().ok())
+            .expect("attribute ABI kind discriminant");
+        kinds.push((name, discriminant));
+    }
+    assert!(
+        !kinds.is_empty(),
+        "attribute ABI kind table must not be empty"
+    );
+
+    let mut output = String::from(
+        "// Generated from packages/lmao/src/lib/schema/systemSchema.ts by build.rs.\n\
+         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n\
+         #[repr(u8)]\n\
+         pub enum AttributeKind {\n",
+    );
+    for (name, discriminant) in &kinds {
+        writeln!(output, "    {} = {discriminant},", rust_variant(name)).unwrap();
+    }
+    output.push_str("}\n\n");
+    for (name, discriminant) in kinds {
+        writeln!(
+            output,
+            "pub const ATTRIBUTE_KIND_{}: u8 = {discriminant};",
+            name.to_uppercase()
+        )
+        .unwrap();
+    }
+    write_generated("thread_kinds.rs", output);
 }
 
 fn generate_tuning_constants(path: &Path) {
