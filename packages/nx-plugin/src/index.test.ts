@@ -2,9 +2,13 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { CreateNodesContextV2, TargetConfiguration } from 'nx/src/devkit-exports.js';
+import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { mergeTargetConfigurations } from 'nx/src/project-graph/utils/project-configuration-utils.js';
+import { BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
+import { serializedTestFilter } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
 import { createNodesV2 } from './index.js';
 import { BUILD_OUTPUT_DEPENDENCIES } from './workspace-config-policy.js';
@@ -629,6 +633,95 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('shards a crate around its serialized group rather than through it', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/rusty/package.json', '{"name":"rusty"}\n');
+      await workspace.write('packages/rusty/Cargo.toml', '[workspace]\nmembers = ["crates/big", "crates/small"]\n');
+      await workspace.write(
+        'packages/rusty/crates/big/Cargo.toml',
+        '[package]\nname = "big"\n\n[package.metadata.smoothbricks.test]\nshards = 3\n',
+      );
+      await workspace.write('packages/rusty/crates/small/Cargo.toml', '[package]\nname = "small"\n');
+
+      const targets = await inferProjectTargets(workspace, 'packages/rusty/package.json');
+
+      // An unsharded crate keeps the bare name and takes no --partition, so
+      // declaring nothing is exactly the old single-target behaviour.
+      expect(targets['cargo-test-small']?.options?.command).toMatch(
+        /nextest run --workspace -E 'package\(small\)' --user-config-file none/,
+      );
+      // The shards partition the crate MINUS the serialized group, i of N. The
+      // group is lifted out because a test-group only holds within one nextest
+      // run, so a hash that scattered it across shards would dissolve it.
+      const serialized = serializedTestFilter(fileURLToPath(new URL('../nextest.toml', import.meta.url)));
+      if (serialized === null) {
+        throw new Error('nextest.toml declares no test-group; this test asserts the pin that protects one');
+      }
+      for (const index of [1, 2, 3]) {
+        expect(targets[`cargo-test-big-shard${index}`]?.options?.command).toContain(
+          `--workspace -E 'package(big) and not (${serialized})' --partition hash:${index}/3`,
+        );
+        expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
+      }
+      // Exact complement of the shards' filterset, so the union is the crate.
+      expect(targets['cargo-test-big-serial']?.options?.command).toContain(
+        `--workspace -E 'package(big) and (${serialized})' --no-tests=pass`,
+      );
+      expect(targets['cargo-test-big-serial']?.options?.command).not.toContain('--partition');
+      expect(targets['cargo-test-big-serial']?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
+      // An unsharded crate needs no pin: its whole suite is already one run.
+      expect(targets['cargo-test-small-serial']).toBeUndefined();
+      expect(targets['cargo-test-big']).toBeUndefined();
+      // Every piece reaches the aggregate, and they chain rather than fan out:
+      // cargo flocks one target/, and chaining also stops the pinned group
+      // contending with a shard over a machine-wide resource.
+      expect(targets['cargo-test']?.dependsOn).toEqual([
+        'cargo-test-big-shard1',
+        'cargo-test-big-shard2',
+        'cargo-test-big-shard3',
+        'cargo-test-big-serial',
+        'cargo-test-small',
+      ]);
+      expect(targets['cargo-test-big-shard1']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-compile']);
+      expect(targets['cargo-test-big-shard2']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard1']);
+      expect(targets['cargo-test-big-shard3']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard2']);
+      expect(targets['cargo-test-big-serial']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-shard3']);
+      expect(targets['cargo-test-small']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-big-serial']);
+      // Pieces of one crate share its inputs: they are one suite, split only to
+      // fit the bound, so any change to the crate invalidates all of them.
+      expect(targets['cargo-test-big-shard2']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
+      expect(targets['cargo-test-big-serial']?.inputs).toEqual(targets['cargo-test-big-shard1']?.inputs);
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it('rejects a shard count that cannot describe a partition', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/rusty/package.json', '{"name":"rusty"}\n');
+      await workspace.write('packages/rusty/Cargo.toml', '[workspace]\nmembers = ["crates/big"]\n');
+      await workspace.write(
+        'packages/rusty/crates/big/Cargo.toml',
+        '[package]\nname = "big"\n\n[package.metadata.smoothbricks.test]\nshards = 0\n',
+      );
+
+      // Nx wraps a createNodes throw in AggregateCreateNodesError, so the
+      // reason a maintainer needs is in the nested error, not the top message.
+      const failure = await inferProjectTargets(workspace, 'packages/rusty/package.json').then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (!(failure instanceof AggregateCreateNodesError)) {
+        throw new Error(`expected AggregateCreateNodesError, got ${String(failure)}`);
+      }
+      expect(failure.errors[0]?.[1]?.message).toMatch(/smoothbricks\.test\.shards must be an integer >= 1, got 0/);
     } finally {
       await workspace.cleanup();
     }
