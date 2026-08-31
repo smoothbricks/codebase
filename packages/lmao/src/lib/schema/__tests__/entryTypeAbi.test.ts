@@ -41,6 +41,8 @@ const FROZEN_ENTRY_TYPES: readonly (readonly [number, string])[] = [
   [22, 'buffer-writes'],
   [23, 'buffer-spans'],
   [24, 'buffer-capacity'],
+  [25, 'axe-signal-admitted'],
+  [26, 'axe-signal-routed'],
 ];
 
 describe('entry-type ABI', () => {
