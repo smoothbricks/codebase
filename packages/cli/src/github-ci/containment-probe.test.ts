@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { expandNxTargetDependencyRuns, expandNxTargetRuns } from './index.js';
 import { applyCollectedOutputs, collectNxOutputs } from './outputs.js';
@@ -208,10 +208,44 @@ describe('publish collect containment probe', () => {
   });
 });
 
+/**
+ * Plant one file inside every output the given runs declare, under `root`.
+ *
+ * The probe needs the REAL inferred graph but must not need the real build's
+ * artifacts: `dist/bin/darwin-arm64` only exists on a macOS host, so collecting
+ * from the repo made this a macOS-only test that failed on Linux with
+ * "Declared output {projectRoot}/dist/bin/darwin-arm64 for cowshed:cli-arm64-macos
+ * is missing." Planting the declared outputs keeps the graph real, the files
+ * deterministic, and the assertion identical on every runner.
+ */
+async function plantDeclaredOutputs(
+  root: string,
+  runs: readonly { target: string; projects: readonly ProjectTargets[] }[],
+): Promise<string[]> {
+  const planted: string[] = [];
+  for (const run of runs) {
+    for (const project of run.projects) {
+      // Declared outputs are `{projectRoot}`-relative, so a project that
+      // reports no root has no place to put one.
+      const projectRoot = project.root;
+      if (projectRoot === undefined) continue;
+      for (const output of project.targetOutputs?.get(run.target) ?? []) {
+        const directory = join(root, output.replace('{projectRoot}', projectRoot));
+        await mkdir(directory, { recursive: true });
+        const file = join(directory, run.target);
+        // 0o755 because `applyCollectedOutputs` must carry the executable bit
+        // of a platform binary through the collect tree.
+        await writeFile(file, `${run.target} artifact`, { mode: 0o755 });
+        planted.push(file);
+      }
+    }
+  }
+  return planted;
+}
+
 describe('publish collect containment probe against the resolved graph', () => {
   it('collects cowshed tsc-js and macos platform trees without overlap', async () => {
-    const root = join(import.meta.dir, '../../../..');
-    const projects = await readProjectTargets(root);
+    const projects = await readProjectTargets(join(import.meta.dir, '../../../..'));
     const cowshed = projects.find((project) => project.project === 'cowshed');
     expect(cowshed?.targetOutputs?.get('build')).toBeUndefined();
     expect(cowshed?.targetOutputs?.get('tsc-js')).toEqual(['{projectRoot}/dist/ts']);
@@ -224,39 +258,52 @@ describe('publish collect containment probe against the resolved graph', () => {
     );
     expect(buildRuns.some((run) => run.target === 'build')).toBe(false);
     expect(buildRuns.some((run) => run.target === 'tsc-js' && run.projects[0]?.project === 'cowshed')).toBe(true);
+    // Every expansion member must be a macOS platform target; the exact set
+    // follows the package's declared triples, so listing them here would break
+    // on the next triple added rather than on a containment regression.
+    expect(macosRuns.length).toBeGreaterThan(0);
+    for (const run of macosRuns) {
+      expect(run.target.endsWith('-macos')).toBe(true);
+    }
+    expect(macosRuns.map((run) => run.target)).toContain('cli-arm64-macos');
 
     const temp = await mkdtemp(join(tmpdir(), 'containment-real-graph-'));
+    const graphRoot = join(temp, 'repo');
     const buildArtifact = join(temp, 'rb');
     const macosArtifact = join(temp, 'mp');
     const applyRoot = join(temp, 'apply');
     try {
-      const buildManifest = await collectNxOutputs(root, buildArtifact, buildRuns, SOURCE_SHA);
-      const macosManifest = await collectNxOutputs(root, macosArtifact, macosRuns, SOURCE_SHA);
+      const plantedBuild = await plantDeclaredOutputs(graphRoot, buildRuns);
+      const plantedMacos = await plantDeclaredOutputs(graphRoot, macosRuns);
+      expect(plantedBuild.length).toBeGreaterThan(0);
+      expect(plantedMacos.length).toBeGreaterThan(0);
 
-      const tsFiles = buildManifest.files.filter(
-        (file) =>
-          file.project === 'cowshed' && file.target === 'tsc-js' && file.path.startsWith('packages/cowshed/dist/ts/'),
-      );
+      const buildManifest = await collectNxOutputs(graphRoot, buildArtifact, buildRuns, SOURCE_SHA);
+      const macosManifest = await collectNxOutputs(graphRoot, macosArtifact, macosRuns, SOURCE_SHA);
+
+      // The aggregate itself declares no outputs, so nothing may be attributed
+      // to it, and the platform families must stay out of the build tree.
       expect(buildManifest.files.some((file) => file.project === 'cowshed' && file.target === 'build')).toBe(false);
-      expect(tsFiles).toHaveLength(19);
-      expect(buildRuns.map((run) => run.target).sort()).toContain('tsc-js');
-      expect(buildRuns.map((run) => run.target).sort()).not.toContain('build');
       expect(
         buildManifest.files.some((file) => file.path.includes('/dist/bin/') || file.path.includes('/dist/native/')),
       ).toBe(false);
+      expect(
+        buildManifest.files.some((file) => file.target === 'tsc-js' && file.path === 'packages/cowshed/dist/ts/tsc-js'),
+      ).toBe(true);
 
-      const macosBins = macosManifest.files.filter((file) => file.path.includes('/dist/bin/'));
-      const macosNative = macosManifest.files.filter((file) => file.path.includes('/dist/native/'));
-      expect(macosBins.map((file) => file.path).sort()).toEqual([
-        'packages/cowshed/dist/bin/darwin-arm64/cowshed',
-        'packages/cowshed/dist/bin/darwin-x64/cowshed',
-      ]);
-      expect(macosNative).toHaveLength(4);
-      expect(macosManifest.files).toHaveLength(6);
+      expect(macosManifest.files.map((file) => file.path).sort()).toEqual(
+        plantedMacos.map((file) => relative(graphRoot, file)).sort(),
+      );
+      const buildPaths = new Set(buildManifest.files.map((file) => file.path));
+      for (const file of macosManifest.files) {
+        expect(buildPaths.has(file.path)).toBe(false);
+      }
 
       await mkdir(applyRoot, { recursive: true });
       await applyCollectedOutputs(applyRoot, [buildArtifact, macosArtifact], SOURCE_SHA, projects);
-      expect((await stat(join(applyRoot, 'packages/cowshed/dist/bin/darwin-arm64/cowshed'))).mode & 0o777).toBe(0o755);
+      expect((await stat(join(applyRoot, 'packages/cowshed/dist/bin/darwin-arm64/cli-arm64-macos'))).mode & 0o777).toBe(
+        0o755,
+      );
     } finally {
       await rm(temp, { recursive: true, force: true });
     }
