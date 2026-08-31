@@ -525,25 +525,15 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['napi-arm64-macos']?.dependsOn).toEqual(
         hostSuffix === '-arm64-macos' ? ['cargo-test-compile'] : undefined,
       );
-      expect(targets['napi-toolchain-arm64-linux']).toEqual({
-        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
-        cache: false,
-        options: { triple: 'aarch64-unknown-linux-gnu' },
-      });
-      expect(targets['napi-toolchain-x64-linux']).toEqual({
-        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
-        cache: false,
-        options: { triple: 'x86_64-unknown-linux-gnu' },
-      });
-      expect(targets['napi-x64-linux']?.dependsOn).toEqual(['napi-toolchain-x64-linux']);
-      expect(targets['napi-arm64-linux']?.dependsOn).toEqual(['napi-toolchain-arm64-linux']);
+      // A macOS triple never gets a cross toolchain: `usesNapiCross` is
+      // `family === 'linux' && target !== host`, so the family decides this one
+      // and no host can change it.
       expect(targets['napi-toolchain-x64-macos']).toBeUndefined();
-      expect(targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
-      expect(targets['napi-x64-linux']?.options).toMatchObject({
-        command:
-          'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/linux-x64-gnu',
-        env: { TARGET_CC: 'clang', TARGET_CXX: 'clang++' },
-      });
+      // Everything else about the cross regime depends on WHICH host is
+      // inferring — on an x64 Linux runner `napi-x64-linux` is the native build,
+      // with no `--use-napi-cross` and no toolchain prerequisite at all. Those
+      // facts are asserted against forced platforms below instead of against
+      // whichever machine happens to run the suite.
 
       // Exercise both host branches explicitly: this suite usually runs on
       // Darwin, but Linux's native compiler selection is the contract at risk.
@@ -575,41 +565,75 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       });
       expect(darwinArm64Targets['napi-x64-linux']?.dependsOn).toEqual(['napi-toolchain-x64-linux']);
       expect(darwinArm64Targets['napi-debug']?.options?.env).toBeUndefined();
-      // The aggregate build pulls in exactly the HOST's platform-suffixed
-      // targets (publish still owns foreign platforms).
-      const hostNapiTargets = [
-        'cli-arm64-macos',
-        'cli-x64-linux',
-        'napi-arm64-macos',
-        'napi-x64-macos',
-        'napi-arm64-linux',
-        'napi-x64-linux',
-      ]
-        .filter((name) => hostSuffix !== null && name.endsWith(hostSuffix))
-        .sort();
-      // Compiling the test executables is the only cargo-test work the build
-      // aggregate owns; every RUNNER is reached through `test`. On a supported
-      // host `cargo-napi` is not inferred, so `tsc-js` is the whole output
-      // family here.
-      expect(targets.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'tsc-js', ...hostNapiTargets]);
-      // Crate `cowshed-napi` names its bounded runner `cargo-test-cowshed-napi`,
-      // which the retired `*-napi` output-family glob matched on suffix alone.
-      // The runners are one serialized chain, so that single edge put the whole
-      // cargo test suite inside `nx run-many -t build`.
-      expect(targets['cargo-test-cowshed-napi']).toBeDefined();
-      for (const dependency of targets.build?.dependsOn ?? []) {
-        expect(String(dependency).startsWith('cargo-test-')).toBe(dependency === 'cargo-test-compile');
-      }
-      const platformBuildDependencies = (targets.build?.dependsOn ?? []).filter(
-        (dependency): dependency is string =>
-          typeof dependency === 'string' && /-(?:arm64|x64)-(?:macos|linux)$/.test(dependency),
+      expect(darwinArm64Targets['napi-toolchain-arm64-linux']).toEqual({
+        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
+        cache: false,
+        options: { triple: 'aarch64-unknown-linux-gnu' },
+      });
+      expect(darwinArm64Targets['napi-toolchain-x64-linux']).toEqual({
+        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
+        cache: false,
+        options: { triple: 'x86_64-unknown-linux-gnu' },
+      });
+      expect(darwinArm64Targets['napi-arm64-linux']?.dependsOn).toEqual(['napi-toolchain-arm64-linux']);
+      expect(darwinArm64Targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
+      expect(darwinArm64Targets['napi-x64-linux']?.options?.command).toBe(
+        'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/linux-x64-gnu',
       );
-      if (hostSuffix !== null) {
-        for (const name of platformBuildDependencies) {
-          expect(name.endsWith(hostSuffix)).toBe(true);
+
+      // The whole rule, stated once per forced host: a triple gets a cross
+      // toolchain exactly when it is a linux triple that is not this host's own.
+      // Asserting the pair by name is what broke on Linux, where
+      // napi-toolchain-x64-linux legitimately does not exist.
+      for (const [inferred, hostTriple] of [
+        [linuxX64Targets, 'x64-linux'],
+        [darwinArm64Targets, 'arm64-macos'],
+      ] as const) {
+        for (const suffix of ['arm64-linux', 'x64-linux', 'arm64-macos', 'x64-macos']) {
+          const expectsToolchain = suffix.endsWith('-linux') && suffix !== hostTriple;
+          expect(inferred[`napi-toolchain-${suffix}`] === undefined).toBe(!expectsToolchain);
+          expect(inferred[`napi-${suffix}`]?.options?.command).toContain(
+            expectsToolchain ? '--use-napi-cross' : '--target',
+          );
         }
-      } else {
-        expect(platformBuildDependencies).toEqual([]);
+      }
+      // The aggregate build pulls in exactly the inferring host's
+      // platform-suffixed targets (publish still owns foreign platforms), and
+      // the only cargo-test work it owns is compiling the executables — every
+      // RUNNER is reached through `test`. Both hosts are asserted here so the
+      // expectation does not depend on which machine runs the suite: the
+      // previous form read `process.platform`, and the macOS answer was the only
+      // one anyone checked.
+      for (const [inferred, hostSuffix] of [
+        [linuxX64Targets, '-x64-linux'],
+        [darwinArm64Targets, '-arm64-macos'],
+      ] as const) {
+        const hostNapiTargets = [
+          'cli-arm64-macos',
+          'cli-x64-linux',
+          'napi-arm64-macos',
+          'napi-x64-macos',
+          'napi-arm64-linux',
+          'napi-x64-linux',
+        ]
+          .filter((name) => name.endsWith(hostSuffix))
+          .sort();
+        expect(hostNapiTargets.length).toBeGreaterThan(0);
+        expect(inferred.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'tsc-js', ...hostNapiTargets]);
+        // Crate `cowshed-napi` names its bounded runner
+        // `cargo-test-cowshed-napi`, which the retired `*-napi` output-family
+        // glob matched on suffix alone. The runners are one serialized chain, so
+        // that single edge put the whole cargo test suite inside
+        // `nx run-many -t build`.
+        expect(inferred['cargo-test-cowshed-napi']).toBeDefined();
+        for (const dependency of inferred.build?.dependsOn ?? []) {
+          expect(String(dependency).startsWith('cargo-test-')).toBe(dependency === 'cargo-test-compile');
+        }
+        for (const dependency of inferred.build?.dependsOn ?? []) {
+          if (typeof dependency === 'string' && /-(?:arm64|x64)-(?:macos|linux)$/.test(dependency)) {
+            expect(dependency.endsWith(hostSuffix)).toBe(true);
+          }
+        }
       }
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       // The test suite runs against the dev-profile addon, never a release
