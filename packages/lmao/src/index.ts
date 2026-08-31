@@ -129,7 +129,7 @@ export * from './lib/flushScheduler.js';
 
 export type { BufferStrategy } from './lib/bufferStrategy.js';
 export { JsBufferStrategy } from './lib/JsBufferStrategy.js';
-
+export { ThreadBufferStrategy } from './lib/ThreadBufferStrategy.js';
 // =============================================================================
 // Tracer
 // =============================================================================

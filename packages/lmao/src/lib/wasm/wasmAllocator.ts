@@ -454,7 +454,7 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
 /**
  * Get compiled WASM module (cached after first load).
  */
-async function getWasmModule(): Promise<WebAssembly.Module> {
+export async function getWasmModule(): Promise<WebAssembly.Module> {
   if (cachedWasmModule) {
     return cachedWasmModule;
   }

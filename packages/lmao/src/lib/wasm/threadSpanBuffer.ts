@@ -155,9 +155,9 @@ export interface ThreadSpanBufferBinding {
     timestamp: bigint,
     line: number,
   ): bigint;
-  writeAttr(row: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
-  writeTag(spanId: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
-  setScope(spanId: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
+  writeAttr(row: number, ordinal: number, kind: number, value: bigint): number;
+  writeTag(spanId: number, ordinal: number, kind: number, value: bigint): number;
+  setScope(spanId: number, ordinal: number, kind: number, value: bigint): number;
   intern(ptr: number, len: number): number;
 }
 
