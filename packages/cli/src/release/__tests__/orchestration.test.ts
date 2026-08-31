@@ -4,6 +4,7 @@ import {
   bumpStableReleaseToNext,
   collectRepairPlatformOutputs,
   completeReleaseAtHead,
+  prepareReleaseCandidate,
   type ReleaseRepairOutputsShell,
   type ReleaseRepairShell,
   type ReleaseTagShell,
@@ -125,6 +126,31 @@ describe('release orchestration', () => {
       { pkg: prerelease, url: 'https://github.test/prerelease@2.0.0-beta.1' },
     ]);
     expect(summary.rerunRequired).toBe(true);
+  });
+
+  it('publishes verified prebuilt artifacts without building them again', async () => {
+    const shell = new RecordingRepairShell({ npmMissing: ['@scope/stable'], prebuilt: true });
+
+    const summary = await completeReleaseAtHead(shell, [stable], false, false);
+
+    expect(shell.builds).toEqual([]);
+    expect(shell.prebuiltChecks).toEqual(['@scope/stable']);
+    expect(shell.publishes).toEqual([{ name: '@scope/stable', distTag: 'latest', dryRun: false }]);
+    expect(summary.published).toEqual([stable]);
+  });
+
+  it('refuses to publish when a named prebuilt artifact is missing', async () => {
+    const shell = new RecordingRepairShell({
+      npmMissing: ['@scope/stable'],
+      prebuilt: true,
+      missingPrebuilt: ['@scope/stable'],
+    });
+
+    await expect(completeReleaseAtHead(shell, [stable], false, false)).rejects.toThrow(
+      'Verified prebuilt artifact for @scope/stable (stable) is missing: declared build output is absent',
+    );
+    expect(shell.builds).toEqual([]);
+    expect(shell.publishes).toEqual([]);
   });
 
   it('leaves a complete HEAD release idempotent', async () => {
@@ -265,6 +291,7 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   readonly pushes: string[][] = [];
   readonly builds: string[][] = [];
   readonly publishes: Array<{ name: string; distTag: string; dryRun: boolean }> = [];
+  readonly prebuiltChecks: string[] = [];
   readonly githubCreates: Array<{ name: string; dryRun: boolean }> = [];
   readonly npmQueries: string[][] = [];
   readonly githubQueries: string[][] = [];
@@ -273,11 +300,22 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   currentRef = 'head';
   private readonly npmMissing: Set<string>;
   private readonly githubMissing: Set<string>;
+  private readonly prebuilt: boolean;
+  private readonly missingPrebuilt: Set<string>;
   readonly prepares: string[] = [];
 
-  constructor(options: { npmMissing?: string[]; githubMissing?: string[] } = {}) {
+  constructor(
+    options: {
+      npmMissing?: string[];
+      githubMissing?: string[];
+      prebuilt?: boolean;
+      missingPrebuilt?: string[];
+    } = {},
+  ) {
     this.npmMissing = new Set(options.npmMissing ?? []);
     this.githubMissing = new Set(options.githubMissing ?? []);
+    this.prebuilt = options.prebuilt === true;
+    this.missingPrebuilt = new Set(options.missingPrebuilt ?? []);
   }
 
   async prepareRepairTarget(target: ReleaseTarget<ReleasePackageInfo>): Promise<void> {
@@ -299,7 +337,21 @@ class RecordingRepairShell implements ReleaseRepairShell<ReleasePackageInfo> {
   }
 
   async buildReleaseCandidate(packages: ReleasePackageInfo[]): Promise<void> {
-    this.builds.push(packageNames(packages));
+    await prepareReleaseCandidate(
+      {
+        build: async (selected) => {
+          this.builds.push(packageNames(selected));
+        },
+        assertPrebuilt: async (pkg) => {
+          this.prebuiltChecks.push(pkg.name);
+          if (this.missingPrebuilt.has(pkg.name)) {
+            throw new Error('declared build output is absent');
+          }
+        },
+      },
+      packages,
+      this.prebuilt,
+    );
   }
 
   async publishPackage(pkg: ReleasePackageInfo, distTag: string, dryRun: boolean): Promise<void> {

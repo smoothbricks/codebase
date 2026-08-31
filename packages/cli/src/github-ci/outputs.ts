@@ -42,7 +42,42 @@ export async function collectNxOutputs(
   sourceSha: string,
 ): Promise<CollectedOutputsManifest> {
   assertGitSha(sourceSha, 'Collected output source SHA');
+  const pending = await inspectNxOutputs(root, runs);
 
+  await requireEmptyDestination(destination);
+  const workspace = resolve(destination, 'workspace');
+  try {
+    await mkdir(workspace);
+  } catch (error) {
+    throw new Error(`Unable to create output workspace ${workspace}: ${describeError(error)}`, { cause: error });
+  }
+  for (const file of pending) {
+    const staged = await prepareSafeOutputPath(workspace, file.path, 'staged output file');
+    try {
+      await copyFile(file.source, staged);
+    } catch (error) {
+      throw new Error(`Unable to stage output ${file.path} at ${staged}: ${describeError(error)}`, { cause: error });
+    }
+  }
+
+  const manifest: CollectedOutputsManifest = {
+    version: 2,
+    sourceSha,
+    files: pending.map(({ source: _source, ...file }) => file),
+  };
+  const manifestPath = resolve(destination, 'manifest.json');
+  try {
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    throw new Error(
+      `Unable to write collected output manifest ${manifestPath} for source SHA ${sourceSha}: ${describeError(error)}`,
+      { cause: error },
+    );
+  }
+  return manifest;
+}
+
+async function inspectNxOutputs(root: string, runs: NxTargetRun[]): Promise<PendingOutputFile[]> {
   const pending: PendingOutputFile[] = [];
   const claimedPaths = new Map<string, { project: string; target: string }>();
   for (const run of runs) {
@@ -93,39 +128,8 @@ export async function collectNxOutputs(
       }
     }
   }
-
   pending.sort((left, right) => left.path.localeCompare(right.path));
-  await requireEmptyDestination(destination);
-  const workspace = resolve(destination, 'workspace');
-  try {
-    await mkdir(workspace);
-  } catch (error) {
-    throw new Error(`Unable to create output workspace ${workspace}: ${describeError(error)}`, { cause: error });
-  }
-  for (const file of pending) {
-    const staged = await prepareSafeOutputPath(workspace, file.path, 'staged output file');
-    try {
-      await copyFile(file.source, staged);
-    } catch (error) {
-      throw new Error(`Unable to stage output ${file.path} at ${staged}: ${describeError(error)}`, { cause: error });
-    }
-  }
-
-  const manifest: CollectedOutputsManifest = {
-    version: 2,
-    sourceSha,
-    files: pending.map(({ source: _source, ...file }) => file),
-  };
-  const manifestPath = resolve(destination, 'manifest.json');
-  try {
-    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-  } catch (error) {
-    throw new Error(
-      `Unable to write collected output manifest ${manifestPath} for source SHA ${sourceSha}: ${describeError(error)}`,
-      { cause: error },
-    );
-  }
-  return manifest;
+  return pending;
 }
 
 export async function applyCollectedOutputs(
@@ -144,14 +148,7 @@ export async function applyCollectedOutputs(
   const overlays: Array<{ source: string; destination: string; mode: number }> = [];
   const claimedPaths = new Set<string>();
   for (const directory of directories) {
-    const manifestPath = resolve(directory, 'manifest.json');
-    let manifest: CollectedOutputsManifest;
-    try {
-      manifest = assertExactManifest(parseManifest(await readFile(manifestPath, 'utf8')));
-    } catch (error) {
-      throw new Error(`Invalid collected output manifest ${manifestPath}: ${describeError(error)}`, { cause: error });
-    }
-    assertGitSha(manifest.sourceSha, `Manifest source SHA in ${manifestPath}`);
+    const { manifest, manifestPath } = await readCollectedOutputsManifest(directory);
     if (manifest.sourceSha !== expectedSourceSha) {
       throw new Error(
         `Source SHA mismatch in ${manifestPath}: expected ${expectedSourceSha}, received ${manifest.sourceSha}.`,
@@ -246,6 +243,66 @@ export async function applyCollectedOutputs(
       );
     }
   }
+}
+
+export async function assertCollectedOutputsApplied(
+  root: string,
+  directories: string[],
+  projectNames: string[],
+): Promise<void> {
+  if (directories.length === 0) {
+    throw new Error('At least one collected output directory is required.');
+  }
+  const requestedProjects = new Set(projectNames);
+  const foundProjects = new Set<string>();
+  for (const directory of directories) {
+    const { manifest, manifestPath } = await readCollectedOutputsManifest(directory);
+    for (const file of manifest.files) {
+      if (!requestedProjects.has(file.project)) {
+        continue;
+      }
+      foundProjects.add(file.project);
+      const path = validateWorkspaceRelativePath(file.path, 'manifest file path');
+      const destination = resolveWorkspacePath(root, path, 'workspace output file');
+      let stat: Stats;
+      try {
+        stat = await lstat(destination);
+      } catch (error) {
+        throw new Error(`Applied output file is missing: ${path}: ${describeError(error)}`, { cause: error });
+      }
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error(`Applied output must be a regular file: ${path}`);
+      }
+      if (stat.size !== file.size) {
+        throw new Error(`Size mismatch for applied output ${path}: expected ${file.size}, received ${stat.size}.`);
+      }
+      const checksum = await checksumFile(destination, 'Unable to checksum applied output');
+      if (checksum !== file.sha256) {
+        throw new Error(
+          `SHA-256 mismatch for applied output ${path} from ${manifestPath}: expected ${file.sha256}, received ${checksum}.`,
+        );
+      }
+    }
+  }
+  for (const project of requestedProjects) {
+    if (!foundProjects.has(project)) {
+      throw new Error(`Collected outputs contain no verified files for Nx project ${project}.`);
+    }
+  }
+}
+
+async function readCollectedOutputsManifest(
+  directory: string,
+): Promise<{ manifest: CollectedOutputsManifest; manifestPath: string }> {
+  const manifestPath = resolve(directory, 'manifest.json');
+  let manifest: CollectedOutputsManifest;
+  try {
+    manifest = assertExactManifest(parseManifest(await readFile(manifestPath, 'utf8')));
+  } catch (error) {
+    throw new Error(`Invalid collected output manifest ${manifestPath}: ${describeError(error)}`, { cause: error });
+  }
+  assertGitSha(manifest.sourceSha, `Manifest source SHA in ${manifestPath}`);
+  return { manifest, manifestPath };
 }
 
 export function resolveDeclaredOutput(declaredOutput: string, project: ProjectTargets): string {

@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { $ } from 'bun';
 import typia from 'typia';
 import { githubCiApplyOutputs, githubCiNxRunMany } from '../github-ci/index.js';
+import { assertCollectedOutputsApplied } from '../github-ci/outputs.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
 import {
@@ -23,6 +24,7 @@ import { listReleasePackages, readPackageJson, repositoryInfo } from '../lib/wor
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 import { readPackedPackageJson, validatePackedWorkspaceDependencies } from '../monorepo/packed-manifest.js';
 import { withPublishManifest } from '../monorepo/publish-manifest.js';
+import { readProjectTargets } from '../nx/index.js';
 import {
   type BootstrapNpmPackagesOptions,
   bootstrapNpmPackages,
@@ -54,6 +56,7 @@ import {
   bumpStableReleaseToNext,
   collectRepairPlatformOutputs,
   completeReleaseAtHead as completeReleaseAtHeadWithShell,
+  prepareReleaseCandidate,
   type ReleaseCompletionShell,
   type ReleaseRepairOutputsShell,
   type ReleaseRepairShell,
@@ -78,6 +81,7 @@ export interface ReleaseTagOptions {
 export interface ReleasePublishOptions {
   bump: string;
   dryRun?: boolean;
+  prebuilt?: string[];
 }
 
 export interface ReleaseRepairPendingOptions {
@@ -203,7 +207,7 @@ export async function releasePublish(root: string, options: ReleasePublishOption
     throw new Error('No release tags found at HEAD for current package versions. Run smoo release version first.');
   }
   const summary = await completeReleaseAtHeadWithShell(
-    releaseCompletionShell(root),
+    releaseCompletionShell(root, options.prebuilt),
     packages,
     options.dryRun === true,
     await newerCommitsRemain(root),
@@ -1010,12 +1014,31 @@ async function pushCurrentBranch(root: string): Promise<void> {
   await run('git', ['push', remote, `HEAD:refs/heads/${branch}`], root);
 }
 
-function releaseCompletionShell(root: string): ReleaseCompletionShell<ReleasePackage> {
+function releaseCompletionShell(root: string, prebuiltOutputs?: string[]): ReleaseCompletionShell<ReleasePackage> {
+  const prebuilt = prebuiltOutputs !== undefined;
+  const projectTargets = prebuilt ? readProjectTargets(root) : Promise.resolve([]);
   return {
     gitHead: () => gitHead(root),
     pushReleaseRefs: (packages) => pushReleaseRefs(root, packages),
     listNpmMissingPackages: (packages) => listUnpublishedPackages(root, packages),
-    buildReleaseCandidate: (packages) => buildReleaseCandidate(root, packages),
+    buildReleaseCandidate: (packages) =>
+      prepareReleaseCandidate(
+        {
+          build: (selected) => buildReleaseCandidate(root, selected),
+          assertPrebuilt: async (pkg) => {
+            const project = (await projectTargets).find((candidate) => candidate.project === pkg.projectName);
+            if (!project) {
+              throw new Error(`Nx project ${pkg.projectName} does not exist.`);
+            }
+            if (!project.targets.includes('build')) {
+              return;
+            }
+            await assertCollectedOutputsApplied(root, prebuiltOutputs ?? [], [pkg.projectName]);
+          },
+        },
+        packages,
+        prebuilt,
+      ),
     publishPackage: async (pkg, distTag, dryRun) => {
       const packageExists = dryRun ? true : await npmPackageExists(root, pkg.name);
       if (!packageExists) {

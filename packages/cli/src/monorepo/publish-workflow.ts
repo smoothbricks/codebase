@@ -657,6 +657,7 @@ ${renderMacosPlatformSteps(options)}
       contents: write
       id-token: write
     env:
+      NIX_STORE_NAR: ${githubExpression('github.workspace')}/nix-store.nar
       TTSC_TSGO_BINARY: ${githubExpression('github.workspace')}/node_modules/@typescript/native/bin/tsc
       GH_TOKEN: ${githubExpression('github.token')}
     steps:
@@ -932,38 +933,20 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '          fetch-depth: 0',
     '',
     `      # Step ${stepNumber++}`,
+    '      - name: 🧱 Setup Nix/devenv',
+    '        # Pending release repair builds historical npm gaps before the current',
+    '        # verified artifacts are restored, so this job still needs the full',
+    '        # toolchain even though current release publishing is prebuilt-only.',
+    '        id: setup',
+    '        uses: ./.github/actions/setup-devenv',
+    '',
+    `      # Step ${stepNumber++}`,
     '      - name: 📥 Download candidate artifacts',
     '        uses: actions/download-artifact@v8.0.1',
     '        with:',
     `          pattern: publish-*-${githubExpression('github.run_id')}`,
     `          path: ${githubExpression('runner.temp')}/publish-artifacts`,
     '          merge-multiple: false',
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 🥟 Install Bun',
-    '        # This job only combines candidate artifacts, tags, and publishes: it',
-    '        # builds nothing, so Bun and Node install directly instead of paying',
-    '        # for the devenv shell. Both read the root package.json pins that',
-    '        # `smoo monorepo update` keeps in sync with devenv.smoo.nix, so the',
-    '        # published runtimes cannot drift from the ones that built the',
-    '        # artifacts.',
-    '        uses: oven-sh/setup-bun@v2.2.0',
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 🟢 Install Node',
-    '        uses: actions/setup-node@v7.0.0',
-    '        with:',
-    '          node-version-file: package.json',
-    '',
-    `      # Step ${stepNumber++}`,
-    '      - name: 📦 Install workspace dependencies',
-    '        # The managed setup script owns the frozen-lockfile install and the',
-    '        # TypeScript API pinning; calling it keeps this job identical to a',
-    '        # devenv activation without building the shell.',
-    `        working-directory: ${githubExpression('github.workspace')}`,
-    '        run: |',
-    '          bun tooling/direnv/setup-environment.ts',
-    '          tooling/direnv/repo-path --github-path',
     '',
     `      # Step ${stepNumber++}`,
     '      - name: 🤖 Configure release author',
@@ -1052,12 +1035,27 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     '',
     `      # Step ${stepNumber++}`,
     `      - name: 📦 Publish release (${githubExpression(mode)})`,
-    '        # smoo packs with Bun, then publishes tarballs with npm. Existing',
-    '        # packages must already exist on npm and use trusted publishing/OIDC.',
-    '        # Missing package names are bootstrapped locally before trust setup.',
-    `        run: smoo release publish --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression(
-      'inputs.dry_run',
+    '        # smoo packs the verified outputs applied above with Bun, then publishes',
+    '        # tarballs with npm. --prebuilt refuses missing outputs instead of',
+    '        # rebuilding unverified bytes. Existing packages must already exist on',
+    '        # npm and use trusted publishing/OIDC; missing package names are',
+    '        # bootstrapped locally before trust setup.',
+    '        run:',
+    '          smoo release publish --prebuilt',
+    `          "${githubExpression('runner.temp')}/publish-artifacts/publish-release-outputs-${githubExpression(
+      'github.run_id',
     )}"`,
+    ...(hasLinuxPlatformTargets(options)
+      ? [
+          `          "${githubExpression('runner.temp')}/publish-artifacts/publish-linux-outputs-${githubExpression(
+            'github.run_id',
+          )}"`,
+        ]
+      : []),
+    ...macosPlatformArtifactNames(options).map(
+      (name) => `          "${githubExpression('runner.temp')}/publish-artifacts/${name}/current"`,
+    ),
+    `          --bump "${githubExpression('inputs.bump')}" --dry-run "${githubExpression('inputs.dry_run')}"`,
   );
   if (options.deploy === true) {
     lines.push(
@@ -1071,6 +1069,18 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
       '        run: smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
     );
   }
+  lines.push(
+    '',
+    '      # --- Cleanup ------------------------------------------------------------',
+    '',
+    `      # Step ${stepNumber}`,
+    '      - name: 🧹 Cleanup and cache Nix/devenv',
+    '        if: always()',
+    '        uses: ./.github/actions/save-nix-devenv',
+    '        with:',
+    `          nix-cache-hit: ${githubExpression('steps.setup.outputs.nix-cache-hit')}`,
+    `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
+  );
   return lines.join('\n').trimEnd();
 }
 
