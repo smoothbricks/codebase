@@ -462,36 +462,45 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+// Macro inputs forward opaque Rust expressions without parsing the full syn AST.
+fn opaque_expr(input: ParseStream) -> syn::Result<proc_macro2::TokenStream> {
+    let mut tokens = proc_macro2::TokenStream::new();
+    while !input.is_empty() && !input.peek(Token![,]) {
+        let token: proc_macro2::TokenTree = input.parse()?;
+        tokens.extend(std::iter::once(token));
+    }
+    if tokens.is_empty() {
+        return Err(input.error("expected expression"));
+    }
+    Ok(tokens)
+}
+
+fn source_metadata() -> proc_macro2::TokenStream {
+    quote! {
+        ::lmao_core::SourceMetadata {
+            package_name: env!("CARGO_PKG_NAME"),
+            package_file: file!(),
+            git_sha: ::lmao_core::source_git_sha(file!()),
+            line: line!(),
+        }
+    }
+}
+
 /// Span invocation with callsite capture — the Rust equivalent of the TS AST
 /// transformer's line-number injection (`01o`).
 ///
 /// ```text
 /// let (out, buf) = span!(trace, "fetch-user", |ctx| -> Result<_, ()> {
-///     ctx.log(EntryType::Info, "looking up {id}", line!());
+///     log!(ctx, EntryType::Info, "looking up {id}");
 ///     Ok(42)
 /// });
 /// ```
 ///
-/// Expands to `trace.span(name, parent, DEFAULT_CAPACITY, ...)` with compile-time
+/// Expands to the doc-hidden core span primitive with compile-time
 /// package/file/git attribution applied before the body runs. Use
 /// `span!(trace, parent_expr, "name", |ctx| ...)` to nest under a parent identity.
 #[proc_macro]
 pub fn span(input: TokenStream) -> TokenStream {
-    // span! only forwards these fragments (`#trace` / `#p` / `#body`); it never
-    // matches on the tree. Parsing `syn::Expr` would pull in syn's `full` AST
-    // just to round-trip tokens. Groups keep nested commas inside one fragment.
-    fn opaque_expr(input: ParseStream) -> syn::Result<proc_macro2::TokenStream> {
-        let mut tokens = proc_macro2::TokenStream::new();
-        while !input.is_empty() && !input.peek(Token![,]) {
-            let tt: proc_macro2::TokenTree = input.parse()?;
-            tokens.extend(std::iter::once(tt));
-        }
-        if tokens.is_empty() {
-            return Err(input.error("expected expression"));
-        }
-        Ok(tokens)
-    }
-
     struct SpanCall {
         trace: proc_macro2::TokenStream,
         parent: Option<proc_macro2::TokenStream>,
@@ -536,16 +545,153 @@ pub fn span(input: TokenStream) -> TokenStream {
         Some(p) => quote!(::core::option::Option::Some(#p)),
         None => quote!(::core::option::Option::None),
     };
+    let source = source_metadata();
     quote! {
-        (#trace).span(::lmao_core::TextInput::Static(#name), #parent_expr, ::lmao_core::DEFAULT_CAPACITY, |__lmao_ctx| {
-            __lmao_ctx.set_source(::lmao_core::SourceMetadata {
-                package_name: env!("CARGO_PKG_NAME"),
-                package_file: file!(),
-                git_sha: option_env!("GIT_SHA").or(option_env!("GITHUB_SHA")),
-                line: line!(),
-            });
-            (#body)(__lmao_ctx)
+        (#trace).__span(::lmao_core::TextInput::Static(#name), #parent_expr, ::lmao_core::DEFAULT_CAPACITY, #source, #body)
+    }
+    .into()
+}
+
+struct LogCall {
+    context: proc_macro2::TokenStream,
+    level: proc_macro2::TokenStream,
+    template: proc_macro2::TokenStream,
+}
+
+impl Parse for LogCall {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let context = opaque_expr(input)?;
+        input.parse::<Token![,]>()?;
+        let level = opaque_expr(input)?;
+        input.parse::<Token![,]>()?;
+        let template = opaque_expr(input)?;
+        if !input.is_empty() {
+            input.parse::<Token![,]>()?;
+        }
+        Ok(Self {
+            context,
+            level,
+            template,
         })
+    }
+}
+
+/// Append a log row with its callsite line injected at expansion.
+#[proc_macro]
+pub fn log(input: TokenStream) -> TokenStream {
+    let LogCall {
+        context,
+        level,
+        template,
+    } = match syn::parse(input) {
+        Ok(call) => call,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    quote!((#context).__log(#level, #template, line!())).into()
+}
+
+struct ChildCall {
+    context: proc_macro2::TokenStream,
+    name: LitStr,
+    body: proc_macro2::TokenStream,
+}
+
+impl Parse for ChildCall {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let context = opaque_expr(input)?;
+        input.parse::<Token![,]>()?;
+        let name = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let body = opaque_expr(input)?;
+        if !input.is_empty() {
+            input.parse::<Token![,]>()?;
+        }
+        Ok(Self {
+            context,
+            name,
+            body,
+        })
+    }
+}
+
+/// Create a child span with module and callsite provenance injected before its body.
+#[proc_macro]
+pub fn child(input: TokenStream) -> TokenStream {
+    let ChildCall {
+        context,
+        name,
+        body,
+    } = match syn::parse(input) {
+        Ok(call) => call,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let source = source_metadata();
+    quote! {
+        (#context).__child(::lmao_core::TextInput::Static(#name), ::lmao_core::DEFAULT_CAPACITY, #source, #body)
+    }
+    .into()
+}
+
+struct RetryCall {
+    trace: proc_macro2::TokenStream,
+    name: LitStr,
+    parent: proc_macro2::TokenStream,
+    capacity: proc_macro2::TokenStream,
+    sleep: proc_macro2::TokenStream,
+    body: proc_macro2::TokenStream,
+}
+
+impl Parse for RetryCall {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let trace = opaque_expr(input)?;
+        input.parse::<Token![,]>()?;
+        let name = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let parent = opaque_expr(input)?;
+        input.parse::<Token![,]>()?;
+        let capacity = opaque_expr(input)?;
+        input.parse::<Token![,]>()?;
+        let sleep = opaque_expr(input)?;
+        input.parse::<Token![,]>()?;
+        let body = opaque_expr(input)?;
+        if !input.is_empty() {
+            input.parse::<Token![,]>()?;
+        }
+        Ok(Self {
+            trace,
+            name,
+            parent,
+            capacity,
+            sleep,
+            body,
+        })
+    }
+}
+
+/// Retry spans with the same source descriptor stamped on every attempt.
+#[proc_macro]
+pub fn span_with_retry(input: TokenStream) -> TokenStream {
+    let RetryCall {
+        trace,
+        name,
+        parent,
+        capacity,
+        sleep,
+        body,
+    } = match syn::parse(input) {
+        Ok(call) => call,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let source = source_metadata();
+    quote! {
+        (#trace).__span_with_retry(
+            ::lmao_core::TextInput::Static(#name),
+            #parent,
+            #capacity,
+            #source,
+            #sleep,
+            #body,
+        )
     }
     .into()
 }

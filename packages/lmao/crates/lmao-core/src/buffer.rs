@@ -43,6 +43,17 @@ pub struct SourceMetadata {
     pub line: u32,
 }
 
+impl SourceMetadata {
+    /// Explicit source marker for internal/test machinery that has no authored callsite.
+    #[doc(hidden)]
+    pub const UNATTRIBUTED: Self = Self {
+        package_name: "<unattributed>",
+        package_file: "<unattributed>",
+        git_sha: None,
+        line: 0,
+    };
+}
+
 /// One span's columnar buffer. SoA: parallel timestamp/packed-header arrays plus
 /// lazily-created attribute columns (todo: generated per-schema by `lmao-macros`).
 #[derive(Debug)]

@@ -29,6 +29,8 @@ pub mod thread_buffer;
 pub mod thread_ffi;
 pub mod tuning;
 
+include!(concat!(env!("OUT_DIR"), "/source_git.rs"));
+
 pub use arena::{ArenaFull, ArenaStr, ScopeText, StringArena, TextInput};
 pub use buffer::{SourceMetadata, SpanBuffer};
 pub use clock::{Clock, CoarseClock, SystemClock, TraceAnchor};

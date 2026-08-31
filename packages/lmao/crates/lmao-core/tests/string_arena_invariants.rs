@@ -152,21 +152,33 @@ fn child_reads_parent_dynamic_scope_text() {
         7,
         Arc::new(TickClock(AtomicU64::new(0))),
     );
-    let (parent_out, parent) = trace.span(TextInput::Static("parent"), None, 8, |ctx| {
-        ctx.set_scope(&[(
-            "route",
-            Some(ScopeValue::Text(std::borrow::Cow::Owned(String::from(
-                "dyn-scope-café",
-            )))),
-        )]);
-        Ok::<_, ()>(())
-    });
+    let (parent_out, parent) = trace.__span(
+        TextInput::Static("parent"),
+        None,
+        8,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            ctx.set_scope(&[(
+                "route",
+                Some(ScopeValue::Text(std::borrow::Cow::Owned(String::from(
+                    "dyn-scope-café",
+                )))),
+            )]);
+            Ok::<_, ()>(())
+        },
+    );
     parent_out.unwrap();
 
-    let (child_out, mut child) = trace.span(TextInput::Static("child"), None, 8, |ctx| {
-        ctx.log(EntryType::Info, "from-child", 1);
-        Ok::<_, ()>(())
-    });
+    let (child_out, mut child) = trace.__span(
+        TextInput::Static("child"),
+        None,
+        8,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            ctx.__log(EntryType::Info, "from-child", 1);
+            Ok::<_, ()>(())
+        },
+    );
     child_out.unwrap();
     child.inherit_scope(parent.scope_handle());
 

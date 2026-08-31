@@ -15,7 +15,12 @@
       "!{projectRoot}/**/*.test.*",
       "!{projectRoot}/**/*.spec.*"
     ],
-    "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"]
+    "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"],
+    "lmaoGitRevision": [
+      {
+        "runtime": "sh -c 'if [ -n \"${LMAO_GIT_REVISION:-}\" ]; then printf \"%s\\n\" \"$LMAO_GIT_REVISION\"; elif revision=$(git rev-parse HEAD 2>/dev/null); then printf \"%s\\n\" \"$revision\"; else printf \"unknown\\n\"; fi'"
+      }
+    ]
   },
   "targetDefaults": {
     "build": {
