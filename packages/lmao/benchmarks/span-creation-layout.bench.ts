@@ -38,6 +38,7 @@ import {
 } from '../src/lib/spanContext.js';
 import { iterateSpanChildren } from '../src/lib/traceTopology.js';
 import type { AnySpanBuffer, SpanBuffer } from '../src/lib/types.js';
+import { registerThreadBufferLane } from './threadBufferLane.js';
 
 const CAPACITIES: readonly [8, 64, 1024] = [8, 64, 1024];
 const QUICK = process.argv.includes('--quick');
@@ -642,7 +643,7 @@ for (const capacity of CAPACITY_FILTER) {
 const format = process.argv.includes('--markdown') ? 'markdown' : process.argv.includes('--json') ? 'json' : undefined;
 const filterArgument = process.argv.find((argument) => argument.startsWith('--filter='));
 const filter = filterArgument === undefined ? undefined : new RegExp(filterArgument.slice('--filter='.length));
-
+await registerThreadBufferLane('span-creation-layout', 8);
 if (format === 'json') await run({ format: { json: { samples: true } }, filter });
 else if (format) await run({ format, filter });
 else await run({ filter });

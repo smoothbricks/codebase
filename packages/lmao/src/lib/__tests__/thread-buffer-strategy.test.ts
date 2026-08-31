@@ -69,4 +69,29 @@ describe('ThreadBufferStrategy', () => {
     if (!isThreadSpanView(root)) return;
     expect(strategy.runtime.readHeader(root.binding, root.completionRow) & 0xff).toBe(ENTRY_TYPE_SPAN_OK);
   });
+
+  it('applies latest setScope across an overflow chain at materialize', () => {
+    const tracer = new TestTracer(opContext, {
+      bufferStrategy: strategy,
+      createTraceRoot,
+    });
+    tracer.trace_fn(0, 'overflow-scope', {}, (ctx) => {
+      for (let i = 0; i < 12; i++) ctx.log.info(`row-${i}`);
+      ctx.setScope({ user: 'late' });
+      return ctx.ok(1);
+    });
+    const root = tracer.rootBuffers[0];
+    expect(isThreadSpanView(root)).toBe(true);
+    if (!isThreadSpanView(root)) return;
+    const rows = strategy.runtime.rowCount(root.binding);
+    expect(rows).toBeGreaterThan(8);
+    strategy.runtime.materializeScope(root.binding, 0, rows);
+    const userOrdinal = root.ordinals.get('user');
+    expect(userOrdinal).toBeDefined();
+    if (userOrdinal === undefined) return;
+    const cell = strategy.runtime.readAttr(root.binding, rows - 1, userOrdinal);
+    expect(cell).toBeDefined();
+    if (cell === undefined) return;
+    expect(strategy.runtime.readInterned(root.binding, Number(cell.value))).toBe('late');
+  });
 });

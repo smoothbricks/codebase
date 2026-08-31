@@ -21,7 +21,7 @@
 //! ## Deliberate divergence, recorded rather than hidden
 //!
 //! TypeScript ALSO eagerly prefills scope into an overflow buffer's future rows at
-//! overflow-creation time (`spanContext.ts:1113` calling the generated
+//! overflow-creation time (`spanContext.ts` calling the generated
 //! `_prefillScopedAttributesOn`). That snapshots the scope as it stood when the
 //! overflow was created, so a later `setScope` cannot reach those rows — which
 //! contradicts `01i`'s own "Scope Value Changes" section, where ALL rows take the
@@ -30,6 +30,13 @@
 //! buffer behaves identically in both; the divergence is confined to rows of an
 //! overflow buffer whose span changed its scope after overflowing, and there Rust is
 //! the correct one. [`overflow_chain_shares_one_scope`] pins the Rust invariant.
+//!
+//! The TS ThreadSpanBuffer binding does not port that eager prefill. Overflow is
+//! internal to the native row store; `set_scope` kind 0 clears, and
+//! `thread_span_buffer_materialize_scope` fills latest-value on the whole chain.
+//! `lmao-wasm::set_scope_after_overflow_fills_latest_value` and the TS
+//! `ThreadBufferStrategy` overflow test write through that ABI and assert the
+//! same Arrow-visible fill as this file's Rust path.
 
 use lmao_core::clock::{Clock, TraceAnchor};
 use lmao_core::{
