@@ -156,7 +156,7 @@
   "scripts": {
     "bench": "bun run benchmarks/*.bench.ts",
     "bench:wasm": "bun run benchmarks/js-vs-wasm.bench.ts",
-    "build:wasm": "nx run lmao:rust-wasm",
+    "build:wasm": "nx run lmao:cargo-wasm",
     "test": "nx run lmao:test --outputStyle=stream"
   },
   "nx": {
@@ -172,6 +172,10 @@
       },
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          "...",
+          "cargo-test"
+        ],
         "options": {
           "command": "bun test --timeout=30000",
           "cwd": "{projectRoot}",
@@ -179,23 +183,27 @@
           "killAfterMs": 10000
         }
       },
-      "rust-wasm": {
+      "cargo-wasm": {
         "executor": "nx:run-commands",
-        "cache": false,
+        "cache": true,
         "dependsOn": [
-          "^build",
-          {
-            "projects": [
-              "lmao-rs"
-            ],
-            "target": "cargo-wasm"
-          }
+          "^build"
+        ],
+        "inputs": [
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/justfile",
+          "{projectRoot}/src/lib/schema/systemSchema.ts",
+          "{projectRoot}/src/lib/capacityTuning.ts"
         ],
         "outputs": [
           "{projectRoot}/dist/allocator.wasm"
         ],
         "options": {
-          "command": "mkdir -p dist && cp ../lmao-rs/dist/lmao_wasm.wasm dist/allocator.wasm",
+          "command": "just wasm",
           "cwd": "{projectRoot}"
         }
       }
