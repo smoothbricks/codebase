@@ -14,10 +14,20 @@ use columine_event_processor::{
 };
 
 const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");
+/// `COMPACT_KIND_TAG` is generated from `arrow-planes.ts` into this module.
+const COMPACT_COLUMN_TS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../src/compact-column.generated.ts"
+);
 
 fn read() -> String {
     std::fs::read_to_string(PARSE_BACKEND_TS)
         .unwrap_or_else(|error| panic!("read parse-backend.ts: {error}"))
+}
+
+fn read_generated() -> String {
+    std::fs::read_to_string(COMPACT_COLUMN_TS)
+        .unwrap_or_else(|error| panic!("read compact-column.generated.ts: {error}"))
 }
 
 fn ts_const(source: &str, name: &str) -> u64 {
@@ -46,41 +56,6 @@ fn parse_int(literal: &str) -> u64 {
         compact
             .parse()
             .unwrap_or_else(|error| panic!("{literal} is not a decimal literal: {error}"))
-    }
-}
-
-/// The TypeScript `COMPACT_KIND_TAG` key for one plane.
-///
-/// Wildcard-free ON PURPOSE, and that is the whole point of this harness.
-/// The audit used to list the tags by hand, which is how a Rust change could
-/// narrow tag 1 to a signed plane while TypeScript kept calling it unsigned
-/// and nothing failed. Adding an `ArrowType` variant without naming its
-/// TypeScript kind here does not fail an assertion — it fails to COMPILE.
-fn ts_kind(plane: ArrowType) -> &'static str {
-    match plane {
-        ArrowType::Null => "null",
-        ArrowType::Int32 => "i32",
-        ArrowType::Float64 => "f64",
-        ArrowType::Binary => "binary",
-        ArrowType::Utf8 => "utf8",
-        ArrowType::Bool => "bool",
-        ArrowType::Int64 => "i64",
-        ArrowType::Int8 => "i8",
-        ArrowType::Int16 => "i16",
-        ArrowType::UInt8 => "u8",
-        ArrowType::UInt16 => "u16",
-        ArrowType::UInt32 => "u32",
-        ArrowType::UInt64 => "u64",
-        ArrowType::Float16 => "f16",
-        ArrowType::Float32 => "f32",
-        ArrowType::Decimal128 => "decimal128",
-        ArrowType::Decimal256 => "decimal256",
-        ArrowType::LargeBinary => "largeBinary",
-        ArrowType::LargeUtf8 => "largeUtf8",
-        ArrowType::FixedSizeBinary => "fixedSizeBinary",
-        ArrowType::IntervalYearMonth => "intervalYearMonth",
-        ArrowType::IntervalDayTime => "intervalDayTime",
-        ArrowType::IntervalMonthDayNano => "intervalMonthDayNano",
     }
 }
 
@@ -206,10 +181,12 @@ fn parse_backend_ts_compact_abi_matches_rust() {
 #[test]
 fn parse_backend_ts_kind_table_is_exactly_the_rust_plane_table() {
     let source = read();
-    let declared = ts_kind_tags(&source);
+    // The table is generated from `arrow-planes.ts`; this asserts the Rust half
+    // of that generation, so a hand-edit of either side fails here.
+    let declared = ts_kind_tags(&read_generated());
     let expected: Vec<(String, u8)> = ArrowType::ALL
         .iter()
-        .map(|plane| (ts_kind(*plane).to_owned(), *plane as u8))
+        .map(|plane| (plane.ts_kind().to_owned(), *plane as u8))
         .collect();
     assert_eq!(
         declared, expected,
@@ -218,7 +195,7 @@ fn parse_backend_ts_kind_table_is_exactly_the_rust_plane_table() {
 
     // Two planes claiming one TypeScript kind would make the comparison above
     // pass while the host decoded one of them as the other.
-    let mut names: Vec<&str> = ArrowType::ALL.iter().map(|plane| ts_kind(*plane)).collect();
+    let mut names: Vec<&str> = ArrowType::ALL.iter().map(|plane| plane.ts_kind()).collect();
     let plane_count = names.len();
     names.sort_unstable();
     names.dedup();
