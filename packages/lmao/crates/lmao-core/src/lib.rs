@@ -9,6 +9,7 @@
 //! time and entropy only via the [`clock::Clock`] and [`identity::Entropy`] traits; same
 //! `(build, seed, config)` must produce bit-identical trace bytes; zero heap allocations per event after warmup.
 
+pub mod arena;
 pub mod buffer;
 pub mod clock;
 pub mod columns;
@@ -28,6 +29,7 @@ pub mod thread_buffer;
 pub mod thread_ffi;
 pub mod tuning;
 
+pub use arena::{ArenaFull, ArenaStr, ScopeText, StringArena, TextInput};
 pub use buffer::{SourceMetadata, SpanBuffer};
 pub use clock::{Clock, CoarseClock, SystemClock, TraceAnchor};
 pub use columns::{

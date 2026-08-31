@@ -17,6 +17,17 @@ include!(concat!(env!("OUT_DIR"), "/tuning.rs"));
 /// Default capacity used before a schema-specific ratchet has learned a workload.
 pub const DEFAULT_CAPACITY: usize = 64;
 
+/// Ceiling on a thread row store's string arena, in bytes.
+///
+/// The arena holds one copy of each DISTINCT dynamic string the thread has
+/// written, so this bounds cardinality, not row count: a thread emitting the
+/// same forty span names forever never approaches it, and a thread minting a
+/// novel string per row hits it and is told so. Exceeding it is an operational
+/// failure reported as [`crate::ThreadBufferError::StringArenaFull`], never a
+/// panic and never a silent stop-deduplicating — a store that quietly began
+/// allocating per row is exactly the failure mode the arena replaces.
+pub const MAX_STRING_ARENA_BYTES: usize = 16 << 20;
+
 /// Per-schema capacity ratchet. One instance lives on each generated buffer class.
 #[derive(Debug)]
 pub struct CapacityRatchet {

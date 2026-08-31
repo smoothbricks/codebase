@@ -8,8 +8,11 @@
 //!
 //! String strategies from `01a_trace_schema_system.md` — NO hot-path interning:
 //! - `enum`   → [`NumColumn<u16>`] index into a schema-time dictionary (zero flush work)
-//! - `category`/`text` → [`StrColumn`]: raw `Arc<str>` slot writes; sort/dedupe and
-//!   UTF-8 dictionary building are deferred to the Arrow flush pass (`lmao-arrow`).
+//! - `category`/`text` → [`StrColumn`]: a [`SharedStr`] cell per slot, which is
+//!   either a `'static` borrow or an eight-byte handle into the store's
+//!   [`StringArena`]. Sort/dedupe and UTF-8 dictionary building are deferred to
+//!   the Arrow flush pass (`lmao-arrow`), where the arena already supplies the
+//!   contiguous values buffer and the offsets.
 //!
 //! Deviation from the JS/WASM layout, documented on purpose: the spec bundles
 //! null-bitmap + values into ONE ArrayBuffer/arena block. Here validity and values
@@ -17,23 +20,38 @@
 //! touch, 0 afterwards). The single-block bundling is an arena concern and lives in
 //! `lmao-arena`; keeping `lmao-core` in safe Rust is worth the extra warmup alloc.
 
-use std::sync::Arc;
+use crate::arena::{ArenaStr, StringArena};
 
-/// A shared string slot value: `'static` borrows (log templates, compile-time
-/// names) cost ZERO allocations; dynamic values ride an `Arc` refcount bump.
-/// This is what keeps the zero-alloc gate honest for `log(template)`.
-#[derive(Debug, Clone)]
+/// A string slot value. Eight-to-sixteen bytes, `Copy`, and `Drop`-free: writing
+/// one is an integer store and dropping a column is a no-op memory release
+/// rather than a walk that decrements a refcount per row.
+///
+/// `'static` borrows (log templates, compile-time names) cost ZERO — they never
+/// enter the arena. Dynamic values are a handle into the arena owned by the row
+/// store that produced them, which is why reading one requires naming that
+/// arena: a value you cannot read without its arena cannot be read against the
+/// wrong one by accident.
+///
+/// Equality is structural, and that is exact rather than approximate: the arena
+/// deduplicates, so two `Arena` cells from one store hold equal bytes exactly
+/// when they hold equal handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SharedStr {
     Static(&'static str),
-    Owned(Arc<str>),
+    Arena(ArenaStr),
 }
 
 impl SharedStr {
+    /// The bytes this cell names.
+    ///
+    /// # Panics
+    /// If an `Arena` cell is resolved against an arena that did not issue it.
     #[inline]
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Static(s) => s,
-            Self::Owned(s) => s,
+    #[must_use]
+    pub fn resolve<'a>(&self, arena: &'a StringArena) -> &'a str {
+        match *self {
+            Self::Static(value) => value,
+            Self::Arena(handle) => arena.resolve(handle),
         }
     }
 }
@@ -87,25 +105,12 @@ impl From<&'static str> for SharedStr {
     }
 }
 
-impl From<Arc<str>> for SharedStr {
+impl From<ArenaStr> for SharedStr {
     #[inline]
-    fn from(s: Arc<str>) -> Self {
-        Self::Owned(s)
+    fn from(handle: ArenaStr) -> Self {
+        Self::Arena(handle)
     }
 }
-
-impl From<String> for SharedStr {
-    fn from(s: String) -> Self {
-        Self::Owned(s.into())
-    }
-}
-
-impl PartialEq for SharedStr {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-impl Eq for SharedStr {}
 
 /// Fixed-capacity validity bitmap + values, allocated at first touch.
 #[derive(Debug)]
@@ -255,11 +260,11 @@ pub type BoolColumn = NumColumn<bool>;
 /// Enum strategy: u16 index into a schema-time `&'static [&'static str]` dictionary.
 pub type EnumColumn = NumColumn<u16>;
 
-/// Lazy string column for `category`/`text` fields: raw shared-slot writes,
-/// `None` = null (no separate bitmap needed, matching the JS `undefined`=null
-/// convention). Slots hold [`SharedStr`]: `'static` templates are free, dynamic
-/// values are a refcount bump — either way the post-warmup path satisfies the
-/// zero-alloc gate.
+/// Lazy string column for `category`/`text` fields: raw cell writes, `None` =
+/// null (no separate bitmap needed, matching the JS `undefined`=null
+/// convention). Slots hold [`SharedStr`], so a warmed write is an integer store
+/// with no allocation and no refcount, and dropping the column releases one
+/// boxed slice without walking it.
 #[derive(Debug, Default)]
 pub struct StrColumn {
     buf: Option<Box<[Option<SharedStr>]>>,
@@ -278,9 +283,19 @@ impl StrColumn {
         buf[row] = Some(value.into());
     }
 
+    /// The bytes at `row`, resolved against the arena of the store that owns
+    /// this column. Passing a different store's arena is a programmer error and
+    /// panics in [`StringArena::resolve`] rather than returning foreign bytes.
     #[inline]
-    pub fn get(&self, row: usize) -> Option<&str> {
-        Some(self.buf.as_ref()?.get(row)?.as_ref()?.as_str())
+    pub fn get<'a>(&self, row: usize, arena: &'a StringArena) -> Option<&'a str> {
+        Some(self.buf.as_ref()?.get(row)?.as_ref()?.resolve(arena))
+    }
+
+    /// The raw cell at `row`, for callers that want the handle rather than the
+    /// bytes — the flush pass keys its dictionary on these.
+    #[inline]
+    pub fn cell(&self, row: usize) -> Option<SharedStr> {
+        *self.buf.as_ref()?.get(row)?
     }
 
     #[inline]
@@ -304,7 +319,7 @@ impl StrColumn {
     /// filled — the [`NumColumn::fill_unset`] counterpart for string columns.
     /// `None` IS the null here, so there is no bitmap to consult and the slot's own
     /// emptiness is the authority on whether a direct write happened.
-    pub fn fill_unset(&mut self, rows: usize, capacity: usize, value: &SharedStr) -> usize {
+    pub fn fill_unset(&mut self, rows: usize, capacity: usize, value: SharedStr) -> usize {
         self.fill_unset_range(0, rows, capacity, value)
     }
 
@@ -316,7 +331,7 @@ impl StrColumn {
         start: usize,
         end: usize,
         capacity: usize,
-        value: &SharedStr,
+        value: SharedStr,
     ) -> usize {
         if start >= end {
             return 0;
@@ -328,7 +343,7 @@ impl StrColumn {
         let mut filled = 0usize;
         for slot in &mut buf[start..end] {
             if slot.is_none() {
-                *slot = Some(value.clone());
+                *slot = Some(value);
                 filled += 1;
             }
         }
@@ -355,11 +370,12 @@ mod tests {
 
     #[test]
     fn str_column_null_is_absence() {
+        let arena = StringArena::new(0);
         let mut col = StrColumn::new();
         assert_eq!(col.allocated_bytes(), 0);
         col.set(2, 8, "hello");
-        assert_eq!(col.get(2), Some("hello"));
-        assert_eq!(col.get(1), None);
+        assert_eq!(col.get(2, &arena), Some("hello"));
+        assert_eq!(col.get(1, &arena), None);
     }
 
     /// `01i`: direct writes win, scope fills only the cells they left null. The
@@ -418,12 +434,13 @@ mod tests {
 
     #[test]
     fn str_fill_unset_preserves_direct_writes() {
+        let arena = StringArena::new(0);
         let mut col = StrColumn::new();
         col.set(1, 8, "direct");
-        assert_eq!(col.fill_unset(4, 8, &SharedStr::Static("scope")), 3);
-        assert_eq!(col.get(0), Some("scope"));
-        assert_eq!(col.get(1), Some("direct"));
-        assert_eq!(col.get(3), Some("scope"));
-        assert_eq!(col.get(4), None);
+        assert_eq!(col.fill_unset(4, 8, SharedStr::Static("scope")), 3);
+        assert_eq!(col.get(0, &arena), Some("scope"));
+        assert_eq!(col.get(1, &arena), Some("direct"));
+        assert_eq!(col.get(3, &arena), Some("scope"));
+        assert_eq!(col.get(4, &arena), None);
     }
 }

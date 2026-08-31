@@ -17,6 +17,7 @@
 //! event after warmup. All growth happens via overflow chaining (allocate a NEW buffer,
 //! never realloc in place) so writes are wait-free with respect to readers.
 
+use crate::arena::{ScopeText, StringArena, TextInput};
 use crate::clock::{Clock, TraceAnchor};
 use crate::columns::{SharedStr, StrColumn};
 use crate::entry_type::EntryType;
@@ -56,6 +57,14 @@ pub struct SpanBuffer {
     /// Dynamic span names and log messages only. Static vocabulary paths leave
     /// this column untouched so it remains lazy and unallocated.
     messages: StrColumn,
+    /// Backing bytes for every dynamic string this buffer's cells name.
+    ///
+    /// Per buffer, not per chain: `append_dynamic` interns into the buffer it
+    /// appends to and `dynamic_message_at` resolves against the buffer it reads
+    /// from, so a cell and its bytes never live in different objects. Lazily
+    /// allocated, so a span whose names are all static vocabulary owns none of
+    /// it.
+    arena: StringArena,
     /// Source attribution captured by `span!`.
     source: Option<SourceMetadata>,
     /// Overflow chain: same identity, appended when this buffer fills (`01b2`).
@@ -80,7 +89,7 @@ impl SpanBuffer {
     pub fn start_dynamic(
         identity: Arc<SpanIdentity>,
         capacity: usize,
-        name: SharedStr,
+        name: TextInput<'_>,
         anchor: &TraceAnchor,
         clock: &dyn Clock,
     ) -> Self {
@@ -91,8 +100,40 @@ impl SpanBuffer {
             anchor,
             clock,
         );
-        buffer.messages.set(0, capacity, name);
+        let cell = buffer.intern_text(name);
+        buffer.messages.set(0, capacity, cell);
         buffer
+    }
+
+    /// Turn caller text into the cell this buffer stores.
+    ///
+    /// Schema-generated attribute writers use the same arena as system
+    /// messages, so every handle remains paired with its owning row store. The
+    /// `expect` is an invariant, not an operational failure: the arena is
+    /// bounded only by the `u32` offset space its handles address, and a single
+    /// span reaching four gigabytes of distinct strings would exhaust the
+    /// allocator first.
+    #[inline]
+    pub fn intern_text(&mut self, text: TextInput<'_>) -> SharedStr {
+        match text {
+            TextInput::Static(value) => SharedStr::Static(value),
+            TextInput::Dynamic(value) => SharedStr::Arena(
+                self.arena
+                    .intern_str(value)
+                    .expect("span string arena exceeded the u32 offset space"),
+            ),
+        }
+    }
+
+    /// Resolve a scope snapshot into a cell owned by this span.
+    ///
+    /// Owned scope text may have crossed from a parent buffer, so it is
+    /// interned here instead of retaining a handle into the parent's arena.
+    pub fn intern_scope_text(&mut self, text: &ScopeText) -> SharedStr {
+        match text {
+            std::borrow::Cow::Borrowed(value) => SharedStr::Static(value),
+            std::borrow::Cow::Owned(value) => self.intern_text(TextInput::Dynamic(value)),
+        }
     }
 
     /// Start a span whose name is represented by a manifest-global vocabulary ID.
@@ -135,6 +176,7 @@ impl SpanBuffer {
             headers,
             line_numbers,
             messages: StrColumn::new(),
+            arena: StringArena::new(StringArena::OFFSET_SPACE),
             source: None,
             overflow: None,
             children: Vec::new(),
@@ -144,7 +186,13 @@ impl SpanBuffer {
 
     /// Dynamic span name stored at row 0, or `None` for a static span start.
     pub fn dynamic_name(&self) -> Option<&str> {
-        self.messages.get(0)
+        self.messages.get(0, &self.arena)
+    }
+
+    /// Backing bytes for this buffer's dynamic strings, for the flush pass.
+    #[inline]
+    pub fn arena(&self) -> &StringArena {
+        &self.arena
     }
 
     /// Record the `span!` source attribution.
@@ -232,14 +280,19 @@ impl SpanBuffer {
     pub fn append_dynamic(
         &mut self,
         entry_type: EntryType,
-        message: Option<SharedStr>,
+        message: Option<TextInput<'_>>,
         line: u32,
         anchor: &TraceAnchor,
         clock: &dyn Clock,
     ) -> usize {
         let (target, row) = self.append_header(pack_dynamic(entry_type), anchor, clock);
         if let Some(message) = message {
-            target.messages.set(row, target.capacity, message);
+            // Intern into the buffer the row landed in, which after an overflow
+            // is NOT `self`. A cell and the bytes it names always live in the
+            // same object; that is what makes `dynamic_message_at` correct
+            // without carrying an arena reference across the chain.
+            let cell = target.intern_text(message);
+            target.messages.set(row, target.capacity, cell);
         }
         target.line_numbers[row] = line;
         row
@@ -280,6 +333,7 @@ impl SpanBuffer {
                 headers: vec![0u32; target.capacity],
                 line_numbers: vec![0u32; target.capacity],
                 messages: StrColumn::new(),
+                arena: StringArena::new(StringArena::OFFSET_SPACE),
                 source: None,
                 overflow: None,
                 children: Vec::new(),
@@ -299,7 +353,7 @@ impl SpanBuffer {
 
     /// Dynamic message for this physical buffer row. Static rows return `None`.
     pub fn dynamic_message_at(&self, row: usize) -> Option<&str> {
-        self.messages.get(row)
+        self.messages.get(row, &self.arena)
     }
 
     pub fn line_at(&self, row: usize) -> u32 {

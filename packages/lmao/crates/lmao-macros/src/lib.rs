@@ -276,35 +276,44 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
             continue;
         }
 
-        let (col_ty, val_ty, doc): (proc_macro2::TokenStream, proc_macro2::TokenStream, &str) =
-            match &f.kind {
-                FieldKind::Number => (
-                    quote!(::lmao_core::F64Column),
-                    quote!(f64),
-                    "number (f64) column",
-                ),
-                FieldKind::Uint64 => (
-                    quote!(::lmao_core::U64Column),
-                    quote!(u64),
-                    "uint64 column (shared metrics/user values, `01f`)",
-                ),
-                FieldKind::Boolean => (
-                    quote!(::lmao_core::BoolColumn),
-                    quote!(bool),
-                    "boolean column",
-                ),
-                FieldKind::Category => (
-                    quote!(::lmao_core::StrColumn),
-                    quote!(impl Into<::lmao_core::SharedStr>),
-                    "category string column — raw slot writes, dictionary at flush (`01a`)",
-                ),
-                FieldKind::Text => (
-                    quote!(::lmao_core::StrColumn),
-                    quote!(impl Into<::lmao_core::SharedStr>),
-                    "text string column — raw slot writes, 2-pass encode at flush (`01a`)",
-                ),
-                FieldKind::Enum(_) => unreachable!(),
-            };
+        let (col_ty, val_ty, doc, write_prelude): (
+            proc_macro2::TokenStream,
+            proc_macro2::TokenStream,
+            &str,
+            proc_macro2::TokenStream,
+        ) = match &f.kind {
+            FieldKind::Number => (
+                quote!(::lmao_core::F64Column),
+                quote!(f64),
+                "number (f64) column",
+                quote!(),
+            ),
+            FieldKind::Uint64 => (
+                quote!(::lmao_core::U64Column),
+                quote!(u64),
+                "uint64 column (shared metrics/user values, `01f`)",
+                quote!(),
+            ),
+            FieldKind::Boolean => (
+                quote!(::lmao_core::BoolColumn),
+                quote!(bool),
+                "boolean column",
+                quote!(),
+            ),
+            FieldKind::Category => (
+                quote!(::lmao_core::StrColumn),
+                quote!(::lmao_core::TextInput<'_>),
+                "category string column — raw slot writes, dictionary at flush (`01a`)",
+                quote!(let value = self.span.intern_text(value);),
+            ),
+            FieldKind::Text => (
+                quote!(::lmao_core::StrColumn),
+                quote!(::lmao_core::TextInput<'_>),
+                "text string column — raw slot writes, 2-pass encode at flush (`01a`)",
+                quote!(let value = self.span.intern_text(value);),
+            ),
+            FieldKind::Enum(_) => unreachable!(),
+        };
         let strategy = match &f.kind {
             FieldKind::Number => quote!(::lmao_core::FieldStrategy::Number),
             FieldKind::Uint64 => quote!(::lmao_core::FieldStrategy::Uint64),
@@ -315,13 +324,16 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
         };
         // `category` and `text` share `ScopeValue::Text` because both are backed by
         // `StrColumn` and differ only in flush strategy, which `FIELD_META` retains.
-        let (scope_ty, scope_variant, scope_fill_arg) = match &f.kind {
-            FieldKind::Number => (quote!(f64), quote!(Number), quote!(*value)),
-            FieldKind::Uint64 => (quote!(u64), quote!(Uint64), quote!(*value)),
-            FieldKind::Boolean => (quote!(bool), quote!(Boolean), quote!(*value)),
-            FieldKind::Category | FieldKind::Text => {
-                (quote!(::lmao_core::SharedStr), quote!(Text), quote!(value))
-            }
+        let (scope_ty, scope_variant, scope_prelude, scope_fill_arg) = match &f.kind {
+            FieldKind::Number => (quote!(f64), quote!(Number), quote!(), quote!(*value)),
+            FieldKind::Uint64 => (quote!(u64), quote!(Uint64), quote!(), quote!(*value)),
+            FieldKind::Boolean => (quote!(bool), quote!(Boolean), quote!(), quote!(*value)),
+            FieldKind::Category | FieldKind::Text => (
+                quote!(::lmao_core::ScopeText),
+                quote!(Text),
+                quote!(let value = self.span.intern_scope_text(value);),
+                quote!(value),
+            ),
             FieldKind::Enum(_) => unreachable!(),
         };
         field_meta.push(quote! {
@@ -337,6 +349,7 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
             #[doc = concat!("Row-targeted write — ", #doc, ".")]
             #[inline]
             #vis fn #set_fn(&mut self, row: usize, value: #val_ty) -> &mut Self {
+                #write_prelude
                 let cap = self.span.capacity();
                 self.#fname.set(row, cap, value);
                 self
@@ -354,7 +367,7 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
             FieldKind::Category | FieldKind::Text => writers.push(quote! {
                 #[inline]
                 #vis fn #get_fn(&self, row: usize) -> Option<&str> {
-                    self.#fname.get(row)
+                    self.#fname.get(row, self.span.arena())
                 }
             }),
             _ => writers.push(quote! {
@@ -370,6 +383,7 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
         scope_fills.push(quote! {
             match scope.get(stringify!(#fname)) {
                 Some(::lmao_core::ScopeValue::#scope_variant(value)) => {
+                    #scope_prelude
                     filled += self.#fname.fill_unset(rows, capacity, #scope_fill_arg);
                 }
                 Some(mismatched) => ::lmao_core::report_scope_mismatch(
@@ -523,7 +537,7 @@ pub fn span(input: TokenStream) -> TokenStream {
         None => quote!(::core::option::Option::None),
     };
     quote! {
-        (#trace).span(#name, #parent_expr, ::lmao_core::DEFAULT_CAPACITY, |__lmao_ctx| {
+        (#trace).span(::lmao_core::TextInput::Static(#name), #parent_expr, ::lmao_core::DEFAULT_CAPACITY, |__lmao_ctx| {
             __lmao_ctx.set_source(::lmao_core::SourceMetadata {
                 package_name: env!("CARGO_PKG_NAME"),
                 package_file: file!(),
