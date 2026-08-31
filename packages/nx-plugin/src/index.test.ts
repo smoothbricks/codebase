@@ -110,6 +110,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.build?.executor).toBe('nx:noop');
       expect(targets.build?.cache).toBe(true);
       expect(targets.build?.dependsOn).toEqual(buildOutputDependencies);
+      // An `nx:noop` aggregate writes no file, so it must claim none: a
+      // `{projectRoot}/dist` claim here would double-cache its children's bytes
+      // and make `github-ci nx-run-many --collect-outputs` attribute every file
+      // under dist to `build`, including the platform artifacts that collect
+      // deliberately leaves to the platform step.
+      expect(targets.build?.outputs).toBeUndefined();
       expect(targets.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
       expect(targets.clean?.cache).toBe(false);
 
