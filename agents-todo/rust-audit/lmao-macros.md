@@ -1,7 +1,7 @@
 # lmao-macros
 
-Scope: `packages/lmao-rs/crates/lmao-macros/Cargo.toml` (19), `src/lib.rs` (396; the only source file — assignment said
-“6 files / 396 lines”; that count is the crate, not six modules), `tests/trybuild.rs` (9),
+Scope: `packages/lmao/crates/lmao-macros/Cargo.toml` (19), `src/lib.rs` (396; the only source file — assignment said “6
+files / 396 lines”; that count is the crate, not six modules), `tests/trybuild.rs` (9),
 `tests/compile_fail/empty_schema.rs` (5) + `.stderr` (5), `tests/compile_fail/unknown_kind.rs` (7) + `.stderr` (5),
 `tests/compile_fail/empty_enum.rs` (7) + `.stderr` (5), `tests/pass/full_dsl.rs` (15). Doctrine:
 `BYPRODUCT-ENGINEERING.md`, `docs/handbook/04-mechanisms.md`, `05-memory-toolkit.md`, `02-measurement.md` §4.1. Targeted
@@ -28,7 +28,7 @@ greps only outside this crate (TS `S` builders, `lmao-core` columns/context/tuni
 
 ### F1 — HIGH — SSOT — `category` vs `text` is parsed then discarded
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/src/lib.rs:216-225`
+Evidence: `packages/lmao/crates/lmao-macros/src/lib.rs:216-225`
 
 ```
 FieldKind::Category => (
@@ -54,13 +54,13 @@ rustc type. `FieldKind` in `lib.rs:49-56` is the single source. Cost/Risk: gener
 
 ### F2 — HIGH — DEP-BLOAT — `syn` `full` exists only to parse `Expr` that is never inspected
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/Cargo.toml:13`
+Evidence: `packages/lmao/crates/lmao-macros/Cargo.toml:13`
 
 ```
 syn = { version = "2", features = ["full"] }
 ```
 
-`packages/lmao-rs/crates/lmao-macros/src/lib.rs:42-47,345-393` — every syn item actually named:
+`packages/lmao/crates/lmao-macros/src/lib.rs:42-47,345-393` — every syn item actually named:
 
 - `derive`+`parsing` subset: `Parse`, `ParseStream`, `Punctuated`, `Ident`, `LitStr`, `Token`, `Visibility`, `braced!`,
   `bracketed!`, `Error`, `syn::parse`
@@ -85,7 +85,7 @@ same feature list without `full`. Do not keep `full` “just in case”. `quote`
 
 ### F3 — HIGH — DUPLICATION — generated schema buffer is a second span lifecycle
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/src/lib.rs:284-316` (generated `start`/`finish_ok` allocate
+Evidence: `packages/lmao/crates/lmao-macros/src/lib.rs:284-316` (generated `start`/`finish_ok` allocate
 `SpanBuffer::start_dynamic`, lock a per-schema ratchet, `end_ok`, `record_span`) vs `lib.rs:389-393` (`span!` forwards
 to `(#trace).span(#name, #parent_expr, 64, …)` + `set_callsite`). Neighbor confirmation (not owned):
 `lmao-core/src/context.rs:74-87` already owns span start/finish; `lmao-core/examples/jcode_tracer.rs:57-89` runs
@@ -101,7 +101,7 @@ it should take ratchet capacity, not a second literal `64`. Cost/Risk: `jcode_tr
 
 ### F4 — HIGH — TESTS — `span!` untested; pass fixture cannot go red for generated API
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/tests/trybuild.rs:4-8`
+Evidence: `packages/lmao/crates/lmao-macros/tests/trybuild.rs:4-8`
 
 ```
 fn compile_fail_cases() {
@@ -131,7 +131,7 @@ non-callable `span!` body and a trailing-junk input if those stay as parse error
 
 ### F5 — MEDIUM — SSOT — initial capacity `64` restated, not named
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/src/lib.rs:280` `CapacityRatchet::new(64)` and `lib.rs:390`
+Evidence: `packages/lmao/crates/lmao-macros/src/lib.rs:280` `CapacityRatchet::new(64)` and `lib.rs:390`
 `(#trace).span(#name, #parent_expr, 64, …)`. Neighbor: `lmao-core/src/tuning.rs:15-16` publishes `MIN_CAPACITY = 8` and
 `MAX_CAPACITY = 1024`; `CapacityRatchet::new` takes an un-named initial. No `DEFAULT_CAPACITY`. Problem: two copies in
 this crate already disagree in **behavior** (ratchet learns; `span!` never does) while sharing the same literal. A third
@@ -142,7 +142,7 @@ start. Cost/Risk: one new public const; all `64` capacity call sites in core/mac
 
 ### F6 — MEDIUM — SSOT — enum dictionaries are unscoped `FIELD_VALUES` consts
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/src/lib.rs:164-173`
+Evidence: `packages/lmao/crates/lmao-macros/src/lib.rs:164-173`
 
 ```
 let dict_name = format_ident!(
@@ -164,7 +164,7 @@ found.
 
 ### F7 — MEDIUM — STRUCTURE — generated API panics on mutex poison
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/src/lib.rs:291` and `lib.rs:312-315`
+Evidence: `packages/lmao/crates/lmao-macros/src/lib.rs:291` and `lib.rs:312-315`
 
 ```
 let capacity = Self::ratchet().lock().unwrap().capacity();
@@ -184,7 +184,7 @@ caller change if `into_inner`.
 
 ### F8 — MEDIUM — STRUCTURE — enum `get_*` indexes the dictionary unchecked
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/src/lib.rs:181-190`
+Evidence: `packages/lmao/crates/lmao-macros/src/lib.rs:181-190`
 
 ```
 pub fn set_fn(&mut self, row: usize, index: u16) -> &mut Self {
@@ -219,20 +219,20 @@ Evidence:
 
 ### F10 — LOW — STRUCTURE — `define_log_schema` is 183 lines with an obvious seam
 
-Evidence: `packages/lmao-rs/crates/lmao-macros/src/lib.rs:145-328` (`pub fn define_log_schema`). Enum arm `163-196` vs
+Evidence: `packages/lmao/crates/lmao-macros/src/lib.rs:145-328` (`pub fn define_log_schema`). Enum arm `163-196` vs
 scalar arm `199-260` duplicate `tag_`/`set_`/`get_`/`col_fields`/`col_inits`/`bytes_terms` pushes. Fix: one
 `fn expand_field(f: &Field) -> FieldTokens` returning those six vecs’ items; `define_log_schema` only parses and
 `quote!`s the struct. Not a 5k-line god file; this is the only expand function. Cost/Risk: none.
 
 ## Cross-slice questions
 
-- **LmaoCore** (`packages/lmao-rs/crates/lmao-core/src/columns.rs:143-147`, `context.rs:74-87`, `tuning.rs:15-16`):
-  should `DEFAULT_CAPACITY` live next to MIN/MAX? Is `EnumColumn = NumColumn<u16>` the intended width vs TS `S.enum` =
+- **LmaoCore** (`packages/lmao/crates/lmao-core/src/columns.rs:143-147`, `context.rs:74-87`, `tuning.rs:15-16`): should
+  `DEFAULT_CAPACITY` live next to MIN/MAX? Is `EnumColumn = NumColumn<u16>` the intended width vs TS `S.enum` =
   Uint8Array / 1 byte (`packages/lmao/src/lib/schema/builder.ts:125-127`)? Rust `uint64` user-field kind has no
   `S.uint64()` on the TS builder (`builder.ts:79-198` exposes number/boolean/enum/category/text/binary/unknown/object;
   `bigUint64` is arrow-builder / `systemSchema.uint64_value`). Empty schema is legal in TS (`defineLogSchema({})` in
   `timestamps.bench.ts`) and rejected here (`lib.rs:128-132`) — which is SSOT?
-- **ColArrow** (`packages/lmao-rs/crates/lmao-arrow/src/dict.rs:464-465`, `source.rs:3-7`): when macro-generated buffers
+- **ColArrow** (`packages/lmao/crates/lmao-arrow/src/dict.rs:464-465`, `source.rs:3-7`): when macro-generated buffers
   implement `SpanSource`, what typed handle will carry the category/text/enum discriminant F1 says this crate must emit?
 - **LmaoCore example/bench** (`examples/jcode_tracer.rs`, `benches/hot_path.rs`): they are the only in-tree
   `define_log_schema!` consumers; F3/F6 change their call sites. `span!` is unused in-tree.

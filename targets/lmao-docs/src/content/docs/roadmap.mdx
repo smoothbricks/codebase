@@ -1,8 +1,7 @@
 ---
 title: Roadmap & ecosystem
 description: >-
-  Companion packages that extend @smoothbricks/lmao, and the directions still on
-  the roadmap.
+  Companion packages that extend @smoothbricks/lmao, and the directions still on the roadmap.
 sidebar:
   order: 99
 id: vx-pA92VNtu
@@ -10,9 +9,9 @@ created: '2026-07-21T09:58:49.227Z'
 modified: '2026-07-21T09:58:49.227Z'
 ---
 
-The rest of these docs cover the shipped `@smoothbricks/lmao` core. This page collects two things: **companion packages**
-that ship separately and extend the core, and the directions that are **still on the roadmap** — listed for context, not
-yet for use.
+The rest of these docs cover the shipped `@smoothbricks/lmao` core. This page collects two things: **companion
+packages** that ship separately and extend the core, and the directions that are **still on the roadmap** — listed for
+context, not yet for use.
 
 ## Companion packages (shipped separately)
 
@@ -42,9 +41,7 @@ transports ship, but the collector service they target is still a design. See
 
 ## Still on the roadmap
 
-:::caution
-The items below are not available as a shipped API. Don't write code against them.
-:::
+:::caution The items below are not available as a shipped API. Don't write code against them. :::
 
 ### AI-agent / MCP integration
 
@@ -58,16 +55,16 @@ browser-based Inspector above; consumers would wrap it with domain-specific verb
 
 ### Rust core
 
-A Rust reimplementation of the columnar core (`packages/lmao-rs`: buffers, Arrow conversion, the query engine, and the
-WASM allocator) is in progress. It backs the AOT/WASM path but is not a separate public API you install today — the
-shipped surface remains the TypeScript `@smoothbricks/lmao`.
+A Rust reimplementation of the columnar core (`packages/lmao`: buffers, Arrow conversion, the query engine, and the WASM
+allocator) is in progress. It backs the AOT/WASM path but is not a separate public API you install today — the shipped
+surface remains the TypeScript `@smoothbricks/lmao`.
 
 ### Partially built
 
 A few capabilities are underway but incomplete — present in the design and partly in the code, not yet a stable API:
 
-- **Op-metrics collection** — the reserved metric entry types and the `uint64_value` writer exist, but automatic
-  per-op accumulation is not wired up.
+- **Op-metrics collection** — the reserved metric entry types and the `uint64_value` writer exist, but automatic per-op
+  accumulation is not wired up.
 - **Runtime column promotion** — lazy→eager column promotion is only half-built.
 - **The Cloudflare collector service** — the billing-grade collector the sink adapters target is not deployed; a
   `FakeCollectorClient` ships so the lane composition is testable.

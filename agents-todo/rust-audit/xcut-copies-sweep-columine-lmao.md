@@ -1,7 +1,7 @@
-# XCUT copies sweep: columine + lmao-rs
+# XCUT copies sweep: columine + lmao
 
-Scope: grep-driven over every `packages/columine/crates/*/src/**/*.rs` and `packages/lmao-rs/crates/*/src/**/*.rs` (74
-src files, 31 066 lines including in-file `#[cfg(test)]`; 27 test-crate files / 11 647 lines excluded from production
+Scope: grep-driven over every `packages/columine/crates/*/src/**/*.rs` and `packages/lmao/crates/*/src/**/*.rs` (74 src
+files, 31 066 lines including in-file `#[cfg(test)]`; 27 test-crate files / 11 647 lines excluded from production
 counts). Close-read of hot-path modules listed below; remaining files covered by pattern census only. Doctrine:
 `BYPRODUCT-ENGINEERING.md`, `docs/handbook/04-mechanisms.md`, `05-memory-toolkit.md`, `02-measurement.md` §4.1.
 
@@ -296,8 +296,8 @@ for every bitmap opcode (F8). ColVmMaps / bitmap slice.
 
 ### F10 — HIGH — COPIES — Every lmao span allocates three capacity-sized `Vec`s plus an owned span name
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/buffer.rs:90-118`;
-`packages/lmao-rs/crates/lmao-core/src/context.rs:132-144`; `packages/lmao-rs/crates/lmao-core/src/columns.rs:22-29`
+Evidence: `packages/lmao/crates/lmao-core/src/buffer.rs:90-118`;
+`packages/lmao/crates/lmao-core/src/context.rs:132-144`; `packages/lmao/crates/lmao-core/src/columns.rs:22-29`
 
 ```
 let mut timestamps = vec![0i64; capacity];
@@ -327,7 +327,7 @@ LmaoArena.
 
 ### F11 — HIGH — COPIES — Span overflow allocates another full buffer (same three vecs) on the append path
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/buffer.rs:197-214`, `229-233`
+Evidence: `packages/lmao/crates/lmao-core/src/buffer.rs:197-214`, `229-233`
 
 ```
 if target.write_index == target.capacity {
@@ -378,7 +378,7 @@ before/after).
 
 ### F13 — HIGH — STRUCTURE — timestamp-proof `span_start` `expect`s on a 8-byte slice every span
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:40-70`; `layout.rs:50`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs:40-70`; `layout.rs:50`
 
 ```
 unsafe fn timestamp_nanos(trace_root_ptr: u32) -> i64 {
@@ -552,7 +552,7 @@ clone vector is.
 
 ### F22 — MEDIUM — COPIES — Arrow convert clones `NullBuffer` to share parent-nulls across two columns
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:284-311`
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:284-311`
 
 ```
 let parent_nulls = NullBuffer::new(parent_valid.finish());
@@ -582,7 +582,7 @@ slice.
 
 Evidence: `packages/columine/crates/columine-wasm/src/lib.rs:15-22, 110-144`;
 `packages/columine/crates/columine-ep-wasm/src/lib.rs:17, 43-45, 125-129, 210-211`;
-`packages/lmao-rs/crates/lmao-wasm/src/lib.rs:22, 67-109`
+`packages/lmao/crates/lmao-wasm/src/lib.rs:22, 67-109`
 
 columine-wasm documents the policy (one contract for all externs) and `state_mut` has a `# Safety` section. `state_ref`
 / `buf` / `cols_vec` / `from_raw_parts` sites do not restate length vs linear-memory bounds. ep-wasm
@@ -597,7 +597,7 @@ bounds check on `num_cols`. Not a copy finding except that unbounded `num_cols` 
 
 ### F25 — MEDIUM — COPIES — `TraceId::generate` `format!`s 32 hex chars
 
-Evidence: `packages/lmao-rs/crates/lmao-core/src/identity.rs:54-57`
+Evidence: `packages/lmao/crates/lmao-core/src/identity.rs:54-57`
 
 ```
 pub fn generate(entropy: &mut dyn Entropy) -> Self {
@@ -622,7 +622,7 @@ tokenize and call `append_*`. Cost/Risk: ColParseJson + ColParseMsgpack. Do it a
 
 ### F27 — LOW — COPIES — lmao-query builds SQL with `format!` / `to_string` per constraint
 
-Evidence: `packages/lmao-rs/crates/lmao-query/src/datafusion_backend.rs:47-76`, `sqlite_backend.rs:87-168`,
+Evidence: `packages/lmao/crates/lmao-query/src/datafusion_backend.rs:47-76`, `sqlite_backend.rs:87-168`,
 `arrow_backend.rs:45-62` Problem: Query-assertion path, not the span write path. `to_string()` on dictionary values per
 row when reading Arrow back is a test/query convenience copy. sqlite `HashMap<(String, u32), _>` keys
 `trace_id.to_string()` per row at ingest (sqlite_backend.rs:87-88). Fix: If this crate stays a test oracle, leave it. If

@@ -31,7 +31,7 @@ in {
       # The toolchain itself comes from ./devenv.smoo.nix (one nightly for every
       # repository, pinned by devenv.lock). Only this repository's extra targets
       # are declared here, below, via languages.rust.targets.
-      just # Task runner for packages/columine (mirrors the lmao-rs justfile)
+      just # Task runner for packages/columine (mirrors the lmao justfile)
       cargo-nextest # Rust test runner
       cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
       # Go comes from ./devenv.smoo.nix (languages.go), one version for every

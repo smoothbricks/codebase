@@ -1,4 +1,4 @@
-//! How a host like jcode adopts lmao-rs: schema definition, spans wrapping ops
+//! How a host like jcode adopts lmao: schema definition, spans wrapping ops
 //! inside async tokio tasks, and an interval flush loop.
 //!
 //! Run: `cargo run -p lmao-core --example jcode_tracer`

@@ -2,7 +2,7 @@
 
 Scope: `packages/columine/crates/columine-arrow/src/lib.rs` (36), `columns.rs` (1138), `record_batch.rs` (713), `ipc.rs`
 (688), `schema.rs` (434), `Cargo.toml` (17). Neighbor reads (public surface only):
-`packages/lmao-rs/crates/lmao-arrow/{Cargo.toml,src/lib.rs,src/convert.rs:1-90}`; targeted greps for Arrow versions,
+`packages/lmao/crates/lmao-arrow/{Cargo.toml,src/lib.rs,src/convert.rs:1-90}`; targeted greps for Arrow versions,
 `ArrowType`, `EventLogError`, batch limits, `has_extraction_fields`. Rubric: `BYPRODUCT-ENGINEERING.md`,
 `docs/handbook/{02-measurement.md §4.1, 04-mechanisms.md, 05-memory-toolkit.md}`.
 
@@ -14,7 +14,7 @@ Scope: `packages/columine/crates/columine-arrow/src/lib.rs` (36), `columns.rs` (
 - Physical `ArrowType` tags and batch ceilings are restated in TS (`COMPACT_KIND_TAG`, `parse-backend.ts` constants);
   `ParseError` claims a TS `EventLogError` that does not exist.
 - This crate is not a copy of `lmao-arrow`. RecordBatch IPC is fully hand-rolled; `arrow-ipc`/`arrow-schema` are used
-  only to decode the inbound Schema message. Arrow 56 here vs 55 in `lmao-rs`.
+  only to decode the inbound Schema message. Arrow 56 here vs 55 in `lmao`.
 - Int32 rides `ColumnType::Int64` with width 4; `read_fixed_i64` zero-extends, so signed Int32 reads are wrong. Null
   columns allocate Utf8 storage they never emit.
 - Null counts are re-derived by walking rows despite an already-packed validity bitmap (once per IPC encode).
@@ -153,11 +153,11 @@ use arrow_schema::DataType;
 Hand-rolled writer: `record_batch.rs:1-5, 367-424` (in-place Message/RecordBatch FlatBuffers, continuation prefix) and
 `ipc.rs:1-6, 155-229` (schema-bytes copy + body + EOS). `Cargo.toml:10-17`: runtime `arrow-ipc` + `arrow-schema`;
 `arrow-array` is dev-only (StreamReader oracle in `ipc.rs:388-617`). `lmao-arrow` public surface
-(`packages/lmao-rs/crates/lmao-arrow/src/lib.rs:1-35`, `convert.rs:52-64, 148-151`): `convert_span_trees` →
+(`packages/lmao/crates/lmao-arrow/src/lib.rs:1-35`, `convert.rs:52-64, 148-151`): `convert_span_trees` →
 `arrow_array::RecordBatch` with dictionary-encoded trace columns (`timestamp`, `trace_id`, …). No IPC writer, no
 event-log schema, no byte-backed columns. Workspace versions: columine/cowshed `arrow-* = "56"`;
-`packages/lmao-rs/Cargo.toml` `arrow-* = "55"`. cowshed uses official `StreamWriter`/`StreamReader` on `RecordBatch`
-values (not this crate). Problem: Three Arrow stacks, two jobs. columine-arrow exists to emit IPC bytes in wasm without
+`packages/lmao/Cargo.toml` `arrow-* = "55"`. cowshed uses official `StreamWriter`/`StreamReader` on `RecordBatch` values
+(not this crate). Problem: Three Arrow stacks, two jobs. columine-arrow exists to emit IPC bytes in wasm without
 `arrow-array`. The hand-rolled path does **not** duplicate `arrow-ipc`’s writer (that writer is unused) and does **not**
 duplicate `lmao-arrow`. Dropping `arrow-ipc`/`arrow-schema` is a real wasm-size win **if and only if** Schema-message
 validation is rewritten. That decoder is not ~30 lines: untrusted FFI schema bytes need a real FlatBuffers Schema
@@ -165,10 +165,9 @@ reader. `logical_types: Vec<DataType>` (`schema.rs:93, 167`) is retained after v
 `schema.rs:345` — it does not justify the dep on its own. `default-features = false` is already set; keep it. `proptest`
 is listed in this crate’s dev-deps and never used (`Cargo.toml:16`; grep in the crate is the manifest line only). Fix:
 Keep `arrow-ipc`/`arrow-schema` for Schema decode until a dedicated decoder exists. Delete `logical_types` from the
-retained config. Delete the unused `proptest` dev-dep. Do not merge with `lmao-arrow`. Align `lmao-rs` to arrow 56 in
-that workspace (cross-slice), not by sharing this crate. Cost/Risk: Schema decode is the processor-create boundary; a
-wrong hand-roll is a security/compat hole. Wrong “just drop the crate” recommendation would ship invalid-schema
-acceptance.
+retained config. Delete the unused `proptest` dev-dep. Do not merge with `lmao-arrow`. Align `lmao` to arrow 56 in that
+workspace (cross-slice), not by sharing this crate. Cost/Risk: Schema decode is the processor-create boundary; a wrong
+hand-roll is a security/compat hole. Wrong “just drop the crate” recommendation would ship invalid-schema acceptance.
 
 ### F5 — MEDIUM — STRUCTURE — Int32 is `ColumnType::Int64` width 4; `read_fixed_i64` zero-extends
 
@@ -311,7 +310,7 @@ literal or delete it. Cost/Risk: Test-only.
   cannot close that without owning that file.
 - `columine-parsing` `read_cell` (`lib.rs:73-87`) consumes `read_fixed_i64` on every `ColumnType::Int64`, including
   width-4 Int32. Confirm whether any differential test feeds negative Int32.
-- `lmao-arrow` / `lmao-rs` workspace: arrow 55 vs columine/cowshed 56. Not a duplicate library; version pin only.
+- `lmao-arrow` / `lmao` workspace: arrow 55 vs columine/cowshed 56. Not a duplicate library; version pin only.
   `LmaoArrow` owns whether 55 is load-bearing.
 - cowshed-core/cowshed-gateway official `StreamWriter` on arrow 56: different job (RecordBatch in-process). No merge
   with this wasm byte-writer.

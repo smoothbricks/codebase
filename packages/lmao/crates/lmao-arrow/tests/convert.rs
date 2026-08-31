@@ -145,7 +145,7 @@ fn pyarrow_reads_our_ipc() {
 
     let empty_catalog = StableVocabularyCatalog::EMPTY;
     let batch = convert_span_trees(&[real_root("pyarrow-trace", 1, 10)], &empty_catalog).unwrap();
-    let dir = std::env::temp_dir().join("lmao-rs-pyarrow-verify");
+    let dir = std::env::temp_dir().join("lmao-pyarrow-verify");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("chunk.arrow");
     let expected_schema = [

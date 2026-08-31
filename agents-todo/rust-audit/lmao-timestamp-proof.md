@@ -1,15 +1,13 @@
 # lmao-timestamp-proof
 
-Scope: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs` (234),
-`packages/lmao-rs/crates/lmao-timestamp-proof/src/layout.rs` (104),
-`packages/lmao-rs/crates/lmao-timestamp-proof/Cargo.toml` (26), `packages/lmao-rs/crates/lmao-timestamp-proof/build.rs`
-(33). Targeted greps/reads (duplication only, not a full audit of those slices):
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs`, `packages/lmao-rs/crates/lmao-arena/src/lib.rs`,
-`packages/lmao-rs/crates/lmao-core/src/clock.rs`, `packages/lmao-rs/crates/lmao-wasm/src/lib.rs`,
+Scope: `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs` (234),
+`packages/lmao/crates/lmao-timestamp-proof/src/layout.rs` (104), `packages/lmao/crates/lmao-timestamp-proof/Cargo.toml`
+(26), `packages/lmao/crates/lmao-timestamp-proof/build.rs` (33). Targeted greps/reads (duplication only, not a full
+audit of those slices): `packages/lmao/crates/lmao-arena/src/raw.rs`, `packages/lmao/crates/lmao-arena/src/lib.rs`,
+`packages/lmao/crates/lmao-core/src/clock.rs`, `packages/lmao/crates/lmao-wasm/src/lib.rs`,
 `packages/lmao/src/lib/schema/systemSchema.ts`, `packages/lmao/src/lib/traceRoot.{es,node,ts}.ts`,
-`packages/lmao/src/lib/wasm/wasmTraceRoot.ts`, `specs/lmao/01b3_high_precision_timestamps.md`,
-`packages/lmao-rs/justfile`, `packages/lmao-rs/Cargo.toml`, `packages/lmao-rs/Cargo.lock`. Src is two files / 338 lines
-(task said three).
+`packages/lmao/src/lib/wasm/wasmTraceRoot.ts`, `specs/lmao/01b3_high_precision_timestamps.md`, `packages/lmao/justfile`,
+`packages/lmao/Cargo.toml`, `packages/lmao/Cargo.lock`. Src is two files / 338 lines (task said three).
 
 ## Summary
 
@@ -27,7 +25,7 @@ Scope: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs` (234),
 
 ### F1 — HIGH — SSOT — WASM and NAPI timestamp formulas are copies, and they already disagree
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:41-54`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs:41-54`
 
 ```
         let wall_clock = i64::from_le_bytes(
@@ -44,7 +42,7 @@ Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:41-54`
         wall_clock + (elapsed_ms * 1_000_000.0) as i64
 ```
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:133-169`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs:133-169`
 
 ```
     fn wall_clock_nanos() -> i64 {
@@ -73,7 +71,7 @@ was comparing `.wasm` vs `.node`. Production TS/arena unchanged if this crate st
 
 ### F2 — HIGH — DUPLICATION — Span lifecycle writes and entry-type bytes are a second Rust copy; write-index already diverged
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/layout.rs:9-12,32-59`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/layout.rs:9-12,32-59`
 
 ```
 pub const ENTRY_TYPE_SPAN_START: u8 = 1;
@@ -108,7 +106,7 @@ justfile artifact consumers must move with it.
 
 ### F3 — HIGH — DEP-BLOAT — Separate crate is not a `lmao-core` module, but NAPI + unused `proptest` do not earn the compile unit
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/Cargo.toml:10-26`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/Cargo.toml:10-26`
 
 ```
 crate-type = ["cdylib", "rlib"]
@@ -119,7 +117,7 @@ napi-build = { version = "2", optional = true }
 proptest = { workspace = true }
 ```
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:2-6`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs:2-6`
 
 ```
 //! This crate implements the proof machinery (measuring span-timestamp accuracy
@@ -133,7 +131,7 @@ weight test anyway. (1) 01b3:23-25 already measured NAPI slower than WASM and re
 package; this crate reintroduces napi 2.16.17 + napi-derive/syn + napi-sys + ctor + once_cell (`Cargo.lock`
 `lmao-timestamp-proof` / `napi` entries) for `span_start.node`. Node can instantiate the WASM module. (2) `proptest` is
 a dev-dep with zero uses in this crate. (3) `proofs/timestamp-accuracy.proof.ts` is not in the repo (grep/`glob` over
-the tree: only this crate doc and `packages/lmao-rs/justfile:33-49`). Workspace still compiles this member on every
+the tree: only this crate doc and `packages/lmao/justfile:33-49`). Workspace still compiles this member on every
 `--workspace` check. Fix: Delete the crate and the `timestamp-proof-artifacts` recipe. Prove against `lmao-wasm`
 (already exports `init_trace_root`/`span_start`/`span_end_*`/`write_log_entry`) and
 `traceRoot.node.ts`/`traceRoot.es.ts`. If a shared-memory stripped wasm is still required, gate it as a `lmao-wasm`
@@ -142,7 +140,7 @@ depends on this crate (only the justfile copies artifacts).
 
 ### F4 — MEDIUM — STRUCTURE — WASM memory views are `unsafe` with no stated invariant
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:35-38,67-70`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs:35-38,67-70`
 
 ```
     unsafe fn buf_at<'a>(offset: u32, len: usize) -> &'a mut [u8] {
@@ -165,7 +163,7 @@ unless folded into arena.
 
 ### F5 — MEDIUM — STRUCTURE — NAPI proof kernel locks a global `Mutex` and scans anchors per stamp
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:124-169`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs:124-169`
 
 ```
     const MAX_TRACE_ROOTS: usize = 64;
@@ -190,7 +188,7 @@ Cost/Risk: NAPI ABI: `initTraceRoot` would write the buffer instead of ignoring 
 
 ### F6 — LOW — TESTS — Tests pin layout bytes, not the timestamp contract; FFI arms never run
 
-Evidence: `packages/lmao-rs/crates/lmao-timestamp-proof/src/layout.rs:71-103`
+Evidence: `packages/lmao/crates/lmao-timestamp-proof/src/layout.rs:71-103`
 
 ```
     fn span_start_arms_exception_row() {

@@ -1,11 +1,12 @@
 # lmao-wasm
 
-Scope: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs` (523), `packages/lmao-rs/crates/lmao-wasm/Cargo.toml` (13),
-`packages/lmao-rs/Cargo.toml` (50), `packages/lmao-rs/Cargo.lock` (3051; name/version census + `lmao-*` entries),
-`packages/lmao-rs/package.json` (42), `packages/lmao-rs/justfile` (49), `packages/lmao-rs/mutants.toml` (30). Targeted
-confirmation (not owned): `packages/lmao/src/lib/wasm/wasmAllocator.ts`, `packages/lmao-rs/.cargo/config.toml`,
-`packages/lmao-rs/crates/lmao-arena/src/lib.rs` (`SizeClass`), `packages/lmao-rs/crates/lmao-arena/src/raw.rs` (ABI
-constants), `AGENTS.md` (Nx `{tool}-{output}` rule).
+Scope: `packages/lmao/crates/lmao-wasm/src/lib.rs` (523), `packages/lmao/crates/lmao-wasm/Cargo.toml` (13),
+`packages/lmao/Cargo.toml` (50), `packages/lmao/Cargo.lock` (3051; name/version census + `lmao-*` entries),
+`packages/lmao/package.json` (the Nx target block; the audited file was the `package.json` of the private Rust-only
+sibling package, since deleted, whose Rust targets moved here unchanged), `packages/lmao/justfile` (49),
+`packages/lmao/mutants.toml` (30). Targeted confirmation (not owned): `packages/lmao/src/lib/wasm/wasmAllocator.ts`,
+`packages/lmao/.cargo/config.toml`, `packages/lmao/crates/lmao-arena/src/lib.rs` (`SizeClass`),
+`packages/lmao/crates/lmao-arena/src/raw.rs` (ABI constants), `AGENTS.md` (Nx `{tool}-{output}` rule).
 
 ## Summary
 
@@ -23,7 +24,7 @@ constants), `AGENTS.md` (Nx `{tool}-{output}` rule).
 
 ### F1 — HIGH — SSOT — `wasm-release` is defined for this allocator and not used by it
 
-Evidence: `packages/lmao-rs/Cargo.toml:36-40`
+Evidence: `packages/lmao/Cargo.toml:36-40`
 
 ```
 # wasm32 export size matters for the allocator module consumed by the TypeScript host.
@@ -33,18 +34,17 @@ opt-level = "z"
 panic = "abort"
 ```
 
-`packages/lmao-rs/justfile:18-21`
+`packages/lmao/justfile:16-25`
 
 ```
 wasm:
     cargo build -p lmao-wasm --target wasm32-unknown-unknown --release
-    mkdir -p dist
-    cp target/wasm32-unknown-unknown/release/lmao_wasm.wasm dist/lmao_wasm.wasm
+    @mkdir -p dist
+    @cp target/wasm32-unknown-unknown/release/allocator.wasm dist/allocator.wasm
 ```
 
-`packages/lmao-rs/package.json:18-36` (`cargo-wasm` → `just wasm`). Contrast `justfile:36-43`: `lmao-timestamp-proof`
-_does_ pass `--profile wasm-release` and copies from `target/wasm32-unknown-unknown/wasm-release/`. Neighbour
-`packages/lmao-rs/.cargo/config.toml:10` repeats the same `--release` alias.
+`packages/lmao/package.json` `nx.targets.cargo-wasm` (`cargo-wasm` → `just wasm`). Neighbour
+`packages/lmao/.cargo/config.toml:10` repeats the same `--release` alias.
 
 Problem: The workspace comment names this crate as the reason `wasm-release` exists (`opt-z` + `panic = abort`). The
 artifact the TypeScript host actually loads is `[profile.release]` (`lto = true`, `codegen-units = 1`, default
@@ -53,16 +53,16 @@ Size claims about the allocator module describe a binary that is not built; any 
 would not match production.
 
 Fix: Point `just wasm` (and the cargo alias) at `--profile wasm-release` and copy from
-`target/wasm32-unknown-unknown/wasm-release/lmao_wasm.wasm` **or** delete the “allocator module” comment and keep
+`target/wasm32-unknown-unknown/wasm-release/allocator.wasm` **or** delete the “allocator module” comment and keep
 `--release` if the host wants the speed profile. Do not leave both. Decision: keep `--release` for the allocator (column
-IO is a hot ABI) and retarget the profile comment at `lmao-timestamp-proof`, which is the only consumer today.
+IO is a hot ABI); the comment now has no other consumer, so it is the comment that must go.
 
 Cost/Risk: Changing the shipped profile changes both size and ns/op of every WASM span write. Same-profile A/B required
 (PH-4.1). Nx `cargo-wasm` inputs already include `justfile` + `Cargo.toml`.
 
 ### F2 — MEDIUM — SSOT — `SizeClass` restated in TS with an extra discriminant this crate silently aliases to `Col8B`
 
-Evidence: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:130-136`
+Evidence: `packages/lmao/crates/lmao-wasm/src/lib.rs:130-136`
 
 ```
 fn size_class(sc: u8) -> SizeClass {
@@ -75,7 +75,7 @@ fn size_class(sc: u8) -> SizeClass {
 }
 ```
 
-`packages/lmao-rs/crates/lmao-arena/src/lib.rs:37-43` (SSOT): `SpanSystem=0, Col1B=1, Col4B=2, Col8B=3` — no `Identity`.
+`packages/lmao/crates/lmao-arena/src/lib.rs:37-43` (SSOT): `SpanSystem=0, Col1B=1, Col4B=2, Col8B=3` — no `Identity`.
 `packages/lmao/src/lib/wasm/wasmAllocator.ts:133-138`
 
 ```
@@ -104,7 +104,7 @@ caller. Freelist debug exports are the only consumers of `size_class`.
 
 ### F3 — MEDIUM — DUPLICATION — crate comment claims the export list matches the TS host; it does not
 
-Evidence: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:13-14`
+Evidence: `packages/lmao/crates/lmao-wasm/src/lib.rs:13-14`
 
 ```
 //! - Export names match the allocator export list consumed by the TypeScript
@@ -140,7 +140,7 @@ bench. `get_performance_now` / `debug_compute_timestamp` are also exported by `l
 
 ### F4 — MEDIUM — COPIES — `black_box` on every load/store, not only header offset 0
 
-Evidence: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:63-110`
+Evidence: `packages/lmao/crates/lmao-wasm/src/lib.rs:63-110`
 
 ```
 /// Absolute offset → pointer, laundered through `black_box` so LLVM cannot prove
@@ -169,7 +169,7 @@ header at 0, then a census of `WasmMem::write_u64` with and without the barrier.
 
 ### F5 — MEDIUM — TESTS — native smoke cannot go red on the wasm backend, clocks, or grow
 
-Evidence: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:39-46` (native clocks)
+Evidence: `packages/lmao/crates/lmao-wasm/src/lib.rs:39-46` (native clocks)
 
 ```
 unsafe fn host_performance_now() -> f64 { 0.0 }
@@ -196,19 +196,18 @@ Cost/Risk: Needs `wasm32-unknown-unknown` in CI and a JS or wasmtime harness. Do
 
 ### F6 — LOW — SSOT — npm package version and Cargo workspace version disagree
 
-Evidence: `packages/lmao-rs/package.json:3` `"version": "0.1.0"` vs `packages/lmao-rs/Cargo.toml:14` `version = "0.0.1"`
-(and `Cargo.lock` `lmao-wasm` `version = "0.0.1"` at line 1775).
+Superseded by the merge of the Rust workspace into `packages/lmao`. As audited, the crates lived in a private Rust-only
+sibling package whose `package.json` version (`0.1.0`) restated a Cargo workspace version (`0.0.1`) for the same thing,
+and both were decorative because that package was never published. That package no longer exists.
 
-Problem: Two version numbers for one package. Not a runtime bug (`publish = false`), but the restated constant will
-drift.
-
-Fix: One version. Cargo workspace is the Rust SSOT; set `package.json` to `0.0.1` or stop claiming a version there.
-
-Cost/Risk: None for the wasm ABI.
+What is left is not the same finding. `packages/lmao/package.json` version (`0.3.6-next.0`) is the PUBLISHED npm version
+and governs the tarball; `packages/lmao/Cargo.toml` `[workspace.package] version = "0.0.1"` is an internal constant for
+crates that are deliberately not published to crates.io — one release channel, so the wasm and the crates that built it
+cannot skew. Two numbers naming two different things is not a restated constant, and there is nothing here to drift.
 
 ### F7 — LOW — STRUCTURE — crate-wide `missing_safety_doc` allow; `unsafe` blocks state no invariant
 
-Evidence: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:22` `#![allow(clippy::missing_safety_doc)]` `lib.rs:88-109`:
+Evidence: `packages/lmao/crates/lmao-wasm/src/lib.rs:22` `#![allow(clippy::missing_safety_doc)]` `lib.rs:88-109`:
 `unsafe { laundered(off).cast::<u32>().read_unaligned() }` (and u8/u64/write twins) with no `// SAFETY:` citing “offset
 is inside the imported linear memory; unaligned column payloads are the ABI”. Host imports (`lib.rs:32-37`) and native
 stubs (`lib.rs:40-46`) are `unsafe fn` without docs.
@@ -223,7 +222,7 @@ Cost/Risk: None.
 
 ### F8 — LOW — STRUCTURE — WASM page size `65536` written twice as a bare literal
 
-Evidence: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:77` and `:84`
+Evidence: `packages/lmao/crates/lmao-wasm/src/lib.rs:77` and `:84`
 
 ```
 (core::arch::wasm32::memory_size(0) as u32).saturating_mul(65536)
@@ -243,7 +242,7 @@ Cost/Risk: None.
 - `packages/lmao/src/lib/wasm/wasmAllocator.ts:328` binds `allocExact: exports.alloc_exact` with no `refreshViews()`.
   `createAndStartSpan` / `createOverflowSpan` do refresh. If `alloc_exact` → `memory.grow`, TypedArray views go stale.
   Owned by the TS wasm wrapper, not this crate.
-- `packages/lmao-rs/crates/lmao-timestamp-proof/src/lib.rs:99-106` re-exports `get_performance_now` /
+- `packages/lmao/crates/lmao-timestamp-proof/src/lib.rs:99-106` re-exports `get_performance_now` /
   `debug_compute_timestamp` under the same names. If those symbols are deleted from this crate (F3), confirm the proof
   crate remains the timestamp-harness ABI. Slice: timestamp-proof.
 - `ENTRY_TYPE_SPAN_{START,OK,ERR,EXCEPTION}` live in `lmao-arena` `raw.rs:86-89` and again in

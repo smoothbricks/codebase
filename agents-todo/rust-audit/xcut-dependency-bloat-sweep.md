@@ -2,13 +2,13 @@
 
 Scope: doctrine (`BYPRODUCT-ENGINEERING.md`, `docs/handbook/02-measurement.md` §4.1, `04-mechanisms.md`,
 `05-memory-toolkit.md`); workspace manifests `packages/cowshed/Cargo.toml` (31), `packages/columine/Cargo.toml` (62),
-`packages/lmao-rs/Cargo.toml` (50); crate manifests cowshed-core (39), cowshed-cli (28), cowshed-gateway (45),
-cowshed-napi (20), cowshed-escape-tests (7), columine-arrow (17), columine-ep-wasm (21), columine-event-processor (19),
+`packages/lmao/Cargo.toml` (50); crate manifests cowshed-core (39), cowshed-cli (28), cowshed-gateway (45), cowshed-napi
+(20), cowshed-escape-tests (7), columine-arrow (17), columine-ep-wasm (21), columine-event-processor (19),
 columine-parsing (16), columine-types (10), columine-vm (19), columine-wasm (15), lmao-arena (19), lmao-arrow (23),
 lmao-core (26), lmao-macros (19), lmao-query (25), lmao-timestamp-proof (26), lmao-wasm (13); lockfiles
 `packages/cowshed/Cargo.lock` (2629, 272 entries / 256 names), `packages/columine/Cargo.lock` (921, 102 / 99),
-`packages/lmao-rs/Cargo.lock` (3051, 289 / 280). Targeted greps of `packages/cowshed`, `packages/columine`,
-`packages/lmao-rs` for candidate-crate use. No `cargo`/`nx`. Versions and closures are from the lockfiles as text.
+`packages/lmao/Cargo.lock` (3051, 289 / 280). Targeted greps of `packages/cowshed`, `packages/columine`, `packages/lmao`
+for candidate-crate use. No `cargo`/`nx`. Versions and closures are from the lockfiles as text.
 
 Regime for this slice (PERFORMANCE-HANDBOOK §4.1): compile/link/lockfile weight, not a hot probe. An extra crate on a
 once-per-boot path is a note; a workspace-wide `tokio/full` or a 224-node DataFusion graph that pins Arrow across
@@ -16,15 +16,15 @@ workspaces is a finding.
 
 ## Summary
 
-- Arrow is 56.2.1 in cowshed+columine and 55.2.0 in lmao-rs; DataFusion 47 is the pin and the lockfile is 224 packages
-  in that crate's closure.
+- Arrow is 56.2.1 in cowshed+columine and 55.2.0 in lmao; DataFusion 47 is the pin and the lockfile is 224 packages in
+  that crate's closure.
 - `tokio = { features = ["full"] }` is workspace-wide in cowshed; every production binary uses `current_thread`, never
   `rt-multi-thread`.
 - `rustls-platform-verifier` pulls `jni` + `rustls-platform-verifier-android` + `openssl-probe` into the cowshed
   lockfile for a macOS-first gateway.
 - `cowshed-napi` (cdylib) depends on `cowshed-cli`, so the `.node` links clap/toml and the full CLI.
 - Unused workspace keys: cowshed `anyhow`; columine `rustc-hash` and `criterion`.
-- Intra-lockfile duplicates: `getrandom` 0.2+0.3+0.4 in all three locks; `hashbrown` three majors in lmao-rs.
+- Intra-lockfile duplicates: `getrandom` 0.2+0.3+0.4 in all three locks; `hashbrown` three majors in lmao.
 - `syn features=["full"]` is KEEP (`syn::Expr`). CLI-substitution candidates are KEEP except as noted in F-list.
 - `roaring` is a columine-vm _dev_-dep only; it must not re-enter `columine-wasm`.
 - `datafusion`/`rusqlite` are optional on `lmao-query` (`default = []`); they still occupy the lockfile and pin
@@ -35,7 +35,7 @@ workspaces is a finding.
 
 ### F1 — HIGH — SSOT — Arrow 55 vs 56 across the three lockfiles
 
-Evidence: `packages/lmao-rs/Cargo.toml:23-27`
+Evidence: `packages/lmao/Cargo.toml:23-27`
 
 ```
 # Arrow subcrates only (not the `arrow` umbrella) to keep compile times down.
@@ -63,14 +63,14 @@ arrow-schema = "56"
 ```
 
 Lockfile resolved: cowshed+columine `arrow-array`/`arrow-buffer`/`arrow-data`/`arrow-ipc`/`arrow-schema`/`arrow-select`
-= 56.2.1; lmao-rs the same crates = 55.2.0, plus the `arrow` umbrella 55.2.0 pulled by DataFusion.
+= 56.2.1; lmao the same crates = 55.2.0, plus the `arrow` umbrella 55.2.0 pulled by DataFusion.
 
-Problem: one on-disk Arrow format, two majors. lmao-rs cannot move to 56 while `datafusion = "47"` remains a member
+Problem: one on-disk Arrow format, two majors. lmao cannot move to 56 while `datafusion = "47"` remains a member
 dependency (optional or not — cargo locks it). IPC written by columine 56 is not guaranteed to be what lmao-arrow 55
 reads. This is already divergence, not just duplication.
 
 Fix: pick 56 as the monorepo SSOT (cowshed and columine already did). Drop the `datafusion` feature of `lmao-query` or
-replace DataFusion 47 with a release that takes Arrow 56; then retarget `packages/lmao-rs/Cargo.toml`
+replace DataFusion 47 with a release that takes Arrow 56; then retarget `packages/lmao/Cargo.toml`
 workspace.dependencies to `"56"`. Do not introduce a compatibility shim.
 
 Cost/Risk: `lmao-query` DataFusion backend and its tests move; Arrow 55 leaves the lmao lockfile. columine/cowshed
@@ -79,7 +79,7 @@ unchanged.
 Cross-lockfile version splits (every crate present in ≥2 lockfiles at disagreeing versions). Patch-level noise listed so
 it is not re-discovered:
 
-| crate                                                   | cowshed                            | columine   | lmao-rs                        |
+| crate                                                   | cowshed                            | columine   | lmao                           |
 | ------------------------------------------------------- | ---------------------------------- | ---------- | ------------------------------ |
 | **arrow-array / buffer / data / ipc / schema / select** | **56.2.1**                         | **56.2.1** | **55.2.0**                     |
 | clap / clap_builder                                     | 4.6.6                              | —          | 4.6.1 / 4.6.0                  |
@@ -94,12 +94,12 @@ it is not re-discovered:
 | rand / rand_chacha / rand_core                          | 0.9.5 / 0.9.0 / 0.9.5              | same       | **also** 0.8.7 / 0.3.1 / 0.6.4 |
 | windows-sys                                             | 0.52.0, 0.60.2, 0.61.2             | 0.61.2     | 0.61.2                         |
 
-Intra-lockfile duplicates not in that table: cowshed `windows-targets` 0.52.6+0.53.5 and eight `windows_*` triples;
-lmao-rs `itertools` 0.10.5+0.14.0.
+Intra-lockfile duplicates not in that table: cowshed `windows-targets` 0.52.6+0.53.5 and eight `windows_*` triples; lmao
+`itertools` 0.10.5+0.14.0.
 
 ### F2 — HIGH — DEP-BLOAT — DataFusion 47 is a 224-node graph behind an optional feature
 
-Evidence: `packages/lmao-rs/crates/lmao-query/Cargo.toml:12-21`
+Evidence: `packages/lmao/crates/lmao-query/Cargo.toml:12-21`
 
 ```
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
@@ -111,12 +111,12 @@ sqlite = ["dep:rusqlite"]
 datafusion = ["dep:datafusion", "dep:tokio"]
 ```
 
-`packages/lmao-rs/Cargo.lock:584-611` — `datafusion` 47.0.0 lists 41 direct deps including `datafusion-datasource-csv`,
+`packages/lmao/Cargo.lock:584-611` — `datafusion` 47.0.0 lists 41 direct deps including `datafusion-datasource-csv`,
 `datafusion-datasource-json`, `datafusion-functions-nested`, and the rest of the 27 `datafusion-*` packages. Closure
-from the lockfile graph: **224** packages. lmao-rs without `datafusion`+`rusqlite`: 161 names; 119 names exist only on
-that path.
+from the lockfile graph: **224** packages. lmao without `datafusion`+`rusqlite`: 161 names; 119 names exist only on that
+path.
 
-`packages/lmao-rs/crates/lmao-query/src/datafusion_backend.rs:37-41` SQL is `SELECT * FROM spans WHERE …` and a
+`packages/lmao/crates/lmao-query/src/datafusion_backend.rs:37-41` SQL is `SELECT * FROM spans WHERE …` and a
 `NOT EXISTS` subquery — no array/list nested-expression functions.
 
 Problem: `default-features = false` does not make DataFusion small. `nested_expressions` is not referenced by the SQL
@@ -159,7 +159,7 @@ Grep of `packages/cowshed` for `flavor = "multi_thread"`, `rt-multi-thread`, `Ru
 
 Lockfile contrast: cowshed `tokio` 1.52.3 depends on
 `bytes, libc, mio, parking_lot, pin-project-lite, signal-hook-registry, socket2, tokio-macros, windows-sys 0.61.2` (9).
-lmao-rs `tokio` 1.52.3 with `features = ["rt"]` depends on `bytes, pin-project-lite, tokio-macros` (3).
+lmao `tokio` 1.52.3 with `features = ["rt"]` depends on `bytes, pin-project-lite, tokio-macros` (3).
 
 Features actually referenced in cowshed source: `macros` (`tokio::main`, `tokio::test`, `select!`, `pin!`, `join!`),
 `rt` (`spawn`, `spawn_blocking`, `JoinSet`, `JoinHandle`), `time`, `signal`, `io-util`, `io-std` (`tokio::io::stdin`),
@@ -302,10 +302,10 @@ Cost/Risk: none.
 
 Evidence: `packages/cowshed/Cargo.lock` packages `getrandom` 0.2.17 (ring), 0.3.4 (cowshed-core direct,
 `getrandom::fill` in `workspace_credentials.rs:121` and `bootstrap/native/macos.rs:912`), 0.4.3 (uuid). Same three
-versions in columine and lmao-rs lockfiles.
+versions in columine and lmao lockfiles.
 
 Problem: three copies of one crate in each workspace. Not a runtime hot-path issue (§4.1). It is the same class as
-hashbrown 0.14/0.15/0.17 in lmao-rs (DataFusion/Arrow). Cannot be collapsed from our manifests without waiting for
+hashbrown 0.14/0.15/0.17 in lmao (DataFusion/Arrow). Cannot be collapsed from our manifests without waiting for
 ring/uuid to share a getrandom major.
 
 Fix: no local fix that is honest. Do not add a fourth. When uuid/ring move, re-lock. Not worth a compatibility crate.

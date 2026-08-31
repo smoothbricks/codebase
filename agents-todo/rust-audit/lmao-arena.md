@@ -1,11 +1,11 @@
 # lmao-arena
 
-Scope: `packages/lmao-rs/crates/lmao-arena/src/lib.rs` (284), `packages/lmao-rs/crates/lmao-arena/src/raw.rs` (905),
-`packages/lmao-rs/crates/lmao-arena/Cargo.toml` (19), `packages/lmao-rs/crates/lmao-arena/benches/arena.rs` (102). TESTS
-axis also read `packages/lmao-rs/crates/lmao-arena/tests/properties.rs` (470). Targeted greps:
-`packages/lmao-rs/crates/lmao-wasm/src/lib.rs`, `packages/lmao-rs/crates/lmao-core/src/entry_type.rs`,
-`packages/lmao-rs/crates/lmao-core/src/tuning.rs`, `packages/lmao/src/lib/wasm/wasmAllocator.ts`,
-`packages/lmao/src/lib/schema/systemSchema.ts`, `packages/lmao-rs/Cargo.lock`.
+Scope: `packages/lmao/crates/lmao-arena/src/lib.rs` (284), `packages/lmao/crates/lmao-arena/src/raw.rs` (905),
+`packages/lmao/crates/lmao-arena/Cargo.toml` (19), `packages/lmao/crates/lmao-arena/benches/arena.rs` (102). TESTS axis
+also read `packages/lmao/crates/lmao-arena/tests/properties.rs` (470). Targeted greps:
+`packages/lmao/crates/lmao-wasm/src/lib.rs`, `packages/lmao/crates/lmao-core/src/entry_type.rs`,
+`packages/lmao/crates/lmao-core/src/tuning.rs`, `packages/lmao/src/lib/wasm/wasmAllocator.ts`,
+`packages/lmao/src/lib/schema/systemSchema.ts`, `packages/lmao/Cargo.lock`.
 
 ## Summary
 
@@ -25,10 +25,10 @@ axis also read `packages/lmao-rs/crates/lmao-arena/tests/properties.rs` (470). T
 
 ### F1 — HIGH — SSOT — Header layout is two sources; exact-freelist head is only in one
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/lib.rs:45-60` +
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs:46-57` + `packages/lmao-rs/crates/lmao-arena/src/lib.rs:91-94`
+Evidence: `packages/lmao/crates/lmao-arena/src/lib.rs:45-60` + `packages/lmao/crates/lmao-arena/src/raw.rs:46-57` +
+`packages/lmao/crates/lmao-arena/src/lib.rs:91-94`
 
-```45:60:packages/lmao-rs/crates/lmao-arena/src/lib.rs
+```45:60:packages/lmao/crates/lmao-arena/src/lib.rs
 /// Arena header at offset 0; field order and padding are ABI, verified by the
 /// const asserts below.
 #[repr(C)]
@@ -47,7 +47,7 @@ pub struct Header {
 }
 ```
 
-```46:57:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```46:57:packages/lmao/crates/lmao-arena/src/raw.rs
 const H_BUMP_PTR: u32 = 0;
 const H_SPAN_ID_COUNTER: u32 = 4;
 const H_ALLOC_COUNT: u32 = 8;
@@ -72,10 +72,10 @@ documents the 192-byte reserved tail. Field order is ABI with TS/wasm linear mem
 
 ### F2 — HIGH — COPIES — Every alloc zeros via a per-byte `write_u8` loop
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/raw.rs:299-305` +
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs:350-357` + `packages/lmao-rs/crates/lmao-arena/benches/arena.rs:12-22`
+Evidence: `packages/lmao/crates/lmao-arena/src/raw.rs:299-305` + `packages/lmao/crates/lmao-arena/src/raw.rs:350-357` +
+`packages/lmao/crates/lmao-arena/benches/arena.rs:12-22`
 
-```299:305:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```299:305:packages/lmao/crates/lmao-arena/src/raw.rs
 fn clear_bytes<M: Mem>(m: &mut M, offset: u32, len: u32) {
     debug_assert_ne!(offset, 0);
     for byte_offset in offset..offset + len {
@@ -84,7 +84,7 @@ fn clear_bytes<M: Mem>(m: &mut M, offset: u32, len: u32) {
 }
 ```
 
-```350:357:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```350:357:packages/lmao/crates/lmao-arena/src/raw.rs
 pub fn alloc_with_capacity<M: Mem>(m: &mut M, sc: SizeClass, capacity: u32) -> u32 {
     let size = effective_block_size(sc, capacity);
     let offset = alloc_at_tier(m, sc, effective_tier(sc, capacity_to_tier(capacity)));
@@ -105,10 +105,9 @@ valid.
 
 ### F3 — HIGH — COPIES — Native arena grows under load and cannot return the OOM sentinel
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/lib.rs:128-154` +
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs:179-185`
+Evidence: `packages/lmao/crates/lmao-arena/src/lib.rs:128-154` + `packages/lmao/crates/lmao-arena/src/raw.rs:179-185`
 
-```128:154:packages/lmao-rs/crates/lmao-arena/src/lib.rs
+```128:154:packages/lmao/crates/lmao-arena/src/lib.rs
 /// `Vec<u8>`-backed [`raw::Mem`] — the native linear-memory backend. Growth is
 /// Vec doubling (bounded below by the requested size); the wasm backend in
 /// `lmao-wasm` implements the same trait over `memory.grow` pages.
@@ -120,7 +119,7 @@ Evidence: `packages/lmao-rs/crates/lmao-arena/src/lib.rs:128-154` +
     }
 ```
 
-```179:185:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```179:185:packages/lmao/crates/lmao-arena/src/raw.rs
     let size = block_size(sc, tier_to_capacity(tier));
     let aligned = (m.read_u32(H_BUMP_PTR) + 7) & !7u32;
     let new_bump = aligned + size;
@@ -141,17 +140,17 @@ analogue.
 
 ### F4 — HIGH — STRUCTURE — Unchecked `capacity_to_tier` aliases another size-class freelist
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/lib.rs:96-106` +
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs:103-106` + `packages/lmao-rs/crates/lmao-core/src/tuning.rs:15-16`
+Evidence: `packages/lmao/crates/lmao-arena/src/lib.rs:96-106` + `packages/lmao/crates/lmao-arena/src/raw.rs:103-106` +
+`packages/lmao/crates/lmao-core/src/tuning.rs:15-16`
 
-```96:106:packages/lmao-rs/crates/lmao-arena/src/lib.rs
+```96:106:packages/lmao/crates/lmao-arena/src/lib.rs
 pub fn capacity_to_tier(capacity: u32) -> usize {
     debug_assert!(capacity.is_power_of_two() && (MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity));
     (capacity.trailing_zeros() - MIN_CAPACITY.trailing_zeros()) as usize
 }
 ```
 
-```103:106:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```103:106:packages/lmao/crates/lmao-arena/src/raw.rs
 fn freelist_off(sc: SizeClass, tier: usize) -> u32 {
     H_FREELISTS + 4 * (sc as u32 * NUM_TIERS as u32 + tier as u32)
 }
@@ -168,10 +167,10 @@ path.
 
 ### F5 — MEDIUM — SSOT — TS `SizeClass.Identity = 4` is not a Rust size class
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/lib.rs:35-43` +
-`packages/lmao/src/lib/wasm/wasmAllocator.ts:133-138` + `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:130-136`
+Evidence: `packages/lmao/crates/lmao-arena/src/lib.rs:35-43` + `packages/lmao/src/lib/wasm/wasmAllocator.ts:133-138` +
+`packages/lmao/crates/lmao-wasm/src/lib.rs:130-136`
 
-```35:43:packages/lmao-rs/crates/lmao-arena/src/lib.rs
+```35:43:packages/lmao/crates/lmao-arena/src/lib.rs
 #[repr(u8)]
 pub enum SizeClass {
     SpanSystem = 0,
@@ -199,10 +198,10 @@ TS `WasmAllocator` stats API; wasm `size_class` catch-all (other slice).
 
 ### F6 — MEDIUM — SSOT — Span entry-type discriminants restated beside `lmao-core` and TS
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/raw.rs:85-89` +
-`packages/lmao-rs/crates/lmao-core/src/entry_type.rs:10-14` + `packages/lmao/src/lib/schema/systemSchema.ts:218-228`
+Evidence: `packages/lmao/crates/lmao-arena/src/raw.rs:85-89` +
+`packages/lmao/crates/lmao-core/src/entry_type.rs:10-14` + `packages/lmao/src/lib/schema/systemSchema.ts:218-228`
 
-```85:89:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```85:89:packages/lmao/crates/lmao-arena/src/raw.rs
 pub const ENTRY_TYPE_SPAN_START: u8 = 1;
 pub const ENTRY_TYPE_SPAN_OK: u8 = 2;
 pub const ENTRY_TYPE_SPAN_ERR: u8 = 3;
@@ -218,8 +217,8 @@ that name `raw::ENTRY_TYPE_*`.
 
 ### F7 — MEDIUM — STRUCTURE — Public surface is not the wasm minimum
 
-Evidence: `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:24-27` +
-`packages/lmao-rs/crates/lmao-arena/src/lib.rs:49-89,181-256` + `packages/lmao-rs/Cargo.lock:1707-1713,1776-1778`
+Evidence: `packages/lmao/crates/lmao-wasm/src/lib.rs:24-27` +
+`packages/lmao/crates/lmao-arena/src/lib.rs:49-89,181-256` + `packages/lmao/Cargo.lock:1707-1713,1776-1778`
 
 Problem: The only non-dev dependent is `lmao-wasm`. It imports `SizeClass`, `raw::{self, Mem}`, and (native fallback)
 `VecMem::with_zeroed`. It never uses `Arena`, `Header`, `Identity`, `TraceRoot`, `FreeBlock`, `Offset`, `block_size`,
@@ -231,10 +230,9 @@ Cost/Risk: this crate's benches/tests (`Arena`, `block_size`). No wasm change if
 
 ### F8 — MEDIUM — COPIES — Free path is two O(n) freelist walks plus a cloned merge function
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/raw.rs:197-235` +
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs:260-323`
+Evidence: `packages/lmao/crates/lmao-arena/src/raw.rs:197-235` + `packages/lmao/crates/lmao-arena/src/raw.rs:260-323`
 
-```197:215:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```197:215:packages/lmao/crates/lmao-arena/src/raw.rs
 fn free_at_tier<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, tier: usize) {
     if tier + 1 < NUM_TIERS {
         let size = block_size(sc, tier_to_capacity(tier));
@@ -249,7 +247,7 @@ fn free_at_tier<M: Mem>(m: &mut M, offset: u32, sc: SizeClass, tier: usize) {
 }
 ```
 
-```307:323:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```307:323:packages/lmao/crates/lmao-arena/src/raw.rs
 fn capacity_block_is_free<M: Mem>(m: &M, offset: u32, sc: SizeClass) -> bool {
     for tier in 0..NUM_TIERS {
         let size = u64::from(block_size(sc, tier_to_capacity(tier)));
@@ -274,9 +272,9 @@ overlay head.
 
 ### F9 — MEDIUM — COPIES — Bump alignment is 8 bytes, not the 64-byte line convention
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/raw.rs:179-188` + `packages/lmao-rs/crates/lmao-arena/src/lib.rs:8,30`
+Evidence: `packages/lmao/crates/lmao-arena/src/raw.rs:179-188` + `packages/lmao/crates/lmao-arena/src/lib.rs:8,30`
 
-```179:181:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```179:181:packages/lmao/crates/lmao-arena/src/raw.rs
     // Bump allocate, 8-byte aligned, growing memory as needed.
     let size = block_size(sc, tier_to_capacity(tier));
     let aligned = (m.read_u32(H_BUMP_PTR) + 7) & !7u32;
@@ -291,10 +289,10 @@ memory (TS host, Arrow views). Waste up to 63 B per bump. ABI-visible.
 
 ### F10 — MEDIUM — TESTS — Overlap property cannot see the col_1b over-provisioned tail
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/tests/properties.rs:29-45` +
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs:325-347`
+Evidence: `packages/lmao/crates/lmao-arena/tests/properties.rs:29-45` +
+`packages/lmao/crates/lmao-arena/src/raw.rs:325-347`
 
-```29:45:packages/lmao-rs/crates/lmao-arena/tests/properties.rs
+```29:45:packages/lmao/crates/lmao-arena/tests/properties.rs
     fn allocated_blocks_do_not_overlap(
         allocs in prop::collection::vec((size_class_strategy(), capacity_strategy()), 1..200),
     ) {
@@ -314,9 +312,9 @@ allocator is correct.
 
 ### F11 — MEDIUM — STRUCTURE — `write_log_entry` / `span_start` do not bound `capacity` or `write_index`
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/raw.rs:765-811`
+Evidence: `packages/lmao/crates/lmao-arena/src/raw.rs:765-811`
 
-```796:811:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```796:811:packages/lmao/crates/lmao-arena/src/raw.rs
 pub fn write_log_entry<M: Mem>(...) -> u32 {
     let idx = m.read_u32(identity_ptr + ID_WRITE_INDEX);
     let ts = timestamp_nanos(m, trace_root_ptr, current_ms);
@@ -335,10 +333,9 @@ checks `_writeIndex` would be unaffected.
 
 ### F12 — LOW — DUPLICATION — Three column writers and two identity-init paths repeat one shape
 
-Evidence: `packages/lmao-rs/crates/lmao-arena/src/raw.rs:816-880` +
-`packages/lmao-rs/crates/lmao-arena/src/lib.rs:111-118`
+Evidence: `packages/lmao/crates/lmao-arena/src/raw.rs:816-880` + `packages/lmao/crates/lmao-arena/src/lib.rs:111-118`
 
-```816:835:packages/lmao-rs/crates/lmao-arena/src/raw.rs
+```816:835:packages/lmao/crates/lmao-arena/src/raw.rs
 pub fn write_col_f64<...>(...) -> u32 {
     let offset = if col_offset == 0 {
         alloc_with_capacity(m, SizeClass::Col8B, capacity)
