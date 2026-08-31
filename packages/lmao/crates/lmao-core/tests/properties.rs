@@ -23,7 +23,9 @@ fn test_span(capacity: usize) -> (SpanBuffer, TraceAnchor, TickClock) {
     let anchor = TraceAnchor::capture(&clock);
     let identity = Arc::new(SpanIdentity {
         thread_id: 7,
-        span_id: 0,
+        // Nonzero: zero is the reserved "no parent" sentinel (see
+        // `identity::successor`), so no real span may carry it.
+        span_id: 1,
         trace_id: TraceId::new("prop-test-trace").unwrap(),
         parent: None,
     });
