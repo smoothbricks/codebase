@@ -202,9 +202,8 @@ impl Drop for ChurnGuard {
 /// time against the whole budget, and a format that regresses names itself instead of being one
 /// of two suspects behind a single timeout.
 ///
-/// These two share the host's APFS driver and Disk Arbitration, so nextest reserves the whole
-/// thread budget for each (see `real_apfs_*` in packages/nx-plugin/nextest.toml) rather than
-/// their isolation depending on living in one test body.
+/// These two share the host's APFS driver and Disk Arbitration, so they are serialized against
+/// each other by the `real-apfs` nextest test group rather than by living in one test body.
 /// Neither format is optional: a missing capability is a failure, never a skip.
 #[test]
 fn real_apfs_sparse_substrate_lifecycle() {

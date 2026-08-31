@@ -4604,8 +4604,8 @@ mod tests {
     }
 
     /// Named `real_apfs_*` like every test that drives the host's real APFS stack: that prefix
-    /// is the filterset nextest reserves the whole thread budget for, so a test opts into
-    /// running with nothing else in flight by being named for what it touches.
+    /// is the filterset the `real-apfs` nextest test group serializes on, so a test opts into
+    /// serialization by being named for what it touches.
     #[cfg(target_os = "macos")]
     #[test]
     fn real_apfs_sparse_attach_resolves_and_verifies_the_synthesized_volume() {
