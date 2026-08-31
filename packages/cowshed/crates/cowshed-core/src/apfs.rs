@@ -152,6 +152,36 @@ impl Sleeper for ThreadSleeper {
     }
 }
 
+/// The wait a freshly attached image's APFS inventory is given to become visible.
+///
+/// `diskutil apfs list -plist <container>` exits ZERO and reports no containers at all while
+/// Disk Arbitration is mid-transaction on an attach: the container exists — `diskutil info`
+/// named it microseconds earlier — but the inventory has not caught up. Observed as
+/// `missing Containers array` on a host where other processes were attaching and detaching
+/// images, failing `execute_create_staged`'s live clone outright. Trusting exit 0 to mean the
+/// answer is complete is the unsound assumption; the volume is not absent, it is not yet
+/// announced.
+///
+/// Five seconds against a 250ms poll. Settling is sub-second on a quiet host, so this is
+/// normally never entered; the bound stays well inside the enclosing per-operation budget even
+/// if several resolutions in one operation each pay it. This buys correctness under contention
+/// rather than time for slow work — no deadline is relaxed, and nothing here waits on progress
+/// the host is making.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeVisibilityGrace {
+    pub total: Duration,
+    pub poll: Duration,
+}
+
+impl Default for VolumeVisibilityGrace {
+    fn default() -> Self {
+        Self {
+            total: Duration::from_secs(5),
+            poll: Duration::from_millis(250),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApfsCaseSensitivity {
     Sensitive,
@@ -300,6 +330,37 @@ pub enum VolumeResolutionFailure {
     Missing,
     Ambiguous(Vec<String>),
     InvalidPlist(String),
+    /// The candidate handed to resolution is not a volume device path at all — cowshed's own
+    /// argv, not something the host said. Separate from `InvalidPlist` because the two differ
+    /// in whether waiting could ever change the answer.
+    InvalidCandidate(String),
+}
+
+impl VolumeResolutionFailure {
+    /// Whether this answer could differ once Disk Arbitration finishes announcing an attach.
+    ///
+    /// Two failures say "not yet", and both were observed with exit status ZERO on a host where
+    /// other processes were attaching images. `InvalidPlist` covers the container that is not in
+    /// the inventory at all — the reported `missing Containers array`, and equally a torn body,
+    /// which is indistinguishable from it and produced by the same contention. `Missing` is the
+    /// same phenomenon one step later: the container is announced, its volumes are not yet. In
+    /// both cases `diskutil info` had already named the container, so the volume is not absent.
+    ///
+    /// Retrying a genuine schema break costs only a bounded grace before reporting the same
+    /// error, while failing a transient one is a spurious hard failure. That asymmetry is why
+    /// the doubtful `InvalidPlist` cases wait rather than fail.
+    ///
+    /// Two failures do NOT say "not yet", and are deliberately reported at once:
+    /// - `Ambiguous` is "announced TWICE", not "not yet announced". Nothing observed suggests it
+    ///   settles, and an ambiguity that persists is a hazard worth surfacing promptly rather than
+    ///   after a grace.
+    /// - `InvalidCandidate` is cowshed's own argv: deterministic, and waiting cannot change it.
+    fn is_inventory_lag(&self) -> bool {
+        match self {
+            Self::Missing | Self::InvalidPlist(_) => true,
+            Self::Ambiguous(_) | Self::InvalidCandidate(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for VolumeResolutionFailure {
@@ -314,6 +375,9 @@ impl fmt::Display for VolumeResolutionFailure {
                 )
             }
             Self::InvalidPlist(message) => write!(f, "invalid APFS list plist: {message}"),
+            Self::InvalidCandidate(candidate) => {
+                write!(f, "invalid APFS device candidate {candidate:?}")
+            }
         }
     }
 }
@@ -624,6 +688,7 @@ pub struct MacOsApfsBackend<R, S = ThreadSleeper> {
     runner: R,
     sleeper: S,
     grace: DetachGrace,
+    visibility: VolumeVisibilityGrace,
 }
 
 impl<R> MacOsApfsBackend<R> {
@@ -632,16 +697,25 @@ impl<R> MacOsApfsBackend<R> {
             runner,
             sleeper: ThreadSleeper,
             grace: DetachGrace::default(),
+            visibility: VolumeVisibilityGrace::default(),
         }
     }
 }
 
 impl<R, S> MacOsApfsBackend<R, S> {
-    pub fn with_grace(runner: R, sleeper: S, grace: DetachGrace) -> Self {
+    /// Both graces are named types rather than a pair of `Duration`s so a caller cannot
+    /// silently transpose them.
+    pub fn with_grace(
+        runner: R,
+        sleeper: S,
+        grace: DetachGrace,
+        visibility: VolumeVisibilityGrace,
+    ) -> Self {
         Self {
             runner,
             sleeper,
             grace,
+            visibility,
         }
     }
     pub fn runner(&self) -> &R {
@@ -912,7 +986,35 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// container: the unscoped `diskutil apfs list` walks every container on the host, and since
     /// every attached workspace image is one, that walk costs seconds per attach on a host with
     /// dozens of warm workspaces. The scoped listing is then verified exactly as before.
+    ///
+    /// Retried while the inventory disagrees with an attach that has already happened. Scoping
+    /// made the listing cheap but not truthful: under concurrent attach/detach activity the
+    /// scoped list exits ZERO and reports no containers, so a live clone failed with
+    /// `missing Containers array` for a container `diskutil info` had just named. The volume was
+    /// never absent — Disk Arbitration had not finished announcing it. A single answer is
+    /// therefore not evidence; an answer that stops changing is.
     fn resolve_apfs_volume(&self, candidate: &str) -> Result<String, ApfsError> {
+        let mut waited = Duration::ZERO;
+        loop {
+            let error = match self.resolve_apfs_volume_once(candidate) {
+                Ok(device) => return Ok(device),
+                Err(error) => error,
+            };
+            let retry = matches!(
+                &error,
+                ApfsError::VolumeResolutionFailed { reason, .. } if reason.is_inventory_lag()
+            );
+            if !retry || waited >= self.visibility.total {
+                return Err(error);
+            }
+            self.sleeper.sleep(self.visibility.poll);
+            waited += self.visibility.poll;
+        }
+    }
+
+    /// One `diskutil info` + scoped `diskutil apfs list` round. Separated so the retry above
+    /// reads as a policy over a total operation rather than as control flow woven through it.
+    fn resolve_apfs_volume_once(&self, candidate: &str) -> Result<String, ApfsError> {
         let info = self.run_checked(
             "inspect APFS device",
             CommandRequest::new(
@@ -1869,8 +1971,13 @@ fn parse_volume_list_plist(candidate: &str, bytes: &[u8]) -> Result<String, Apfs
         candidate: candidate.to_owned(),
         reason: VolumeResolutionFailure::InvalidPlist(message),
     };
-    let candidate_path = volume_device_path(candidate)
-        .ok_or_else(|| invalid(format!("invalid APFS device candidate {candidate:?}")))?;
+    // Not `invalid`: a candidate that is not a volume device path is cowshed's own argv, so it
+    // must not be retried as though the host might change its mind.
+    let candidate_path =
+        volume_device_path(candidate).ok_or_else(|| ApfsError::VolumeResolutionFailed {
+            candidate: candidate.to_owned(),
+            reason: VolumeResolutionFailure::InvalidCandidate(candidate.to_owned()),
+        })?;
     let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
         .map_err(|error| invalid(error.to_string()))?;
     let containers = value
@@ -2203,7 +2310,8 @@ mod tests {
         }
     }
 
-    /// A backend whose grace admits exactly two unforced retries before it forces.
+    /// A backend whose graces each admit exactly two retries before giving up. The sleeper only
+    /// records, so both bounds are reached in zero wall-clock time.
     fn graced_backend(
         outputs: impl IntoIterator<Item = CommandOutput>,
     ) -> MacOsApfsBackend<RecordingRunner, RecordingSleeper> {
@@ -2211,6 +2319,10 @@ mod tests {
             RecordingRunner::with_outputs(outputs),
             RecordingSleeper::default(),
             DetachGrace {
+                total: Duration::from_millis(20),
+                poll: Duration::from_millis(10),
+            },
+            VolumeVisibilityGrace {
                 total: Duration::from_millis(20),
                 poll: Duration::from_millis(10),
             },
@@ -2787,13 +2899,21 @@ mod tests {
 
     #[test]
     fn missing_volume_resolution_detaches_the_whole_image_before_failing() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+        // `graced_backend` rather than `new`: a `Missing` volume is now waited out as inventory
+        // lag, so the real 5s grace would be spent here for nothing. The contract under test is
+        // unchanged — a resolution that never succeeds still detaches the image it attached —
+        // but reaching it now takes every round of the grace.
+        let backend = graced_backend([
             CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
+            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
+            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
-        ]));
+        ]);
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
             .unwrap_err();
@@ -2806,11 +2926,24 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
-        assert_eq!(argv(&requests[2]), ["info", "-plist", "/dev/disk4s1"]);
-        assert_eq!(argv(&requests[3]), ["apfs", "list", "-plist", "disk5"]);
-        assert_eq!(requests[4].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
+        assert_eq!(requests.len(), 9);
+        for round in 0..3 {
+            assert_eq!(
+                argv(&requests[2 + round * 2]),
+                ["info", "-plist", "/dev/disk4s1"]
+            );
+            assert_eq!(
+                argv(&requests[3 + round * 2]),
+                ["apfs", "list", "-plist", "disk5"]
+            );
+        }
+        assert_eq!(requests[8].program, Path::new(HDIUTIL));
+        assert_eq!(argv(&requests[8]), ["detach", "/dev/disk4"]);
+        assert_eq!(
+            backend.sleeper.waits().len(),
+            2,
+            "two polls, then a verdict"
+        );
     }
 
     #[test]
@@ -2926,14 +3059,23 @@ mod tests {
 
     #[test]
     fn a_device_outside_any_container_is_a_missing_volume_not_a_host_walk() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
-            CommandOutput::success(SPARSE_ATTACH_PLIST),
+        let info_without_container = || {
             CommandOutput::success(
                 r#"<?xml version="1.0"?><plist version="1.0"><dict><key>Content</key><string>Apple_HFS</string></dict></plist>"#,
-            ),
+            )
+        };
+        // `graced_backend`: a device that names no container reads as inventory lag one step
+        // earlier than a missing volume — the reference is not populated yet — so it is waited
+        // out too. The contract this test defends is unchanged: the answer is `Missing`, and the
+        // unscoped host walk is never reached no matter how many rounds it takes.
+        let backend = graced_backend([
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+            CommandOutput::success(SPARSE_ATTACH_PLIST),
+            info_without_container(),
+            info_without_container(),
+            info_without_container(),
             CommandOutput::success([]),
-        ]));
+        ]);
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
             .unwrap_err();
@@ -2945,14 +3087,14 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 6);
         assert!(
             !requests
                 .iter()
                 .any(|request| argv(request).first().is_some_and(|arg| arg == "apfs")),
             "no container inventory is walked when the device is not in a container"
         );
-        assert_eq!(argv(&requests[3]), ["detach", "/dev/disk4"]);
+        assert_eq!(argv(&requests[5]), ["detach", "/dev/disk4"]);
     }
 
     #[test]
@@ -4691,6 +4833,107 @@ mod tests {
             }) if candidate == "/dev/disk4s1"
                 && devices == ["/dev/disk5s2", "/dev/disk6s2"]
         ));
+    }
+
+    /// What the scoped `diskutil apfs list -plist <container>` actually returns, with exit status
+    /// ZERO, while Disk Arbitration is still announcing a just-attached image: a well-formed
+    /// plist that mentions no container at all.
+    const UNANNOUNCED_VOLUME_LIST_PLIST: &str =
+        r#"<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>"#;
+
+    #[test]
+    fn volume_resolution_waits_for_an_inventory_that_has_not_announced_the_container_yet() {
+        let backend = graced_backend([
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST.as_bytes().to_vec()),
+            CommandOutput::success(UNANNOUNCED_VOLUME_LIST_PLIST.as_bytes().to_vec()),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST.as_bytes().to_vec()),
+            CommandOutput::success(EMPTY_VOLUME_LIST_PLIST.as_bytes().to_vec()),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST.as_bytes().to_vec()),
+            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST.as_bytes().to_vec()),
+        ]);
+        // A missing `Containers` array, then a container that does not list the volume yet, then
+        // the truth. Both intermediate answers carried exit status zero.
+        assert_eq!(
+            backend.resolve_apfs_volume("/dev/disk4s1").unwrap(),
+            "/dev/disk5s2"
+        );
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10), Duration::from_millis(10)]
+        );
+    }
+
+    #[test]
+    fn volume_resolution_reports_an_ambiguous_inventory_at_once() {
+        let backend = graced_backend([
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST.as_bytes().to_vec()),
+            CommandOutput::success(AMBIGUOUS_VOLUME_LIST_PLIST.as_bytes().to_vec()),
+        ]);
+        // Two containers claiming one physical store is "announced twice", not "not yet
+        // announced". Nothing observed suggests it settles, and a persistent ambiguity is a
+        // hazard worth surfacing now rather than after the grace.
+        assert!(matches!(
+            backend.resolve_apfs_volume("/dev/disk4s1"),
+            Err(ApfsError::VolumeResolutionFailed {
+                reason: VolumeResolutionFailure::Ambiguous(devices),
+                ..
+            }) if devices == ["/dev/disk5s2", "/dev/disk5s3"]
+        ));
+        assert!(backend.sleeper.waits().is_empty());
+    }
+
+    #[test]
+    fn volume_resolution_gives_up_when_the_inventory_never_announces_the_container() {
+        let torn = || {
+            [
+                CommandOutput::success(SPARSE_DEVICE_INFO_PLIST.as_bytes().to_vec()),
+                CommandOutput::success(UNANNOUNCED_VOLUME_LIST_PLIST.as_bytes().to_vec()),
+            ]
+        };
+        let backend = graced_backend(
+            torn()
+                .into_iter()
+                .chain(torn())
+                .chain(torn())
+                .collect::<Vec<_>>(),
+        );
+        // The grace is bounded: a host that never settles must still produce a verdict, and the
+        // verdict must be the host's own last answer rather than a synthesized one.
+        assert!(matches!(
+            backend.resolve_apfs_volume("/dev/disk4s1"),
+            Err(ApfsError::VolumeResolutionFailed {
+                candidate,
+                reason: VolumeResolutionFailure::InvalidPlist(message),
+            }) if candidate == "/dev/disk4s1" && message == "missing Containers array"
+        ));
+        assert_eq!(
+            backend.sleeper.waits().len(),
+            2,
+            "two polls, then a verdict"
+        );
+        assert_eq!(
+            backend.runner().requests().len(),
+            6,
+            "three rounds of info + scoped list"
+        );
+    }
+
+    #[test]
+    fn volume_resolution_rejects_cowsheds_own_malformed_candidate_without_waiting() {
+        let backend = graced_backend([
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST.as_bytes().to_vec()),
+            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST.as_bytes().to_vec()),
+        ]);
+        // A whole device is not a volume device. That is cowshed's argv, not the host's answer,
+        // so no amount of settling could change it and the grace must not be spent on it.
+        assert!(matches!(
+            backend.resolve_apfs_volume("/dev/disk4"),
+            Err(ApfsError::VolumeResolutionFailed {
+                reason: VolumeResolutionFailure::InvalidCandidate(candidate),
+                ..
+            }) if candidate == "/dev/disk4"
+        ));
+        assert!(backend.sleeper.waits().is_empty());
     }
 
     const SPARSE_RESIZE_LIMITS_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
