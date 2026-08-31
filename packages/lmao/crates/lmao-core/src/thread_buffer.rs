@@ -18,6 +18,10 @@ use crate::tuning::{MAX_CAPACITY, MAX_STRING_ARENA_BYTES, MIN_CAPACITY};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::thread_kinds::{
+    ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
+    ATTRIBUTE_KIND_UINT64,
+};
 use crate::thread_schema::SYSTEM_COLUMN_COUNT;
 
 /// A row-targeted schema attribute value.
@@ -429,6 +433,27 @@ impl ThreadSpanBuffer {
                     .interned_cell(ordinal)
                     .expect("intern just issued this ordinal"))
             }
+        }
+    }
+    /// Decode the scalar representation used by both native and WASM ABI adapters.
+    ///
+    /// Text values are intern ordinals, numbers preserve all f64 bits, and enum
+    /// values occupy the low u16 bits. Invalid kind/value pairs are rejected
+    /// before they reach a schema column.
+    pub fn decode_abi_value(&self, kind: u8, value: u64) -> Option<ColumnValue> {
+        match kind {
+            ATTRIBUTE_KIND_NUMBER => Some(ColumnValue::Number(f64::from_bits(value))),
+            ATTRIBUTE_KIND_UINT64 => Some(ColumnValue::Uint64(value)),
+            ATTRIBUTE_KIND_BOOLEAN => (value <= 1).then_some(ColumnValue::Boolean(value != 0)),
+            // Text stays an ordinal end to end: the ABI passed one in, the row
+            // store records one, and the arena resolves it at flush. Decoding
+            // only proves the ordinal names a live cell.
+            ATTRIBUTE_KIND_TEXT => u32::try_from(value)
+                .ok()
+                .filter(|id| self.interned(*id).is_some())
+                .map(ColumnValue::Text),
+            ATTRIBUTE_KIND_ENUM => u16::try_from(value).ok().map(ColumnValue::Enum),
+            _ => None,
         }
     }
     fn ensure_rows(&mut self, count: usize) {
@@ -1067,5 +1092,28 @@ mod tests {
         }
         assert_eq!(buffer.intern("dynamic-name"), Ok(id));
         assert!(buffer.row_count() > 8);
+    }
+
+    #[test]
+    fn abi_decoder_rejects_invalid_kind_and_value_pairs() {
+        let mut buffer = ThreadSpanBuffer::new(7, 8, &[]);
+        assert!(buffer.decode_abi_value(0, 0).is_none());
+        assert!(buffer.decode_abi_value(ATTRIBUTE_KIND_BOOLEAN, 2).is_none());
+        assert!(
+            buffer
+                .decode_abi_value(ATTRIBUTE_KIND_ENUM, u64::from(u16::MAX) + 1)
+                .is_none()
+        );
+
+        let text_id = buffer.intern("dynamic").unwrap();
+        assert!(matches!(
+            buffer.decode_abi_value(ATTRIBUTE_KIND_TEXT, u64::from(text_id)),
+            Some(ColumnValue::Text(_))
+        ));
+        assert!(
+            buffer
+                .decode_abi_value(ATTRIBUTE_KIND_TEXT, u64::from(text_id) + 1)
+                .is_none()
+        );
     }
 }
