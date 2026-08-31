@@ -37,6 +37,43 @@ slow-timeout = { period = "180s", terminate-after = 1 }
 [test-groups]
 real-apfs = { max-threads = 1 }
 
+# The full-lifecycle real-APFS tests cannot meet the default deadline, and
+# `specs/cowshed/08_testing.md` already contains the arithmetic that proves it.
+#
+# That spec sets the house rule for real-substrate timing: "CI asserts with a 3×
+# multiplier to absorb runner noise". `apfs_integration.rs` measured its lifecycle
+# at 14.8s (Sparse) and 10.6s (Asif) on an IDLE host, so under the repo's own noise
+# model CI needs 44.4s and 31.8s. A 30s deadline was therefore unreachable by
+# construction: the test was not slow, the bound contradicted the spec.
+#
+# Nor is the cost reducible. The same spec's "Attach floor verdict: not
+# flag-reducible" records that `-noverify` saves ~15ms (noise), `-noautofsck`
+# nothing, and `diskutil image attach` exposes no equivalent knobs — the ~235-400ms
+# per attach is inherent to DiskImages + APFS mount + DiskArbitration, and halving
+# it would need DiskImages2 or the diskarbitrationd private API, which the spec
+# explicitly forbids budgets from assuming. The lifecycle attaches once per phase
+# across adopt, mount, clone-under-churn, checkpoint, restore, retire, reclaim, GC
+# and detach, so its floor is a multiple of an irreducible constant.
+#
+# The alternative was splitting the lifecycle into phase-scoped tests so each fits
+# 30s. It loses: every split pays that attach constant again, so the suite's total
+# wall time rises to buy a smaller per-test bound. Splitting Sparse from Asif was
+# worth it because it bought failure ATTRIBUTION; splitting phases buys only a
+# number.
+#
+# 60s is 3× the worst idle measurement (44.4s) rounded up, not a guess. It stays
+# bounded because an unbounded run phase is how a hung test becomes a hung lane.
+# Re-derive it if the idle measurements in `apfs_integration.rs` change.
+#
+# Membership is by name and narrower than the group: the fast `real_apfs_*` unit
+# tests in the lib keep the 30s default — they passed at 4.4s and 7.3s and have no
+# claim on more. This override precedes the group-only one so it wins the
+# first-match for both keys it sets.
+[[profile.default.overrides]]
+filter = 'test(/real_apfs_.*_substrate_lifecycle/)'
+slow-timeout = { period = "60s", terminate-after = 1 }
+test-group = 'real-apfs'
+
 [[profile.default.overrides]]
 filter = 'test(/real_apfs_/)'
 test-group = 'real-apfs'
