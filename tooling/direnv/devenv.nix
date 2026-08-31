@@ -56,6 +56,15 @@ in {
       pkgs.openssl
     ];
 
+  # Devenv's Rust module exports CC=clang/CXX=clang++ on Linux for its Clang
+  # linker driver. The raw Clang above then wins PATH resolution and bypasses
+  # the Nix wrapper's libc include paths. Pin host builds to the wrapper;
+  # N-API cross builds still select raw Clang through TARGET_CC/TARGET_CXX.
+  env = lib.optionalAttrs pkgs.stdenv.isLinux {
+    CC = "${pkgs.stdenv.cc}/bin/cc";
+    CXX = "${pkgs.stdenv.cc}/bin/c++";
+  };
+
   # Use system Xcode for iOS simulator, signing, and instruments.
   # Nix Apple SDK is build-only — no simctl/simulator runtimes, and nix's
   # clang doesn't support -index-store-path which xcodebuild passes.
