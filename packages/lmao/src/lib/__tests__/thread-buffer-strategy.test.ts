@@ -94,4 +94,43 @@ describe('ThreadBufferStrategy', () => {
     if (cell === undefined) return;
     expect(strategy.runtime.readInterned(root.binding, Number(cell.value))).toBe('late');
   });
+
+  it('coarsens log-row stamps but never a span duration', () => {
+    const tracer = new TestTracer(opContext, {
+      bufferStrategy: strategy,
+      createTraceRoot,
+    });
+    // Two rows would ride one cached stamp; 40 crosses the refresh boundary
+    // more than once, so this pins the refresh as well as the sharing.
+    const rowCount = 40;
+    tracer.trace_fn(0, 'stamps', {}, (ctx) => {
+      for (let i = 0; i < rowCount; i++) ctx.log.info(`row-${i}`);
+      return ctx.ok(1);
+    });
+    const root = tracer.rootBuffers[0];
+    expect(isThreadSpanView(root)).toBe(true);
+    if (!isThreadSpanView(root)) return;
+
+    const start = strategy.runtime.readTimestamp(root.binding, root.startRow);
+    const completion = strategy.runtime.readTimestamp(root.binding, root.completionRow);
+    // Boundaries always read fresh: a duration derived from these two never
+    // collapses, however many rows shared a cached stamp in between.
+    expect(completion).toBeGreaterThan(start);
+
+    const stamps = [...root.fakeToReal.values()].map((row) => strategy.runtime.readTimestamp(root.binding, row));
+    expect(stamps).toHaveLength(rowCount);
+    for (const stamp of stamps) {
+      expect(stamp).toBeGreaterThanOrEqual(start);
+      expect(stamp).toBeLessThanOrEqual(completion);
+    }
+    for (let i = 1; i < stamps.length; i++) {
+      const previous = stamps[i - 1] ?? 0n;
+      const current = stamps[i] ?? 0n;
+      expect(current).toBeGreaterThanOrEqual(previous);
+    }
+    // Bounded staleness, not a frozen clock: 40 rows span more than two
+    // refresh windows, so the cache must have been re-read.
+    expect(new Set(stamps).size).toBeGreaterThan(1);
+    expect(new Set(stamps).size).toBeLessThan(rowCount);
+  });
 });
