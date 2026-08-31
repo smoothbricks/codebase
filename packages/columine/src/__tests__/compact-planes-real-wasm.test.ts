@@ -60,15 +60,14 @@ function schemaMessage(name: string, sample: unknown, type: DataType, tag: numbe
   return { schemaBytes: stream.slice(0, messageLength), fieldMetadata };
 }
 
-function readColumn(ipc: Uint8Array, name: string): unknown[] {
+function readColumn(ipc: Uint8Array, name: string) {
   const table = tableFromIPC(ipc, { useBigInt: true });
   expect(table.numRows).toBeGreaterThan(0);
-  const columns = table.toColumns() as Record<string, unknown[]>;
-  const values = columns[name];
-  if (values === undefined) {
+  const found = Object.entries(table.toColumns()).find(([key]) => key === name);
+  if (found === undefined) {
     throw new Error(`missing column ${name}`);
   }
-  return values;
+  return found[1];
 }
 
 function leInteger(width: number, value: bigint): Uint8Array {
@@ -90,7 +89,7 @@ function monthDayNano(months: number, days: number, nanos: bigint): Uint8Array {
   return bytes;
 }
 
-function encodeOne(name: string, schema: EncodedArrowSchema, column: CompactColumn): unknown[] {
+function encodeOne(name: string, schema: EncodedArrowSchema, column: CompactColumn) {
   const ipc = backend.encode({ rowCount: 2, schema, columns: [column] });
   return readColumn(ipc, name);
 }
