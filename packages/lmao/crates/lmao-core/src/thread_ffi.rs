@@ -68,7 +68,7 @@ fn valid_capacity(capacity: usize) -> bool {
 
 /// Allocate a schema-less handle. Use `thread_span_buffer_new_with_fields` for
 /// typed schema attributes; both constructors share the exact same row store.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub extern "C" fn thread_span_buffer_new(
     thread_id: u64,
     capacity: usize,
@@ -86,7 +86,7 @@ pub extern "C" fn thread_span_buffer_new(
 /// `fields` must either be null when `field_count == 0`, or point to a
 /// `'static` contiguous `FieldMeta` table. The table remains borrowed by every
 /// overflow block for the handle's lifetime.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_new_with_fields(
     thread_id: u64,
     capacity: usize,
@@ -111,7 +111,7 @@ pub unsafe extern "C" fn thread_span_buffer_new_with_fields(
 /// # Safety
 /// `handle` must be null or a live handle returned by a constructor and not
 /// previously freed.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_free(handle: *mut ThreadSpanBufferHandle) {
     if !handle.is_null() {
         // SAFETY: the pointer was allocated by one of the constructors and is
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn thread_span_buffer_free(handle: *mut ThreadSpanBufferHa
 /// # Safety
 /// `handle` must be a live uniquely owned handle. When `len > 0`, `ptr` must
 /// point to readable storage for `len` bytes for the duration of this call.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_intern(
     handle: *mut ThreadSpanBufferHandle,
     ptr: *const u8,
@@ -147,7 +147,7 @@ pub unsafe extern "C" fn thread_span_buffer_intern(
 /// # Safety
 /// `handle` must be a live uniquely owned handle. `trace_ptr` must point to
 /// readable storage for `trace_len` bytes, unless the length is zero.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span(
     handle: *mut ThreadSpanBufferHandle,
     trace_ptr: *const u8,
@@ -186,7 +186,7 @@ pub unsafe extern "C" fn thread_span_buffer_open_span(
 /// # Safety
 /// `handle` must be a live uniquely owned handle. `trace_ptr` must point to
 /// readable storage for `trace_len` bytes, unless the length is zero.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span_static(
     handle: *mut ThreadSpanBufferHandle,
     trace_ptr: *const u8,
@@ -228,7 +228,7 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_static(
 /// `handle` must be a live uniquely owned handle. Both byte ranges must be
 /// readable for the duration of this call; null pointers are valid only with
 /// zero lengths.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
     handle: *mut ThreadSpanBufferHandle,
     trace_ptr: *const u8,
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
 
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_end_ok(
     handle: *mut ThreadSpanBufferHandle,
     span_id: u32,
@@ -282,7 +282,7 @@ pub unsafe extern "C" fn thread_span_buffer_end_ok(
 
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_end_err(
     handle: *mut ThreadSpanBufferHandle,
     span_id: u32,
@@ -297,7 +297,7 @@ pub unsafe extern "C" fn thread_span_buffer_end_err(
 /// Warmed log path: `message_ordinal` is from `thread_span_buffer_intern`.
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_append_log(
     handle: *mut ThreadSpanBufferHandle,
     span_id: u32,
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn thread_span_buffer_append_log(
 
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_append_log_static(
     handle: *mut ThreadSpanBufferHandle,
     span_id: u32,
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn thread_span_buffer_append_log_static(
 
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     handle: *mut ThreadSpanBufferHandle,
     span_id: u32,
@@ -387,7 +387,7 @@ fn write_value(buffer: &mut ThreadSpanBuffer, row: u32, ordinal: u16, kind: u8, 
 
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_write_attr(
     handle: *mut ThreadSpanBufferHandle,
     row: u32,
@@ -403,7 +403,7 @@ pub unsafe extern "C" fn thread_span_buffer_write_attr(
 
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_write_tag(
     handle: *mut ThreadSpanBufferHandle,
     span_id: u32,
@@ -425,7 +425,7 @@ pub unsafe extern "C" fn thread_span_buffer_write_tag(
 
 /// # Safety
 /// `handle` must be a live uniquely owned handle.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
 pub unsafe extern "C" fn thread_span_buffer_set_scope(
     handle: *mut ThreadSpanBufferHandle,
     span_id: u32,
