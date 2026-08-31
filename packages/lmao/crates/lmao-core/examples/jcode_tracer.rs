@@ -22,7 +22,7 @@
 use lmao_core::{
     Clock, EntryType, SpanBuffer, SystemClock, TextInput, TraceContext, TraceId, Transient,
 };
-use lmao_macros::define_log_schema;
+use lmao_macros::{define_log_schema, log, span_with_retry};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -56,17 +56,18 @@ async fn main() {
                 clock,
             );
             for call in 0..25 {
-                let (out, buf) = trace.span_with_retry(
-                    TextInput::Static("tool-call"),
+                let (out, buf) = span_with_retry!(
+                    trace,
+                    "tool-call",
                     None,
                     64,
                     |_delay_ms| { /* tokio::time::sleep in real async retry */ },
                     |ctx| {
-                        ctx.log(EntryType::Info, "invoking {tool} with {args}", line!());
+                        log!(ctx, EntryType::Info, "invoking {tool} with {args}");
                         if call % 10 == 9 {
                             Err(Transient::fixed("transient provider error", 2, 5))
                         } else {
-                            ctx.log(EntryType::Debug, "tool returned {bytes} bytes", line!());
+                            log!(ctx, EntryType::Debug, "tool returned {bytes} bytes");
                             Ok(call)
                         }
                     },

@@ -171,6 +171,56 @@
     "projectType": "library",
     "targets": {
       "lint": {},
+      "cargo-lint": {
+        "inputs": [
+          "{projectRoot}/**/*.rs",
+          "{projectRoot}/**/Cargo.toml",
+          "{projectRoot}/**/Cargo.lock",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-compile": {
+        "inputs": [
+          "{projectRoot}/**/*.rs",
+          "{projectRoot}/**/Cargo.toml",
+          "{projectRoot}/**/Cargo.lock",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-lmao-core": {
+        "inputs": [
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/crates/lmao-core/**/*.rs",
+          "{projectRoot}/crates/lmao-core/Cargo.toml",
+          "{projectRoot}/crates/lmao-macros/**/*.rs",
+          "{projectRoot}/crates/lmao-macros/Cargo.toml",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-lmao-macros": {
+        "inputs": [
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/crates/lmao-core/**/*.rs",
+          "{projectRoot}/crates/lmao-core/Cargo.toml",
+          "{projectRoot}/crates/lmao-macros/**/*.rs",
+          "{projectRoot}/crates/lmao-macros/Cargo.toml",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
       "typecheck": {
         "dependsOn": [
           "build",
@@ -204,7 +254,8 @@
           "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/justfile",
           "{projectRoot}/src/lib/schema/systemSchema.ts",
-          "{projectRoot}/src/lib/capacityTuning.ts"
+          "{projectRoot}/src/lib/capacityTuning.ts",
+          "lmaoGitRevision"
         ],
         "outputs": [
           "{projectRoot}/dist/allocator.wasm"

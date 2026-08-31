@@ -198,28 +198,39 @@ fn run(capacity_exp: usize, ops: &[(u8, u16)]) -> lmao_core::SpanBuffer {
         42,
         std::sync::Arc::new(clock),
     );
-    let (_, buf) = trace.span(TextInput::Static("root"), None, 1 << capacity_exp, |ctx| {
-        for (op, val) in ops {
-            match op {
-                0 => {
-                    ctx.log(EntryType::Info, "op {v}", *val as u32);
-                }
-                1 => {
-                    ctx.log(EntryType::Warn, "warn {v}", *val as u32);
-                }
-                2 => {
-                    ctx.append(EntryType::BufferWrites);
-                }
-                _ => {
-                    ctx.child(TextInput::Static("kid"), 8, |c| {
-                        c.log(EntryType::Debug, "child {v}", *val as u32);
-                        Ok::<_, ()>(())
-                    })?;
+    let (_, buf) = trace.__span(
+        TextInput::Static("root"),
+        None,
+        1 << capacity_exp,
+        lmao_core::SourceMetadata::UNATTRIBUTED,
+        |ctx| {
+            for (op, val) in ops {
+                match op {
+                    0 => {
+                        ctx.__log(EntryType::Info, "op {v}", *val as u32);
+                    }
+                    1 => {
+                        ctx.__log(EntryType::Warn, "warn {v}", *val as u32);
+                    }
+                    2 => {
+                        ctx.append(EntryType::BufferWrites);
+                    }
+                    _ => {
+                        ctx.__child(
+                            TextInput::Static("kid"),
+                            8,
+                            lmao_core::SourceMetadata::UNATTRIBUTED,
+                            |c| {
+                                c.__log(EntryType::Debug, "child {v}", *val as u32);
+                                Ok::<_, ()>(())
+                            },
+                        )?;
+                    }
                 }
             }
-        }
-        Ok::<_, ()>(())
-    });
+            Ok::<_, ()>(())
+        },
+    );
     buf
 }
 

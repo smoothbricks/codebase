@@ -1,0 +1,17 @@
+error[E0599]: no method named `span` found for reference `&TraceContext` in the current scope
+ --> tests/compile_fail/provenance_required.rs:4:19
+  |
+4 |     let _ = trace.span(TextInput::Static("missing"), None, 8, |_| Ok::<_, ()>(()));
+  |                   ^^^^
+  |
+help: there is a method `__span` with a similar name, but with different arguments
+ --> $WORKSPACE/crates/lmao-core/src/context.rs
+  |
+  | /     pub fn __span<T, E>(
+  | |         &self,
+  | |         name: TextInput<'_>,
+  | |         parent: Option<Arc<SpanIdentity>>,
+... |
+  | |         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
+  | |     ) -> (Result<T, E>, SpanBuffer) {
+  | |___________________________________^
