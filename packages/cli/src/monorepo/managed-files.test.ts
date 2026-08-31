@@ -321,18 +321,39 @@ describe('managed raw files', () => {
     expect(generated).toContain('bun run check:linux');
   });
 
-  it('exports the restored ttsc cache path while preserving host cache overrides', async () => {
+  it('persists the ttsc cache path the shell computes, leaving host overrides untouched', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'smoo-github-bootstrap-'));
     const bin = join(temp, 'bin');
     await mkdir(bin);
     const devenv = join(bin, 'devenv');
-    await writeFile(devenv, '#!/bin/sh\nexit 0\n');
+    // Emulates `devenv shell [flags] -- cmd...` the way devenv.smoo.nix's
+    // enterShell behaves: cd to the workspace root, compute TTSC_CACHE_DIR
+    // honoring a host-provided value, then run the command — so build-shell's
+    // wholesale environment capture sees real shell exports instead of a
+    // hand-copied list.
+    await writeFile(
+      devenv,
+      [
+        '#!/usr/bin/env bash',
+        'set -euo pipefail',
+        'while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done',
+        'shift',
+        'cd ../..',
+        'export TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"',
+        'exec "$@"',
+        '',
+      ].join('\n'),
+    );
     await chmod(devenv, 0o755);
 
     try {
       const cases = [
-        { input: '', expected: join(REPO_ROOT, '.cache', 'ttsc') },
-        { input: join(temp, 'host-ttsc'), expected: join(temp, 'host-ttsc') },
+        // No host value: the shell computes the repo-local default and the
+        // capture persists it for the workflow steps that follow.
+        { input: '', expected: `TTSC_CACHE_DIR=${join(REPO_ROOT, '.cache', 'ttsc')}\n` },
+        // Host-provided value: the shell keeps it, so nothing changed and
+        // nothing is rewritten — the override stays live in the step env.
+        { input: join(temp, 'host-ttsc'), expected: undefined },
       ];
       for (const [index, cache] of cases.entries()) {
         const githubEnv = join(temp, `github-env-${index}`);
@@ -353,7 +374,13 @@ describe('managed raw files', () => {
           },
         );
         expect(await process.exited).toBe(0);
-        expect(await readFile(githubEnv, 'utf8')).toContain(`TTSC_CACHE_DIR=${cache.expected}\n`);
+        // Nothing to persist leaves GITHUB_ENV untouched — possibly never created.
+        const persisted = await readFile(githubEnv, 'utf8').catch(() => '');
+        if (cache.expected === undefined) {
+          expect(persisted).not.toContain('TTSC_CACHE_DIR=');
+        } else {
+          expect(persisted).toContain(cache.expected);
+        }
       }
     } finally {
       await rm(temp, { recursive: true, force: true });

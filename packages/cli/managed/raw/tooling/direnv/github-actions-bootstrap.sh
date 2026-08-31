@@ -11,7 +11,10 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 # Host CI supplies its bind-mounted cache through the runner profile. Ephemeral
 # runners must use the same repository path restored by cache-ttsc-plugins.
-TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-$repo_root/.cache/ttsc}"
+# A separate name on purpose: assigning to TTSC_CACHE_DIR itself would mutate
+# the (possibly exported) environment that persist_devenv_environment later
+# fingerprints as the pre-shell baseline.
+ttsc_cache_dir_default="${TTSC_CACHE_DIR:-$repo_root/.cache/ttsc}"
 
 clear_devenv_cache_state() {
   rm -rf "$repo_root/tooling/direnv/.devenv" "$repo_root/tooling/direnv/.direnv"
@@ -52,8 +55,8 @@ install_devenv() {
   if [ -d "$HOME/.nix-profile/bin" ]; then
     echo "$HOME/.nix-profile/bin" >> "${GITHUB_PATH:-/dev/null}"
   fi
-  if [ -n "$TTSC_CACHE_DIR" ]; then
-    mkdir -p "$TTSC_CACHE_DIR"
+  if [ -n "$ttsc_cache_dir_default" ]; then
+    mkdir -p "$ttsc_cache_dir_default"
   fi
 }
 
