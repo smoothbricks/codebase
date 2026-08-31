@@ -15,13 +15,13 @@ import { parse as parseToml } from 'smol-toml';
 import { BOUNDED_TEST_KILL_AFTER_MS, BOUNDED_TEST_TIMEOUT_MS } from './bounded-test-policy.js';
 import {
   CARGO_TEST_COMPILE_TARGET,
-  CARGO_TEST_SERIAL_SUFFIX,
+  CARGO_TEST_EXCEPTIONS_SUFFIX,
   CARGO_TEST_TARGET,
   cargoPackageTestInputs,
   cargoTestPackageTargetName,
+  exceptionalTestFilter,
   listCargoWorkspacePackages,
   nextestConfigRelPath,
-  serializedTestFilter,
 } from './cargo-workspace.js';
 import {
   CARGO_CROSS_LINT_COMMAND,
@@ -213,7 +213,7 @@ const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.me
 
 /**
  * One bounded target per crate; a crate that declares `smoothbricks.test.shards`
- * gets one per shard plus one for the tests a nextest test-group serializes.
+ * gets one per shard plus one for the tests nextest.toml singles out.
  *
  * `--workspace -E 'package(X)'` rather than `--package X`. A filterset selects
  * what RUNS; `--package` also re-resolves FEATURES for that crate alone, which
@@ -224,17 +224,19 @@ const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.me
  * run while nothing was wrong with them. The two forms select the same tests;
  * only the filterset reuses the compile target's artifacts.
  *
- * A test-group is scoped to one nextest RUN, so sharding would dissolve it:
- * grouped tests landing in different shards are different processes with no
- * mutual exclusion. The serialized set is therefore lifted OUT of the hash and
- * pinned whole to its own target, and the shards run the complement. That makes
- * the group's coverage a property of the split rather than of how the hash
- * happened to fall — renaming a test cannot scatter the group.
+ * nextest.toml singles some tests out with an override, and each such class
+ * breaks a shard in its own way — a `test-group` is scoped to one nextest RUN
+ * so the hash would dissolve it, and a raised `slow-timeout` marks a test whose
+ * cost is not the suite's. Those are lifted OUT of the hash into one target and
+ * the shards run the exact complement, so which tests a shard holds stops
+ * depending on how the hash happened to fall.
  *
  * The two filtersets are exact complements, so their union is the crate whatever
- * either one matches; an empty serialized set (every real-APFS test is
+ * either one matches; an empty exception set (every real-APFS test is
  * `cfg(target_os = "macos")`, so on Linux there are none) costs coverage
- * nothing, which is why that target may pass having run zero tests.
+ * nothing, which is why that target may pass having run zero tests. It cannot
+ * hide a lost test — only a pin that stopped matching, whose members then fall
+ * into the shards.
  *
  * Pieces chain rather than fan out, like the crates do: cargo flocks one
  * `target/`, and chaining keeps even the pinned group from overlapping the
@@ -251,13 +253,13 @@ async function addPerPackageCargoTestTargets(
     return [];
   }
   const configFile = nextestConfigRelPath(workspaceRoot, projectRoot, PLUGIN_NEXTEST_CONFIG);
-  const serialized = serializedTestFilter(PLUGIN_NEXTEST_CONFIG);
+  const exceptional = exceptionalTestFilter(PLUGIN_NEXTEST_CONFIG);
   const packageTargetNames: string[] = [];
   let previous = CARGO_TEST_COMPILE_TARGET;
   for (const pkg of packages) {
     const inputs = await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir);
     const sharded = pkg.testShards > 1;
-    const pin = sharded && serialized !== null ? serialized : null;
+    const pin = sharded && exceptional !== null ? exceptional : null;
     const addTarget = (piece: string | undefined, selector: string, extra: string) => {
       const targetName = cargoTestPackageTargetName(pkg.name, piece);
       packageTargetNames.push(targetName);
@@ -288,7 +290,7 @@ async function addPerPackageCargoTestTargets(
       );
     }
     if (pin !== null) {
-      addTarget(CARGO_TEST_SERIAL_SUFFIX, `package(${pkg.name}) and (${pin})`, ' --no-tests=pass');
+      addTarget(CARGO_TEST_EXCEPTIONS_SUFFIX, `package(${pkg.name}) and (${pin})`, ' --no-tests=pass');
     }
   }
   return packageTargetNames;

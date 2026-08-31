@@ -157,11 +157,11 @@ export const CARGO_TEST_TARGET = 'cargo-test';
 export const CARGO_TEST_COMPILE_TARGET = 'cargo-test-compile';
 
 /**
- * Serialized tests are pinned to this suffix instead of being sharded. Only a
- * sharded crate has one: an unsharded crate runs its whole suite in a single
- * nextest process, where the group already holds.
+ * Tests that nextest.toml singles out are pinned to this suffix instead of
+ * being sharded. Only a sharded crate has one: an unsharded crate runs its
+ * whole suite in a single nextest process, which is all the pin restores.
  */
-export const CARGO_TEST_SERIAL_SUFFIX = 'serial';
+export const CARGO_TEST_EXCEPTIONS_SUFFIX = 'exceptions';
 
 /**
  * A crate on one target keeps the bare name; a split crate suffixes the piece,
@@ -183,33 +183,43 @@ export function packageNameFromCargoTestTarget(targetName: string): string | nul
   }
   const name = targetName
     .slice('cargo-test-'.length)
-    .replace(new RegExp(`-(shard[1-9][0-9]*|${CARGO_TEST_SERIAL_SUFFIX})$`), '');
+    .replace(new RegExp(`-(shard[1-9][0-9]*|${CARGO_TEST_EXCEPTIONS_SUFFIX})$`), '');
   return name.length === 0 ? null : name;
 }
 
 /**
- * The tests a nextest test-group serializes, as one filterset.
+ * The tests nextest.toml singles out with an override, as one filterset.
  *
- * A test-group is scoped to a single nextest RUN, so sharding a crate across
- * several runs would silently dissolve it: the real-APFS group exists because
- * those tests contend on Disk Arbitration machine-wide, where an unscoped
- * `diskutil apfs list -plist` measured 0.7s idle against 14.4s while another
- * process is attaching. Splitting them across runs is exactly the contention
- * the group was added to remove.
+ * An override is the config author saying "this class does not behave like the
+ * rest of the suite", and both classes declared today break a shard, each in a
+ * different way:
  *
- * So the split reads the groups back out of the config that declares them and
- * keeps every grouped test in one target. Deriving it here rather than
- * restating the filter means declaring a new group in nextest.toml is the whole
- * change — the pin follows, and cannot drift from the mutex it protects.
+ *   - a `test-group` is scoped to a single nextest RUN, so letting the hash
+ *     scatter its members across shards silently dissolves it. The real-APFS
+ *     group exists because those tests contend on Disk Arbitration
+ *     machine-wide, where an unscoped `diskutil apfs list -plist` measured 0.7s
+ *     idle against 14.4s while another process is attaching.
+ *   - a raised `slow-timeout` marks a test whose cost is not the suite's cost.
+ *     `lesser_capabilities_fail_to_compile_...` rustc's a fixture that
+ *     `cargo test --no-run` cannot pre-build, so it costs 25.6s on a cold
+ *     target directory against 1.8s warm. Every CI runner is cold, and left in
+ *     a shard that spike lands on whichever 250-odd tests share it.
  *
- * Returns null when no group is declared, which is the "nothing to pin" case.
+ * One target for all of them rather than one each: they sit in different groups
+ * so they run concurrently, making the combined wall the max of the classes
+ * rather than their sum.
+ *
+ * Deriving this from the config that declares the classes, rather than
+ * restating their filters, means adding an override there is the whole change —
+ * the pin follows and cannot drift from what it protects.
+ *
+ * Returns null when nothing is singled out, the "nothing to pin" case.
  */
-export function serializedTestFilter(nextestConfigPath: string): string | null {
+export function exceptionalTestFilter(nextestConfigPath: string): string | null {
   const parsed: unknown = parseToml(readFileSync(nextestConfigPath, 'utf-8'));
-  if (!isRecord(parsed) || !isRecord(parsed['test-groups'])) {
+  if (!isRecord(parsed)) {
     return null;
   }
-  const groups = new Set(Object.keys(parsed['test-groups']));
   const profiles = isRecord(parsed.profile) ? parsed.profile : {};
   const filters: string[] = [];
   for (const profile of Object.values(profiles)) {
@@ -218,10 +228,7 @@ export function serializedTestFilter(nextestConfigPath: string): string | null {
       continue;
     }
     for (const override of overrides) {
-      if (!isRecord(override) || typeof override.filter !== 'string') {
-        continue;
-      }
-      if (typeof override['test-group'] === 'string' && groups.has(override['test-group'])) {
+      if (isRecord(override) && typeof override.filter === 'string' && override.filter.length > 0) {
         filters.push(override.filter);
       }
     }
