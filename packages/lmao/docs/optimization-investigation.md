@@ -1,8 +1,8 @@
-# lmao-rs Optimization Investigation
+# lmao Optimization Investigation
 
 Date: 2026-07-11. Hardware: Apple M5 Max (~4.43 GHz), bun 1.3.14 (JSC), rustc 1.96.0 (aarch64, `lto=true` release).
-Question: does lmao-rs unlock optimizations beyond the current TS+WASM design, given the design history that JS
-TypedArray writes beat NAPI and JIT-compiled WASM beat NAPI?
+Question: does lmao unlock optimizations beyond the current TS+WASM design, given the design history that JS TypedArray
+writes beat NAPI and JIT-compiled WASM beat NAPI?
 
 ## 1. Existing benchmark survey
 
@@ -40,11 +40,10 @@ Fresh numbers CONFIRM the recorded 04-01 results: warm WASM wins are modest (1.2
 
 ## 2. New benchmarks added
 
-- `packages/lmao-rs/crates/lmao-core/benches/hot_path.rs` (criterion): span lifecycle, span+50 logs, 1000-append
-  per-event cost, tag-write proxy (bitmap set + f64 store), 256-string dictionary build. `SpanBuffer::append` was
-  implemented (overflow chaining per 01b2) to make these honest — it also turned the `appends_are_ordered_and_lossless`
-  proptest green (its overflow-row accounting was corrected to match 01b4/01b5: overflow buffers carry no reserved
-  rows).
+- `packages/lmao/crates/lmao-core/benches/hot_path.rs` (criterion): span lifecycle, span+50 logs, 1000-append per-event
+  cost, tag-write proxy (bitmap set + f64 store), 256-string dictionary build. `SpanBuffer::append` was implemented
+  (overflow chaining per 01b2) to make these honest — it also turned the `appends_are_ordered_and_lossless` proptest
+  green (its overflow-row accounting was corrected to match 01b4/01b5: overflow buffers carry no reserved rows).
 - `packages/lmao/benchmarks/wasm-boundary.bench.ts` (mitata): instantiates the checked-in `allocator.wasm` via **raw
   exports** (bypassing the stale TS wrapper) and isolates boundary costs.
 
@@ -80,7 +79,7 @@ host.**
 **"Strings stay in JS" is validated.** Shipping raw string bytes into WASM for dictionary building there loses even
 before the WASM-side hashing work is counted.
 
-### Native Rust (criterion, lmao-rs)
+### Native Rust (criterion, lmao)
 
 | Shape                                                | Rust native                                    | JS equivalent                                                    | Speedup                           |
 | ---------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------- | --------------------------------- |
@@ -102,7 +101,7 @@ available.
 
 | Approach                                                     | Verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| (a) Native in-process Rust (jcode, deterministic simulation) | **Real, and the big win.** 30–90x on comparable shapes; per-event cost 1.9 ns satisfies the zero-alloc/≤20%-overhead gates with enormous margin. This is where lmao-rs pays for itself, no boundary exists at all.                                                                                                                                                                                                                                                                                                                                                                               |
+| (a) Native in-process Rust (jcode, deterministic simulation) | **Real, and the big win.** 30–90x on comparable shapes; per-event cost 1.9 ns satisfies the zero-alloc/≤20%-overhead gates with enormous margin. This is where lmao pays for itself, no boundary exists at all.                                                                                                                                                                                                                                                                                                                                                                                  |
 | (b) Rust-WASM hot path for the TS host                       | **Myth (for per-event work).** Not directly testable on this machine (no wasm32 std in the nix toolchain or rustup), but the boundary measurements make it moot: 39 ns per crossed value vs 0.5–7.6 ns staying in JS. No compiler choice can recover a 5–70x boundary tax. Rust-WASM could only match the current design by adopting the same shape: JS writes TypedArray views, WASM only allocates — i.e., a drop-in allocator.wasm replacement with identical economics (recorded: 1.06–1.44x). Adopt it for maintainability if desired, not for speed.                                       |
 | (c) Flush/Arrow conversion in Rust-WASM                      | **Plausible, unproven, bounded.** Cold path, one crossing per flush (1 ns fixed cost is nothing amortized over a batch). But the JS dictionary work it would replace is already fast (3.3 µs/256 strings, and strings would still need to cross as bytes: +7 µs). Only worth it if profiling shows the 1811-line convertToArrow dominating real flushes; requires the string-crossing cost to be amortized by doing MORE per crossing (full batch conversion + IPC serialization in one call). Build `lmao-arrow` native first (jcode needs it anyway), then decide with a real flush benchmark. |
 | (d) Bulk string bytes into WASM at flush                     | **Refuted.** Measured slower (7.0–10.6 µs vs 3.3 µs). Keep strings in JS for JS hosts; in native Rust the question disappears.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -110,7 +109,7 @@ available.
 
 ## 5. Recommended roadmap
 
-1. **Native-first.** Implement lmao-rs for in-process hosts (jcode tracer, deterministic simulations). Every measured
+1. **Native-first.** Implement lmao for in-process hosts (jcode tracer, deterministic simulations). Every measured
    number says this is where the order-of-magnitude win lives. Keep the zero-alloc append path (already 1.9 ns).
 2. **Clock strategy.** Add a `CoarseClock`/batch-stamp option behind the `Clock` trait; benchmark `Instant::now()`
    alternatives on macOS/Linux before committing.
@@ -132,7 +131,7 @@ bun run benchmarks/js-vs-wasm.bench.ts        # JS column only until wrapper dri
 bun run benchmarks/wasm-boundary.bench.ts     # new: boundary costs, raw exports
 
 # Rust side
-cd packages/lmao-rs
+cd packages/lmao
 cargo bench -p lmao-core --bench hot_path
 ```
 

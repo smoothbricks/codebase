@@ -3,15 +3,15 @@
 Scope: `packages/columine/crates/columine-arrow/Cargo.toml` (17), `src/lib.rs` (36), `src/schema.rs` (434), `src/ipc.rs`
 (688), `src/record_batch.rs` (713; framing + `DynamicColumn` read; encoder body sampled), `src/columns.rs` (1138;
 header + `DynamicColumns::new` read; remainder not audited — ColArrow owns internals).
-`packages/lmao-rs/crates/lmao-arrow/Cargo.toml` (23), `src/lib.rs` (53), `src/convert.rs` (317), `src/dict.rs` (577),
+`packages/lmao/crates/lmao-arrow/Cargo.toml` (23), `src/lib.rs` (53), `src/convert.rs` (317), `src/dict.rs` (577),
 `src/archive.rs` (155), `src/source.rs` (136), `tests/convert.rs` (168), `tests/properties.rs` (646; IPC helper + schema
 asserts), `benches/flush.rs` (120; imports only). `packages/cowshed/crates/cowshed-core/Cargo.toml` (39),
 `src/storage/audit.rs` (637; Arrow sink + `StreamWriter` seal), `src/storage/job_artifact.rs` (4574; Arrow
 schema/codec/IPC sites only — CsCoreJobArtifact owns the rest). `packages/cowshed/crates/cowshed-gateway/Cargo.toml`
-(45), `src/telemetry.rs` (1114). Workspace pins: `packages/columine/Cargo.toml` (62), `packages/lmao-rs/Cargo.toml`
-(50). Locks: `packages/columine/Cargo.lock` (arrow-* 56.2.1), `packages/lmao-rs/Cargo.lock` (arrow 55.2.0 + datafusion
-47), `packages/cowshed/Cargo.lock` (arrow-* 56.2.1). Targeted greps across `packages/*/crates` and `packages/lmao/src`
-for schema/IPC/entry-type restatements.
+(45), `src/telemetry.rs` (1114). Workspace pins: `packages/columine/Cargo.toml` (62), `packages/lmao/Cargo.toml` (50).
+Locks: `packages/columine/Cargo.lock` (arrow-* 56.2.1), `packages/lmao/Cargo.lock` (arrow 55.2.0 + datafusion 47),
+`packages/cowshed/Cargo.lock` (arrow-* 56.2.1). Targeted greps across `packages/*/crates` and `packages/lmao/src` for
+schema/IPC/entry-type restatements.
 
 ## Summary
 
@@ -35,9 +35,9 @@ for schema/IPC/entry-type restatements.
 
 ### F1 — HIGH — SSOT — Arrow is pinned twice (55 and 56); no crate owns the version
 
-Evidence: `packages/columine/Cargo.toml:20-22`, `packages/lmao-rs/Cargo.toml:23-27`,
+Evidence: `packages/columine/Cargo.toml:20-22`, `packages/lmao/Cargo.toml:23-27`,
 `packages/cowshed/crates/cowshed-core/Cargo.toml:14-17`, `packages/cowshed/crates/cowshed-gateway/Cargo.toml:9-11`,
-`packages/lmao-rs/Cargo.lock:64-68`, `packages/lmao-rs/Cargo.lock:583-591`, `packages/columine/Cargo.lock:29-30`,
+`packages/lmao/Cargo.lock:64-68`, `packages/lmao/Cargo.lock:583-591`, `packages/columine/Cargo.lock:29-30`,
 `packages/cowshed/Cargo.lock:44-45`
 
 ```
@@ -46,7 +46,7 @@ arrow-array = { version = "56", default-features = false }
 arrow-ipc = { version = "56", default-features = false }
 arrow-schema = { version = "56", default-features = false }
 
-# lmao-rs workspace
+# lmao workspace
 # Arrow subcrates only (not the `arrow` umbrella) to keep compile times down.
 arrow-array = "55"
 arrow-buffer = "55"
@@ -59,7 +59,7 @@ arrow-ipc = "56"
 arrow-schema = "56"
 ```
 
-`packages/lmao-rs/Cargo.lock` resolves `arrow` 55.2.0 (umbrella) as a dependency of `datafusion` 47.0.0. columine and
+`packages/lmao/Cargo.lock` resolves `arrow` 55.2.0 (umbrella) as a dependency of `datafusion` 47.0.0. columine and
 cowshed locks resolve `arrow-array`/`arrow-ipc`/`arrow-schema` 56.2.1 only — no 55, no umbrella. Problem: three Cargo
 workspaces, two Arrow generations, four dependents. Types cannot be shared. A `RecordBatch` from lmao-arrow is a
 different crate than one from cowshed. The version split is the SSOT failure; it is not itself a wire-format bug (IPC is
@@ -74,7 +74,7 @@ cowshed's nested job schema into this crate.
 
 ### F2 — HIGH — SSOT — 01f trace schema restated incompatibly (live type split)
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:52-63` vs
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:52-63` vs
 `packages/cowshed/crates/cowshed-gateway/src/telemetry.rs:700-728`
 
 ```
@@ -128,8 +128,7 @@ Evidence:
   admits the fork)
 - `packages/cowshed/crates/cowshed-core/src/storage/audit.rs:413-421` (`ArrowAuditSink::seal`)
 - `packages/cowshed/crates/cowshed-gateway/src/telemetry.rs:571-579` (`write_segment`)
-- `packages/lmao-rs/crates/lmao-arrow/tests/properties.rs:116-123` (`ipc_bytes`); same pattern
-  `tests/convert.rs:144-146`
+- `packages/lmao/crates/lmao-arrow/tests/properties.rs:116-123` (`ipc_bytes`); same pattern `tests/convert.rs:144-146`
 
 ```
 /// One commitment as a self-contained Arrow IPC stream — the byte form an
@@ -165,7 +164,7 @@ types today wrap `to_string()`; keep that at the callsite.
 
 ### F4 — MEDIUM — SSOT — `ENTRY_TYPE_NAMES` restated three ways
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:21-46`,
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:21-46`,
 `packages/lmao/src/lib/schema/systemSchema.ts:314-340`,
 `packages/cowshed/crates/cowshed-gateway/src/telemetry.rs:667-774`
 
@@ -196,12 +195,12 @@ not hand-sync.
 
 ### F5 — MEDIUM — DEP-BLOAT — lmao Arrow 55 default features pull `chrono-tz` and the `arrow` umbrella
 
-Evidence: `packages/lmao-rs/Cargo.toml:23-27`, `packages/lmao-rs/Cargo.lock:100-114`,
-`packages/lmao-rs/Cargo.lock:64-83`, `packages/columine/Cargo.toml:20-22`, `packages/columine/Cargo.lock:29-42`,
-`packages/lmao-rs/crates/lmao-query/Cargo.toml:10-21`
+Evidence: `packages/lmao/Cargo.toml:23-27`, `packages/lmao/Cargo.lock:100-114`, `packages/lmao/Cargo.lock:64-83`,
+`packages/columine/Cargo.toml:20-22`, `packages/columine/Cargo.lock:29-42`,
+`packages/lmao/crates/lmao-query/Cargo.toml:10-21`
 
 ```
-# lmao-rs lock, arrow-array 55.2.0
+# lmao lock, arrow-array 55.2.0
 dependencies = [
  "ahash", "arrow-buffer", "arrow-data", "arrow-schema",
  "chrono", "chrono-tz", "half", "hashbrown 0.15.5", "num",
@@ -218,7 +217,7 @@ workspace comment says "subcrates only (not the `arrow` umbrella)" but `datafusi
 (`arrow-arith`/`arrow-csv`/`arrow-json`/`arrow-ord`/`arrow-row`/`arrow-string`/…). Problem: columine already proved
 `default-features = false` on 56 drops `chrono-tz`. lmao did not. The umbrella is optional-feature lock residue, but it
 is the reason the workspace cannot move to 56 (F1). Fix: set `arrow-array`/`arrow-buffer`/`arrow-schema`/`arrow-ipc` to
-`{ version = "…", default-features = false }` in `packages/lmao-rs/Cargo.toml` now (safe even on 55). Treat datafusion's
+`{ version = "…", default-features = false }` in `packages/lmao/Cargo.toml` now (safe even on 55). Treat datafusion's
 umbrella as LmaoQuery's problem: either drop the feature or bump datafusion until it accepts 56. Cost/Risk: wrong "just
 shell out" would be worse — Arrow is load-bearing in-process (typed `RecordBatch`, wasm-adjacent flush, error typing).
 Do not replace these crates with `pyarrow` CLI. rustc-hash in lmao-arrow is also load-bearing (dict.rs:4-9 records the
@@ -227,7 +226,7 @@ hasher measurement).
 ### F6 — MEDIUM — COPIES — gateway builds Utf8 columns by cloning every field 2–4 times per event
 
 Evidence: `packages/cowshed/crates/cowshed-gateway/src/telemetry.rs:591-665`, contrast
-`packages/lmao-rs/crates/lmao-arrow/src/dict.rs:4-7, 447-454` and `src/convert.rs:223-233`
+`packages/lmao/crates/lmao-arrow/src/dict.rs:4-7, 447-454` and `src/convert.rs:223-233`
 
 ```
     let row_capacity = events.len().saturating_mul(4);
@@ -268,7 +267,7 @@ gateway tests address `ArrowAuditSink` by name. Core audit sink stays.
 
 ### F8 — LOW — TESTS — `pyarrow_reads_our_ipc` cannot go red without pyarrow
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/tests/convert.rs:125-136`
+Evidence: `packages/lmao/crates/lmao-arrow/tests/convert.rs:125-136`
 
 ```
     if !probe.map(|o| o.status.success()).unwrap_or(false) {
@@ -308,8 +307,8 @@ Schema still compares fields.
 
 ## Cross-slice questions
 
-- **LmaoQuery** (`packages/lmao-rs/crates/lmao-query/Cargo.toml`): `datafusion = { version = "47", …, optional = true }`
-  is the only reason `packages/lmao-rs/Cargo.lock` contains `arrow` 55.2.0 umbrella. Can datafusion be bumped to a
+- **LmaoQuery** (`packages/lmao/crates/lmao-query/Cargo.toml`): `datafusion = { version = "47", …, optional = true }` is
+  the only reason `packages/lmao/Cargo.lock` contains `arrow` 55.2.0 umbrella. Can datafusion be bumped to a
   56-compatible line, or is the feature dead enough to delete? F1 cannot close without that answer.
 - **XcutRustTs / LmaoCore**: `packages/lmao/src/lib/schema/systemSchema.ts:314` vs `lmao-arrow` `ENTRY_TYPE_NAMES` (F4).
   Which is generated from which?

@@ -28,10 +28,10 @@ reads only to resolve SSOT: `lmao-core/src/lib.rs` + `entry_type.rs`, `lmao-arro
 
 ### F1 — HIGH — SSOT — Gateway audit IPC restates lmao schema and already diverges
 
-Evidence: `packages/lmao-rs/crates/lmao-arrow/src/convert.rs:21-63` vs
+Evidence: `packages/lmao/crates/lmao-arrow/src/convert.rs:21-63` vs
 `packages/cowshed/crates/cowshed-gateway/src/telemetry.rs:700-728` vs `packages/cowshed/docs/telemetry.md:3-6`
 
-```21:63:packages/lmao-rs/crates/lmao-arrow/src/convert.rs
+```21:63:packages/lmao/crates/lmao-arrow/src/convert.rs
 pub const ENTRY_TYPE_NAMES: [&str; 24] = [
     "span-start",
     "span-ok",

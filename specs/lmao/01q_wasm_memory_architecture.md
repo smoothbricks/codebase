@@ -776,7 +776,7 @@ oldest lease age, pinned/reusable/orphaned bytes, committed pages, fragmentation
 
 ## Implementation Map <a id="smoo/lmao!n/wasm-mem.implementation-map"></a>
 
-The architecture spans a Rust WASM allocator (`packages/lmao-rs/crates/lmao-wasm`) and a TypeScript surface (buffer
+The architecture spans a Rust WASM allocator (`packages/lmao/crates/lmao-wasm`) and a TypeScript surface (buffer
 strategy, span buffer, codegen). It integrates with `TestTracer` / `StdioTracer` / `ArrayQueueTracer` via
 `WasmBufferStrategy`, with `defineOpContext()` and the logging API (tag, log, ok, err, span), with Arrow conversion via
 `convertSpanTreeToArrowTable()`, and with schema generation (`S.enum`, `S.category`, `S.text`, `S.number`, `S.boolean`).
@@ -784,8 +784,8 @@ The pieces below are the commitments — what lives where, the file:symbol map.
 
 ### WASM Allocator Module <a id="smoo/lmao!n/wasm-mem.allocator"></a>
 
-Lives in Rust (`packages/lmao-rs/crates/lmao-wasm/src/lib.rs`), with the allocation core in
-`packages/lmao-rs/crates/lmao-arena/src/raw.rs`:
+Lives in Rust (`packages/lmao/crates/lmao-wasm/src/lib.rs`), with the allocation core in
+`packages/lmao/crates/lmao-arena/src/raw.rs`:
 
 - Header initialization: `init()`, `reset()`
 - Tiered allocation: `alloc_span_system(capacity)`, `alloc_col_1b(capacity)`, `alloc_col_4b(capacity)`,

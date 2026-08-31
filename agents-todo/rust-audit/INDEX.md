@@ -1,7 +1,7 @@
 # Rust audit — index
 
 Read-only audit of every Rust crate in the monorepo: 19 crates across 3 cargo workspaces (`packages/cowshed`,
-`packages/columine`, `packages/lmao-rs`), 133k lines of Rust. 45 slices, one report each. Rubric:
+`packages/columine`, `packages/lmao`), 133k lines of Rust. 45 slices, one report each. Rubric:
 `_fork/minigraf/BYPRODUCT-ENGINEERING.md` + `PERFORMANCE-HANDBOOK.md`. Every finding carries `path:line` evidence.
 
 509 findings: **10 CRITICAL / 154 HIGH / 234 MEDIUM / 111 LOW**.
@@ -39,7 +39,7 @@ carry more information.
 
 ## Cross-cutting verdicts
 
-- **Arrow is pinned at two versions** — 56 in cowshed/columine, 55 in lmao-rs (dragged by datafusion 47).
+- **Arrow is pinned at two versions** — 56 in cowshed/columine, 55 in lmao (dragged by datafusion 47).
   `lmao_arrow::trace_schema` and the gateway's `event_batch` share the `01f` names but already disagree (Int64 vs
   Timestamp, dict vs Utf8, UInt32 vs UInt64 span ids): a live interop split. `StreamWriter try_new/write/finish` is
   copied at five sites. → `xcut-arrow-triplication.md`
@@ -58,7 +58,7 @@ carry more information.
 - **Copies**: 106 findings. Hot-path standouts — every JSON field costs two heap allocs before columns see bytes; every
   lmao span pays three `vec![0; capacity]`; every arena alloc zeroes its block with a per-byte `write_u8` loop (576
   stores for `SpanSystem/64`); every gateway cache _hit_ re-SHA-256s the sealed body (Byproduct L7 violation). →
-  `xcut-copies-sweep-cowshed.md`, `xcut-copies-sweep-columine-lmao-rs.md`
+  `xcut-copies-sweep-cowshed.md`, `xcut-copies-sweep-columine-lmao.md`
 
 ## Reports
 
@@ -104,7 +104,7 @@ carry more information.
 | `columine-event-processor.md`           | 9   | 0    | 2    |
 | `columine-wasm-exports.md`              | 9   | 0    | 4    |
 
-### lmao-rs (7 crates, 5.7k lines — 7 slices)
+### lmao Rust crates (7 crates, 5.7k lines — 7 slices)
 
 | Report                    | F   | CRIT | HIGH |
 | ------------------------- | --- | ---- | ---- |
@@ -124,7 +124,7 @@ carry more information.
 | `xcut-arrow-triplication.md`             | 9   | 0    | 3    |
 | `xcut-dependency-bloat-sweep.md`         | 9   | 0    | 3    |
 | `xcut-copies-sweep-cowshed.md`           | 26  | 0    | 10   |
-| `xcut-copies-sweep-columine-lmao-rs.md`  | 30  | 0    | 14   |
+| `xcut-copies-sweep-columine-lmao.md`     | 30  | 0    | 14   |
 | `xcut-intra-cowshed-duplication.md`      | 12  | 0    | 3    |
 
 ## Findings that were checked and rejected

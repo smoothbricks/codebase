@@ -18,7 +18,7 @@ Columine TS: `packages/columine/src/types.ts` (470), `wasm-backend.ts` (785), `p
 constants), `columine-vm/src/hashmap_ops.rs` (CmpType).
 
 LMAO TS seam: `packages/lmao/src/lib/schema/systemSchema.ts` (341), `lib/wasm/wasmAllocator.ts` (514),
-`lib/wasm/wasmPhysicalLayout.ts` (~309). Rust seam: `lmao-rs/crates/lmao-wasm/src/lib.rs` (523),
+`lib/wasm/wasmPhysicalLayout.ts` (~309). Rust seam: `lmao/crates/lmao-wasm/src/lib.rs` (523),
 `lmao-core/src/entry_type.rs` (82), `lmao-arena/src/lib.rs` (284).
 
 ## Summary
@@ -182,8 +182,8 @@ Cost/Risk: every `columine_types::opcodes::Opcode` vs `columine_types::types::Op
 
 ### F5 — HIGH — SSOT — lmao SizeClass.Identity=4 is TS-only; WASM maps unknown to Col8B
 
-Evidence: `packages/lmao/src/lib/wasm/wasmAllocator.ts:130-139` +
-`packages/lmao-rs/crates/lmao-arena/src/lib.rs:27-43` + `packages/lmao-rs/crates/lmao-wasm/src/lib.rs:130-136`
+Evidence: `packages/lmao/src/lib/wasm/wasmAllocator.ts:130-139` + `packages/lmao/crates/lmao-arena/src/lib.rs:27-43` +
+`packages/lmao/crates/lmao-wasm/src/lib.rs:130-136`
 
 ```ts
 export enum SizeClass {
@@ -306,7 +306,7 @@ identical.
 ### F9 — MEDIUM — SSOT — lmao entry types 1–24 restated, currently equal
 
 Evidence: `packages/lmao/src/lib/schema/systemSchema.ts:218-300` +
-`packages/lmao-rs/crates/lmao-core/src/entry_type.rs:10-38`
+`packages/lmao/crates/lmao-core/src/entry_type.rs:10-38`
 
 TS `ENTRY_TYPE_SPAN_START = 1` … `ENTRY_TYPE_BUFFER_CAPACITY = 24` match Rust
 `EntryType::{SpanStart=1, … BufferCapacity=24}` and `COUNT: 24`. Rust's own comment (`entry_type.rs:1-6`) says the

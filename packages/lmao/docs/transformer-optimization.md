@@ -1,4 +1,4 @@
-# Transformer × lmao-rs: optimization analysis
+# Transformer × lmao: optimization analysis
 
 Companion to [optimization-investigation.md](./optimization-investigation.md). This document keeps the historical wasm
 boundary and tag-write measurements, then records the transformer/runtime optimizations that have since shipped. Do not
@@ -47,7 +47,7 @@ amortized over the span's writes).
 
 The transformer's lever: the inliner currently emits `buf.field_values[0] = v` against the generated buffer class's
 views. For the wasm-backed `WasmBufferStrategy`, those views point into wasm memory already — so the inliner output
-composes with lmao-rs **unchanged**. An optional future mode could fold the schema's column offsets into constants
+composes with lmao **unchanged**. An optional future mode could fold the schema's column offsets into constants
 (`u8view[BASE + 12] = v`) and skip the view-object indirection, but the measured gap (view write 7.6 ns vs plain 0.5–2
 ns) bounds the win at a few ns per write; only worth it bundled with the checker-aware ttsc port.
 
@@ -57,7 +57,7 @@ Any inliner emission — TS or Go — must write **library-local (unprefixed)** 
 remapping is cold-path-only via `RemappedBufferView` at Arrow conversion. The transformer must never resolve prefixes
 into hot-path writes; offsets/constants it folds are per-library-schema, not per-application-schema.
 
-### 5. Native lmao-rs hosts don't need the transformer
+### 5. Native lmao hosts don't need the transformer
 
 In-process Rust (jcode, deterministic simulation) gets the same effect from `define_log_schema!` proc-macro expansion at
 Rust compile time (1.9 ns append, 2.5 ns tag write, per the main investigation). The native ttsc transformer is the
@@ -405,16 +405,16 @@ immutable dictionary generations is shipped. The target cannot be promoted until
   selection was rejected because it changes observable Promise microtask scheduling.
 - **Compile-time masking**: `.mask(preset)` fields could have the mask applied in the emitted write so unmasked values
   never reach the buffer; this is not described here as shipped.
-- **Layout-table emission for lmao-rs**: capacities and column layouts are deterministic from schema; a future emitted
+- **Layout-table emission for lmao**: capacities and column layouts are deterministic from schema; a future emitted
   offset table could let both the TS host and Rust arena assert against ABI drift.
 
 The through-line: **compile out all runtime schema interpretation** — classes, layouts, eager sets, capacities,
 dictionaries — so the TS host reaches the same "everything static" regime the Rust macro host gets, plus whole-program
 analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that per-crate Rust macros can't see either.
 
-## ttsc-specific opportunities, split by whether lmao-rs must change
+## ttsc-specific opportunities, split by whether lmao must change
 
-### Needing NO lmao-rs changes (pure ttsc/TS host)
+### Needing NO lmao changes (pure ttsc/TS host)
 
 - **Lint-stage contract enforcement.** ttsc plugins can also run at the check stage and emit real diagnostics. A future
   program-wide trace-vocabulary contract could make renaming a span/template without updating a checked-in manifest, or
@@ -434,7 +434,7 @@ analyses (usage-driven pre-allocation, dead columns, vocabulary contracts) that 
   drive the eager sets (B) and capacity seeds (C) with real data instead of static bounds — PGO where the profile is
   lmao's own trace output. Deterministic given a checked-in profile snapshot.
 
-### Requiring lmao-rs / lmao-wasm cooperation
+### Requiring lmao / lmao-wasm cooperation
 
 - **`alloc_span_with_columns(descriptor)`** — allocation batching (D above): one boundary crossing for span-system +
   identity + the op's full column set; descriptor is a transformer-emitted constant.
