@@ -5,6 +5,8 @@
  * Arrow IPC encoding remains entirely native.
  */
 
+import { COMPACT_KIND_TAG, COMPACT_MAX_KIND_TAG } from './compact-column.generated.js';
+
 import type { CompactBatch, CompactColumn, EncodedArrowSchema, ParseConfig, ParseResult } from './pipeline.js';
 import {
   align8,
@@ -131,38 +133,6 @@ const COMPACT_HEADER_SIZE = 16;
 const COMPACT_DESCRIPTOR_SIZE = 32;
 const HOST_IS_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
-/**
- * Physical plane tags — the `ArrowType` enum in columine-arrow, pinned by
- * `parse_backend_abi.rs`. The key is the plane's name on this side of the ABI
- * and must describe the same plane the tag selects natively.
- */
-const COMPACT_KIND_TAG = {
-  null: 0,
-  i32: 1,
-  f64: 2,
-  binary: 3,
-  utf8: 4,
-  bool: 5,
-  i64: 6,
-  i8: 7,
-  i16: 8,
-  u8: 9,
-  u16: 10,
-  u32: 11,
-  u64: 12,
-  f16: 13,
-  f32: 14,
-  decimal128: 15,
-  decimal256: 16,
-  largeBinary: 17,
-  largeUtf8: 18,
-  fixedSizeBinary: 19,
-  intervalYearMonth: 20,
-  intervalDayTime: 21,
-  intervalMonthDayNano: 22,
-} as const satisfies Record<CompactColumn['kind'], number>;
-
-const COMPACT_MAX_KIND_TAG = Math.max(...Object.values(COMPACT_KIND_TAG));
 const MAX_FIXED_SIZE_BINARY_WIDTH = Math.floor(MAX_VARIABLE_DATA_BYTES / MAX_EVENTS_PER_BATCH);
 
 const COMPACT_STATUS_CODE = {

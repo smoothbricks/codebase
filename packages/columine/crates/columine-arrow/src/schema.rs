@@ -30,7 +30,7 @@ pub const MAX_FIXED_SIZE_BINARY_WIDTH: u16 = (MAX_VALUE_BYTES / MAX_EVENTS_PER_B
 /// the enum is what stops the two from drifting — there is no second place to
 /// forget a plane.
 macro_rules! arrow_planes {
-    ($( $(#[$attr:meta])* $variant:ident = $tag:literal, )+) => {
+    ($( $(#[$attr:meta])* $variant:ident = $tag:literal => $kind:literal, )+) => {
         /// Arrow physical planes, matching the TypeScript `COMPACT_KIND_TAG`
         /// table byte for byte.
         ///
@@ -72,66 +72,80 @@ macro_rules! arrow_planes {
             /// Every plane, ascending by tag. Generated from the same table as
             /// the enum, so it cannot fall behind it.
             pub const ALL: &'static [ArrowType] = &[ $( ArrowType::$variant, )+ ];
+
+            /// This plane's name on the TypeScript side of the ABI.
+            ///
+            /// Declared with the tag rather than restated in TypeScript, because
+            /// a hand-maintained copy is how tag 1 came to be called `'u32'`
+            /// while the plane it selects is signed. `COMPACT_KIND_TAG` is
+            /// generated from this, so a plane cannot be renamed on one side
+            /// only, and a new plane cannot be added without naming it here —
+            /// the macro will not expand without the name.
+            pub const fn ts_kind(self) -> &'static str {
+                match self {
+                    $( ArrowType::$variant => $kind, )+
+                }
+            }
         }
     };
 }
 
 arrow_planes! {
     /// No values: one field node, zero buffers, every row null.
-    Null = 0,
+    Null = 0 => "null",
     /// The four-byte signed plane: one little-endian `i32` per row. Carries
     /// Int32, Date32 (days since epoch) and Time32 (seconds or milliseconds
     /// since midnight), which are byte-identical and told apart by the logical
     /// schema. UInt32, Float32 and Interval(YearMonth) are the same width but
     /// have their own planes, so they are rejected here.
-    Int32 = 1,
+    Int32 = 1 => "i32",
     /// One little-endian IEEE-754 `binary64` per row.
-    Float64 = 2,
+    Float64 = 2 => "f64",
     /// Opaque bytes behind 32-bit monotone offsets.
-    Binary = 3,
+    Binary = 3 => "binary",
     /// UTF-8 validated bytes behind 32-bit monotone offsets.
-    Utf8 = 4,
+    Utf8 = 4 => "utf8",
     /// One bit per row, Arrow LSB-first.
-    Bool = 5,
+    Bool = 5 => "bool",
     /// The eight-byte signed plane: one little-endian `i64` per row. Carries
     /// Int64, Date64, Time64, Timestamp and Duration.
-    Int64 = 6,
+    Int64 = 6 => "i64",
     /// One little-endian `i8` per row.
-    Int8 = 7,
+    Int8 = 7 => "i8",
     /// One little-endian `i16` per row.
-    Int16 = 8,
+    Int16 = 8 => "i16",
     /// One `u8` per row.
-    UInt8 = 9,
+    UInt8 = 9 => "u8",
     /// One little-endian `u16` per row.
-    UInt16 = 10,
+    UInt16 = 10 => "u16",
     /// One little-endian `u32` per row. Distinct from [`ArrowType::Int32`]
     /// because the widening read differs: `0xFFFF_FFFF` is 4294967295 here and
     /// -1 there, and no width check can tell those apart.
-    UInt32 = 11,
+    UInt32 = 11 => "u32",
     /// One little-endian `u64` per row.
-    UInt64 = 12,
+    UInt64 = 12 => "u64",
     /// One little-endian IEEE-754 `binary16` per row, stored as its raw bits.
-    Float16 = 13,
+    Float16 = 13 => "f16",
     /// One little-endian IEEE-754 `binary32` per row.
-    Float32 = 14,
+    Float32 = 14 => "f32",
     /// Sixteen little-endian two's-complement bytes per row.
-    Decimal128 = 15,
+    Decimal128 = 15 => "decimal128",
     /// Thirty-two little-endian two's-complement bytes per row.
-    Decimal256 = 16,
+    Decimal256 = 16 => "decimal256",
     /// Opaque bytes behind 64-bit monotone offsets.
-    LargeBinary = 17,
+    LargeBinary = 17 => "largeBinary",
     /// UTF-8 validated bytes behind 64-bit monotone offsets.
-    LargeUtf8 = 18,
+    LargeUtf8 = 18 => "largeUtf8",
     /// The one parameterized plane: `SignalSchemaField::type_param` bytes per
     /// row, bounded by [`MAX_FIXED_SIZE_BINARY_WIDTH`].
-    FixedSizeBinary = 19,
+    FixedSizeBinary = 19 => "fixedSizeBinary",
     /// One little-endian `i32` month count per row.
-    IntervalYearMonth = 20,
+    IntervalYearMonth = 20 => "intervalYearMonth",
     /// Eight bytes per row: little-endian `i32` days then `i32` milliseconds.
-    IntervalDayTime = 21,
+    IntervalDayTime = 21 => "intervalDayTime",
     /// Sixteen bytes per row: little-endian `i32` months, `i32` days, `i64`
     /// nanoseconds.
-    IntervalMonthDayNano = 22,
+    IntervalMonthDayNano = 22 => "intervalMonthDayNano",
     // Nested and dictionary-encoded types do NOT belong here. See the
     // `ArrowType` doc comment: the retained-metadata contract encodes at most
     // three buffers per field, and a nested or dictionary type needs a
