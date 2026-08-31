@@ -177,13 +177,16 @@ ${extra}  ];
 `,
       );
 
-      expect(validateDevenvPackages(root)).toBe(2);
+      // One failure, not two: the Linux compiler block. sccache is no longer required, which is
+      // the point — a Rust repo needs nothing on PATH for a compiler cache any more.
+      expect(validateDevenvPackages(root)).toBe(1);
       applyDevenvPackageDefaults(root);
       expect(validateDevenvPackages(root)).toBe(0);
       const devenv = await readFile(devenvPath, 'utf8');
-      expect(devenv).toContain(
-        'sccache # Rust compiler cache; client of the host-owned daemon (cowshed sccache start)',
-      );
+      // sccache is deliberately NOT injected: a bare `sccache` on a repo's PATH is what let
+      // RUSTC_WRAPPER resolve a different binary per project. It belongs to `cowshed setup
+      // --sccache`, which supervises one pinned store path.
+      expect(devenv).not.toContain('sccache');
       expect(devenv).toContain('++ lib.optionals pkgs.stdenv.isLinux [');
       expect(devenv).toContain('pkgs.stdenv.cc');
       expect(devenv).toContain('stdenv.cc.cc.lib');
