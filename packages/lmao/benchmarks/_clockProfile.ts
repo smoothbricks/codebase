@@ -64,7 +64,11 @@ for (const trace of traces.traces) {
     .slice(1, 5)
     .map((f) => f.name || '(anon)')
     .join(' < ');
-  const bucket = (chains[label] ??= {});
+  let bucket = chains[label];
+  if (bucket === undefined) {
+    bucket = {};
+    chains[label] = bucket;
+  }
   bucket[chain] = (bucket[chain] ?? 0) + 1;
 }
 
