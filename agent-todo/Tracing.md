@@ -101,3 +101,16 @@ Do not route `ENTRY_TYPE_SPAN_EXCEPTION` through `end_err`. Either:
 
 Stamp the timestamp. Leave the `span-err` / `span-exception` distinction intact. The pre-armed completion row is already
 `SpanException`; the exception path should not overwrite it with `SpanErr`.
+
+## Landed
+
+`0cb5e10d fix(lmao): record a thrown exception as SpanException, not SpanErr` — OBSERVED bun 1.4.0 arm64-darwin: the
+same throw now stores wasm header 4 (`span-exception`) on the thread lane, matching js-heap `entry_type[1] === 4`.
+`ThreadSpanView.end` passes the tracer's entry type through `binding.end(spanId, entryType, timestamp)`
+(`threadSpanView.ts:324-331`); wasm export is `thread_span_buffer_end`.
+
+`c9364da0 fix(lmao): give the thread lane the static-vocabulary message lane` — `_infoTemplate` no longer throws.
+`ThreadSpanView` has a `_messageIds` getter. It still forwards into `commitLog` → intern + `appendLog`, so
+`appendLogStatic` stays 0 until static routing lands.
+
+Still open: flat-class cutover and `appendLogStatic` on the write path. Jurisdiction not re-judged until those land.
