@@ -80,8 +80,6 @@ fn extract_msgpack_fields(
     // once with the column storage. Resetting it per row avoids both the old
     // 64-field ceiling and any per-event allocation.
     columns.columns_seen.fill(false);
-    let mut extra_count: u32 = 0;
-    let mut extra_end: usize = 0;
     // A fallback column with an unusably small work buffer (< 5 bytes, where
     // even the MessagePack header cannot fit) is a configuration error. Refuse
     // rather than silently dropping undeclared fields.
@@ -89,61 +87,85 @@ fn extract_msgpack_fields(
         return Err(ExtractionError::OutOfMemory);
     }
     let extra_active = config.fallback_column.is_some();
+    let mut state = ExtraState {
+        count: 0,
+        end: 0,
+        active: extra_active,
+    };
+    let mut saw_nested_value = false;
+    let mut saw_flat_value_key = false;
+    let mut column_name = String::new();
     for _ in 0..fields {
         let key_start = reader.position();
         let key = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
         let key_end = reader.position();
-        // A non-UTF-8 key is undeclared, not a parse error.
-        let lookup = std::str::from_utf8(key)
-            .ok()
-            .and_then(|name| config.lookup_field(name));
-        if let Some(lookup) = lookup {
-            extract_typed_value(reader, lookup.field, columns, lookup.column)?;
-            columns.columns_seen[lookup.column] = true;
-        } else if extra_active {
-            let value_start = reader.position();
-            reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
-            let value_end = reader.position();
-            if extra_count == 0 {
-                extra_end = 5;
-            }
-            let raw_value = &reader.input()[value_start..value_end];
-            let raw_key = &reader.input()[key_start..key_end];
-            // The carrier is path-keyed: a literal `%` or `.` in a segment
-            // escapes as %25/%2E (validate::encode_path_segment is the one
-            // spelling of that rule) so a captured key can never be misread
-            // as nesting. Escaping changes the string's length header, so an
-            // affected key re-encodes; every clean key copies its raw
-            // already-encoded slice, and a non-UTF-8 key is opaque bytes with
-            // nothing to escape.
-            let escaped = std::str::from_utf8(key)
-                .ok()
-                .filter(|name| name.contains(['%', '.']))
-                .map(encode_path_segment);
-            let key_len = match &escaped {
-                Some(name) => msgpack_str_header_len(name.len()) + name.len(),
-                None => raw_key.len(),
-            };
-            let end = extra_end
-                .checked_add(key_len + raw_value.len())
-                .ok_or(ExtractionError::BufferOverflow)?;
-            if end > work_buffer.len() {
-                return Err(ExtractionError::BufferOverflow);
-            }
-            let value_at = match &escaped {
-                Some(name) => write_msgpack_str(work_buffer, extra_end, name),
-                None => {
-                    work_buffer[extra_end..extra_end + raw_key.len()].copy_from_slice(raw_key);
-                    extra_end + raw_key.len()
-                }
-            };
-            work_buffer[value_at..end].copy_from_slice(raw_value);
-            extra_end = end;
-            extra_count += 1;
-        } else {
-            reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
+        if saw_nested_value && key.starts_with(b"value.")
+            || saw_flat_value_key && key == b"value" && config.has_value_fields
+        {
+            // One spelling per event: the validator judges the nested form,
+            // and a second spelling in the same event would let the judged
+            // bytes and the stored bytes diverge.
+            return Err(ExtractionError::InvalidJson);
         }
+        saw_flat_value_key |= key.starts_with(b"value.");
+        // The nested-envelope descent, the msgpack twin of the JSON
+        // extractor's: payload members resolve their `value.<member>`
+        // columns; a non-map `value` and a pure system schema keep the plain
+        // member handling.
+        if key == b"value"
+            && config.has_value_fields
+            && matches!(
+                reader.input().get(reader.position()),
+                Some(0x80..=0x8f | 0xde | 0xdf)
+            )
+        {
+            saw_nested_value = true;
+            let members = reader
+                .read_map_header()
+                .ok_or(ExtractionError::InvalidJson)?;
+            for _ in 0..members {
+                let member_start = reader.position();
+                let member = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
+                let member_end = reader.position();
+                let lookup_name = match std::str::from_utf8(member) {
+                    Ok(name) => {
+                        column_name.clear();
+                        column_name.push_str("value.");
+                        column_name.push_str(name);
+                        Some(column_name.as_str())
+                    }
+                    // A non-UTF-8 member is undeclared by construction.
+                    Err(_) => None,
+                };
+                extract_msgpack_member(
+                    reader,
+                    config,
+                    columns,
+                    work_buffer,
+                    &mut state,
+                    lookup_name,
+                    member,
+                    member_start,
+                    member_end,
+                )?;
+            }
+            continue;
+        }
+        let lookup_name = std::str::from_utf8(key).ok();
+        extract_msgpack_member(
+            reader,
+            config,
+            columns,
+            work_buffer,
+            &mut state,
+            lookup_name,
+            key,
+            key_start,
+            key_end,
+        )?;
     }
+    let extra_count = state.count;
+    let extra_end = state.end;
     for (presence_column, source_column) in &config.presence_entries {
         let present = columns.columns_seen[*source_column];
         append(columns, *presence_column, Some(ColumnValue::Bool(present)))?;
@@ -209,6 +231,88 @@ fn write_msgpack_str(buffer: &mut [u8], at: usize, value: &str) -> usize {
     }
     buffer[cursor..cursor + bytes.len()].copy_from_slice(bytes);
     cursor + bytes.len()
+}
+
+/// Bounded carrier accumulation state threaded through one row's members.
+struct ExtraState {
+    count: u32,
+    end: usize,
+    active: bool,
+}
+
+/// Handle one named member of the event or its nested payload, the msgpack
+/// twin of the JSON extractor's `extract_named_member`: a declared column
+/// extracts typed, an unknown member captures raw key/value slices into the
+/// bounded carrier (path-keyed, `%`/`.` re-encoded via `encode_path_segment`),
+/// otherwise the value is skipped. A member named after the carrier column
+/// routes to capture, never to the carrier's own cell.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one seam, two call shapes: top-level and payload descent"
+)]
+fn extract_msgpack_member(
+    reader: &mut Reader<'_>,
+    config: &ExtractionConfig,
+    columns: &mut DynamicColumns,
+    work_buffer: &mut [u8],
+    state: &mut ExtraState,
+    lookup_name: Option<&str>,
+    key: &[u8],
+    key_start: usize,
+    key_end: usize,
+) -> Result<(), ExtractionError> {
+    let lookup = lookup_name
+        .and_then(|name| config.lookup_field(name))
+        .filter(|lookup| Some(lookup.column) != config.fallback_column);
+    if let Some(lookup) = lookup {
+        extract_typed_value(reader, lookup.field, columns, lookup.column)?;
+        columns.columns_seen[lookup.column] = true;
+        return Ok(());
+    }
+    if !state.active {
+        reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
+        return Ok(());
+    }
+    let value_start = reader.position();
+    reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
+    let value_end = reader.position();
+    if state.count == 0 {
+        state.end = 5;
+    }
+    let raw_value = &reader.input()[value_start..value_end];
+    let raw_key = &reader.input()[key_start..key_end];
+    // The carrier is path-keyed: a literal `%` or `.` in a segment escapes as
+    // %25/%2E (validate::encode_path_segment is the one spelling of that
+    // rule) so a captured key can never be misread as nesting. Escaping
+    // changes the string's length header, so an affected key re-encodes;
+    // every clean key copies its raw already-encoded slice, and a non-UTF-8
+    // key is opaque bytes with nothing to escape.
+    let escaped = std::str::from_utf8(key)
+        .ok()
+        .filter(|name| name.contains(['%', '.']))
+        .map(encode_path_segment);
+    let key_len = match &escaped {
+        Some(name) => msgpack_str_header_len(name.len()) + name.len(),
+        None => raw_key.len(),
+    };
+    let end = state
+        .end
+        .checked_add(key_len + raw_value.len())
+        .ok_or(ExtractionError::BufferOverflow)?;
+    if end > work_buffer.len() {
+        return Err(ExtractionError::BufferOverflow);
+    }
+    let value_at = match &escaped {
+        Some(name) => write_msgpack_str(work_buffer, state.end, name),
+        None => {
+            work_buffer[state.end..state.end + raw_key.len()].copy_from_slice(raw_key);
+            state.end + raw_key.len()
+        }
+    };
+    work_buffer[value_at..end].copy_from_slice(raw_value);
+    state.end = end;
+    state.count += 1;
+    Ok(())
 }
 
 /// Coerce one MessagePack value into one column.
@@ -691,6 +795,90 @@ mod tests {
             Some(ColumnValue::Binary(vec![
                 0xdf, 0, 0, 0, 1, 0xa5, b'a', b'%', b'2', b'E', b'b', 7
             ]))
+        );
+    }
+    #[test]
+    fn extract_msgpack_events_descends_a_nested_value_envelope() {
+        // The ingest wire shape, msgpack twin of the JSON descent gate.
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let mut input = vec![0x82];
+        str_(&mut input, "id");
+        str_(&mut input, "s1");
+        str_(&mut input, "value");
+        input.push(0x81);
+        str_(&mut input, "note");
+        str_(&mut input, "hello");
+        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut work = [0; 128];
+        assert_eq!(
+            extract_msgpack_events(
+                &input,
+                &config(&fields, &["id", "value.note"]),
+                &mut columns,
+                &mut work,
+                true
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(columns.columns[0].read_variable(0), Some(b"s1".as_slice()));
+        assert_eq!(
+            columns.columns[1].read_variable(0),
+            Some(b"hello".as_slice())
+        );
+    }
+    #[test]
+    fn extract_msgpack_events_captures_nested_unknowns_payload_relative() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
+        let mut input = vec![0x82];
+        str_(&mut input, "id");
+        str_(&mut input, "s1");
+        str_(&mut input, "value");
+        input.push(0x81);
+        str_(&mut input, "bogus");
+        input.push(7);
+        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut work = [0; 128];
+        assert_eq!(
+            extract_msgpack_events(
+                &input,
+                &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
+                &mut columns,
+                &mut work,
+                true
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            columns.cell(1, 0),
+            Some(ColumnValue::Binary(vec![
+                0xdf, 0, 0, 0, 1, 0xa5, b'b', b'o', b'g', b'u', b's', 7
+            ]))
+        );
+    }
+    #[test]
+    fn extract_msgpack_events_refuses_a_mixed_payload_spelling() {
+        // Nested `value` object plus a flat `value.note` key in one event.
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Utf8)];
+        let mut input = vec![0x82];
+        str_(&mut input, "value");
+        input.push(0x81);
+        str_(&mut input, "note");
+        str_(&mut input, "a");
+        str_(&mut input, "value.note");
+        str_(&mut input, "b");
+        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut work = [0; 128];
+        assert!(
+            extract_msgpack_events(
+                &input,
+                &config(&fields, &["id", "value.note"]),
+                &mut columns,
+                &mut work,
+                true
+            )
+            .is_err()
         );
     }
     #[test]
