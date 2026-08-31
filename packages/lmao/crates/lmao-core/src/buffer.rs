@@ -35,6 +35,15 @@ pub const COMPLETION_ROW: usize = 1;
 /// First appendable log row.
 pub const FIRST_LOG_ROW: usize = 2;
 
+/// Source identity has four deliberately distinct forms:
+///
+/// - a versioned module names its package and file and carries the source file's
+///   40-hex last-touch commit;
+/// - `js-hash:<64 hex>` names unversioned authored JavaScript by content and has
+///   no commit;
+/// - `<unversioned>` marks authored source with neither commit nor content hash;
+/// - `<internal>` with no commit and line zero is reserved for test-only internal
+///   machinery with no authored callsite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceMetadata {
     pub package_name: &'static str,
@@ -47,8 +56,8 @@ impl SourceMetadata {
     /// Explicit source marker for internal/test machinery that has no authored callsite.
     #[doc(hidden)]
     pub const UNATTRIBUTED: Self = Self {
-        package_name: "<unattributed>",
-        package_file: "<unattributed>",
+        package_name: "<internal>",
+        package_file: "<internal>",
         git_sha: None,
         line: 0,
     };
