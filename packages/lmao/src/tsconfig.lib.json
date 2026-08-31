@@ -1,0 +1,16 @@
+{
+  "//": "Runtime-transform project for the bun typia preload (packages/validation/src/bun/preload.ts). The preload routes every loaded file to its own nearest project, searching upward for `tsconfig.lib.json` for imported production source. Without this file the nearest match is packages/lmao/tsconfig.lib.json, whose directory is the package root — so @ttsc/unplugin walks and hashes the whole package, including the Cargo workspace's target/ output, which is not on its hardcoded skip list. That walk is paid by every package that imports lmao source, not just by lmao, and a concurrent cargo write into target/ makes the generation unstable because the directory-membership terms are not scoped to declared inputs. Rooting the project at src/ keeps the walk to the sources actually being transformed.",
+  "extends": "../tsconfig.lib.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "rootDir": ".",
+    "outDir": null,
+    "tsBuildInfoFile": null
+  },
+  "include": ["./**/*.ts"],
+  "exclude": ["./**/__tests__/**", "./**/*.test.ts", "./**/*.spec.ts"]
+}
