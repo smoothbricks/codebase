@@ -464,6 +464,45 @@ pub unsafe extern "C" fn thread_span_buffer_set_scope(
     buffer.set_scope(span_id, &update).is_err() as u8
 }
 
+/// Release every row and span on a handle, keeping its interned vocabulary.
+///
+/// Returns zero on success and nonzero when the handle is null.
+///
+/// # Safety
+/// `handle` must be null or a live handle returned by a constructor and not
+/// previously freed.
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
+pub unsafe extern "C" fn thread_span_buffer_reset(handle: *mut ThreadSpanBufferHandle) -> u8 {
+    let Some(buffer) = as_buffer(handle) else {
+        return 1;
+    };
+    buffer.reset();
+    0
+}
+
+/// Complete a span with the caller's entry type.
+///
+/// The generic endpoint preserves the distinction between handled errors and
+/// thrown exceptions that the end_ok/end_err pair cannot carry.
+///
+/// # Safety
+/// `handle` must be a live uniquely owned handle.
+#[cfg_attr(not(target_family = "wasm"), unsafe(no_mangle))]
+pub unsafe extern "C" fn thread_span_buffer_end(
+    handle: *mut ThreadSpanBufferHandle,
+    span_id: u32,
+    entry_type: u8,
+    timestamp: i64,
+) -> u8 {
+    let Some(buffer) = as_buffer(handle) else {
+        return 1;
+    };
+    let Some(entry_type) = EntryType::from_u8(entry_type) else {
+        return 1;
+    };
+    buffer.end(span_id, entry_type, timestamp).is_err() as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
