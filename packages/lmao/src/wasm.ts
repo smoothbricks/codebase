@@ -1,7 +1,9 @@
 export {
   bindThreadSpanBuffer,
   isThreadSpanBufferWasmExports,
+  THREAD_ATTRIBUTE_KINDS,
   THREAD_SPAN_BUFFER_OK,
+  type ThreadAttributeKind,
   type ThreadSpanBufferBinding,
   type ThreadSpanBufferHandle,
   type ThreadSpanBufferWasmExports,

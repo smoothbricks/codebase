@@ -1,304 +1,303 @@
-//! Phase-A opaque-handle ABI for the shared thread span buffer.
+//! Numeric-handle adapter for the canonical [`lmao_core::ThreadSpanBuffer`] ABI.
 //!
-//! The registry and row model are deliberately local to this shim. They make the
-//! ABI executable before `lmao-core::ThreadSpanBuffer` lands, while keeping every
-//! exported signature identical to the core-backed implementation. Phase B
-//! replaces `StubThreadSpanBuffer` and its adapter; callers do not change.
+//! Native callers use `lmao_core::thread_ffi`, whose opaque handle is a Rust
+//! pointer. WASM callers cannot safely retain that pointer as a JavaScript
+//! number, so this module owns a per-module slot table and keeps the pointer
+//! private. The row store, lifecycle, parentage, overflow, and value decoding
+//! remain in `lmao-core`; this file only validates slots and translates the
+//! frozen numeric ABI.
 
 use std::cell::RefCell;
-use std::str;
+use std::mem::ManuallyDrop;
+use std::{collections::HashSet, str};
 
-const OK: u8 = 0;
-const INVALID_HANDLE: u8 = 1;
-const INVALID_INPUT: u8 = 2;
-const UNKNOWN_SPAN: u8 = 3;
-const INVALID_COLUMN: u8 = 4;
-const EXHAUSTED: u8 = 5;
-const MIN_CAPACITY: u32 = 8;
-const MAX_CAPACITY: u32 = 1024;
+use lmao_core::{
+    ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
+    ATTRIBUTE_KIND_UINT64, ColumnValue, EntryType, FieldMeta, FieldStrategy, ScopeValue, SharedStr,
+    ThreadBufferError, ThreadSpanBuffer, TraceId, VocabularyId,
+};
 
-const SPAN_START: u8 = 1;
-const SPAN_OK: u8 = 2;
-const SPAN_ERR: u8 = 3;
-const SPAN_EXCEPTION: u8 = 4;
-const SYSTEM_COLUMN_COUNT: u16 = 12;
+const STATUS_OK: u8 = 0;
+const STATUS_ERROR: u8 = 1;
+const SYSTEM_COLUMN_COUNT: usize = lmao_core::SYSTEM_COLUMN_COUNT;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Attr {
-    ordinal: u16,
-    kind: u8,
-    value: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Row {
-    span_id: u32,
-    entry_type: u8,
-    timestamp: i64,
-    line: u32,
-    message: Option<String>,
-    attrs: Vec<Attr>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Span {
-    span_id: u32,
-    start_row: u32,
-    completion_row: u32,
-    parent_thread_id: u64,
-    parent_span_id: u32,
-    trace_id: Vec<u8>,
-    open: bool,
+thread_local! {
+    static HANDLES: RefCell<Vec<Option<ThreadBufferSlot>>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Debug)]
-struct StubThreadSpanBuffer {
-    thread_id: u64,
-    capacity: usize,
-    next_span_id: u32,
-    rows: Vec<Row>,
-    spans: Vec<Span>,
-    scope: Vec<(u32, Attr)>,
-    interned: Vec<String>,
+enum ParsedFieldStrategy {
+    Number,
+    Uint64,
+    Boolean,
+    Text,
+    Enum(Vec<String>),
 }
 
-impl StubThreadSpanBuffer {
-    fn new(thread_id: u64, capacity: usize) -> Self {
+#[derive(Debug)]
+struct ParsedField {
+    name: String,
+    strategy: ParsedFieldStrategy,
+}
+
+#[derive(Debug)]
+struct SchemaStorage {
+    fields: Box<[FieldMeta]>,
+    _names: Vec<Box<str>>,
+    _enum_variants: Vec<Vec<Box<str>>>,
+    _enum_values: Vec<Box<[&'static str]>>,
+}
+
+impl SchemaStorage {
+    fn from_fields(fields: Vec<ParsedField>) -> Self {
+        let mut names = Vec::with_capacity(fields.len());
+        let mut enum_variants = Vec::new();
+        let mut enum_values = Vec::new();
+        let mut metadata = Vec::with_capacity(fields.len());
+        for field in fields {
+            names.push(field.name.into_boxed_str());
+            let name_ptr = names.last().expect("just-pushed schema name").as_ref() as *const str;
+            // SAFETY: `names` owns this allocation for the lifetime of this
+            // storage, and `SchemaStorage` is dropped only after its buffer.
+            let name: &'static str = unsafe { &*name_ptr };
+            let strategy = match field.strategy {
+                ParsedFieldStrategy::Number => FieldStrategy::Number,
+                ParsedFieldStrategy::Uint64 => FieldStrategy::Uint64,
+                ParsedFieldStrategy::Boolean => FieldStrategy::Boolean,
+                ParsedFieldStrategy::Text => FieldStrategy::Text,
+                ParsedFieldStrategy::Enum(values) => {
+                    let owned_values = values
+                        .into_iter()
+                        .map(String::into_boxed_str)
+                        .collect::<Vec<_>>();
+                    let values = owned_values
+                        .iter()
+                        .map(|value| {
+                            let value_ptr = value.as_ref() as *const str;
+                            // SAFETY: the boxed strings are retained by
+                            // `_enum_variants` for the schema lifetime.
+                            unsafe { &*value_ptr }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    let values_ptr = values.as_ref() as *const [&'static str];
+                    // SAFETY: the boxed slice is retained by `_enum_values`.
+                    let values_ref: &'static [&'static str] = unsafe { &*values_ptr };
+                    enum_variants.push(owned_values);
+                    enum_values.push(values);
+                    FieldStrategy::Enum(values_ref)
+                }
+            };
+            metadata.push(FieldMeta::new(name, strategy));
+        }
         Self {
-            thread_id,
-            capacity,
-            next_span_id: 1,
-            rows: Vec::with_capacity(capacity),
-            spans: Vec::with_capacity(capacity),
-            scope: Vec::new(),
-            interned: Vec::new(),
+            fields: metadata.into_boxed_slice(),
+            _names: names,
+            _enum_variants: enum_variants,
+            _enum_values: enum_values,
         }
     }
 
-    fn next_span_id(&mut self) -> Result<u32, u8> {
-        let span_id = self.next_span_id;
-        if span_id == 0 {
-            return Err(EXHAUSTED);
+    fn fields(&self) -> &'static [FieldMeta] {
+        let fields_ptr = self.fields.as_ref() as *const [FieldMeta];
+        // SAFETY: `ThreadBufferSlot` drops its buffer before this storage, and
+        // the buffer is the only consumer of these metadata references.
+        unsafe { &*fields_ptr }
+    }
+}
+
+#[derive(Debug)]
+struct ThreadBufferSlot {
+    buffer: ManuallyDrop<ThreadSpanBuffer>,
+    _schema: SchemaStorage,
+}
+
+impl ThreadBufferSlot {
+    fn new(thread_id: u64, capacity: usize, fields: Vec<ParsedField>) -> Self {
+        let schema = SchemaStorage::from_fields(fields);
+        let buffer = ThreadSpanBuffer::new(thread_id, capacity, schema.fields());
+        Self {
+            buffer: ManuallyDrop::new(buffer),
+            _schema: schema,
         }
-        self.next_span_id = self.next_span_id.checked_add(1).ok_or(EXHAUSTED)?;
-        Ok(span_id)
     }
-    fn reserve_row(&self) -> Result<(), u8> {
-        (self.rows.len() < self.capacity)
-            .then_some(())
-            .ok_or(EXHAUSTED)
-    }
+}
 
-    fn push_span(
-        &mut self,
-        trace_id: &[u8],
-        parent_thread_id: u64,
-        parent_span_id: u32,
-        message: Option<String>,
-        timestamp: i64,
-        line: u32,
-    ) -> Result<u64, u8> {
-        let _ = self.thread_id;
-        let span_id = self.next_span_id()?;
-        self.reserve_row()?;
-        let start_row = u32::try_from(self.rows.len()).map_err(|_| EXHAUSTED)?;
-        self.rows.push(Row {
-            span_id,
-            entry_type: SPAN_START,
-            timestamp,
-            line,
-            message,
-            attrs: Vec::new(),
-        });
-        self.reserve_row()?;
-        let completion_row = u32::try_from(self.rows.len()).map_err(|_| EXHAUSTED)?;
-        self.rows.push(Row {
-            span_id,
-            entry_type: SPAN_EXCEPTION,
-            timestamp,
-            line: 0,
-            message: None,
-            attrs: Vec::new(),
-        });
-        self.spans.push(Span {
-            span_id,
-            start_row,
-            completion_row,
-            parent_thread_id,
-            parent_span_id,
-            trace_id: trace_id.to_vec(),
-            open: true,
-        });
-        Ok(pack(span_id, start_row))
+impl Drop for ThreadBufferSlot {
+    fn drop(&mut self) {
+        // SAFETY: the metadata owner remains alive until this explicit buffer
+        // drop completes.
+        unsafe { ManuallyDrop::drop(&mut self.buffer) };
     }
+}
 
-    fn append_log(
-        &mut self,
-        span_id: u32,
-        entry_type: u8,
-        message: Option<String>,
-        timestamp: i64,
-        line: u32,
-    ) -> Result<u64, u8> {
-        self.find_span(span_id)?;
-        self.reserve_row()?;
-        let row = u32::try_from(self.rows.len()).map_err(|_| EXHAUSTED)?;
-        self.rows.push(Row {
-            span_id,
-            entry_type,
-            timestamp,
-            line,
-            message,
-            attrs: Vec::new(),
-        });
-        Ok(pack(span_id, row))
-    }
+fn parse_schema(ptr: *const u8, len: usize) -> Option<Vec<ParsedField>> {
+    let bytes = unsafe { bytes(ptr, len) }?;
+    let mut cursor = 0;
+    let mut names = HashSet::new();
+    let mut fields = Vec::new();
 
-    fn end(&mut self, span_id: u32, entry_type: u8, timestamp: i64) -> Result<(), u8> {
-        let span = self.find_span(span_id)?.clone();
-        let row = self
-            .rows
-            .get_mut(span.completion_row as usize)
-            .ok_or(EXHAUSTED)?;
-        row.entry_type = entry_type;
-        row.timestamp = timestamp;
-        self.spans
-            .iter_mut()
-            .find(|candidate| candidate.span_id == span_id)
-            .ok_or(UNKNOWN_SPAN)?
-            .open = false;
-        Ok(())
-    }
-
-    fn write_attr(&mut self, row: u32, ordinal: u16, kind: u8, value: u64) -> Result<(), u8> {
-        if ordinal < SYSTEM_COLUMN_COUNT || kind == 0 {
-            return Err(INVALID_COLUMN);
+    while cursor < bytes.len() {
+        let kind = *bytes.get(cursor)?;
+        cursor += 1;
+        let name_len = usize::from(*bytes.get(cursor)?);
+        cursor += 1;
+        let name_end = cursor.checked_add(name_len)?;
+        let name_bytes = bytes.get(cursor..name_end)?;
+        cursor = name_end;
+        let name = str::from_utf8(name_bytes).ok()?;
+        if name.is_empty() || !names.insert(name) {
+            return None;
         }
-        let attrs = &mut self.rows.get_mut(row as usize).ok_or(INVALID_INPUT)?.attrs;
-        if let Some(attr) = attrs.iter_mut().find(|attr| attr.ordinal == ordinal) {
-            attr.kind = kind;
-            attr.value = value;
-        } else {
-            attrs.push(Attr {
-                ordinal,
-                kind,
-                value,
-            });
-        }
-        Ok(())
-    }
 
-    fn write_tag(&mut self, span_id: u32, ordinal: u16, kind: u8, value: u64) -> Result<(), u8> {
-        let row = self.find_span(span_id)?.start_row;
-        self.write_attr(row, ordinal, kind, value)
-    }
-
-    fn set_scope(&mut self, span_id: u32, ordinal: u16, kind: u8, value: u64) -> Result<(), u8> {
-        if ordinal < SYSTEM_COLUMN_COUNT || kind == 0 {
-            return Err(INVALID_COLUMN);
-        }
-        self.find_span(span_id)?;
-        let attr = Attr {
-            ordinal,
-            kind,
-            value,
+        let strategy = match kind {
+            ATTRIBUTE_KIND_NUMBER => ParsedFieldStrategy::Number,
+            ATTRIBUTE_KIND_UINT64 => ParsedFieldStrategy::Uint64,
+            ATTRIBUTE_KIND_BOOLEAN => ParsedFieldStrategy::Boolean,
+            ATTRIBUTE_KIND_TEXT => ParsedFieldStrategy::Text,
+            ATTRIBUTE_KIND_ENUM => {
+                let count_end = cursor.checked_add(2)?;
+                let count_bytes = bytes.get(cursor..count_end)?;
+                cursor = count_end;
+                let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]);
+                if count == 0 {
+                    return None;
+                }
+                let mut variants = Vec::with_capacity(usize::from(count));
+                let mut variant_names = HashSet::with_capacity(usize::from(count));
+                for _ in 0..count {
+                    let variant_len = usize::from(*bytes.get(cursor)?);
+                    cursor += 1;
+                    let variant_end = cursor.checked_add(variant_len)?;
+                    let variant_bytes = bytes.get(cursor..variant_end)?;
+                    cursor = variant_end;
+                    let variant = str::from_utf8(variant_bytes).ok()?;
+                    if variant.is_empty() || !variant_names.insert(variant) {
+                        return None;
+                    }
+                    variants.push(variant.to_owned());
+                }
+                ParsedFieldStrategy::Enum(variants)
+            }
+            _ => return None,
         };
-        if let Some((_, existing)) = self
-            .scope
-            .iter_mut()
-            .find(|(candidate, existing)| *candidate == span_id && existing.ordinal == ordinal)
-        {
-            *existing = attr;
-        } else {
-            self.scope.push((span_id, attr));
-        }
-        Ok(())
+        fields.push(ParsedField {
+            name: name.to_owned(),
+            strategy,
+        });
     }
 
-    fn intern(&mut self, value: &str) -> Result<u32, u8> {
-        if let Some((index, _)) = self
-            .interned
-            .iter()
-            .enumerate()
-            .find(|(_, existing)| existing.as_str() == value)
-        {
-            return u32::try_from(index + 1).map_err(|_| EXHAUSTED);
-        }
-        self.interned.push(value.to_owned());
-        u32::try_from(self.interned.len()).map_err(|_| EXHAUSTED)
-    }
-
-    fn find_span(&self, span_id: u32) -> Result<&Span, u8> {
-        self.spans
-            .iter()
-            .find(|span| span.span_id == span_id)
-            .ok_or(UNKNOWN_SPAN)
-    }
+    let highest_ordinal = fields
+        .len()
+        .checked_add(SYSTEM_COLUMN_COUNT)?
+        .checked_sub(1)?;
+    u16::try_from(highest_ordinal).ok()?;
+    Some(fields)
 }
 
-fn pack(span_id: u32, row: u32) -> u64 {
-    (u64::from(span_id) << 32) | u64::from(row)
-}
-
-thread_local! {
-    static HANDLES: RefCell<Vec<Option<StubThreadSpanBuffer>>> = const { RefCell::new(Vec::new()) };
+fn valid_capacity(capacity: u32) -> Option<usize> {
+    let capacity = usize::try_from(capacity).ok()?;
+    capacity
+        .is_power_of_two()
+        .then_some(capacity)
+        .filter(|capacity| (lmao_core::MIN_CAPACITY..=lmao_core::MAX_CAPACITY).contains(capacity))
 }
 
 fn with_handle<R>(
     handle: u32,
-    f: impl FnOnce(&mut StubThreadSpanBuffer) -> Result<R, u8>,
-) -> Result<R, u8> {
+    f: impl FnOnce(&mut ThreadSpanBuffer) -> Result<R, ThreadBufferError>,
+) -> Result<R, ThreadBufferError> {
     if handle == 0 {
-        return Err(INVALID_HANDLE);
+        return Err(ThreadBufferError::UnknownSpan(0));
     }
     HANDLES.with(|handles| {
-        let mut handles = handles.borrow_mut();
         handles
+            .borrow_mut()
             .get_mut(handle as usize - 1)
             .and_then(Option::as_mut)
-            .ok_or(INVALID_HANDLE)
-            .and_then(f)
+            .ok_or(ThreadBufferError::UnknownSpan(0))
+            .and_then(|slot| f(&mut slot.buffer))
     })
 }
 
-unsafe fn read_bytes<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8], u8> {
+fn allocate_handle(thread_id: u64, capacity: usize, fields: Vec<ParsedField>) -> u32 {
+    let slot = ThreadBufferSlot::new(thread_id, capacity, fields);
+    HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        if let Some(index) = handles.iter().position(Option::is_none) {
+            handles[index] = Some(slot);
+            return u32::try_from(index + 1).unwrap_or(0);
+        }
+        handles.push(Some(slot));
+        u32::try_from(handles.len()).unwrap_or(0)
+    })
+}
+
+fn pack(span_id: u32, row: usize) -> u64 {
+    (u64::from(span_id) << 32) | u64::try_from(row).unwrap_or(u64::MAX)
+}
+
+unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len > 0 && ptr.is_null() {
+        return None;
+    }
+    // SAFETY: each exported dynamic entrypoint documents that the caller owns
+    // this readable range for the duration of the call. A null pointer is
+    // valid for an empty range and `from_raw_parts` accepts it only through the
+    // explicit empty-slice branch below.
     if len == 0 {
-        return Ok(&[]);
+        return Some(&[]);
     }
-    if ptr.is_null() {
-        return Err(INVALID_INPUT);
-    }
-    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-fn decode_utf8(ptr: *const u8, len: usize) -> Result<String, u8> {
-    let bytes = unsafe { read_bytes(ptr, len) }?;
-    str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| INVALID_INPUT)
+fn trace_id(ptr: *const u8, len: usize) -> Option<TraceId> {
+    let bytes = unsafe { bytes(ptr, len) }?;
+    let value = std::str::from_utf8(bytes).ok()?.to_owned();
+    TraceId::new(value).ok()
 }
 
-fn decode_trace(ptr: *const u8, len: usize) -> Result<Vec<u8>, u8> {
-    Ok(unsafe { read_bytes(ptr, len) }?.to_vec())
+fn shared_string(ptr: *const u8, len: usize) -> Option<SharedStr> {
+    let bytes = unsafe { bytes(ptr, len) }?;
+    ThreadSpanBuffer::shared_utf8(bytes).ok()
+}
+
+fn write_value(buffer: &mut ThreadSpanBuffer, row: u32, ordinal: u16, kind: u8, value: u64) -> u8 {
+    let Some(value) = buffer.decode_abi_value(kind, value) else {
+        return STATUS_ERROR;
+    };
+    buffer
+        .write_attr(row, ordinal, value)
+        .map(|()| STATUS_OK)
+        .unwrap_or(STATUS_ERROR)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn thread_span_buffer_new(thread_id: u64, capacity: u32) -> u32 {
-    if !capacity.is_power_of_two() || !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
+    let Some(capacity) = valid_capacity(capacity) else {
         return 0;
-    }
-    HANDLES.with(|handles| {
-        let mut handles = handles.borrow_mut();
-        let Some(slot) = handles.iter().position(Option::is_none) else {
-            handles.push(Some(StubThreadSpanBuffer::new(
-                thread_id,
-                capacity as usize,
-            )));
-            return u32::try_from(handles.len()).unwrap_or(0);
-        };
-        handles[slot] = Some(StubThreadSpanBuffer::new(thread_id, capacity as usize));
-        u32::try_from(slot + 1).unwrap_or(0)
-    })
+    };
+    allocate_handle(thread_id, capacity, Vec::new())
+}
+
+/// Construct a schema-bearing buffer from the compact generated-schema blob.
+///
+/// Each field is `[kind:u8][name_len:u8][name bytes]`; enum fields append
+/// `[variant_count:u16 LE]` and `[len:u8][variant bytes]` for each variant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_new_with_schema(
+    thread_id: u64,
+    capacity: u32,
+    fields_ptr: *const u8,
+    fields_len: usize,
+) -> u32 {
+    let Some(capacity) = valid_capacity(capacity) else {
+        return 0;
+    };
+    let Some(fields) = parse_schema(fields_ptr, fields_len) else {
+        return 0;
+    };
+    allocate_handle(thread_id, capacity, fields)
 }
 
 #[unsafe(no_mangle)]
@@ -314,38 +313,80 @@ pub extern "C" fn thread_span_buffer_free(handle: u32) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn thread_span_buffer_open_span(
+pub unsafe extern "C" fn thread_span_buffer_intern(handle: u32, ptr: *const u8, len: usize) -> u32 {
+    let Some(bytes) = (unsafe { bytes(ptr, len) }) else {
+        return 0;
+    };
+    with_handle(handle, |buffer| buffer.intern_utf8(bytes)).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_open_span(
     handle: u32,
     trace_ptr: *const u8,
     trace_len: usize,
     parent_thread_id: u64,
     parent_span_id: u32,
-    name_vocab: u32,
+    name_ordinal: u32,
     timestamp: i64,
     line: u32,
 ) -> u64 {
-    if name_vocab == 0 {
+    let Some(trace_id) = trace_id(trace_ptr, trace_len) else {
         return 0;
-    }
-    let trace_id = match decode_trace(trace_ptr, trace_len) {
-        Ok(trace_id) => trace_id,
-        Err(_) => return 0,
     };
     with_handle(handle, |buffer| {
-        buffer.push_span(
-            &trace_id,
+        let span_id = buffer.open_span_interned(
+            trace_id,
             parent_thread_id,
             parent_span_id,
-            Some(format!("vocab:{name_vocab}")),
+            name_ordinal,
             timestamp,
             line,
-        )
+        )?;
+        let row = buffer
+            .start_row(span_id)
+            .ok_or(ThreadBufferError::InvalidRow(0))?;
+        Ok(pack(span_id, row))
     })
     .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn thread_span_buffer_open_span_dynamic(
+pub unsafe extern "C" fn thread_span_buffer_open_span_static(
+    handle: u32,
+    trace_ptr: *const u8,
+    trace_len: usize,
+    parent_thread_id: u64,
+    parent_span_id: u32,
+    name_id: u32,
+    timestamp: i64,
+    line: u32,
+) -> u64 {
+    let Some(trace_id) = trace_id(trace_ptr, trace_len) else {
+        return 0;
+    };
+    let Ok(name_id) = VocabularyId::try_from(name_id) else {
+        return 0;
+    };
+    with_handle(handle, |buffer| {
+        let span_id = buffer.open_span_static(
+            trace_id,
+            parent_thread_id,
+            parent_span_id,
+            name_id,
+            timestamp,
+            line,
+        )?;
+        let row = buffer
+            .start_row(span_id)
+            .ok_or(ThreadBufferError::InvalidRow(0))?;
+        Ok(pack(span_id, row))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
     handle: u32,
     trace_ptr: *const u8,
     trace_len: usize,
@@ -356,39 +397,41 @@ pub extern "C" fn thread_span_buffer_open_span_dynamic(
     timestamp: i64,
     line: u32,
 ) -> u64 {
-    let trace_id = match decode_trace(trace_ptr, trace_len) {
-        Ok(trace_id) => trace_id,
-        Err(_) => return 0,
+    let Some(trace_id) = trace_id(trace_ptr, trace_len) else {
+        return 0;
     };
-    let name = match decode_utf8(name_ptr, name_len) {
-        Ok(name) => name,
-        Err(_) => return 0,
+    let Some(name) = shared_string(name_ptr, name_len) else {
+        return 0;
     };
     with_handle(handle, |buffer| {
-        buffer.push_span(
-            &trace_id,
+        let span_id = buffer.open_span(
+            trace_id,
             parent_thread_id,
             parent_span_id,
-            Some(name),
+            name,
             timestamp,
             line,
-        )
+        )?;
+        let row = buffer
+            .start_row(span_id)
+            .ok_or(ThreadBufferError::InvalidRow(0))?;
+        Ok(pack(span_id, row))
     })
     .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn thread_span_buffer_end_ok(handle: u32, span_id: u32, timestamp: i64) -> u8 {
-    with_handle(handle, |buffer| buffer.end(span_id, SPAN_OK, timestamp))
-        .map(|()| OK)
-        .unwrap_or_else(|error| error)
+    with_handle(handle, |buffer| buffer.end_ok(span_id, timestamp))
+        .map(|()| STATUS_OK)
+        .unwrap_or(STATUS_ERROR)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn thread_span_buffer_end_err(handle: u32, span_id: u32, timestamp: i64) -> u8 {
-    with_handle(handle, |buffer| buffer.end(span_id, SPAN_ERR, timestamp))
-        .map(|()| OK)
-        .unwrap_or_else(|error| error)
+    with_handle(handle, |buffer| buffer.end_err(span_id, timestamp))
+        .map(|()| STATUS_OK)
+        .unwrap_or(STATUS_ERROR)
 }
 
 #[unsafe(no_mangle)]
@@ -396,27 +439,45 @@ pub extern "C" fn thread_span_buffer_append_log(
     handle: u32,
     span_id: u32,
     entry_type: u8,
-    message_vocab: u32,
+    message_ordinal: u32,
     timestamp: i64,
     line: u32,
 ) -> u64 {
-    if entry_type == 0 || message_vocab == 0 {
+    let Some(entry_type) = EntryType::from_u8(entry_type) else {
         return 0;
-    }
+    };
     with_handle(handle, |buffer| {
-        buffer.append_log(
-            span_id,
-            entry_type,
-            Some(format!("vocab:{message_vocab}")),
-            timestamp,
-            line,
-        )
+        let row =
+            buffer.append_log_interned(span_id, entry_type, message_ordinal, line, timestamp)?;
+        Ok(pack(span_id, row as usize))
     })
     .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn thread_span_buffer_append_log_dynamic(
+pub extern "C" fn thread_span_buffer_append_log_static(
+    handle: u32,
+    span_id: u32,
+    entry_type: u8,
+    message_id: u32,
+    timestamp: i64,
+    line: u32,
+) -> u64 {
+    let Some(entry_type) = EntryType::from_u8(entry_type) else {
+        return 0;
+    };
+    let Ok(message_id) = VocabularyId::try_from(message_id) else {
+        return 0;
+    };
+    with_handle(handle, |buffer| {
+        let row = buffer.append_log_static(span_id, entry_type, message_id, line, timestamp)?;
+        Ok(pack(span_id, row as usize))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     handle: u32,
     span_id: u32,
     entry_type: u8,
@@ -425,15 +486,15 @@ pub extern "C" fn thread_span_buffer_append_log_dynamic(
     timestamp: i64,
     line: u32,
 ) -> u64 {
-    if entry_type == 0 {
+    let Some(entry_type) = EntryType::from_u8(entry_type) else {
         return 0;
-    }
-    let message = match decode_utf8(message_ptr, message_len) {
-        Ok(message) => message,
-        Err(_) => return 0,
+    };
+    let Some(message) = shared_string(message_ptr, message_len) else {
+        return 0;
     };
     with_handle(handle, |buffer| {
-        buffer.append_log(span_id, entry_type, Some(message), timestamp, line)
+        let row = buffer.append_log(span_id, entry_type, Some(message), line, timestamp)?;
+        Ok(pack(span_id, row as usize))
     })
     .unwrap_or(0)
 }
@@ -447,10 +508,9 @@ pub extern "C" fn thread_span_buffer_write_attr(
     value: u64,
 ) -> u8 {
     with_handle(handle, |buffer| {
-        buffer.write_attr(row, ordinal, kind, value)
+        Ok(write_value(buffer, row, ordinal, kind, value))
     })
-    .map(|()| OK)
-    .unwrap_or_else(|error| error)
+    .unwrap_or(STATUS_ERROR)
 }
 
 #[unsafe(no_mangle)]
@@ -462,10 +522,13 @@ pub extern "C" fn thread_span_buffer_write_tag(
     value: u64,
 ) -> u8 {
     with_handle(handle, |buffer| {
-        buffer.write_tag(span_id, ordinal, kind, value)
+        let row = buffer
+            .start_row(span_id)
+            .and_then(|row| u32::try_from(row).ok())
+            .ok_or(ThreadBufferError::UnknownSpan(span_id))?;
+        Ok(write_value(buffer, row, ordinal, kind, value))
     })
-    .map(|()| OK)
-    .unwrap_or_else(|error| error)
+    .unwrap_or(STATUS_ERROR)
 }
 
 #[unsafe(no_mangle)]
@@ -477,146 +540,161 @@ pub extern "C" fn thread_span_buffer_set_scope(
     value: u64,
 ) -> u8 {
     with_handle(handle, |buffer| {
-        buffer.set_scope(span_id, ordinal, kind, value)
+        let index = usize::from(ordinal)
+            .checked_sub(SYSTEM_COLUMN_COUNT)
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
+        let field = buffer
+            .schema_fields()
+            .get(index)
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
+        let value = buffer
+            .decode_abi_value(kind, value)
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
+        let scope_value = match value {
+            ColumnValue::Number(value) => ScopeValue::Number(value),
+            ColumnValue::Uint64(value) => ScopeValue::Uint64(value),
+            ColumnValue::Boolean(value) => ScopeValue::Boolean(value),
+            ColumnValue::Text(value) => ScopeValue::Text(value),
+            ColumnValue::Enum(value) => ScopeValue::EnumIndex(value),
+        };
+        let update = [(field.name, Some(scope_value))];
+        buffer.set_scope(span_id, &update)
     })
-    .map(|()| OK)
-    .unwrap_or_else(|error| error)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn thread_span_buffer_intern(handle: u32, ptr: *const u8, len: usize) -> u32 {
-    let value = match decode_utf8(ptr, len) {
-        Ok(value) => value,
-        Err(_) => return 0,
-    };
-    with_handle(handle, |buffer| buffer.intern(&value)).unwrap_or(0)
+    .map(|()| STATUS_OK)
+    .unwrap_or(STATUS_ERROR)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn reset_handles() {
-        HANDLES.with(|handles| handles.borrow_mut().clear());
+    fn bytes(value: &str) -> (*const u8, usize) {
+        (value.as_ptr(), value.len())
     }
 
     #[test]
-    fn new_accepts_only_core_capacity_domain() {
-        reset_handles();
-        assert_eq!(thread_span_buffer_new(7, 0), 0);
-        assert_eq!(thread_span_buffer_new(7, 1), 0);
+    fn numeric_handle_adapter_uses_core_rows_and_overflow() {
+        HANDLES.with(|handles| handles.borrow_mut().clear());
+        let handle = thread_span_buffer_new(7, 8);
+        assert_ne!(handle, 0);
+        let (trace, trace_len) = bytes("trace");
+        let (name, name_len) = bytes("root");
+        let name_id = unsafe { thread_span_buffer_intern(handle, name, name_len) };
+        assert_eq!(name_id, 1);
+        let parent =
+            unsafe { thread_span_buffer_open_span(handle, trace, trace_len, 0, 0, name_id, 10, 1) };
+        assert_ne!(parent, 0);
+        let parent_id = (parent >> 32) as u32;
+        for timestamp in 11..20 {
+            let row = thread_span_buffer_append_log(handle, parent_id, 5, name_id, timestamp, 2);
+            assert_ne!(row, 0);
+        }
+        assert_eq!(thread_span_buffer_end_ok(handle, parent_id, 20), STATUS_OK);
+        assert_eq!(unsafe { thread_span_buffer_intern(0, trace, trace_len) }, 0);
+        thread_span_buffer_free(handle);
+        assert_eq!(
+            thread_span_buffer_end_ok(handle, parent_id, 21),
+            STATUS_ERROR
+        );
+    }
+
+    #[test]
+    fn capacity_rejects_values_outside_core_domain() {
+        assert_eq!(thread_span_buffer_new(7, 4), 0);
         assert_eq!(thread_span_buffer_new(7, 12), 0);
         assert_eq!(thread_span_buffer_new(7, 2048), 0);
+        let handle = thread_span_buffer_new(7, 1024);
+        assert_ne!(handle, 0);
+        thread_span_buffer_free(handle);
+    }
 
-        let minimum = thread_span_buffer_new(7, MIN_CAPACITY);
-        assert_ne!(minimum, 0);
-        thread_span_buffer_free(minimum);
-        let maximum = thread_span_buffer_new(7, MAX_CAPACITY);
-        assert_ne!(maximum, 0);
-        thread_span_buffer_free(maximum);
+    fn number_field_blob() -> Vec<u8> {
+        let mut blob = vec![ATTRIBUTE_KIND_NUMBER, 1];
+        blob.extend_from_slice(b"n");
+        blob
+    }
+
+    fn enum_field_blob() -> Vec<u8> {
+        let mut blob = vec![ATTRIBUTE_KIND_ENUM, 1];
+        blob.extend_from_slice(b"e");
+        blob.extend_from_slice(&2u16.to_le_bytes());
+        blob.push(1);
+        blob.extend_from_slice(b"a");
+        blob.push(1);
+        blob.extend_from_slice(b"b");
+        blob
+    }
+
+    fn open_named(handle: u32, name: &str) -> (u32, u32) {
+        let (trace, trace_len) = bytes("trace");
+        let (name, name_len) = bytes(name);
+        let name_id = unsafe { thread_span_buffer_intern(handle, name, name_len) };
+        let packed =
+            unsafe { thread_span_buffer_open_span(handle, trace, trace_len, 0, 0, name_id, 10, 1) };
+        assert_ne!(packed, 0);
+        ((packed >> 32) as u32, packed as u32)
     }
 
     #[test]
-    fn kind_zero_is_invalid_and_intern_zero_is_not_an_id() {
-        reset_handles();
-        let handle = thread_span_buffer_new(7, 16);
+    fn kind_zero_is_invalid_and_schema_ordinals_are_real() {
+        HANDLES.with(|handles| handles.borrow_mut().clear());
+        let blob = number_field_blob();
+        let handle = unsafe { thread_span_buffer_new_with_schema(7, 8, blob.as_ptr(), blob.len()) };
         assert_ne!(handle, 0);
-        let trace = b"trace";
-        let packed =
-            thread_span_buffer_open_span(handle, trace.as_ptr(), trace.len(), 0, 0, 11, 10, 4);
-        let span_id = (packed >> 32) as u32;
-        assert_ne!(span_id, 0);
-        assert_eq!(
-            thread_span_buffer_write_attr(handle, 0, SYSTEM_COLUMN_COUNT, 0, 1),
-            INVALID_COLUMN
-        );
-        assert_eq!(
-            thread_span_buffer_write_tag(handle, span_id, SYSTEM_COLUMN_COUNT, 0, 1),
-            INVALID_COLUMN
-        );
-        assert_eq!(
-            thread_span_buffer_set_scope(handle, span_id, SYSTEM_COLUMN_COUNT, 0, 1),
-            INVALID_COLUMN
-        );
+        let (span_id, row) = open_named(handle, "root");
+        let ordinal = u16::try_from(SYSTEM_COLUMN_COUNT).expect("system prefix fits u16");
         let bits = 1.5f64.to_bits();
         assert_eq!(
-            thread_span_buffer_write_attr(handle, 0, SYSTEM_COLUMN_COUNT, 3, bits),
-            OK
+            thread_span_buffer_write_attr(handle, row, ordinal, 0, bits),
+            STATUS_ERROR
         );
-        assert_eq!(thread_span_buffer_intern(0, trace.as_ptr(), trace.len()), 0);
-        thread_span_buffer_free(handle);
         assert_eq!(
-            thread_span_buffer_intern(handle, trace.as_ptr(), trace.len()),
-            0
+            thread_span_buffer_write_attr(handle, row, ordinal, ATTRIBUTE_KIND_NUMBER, bits),
+            STATUS_OK
         );
+        assert_eq!(
+            thread_span_buffer_write_attr(handle, row, ordinal - 1, ATTRIBUTE_KIND_NUMBER, bits),
+            STATUS_ERROR
+        );
+        assert_eq!(
+            thread_span_buffer_write_attr(handle, row, ordinal + 1, ATTRIBUTE_KIND_NUMBER, bits),
+            STATUS_ERROR
+        );
+        assert_eq!(
+            thread_span_buffer_write_tag(handle, span_id, ordinal, 0, bits),
+            STATUS_ERROR
+        );
+        assert_eq!(
+            thread_span_buffer_set_scope(handle, span_id, ordinal, 0, bits),
+            STATUS_ERROR
+        );
+        assert_eq!(
+            thread_span_buffer_set_scope(handle, span_id, ordinal, ATTRIBUTE_KIND_NUMBER, bits),
+            STATUS_OK
+        );
+        thread_span_buffer_free(handle);
     }
 
     #[test]
-    fn static_and_dynamic_writes_share_the_same_row_contract() {
-        reset_handles();
-        let handle = thread_span_buffer_new(7, 16);
+    fn enum_schema_blob_accepts_in_range_and_rejects_kind_zero() {
+        HANDLES.with(|handles| handles.borrow_mut().clear());
+        let blob = enum_field_blob();
+        let handle = unsafe { thread_span_buffer_new_with_schema(7, 8, blob.as_ptr(), blob.len()) };
         assert_ne!(handle, 0);
-        let trace = b"trace";
-        let static_span =
-            thread_span_buffer_open_span(handle, trace.as_ptr(), trace.len(), 0, 0, 11, 10, 4);
-        let dynamic_name = b"dynamic";
-        let dynamic_span = thread_span_buffer_open_span_dynamic(
-            handle,
-            trace.as_ptr(),
-            trace.len(),
-            7,
-            (static_span >> 32) as u32,
-            dynamic_name.as_ptr(),
-            dynamic_name.len(),
-            20,
-            8,
-        );
-        assert_eq!(static_span as u32, 0);
-        assert_eq!(dynamic_span as u32, 2);
-        assert_ne!(static_span >> 32, 0);
-        assert_ne!(dynamic_span >> 32, 0);
-
-        let static_id = (static_span >> 32) as u32;
-        let dynamic_id = (dynamic_span >> 32) as u32;
-        let static_log = thread_span_buffer_append_log(handle, static_id, 5, 12, 30, 10);
-        let message = b"hello";
-        let dynamic_log = thread_span_buffer_append_log_dynamic(
-            handle,
-            dynamic_id,
-            5,
-            message.as_ptr(),
-            message.len(),
-            40,
-            12,
-        );
-        assert_eq!(static_log as u32, 4);
-        assert_eq!(dynamic_log as u32, 5);
+        let (span_id, row) = open_named(handle, "root");
+        let ordinal = u16::try_from(SYSTEM_COLUMN_COUNT).expect("system prefix fits u16");
         assert_eq!(
-            thread_span_buffer_write_attr(handle, 0, SYSTEM_COLUMN_COUNT, 1, 9),
-            OK
+            thread_span_buffer_write_attr(handle, row, ordinal, 0, 0),
+            STATUS_ERROR
         );
         assert_eq!(
-            thread_span_buffer_write_tag(handle, static_id, SYSTEM_COLUMN_COUNT + 1, 2, 10),
-            OK
+            thread_span_buffer_write_attr(handle, row, ordinal, ATTRIBUTE_KIND_ENUM, 1),
+            STATUS_OK
         );
         assert_eq!(
-            thread_span_buffer_set_scope(handle, dynamic_id, SYSTEM_COLUMN_COUNT + 2, 3, 11),
-            OK
-        );
-        assert_eq!(thread_span_buffer_end_ok(handle, static_id, 50), OK);
-        assert_eq!(thread_span_buffer_end_err(handle, dynamic_id, 60), OK);
-        assert_eq!(
-            thread_span_buffer_intern(handle, message.as_ptr(), message.len()),
-            1
-        );
-        assert_eq!(
-            thread_span_buffer_intern(handle, message.as_ptr(), message.len()),
-            1
+            thread_span_buffer_write_tag(handle, span_id, ordinal, ATTRIBUTE_KIND_ENUM, 2),
+            STATUS_ERROR
         );
         thread_span_buffer_free(handle);
-        assert_eq!(
-            thread_span_buffer_end_ok(handle, static_id, 70),
-            INVALID_HANDLE
-        );
     }
 }

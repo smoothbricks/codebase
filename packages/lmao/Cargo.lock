@@ -602,6 +602,7 @@ name = "lmao-wasm"
 version = "0.0.1"
 dependencies = [
  "lmao-arena",
+ "lmao-core",
 ]
 
 [[package]]
