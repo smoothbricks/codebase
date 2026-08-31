@@ -69,7 +69,9 @@
         ],
         "outputs": [
           "{projectRoot}/dist/columine.wasm",
-          "{projectRoot}/dist/event_processor.wasm"
+          "{projectRoot}/dist/event_processor.wasm",
+          "{projectRoot}/target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm",
+          "{projectRoot}/target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
         ],
         "options": {
           "command": "just wasm && just wasm-ep",
