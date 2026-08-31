@@ -56,6 +56,10 @@ const HOST_PLATFORM_SUFFIX: string | null = (() => {
   return os !== null && arch !== null ? `-${arch}-${os}` : null;
 })();
 
+// Cross N-API targets deliberately use raw Clang with a downloaded sysroot.
+// Linux host builds need Nix's cc wrapper so native crates see host libc headers.
+const HOST_NAPI_COMPILER_ENV = process.platform === 'linux' ? Object.freeze({ CC: 'cc', CXX: 'c++' }) : undefined;
+
 export function hostPlatformTargetNames(targetNames: Iterable<string>): string[] {
   if (HOST_PLATFORM_SUFFIX === null) return [];
   return [...new Set(targetNames)]
@@ -946,6 +950,7 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
     options: {
       cwd: projectRoot,
       command: `napi build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir .cache/native-debug`,
+      env: HOST_NAPI_COMPILER_ENV,
     },
   };
 
@@ -963,6 +968,7 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
       options: {
         cwd: projectRoot,
         command: `napi build --release --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir dist/native/host`,
+        env: HOST_NAPI_COMPILER_ENV,
       },
     };
   }
