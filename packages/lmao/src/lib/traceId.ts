@@ -57,6 +57,25 @@ export function isValidTraceId(value: unknown): value is TraceId {
 }
 
 /**
+ * Byte → its two lowercase hex digits.
+ *
+ * `byte.toString(16).padStart(2, '0')` is a radix conversion plus a pad, run 16
+ * times per trace id; the JSC sampling profile of the js-heap row path
+ * (`benchmarks/_clockProfile.ts`) puts `generateTraceId` + `padStart` at 7.7% of
+ * on-CPU even at 50 log rows per span, where the trace id is paid once per span.
+ * Two hundred fifty-six interned two-character strings turn the loop into
+ * sixteen array loads and one concatenation.
+ *
+ * Built from an explicit digit table rather than from `toString(16)` so the
+ * parity check over all 256 bytes tests the table instead of restating it.
+ */
+const HEX_DIGITS = '0123456789abcdef';
+const HEX_BYTE: readonly string[] = Array.from(
+  { length: 256 },
+  (_, byte) => `${HEX_DIGITS[byte >>> 4]}${HEX_DIGITS[byte & 0xf]}`,
+);
+
+/**
  * Generate a new random TraceId (W3C format: 32 hex chars).
  */
 export function generateTraceId(): TraceId {
@@ -78,11 +97,24 @@ export function generateTraceId(): TraceId {
     }
   }
 
-  // Convert to hex string
-  let hex = '';
-  for (let i = 0; i < 16; i++) {
-    hex += bytes[i].toString(16).padStart(2, '0');
-  }
+  // 16 table loads into one rope; see HEX_BYTE for why the toString(16) loop went.
+  const hex =
+    HEX_BYTE[bytes[0]] +
+    HEX_BYTE[bytes[1]] +
+    HEX_BYTE[bytes[2]] +
+    HEX_BYTE[bytes[3]] +
+    HEX_BYTE[bytes[4]] +
+    HEX_BYTE[bytes[5]] +
+    HEX_BYTE[bytes[6]] +
+    HEX_BYTE[bytes[7]] +
+    HEX_BYTE[bytes[8]] +
+    HEX_BYTE[bytes[9]] +
+    HEX_BYTE[bytes[10]] +
+    HEX_BYTE[bytes[11]] +
+    HEX_BYTE[bytes[12]] +
+    HEX_BYTE[bytes[13]] +
+    HEX_BYTE[bytes[14]] +
+    HEX_BYTE[bytes[15]];
 
   return brandTraceId(hex);
 }
