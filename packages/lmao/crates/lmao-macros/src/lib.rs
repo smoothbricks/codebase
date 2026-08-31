@@ -165,12 +165,14 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
     let mut dict_consts = Vec::new();
     let mut bytes_terms = Vec::new();
     let mut field_meta = Vec::new();
+    let mut scope_fills = Vec::new();
 
     for f in &fields {
         let fname = &f.name;
         let tag_fn = format_ident!("tag_{}", fname);
         let set_fn = format_ident!("set_{}", fname);
         let get_fn = format_ident!("get_{}", fname);
+        let scope_fn = format_ident!("scope_{}", fname);
 
         if let FieldKind::Enum(values) = &f.kind {
             let dict_name = format_ident!(
@@ -222,10 +224,55 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
                         .get(row)
                         .and_then(|index| Self::#dict_name.get(index as usize).copied())
                 }
+                #[doc = concat!("Scope entry for enum field `", stringify!(#fname), "`: `Some(index)` sets it for every row of the span and its later children, `None` clears it (`01i`).")]
+                #[inline]
+                #vis fn #scope_fn(
+                    index: Option<u16>,
+                ) -> ::core::result::Result<::lmao_core::ScopeEntry, ::lmao_core::EnumIndexError> {
+                    if let Some(index) = index {
+                        if index >= #n {
+                            return ::core::result::Result::Err(::lmao_core::EnumIndexError {
+                                field: stringify!(#fname),
+                                index,
+                                variants: #n,
+                            });
+                        }
+                    }
+                    ::core::result::Result::Ok((
+                        stringify!(#fname),
+                        index.map(::lmao_core::ScopeValue::EnumIndex),
+                    ))
+                }
             });
             col_fields.push(quote! { #fname: ::lmao_core::EnumColumn });
             col_inits.push(quote! { #fname: ::lmao_core::EnumColumn::new() });
             bytes_terms.push(quote! { self.#fname.allocated_bytes() });
+            scope_fills.push(quote! {
+                match scope.get(stringify!(#fname)) {
+                    Some(value @ ::lmao_core::ScopeValue::EnumIndex(index)) => {
+                        // An out-of-range index would be written straight into a
+                        // column the Arrow flush indexes against a fixed-size
+                        // dictionary, so it is refused here rather than corrupting
+                        // the batch. `scope_*` validates, but a raw `set_scope` can
+                        // bypass it.
+                        if *index < #n {
+                            filled += self.#fname.fill_unset(rows, capacity, *index);
+                        } else {
+                            ::lmao_core::report_scope_mismatch(
+                                stringify!(#fname),
+                                "an in-range enum index",
+                                value,
+                            );
+                        }
+                    }
+                    Some(mismatched) => ::lmao_core::report_scope_mismatch(
+                        stringify!(#fname),
+                        "ScopeValue::EnumIndex",
+                        mismatched,
+                    ),
+                    None => {}
+                }
+            });
             continue;
         }
 
@@ -266,6 +313,17 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
             FieldKind::Text => quote!(::lmao_core::FieldStrategy::Text),
             FieldKind::Enum(_) => unreachable!(),
         };
+        // `category` and `text` share `ScopeValue::Text` because both are backed by
+        // `StrColumn` and differ only in flush strategy, which `FIELD_META` retains.
+        let (scope_ty, scope_variant, scope_fill_arg) = match &f.kind {
+            FieldKind::Number => (quote!(f64), quote!(Number), quote!(*value)),
+            FieldKind::Uint64 => (quote!(u64), quote!(Uint64), quote!(*value)),
+            FieldKind::Boolean => (quote!(bool), quote!(Boolean), quote!(*value)),
+            FieldKind::Category | FieldKind::Text => {
+                (quote!(::lmao_core::SharedStr), quote!(Text), quote!(value))
+            }
+            FieldKind::Enum(_) => unreachable!(),
+        };
         field_meta.push(quote! {
             ::lmao_core::FieldMeta::new(stringify!(#fname), #strategy)
         });
@@ -282,6 +340,14 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
                 let cap = self.span.capacity();
                 self.#fname.set(row, cap, value);
                 self
+            }
+            #[doc = concat!("Scope entry for `", stringify!(#fname), "`: `Some(value)` makes it the default on every row of this span and every child created afterwards, `None` clears it (`01i`). Direct `tag_`/`set_` writes always win on the rows they touch.")]
+            #[inline]
+            #vis fn #scope_fn(value: Option<#scope_ty>) -> ::lmao_core::ScopeEntry {
+                (
+                    stringify!(#fname),
+                    value.map(::lmao_core::ScopeValue::#scope_variant),
+                )
             }
         });
         match &f.kind {
@@ -301,6 +367,19 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
         col_fields.push(quote! { #fname: #col_ty });
         col_inits.push(quote! { #fname: <#col_ty>::new() });
         bytes_terms.push(quote! { self.#fname.allocated_bytes() });
+        scope_fills.push(quote! {
+            match scope.get(stringify!(#fname)) {
+                Some(::lmao_core::ScopeValue::#scope_variant(value)) => {
+                    filled += self.#fname.fill_unset(rows, capacity, #scope_fill_arg);
+                }
+                Some(mismatched) => ::lmao_core::report_scope_mismatch(
+                    stringify!(#fname),
+                    concat!("ScopeValue::", stringify!(#scope_variant)),
+                    mismatched,
+                ),
+                None => {}
+            }
+        });
     }
 
     let expanded = quote! {
@@ -334,6 +413,33 @@ pub fn define_log_schema(input: TokenStream) -> TokenStream {
             /// Total heap bytes held by lazy attribute columns (0 when untouched).
             #vis fn attribute_bytes(&self) -> usize {
                 0 #(+ #bytes_terms)*
+            }
+
+            /// Materialize this span's scope (`01i`) into the attribute columns and
+            /// return how many cells were filled.
+            ///
+            /// Cold path: call once before handing the buffer to the flush pipeline.
+            /// Every cell a direct `tag_*`/`set_*` write already touched keeps its
+            /// value — scope only fills the nulls those writes left behind, which is
+            /// `01i`'s "direct writes always win", enforced per row through the
+            /// column's own validity bitmap rather than by remembering what was
+            /// written.
+            ///
+            /// Fills rows `0..write_index` of THIS buffer. A scope field naming no
+            /// schema column is ignored, exactly as in TypeScript, where a
+            /// `_scopeValues` key with no matching column has nothing to fill.
+            #vis fn fill_scope(&mut self) -> usize {
+                // Take the shared handle first: one refcount bump, and the rest of
+                // the method then needs no borrow of `self.span` while it writes
+                // columns.
+                let Some(scope) = self.span.scope_handle() else {
+                    return 0;
+                };
+                let capacity = self.span.capacity();
+                let rows = self.span.write_index();
+                let mut filled = 0usize;
+                #(#scope_fills)*
+                filled
             }
 
             #(#writers)*

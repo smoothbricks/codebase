@@ -177,6 +177,70 @@ impl<T: Copy + Default> NumColumn<T> {
     pub fn raw(&self) -> Option<(&[u8], &[T])> {
         self.buf.as_ref().map(|b| (&*b.validity, &*b.values))
     }
+
+    /// Fill every row in `0..rows` that has NO direct write with `value`, and
+    /// return how many rows were filled. This is the cold-path scope
+    /// materialization of `01i`: *direct writes always win*, scope only fills the
+    /// cells a direct write left null.
+    ///
+    /// Allocates at `capacity` if the column was never touched, because a column
+    /// with no direct writes at all is exactly the case where scope supplies every
+    /// value.
+    ///
+    /// The scan walks the validity bitmap a BYTE at a time, which is where `01i`'s
+    /// "SIMD where possible" actually lands: a `0x00` byte is eight unwritten rows
+    /// that become one vectorizable `fill` of eight values, and `0xFF` is eight rows
+    /// skipped by a single compare. Only a byte with mixed validity pays per-bit
+    /// cost. Scope is normally set for a whole span and direct writes are sparse, so
+    /// the all-zero byte is the common case by a wide margin.
+    pub fn fill_unset(&mut self, rows: usize, capacity: usize, value: T) -> usize {
+        if rows == 0 {
+            return 0;
+        }
+        let buf = self
+            .buf
+            .get_or_insert_with(|| Box::new(ColumnBuf::new(capacity)));
+        debug_assert!(
+            rows <= buf.values.len(),
+            "fill range exceeds column capacity"
+        );
+
+        let mut filled = 0usize;
+        let whole_bytes = rows >> 3;
+        for byte in 0..whole_bytes {
+            let validity = buf.validity[byte];
+            if validity == u8::MAX {
+                continue;
+            }
+            let base = byte << 3;
+            if validity == 0 {
+                buf.values[base..base + 8].fill(value);
+                filled += 8;
+            } else {
+                for bit in 0..8 {
+                    if validity & (1 << bit) == 0 {
+                        buf.values[base + bit] = value;
+                        filled += 1;
+                    }
+                }
+            }
+            buf.validity[byte] = u8::MAX;
+        }
+
+        let tail = rows & 7;
+        if tail != 0 {
+            let base = whole_bytes << 3;
+            let validity = buf.validity[whole_bytes];
+            for bit in 0..tail {
+                if validity & (1 << bit) == 0 {
+                    buf.values[base + bit] = value;
+                    buf.validity[whole_bytes] |= 1 << bit;
+                    filled += 1;
+                }
+            }
+        }
+        filled
+    }
 }
 
 pub type F64Column = NumColumn<f64>;
@@ -229,6 +293,29 @@ impl StrColumn {
     pub fn raw(&self) -> Option<&[Option<SharedStr>]> {
         self.buf.as_deref()
     }
+
+    /// Fill every null slot in `0..rows` with `value`, returning how many were
+    /// filled — the [`NumColumn::fill_unset`] counterpart for string columns.
+    /// `None` IS the null here, so there is no bitmap to consult and the slot's own
+    /// emptiness is the authority on whether a direct write happened.
+    pub fn fill_unset(&mut self, rows: usize, capacity: usize, value: &SharedStr) -> usize {
+        if rows == 0 {
+            return 0;
+        }
+        let buf = self
+            .buf
+            .get_or_insert_with(|| vec![None; capacity].into_boxed_slice());
+        debug_assert!(rows <= buf.len(), "fill range exceeds column capacity");
+        let mut filled = 0usize;
+        for slot in buf[..rows].iter_mut() {
+            if slot.is_none() {
+                // Static values copy a pointer pair; dynamic ones bump an Arc.
+                *slot = Some(value.clone());
+                filled += 1;
+            }
+        }
+        filled
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +342,70 @@ mod tests {
         col.set(2, 8, "hello");
         assert_eq!(col.get(2), Some("hello"));
         assert_eq!(col.get(1), None);
+    }
+
+    /// `01i`: direct writes win, scope fills only the cells they left null. The
+    /// range crosses the byte boundary at row 8 deliberately, so the whole-byte
+    /// path, the mixed-byte path and the tail path are all exercised.
+    #[test]
+    fn fill_unset_preserves_direct_writes() {
+        let mut col = F64Column::new();
+        col.set(0, 64, 1.0);
+        col.set(9, 64, 2.0);
+
+        assert_eq!(
+            col.fill_unset(13, 64, 9.9),
+            11,
+            "13 rows minus 2 direct writes"
+        );
+
+        assert_eq!(col.get(0), Some(1.0), "direct write survives");
+        assert_eq!(col.get(9), Some(2.0), "direct write survives across a byte");
+        for row in [1, 7, 8, 10, 12] {
+            assert_eq!(col.get(row), Some(9.9), "row {row} filled from scope");
+        }
+        assert_eq!(col.get(13), None, "fill stops at the row count");
+    }
+
+    /// A column with no direct writes at all is the case where scope supplies every
+    /// value, so the fill must allocate rather than silently drop the values.
+    #[test]
+    fn fill_unset_allocates_an_untouched_column() {
+        let mut col = U64Column::new();
+        assert!(!col.is_allocated());
+        assert_eq!(col.fill_unset(8, 32, 7), 8);
+        assert!(col.is_allocated());
+        assert_eq!(col.get(0), Some(7));
+        assert_eq!(col.get(7), Some(7));
+        assert_eq!(col.get(8), None);
+    }
+
+    #[test]
+    fn fill_unset_is_idempotent_and_zero_rows_is_a_no_op() {
+        let mut col = F64Column::new();
+        assert_eq!(col.fill_unset(0, 64, 1.0), 0);
+        assert!(
+            !col.is_allocated(),
+            "an empty range must not force allocation"
+        );
+
+        assert_eq!(col.fill_unset(4, 64, 1.0), 4);
+        assert_eq!(
+            col.fill_unset(4, 64, 2.0),
+            0,
+            "already-filled rows are direct writes now"
+        );
+        assert_eq!(col.get(0), Some(1.0));
+    }
+
+    #[test]
+    fn str_fill_unset_preserves_direct_writes() {
+        let mut col = StrColumn::new();
+        col.set(1, 8, "direct");
+        assert_eq!(col.fill_unset(4, 8, &SharedStr::Static("scope")), 3);
+        assert_eq!(col.get(0), Some("scope"));
+        assert_eq!(col.get(1), Some("direct"));
+        assert_eq!(col.get(3), Some("scope"));
+        assert_eq!(col.get(4), None);
     }
 }

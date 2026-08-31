@@ -25,6 +25,7 @@ use crate::columns::SharedStr;
 use crate::entry_type::EntryType;
 use crate::identity::{SpanIdentity, TraceId, next_span_id};
 use crate::result::{SpanOutcome, Transient};
+use crate::scope::{ScopeEntry, SpanScope};
 use std::sync::Arc;
 
 /// Per-trace root: shared time reference + identity factory.
@@ -189,15 +190,47 @@ impl<'t> SpanContext<'t> {
         self.buf.identity.clone()
     }
 
+    /// Merge scope attributes into this span (`01i`): `Some(value)` sets a field,
+    /// `None` clears it, and a field the update does not name is left alone.
+    ///
+    /// Scope applies to EVERY row of this span that has no direct write to the same
+    /// column, and is inherited by children created after this call. Children
+    /// created BEFORE it keep the snapshot they captured — the update replaces this
+    /// span's scope value, it never mutates the one already handed out.
+    ///
+    /// Use schema-generated `tag_*` row-0 writes for values that describe only the
+    /// span's entry point, and scope for context that should appear on every row and
+    /// every descendant.
+    pub fn set_scope(&mut self, update: &[ScopeEntry]) {
+        self.buf.set_scope(update);
+    }
+
+    /// Read-only view of the current scope (`01i`'s `ctx.scope`).
+    pub fn scope(&self) -> Option<&SpanScope> {
+        self.buf.scope()
+    }
+
     /// Nest a child span (buffer attached to this span's children).
+    ///
+    /// The child inherits this span's scope AT CREATION, by reference: one `Arc`
+    /// refcount bump, no copy, and immune to any later `set_scope` here. That is
+    /// `01i`'s snapshot semantics, and it is why the child is built here rather than
+    /// delegated to [`TraceContext::span`] — the scope has to be in place before the
+    /// body runs, since the body may create grandchildren.
     pub fn child<T, E>(
         &mut self,
         name: impl Into<SharedStr>,
         capacity: usize,
         f: impl FnOnce(&mut SpanContext<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
-        let parent = self.identity();
-        let (out, child) = self.trace.span(name, Some(parent), capacity, f);
+        let identity = self.trace.identity(Some(self.identity()));
+        let mut ctx = SpanContext::start(self.trace, identity, capacity, name);
+        ctx.buf.inherit_scope(self.buf.scope_handle());
+        let out = f(&mut ctx);
+        let child = ctx.finish(match &out {
+            Ok(_) => SpanOutcome::Ok,
+            Err(_) => SpanOutcome::Err,
+        });
         self.buf.add_child(child);
         out
     }

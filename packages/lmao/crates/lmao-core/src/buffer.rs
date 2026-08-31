@@ -25,6 +25,7 @@ use crate::packed_header::{
     StaticVocabularyNotAllowed, VocabularyId, entry_type_from_header, pack_dynamic, pack_static,
     vocabulary_id_from_header,
 };
+use crate::scope::{ScopeEntry, SpanScope};
 use crate::tuning::{MAX_CAPACITY, MIN_CAPACITY};
 use std::sync::Arc;
 
@@ -61,6 +62,17 @@ pub struct SpanBuffer {
     overflow: Option<Box<SpanBuffer>>,
     /// Child spans, walked depth-first pre-order at Arrow conversion (`01k`).
     children: Vec<SpanBuffer>,
+    /// Inherited scope attributes (`01i`). `None` is the empty scope, so the
+    /// untouched case owns no heap at all — cheaper than the TypeScript
+    /// `EMPTY_SCOPE` singleton it corresponds to, and canonical: exactly one
+    /// representation per logical scope, since a merge that empties the scope
+    /// yields `None`.
+    ///
+    /// [`SpanScope`] is itself a shared handle, so a child span inherits by refcount
+    /// bump rather than copy, and the value the child captured cannot be perturbed by
+    /// a later `set_scope` here — the snapshot semantics `01i` requires for async
+    /// safety.
+    scope: Option<SpanScope>,
 }
 
 impl SpanBuffer {
@@ -126,6 +138,7 @@ impl SpanBuffer {
             source: None,
             overflow: None,
             children: Vec::new(),
+            scope: None,
         }
     }
 
@@ -142,6 +155,53 @@ impl SpanBuffer {
 
     pub fn source(&self) -> Option<SourceMetadata> {
         self.source
+    }
+
+    /// This span's inherited scope attributes (`01i`), `None` when never set.
+    pub fn scope(&self) -> Option<&SpanScope> {
+        self.scope.as_ref()
+    }
+
+    /// The shared scope handle, for handing this span's snapshot to a child or to the
+    /// flush pass. Cloning it is a refcount bump, never a copy.
+    pub fn scope_handle(&self) -> Option<SpanScope> {
+        self.scope.clone()
+    }
+
+    /// Adopt `scope` wholesale, sharing the caller's value. Used at child-span
+    /// creation to take the parent's snapshot; `01i`'s zero-cost inheritance is
+    /// exactly this refcount bump.
+    pub fn inherit_scope(&mut self, scope: Option<SpanScope>) {
+        self.assign_scope(scope);
+    }
+
+    /// Merge `update` into this span's scope, per `01i`: `Some` sets, `None` clears,
+    /// an unnamed field is untouched. The previous scope value is not modified, so
+    /// any child already holding it keeps its snapshot.
+    ///
+    /// Cold path by construction — `01i` places every scope operation off the hot
+    /// path, and this one allocates the new immutable value.
+    pub fn set_scope(&mut self, update: &[ScopeEntry]) {
+        if update.is_empty() {
+            return;
+        }
+        let merged = SpanScope::merge(self.scope.as_ref(), update);
+        self.assign_scope(merged);
+    }
+
+    /// One span's overflow chain is ONE span, so every buffer in it must answer the
+    /// same scope. Assigning down the chain keeps that true after a `set_scope` that
+    /// follows an overflow, rather than leaving already-created continuation buffers
+    /// holding a stale snapshot — the failure mode the TypeScript eager prefill has.
+    fn assign_scope(&mut self, scope: Option<SpanScope>) {
+        let mut target = self;
+        loop {
+            target.scope = scope.clone();
+            match target.overflow.as_deref_mut() {
+                Some(next) => target = next,
+                None => return,
+            }
+        }
     }
 
     /// Attach a finished/running child span (walked depth-first pre-order at
@@ -223,6 +283,8 @@ impl SpanBuffer {
                 source: None,
                 overflow: None,
                 children: Vec::new(),
+                // Same span, so the same scope — see `set_scope_handle`.
+                scope: target.scope.clone(),
             }));
             let target = target
                 .overflow
