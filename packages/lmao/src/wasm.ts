@@ -8,6 +8,9 @@ export {
   type ThreadSpanBufferHandle,
   type ThreadSpanBufferWasmExports,
 } from './lib/wasm/threadSpanBuffer.js';
+// Thread-lane buffer discriminator: platform runtimes assert which lane a
+// captured buffer came from without reaching into lib internals.
+export { isThreadSpanView } from './lib/wasm/threadSpanView.js';
 export {
   createWasmAllocator,
   createWasmAllocatorSync,

@@ -55,10 +55,13 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
     threadId?: bigint;
     initialPages?: number;
     maxPages?: number;
+    /** Pre-compiled allocator.wasm for bundled environments; see createThreadSpanBufferRuntime. */
+    module?: WebAssembly.Module;
   }): Promise<ThreadBufferStrategy<TSchema>> {
     const runtime = await createThreadSpanBufferRuntime({
       initialPages: options?.initialPages,
       maxPages: options?.maxPages,
+      module: options?.module,
     });
     return new ThreadBufferStrategy<TSchema>(runtime, options?.capacity ?? 64, options?.threadId ?? getThreadId());
   }
