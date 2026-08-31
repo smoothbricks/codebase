@@ -2,16 +2,8 @@ use super::*;
 
 use std::{path::PathBuf, sync::LazyLock};
 use tokio::net::UnixStream;
-static LINUX_SOCKET_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let root = std::env::temp_dir().join(format!("cowshed-gateway-data-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir(&root).expect("create Linux data socket root");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("secure Linux data socket root");
-    root
-});
+static LINUX_SOCKET_ROOT: LazyLock<PathBuf> =
+    LazyLock::new(|| secure_fixture_dir(&format!("cowshed-gateway-data-{}", std::process::id())));
 
 pub(super) fn socket_root() -> PathBuf {
     LINUX_SOCKET_ROOT.clone()

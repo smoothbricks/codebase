@@ -1470,11 +1470,84 @@ async fn control_start_failure_stops_and_joins_gateway_actor() {
     assert_eq!(Arc::strong_count(&audit), 1);
 }
 
+/// The control socket parent is what a stranger would have to own in order to swap the socket out
+/// from under the gateway, so both ways of losing that exclusivity are pinned here.
+///
+/// A group-writable parent lets another member of the group unlink the socket and bind their own;
+/// a symlinked parent lets whoever owns the link retarget it after the check and before the bind.
+/// Neither refusal may be traded away to make a fixture pass — a fixture that trips this check is
+/// a fixture creating a directory no production parent is allowed to look like.
+#[tokio::test]
+async fn control_socket_parent_must_be_a_private_real_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    async fn refusal(control: &std::path::Path) -> io::Error {
+        let mut config = test_config();
+        config.control_socket = Some(control.to_path_buf());
+        let Err(error) = Gateway::start(
+            config,
+            Arc::new(NoCredentials),
+            Arc::new(LocalConnector {
+                health: UpstreamHealth::Healthy,
+                observed: None,
+            }),
+            Arc::new(DiscardAudit),
+        )
+        .await
+        else {
+            panic!("insecure control socket parent must refuse the gateway");
+        };
+        let GatewayError::Io(error) = error else {
+            panic!("expected an I/O refusal, got {error:?}");
+        };
+        assert!(
+            !control.exists(),
+            "the parent is rejected before the socket is bound, so {} must not exist",
+            control.display()
+        );
+        error
+    }
+
+    // Deliberately terse: `sockaddr_un.sun_path` is 104 bytes on macOS, and the per-user `TMPDIR`
+    // already spends 49 of them. A descriptive name pushes the socket past `SUN_LEN`, and then the
+    // bind refuses before the parent check is reached — which would let this test keep passing for
+    // the wrong reason if the check under test were ever removed.
+    let root = secure_fixture_dir(&format!("cowshed-ctl-parent-{}", std::process::id()));
+
+    let shared = root.join("shared");
+    std::fs::create_dir(&shared).expect("create group-writable parent");
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770))
+        .expect("relax group-writable parent");
+    let error = refusal(&shared.join("gateway.sock")).await;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "control socket parent must be an owned, non-writable real directory"
+    );
+
+    let target = root.join("real");
+    std::fs::create_dir(&target).expect("create symlink target");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+        .expect("secure symlink target");
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("link a private parent");
+    let error = refusal(&link.join("gateway.sock")).await;
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "control socket parent must be an owned, non-writable real directory"
+    );
+    assert!(
+        !target.join("gateway.sock").exists(),
+        "the refusal must not bind through the link either"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove control parent fixture directory");
+}
+
 #[tokio::test]
 async fn control_socket_is_local_authenticated_and_reports_status() {
-    let root = std::env::temp_dir().join(format!("cowshed-gateway-control-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir(&root).expect("create control fixture directory");
+    let root = secure_fixture_dir(&format!("cowshed-gateway-control-{}", std::process::id()));
     let control = root.join("gateway.sock");
     let mut config = test_config();
     config.control_socket = Some(control.clone());
