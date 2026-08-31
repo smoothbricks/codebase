@@ -135,12 +135,17 @@ function requiredAt<T>(values: readonly T[], index: number, label: string): T {
   return value;
 }
 
-function schema(...fields: ReadonlyArray<readonly [tag: number, nullable: 0 | 1]>): EncodedArrowSchema {
+function schema(
+  ...fields: ReadonlyArray<readonly [tag: number, nullable: 0 | 1, typeParam?: number]>
+): EncodedArrowSchema {
   const metadata = new Uint8Array(fields.length * 4);
   for (let index = 0; index < fields.length; index += 1) {
     const field = requiredAt(fields, index, 'schema field');
+    const typeParam = field[2] ?? 0;
     metadata[index * 4] = field[0];
     metadata[index * 4 + 1] = field[1];
+    metadata[index * 4 + 2] = typeParam & 0xff;
+    metadata[index * 4 + 3] = (typeParam >>> 8) & 0xff;
   }
   return { schemaBytes: new Uint8Array([0xff, 0xff, 0xff, 0xff, fields.length]), fieldMetadata: metadata };
 }
@@ -282,6 +287,54 @@ describe('Compact CPB1 packing', () => {
       expect(call.request.subarray(dataOffset, dataOffset + source.byteLength)).toEqual(source);
     }
   });
+
+  it('accepts unsigned and narrow planes whose tags sit above i64', () => {
+    const mock = createCompactMock();
+    const backend = createParseCompactWasmBackend(mock.exports);
+    const u32 = new Uint32Array([0, 0xffff_ffff]);
+    const i8 = new Int8Array([-128, 127]);
+
+    backend.encode(
+      batch(2, schema([11, 0], [7, 0]), [
+        { kind: 'u32', data: u32 },
+        { kind: 'i8', data: i8 },
+      ]),
+    );
+
+    const call = requiredAt(mock.compactCalls, 0, 'Compact invocation');
+    expect(call.request[16]).toBe(11);
+    expect(call.request[48]).toBe(7);
+    const first = new DataView(call.request.buffer, call.request.byteOffset + 16, 32);
+    const dataOffset = first.getUint32(20, true);
+    expect(call.request.subarray(dataOffset, dataOffset + 8)).toEqual(new Uint8Array(u32.buffer));
+    expect(first.getUint32(24, true)).toBe(8);
+    const second = new DataView(call.request.buffer, call.request.byteOffset + 48, 32);
+    expect(second.getUint32(24, true)).toBe(2);
+  });
+
+  it('packs intervalDayTime as two i32s per row and FixedSizeBinary by typeParam', () => {
+    const mock = createCompactMock();
+    const backend = createParseCompactWasmBackend(mock.exports);
+    const dayTime = new Int32Array([1, 2, 3, 4]);
+    const fixed = new Uint8Array([9, 8, 7, 6, 5, 4]);
+
+    backend.encode(
+      batch(2, schema([21, 0], [19, 0, 3]), [
+        { kind: 'intervalDayTime', data: dayTime },
+        { kind: 'fixedSizeBinary', data: fixed },
+      ]),
+    );
+
+    const call = requiredAt(mock.compactCalls, 0, 'Compact invocation');
+    const dayTimeDesc = new DataView(call.request.buffer, call.request.byteOffset + 16, 32);
+    const fixedDesc = new DataView(call.request.buffer, call.request.byteOffset + 48, 32);
+    expect(call.request[16]).toBe(21);
+    expect(call.request[48]).toBe(19);
+    expect(dayTimeDesc.getUint32(24, true)).toBe(16);
+    expect(fixedDesc.getUint32(24, true)).toBe(6);
+    const dayTimeOffset = dayTimeDesc.getUint32(20, true);
+    expect(call.request.subarray(dayTimeOffset, dayTimeOffset + 16)).toEqual(new Uint8Array(dayTime.buffer));
+  });
 });
 
 describe('Compact validation', () => {
@@ -297,7 +350,7 @@ describe('Compact validation', () => {
       ['field count mismatch', batch(0, schema([1, 0]), [])],
       [
         'unknown physical type',
-        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([7, 0, 0, 0]) }, [{ kind: 'null' }]),
+        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([23, 0, 0, 0]) }, [{ kind: 'null' }]),
       ],
       [
         'invalid nullable byte',
@@ -419,6 +472,40 @@ describe('Compact validation', () => {
       ),
     ).toThrow(/packed batch/);
     expect(sizeMock.compactCalls).toHaveLength(0);
+  });
+
+  it('names the out-of-range tag and admits FixedSizeBinary typeParam', () => {
+    const mock = createCompactMock();
+    expect(() =>
+      createParseCompactWasmBackend(mock.exports).encode(
+        batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([23, 0, 0, 0]) }, [{ kind: 'null' }]),
+      ),
+    ).toThrow(/unknown physical type 23 \(max 22\)/);
+    expect(mock.compactCalls).toHaveLength(0);
+
+    expect(() =>
+      createParseCompactWasmBackend(mock.exports).encode(
+        batch(1, schema([19, 0, 0]), [{ kind: 'fixedSizeBinary', data: new Uint8Array() }]),
+      ),
+    ).toThrow(/FixedSizeBinary width/);
+
+    expect(() =>
+      createParseCompactWasmBackend(mock.exports).encode(
+        batch(1, schema([19, 0, 257]), [{ kind: 'fixedSizeBinary', data: new Uint8Array(257) }]),
+      ),
+    ).toThrow(/FixedSizeBinary width/);
+
+    const accepted = createCompactMock();
+    createParseCompactWasmBackend(accepted.exports).encode(
+      batch(1, schema([19, 0, 4]), [{ kind: 'fixedSizeBinary', data: new Uint8Array([1, 2, 3, 4]) }]),
+    );
+    expect(accepted.compactCalls).toHaveLength(1);
+
+    expect(() =>
+      createParseCompactWasmBackend(mock.exports).encode(
+        batch(1, schema([21, 0]), [{ kind: 'intervalDayTime', data: new Int32Array([1]) }]),
+      ),
+    ).toThrow(/exactly 2 values/);
   });
 });
 
