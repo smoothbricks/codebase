@@ -1,6 +1,7 @@
 //! MessagePack event extraction into typed columns.
 
 use crate::msgpack_scanner::Reader;
+use crate::validate::encode_path_segment;
 use crate::{
     ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind, SignalSchemaField,
     json_extractor::ExtractionError, json_scanner::parse_iso8601_to_micros,
@@ -95,7 +96,7 @@ fn extract_msgpack_fields(
         // A non-UTF-8 key is undeclared, not a parse error.
         let lookup = std::str::from_utf8(key)
             .ok()
-            .and_then(|name| config.field_map.get(name));
+            .and_then(|name| config.lookup_field(name));
         if let Some(lookup) = lookup {
             extract_typed_value(reader, lookup.field, columns, lookup.column)?;
             columns.columns_seen[lookup.column] = true;
@@ -106,16 +107,37 @@ fn extract_msgpack_fields(
             if extra_count == 0 {
                 extra_end = 5;
             }
-            let raw = &reader.input()[key_start..key_end];
             let raw_value = &reader.input()[value_start..value_end];
+            let raw_key = &reader.input()[key_start..key_end];
+            // The carrier is path-keyed: a literal `%` or `.` in a segment
+            // escapes as %25/%2E (validate::encode_path_segment is the one
+            // spelling of that rule) so a captured key can never be misread
+            // as nesting. Escaping changes the string's length header, so an
+            // affected key re-encodes; every clean key copies its raw
+            // already-encoded slice, and a non-UTF-8 key is opaque bytes with
+            // nothing to escape.
+            let escaped = std::str::from_utf8(key)
+                .ok()
+                .filter(|name| name.contains(['%', '.']))
+                .map(crate::validate::encode_path_segment);
+            let key_len = match &escaped {
+                Some(name) => msgpack_str_header_len(name.len()) + name.len(),
+                None => raw_key.len(),
+            };
             let end = extra_end
-                .checked_add(raw.len() + raw_value.len())
+                .checked_add(key_len + raw_value.len())
                 .ok_or(ExtractionError::BufferOverflow)?;
             if end > work_buffer.len() {
                 return Err(ExtractionError::BufferOverflow);
             }
-            work_buffer[extra_end..extra_end + raw.len()].copy_from_slice(raw);
-            work_buffer[extra_end + raw.len()..end].copy_from_slice(raw_value);
+            let value_at = match &escaped {
+                Some(name) => write_msgpack_str(work_buffer, extra_end, name),
+                None => {
+                    work_buffer[extra_end..extra_end + raw_key.len()].copy_from_slice(raw_key);
+                    extra_end + raw_key.len()
+                }
+            };
+            work_buffer[value_at..end].copy_from_slice(raw_value);
             extra_end = end;
             extra_count += 1;
         } else {
@@ -147,6 +169,46 @@ fn extract_msgpack_fields(
     }
     columns.end_row();
     Ok(())
+}
+
+/// Byte length of the MessagePack string header for a payload of `len` bytes.
+const fn msgpack_str_header_len(len: usize) -> usize {
+    match len {
+        0..=31 => 1,
+        32..=255 => 2,
+        256..=65535 => 3,
+        _ => 5,
+    }
+}
+
+/// Write one MessagePack-encoded string at `at`, returning the position past
+/// it. The caller has already bounds-checked header + payload.
+fn write_msgpack_str(buffer: &mut [u8], at: usize, value: &str) -> usize {
+    let bytes = value.as_bytes();
+    let mut cursor = at;
+    match bytes.len() {
+        len @ 0..=31 => {
+            buffer[cursor] = 0xa0 | len as u8;
+            cursor += 1;
+        }
+        len @ 32..=255 => {
+            buffer[cursor] = 0xd9;
+            buffer[cursor + 1] = len as u8;
+            cursor += 2;
+        }
+        len @ 256..=65535 => {
+            buffer[cursor] = 0xda;
+            buffer[cursor + 1..cursor + 3].copy_from_slice(&(len as u16).to_be_bytes());
+            cursor += 3;
+        }
+        len => {
+            buffer[cursor] = 0xdb;
+            buffer[cursor + 1..cursor + 5].copy_from_slice(&(len as u32).to_be_bytes());
+            cursor += 5;
+        }
+    }
+    buffer[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+    cursor + bytes.len()
 }
 
 /// Coerce one MessagePack value into one column.
@@ -570,7 +632,7 @@ mod tests {
         assert_eq!(
             extract_msgpack_events(
                 &input,
-                &config(&fields, &["id", "value.$extra"]),
+                &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
                 &mut columns,
                 &mut work,
                 true
@@ -590,7 +652,7 @@ mod tests {
         let mut work = [0; 128];
         extract_msgpack_events(
             &input,
-            &config(&fields, &["id", "value.$extra"]),
+            &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
             &mut columns,
             &mut work,
             true,
@@ -600,6 +662,34 @@ mod tests {
             columns.cell(1, 0),
             Some(ColumnValue::Binary(vec![
                 0xdf, 0, 0, 0, 1, 0xa3, b'q', b't', b'y', 42
+            ]))
+        );
+    }
+    #[test]
+    fn extract_msgpack_events_escapes_dotted_extra_key() {
+        // A literal dot in a captured key re-encodes as %2E so the path-keyed
+        // carrier can never misread it as nesting; the re-encoded string gets
+        // a fresh MessagePack header because escaping changed its length.
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Binary)];
+        let mut input = vec![0x82];
+        str_(&mut input, "id");
+        str_(&mut input, "x");
+        str_(&mut input, "a.b");
+        input.push(7);
+        let mut columns = DynamicColumns::new(&fields, 10);
+        let mut work = [0; 128];
+        extract_msgpack_events(
+            &input,
+            &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
+            &mut columns,
+            &mut work,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            columns.cell(1, 0),
+            Some(ColumnValue::Binary(vec![
+                0xdf, 0, 0, 0, 1, 0xa5, b'a', b'%', b'2', b'E', b'b', 7
             ]))
         );
     }
@@ -618,7 +708,7 @@ mod tests {
         assert_eq!(
             extract_msgpack_events(
                 &input,
-                &config(&fields, &["id", "value.$extra"]),
+                &config(&fields, &["id", crate::UNDECLARED_COLUMN_NAME]),
                 &mut columns,
                 &mut work,
                 true

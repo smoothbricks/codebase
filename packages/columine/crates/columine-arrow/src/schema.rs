@@ -461,6 +461,10 @@ pub struct DynamicSchemaConfig {
     pub field_metadata: Vec<SignalSchemaField>,
     /// Logical types decoded from `schema_bytes`, in field order.
     pub logical_types: Vec<DataType>,
+    /// Optional canonical-JSON semantic schema envelope:
+    /// `{"<eventType>": <tree>, ...}`. `None` preserves the pre-validation
+    /// behavior; when present it is immutable for the lifetime of an EP.
+    pub semantic_schema: Option<Vec<u8>>,
     /// True when this schema IS the base event log — the four
     /// [`BASE_EVENT_LOG_FIELDS`] with the [`BASE_EVENT_LOG_NAMES`] when names
     /// were supplied. The scanners write those four columns by index, so
@@ -571,6 +575,7 @@ impl DynamicSchemaConfig {
             schema_bytes: schema_bytes.to_vec(),
             field_metadata,
             logical_types,
+            semantic_schema: None,
             field_names,
         })
     }

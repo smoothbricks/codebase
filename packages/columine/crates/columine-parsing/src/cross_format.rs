@@ -97,7 +97,7 @@ pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnVa
 
 /// Canonical MessagePack bytes for one JSON value, produced by the crate's
 /// own encoder. This is the SSOT for "the same logical value on the other
-/// wire": the `$extra` and `Binary` encoders already use it in production.
+/// wire": the undeclared carrier and `Binary` encoders already use it in production.
 pub(crate) fn canonical_msgpack(json: &str) -> Vec<u8> {
     let mut buffer = vec![0_u8; 1 << 16];
     let written = {

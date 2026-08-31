@@ -15,6 +15,7 @@ pub mod json_scanner;
 pub mod msgpack_extractor;
 pub mod msgpack_scanner;
 pub mod scan;
+pub mod validate;
 
 pub use columine_arrow::{
     ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, ColumnStorage, DynamicColumns,
@@ -182,15 +183,47 @@ pub(crate) struct FieldLookup {
     /// plane kind, and one plane's kind depends on its `type_param`.
     pub field: SignalSchemaField,
 }
-
 /// Schema-name lookup for extraction: O(1) name → column/type, plus the
-/// `value.$extra` fallback column when declared.
+/// [`UNDECLARED_COLUMN_NAME`] carrier column when declared.
 #[derive(Clone, Debug)]
 pub struct ExtractionConfig {
     pub(crate) field_entries: Vec<(usize, SignalSchemaField)>,
     pub(crate) field_map: HashMap<String, FieldLookup>,
     pub(crate) fallback_column: Option<usize>,
     pub(crate) presence_entries: Vec<(usize, usize)>,
+    /// Relative payload paths whose object schemas opt into capture.
+    pub(crate) open_paths: Vec<String>,
+    pub(crate) semantic_schemas: Option<crate::validate::SemanticSchemaSet>,
+}
+
+impl ExtractionConfig {
+    pub(crate) fn is_open_payload_path(&self, path: &str) -> bool {
+        self.open_paths.iter().any(|open| open == path)
+    }
+
+    pub(crate) fn has_declared_payload_path(&self, path: &str) -> bool {
+        self.field_map.contains_key(path) || self.field_map.contains_key(&format!("value.{path}"))
+    }
+    pub(crate) fn semantic_field_schema(
+        &self,
+        name: &str,
+    ) -> Option<&crate::validate::SemanticSchema> {
+        let name = name.strip_prefix("value.").unwrap_or(name);
+        let schemas = self.semantic_schemas.as_ref()?;
+        schemas.values().find_map(|schema| match schema {
+            crate::validate::SemanticSchema::Object { fields, .. } => fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, schema)| schema),
+            _ => None,
+        })
+    }
+    pub(crate) fn lookup_field(&self, name: &str) -> Option<&FieldLookup> {
+        self.field_map.get(name).or_else(|| {
+            let prefixed = format!("value.{name}");
+            self.field_map.get(&prefixed)
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +234,9 @@ pub enum ConfigError {
 }
 
 const VALUE_PRESENCE_PREFIX: &str = "event_value_present.";
+
+/// The sole Arrow/config/spec spelling for the bounded undeclared-value carrier.
+pub const UNDECLARED_COLUMN_NAME: &str = "value.$undeclared";
 
 fn decode_presence_source(name: &str) -> Result<Option<String>, ConfigError> {
     let Some(encoded) = name.strip_prefix(VALUE_PRESENCE_PREFIX) else {
@@ -232,12 +268,28 @@ pub fn build_extraction_config(
     fields: &[SignalSchemaField],
     names: &[&str],
 ) -> Result<ExtractionConfig, ConfigError> {
+    build_extraction_config_with_semantic_schemas(fields, names, None)
+}
+
+pub fn build_extraction_config_with_semantic_schemas(
+    fields: &[SignalSchemaField],
+    names: &[&str],
+    semantic_schemas: Option<&crate::validate::SemanticSchemaSet>,
+) -> Result<ExtractionConfig, ConfigError> {
     if fields.len() != names.len() {
         return Err(ConfigError::FieldNameCountMismatch);
     }
     let mut field_entries = Vec::with_capacity(fields.len());
     let mut field_map = HashMap::with_capacity(fields.len());
     let mut unresolved_presence = Vec::new();
+    let mut open_paths = Vec::new();
+    if let Some(semantic_schemas) = semantic_schemas {
+        for schema in semantic_schemas.values() {
+            crate::validate::collect_open_paths(schema, "", &mut open_paths);
+        }
+        open_paths.sort();
+        open_paths.dedup();
+    }
     let mut fallback_column = None;
     for (column, (field, name)) in fields.iter().zip(names).enumerate() {
         if let Some(source_name) = decode_presence_source(name)? {
@@ -260,7 +312,7 @@ pub fn build_extraction_config(
         {
             return Err(ConfigError::DuplicateFieldName);
         }
-        if *name == "value.$extra" {
+        if *name == UNDECLARED_COLUMN_NAME {
             fallback_column = Some(column);
         }
         field_entries.push((column, *field));
@@ -277,6 +329,8 @@ pub fn build_extraction_config(
         field_map,
         fallback_column,
         presence_entries,
+        open_paths,
+        semantic_schemas: semantic_schemas.cloned(),
     })
 }
 
@@ -431,7 +485,7 @@ mod properties {
         }
 
         /// JSON extractor differential: declared fields land typed, the
-        /// undeclared field lands as typed msgpack in $extra, byte-exact.
+        /// undeclared field lands as typed msgpack in the undeclared carrier, byte-exact.
         #[test]
         fn json_extractor_routes_declared_and_undeclared_fields(
             id in "[a-z0-9]{1,12}",
@@ -447,7 +501,7 @@ mod properties {
                 SignalSchemaField::new(ArrowType::Int64, false),
                 SignalSchemaField::new(ArrowType::Binary, true),
             ];
-            let config = build_extraction_config(&fields, &["id", "qty", "value.$extra"]).unwrap();
+            let config = build_extraction_config(&fields, &["id", "qty", UNDECLARED_COLUMN_NAME]).unwrap();
             let mut typed = DynamicColumns::new(&fields, 2);
             let mut work = [0_u8; 256];
             assert_eq!(
