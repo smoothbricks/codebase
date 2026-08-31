@@ -193,11 +193,82 @@
           "lmaoGitRevision"
         ]
       },
+      "cargo-lint-cross": {
+        "inputs": [
+          "{projectRoot}/**/*.rs",
+          "{projectRoot}/**/Cargo.toml",
+          "{projectRoot}/**/Cargo.lock",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
       "cargo-test-compile": {
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
           "{projectRoot}/**/Cargo.lock",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-lmao-arrow": {
+        "inputs": [
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/crates/lmao-arrow/**/*.rs",
+          "{projectRoot}/crates/lmao-arrow/Cargo.toml",
+          "{projectRoot}/crates/lmao-core/**/*.rs",
+          "{projectRoot}/crates/lmao-core/Cargo.toml",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-lmao-ffi-dylib": {
+        "inputs": [
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/crates/lmao-core/**/*.rs",
+          "{projectRoot}/crates/lmao-core/Cargo.toml",
+          "{projectRoot}/crates/lmao-ffi-dylib/**/*.rs",
+          "{projectRoot}/crates/lmao-ffi-dylib/Cargo.toml",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-lmao-query": {
+        "inputs": [
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/crates/lmao-arrow/**/*.rs",
+          "{projectRoot}/crates/lmao-arrow/Cargo.toml",
+          "{projectRoot}/crates/lmao-core/**/*.rs",
+          "{projectRoot}/crates/lmao-core/Cargo.toml",
+          "{projectRoot}/crates/lmao-query/**/*.rs",
+          "{projectRoot}/crates/lmao-query/Cargo.toml",
+          "{projectRoot}/**/.cargo/config.toml",
+          "{projectRoot}/scripts/*.sh",
+          "!{projectRoot}/**/target/**",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-lmao-wasm": {
+        "inputs": [
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/crates/lmao-arena/**/*.rs",
+          "{projectRoot}/crates/lmao-arena/Cargo.toml",
+          "{projectRoot}/crates/lmao-core/**/*.rs",
+          "{projectRoot}/crates/lmao-core/Cargo.toml",
+          "{projectRoot}/crates/lmao-wasm/**/*.rs",
+          "{projectRoot}/crates/lmao-wasm/Cargo.toml",
           "{projectRoot}/**/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
@@ -288,7 +359,8 @@
           "{projectRoot}/crates/**/Cargo.toml",
           "{projectRoot}/Cargo.toml",
           "{projectRoot}/Cargo.lock",
-          "{projectRoot}/.cargo/config.toml"
+          "{projectRoot}/.cargo/config.toml",
+          "lmaoGitRevision"
         ],
         "outputs": [
           "{projectRoot}/target/release/liblmao_ffi_dylib.dylib",
