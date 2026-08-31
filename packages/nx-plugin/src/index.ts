@@ -209,6 +209,17 @@ function createCargoTestTarget(projectRoot: string): TargetConfiguration {
 
 const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.meta.url));
 
+/**
+ * `--workspace -E 'package(X)'` rather than `--package X`. A filterset selects
+ * what RUNS; `--package` also re-resolves FEATURES for that crate alone, which
+ * fingerprints differently from the `cargo test --workspace --no-run` that
+ * `cargo-test-compile` already paid for, so cargo rebuilds the divergent half
+ * inside the bounded window. Measured on a hosted 3-core macOS runner that
+ * rebuild was 57.9s of a 120s budget — the tests were then killed with 264 of
+ * 836 still to run while nothing was wrong with any of them. The two forms
+ * select the same tests; only the filterset reuses the compile target's
+ * artifacts.
+ */
 async function addPerPackageCargoTestTargets(
   targets: Record<string, TargetConfiguration>,
   projectRoot: string,
@@ -231,7 +242,9 @@ async function addPerPackageCargoTestTargets(
       inputs: await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir),
       dependsOn: [previous],
       options: {
-        command: cargoFrozen(`nextest run --package ${pkg.name} --user-config-file none --config-file ${configFile}`),
+        command: cargoFrozen(
+          `nextest run --workspace -E 'package(${pkg.name})' --user-config-file none --config-file ${configFile}`,
+        ),
         cwd: projectRoot,
         timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
