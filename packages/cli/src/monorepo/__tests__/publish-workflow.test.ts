@@ -105,7 +105,7 @@ describe('publish workflow definition', () => {
     expect(stepAnchorNumbers(singleJob)).toEqual(Array.from({ length: 16 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(linuxCandidate)).toEqual(Array.from({ length: 19 }, (_, index) => index + 1));
     expect(stepAnchorNumbers(macosPlatform)).toEqual(Array.from({ length: 10 }, (_, index) => index + 1));
-    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
+    expect(stepAnchorNumbers(finalJob)).toEqual(Array.from({ length: 14 }, (_, index) => index + 1));
     expect(singleJob).toContain('# Step 14\n      - name: 🏷️ Tag release');
     expect(singleJob).toContain('# Step 15\n      - name: 📦 Publish release (${{ steps.version.outputs.mode }})');
     expect(singleJob).toContain('# Step 16\n      - name: 🧹 Cleanup and cache Nix/devenv');
@@ -117,23 +117,23 @@ describe('publish workflow definition', () => {
     expect(macosPlatform).toContain('# Step 6\n      - name: 🔢 Version release');
     expect(macosPlatform).toContain('# Step 7\n      - name: 🍎 Build selected macOS and iOS release outputs');
     expect(macosPlatform).toContain('# Step 10\n      - name: 🧹 Cleanup and cache Nix/devenv');
-    expect(finalJob).toContain('# Step 4\n      - name: 🥟 Install Bun');
-    expect(finalJob).toContain('# Step 5\n      - name: 🟢 Install Node');
-    expect(finalJob).toContain('# Step 6\n      - name: 📦 Install workspace dependencies');
-    expect(finalJob).toContain('# Step 8\n      - name: 🏗️ Build smoo Nx version actions');
-    expect(finalJob).toContain('# Step 9\n      - name: 🧯 Repair pending releases');
-    expect(finalJob).toContain('# Step 10\n      - name: ♻️ Restore validated release state');
-    expect(finalJob).toContain('# Step 11\n      - name: 📦 Apply verified Linux outputs');
-    expect(finalJob).toContain('# Step 12\n      - name: 🍎 Apply verified macOS outputs');
-    expect(finalJob).toContain('# Step 13\n      - name: 🏷️ Tag release');
+    expect(finalJob).toContain('# Step 3\n      - name: 🧱 Setup Nix/devenv');
+    expect(finalJob).toContain('# Step 4\n      - name: 📥 Download candidate artifacts');
+    expect(finalJob).toContain('# Step 6\n      - name: 🏗️ Build smoo Nx version actions');
+    expect(finalJob).toContain('# Step 7\n      - name: 🧯 Repair pending releases');
+    expect(finalJob).toContain('# Step 8\n      - name: ♻️ Restore validated release state');
+    expect(finalJob).toContain('# Step 9\n      - name: 📦 Apply verified Linux outputs');
+    expect(finalJob).toContain('# Step 10\n      - name: 🍎 Apply verified macOS outputs');
+    expect(finalJob).toContain('# Step 11\n      - name: 🏷️ Tag release');
     expect(finalJob).toContain(
-      '# Step 14\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
+      '# Step 12\n      - name: 📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
     );
-    expect(finalJob).toContain('# Step 15\n      - name: 🚀 Deploy production');
-    // The publishing job combines, tags, and publishes; it never builds the
-    // workspace, so it installs Bun and Node directly and owns no Nix cache.
-    expect(finalJob).not.toContain('setup-devenv');
-    expect(finalJob).not.toContain('save-nix-devenv');
+    expect(finalJob).toContain('# Step 13\n      - name: 🚀 Deploy production');
+    expect(finalJob).toContain('# Step 14\n      - name: 🧹 Cleanup and cache Nix/devenv');
+    expect(finalJob).toContain('uses: ./.github/actions/setup-devenv');
+    expect(finalJob).toContain('uses: ./.github/actions/save-nix-devenv');
+    expect(finalJob).not.toContain('🥟 Install Bun');
+    expect(finalJob).not.toContain('🟢 Install Node');
     expect(finalJob).not.toContain('smoo monorepo validate');
   });
 
@@ -379,13 +379,21 @@ describe('publish workflow definition', () => {
       finalJob.indexOf('♻️ Restore validated release state'),
     );
     expect(finalJob.indexOf('♻️ Restore validated release state')).toBeGreaterThan(
-      finalJob.indexOf('📦 Install workspace dependencies'),
+      finalJob.indexOf('🧱 Setup Nix/devenv'),
     );
     expect(rendered).not.toContain('GITHUB_SHA:');
     expect(finalJob).toContain("needs.linux-release-candidate.outputs.mode != 'none'");
     expect(finalJob).toContain("inputs.deploy_stage == 'production'");
     expect(finalJob).toContain("inputs.dry_run != 'true'");
-    expect(finalJob).toContain('smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"');
+    const publishCommand = foldedRunCommand(
+      finalJob,
+      '📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})',
+    );
+    expect(publishCommand).toContain('smoo release publish --prebuilt');
+    expect(publishCommand).toContain('/publish-release-outputs-${{ github.run_id }}"');
+    expect(publishCommand).toContain('/publish-linux-outputs-${{ github.run_id }}"');
+    expect(publishCommand).toContain('/publish-macos-outputs-${{ github.run_id }}/current"');
+    expect(publishCommand).toContain('--bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"');
     expect(finalJob).toContain('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}');
     expect(finalJob).toContain('CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}');
   });

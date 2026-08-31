@@ -246,9 +246,17 @@ function buildProgram(): Command {
     .command('publish')
     .option('--bump <bump>', 'auto, patch, minor, major, or prerelease', 'auto')
     .option('--dry-run [dryRun]', 'run without pushing, publishing, or writing GitHub Releases')
-    .action(async (options: { bump: string; dryRun?: string | boolean }) => {
+    .option(
+      '--prebuilt <directories...>',
+      'publish only outputs matching the collected artifact manifests in these directories',
+    )
+    .action(async (options: { bump: string; dryRun?: string | boolean; prebuilt?: string[] }) => {
       const { releasePublish } = await import('./release/index.js');
-      await releasePublish(await findRepoRoot(), { ...options, dryRun: booleanOption(options.dryRun) });
+      await releasePublish(await findRepoRoot(), {
+        ...options,
+        dryRun: booleanOption(options.dryRun),
+        prebuilt: options.prebuilt,
+      });
     });
   release
     .command('retag-unpublished')

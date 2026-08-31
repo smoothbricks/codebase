@@ -26,6 +26,32 @@ export interface ReleaseCompletionShell<Package extends ReleasePackageInfo = Rel
   createGithubRelease(pkg: Package, dryRun: boolean): Promise<string | null>;
 }
 
+export interface ReleaseCandidatePreparationShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
+  build(packages: Package[]): Promise<void>;
+  assertPrebuilt(pkg: Package): Promise<void>;
+}
+
+export async function prepareReleaseCandidate<Package extends ReleasePackageInfo>(
+  shell: ReleaseCandidatePreparationShell<Package>,
+  packages: Package[],
+  prebuilt: boolean,
+): Promise<void> {
+  if (!prebuilt) {
+    await shell.build(packages);
+    return;
+  }
+  for (const pkg of packages) {
+    try {
+      await shell.assertPrebuilt(pkg);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Verified prebuilt artifact for ${pkg.name} (${pkg.projectName}) is missing: ${detail}`, {
+        cause: error,
+      });
+    }
+  }
+}
+
 export interface ReleaseNextShell<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   bumpStablePackagesToNext(packages: Package[]): Promise<void>;
 }

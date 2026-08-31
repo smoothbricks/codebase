@@ -21,6 +21,7 @@ import {
 } from './index.js';
 import {
   applyCollectedOutputs,
+  assertCollectedOutputsApplied,
   type CollectedOutputsManifest,
   collectNxOutputs,
   resolveDeclaredOutput,
@@ -266,6 +267,30 @@ describe('collected Nx outputs', () => {
       expect(manifest).toEqual({ version: 2, sourceSha: SOURCE_SHA, files: [] });
       await rm(join(artifact, 'workspace'), { recursive: true });
       await expect(applyCollectedOutputs(root, [artifact], SOURCE_SHA, [])).resolves.toBeUndefined();
+    });
+  });
+
+  it('accepts only workspace outputs that still match their collected artifacts', async () => {
+    await withOutputFixture(async ({ root, artifact, outputProject }) => {
+      outputProject.targets = ['build'];
+      outputProject.targetOutputs = new Map([['build', ['{projectRoot}/dist']]]);
+      await mkdir(join(root, 'packages/app/dist'), { recursive: true });
+      const outputPath = join(root, 'packages/app/dist/index.js');
+      await writeFile(outputPath, 'verified output');
+      await collectNxOutputs(root, artifact, [{ target: 'build', projects: [outputProject] }], SOURCE_SHA);
+
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).resolves.toBeUndefined();
+      await writeFile(outputPath, 'stale output');
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).rejects.toThrow(
+        'Size mismatch for applied output packages/app/dist/index.js',
+      );
+
+      await applyCollectedOutputs(root, [artifact], SOURCE_SHA, [outputProject]);
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).resolves.toBeUndefined();
+      await rm(join(root, 'packages/app/dist'), { recursive: true });
+      await expect(assertCollectedOutputsApplied(root, [artifact], ['app'])).rejects.toThrow(
+        'Applied output file is missing: packages/app/dist/index.js',
+      );
     });
   });
 
