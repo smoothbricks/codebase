@@ -817,11 +817,6 @@ impl WorkspaceMarker {
             });
         }
         validate_role_name(self.role, &self.workspace)?;
-        if let Some(source) = &self.forked_from
-            && source.is_main()
-        {
-            return Err(MetadataError::ReservedSessionName);
-        }
         if let Some(lineage) = &self.lineage {
             let mut seen = std::collections::BTreeSet::new();
             for ancestor in lineage {
@@ -1412,12 +1407,20 @@ mod tests {
     }
 
     #[test]
+    fn pending_fork_from_main_marker_reopens() {
+        let mut pending_fork = serde_json::to_value(marker_from_json()).unwrap();
+        pending_fork["forkedFrom"] = json!("main");
+
+        let marker: WorkspaceMarker = serde_json::from_value(pending_fork).unwrap();
+        assert_eq!(marker.forked_from, Some(WorkspaceName::main()));
+    }
+
+    #[test]
     fn marker_deserialization_rejects_inconsistent_invariants_and_unknown_fields() {
         let valid = serde_json::to_value(marker_from_json()).unwrap();
         for (field, value) in [
             ("version", json!(MARKER_VERSION + 1)),
             ("role", json!("main")),
-            ("forkedFrom", json!("main")),
         ] {
             let mut invalid = valid.clone();
             invalid[field] = value;
@@ -1738,12 +1741,6 @@ mod tests {
         assert!(matches!(
             marker.validate(),
             Err(MetadataError::WorkspaceRoleMismatch { .. })
-        ));
-        marker.role = WorkspaceRole::Workspace;
-        marker.forked_from = Some(WorkspaceName::new("main").unwrap());
-        assert!(matches!(
-            marker.validate(),
-            Err(MetadataError::ReservedSessionName)
         ));
     }
 
