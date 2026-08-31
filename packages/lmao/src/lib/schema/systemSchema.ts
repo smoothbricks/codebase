@@ -299,6 +299,22 @@ export const ENTRY_TYPE_BUFFER_SPANS = 23;
 /** Buffer capacity - current buffer capacity for this module */
 export const ENTRY_TYPE_BUFFER_CAPACITY = 24;
 
+// =============================================================================
+// AxE engine state transitions
+// =============================================================================
+
+/**
+ * A signal was admitted and became an engine event - row on the `execute-loop`
+ * span, one per admitted signal, with the signal type in the message column.
+ */
+export const ENTRY_TYPE_AXE_SIGNAL_ADMITTED = 25;
+
+/**
+ * A decision became an outbound signal - row on the `route-signals` span, one
+ * per routed signal, with the signal type in the message column.
+ */
+export const ENTRY_TYPE_AXE_SIGNAL_ROUTED = 26;
+
 /**
  * Human-readable names for entry types, indexed by entry type code.
  *
@@ -337,5 +353,16 @@ export const ENTRY_TYPE_NAMES = [
   'buffer-writes', // 22
   'buffer-spans', // 23
   'buffer-capacity', // 24
+  // AxE engine state transitions. Tail-appended: every number above is written
+  // into persisted trace rows and generated into Rust `EntryType` discriminants
+  // BY INDEX, so inserting mid-table would silently renumber history.
+  //
+  // Both are transitions rather than attributes, which is why they are entry
+  // types at all: a signal becoming an engine event, and a decision becoming an
+  // outbound signal. The signal TYPE rides the message column, following the
+  // `ff-access`/`ff-usage` precedent — a 1-byte discriminant plus a name, not a
+  // discriminant per name.
+  'axe-signal-admitted', // 25 (row on execute-loop, one per admitted signal)
+  'axe-signal-routed', // 26 (row on route-signals, one per routed signal)
 ] as const;
 //#endregion smoo/lmao!n/lmao-entry-entry-type-definitions
