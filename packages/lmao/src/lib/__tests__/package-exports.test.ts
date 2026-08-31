@@ -52,6 +52,7 @@ describe('package export conditions', () => {
     expectCoreConditions(exports['.']);
     expectCoreConditions(exports['./node']);
     expectCoreConditions(exports['./es']);
+    expectCoreConditions(exports['./react-native']);
 
     expect(exports['./package.json']).toBe('./package.json');
   });
