@@ -507,6 +507,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
               'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
           },
         });
+        expect(targets['cargo-napi']?.options?.env).toEqual(
+          process.platform === 'linux' ? { CC: 'cc', CXX: 'c++' } : undefined,
+        );
       } else {
         expect(targets['cargo-napi']).toBeUndefined();
       }
@@ -576,6 +579,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
             'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir .cache/native-debug',
         },
       });
+      expect(targets['napi-debug']?.options?.env).toEqual(
+        process.platform === 'linux' ? { CC: 'cc', CXX: 'c++' } : undefined,
+      );
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
       // cargo-fetch survives the napi-debug re-route: the per-crate runner is
       // itself a frozen cargo command, so its precondition is its own edge and
