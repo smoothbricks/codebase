@@ -119,7 +119,7 @@ fn extract_msgpack_fields(
             let escaped = std::str::from_utf8(key)
                 .ok()
                 .filter(|name| name.contains(['%', '.']))
-                .map(crate::validate::encode_path_segment);
+                .map(encode_path_segment);
             let key_len = match &escaped {
                 Some(name) => msgpack_str_header_len(name.len()) + name.len(),
                 None => raw_key.len(),
