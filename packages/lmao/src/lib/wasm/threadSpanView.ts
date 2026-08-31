@@ -43,6 +43,25 @@ const LANE_SCHEMA_BASE = 5;
 /** Null-lane sink size: covers any row index a single span can reach. */
 const NULL_LANE_BYTES = 8192;
 
+/**
+ * Log rows between forced clock reads.
+ *
+ * `_timestampNow` is `process.hrtime.bigint()` plus bigint arithmetic, and it
+ * is the largest deletable slice of the row path: freezing it moved a 32-row
+ * span from 179-190 to 155-163 ns/row over six interleaved pairs, -27 ns/row
+ * (14%), while ablating the two `writeNamed` Map lookups or `f64Bits`/
+ * `encodeValue` moved nothing out of noise. Log rows therefore ride a cached
+ * stamp and span boundaries read fresh.
+ *
+ * The invariant is `lmao-core`'s `CoarseClock`: rows stamped from the cache
+ * share a timestamp, which is sound because row order — not stamp distinctness
+ * — is authoritative for ordering, while span start and completion always read
+ * fresh, so durations never coarsen. Sixteen is a quarter of the 64-row buffer,
+ * the same ratio `containium-trace` uses, so staleness stays bounded well
+ * inside one buffer.
+ */
+const LOG_STAMP_REFRESH = 16;
+
 const bits = new DataView(new ArrayBuffer(8));
 
 function f64Bits(value: number): bigint {
@@ -59,6 +78,33 @@ function f64Bits(value: number): bigint {
  * than on the target — storing it on the array reshapes indexed storage on
  * every write and cost 39 ns of a 228 ns row, more than the ABI crossing it
  * accompanies, for a number no reader of this lane consults.
+ *
+ * A Proxy looks like the expensive way to observe an indexed store, and the
+ * profiler agrees it is visible (12.8% of thread-lane self time: this trap
+ * plus `performProxyObjectSetByValStrict`). It is nonetheless the cheapest
+ * mechanism available here. Measured per store, M5 Max / bun 1.4.0, 128-row
+ * spans, best-of-five:
+ *
+ * | shape                                    | ns/store |
+ * | ---------------------------------------- | -------- |
+ * | this Proxy trap                          |     10.8 |
+ * | index accessors (`String(i)` setters)    |  18.2–22 |
+ * | plain method call                        |      2.7 |
+ * | real array / TypedArray store            |      0.4 |
+ *
+ * Only two mechanisms in JS can observe `obj[i] = v` at all — a Proxy, or an
+ * accessor named `String(i)` — and JSC's sparse-accessor `putByIndex` slow
+ * path is worse than its proxy set-by-val path, in every accessor variant
+ * tried (prototype table x256 and x4096, own accessors, sealed instances). So
+ * a "flat class with real setters" is a measured REGRESSION of ~6.5 ns per
+ * store, ~13 ns/row at two lane stores per row; do not re-attempt it.
+ *
+ * The exit is not a better observer but no observer: with the lane as a
+ * TypedArray view over the buffer's columns (spec 30 §"The wasm binding is
+ * memory-view writes, not per-row exports") the store needs no interception at
+ * all and costs 0.4 ns. Deleting this Proxy is that unit's side effect, not a
+ * unit of its own — interception exists here only because the lane is not yet
+ * a real column view.
  */
 function laneProxy(write: (index: number, value: unknown) => void): unknown[] {
   const target: unknown[] = [];
@@ -113,6 +159,14 @@ export class ThreadSpanView {
   pendingEntryType: number | undefined;
   opened = false;
   readonly fakeToReal = new Map<number, number>();
+
+  /**
+   * Row-stamp cache: the value log rows ride and the reads left before a
+   * refresh. Seeded by every boundary read, so a span's first log rows reuse
+   * the fresh stamp `openSpan` already paid for.
+   */
+  _stampCache = 0n;
+  _stampReads = 0;
 
   _writeIndex = 0;
   readonly _capacity = Number.MAX_SAFE_INTEGER;
@@ -222,7 +276,7 @@ export class ThreadSpanView {
     if (!this.opened) this.openSpan(this._spanName ?? 'span');
     const entryType = this.pendingEntryType ?? 8;
     this.pendingEntryType = undefined;
-    const timestamp = this._traceRoot._timestampNow(this._traceRoot);
+    const timestamp = this.logTimestamp();
     const packed = this.binding.appendLogStatic(this.spanId, entryType, vocabularyId, timestamp, this.pendingLine);
     if (packed === 0n) {
       throw new Error(
@@ -307,6 +361,26 @@ export class ThreadSpanView {
     return this.timestamp[0] === 0n ? null : this.timestamp[0];
   }
 
+  /**
+   * Stamp for a span boundary: always a fresh read, and it seeds the row cache
+   * so the log rows that follow reuse it. Durations derive from these two
+   * reads, so they never see a cached value.
+   */
+  boundaryTimestamp(): bigint {
+    const timestamp = this._traceRoot._timestampNow(this._traceRoot);
+    this._stampCache = timestamp;
+    this._stampReads = LOG_STAMP_REFRESH;
+    return timestamp;
+  }
+
+  /** Stamp for a log row: the cached value, refreshed every {@link LOG_STAMP_REFRESH} rows. */
+  logTimestamp(): bigint {
+    const reads = this._stampReads;
+    if (reads === 0) return this.boundaryTimestamp();
+    this._stampReads = reads - 1;
+    return this._stampCache;
+  }
+
   beginLog(entryType: number): number {
     if (!this.opened) this.openSpan(this._spanName ?? 'span');
     this.pendingEntryType = entryType;
@@ -317,7 +391,7 @@ export class ThreadSpanView {
 
   openSpan(name: string | number): void {
     if (this.opened) return;
-    const timestamp = this._traceRoot._timestampNow(this._traceRoot);
+    const timestamp = this.boundaryTimestamp();
     const label = typeof name === 'string' ? name : String(name);
     const nameId = this.runtime.intern(this.binding, label);
     const trace = this.runtime.writeUtf8(this._traceRoot.trace_id);
@@ -346,7 +420,7 @@ export class ThreadSpanView {
 
   end(entryType: number): void {
     if (!this.opened) this.openSpan(this._spanName ?? 'span');
-    const timestamp = this._traceRoot._timestampNow(this._traceRoot);
+    const timestamp = this.boundaryTimestamp();
     // The tracer's entry type goes through verbatim. Folding EXCEPTION onto
     // the error path recorded a thrown bug as a handled failure, which is the
     // one distinction the completion taxonomy exists to make.
@@ -467,7 +541,7 @@ export class ThreadSpanView {
     if (!this.opened) this.openSpan(this._spanName ?? 'span');
     const entryType = this.pendingEntryType ?? 8;
     this.pendingEntryType = undefined;
-    const timestamp = this._traceRoot._timestampNow(this._traceRoot);
+    const timestamp = this.logTimestamp();
     // Intern to a u32 and pass the ordinal, rather than re-encoding the same
     // message to UTF-8 on every row. Vocabulary ids are stable per handle, so
     // a repeated message costs one Map lookup and no encode at all.
