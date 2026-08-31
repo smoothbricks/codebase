@@ -2427,6 +2427,117 @@ fn recovery_rejects_missing_or_contradictory_ca_companion_layouts() {
     }
 }
 
+/// A sibling whose payload is provably gone must not fail recovery for the rest of the store.
+///
+/// `recover_pending` runs at project open (`runtime/project.rs`), before any verb dispatches, so
+/// refusing here failed `ls`, `rm`, and even the `cowshed doctor --json` the refusal itself
+/// pointed at — for every *other* workspace, none of which was inconsistent. Reproduced on a real
+/// host by parking one session image aside and leaving its sidecar and CA key: `cowshed ls` exited
+/// 7 immediately.
+#[test]
+fn an_imageless_sibling_publication_is_reconciled_instead_of_failing_every_other_workspace() {
+    let fixture = Fixture::new("orphan-publication-sibling");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+
+    let live = WorkspaceName::new("session-live").expect("live session");
+    let live_canonical = layout
+        .session_image(&live, ImageFormat::Sparse)
+        .expect("live canonical");
+    create_image(live_canonical.image(), ImageFormat::Sparse);
+    let mut live_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut live_metadata, live.clone());
+    live_metadata
+        .write_for_image(live_canonical.image())
+        .expect("live metadata");
+
+    let dangling = WorkspaceName::new("session-dangling").expect("dangling session");
+    let dangling_canonical = layout
+        .session_image(&dangling, ImageFormat::Sparse)
+        .expect("dangling canonical");
+    create_image(dangling_canonical.image(), ImageFormat::Sparse);
+    let mut dangling_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut dangling_metadata, dangling.clone());
+    dangling_metadata
+        .write_for_image(dangling_canonical.image())
+        .expect("dangling metadata");
+    // Sidecar and CA companion published, image gone: an interrupted publication or an
+    // interrupted retirement, indistinguishable and identical in consequence.
+    std::fs::remove_file(dangling_canonical.image()).expect("lose the dangling payload");
+    assert!(sidecar_path(dangling_canonical.image()).exists());
+    assert!(ca_key_path(dangling_canonical.image()).exists());
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.recover_pending(&fixture.config(), &[])
+        .expect("a sibling whose image is provably gone must not fail project recovery");
+
+    assert!(
+        !sidecar_path(dangling_canonical.image()).exists(),
+        "the orphaned grants sidecar is reconciled away"
+    );
+    assert!(
+        !ca_key_path(dangling_canonical.image()).exists(),
+        "the orphaned CA key goes with it rather than being stranded as an unreachable private key"
+    );
+    let listed = host
+        .list(&repo())
+        .expect("recovery leaves the project enumerable")
+        .into_iter()
+        .map(|fact| fact.workspace.name().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        vec![live],
+        "the live sibling survives and stays enumerable, so its removal is unblocked"
+    );
+    assert_eq!(
+        std::fs::read(live_canonical.image()).expect("live image"),
+        b"fixture",
+        "reconciling one workspace's metadata must not touch another's payload"
+    );
+    host.recover_pending(&fixture.config(), &[])
+        .expect("repeated recovery is idempotent");
+}
+
+/// The boundary of the reconciliation above: an in-flight restore is the one reading of a missing
+/// canonical image that is not "the payload is gone", so it keeps its evidence and still refuses.
+#[test]
+fn an_imageless_publication_with_a_restore_in_flight_keeps_its_evidence_and_still_refuses() {
+    let fixture = Fixture::new("orphan-publication-restore-in-flight");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    let undo = layout
+        .project()
+        .checkpoints
+        .join("main/pre-restore-00000000000000000000000000000002.sparseimage");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    create_image(&undo, ImageFormat::Sparse);
+    std::fs::write(&undo, b"old generation").expect("undo payload");
+    std::fs::remove_file(canonical.image()).expect("lose the canonical image");
+    std::fs::write(restore_recovery_fact_path(canonical.image()), b"{}")
+        .expect("restore recovery fact");
+
+    let error = native_host(&fixture, RecordingRunner::default())
+        .recover_pending(&fixture.config(), &[])
+        .expect_err("an in-flight restore is ambiguous and must still fail closed");
+    match error {
+        ApfsStorageError::MarkerMismatch(message) => {
+            assert!(message.contains("restore recovery has no canonical image"));
+            assert!(message.contains(&canonical.image().display().to_string()));
+        }
+        other => panic!("expected typed restore integrity error, got {other:?}"),
+    }
+    assert!(
+        sidecar_path(canonical.image()).exists(),
+        "reconciliation must not consume the evidence the restore pass reads"
+    );
+    assert!(ca_key_path(canonical.image()).exists());
+    assert_eq!(
+        std::fs::read(&undo).expect("undo"),
+        b"old generation",
+        "the retained undo generation is the payload and must survive"
+    );
+}
+
 #[test]
 fn gc_reclaims_sidecarless_staging_crash_images_but_preserves_recoverable_pairs() {
     let fixture = Fixture::new("staging-orphan");
