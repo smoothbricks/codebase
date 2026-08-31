@@ -2,10 +2,19 @@
 //!
 //! Deliberately NOT OpenTelemetry random 128-bit span ids:
 //! - `thread_id`: 64-bit crypto-random, generated once per process/worker (cold path).
-//! - `span_id`: 32-bit thread-local monotonic counter — counts all spans on that
-//!   thread across all traces. Zero coordination.
+//! - `span_id`: 32-bit thread-local monotonic counter, NEVER zero — counts all spans
+//!   on that thread across all traces. Zero coordination.
 //! - `trace_id`: validated, shared by reference (`Arc<str>`) across the whole tree.
 //! - Parent linkage is by reference, not copied bytes.
+//!
+//! Zero is reserved rather than merely unused, and the reason is about transports
+//! rather than about this counter. A span with no parent expresses that as
+//! `parent: None`, which reaches Arrow as a genuine NULL. But a fixed-width wire field
+//! has no NULL, so a transport that must say "no parent" in 32 bits says `0`. That
+//! sentinel is only unambiguous if no emitter can ever mint 0 as a REAL span id —
+//! otherwise a receiver cannot tell "deliberately no parent" from "a genuine first
+//! span on some thread". Reserving zero here is what makes the sentinel sound, so it
+//! belongs in the generator that every emitter shares, not in each reader.
 //!
 //! Global uniqueness: `(trace_id, thread_id, span_id)`.
 //!
@@ -22,15 +31,33 @@ pub trait Entropy {
 }
 
 thread_local! {
-    static SPAN_ID_COUNTER: Cell<u32> = const { Cell::new(0) };
+    /// Starts at 1: zero is reserved as the wire's "no parent" sentinel, so no real
+    /// span may ever carry it.
+    static SPAN_ID_COUNTER: Cell<u32> = const { Cell::new(1) };
 }
 
-/// Next thread-local monotonic span id (`i++`, wraps are a non-goal at u32 scale).
+/// Successor of a span id, skipping zero.
+///
+/// Separated from the thread-local plumbing so the wrap boundary is directly
+/// testable: driving a real counter to `u32::MAX` is not a test anyone can run.
+#[inline]
+const fn successor(id: u32) -> u32 {
+    // `wrapping_add` yields 0 exactly at `u32::MAX`, and that 0 is redirected to 1, so
+    // zero stays reserved for all time rather than only until the counter wraps.
+    // Without this, exhausting u32 re-mints 0 as a real span id and the wire sentinel
+    // silently becomes ambiguous again — a four-billion-span fuse rather than an
+    // invariant, and reachable on a long-lived pinned per-core thread, which is
+    // precisely where spans are emitted fastest.
+    let next = id.wrapping_add(1);
+    if next == 0 { 1 } else { next }
+}
+
+/// Next thread-local monotonic span id. NEVER returns 0 (see [`successor`]).
 #[inline]
 pub fn next_span_id() -> u32 {
     SPAN_ID_COUNTER.with(|c| {
         let v = c.get();
-        c.set(v.wrapping_add(1));
+        c.set(successor(v));
         v
     })
 }
@@ -99,10 +126,38 @@ mod tests {
     }
 
     #[test]
-    fn span_ids_are_monotonic_per_thread() {
-        let a = next_span_id();
-        let b = next_span_id();
-        assert_eq!(b, a.wrapping_add(1));
+    fn span_ids_are_monotonic_and_never_zero_per_thread() {
+        // Fresh thread so the counter starts where a real emitter's does.
+        std::thread::spawn(|| {
+            let first = next_span_id();
+            assert_ne!(
+                first, 0,
+                "the very first id on a thread must not be the sentinel"
+            );
+            let second = next_span_id();
+            assert_eq!(second, successor(first));
+            assert!(second > first);
+        })
+        .join()
+        .expect("id thread");
+    }
+
+    /// The wrap boundary, which is the whole point of the zero-skip and is
+    /// unreachable through the counter itself: 2^32 calls is not a test.
+    #[test]
+    fn the_successor_skips_zero_on_wrap() {
+        assert_eq!(
+            successor(u32::MAX),
+            1,
+            "wrapping past MAX must not re-mint the sentinel"
+        );
+        assert_eq!(successor(0), 1, "even a zero seed advances to a legal id");
+        assert_eq!(successor(1), 2);
+        assert_eq!(
+            successor(u32::MAX - 1),
+            u32::MAX,
+            "the last legal id is still reachable"
+        );
     }
 
     #[test]
