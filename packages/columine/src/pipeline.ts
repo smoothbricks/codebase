@@ -15,7 +15,7 @@
  *   stages.undo.rollback(state, token);
  */
 
-import type { CompactColumn } from './compact-column.generated.js';
+import type { CompactColumn } from './arrow-planes.js';
 import type { ParseCompactBackend } from './parse-backend.js';
 import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
 

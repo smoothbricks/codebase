@@ -2,10 +2,9 @@ import { describe, expect, it } from 'bun:test';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ARROW_PLANES } from '../arrow-planes.js';
-import { renderCompactColumnModule, renderRustPlaneDeclarations } from '../arrow-planes-codegen.js';
+import { renderRustPlaneDeclarations } from '../arrow-planes-codegen.js';
 
 const SRC = join(import.meta.dir, '..');
-const GENERATED_TS = join(SRC, 'compact-column.generated.ts');
 const SCHEMA_RS = join(SRC, '..', 'crates', 'columine-arrow', 'src', 'schema.rs');
 const WRITE = process.env.UPDATE_GENERATED === '1';
 
@@ -22,10 +21,6 @@ function expectGenerated(path: string, rendered: string): void {
 }
 
 describe('arrow plane table', () => {
-  it('generates the committed TypeScript surface', () => {
-    expectGenerated(GENERATED_TS, renderCompactColumnModule());
-  });
-
   it('generates the committed Rust plane declarations', () => {
     const source = readFileSync(SCHEMA_RS, 'utf8');
     expectGenerated(SCHEMA_RS, renderRustPlaneDeclarations(source));

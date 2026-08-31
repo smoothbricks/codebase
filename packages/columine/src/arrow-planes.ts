@@ -109,3 +109,76 @@ export const ARROW_PLANES = [
     validity: 'Uint8Array',
   },
 ] as const satisfies readonly ArrowPlane[];
+
+/** Carrier name -> the language's typed array. Ten entries, none plane-specific. */
+interface Carriers {
+  Int8Array: Int8Array;
+  Uint8Array: Uint8Array;
+  Int16Array: Int16Array;
+  Uint16Array: Uint16Array;
+  Int32Array: Int32Array;
+  Uint32Array: Uint32Array;
+  Float32Array: Float32Array;
+  Float64Array: Float64Array;
+  BigInt64Array: BigInt64Array;
+  BigUint64Array: BigUint64Array;
+}
+
+type Plane = (typeof ARROW_PLANES)[number];
+
+/** Collapses the intersection so each column renders as one flat object. */
+type Flatten<T> = { [K in keyof T]: T[K] };
+
+type Buffers<P extends Plane> = (P['offsets'] extends keyof Carriers
+  ? { readonly offsets: Carriers[P['offsets']] }
+  : // biome-ignore lint/complexity/noBannedTypes: an empty member contributes nothing to the intersection
+    {}) &
+  (P['data'] extends keyof Carriers
+    ? { readonly data: Carriers[P['data']] }
+    : // biome-ignore lint/complexity/noBannedTypes: as above
+      {}) &
+  (P['validity'] extends keyof Carriers
+    ? { readonly validity?: Carriers[P['validity']] }
+    : // biome-ignore lint/complexity/noBannedTypes: as above
+      {});
+
+/** Distributive over the plane union: `P` is a type parameter, so each row maps separately. */
+type ColumnOf<P extends Plane> = P extends unknown ? Flatten<{ readonly kind: P['kind'] } & Buffers<P>> : never;
+
+/**
+ * One compact column: a physical plane plus its buffers.
+ *
+ * DERIVED from {@link ARROW_PLANES}, not generated and not hand-written, so a
+ * plane's name, tag and carrier cannot disagree — there is one row to edit and
+ * no second copy to forget.
+ */
+export type CompactColumn = ColumnOf<Plane>;
+
+/**
+ * Physical plane tags — the `ArrowType` enum in columine-arrow.
+ *
+ * Coverage is structural rather than checked: the same array supplies the union
+ * members and these entries, so a plane cannot appear in one and not the other.
+ */
+const KIND_TAGS: ReadonlyMap<CompactColumn['kind'], number> = new Map(
+  ARROW_PLANES.map((plane) => [plane.kind, plane.tag] as const),
+);
+
+/**
+ * This plane's wire tag. Takes the exact discriminant rather than a string, so
+ * a misspelled plane name is a compile error instead of an undefined lookup.
+ */
+export function compactKindTag(kind: CompactColumn['kind']): number {
+  const tag = KIND_TAGS.get(kind);
+  if (tag === undefined) {
+    // invariant throw: the map is built from the table this type is derived from
+    throw new Error(`plane ${kind} has no tag`);
+  }
+  return tag;
+}
+
+/**
+ * Highest valid plane tag, DERIVED. A bounds check naming one plane's tag
+ * silently rejected every plane appended after it.
+ */
+export const COMPACT_MAX_KIND_TAG: number = Math.max(...ARROW_PLANES.map((plane) => plane.tag));
