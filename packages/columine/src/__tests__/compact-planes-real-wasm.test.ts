@@ -94,6 +94,18 @@ function encodeOne(name: string, schema: EncodedArrowSchema, column: CompactColu
   return readColumn(ipc, name);
 }
 
+function expectNumeric(actual: unknown, expected: bigint): void {
+  if (typeof actual === 'bigint') {
+    expect(actual).toBe(expected);
+    return;
+  }
+  if (typeof actual === 'number') {
+    expect(BigInt(actual)).toBe(expected);
+    return;
+  }
+  throw new Error(`expected a numeric column value, got ${typeof actual}`);
+}
+
 describe('Compact real-wasm flat planes', () => {
   it('null', () => {
     const schema = schemaMessage('v', null, nullType(), 0);
@@ -258,8 +270,8 @@ describe('Compact real-wasm flat planes', () => {
   it('date64 rides i64', () => {
     const schema = schemaMessage('v', 0n, dateMillisecond(), 6);
     const values = encodeOne('v', schema, { kind: 'i64', data: new BigInt64Array([0n, 86_400_000n]) });
-    expect(values[0]).toBe(0n);
-    expect(values[1]).toBe(86_400_000n);
+    expectNumeric(values[0], 0n);
+    expectNumeric(values[1], 86_400_000n);
   });
 
   it('time32 rides i32', () => {
@@ -270,22 +282,22 @@ describe('Compact real-wasm flat planes', () => {
   it('time64 rides i64', () => {
     const schema = schemaMessage('v', 0n, timeMicrosecond(), 6);
     const values = encodeOne('v', schema, { kind: 'i64', data: new BigInt64Array([0n, 1_000_000n]) });
-    expect(values[0]).toBe(0n);
-    expect(values[1]).toBe(1_000_000n);
+    expectNumeric(values[0], 0n);
+    expectNumeric(values[1], 1_000_000n);
   });
 
   it('timestamp rides i64', () => {
     const schema = schemaMessage('v', 0n, timestamp(TimeUnit.MILLISECOND), 6);
     const values = encodeOne('v', schema, { kind: 'i64', data: new BigInt64Array([0n, 1_700_000_000_000n]) });
-    expect(values[0]).toBe(0n);
-    expect(values[1]).toBe(1_700_000_000_000n);
+    expectNumeric(values[0], 0n);
+    expectNumeric(values[1], 1_700_000_000_000n);
   });
 
   it('duration rides i64', () => {
     const schema = schemaMessage('v', 0n, duration(TimeUnit.MILLISECOND), 6);
     const values = encodeOne('v', schema, { kind: 'i64', data: new BigInt64Array([0n, 5_000n]) });
-    expect(values[0]).toBe(0n);
-    expect(values[1]).toBe(5_000n);
+    expectNumeric(values[0], 0n);
+    expectNumeric(values[1], 5_000n);
   });
 
   it('intervalYearMonth', () => {
@@ -294,14 +306,14 @@ describe('Compact real-wasm flat planes', () => {
   });
 
   it('intervalDayTime', () => {
-    const schema = schemaMessage('v', 0, interval(IntervalUnit.DAY_TIME), 21);
+    const schema = schemaMessage('v', [0, 0], interval(IntervalUnit.DAY_TIME), 21);
     const values = encodeOne('v', schema, { kind: 'intervalDayTime', data: new Int32Array([1, 2, 3, 4]) });
     expect(values[0]).toEqual(Int32Array.of(1, 2));
     expect(values[1]).toEqual(Int32Array.of(3, 4));
   });
 
   it('intervalMonthDayNano', () => {
-    const schema = schemaMessage('v', 0, interval(IntervalUnit.MONTH_DAY_NANO), 22);
+    const schema = schemaMessage('v', [0, 0, 0n], interval(IntervalUnit.MONTH_DAY_NANO), 22);
     const first = monthDayNano(1, 2, 3n);
     const second = monthDayNano(-1, 0, 4n);
     const values = encodeOne('v', schema, {
