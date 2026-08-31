@@ -160,6 +160,9 @@ pub struct SetupArgs {
     /// Host-configured session mount root (`<mount-root>/<owner>/<repo>/<ws>`). Settable only
     /// when every session workspace is detached; direct-mounted mains are unaffected.
     pub mount_root: Option<PathBuf>,
+    /// Build the patched sccache from cowshed's own nix flake, root the result, and start its
+    /// LaunchAgent. Opt-in because not every cowshed user writes Rust and it requires nix.
+    pub sccache: bool,
 }
 
 /// `start` takes the cache cap because the cap is the one thing a host operator has to be able to
@@ -564,7 +567,12 @@ fn cli_command() -> ClapCommand {
             value("repo-id"),
             flag("quarantine"),
         ]))
-        .subcommand(leaf("setup").args([flag("uninstall"), flag("force"), value("mount-root")]))
+        .subcommand(leaf("setup").args([
+            flag("uninstall"),
+            flag("force"),
+            flag("sccache"),
+            value("mount-root"),
+        ]))
         .subcommand(leaf("new").arg(positional("name", 0..=1)).args([
             value("ref"),
             value("from"),
@@ -1240,6 +1248,7 @@ const SETUP: CommandSpec = CommandSpec {
         "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
         "`--mount-root <dir>` sets the host session workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at `<mount-root>/<owner>/<repo>/<ws>`. The root can change only while every session workspace is detached; mains stay mounted directly at their checkout paths.",
         "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
+        "`--sccache` builds the patched sccache from the flake this package ships at `nix/sccache`, registers a nix GC root for the result under cowshed's support directory, and starts a LaunchAgent running that exact store path. It is opt-in: not every cowshed user writes Rust, and it needs nix. A host without nix is told so and the rest of the run still repairs storage. The plist names the resolved `/nix/store` path rather than the GC root symlink, so a rebuild is a plist change — and therefore an explicit restart — instead of a different binary appearing under a loaded agent.",
     ],
     options: &[
         Opt {
@@ -1254,6 +1263,10 @@ const SETUP: CommandSpec = CommandSpec {
             spelling: "--mount-root <dir>",
             meaning: "set the host session mount root; refused while any session workspace is attached",
         },
+        Opt {
+            spelling: "--sccache",
+            meaning: "build the patched sccache from the shipped nix flake, root it, and run it as a LaunchAgent (requires nix)",
+        },
     ],
 };
 
@@ -1261,7 +1274,9 @@ const SETUP: CommandSpec = CommandSpec {
 /// so silently accepting `--project` would promise a scope the verb does not have. `--force`
 /// without `--uninstall` is refused rather than ignored — it confirms a refusal that the forward
 /// direction never makes, so accepting it would answer a question nobody asked. `--mount-root`
-/// is a third direction and cannot combine with teardown.
+/// is a third direction and cannot combine with teardown, and neither can `--sccache`: teardown
+/// releases the GC root an install registers, so asking for both in one command line names two
+/// opposite intents.
 fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SETUP;
     reject_project(global, USAGE, "--project is not valid for setup")?;
@@ -1271,9 +1286,16 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
         Some(value) => Some(absolute_mount_root(&value, USAGE)?),
         None => None,
     };
+    let sccache = flagged(matches, "sccache");
     if mount_root.is_some() && (uninstall || force) {
         return Err(UsageError::new(
             "--mount-root cannot be combined with --uninstall",
+            USAGE,
+        ));
+    }
+    if sccache && (uninstall || force) {
+        return Err(UsageError::new(
+            "--sccache installs sccache; --uninstall removes it",
             USAGE,
         ));
     }
@@ -1287,6 +1309,7 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
         uninstall,
         force,
         mount_root,
+        sccache,
     }))
 }
 
@@ -2453,6 +2476,7 @@ mod tests {
             uninstall: false,
             force: false,
             mount_root: None,
+            sccache: false,
         };
         assert_eq!(
             parse_args(["setup"]).unwrap().command,
@@ -2473,6 +2497,7 @@ mod tests {
                 uninstall: true,
                 force: false,
                 mount_root: None,
+                sccache: false,
             })
         );
         assert_eq!(
@@ -2483,7 +2508,25 @@ mod tests {
                 uninstall: true,
                 force: true,
                 mount_root: None,
+                sccache: false,
             })
+        );
+
+        // sccache is opt-in: absent by default, and it cannot ride along with the teardown that
+        // releases the very GC root it registers.
+        assert_eq!(
+            parse_args(["setup", "--sccache"]).unwrap().command,
+            Command::Setup(SetupArgs {
+                uninstall: false,
+                force: false,
+                mount_root: None,
+                sccache: true,
+            })
+        );
+        let error = parse_args(["setup", "--sccache", "--uninstall"]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "--sccache installs sccache; --uninstall removes it"
         );
 
         let Command::Setup(configured) =
