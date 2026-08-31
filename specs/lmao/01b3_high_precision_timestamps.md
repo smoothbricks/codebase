@@ -257,6 +257,20 @@ import { TestTracer, defineOpContext } from '@smoothbricks/lmao';
 
 Uses `performance.now()` with microsecond precision (~5-20μs resolution), converted to nanoseconds for storage.
 
+### React Native Entry Point
+
+```typescript
+// React Native / Hermes; import an entropy provider before this line
+import 'react-native-get-random-values';
+import { TestTracer, defineOpContext } from '@smoothbricks/lmao/react-native';
+```
+
+Re-exports the same `traceRoot.es.ts` factory as the browser entry: React Native installs `global.performance.now` in
+`InitializeCore`, and Hermes has no `WebAssembly` global, so the pure-TypedArray lane is the only lane that runs there.
+Hermes supplies neither `crypto.getRandomValues` (declined as out of engine scope in facebook/hermes#915) nor
+`TextDecoder`, and gained `TextEncoder` only in the Hermes build shipped with React Native 0.74; the app provides the
+two missing globals before importing the entry point.
+
 ### Why Separate Entry Points?
 
 1. **Tree-shaking**: Node.js-specific code (e.g., `process.hrtime.bigint()`) doesn't bundle into browser builds

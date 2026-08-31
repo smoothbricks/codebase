@@ -43,6 +43,12 @@
       "import": "./dist/ts/es.js",
       "default": "./dist/ts/es.js"
     },
+    "./react-native": {
+      "types": "./dist/ts/react-native.d.ts",
+      "development": "./src/react-native.ts",
+      "import": "./dist/ts/react-native.js",
+      "default": "./dist/ts/react-native.js"
+    },
     "./wasm": {
       "types": "./dist/ts/wasm.d.ts",
       "development": "./src/wasm.ts",
