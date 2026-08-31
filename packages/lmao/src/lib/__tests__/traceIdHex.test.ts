@@ -11,35 +11,20 @@
 
 import { describe, expect, it } from 'bun:test';
 
-import { generateTraceId } from '../traceId.js';
+import { createTraceId, generateTraceId, type TraceId, traceIdFromBytes } from '../traceId.js';
 
-/** The encoder the LUT replaced, kept here as the parity oracle. */
-function referenceHex(bytes: Uint8Array): string {
+/**
+ * The encoder the LUT replaced, kept here as the parity oracle. Its result goes
+ * through `createTraceId` so the comparison stays inside the branded type
+ * instead of widening the assertion to `string`, and so the oracle's own output
+ * has to be a valid trace id too.
+ */
+function referenceTraceId(bytes: Uint8Array): TraceId {
   let hex = '';
   for (let i = 0; i < bytes.length; i++) {
     hex += bytes[i].toString(16).padStart(2, '0');
   }
-  return hex;
-}
-
-/**
- * Run `generateTraceId` against chosen bytes by substituting the source it
- * actually reads. This is the only seam: the byte source is not a parameter.
- */
-function traceIdForBytes(bytes: Uint8Array): string {
-  const original = crypto.getRandomValues;
-  Object.defineProperty(crypto, 'getRandomValues', {
-    configurable: true,
-    value: (target: Uint8Array) => {
-      target.set(bytes);
-      return target;
-    },
-  });
-  try {
-    return generateTraceId();
-  } finally {
-    Object.defineProperty(crypto, 'getRandomValues', { configurable: true, value: original });
-  }
+  return createTraceId(hex);
 }
 
 describe('trace-id hex encoding', () => {
@@ -48,8 +33,7 @@ describe('trace-id hex encoding', () => {
     // single wrong table entry cannot hide in a position the test never reached.
     for (let value = 0; value <= 0xff; value++) {
       const bytes = new Uint8Array(16).fill(value);
-      const actual = traceIdForBytes(bytes);
-      expect(actual).toBe(referenceHex(bytes));
+      expect(traceIdFromBytes(bytes)).toBe(referenceTraceId(bytes));
     }
   });
 
@@ -60,20 +44,20 @@ describe('trace-id hex encoding', () => {
       for (let value = 0; value <= 0xff; value++) {
         const bytes = new Uint8Array(16).fill(0x5a);
         bytes[position] = value;
-        expect(traceIdForBytes(bytes)).toBe(referenceHex(bytes));
+        expect(traceIdFromBytes(bytes)).toBe(referenceTraceId(bytes));
       }
     }
   });
 
   it('emits exactly 32 lowercase hex characters for every byte value', () => {
     for (let value = 0; value <= 0xff; value++) {
-      const id = traceIdForBytes(new Uint8Array(16).fill(value));
+      const id = traceIdFromBytes(new Uint8Array(16).fill(value));
       expect(id).toHaveLength(32);
       expect(id).toMatch(/^[0-9a-f]{32}$/);
       // Case matters: an uppercase table would still round-trip through
       // parseInt and still look like a trace id, while breaking every stored
       // id's string equality.
-      expect(id).toBe(id.toLowerCase());
+      expect(id).toBe(createTraceId(id.toLowerCase()));
     }
   });
 
