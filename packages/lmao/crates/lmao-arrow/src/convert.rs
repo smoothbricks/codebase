@@ -11,7 +11,9 @@ use arrow_array::{
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
-use lmao_core::{EntryType, entry_type_from_header, vocabulary_id_from_header};
+use lmao_core::{
+    EntryType, SYSTEM_COLUMNS, SystemColumnKind, entry_type_from_header, vocabulary_id_from_header,
+};
 
 use crate::dict::{
     ColumnDictionary, FinalizedDictionary, FirstSeenDictionary, StableVocabularyCatalog,
@@ -27,24 +29,23 @@ fn dict_type(key: DataType) -> DataType {
 }
 
 static TRACE_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new("trace_id", dict_type(DataType::UInt32), false),
-        Field::new("thread_id", DataType::UInt64, false),
-        Field::new("span_id", DataType::UInt32, false),
-        Field::new("parent_thread_id", DataType::UInt64, true),
-        Field::new("parent_span_id", DataType::UInt32, true),
-        Field::new("entry_type", dict_type(DataType::UInt8), false),
-        Field::new("package_name", dict_type(DataType::UInt32), true),
-        Field::new("package_file", dict_type(DataType::UInt32), true),
-        Field::new("git_sha", dict_type(DataType::UInt32), true),
-        Field::new("message", dict_type(DataType::UInt32), true),
-        Field::new("line", DataType::UInt32, false),
-    ]))
+    Arc::new(Schema::new(
+        SYSTEM_COLUMNS
+            .iter()
+            .map(|column| {
+                let data_type = match column.kind {
+                    SystemColumnKind::TimestampNanosecond => {
+                        DataType::Timestamp(TimeUnit::Nanosecond, None)
+                    }
+                    SystemColumnKind::DictionaryU32 => dict_type(DataType::UInt32),
+                    SystemColumnKind::DictionaryU8 => dict_type(DataType::UInt8),
+                    SystemColumnKind::U64 => DataType::UInt64,
+                    SystemColumnKind::U32 => DataType::UInt32,
+                };
+                Field::new(column.name, data_type, column.nullable)
+            })
+            .collect::<Vec<_>>(),
+    ))
 });
 
 static ENTRY_TYPE_VALUES: LazyLock<ArrayRef> =
