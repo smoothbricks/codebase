@@ -3,7 +3,12 @@ import { printCommandOutput, run, runResult } from '../lib/run.js';
 import { escapeRegex, getWorkspacePackages, getWorkspacePatterns, listReleasePackages } from '../lib/workspace.js';
 import { readProjectTargets } from '../nx/index.js';
 import { validateCargoCachePolicy } from './cargo-policy.js';
-import { formatCommitMessage, validateCommitMessage } from './commit-msg.js';
+import {
+  formatCommitMessage,
+  stagedDeletedPublicPackages,
+  validateBreakingDisclosure,
+  validateCommitMessage,
+} from './commit-msg.js';
 import { applyWorkspaceGitConfig } from './git-config.js';
 import { syncBunLockfileVersions } from './lockfile.js';
 import {
@@ -160,6 +165,10 @@ export function validateCommitMessageFile(
   const error = validateCommitMessage(message, { validScopes: listValidCommitScopes(root) });
   if (error) {
     throw new Error(error);
+  }
+  const disclosure = validateBreakingDisclosure(message, stagedDeletedPublicPackages(root));
+  if (disclosure) {
+    throw new Error(disclosure);
   }
 }
 
