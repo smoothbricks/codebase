@@ -37,7 +37,6 @@ in {
       # Go comes from ./devenv.smoo.nix (languages.go), one version for every
       # repository for the same reason as the Rust toolchain: a compiler is part
       # of a cache key. packages/lmao-ttsc/plugin builds against it.
-      sccache # Rust compiler cache; client of the host-owned daemon (cowshed sccache start)
       # Git hooks and formatters
       git-format-staged
       jq # Used in pre-commit hook and generally useful
@@ -77,7 +76,7 @@ in {
       "aarch64-unknown-linux-gnu"
     ];
 
-  # NX_PARALLEL, the PATH/toolchain exports, and the sccache policy come from
+  # NX_PARALLEL, and the PATH/toolchain exports come from
   # ./devenv.smoo.nix.
 
   # https://devenv.sh/languages/

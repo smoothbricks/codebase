@@ -21,11 +21,13 @@
   # Nx otherwise defaults to three workers. Scale to the cores available in each
   # developer shell or CI runner; explicit --parallel flags still take precedence.
   env.NX_PARALLEL = "100%";
-  # cc-rs documented form (wrapper plus driver). Not CC/CXX: xcodebuild reads
-  # those and then dies on -index-store-path. print-dev-env exports these into
-  # cowshed exec; enterShell is not in that snapshot.
-  env.HOST_CC = "sccache cc";
-  env.HOST_CXX = "sccache c++";
+  # sccache is deliberately absent from this shell. It used to export
+  # RUSTC_WRAPPER=sccache as a BARE NAME, which PATH then resolved per project —
+  # which is precisely how an unpatched binary from one profile came to serve
+  # clients from another. sccache now belongs to cowshed: `cowshed setup
+  # --sccache` builds packages/cowshed/nix/sccache, pins the result with a nix GC
+  # root, and supervises that exact store path. A repository shell has no
+  # business deciding which compiler cache a host runs.
 
   # One toolchain for every repository and every workspace, pinned by devenv.lock
   # rather than by a rust-toolchain file. devenv resolves the channel through
@@ -125,7 +127,7 @@
   # It needs its own input because the fleet's nixpkgs does not carry that patch:
   # devenv-nixpkgs rolling ships go 1.26.5 and its `go_1_27` is a release
   # candidate, while ttsc 0.28.3 vendors go1.26.7. Same idiom, and same reason,
-  # as the dedicated sccache input — one leaf package from a nixpkgs that has it,
+  # for any single-package pin — one leaf package from a nixpkgs that has it,
   # lock-pinned, prebuilt, rather than a fleet-wide bump that would move rustc,
   # bun and node too. Not every pairing is reachable: ttsc 0.28.1/0.28.2 vendor
   # go1.26.6, which NO channel packages, so when no revision offers the vendored
@@ -200,34 +202,7 @@
     # 5. enter-shell.ts chdirs to the workspace root and runs setup-environment.ts;
     #    a failed bootstrap aborts shell entry instead of yielding a half-working
     #    shell.
-    # 6. The wrapper follows the store, so a cowshed host wraps every checkout,
-    #    including main. The store and the socket are cowshed's own, not this
-    #    module's invention: cowshed-core/src/sandbox.rs defines them as
-    #    /private/cowshed/caches/sccache and /private/cowshed/store/sccache.sock,
-    #    its Seatbelt profile admits exactly that socket and denies binding it, and
-    #    its supervisor exports the same pair into every sandboxed process. Naming
-    #    any other path here does not create a second opinion, it creates a second
-    #    cache — and a $HOME path is the worst of them, because $HOME is private
-    #    per workspace inside the sandbox, so every client is sent to a store the
-    #    daemon does not serve while the daemon's own store goes unread.
-    #
-    #    A client that finds no daemon compiles uncached, so the socket path is a
-    #    fixed convention rather than a discovery. A CI runner that exports
-    #    SCCACHE_DIR opts in the same way. A machine with no cowshed store stays
-    #    unwrapped, so nothing grows a cache nobody reclaims. SCCACHE_BASEDIR_CWD=1
-    #    activates the patched sccache from the repository's nixpkgs overlay, which
-    #    keys path-bearing hash inputs relative to the request cwd so workspaces
-    #    share one cache at any mount path; crates that compile
-    #    env!("CARGO_MANIFEST_DIR") into their output fail closed.
-    #
-    #    CARGO_INCREMENTAL is not set here, so a shell outside cowshed keeps
-    #    incremental for local dev units — sccache reports them non-cacheable and
-    #    forwards them, which costs nothing because an agent's own edit is novel
-    #    input that could never hit — while everything cargo compiles
-    #    non-incrementally still goes through the cache. Under cowshed the choice
-    #    is not this module's to make: the supervisor sets CARGO_INCREMENTAL=0 for
-    #    every sandboxed process, so incremental is off wherever cowshed runs.
-    # 7. GOROOT is unset rather than set. With devenv's Go pinned to the patch
+    # 6. GOROOT is unset rather than set. With devenv's Go pinned to the patch
     #    release ttsc vendors, a GOROOT crossing cannot misfire on version at all,
     #    so this is belt-and-braces rather than the fix — it keeps the isolation
     #    boundary intact even while the two are momentarily out of step, e.g. after
@@ -239,10 +214,10 @@
     #    resolves its own GOROOT from its own binary, which makes "whose Go is
     #    whose" a property of which binary is invoked — the only thing that can
     #    actually be reasoned about.
-    # 8. On Darwin, drop nix CC/CXX so xcodebuild finds Xcode's clang (it supports
+    # 7. On Darwin, drop nix CC/CXX so xcodebuild finds Xcode's clang (it supports
     #    -index-store-path); bun/node native addons find compilers through
-    #    node-gyp. Host C from cc-rs is wrapped with HOST_CC/HOST_CXX set to the
-    #    documented `sccache cc` form — never CC/CXX, which xcodebuild reads.
+    #    node-gyp. CC/CXX are what xcodebuild reads, which is why they go rather
+    #    than being pointed somewhere else.
     (lib.mkBefore ''
       cd "$DEVENV_ROOT/../.."
       export PATH="$("$PWD/tooling/direnv/repo-path")"
@@ -259,14 +234,6 @@
       export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
       bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
-
-      if [ -n "''${SCCACHE_DIR:-}" ] || [ -d /private/cowshed/caches/sccache ]; then
-        export SCCACHE_DIR="''${SCCACHE_DIR:-/private/cowshed/caches/sccache}"
-        export SCCACHE_SERVER_UDS="''${SCCACHE_SERVER_UDS:-/private/cowshed/store/sccache.sock}"
-        export RUSTC_WRAPPER=sccache
-        export SCCACHE_BASEDIR_CWD=1
-      fi
-
       ${lib.optionalString pkgs.stdenv.isDarwin "unset CC CXX"}
     '')
     # Epilogue: the wrapper runs devenv from tooling/direnv, so return the shell
