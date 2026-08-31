@@ -5,7 +5,7 @@
  * Arrow IPC encoding remains entirely native.
  */
 
-import { COMPACT_KIND_TAG, COMPACT_MAX_KIND_TAG } from './compact-column.generated.js';
+import { COMPACT_MAX_KIND_TAG, compactKindTag } from './arrow-planes.js';
 
 import type { CompactBatch, CompactColumn, EncodedArrowSchema, ParseConfig, ParseResult } from './pipeline.js';
 import {
@@ -651,7 +651,7 @@ function validateCompactBatch(batch: CompactBatch): void {
     if (nullableByte !== 0 && nullableByte !== 1) {
       throw new TypeError(`fieldMetadata field ${fieldIndex} nullable byte must be zero or one`);
     }
-    if (tag === COMPACT_KIND_TAG.fixedSizeBinary) {
+    if (tag === compactKindTag('fixedSizeBinary')) {
       if (typeParam < 1 || typeParam > MAX_FIXED_SIZE_BINARY_WIDTH) {
         throw new RangeError(
           `fieldMetadata field ${fieldIndex} FixedSizeBinary width must be in 1..${MAX_FIXED_SIZE_BINARY_WIDTH}`,
@@ -665,7 +665,7 @@ function validateCompactBatch(batch: CompactBatch): void {
     if (typeof column !== 'object' || column === null || !('kind' in column)) {
       throw new TypeError(`columns[${fieldIndex}] must be a CompactColumn`);
     }
-    const expectedTag = COMPACT_KIND_TAG[column.kind];
+    const expectedTag = compactKindTag(column.kind);
     if (expectedTag === undefined || expectedTag !== tag) {
       throw new TypeError(
         `columns[${fieldIndex}] kind ${String(column.kind)} does not match metadata physical type ${tag}`,
@@ -853,7 +853,7 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
     }
 
     columns.push({
-      tag: COMPACT_KIND_TAG[column.kind],
+      tag: compactKindTag(column.kind),
       validity,
       offsets,
       data,

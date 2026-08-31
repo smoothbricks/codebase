@@ -14,20 +14,10 @@ use columine_event_processor::{
 };
 
 const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");
-/// `COMPACT_KIND_TAG` is generated from `arrow-planes.ts` into this module.
-const COMPACT_COLUMN_TS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../src/compact-column.generated.ts"
-);
 
 fn read() -> String {
     std::fs::read_to_string(PARSE_BACKEND_TS)
         .unwrap_or_else(|error| panic!("read parse-backend.ts: {error}"))
-}
-
-fn read_generated() -> String {
-    std::fs::read_to_string(COMPACT_COLUMN_TS)
-        .unwrap_or_else(|error| panic!("read compact-column.generated.ts: {error}"))
 }
 
 fn ts_const(source: &str, name: &str) -> u64 {
@@ -75,38 +65,6 @@ fn ts_create_failure_name(failure: CreateFailure) -> &'static str {
         CreateFailure::Init => "INIT",
         CreateFailure::HandlesExhausted => "HANDLES_EXHAUSTED",
     }
-}
-
-/// Every `key: <decimal>,` entry of the `COMPACT_KIND_TAG` object literal, in
-/// source order.
-///
-/// A line inside the braces that is not an entry PANICS rather than being
-/// skipped: an audit that silently ignores what it cannot read is an audit
-/// that passes when the table is broken.
-fn ts_kind_tags(source: &str) -> Vec<(String, u8)> {
-    const OPENER: &str = "const COMPACT_KIND_TAG = {";
-    let block_start = source.find(OPENER).expect("COMPACT_KIND_TAG not declared");
-    let body_start = block_start + OPENER.len();
-    let body_end = body_start
-        + source[body_start..]
-            .find('}')
-            .expect("COMPACT_KIND_TAG is not closed");
-    source[body_start..body_end]
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim().trim_end_matches(',');
-            if line.is_empty() {
-                return None;
-            }
-            let (key, value) = line
-                .split_once(':')
-                .unwrap_or_else(|| panic!("COMPACT_KIND_TAG entry is not `key: number`: {line}"));
-            let tag = value.trim().parse::<u8>().unwrap_or_else(|error| {
-                panic!("COMPACT_KIND_TAG.{key} is not a u8 literal: {error}")
-            });
-            Some((key.trim().to_owned(), tag))
-        })
-        .collect()
 }
 
 /// Read the `EP_CREATE_FAILURE` decoder table, which is keyed by ABI code:
@@ -181,28 +139,36 @@ fn parse_backend_ts_compact_abi_matches_rust() {
 #[test]
 fn parse_backend_ts_kind_table_is_exactly_the_rust_plane_table() {
     let source = read();
-    // The table is generated from `arrow-planes.ts`; this asserts the Rust half
-    // of that generation, so a hand-edit of either side fails here.
-    let declared = ts_kind_tags(&read_generated());
-    let expected: Vec<(String, u8)> = ArrowType::ALL
-        .iter()
-        .map(|plane| (plane.ts_kind().to_owned(), *plane as u8))
-        .collect();
-    assert_eq!(
-        declared, expected,
-        "COMPACT_KIND_TAG must be exactly the Rust plane table, in tag order"
-    );
+    // Rust↔TypeScript agreement is not asserted by parsing TypeScript any more:
+    // `schema.rs`'s declarations are GENERATED from `arrow-planes.ts`, and
+    // `arrow-planes.test.ts` fails when they drift. Parsing a formatted source
+    // file for the table was brittle in exactly the way that matters — it broke
+    // three times on formatting alone, and a parser that silently reads nothing
+    // is an audit that always passes. What stays here is what only Rust can see.
+    let plane_count = ArrowType::ALL.len();
 
-    // Two planes claiming one TypeScript kind would make the comparison above
-    // pass while the host decoded one of them as the other.
+    // Two planes claiming one TypeScript kind would let the host decode one as
+    // the other; the enum cannot express it twice but the names can collide.
     let mut names: Vec<&str> = ArrowType::ALL.iter().map(|plane| plane.ts_kind()).collect();
-    let plane_count = names.len();
     names.sort_unstable();
     names.dedup();
     assert_eq!(
         names.len(),
         plane_count,
         "two planes share a TypeScript kind"
+    );
+
+    // Tags are a gapless block from zero: the wasm and every persisted fixture
+    // index by tag, so a hole means a plane was deleted rather than appended.
+    let highest = ArrowType::ALL
+        .iter()
+        .map(|plane| *plane as u8)
+        .max()
+        .expect("at least one plane");
+    assert_eq!(
+        usize::from(highest) + 1,
+        plane_count,
+        "plane tags must be a gapless block from zero"
     );
 
     // The host's bounds check must be a DERIVED maximum. It used to be
@@ -215,16 +181,6 @@ fn parse_backend_ts_kind_table_is_exactly_the_rust_plane_table() {
     assert!(
         !source.contains("tag > COMPACT_KIND_TAG."),
         "the plane bounds check must not name one plane's tag as the maximum"
-    );
-    let highest = declared
-        .iter()
-        .map(|(_, tag)| *tag)
-        .max()
-        .expect("at least one plane");
-    assert_eq!(
-        usize::from(highest) + 1,
-        plane_count,
-        "plane tags must be a gapless block from zero"
     );
 }
 

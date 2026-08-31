@@ -1,66 +1,16 @@
 import { ARROW_PLANES, type ArrowPlane } from './arrow-planes.js';
 
 /**
- * Renders both language surfaces from {@link ARROW_PLANES}.
+ * Renders the Rust plane declarations from {@link ARROW_PLANES}.
+ *
+ * Only Rust is generated. The TypeScript surface is DERIVED by type mapping in
+ * `arrow-planes.ts`, so there is no generated TypeScript to format, review or
+ * drift — Rust needs generation only because it cannot read TypeScript types.
  *
  * Output is committed rather than produced during a build, so `cargo check`
- * needs no Bun and `tsc` needs no cargo, and a plane rename shows up as a
- * reviewable diff instead of vanishing into a build step. `arrow-planes.test.ts`
- * fails when a committed surface drifts from what this renders.
+ * needs no Bun and `tsc` needs no cargo, and a plane rename lands as a
+ * reviewable diff instead of vanishing into a build step.
  */
-
-const GENERATED_BY = 'UPDATE_GENERATED=1 nx test columine';
-
-function unionMember(plane: ArrowPlane): string {
-  const fields = [`readonly kind: '${plane.kind}'`];
-  if (plane.offsets) {
-    fields.push(`readonly offsets: ${plane.offsets}`);
-  }
-  if (plane.data) {
-    fields.push(`readonly data: ${plane.data}`);
-  }
-  if (plane.validity) {
-    fields.push(`readonly validity?: ${plane.validity}`);
-  }
-  const single = `  | { ${fields.join('; ')} }`;
-  if (single.length <= 120) {
-    return single;
-  }
-  // Biome wraps a member past the line limit, so render it pre-wrapped rather
-  // than leaving the formatter to rewrite generated output into drift.
-  return ['  | {', ...fields.map((field) => `      ${field};`), '    }'].join('\n');
-}
-
-/** The `CompactColumn` union and the tag table the host decodes with. */
-export function renderCompactColumnModule(planes: readonly ArrowPlane[] = ARROW_PLANES): string {
-  const maxTag = Math.max(...planes.map((plane) => plane.tag));
-  return `${[
-    `// @generated from arrow-planes.ts — DO NOT EDIT. Regenerate: \`${GENERATED_BY}\`.`,
-    '',
-    '/**',
-    ' * One compact column: a physical plane plus its buffers.',
-    ' *',
-    ' * The discriminant, its wire tag and its carrier are declared together in',
-    ' * `arrow-planes.ts`, so a plane cannot be named on one side of the ABI and',
-    ' * carried by a different-signedness array on the other.',
-    ' */',
-    'export type CompactColumn =',
-    // A type alias ends at its semicolon; without it the formatter rewrites the
-    // generated file and every run reports drift.
-    ...planes.map(unionMember).map((member, index) => (index === planes.length - 1 ? `${member};` : member)),
-    '',
-    '/** Physical plane tags — the `ArrowType` enum in columine-arrow. */',
-    'export const COMPACT_KIND_TAG = {',
-    ...planes.map((plane) => `  ${plane.kind}: ${plane.tag},`),
-    "} as const satisfies Record<CompactColumn['kind'], number>;",
-    '',
-    '/**',
-    ' * Highest valid plane tag, DERIVED. A bounds check naming one plane’s tag',
-    ' * silently rejected every plane appended after it.',
-    ' */',
-    `export const COMPACT_MAX_KIND_TAG = ${maxTag};`,
-  ].join('\n')}\n`;
-}
 
 /**
  * Rewrites only the declaration lines inside `arrow_planes! { … }`.
