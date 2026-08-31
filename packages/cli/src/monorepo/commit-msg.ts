@@ -1,4 +1,14 @@
 import { spawnSync } from 'node:child_process';
+import typia from 'typia';
+
+/** The only fields of a deleted manifest this guard needs. */
+interface DeletedManifest {
+  name?: string;
+  nx?: { tags?: string[] };
+}
+
+/** `git show` output is an untrusted JSON boundary, so it is validated rather than cast. */
+const parseDeletedManifest = typia.json.createIsParse<DeletedManifest>();
 
 const validCommitTypes = new Set([
   'build',
@@ -54,6 +64,59 @@ Use package.json nx.name values, for example:
     }
   }
   return null;
+}
+
+/**
+ * A commit that deletes a published package's manifest is breaking for anyone
+ * depending on it, but conventional-commit TYPE selection decides the changelog:
+ * `refactor` does not release at all and `fix` files under Fixes, so such a
+ * deletion can ship with no breaking notice in the release notes. That happened
+ * to `@smoothbricks/lmao-rs`, which was removed in a `refactor(lmao):` commit and
+ * is absent from the lmao@0.3.6 changelog entirely. Requiring an explicit marker
+ * puts the disclosure in the notes consumers actually read.
+ */
+export function validateBreakingDisclosure(message: string, deletedPublicPackages: readonly string[]): string | null {
+  if (deletedPublicPackages.length === 0) {
+    return null;
+  }
+  const subject = message.split('\n', 1)[0]?.trim() ?? '';
+  if (isGitGeneratedSubject(subject)) {
+    return null;
+  }
+  const declaresBreaking = /^[a-z]+(\([a-z0-9._/@,-]+\))?!: /.test(subject) || /^BREAKING[ -]CHANGE:/m.test(message);
+  if (declaresBreaking) {
+    return null;
+  }
+  const names = deletedPublicPackages.join(', ');
+  return `This commit deletes published package manifest(s): ${names}. Removing an npm:public package breaks every dependant, so the commit must declare it — add "!" after the type/scope, or a "BREAKING CHANGE:" footer explaining what replaces it. Without a marker the release notes omit the removal entirely.`;
+}
+
+/** Manifests of `npm:public` packages deleted in the staged change, relative to HEAD. */
+export function stagedDeletedPublicPackages(root: string): string[] {
+  const deleted = spawnSync('git', ['diff', '--cached', '--diff-filter=D', '--name-only'], {
+    cwd: root,
+    encoding: 'utf8',
+  });
+  if (deleted.status !== 0) {
+    return [];
+  }
+  const manifests = (deleted.stdout ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^packages\/[^/]+\/package\.json$/.test(line));
+  const names: string[] = [];
+  for (const manifest of manifests) {
+    // The manifest is gone from the worktree, so its tags are only readable at HEAD.
+    const shown = spawnSync('git', ['show', `HEAD:${manifest}`], { cwd: root, encoding: 'utf8' });
+    if (shown.status !== 0) {
+      continue;
+    }
+    const parsed = parseDeletedManifest(shown.stdout ?? '');
+    if (parsed && (parsed.nx?.tags ?? []).includes('npm:public')) {
+      names.push(parsed.name ?? manifest);
+    }
+  }
+  return names;
 }
 
 export function formatCommitMessage(message: string, options: FormatCommitMessageOptions = {}): string {
