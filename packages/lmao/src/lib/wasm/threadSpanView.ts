@@ -8,6 +8,7 @@
 
 import type { RemapDescriptor } from '../logBinding.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
+import { decodeVocabularyMessage } from '../resolveMessage.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_EXCEPTION, THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
@@ -37,7 +38,8 @@ const LANE_MESSAGE = 0;
 const LANE_ERROR_CODE = 1;
 const LANE_EXCEPTION_STACK = 2;
 const LANE_FF_VALUE = 3;
-const LANE_SCHEMA_BASE = 4;
+const LANE_MESSAGE_IDS = 4;
+const LANE_SCHEMA_BASE = 5;
 
 /** Null-lane sink size: covers any row index a single span can reach. */
 const NULL_LANE_BYTES = 8192;
@@ -172,6 +174,41 @@ export class ThreadSpanView {
     }) as (string | undefined)[];
     this._laneStore[LANE_MESSAGE] = lane;
     return lane;
+  }
+
+  /**
+   * Static-vocabulary message lane.
+   *
+   * Generated loggers resolve a compile-time template to a local u16 id and
+   * store it here instead of a string. Without this lane the write landed on
+   * `undefined` and threw, so the lane's own best case — a message that never
+   * needs encoding — was the one path it could not take.
+   *
+   * The id is an index into the callsite's local dictionary, whose entries are
+   * dense vocabulary indices; resolving one yields the same string the dynamic
+   * path would have produced, which the intern cache then answers without
+   * crossing or encoding.
+   *
+   * Typed as Uint16Array to satisfy the SpanBuffer contract: this lane is a
+   * write sink with indexed-set semantics, not storage, and nothing reads it.
+   */
+  get _messageIds(): Uint16Array {
+    const existing = this._laneStore[LANE_MESSAGE_IDS];
+    if (existing !== undefined) return existing as Uint16Array;
+    const lane = laneProxy((index, value) => {
+      this.commitLog(index, this.resolveLocalMessage(Number(value)));
+    }) as unknown as Uint16Array;
+    this._laneStore[LANE_MESSAGE_IDS] = lane;
+    return lane;
+  }
+
+  private resolveLocalMessage(localMessageId: number): string {
+    const dictionary = this._opMetadata._physicalLayoutPlan?.localMessageDictionary;
+    const denseIndex = dictionary?.[localMessageId - 1];
+    if (denseIndex === undefined) {
+      throw new Error(`Missing local message dictionary entry ${localMessageId}`);
+    }
+    return decodeVocabularyMessage(this._vocabularyGeneration, denseIndex);
   }
 
   get error_code_values(): unknown[] {
