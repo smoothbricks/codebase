@@ -29,6 +29,7 @@ export interface ThreadSpanBufferWasmExports {
     fieldsLen: number,
   ): ThreadSpanBufferHandle;
   thread_span_buffer_free(handle: ThreadSpanBufferHandle): void;
+  thread_span_buffer_reset(handle: ThreadSpanBufferHandle): number;
   thread_span_buffer_intern(handle: ThreadSpanBufferHandle, ptr: number, len: number): number;
   thread_span_buffer_open_span(
     handle: ThreadSpanBufferHandle,
@@ -115,6 +116,8 @@ export interface ThreadSpanBufferWasmExports {
 export interface ThreadSpanBufferBinding {
   readonly handle: ThreadSpanBufferHandle;
   free(): void;
+  /** Release every row and span, keeping this handle's interned vocabulary. */
+  reset(): number;
   openSpan(
     tracePtr: number,
     traceLen: number,
@@ -167,6 +170,7 @@ export function isThreadSpanBufferWasmExports(value: unknown): value is ThreadSp
   return (
     typeof Reflect.get(value, 'thread_span_buffer_new') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_new_with_schema') === 'function' &&
+    typeof Reflect.get(value, 'thread_span_buffer_reset') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_intern') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span') === 'function' &&
     typeof Reflect.get(value, 'thread_span_buffer_open_span_static') === 'function' &&
@@ -191,6 +195,7 @@ export function bindThreadSpanBuffer(
   return {
     handle,
     free: () => value.thread_span_buffer_free(handle),
+    reset: () => value.thread_span_buffer_reset(handle),
     openSpan: (tracePtr, traceLen, parentThreadId, parentSpanId, nameOrdinal, timestamp, line) =>
       value.thread_span_buffer_open_span(
         handle,
