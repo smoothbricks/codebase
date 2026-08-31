@@ -60,6 +60,25 @@ pub enum ResultCode {
     SchemaMismatch = 7,
 }
 
+/// Event capacity every wasm `ep_create_*` handle is built with.
+///
+/// This is an ALLOCATION SIZE, not a validation ceiling, and the two must not
+/// share a number. `DynamicColumns::new` allocates the whole column plane up
+/// front: each variable-width column takes
+/// `min(MAX_VALUE_BYTES, capacity * 128)` data bytes plus `(capacity + 1) * 4`
+/// offset bytes. Measured against the shipped artifact with the seven-field
+/// compact schema, creating one handle at capacity 65536 grows the wasm heap
+/// from 145 to 532 pages — 24.19 MiB for a 26.06 MiB layout — while the same
+/// schema at 256 needs 0.10 MiB and grows the heap by nothing. Width
+/// multiplies it: 32 utf8 columns create cleanly at 61440 and trap at 61932,
+/// where the plane crosses the artifact's `--max-memory=256MiB`.
+///
+/// Rows above this capacity are not lost: the compact path encodes a
+/// caller-supplied batch of up to `MAX_EVENTS_PER_BATCH` rows without touching
+/// the parse plane at all, so paying for 65536 parse rows per handle buys
+/// nothing.
+pub const WASM_EVENT_CAPACITY: u32 = 256;
+
 /// Why an `ep_create_*` call produced no handle (u32 values are ABI).
 ///
 /// Handles occupy 1..=255, so any other return value is a failure and these
@@ -221,7 +240,8 @@ impl EventProcessor {
 
     /// Init with a batch-column capacity distinct from the dedup capacity:
     /// the bloom filter uses the caller's full `capacity` while the column
-    /// plane is sized independently.
+    /// plane is sized independently. The wasm exports build every handle at
+    /// [`WASM_EVENT_CAPACITY`]; native callers pass what they want for both.
     pub fn with_column_capacity(
         wiring: EpWiring,
         capacity: u32,
