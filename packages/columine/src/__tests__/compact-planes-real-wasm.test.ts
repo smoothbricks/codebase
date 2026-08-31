@@ -61,13 +61,24 @@ function schemaMessage(name: string, sample: unknown, type: DataType, tag: numbe
 }
 
 function readColumn(ipc: Uint8Array, name: string) {
-  const table = tableFromIPC(ipc, { useBigInt: true });
+  const table = tableFromIPC(ipc, { useBigInt: true, useDecimalInt: true });
   expect(table.numRows).toBeGreaterThan(0);
   const found = Object.entries(table.toColumns()).find(([key]) => key === name);
   if (found === undefined) {
     throw new Error(`missing column ${name}`);
   }
   return found[1];
+}
+
+function expectTypedValues(
+  values: unknown,
+  ctor: new (length: number) => ArrayLike<number>,
+  expected: readonly number[],
+): void {
+  if (!(values instanceof ctor)) {
+    throw new TypeError(`expected ${ctor.name}, got ${Object.prototype.toString.call(values)}`);
+  }
+  expect(Array.from(values)).toEqual([...expected]);
 }
 
 function leInteger(width: number, value: bigint): Uint8Array {
@@ -129,22 +140,30 @@ describe('Compact real-wasm flat planes', () => {
 
   it('i8', () => {
     const schema = schemaMessage('v', 0, int8(), 7);
-    expect(encodeOne('v', schema, { kind: 'i8', data: new Int8Array([-128, 127]) })).toEqual([-128, 127]);
+    expectTypedValues(encodeOne('v', schema, { kind: 'i8', data: new Int8Array([-128, 127]) }), Int8Array, [-128, 127]);
   });
 
   it('i16', () => {
     const schema = schemaMessage('v', 0, int16(), 8);
-    expect(encodeOne('v', schema, { kind: 'i16', data: new Int16Array([-32768, 32767]) })).toEqual([-32768, 32767]);
+    expectTypedValues(
+      encodeOne('v', schema, { kind: 'i16', data: new Int16Array([-32768, 32767]) }),
+      Int16Array,
+      [-32768, 32767],
+    );
   });
 
   it('u8', () => {
     const schema = schemaMessage('v', 0, uint8(), 9);
-    expect(encodeOne('v', schema, { kind: 'u8', data: new Uint8Array([0, 255]) })).toEqual([0, 255]);
+    expectTypedValues(encodeOne('v', schema, { kind: 'u8', data: new Uint8Array([0, 255]) }), Uint8Array, [0, 255]);
   });
 
   it('u16', () => {
     const schema = schemaMessage('v', 0, uint16(), 10);
-    expect(encodeOne('v', schema, { kind: 'u16', data: new Uint16Array([0, 0xffff]) })).toEqual([0, 65535]);
+    expectTypedValues(
+      encodeOne('v', schema, { kind: 'u16', data: new Uint16Array([0, 0xffff]) }),
+      Uint16Array,
+      [0, 65535],
+    );
   });
 
   it('u64', () => {
@@ -243,28 +262,52 @@ describe('Compact real-wasm flat planes', () => {
   });
 
   it('decimal128', () => {
+    // flechette's DEFAULT decimal path is a lossy Float64Array, and `useBigInt`
+    // does not govern decimals — the option a reader would reach for. Measured
+    // on decimal128(38,0) values 2^53+1, 10^38-1, -1:
+    //   {} / { useBigInt: true } -> 9007199254740992 | 1e+38 | -1  (lossy)
+    //   { useDecimalInt: true }  -> 9007199254740993n | 999...9n | -1n (exact)
+    // `readColumn` therefore passes useDecimalInt. Full precision is also
+    // covered independently by crates/columine-arrow/tests/pyarrow_oracle.rs.
+    const aboveMantissa = (1n << 53n) + 1n;
+    const thirtyEightNines = 10n ** 38n - 1n;
     const schema = schemaMessage('v', 0n, decimal128(38, 0), 15);
-    const values = encodeOne('v', schema, {
-      kind: 'decimal128',
-      data: new Uint8Array([...leInteger(16, 1n), ...leInteger(16, -1n)]),
+    const ipc = backend.encode({
+      rowCount: 3,
+      schema,
+      columns: [
+        {
+          kind: 'decimal128',
+          data: new Uint8Array([
+            ...leInteger(16, aboveMantissa),
+            ...leInteger(16, thirtyEightNines),
+            ...leInteger(16, -1n),
+          ]),
+        },
+      ],
     });
-    expect(values[0]).toBe(1n);
-    expect(values[1]).toBe(-1n);
+    const values = readColumn(ipc, 'v');
+    expect(values[0]).toBe(aboveMantissa);
+    expect(values[1]).toBe(thirtyEightNines);
+    expect(values[2]).toBe(-1n);
   });
 
   it('decimal256', () => {
+    const aboveMantissa = (1n << 53n) + 1n;
     const schema = schemaMessage('v', 0n, decimal256(76, 0), 16);
     const values = encodeOne('v', schema, {
       kind: 'decimal256',
-      data: new Uint8Array([...leInteger(32, 1n), ...leInteger(32, -1n)]),
+      data: new Uint8Array([...leInteger(32, aboveMantissa), ...leInteger(32, -1n)]),
     });
-    expect(values[0]).toBe(1n);
+    expect(values[0]).toBe(aboveMantissa);
     expect(values[1]).toBe(-1n);
   });
 
   it('date32 rides i32', () => {
     const schema = schemaMessage('v', 0, dateDay(), 1);
-    expect(encodeOne('v', schema, { kind: 'i32', data: new Int32Array([0, 19_000]) })).toEqual([0, 19_000]);
+    const values = encodeOne('v', schema, { kind: 'i32', data: new Int32Array([0, 19_000]) });
+    expect(values[0]).toBe(0);
+    expect(values[1]).toBe(19_000 * 86_400_000);
   });
 
   it('date64 rides i64', () => {
@@ -276,7 +319,11 @@ describe('Compact real-wasm flat planes', () => {
 
   it('time32 rides i32', () => {
     const schema = schemaMessage('v', 0, timeMillisecond(), 1);
-    expect(encodeOne('v', schema, { kind: 'i32', data: new Int32Array([0, 1_000]) })).toEqual([0, 1_000]);
+    expectTypedValues(
+      encodeOne('v', schema, { kind: 'i32', data: new Int32Array([0, 1_000]) }),
+      Int32Array,
+      [0, 1_000],
+    );
   });
 
   it('time64 rides i64', () => {
@@ -302,7 +349,11 @@ describe('Compact real-wasm flat planes', () => {
 
   it('intervalYearMonth', () => {
     const schema = schemaMessage('v', 0, interval(IntervalUnit.YEAR_MONTH), 20);
-    expect(encodeOne('v', schema, { kind: 'intervalYearMonth', data: new Int32Array([13, -1]) })).toEqual([13, -1]);
+    expectTypedValues(
+      encodeOne('v', schema, { kind: 'intervalYearMonth', data: new Int32Array([13, -1]) }),
+      Int32Array,
+      [13, -1],
+    );
   });
 
   it('intervalDayTime', () => {
@@ -320,7 +371,7 @@ describe('Compact real-wasm flat planes', () => {
       kind: 'intervalMonthDayNano',
       data: new Uint8Array([...first, ...second]),
     });
-    expect(values[0]).toEqual(first);
-    expect(values[1]).toEqual(second);
+    expect(values[0]).toEqual(Float64Array.of(1, 2, 3));
+    expect(values[1]).toEqual(Float64Array.of(-1, 0, 4));
   });
 });
