@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
+import { LOG_STAMP_REFRESH } from '../coarseClock.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import { resolveEntryType } from '../resolveMessage.js';
 import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
@@ -196,7 +197,11 @@ describe('Platform timestamp append contract', () => {
     }
   });
 
-  it('keeps lifecycle appends strictly monotonic when the wrapped clock stalls or rolls back', () => {
+  it('keeps lifecycle appends non-decreasing and boundaries strictly monotonic when the clock stalls or rolls back', () => {
+    // Log rows ride the coarse cache, so the row contract is non-decreasing.
+    // The two boundaries always read fresh, so they absorb stalls and rollbacks
+    // through the guard and stay strictly monotonic — that is the pair
+    // `axe_execution_duration_seconds` derives from.
     const epoch = 1_700_000_000_000_000_000n;
     const anchor = 10_000_000n;
     const ticks = [anchor, anchor, anchor - 50n, anchor + 1n, anchor - 1_000n];
@@ -210,17 +215,21 @@ describe('Platform timestamp append contract', () => {
       appendLifecycle(root, buffer);
       const chronological = [buffer.timestamp[0], buffer.timestamp[2], buffer.timestamp[3], buffer.timestamp[1]];
       for (let i = 1; i < chronological.length; i++) {
-        expect(chronological[i]).toBeGreaterThan(chronological[i - 1]);
+        expect(chronological[i]).toBeGreaterThanOrEqual(chronological[i - 1]);
       }
+      expect(buffer.timestamp[1]).toBeGreaterThan(buffer.timestamp[0]);
+      // Only the two boundaries read the clock.
+      expect(index).toBe(2);
     } finally {
       process.hrtime.bigint = original;
     }
   });
 
-  it('advances ES lifecycle appends by one microsecond when performance.now stalls or rolls back', () => {
+  it('advances ES lifecycle boundaries by one microsecond when performance.now stalls or rolls back', () => {
     const epoch = 1_700_000_000_000_000_000n;
     const buffer = createMockSpanBuffer();
-    const ticks = [10, 10, 9, 10.0001];
+    // Two boundary reads: a stalled clock and then a rolled-back one.
+    const ticks = [10, 9];
     let index = 0;
     const root = new EsTraceRoot(createTraceId('es-rollback'), epoch, 10, createMockTracer());
 
@@ -229,11 +238,12 @@ describe('Platform timestamp append contract', () => {
       () => appendLifecycle(root, buffer),
     );
 
-    const chronological = [buffer.timestamp[0], buffer.timestamp[2], buffer.timestamp[3], buffer.timestamp[1]];
-    expect(chronological[0]).toBe(epoch);
-    for (let i = 1; i < chronological.length; i++) {
-      expect(chronological[i] - chronological[i - 1]).toBe(1_000n);
-    }
+    expect(buffer.timestamp[0]).toBe(epoch);
+    // The log rows share the span-start stamp; completion is bumped one
+    // microsecond past it because the clock went backwards.
+    expect(buffer.timestamp[2]).toBe(epoch);
+    expect(buffer.timestamp[3]).toBe(epoch);
+    expect(buffer.timestamp[1]).toBe(epoch + 1_000n);
   });
 
   it('preserves exact nanosecond deltas after a long Node monotonic-clock gap', () => {
@@ -249,10 +259,13 @@ describe('Platform timestamp append contract', () => {
     try {
       const root = new NodeTraceRoot(createTraceId('long-gap'), epoch, Number(anchor), anchor, createMockTracer());
       appendLifecycle(root, buffer);
+      // Above Number.MAX_SAFE_INTEGER the arithmetic must stay in bigint, so the
+      // boundary pair still resolves a 1 ns duration a year after the anchor.
       expect(buffer.timestamp[0]).toBe(epoch + gap);
-      expect(buffer.timestamp[2] - buffer.timestamp[0]).toBe(1n);
-      expect(buffer.timestamp[3] - buffer.timestamp[2]).toBe(1n);
-      expect(buffer.timestamp[1] - buffer.timestamp[3]).toBe(1n);
+      expect(buffer.timestamp[1] - buffer.timestamp[0]).toBe(1n);
+      // The log rows in between carry the span-start stamp exactly.
+      expect(buffer.timestamp[2]).toBe(epoch + gap);
+      expect(buffer.timestamp[3]).toBe(epoch + gap);
     } finally {
       process.hrtime.bigint = original;
     }
@@ -323,27 +336,57 @@ describe('Platform timestamp append contract', () => {
     }
   });
 
-  it('keeps generated rapid-write sequences strictly monotonic through the real append primitive', () => {
+  it('keeps generated rapid-write sequences non-decreasing with row-bounded staleness', () => {
     fc.assert(
-      fc.property(fc.array(fc.integer({ min: -5, max: 5 }), { minLength: 4, maxLength: 40 }), (steps) => {
-        const epoch = 1_700_000_000_000_000_000n;
-        const anchor = 1_000_000n;
-        let tick = anchor;
-        let index = 0;
-        const ticks = steps.map((step) => (tick += BigInt(step)));
-        const buffer = createMockSpanBuffer();
-        const original = process.hrtime.bigint;
-        process.hrtime.bigint = () => ticks[index++] ?? ticks[ticks.length - 1];
-        try {
-          const root = new NodeTraceRoot(createTraceId('property'), epoch, Number(anchor), anchor, createMockTracer());
-          root._writeSpanStart(root, buffer, 'property');
-          for (let i = 1; i < steps.length; i++) root._appendLogEntry(root, buffer, ENTRY_TYPE_INFO);
-          const written = Array.from(buffer.timestamp.slice(0, buffer._writeIndex)).filter((value) => value !== 0n);
-          for (let i = 1; i < written.length; i++) expect(written[i]).toBeGreaterThan(written[i - 1]);
-        } finally {
-          process.hrtime.bigint = original;
-        }
-      }),
+      fc.property(
+        fc.array(fc.integer({ min: -5, max: 5 }), { minLength: 4, maxLength: 40 }),
+        fc.integer({ min: 1, max: 48 }),
+        (steps, logs) => {
+          const epoch = 1_700_000_000_000_000_000n;
+          const anchor = 1_000_000n;
+          let tick = anchor;
+          let index = 0;
+          const ticks = steps.map((step) => (tick += BigInt(step)));
+          // Wide enough that the row count can cross several refresh blocks.
+          const buffer = createTestSpanBuffer({}, { capacity: 64 }).spanBuffer;
+          const original = process.hrtime.bigint;
+          process.hrtime.bigint = () => ticks[index++] ?? ticks[ticks.length - 1];
+          try {
+            const root = new NodeTraceRoot(
+              createTraceId('property'),
+              epoch,
+              Number(anchor),
+              anchor,
+              createMockTracer(),
+            );
+            root._writeSpanStart(root, buffer, 'property');
+            for (let i = 0; i < logs; i++) root._appendLogEntry(root, buffer, ENTRY_TYPE_INFO);
+            root._writeSpanEnd(root, buffer, ENTRY_TYPE_SPAN_OK);
+
+            // Rows are non-decreasing: a rolled-back clock can never move a row
+            // backwards, because rows never read the clock at all except at a
+            // refresh, where the boundary guard applies.
+            const rows = Array.from(buffer.timestamp.slice(2, 2 + logs));
+            for (let i = 1; i < rows.length; i++) expect(rows[i]).toBeGreaterThanOrEqual(rows[i - 1]);
+
+            // Staleness is bounded by rows: at most LOG_STAMP_REFRESH share a stamp.
+            let run = 0;
+            let previous = rows[0];
+            for (const stamp of rows) {
+              run = stamp === previous ? run + 1 : 1;
+              previous = stamp;
+              expect(run).toBeLessThanOrEqual(LOG_STAMP_REFRESH);
+            }
+
+            // The boundary pair a duration comes from is strictly increasing.
+            expect(buffer.timestamp[1]).toBeGreaterThan(buffer.timestamp[0]);
+            expect(rows[0]).toBeGreaterThanOrEqual(buffer.timestamp[0]);
+            expect(buffer.timestamp[1]).toBeGreaterThanOrEqual(rows[rows.length - 1]);
+          } finally {
+            process.hrtime.bigint = original;
+          }
+        },
+      ),
       { numRuns: 80 },
     );
   });

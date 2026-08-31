@@ -741,7 +741,7 @@ describe('Fixed Row Layout', () => {
     expect(buffer._spanStartTime).toBe(Nanoseconds.unsafe(111n));
   });
 
-  it('preserves strict chronological timestamps across root overflow and a child span', async () => {
+  it('preserves chronological timestamps across root overflow and a child span', async () => {
     let rootBuffer: AnySpanBuffer | undefined;
     let childBuffer: AnySpanBuffer | undefined;
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
@@ -780,8 +780,19 @@ describe('Fixed Row Layout', () => {
     chronological.push(childBuffer.timestamp[1], rootBuffer.timestamp[1]);
 
     expect(chronological).toHaveLength(204);
+    // Log rows ride the coarse row-stamp cache (lib/coarseClock.ts), so the
+    // chronology contract across a whole span tree is non-decreasing. Overflow
+    // chaining and nesting must never move a stamp BACKWARDS, which is the
+    // property this walk exists to check.
     for (let i = 1; i < chronological.length; i++) {
-      expect(chronological[i]).toBeGreaterThan(chronological[i - 1]);
+      expect(chronological[i]).toBeGreaterThanOrEqual(chronological[i - 1]);
     }
+    // Both spans' boundary pairs stay strictly ordered — durations are derived
+    // from these and must never collapse to zero.
+    expect(rootBuffer.timestamp[1]).toBeGreaterThan(rootBuffer.timestamp[0]);
+    expect(childBuffer.timestamp[1]).toBeGreaterThan(childBuffer.timestamp[0]);
+    // Coarsening must actually be in effect over 200 rows, or this test would
+    // silently keep passing if the cache were bypassed.
+    expect(new Set(chronological).size).toBeLessThan(chronological.length);
   });
 });
