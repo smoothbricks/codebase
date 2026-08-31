@@ -1,0 +1,985 @@
+diff --git a/lib/core/transform.js b/lib/core/transform.js
+index c5481650f311e286a9c2eb17bb7d3ea347d85089..91c4b07ee6d740b81ebd07fd6893abd0d59b717d 100644
+--- a/lib/core/transform.js
++++ b/lib/core/transform.js
+@@ -1658,7 +1658,7 @@ function matchesCompleteInputSnapshot(cached, currentKey, source) {
+     if (!walkSnapshotComplete(current, declaredInputs)) {
+         return false;
+     }
+-    if (!sameProjectDirectories(cached.projectDirectories, current.projectDirectories)) {
++    if (!sameProjectDirectories(cached.projectDirectories, current.projectDirectories, declaredInputs, cached.projectRoot)) {
+         return false;
+     }
+     if (Object.prototype.hasOwnProperty.call(cached.inputHashes, currentKey)) {
+@@ -1958,6 +1958,10 @@ function collectProjectInputSnapshot(projectRoot, identities, filesystem = DEFAU
+     let attributed = true;
+     const walked = walkProjectInputs(projectRoot, filesystem);
+     const walkFailures = [...walked.failures];
++    // Directory-level walk failures, keyed like every other input so the
++    // completeness term can be scoped to the declared inputs instead of letting
++    // an unreadable build-output sibling taint the whole snapshot.
++    const directoryFailureKeys = new Set(walked.failures.map((failure) => projectDirectoryKey(projectRoot, failure.path)));
+     let complete = walked.complete;
+     for (const file of walked.files) {
+         try {
+@@ -2014,8 +2018,10 @@ function collectProjectInputSnapshot(projectRoot, identities, filesystem = DEFAU
+         }
+     }
+     return {
++        attributed,
+         complete,
+         directoryComplete: walked.complete && attributed,
++        directoryFailureKeys,
+         fileSignatures,
+         hashes,
+         projectDirectories: walked.directories,
+@@ -2032,7 +2038,16 @@ function collectProjectInputSnapshot(projectRoot, identities, filesystem = DEFAU
+  * unbounded call-stack depth on deep project trees. The result is sorted so
+  * that hash comparisons are deterministic across OS-level directory orderings.
+  */
++const TTSC_WALK_ROOTS_SEEN = new Set();
+ function walkProjectInputs(root, filesystem = DEFAULT_FILESYSTEM_OPERATIONS) {
++    // Which project roots a process walks is the single most useful fact when a
++    // generation will not stabilise, and it is otherwise invisible: the roots
++    // come from per-file nearest-config discovery, not from any one config.
++    if (process.env.TTSC_DEBUG_WALK_ROOTS !== undefined &&
++        !TTSC_WALK_ROOTS_SEEN.has(root)) {
++        TTSC_WALK_ROOTS_SEEN.add(root);
++        process.stderr.write(`[ttsc walk-root] ${root}\n`);
++    }
+     let complete = true;
+     const directories = [];
+     const failures = [];
+@@ -2068,8 +2083,25 @@ function walkProjectInputs(root, filesystem = DEFAULT_FILESYSTEM_OPERATIONS) {
+                 path: current,
+             });
+         }
++        const members = [];
++        for (const entry of entries) {
++            if (isIgnoredProjectDirectory(entry.name)) {
++                continue;
++            }
++            const file = path.join(current, entry.name);
++            if (entry.isDirectory()) {
++                stack.push(file);
++                members.push(`${entry.name}/`);
++            }
++            else if (entry.isFile()) {
++                files.push(file);
++                members.push(entry.name);
++            }
++        }
++        members.sort();
+         directories.push({
+             path: current,
++            members,
+             // If membership moved during enumeration, force the next delivery to
+             // replace this generation instead of blessing a torn directory/file
+             // snapshot as stable.
+@@ -2077,18 +2109,6 @@ function walkProjectInputs(root, filesystem = DEFAULT_FILESYSTEM_OPERATIONS) {
+                 ? after
+                 : `unstable:${before}:${after ?? "missing"}`,
+         });
+-        for (const entry of entries) {
+-            if (isIgnoredProjectDirectory(entry.name)) {
+-                continue;
+-            }
+-            const file = path.join(current, entry.name);
+-            if (entry.isDirectory()) {
+-                stack.push(file);
+-            }
+-            else if (entry.isFile()) {
+-                files.push(file);
+-            }
+-        }
+     }
+     directories.sort((left, right) => left.path.localeCompare(right.path));
+     files.sort();
+@@ -2118,10 +2138,88 @@ function projectDirectorySignature(directory, filesystem = DEFAULT_FILESYSTEM_OP
+     }
+ }
+ /** Compare two deterministic project-directory membership snapshots. */
+-function sameProjectDirectories(left, right) {
+-    return (left.length === right.length &&
+-        left.every((directory, index) => directory.path === right[index]?.path &&
+-            directory.signature === right[index]?.signature));
++/**
++ * Project-relative POSIX key for one walked directory, in the same spelling
++ * `toProjectKey` produces for files so the two can be compared.
++ */
++function projectDirectoryKey(root, directory) {
++    const relative = path.relative(root, directory);
++    return relative === "" ? "." : normalizePath(relative);
++}
++/**
++ * Every directory that can still bear a declared input: the project root plus
++ * each ancestor of each declared input key.
++ *
++ * Keys for inputs outside the walk keep their full spelling and contribute
++ * prefixes no walked directory key can equal, so they drop out on their own
++ * rather than needing a separate filter.
++ */
++function inputBearingDirectories(declared) {
++    const bearing = new Set(["."]);
++    for (const key of declared) {
++        const segments = key.split("/");
++        for (let depth = segments.length - 1; depth > 0; depth -= 1) {
++            bearing.add(segments.slice(0, depth).join("/"));
++        }
++    }
++    return bearing;
++}
++/**
++ * One input-bearing directory's membership, with subdirectories that bear no
++ * declared input removed.
++ *
++ * Files are always counted: a file appearing beside a declared input is a
++ * candidate input for the next program, and the membership snapshot is the only
++ * term that can see a file enter or leave the project (samchon/ttsc#1246), so
++ * its arrival must still reject the generation. A subtree holding no declared
++ * input could not have contributed to this generation, so its churn is not
++ * evidence about it.
++ */
++function scopedDirectorySignature(entry, key, bearing) {
++    if (entry.members === undefined || entry.signature.startsWith("unstable:")) {
++        return entry.signature;
++    }
++    const prefix = key === "." ? "" : `${key}/`;
++    return `members:${entry.members
++        .filter((member) => !member.endsWith("/") ||
++        bearing.has(`${prefix}${member.slice(0, -1)}`))
++        .join("\u0000")}`;
++}
++/**
++ * Compare two project-directory membership snapshots.
++ *
++ * `declared` scopes the comparison to the inputs the compiler reported, exactly
++ * as `sameHashes` is scoped. An unscoped comparison rejects a generation
++ * whenever any walked directory moves, including build-output siblings nothing
++ * compiled, which makes every project with a concurrently written sibling
++ * directory nondeterministic. Without `declared` the comparison stays exact.
++ */
++function sameProjectDirectories(left, right, declared, projectRoot) {
++    if (declared === undefined || projectRoot === undefined) {
++        return (left.length === right.length &&
++            left.every((directory, index) => directory.path === right[index]?.path &&
++                directory.signature === right[index]?.signature));
++    }
++    const bearing = inputBearingDirectories(declared);
++    const scope = (entries) => {
++        const scoped = new Map();
++        for (const entry of entries) {
++            const key = projectDirectoryKey(projectRoot, entry.path);
++            if (!bearing.has(key))
++                continue;
++            scoped.set(key, scopedDirectorySignature(entry, key, bearing));
++        }
++        return scoped;
++    };
++    const leftScoped = scope(left);
++    const rightScoped = scope(right);
++    if (leftScoped.size !== rightScoped.size)
++        return false;
++    for (const [key, signature] of leftScoped) {
++        if (rightScoped.get(key) !== signature)
++            return false;
++    }
++    return true;
+ }
+ /**
+  * Open one directory's change notification through the cache-owned watch seam,
+@@ -2995,7 +3093,15 @@ function walkSnapshotComplete(snapshot, declared) {
+         return snapshot.complete;
+     }
+     if (!snapshot.directoryComplete) {
+-        return false;
++        if (snapshot.attributed === false ||
++            snapshot.directoryFailureKeys === undefined) {
++            return false;
++        }
++        const bearing = inputBearingDirectories(declared);
++        for (const key of snapshot.directoryFailureKeys) {
++            if (bearing.has(key))
++                return false;
++        }
+     }
+     for (const key of snapshot.unstableFiles) {
+         if (declared.has(key))
+@@ -3047,14 +3153,28 @@ function recordProjectSnapshotFailures(failures, props) {
+             });
+         }
+     }
+-    const leftDirectories = new Map(props.before.projectDirectories.map((entry) => [
+-        entry.path,
+-        entry.signature,
+-    ]));
+-    const rightDirectories = new Map(props.snapshot.projectDirectories.map((entry) => [
+-        entry.path,
+-        entry.signature,
+-    ]));
++    // Report exactly the directories the decision considered. An unscoped
++    // witness would name build-output siblings that no longer reject anything,
++    // which is worse than silence: it points the reader at the wrong cause.
++    const bearingDirectories = props.declared === undefined
++        ? undefined
++        : inputBearingDirectories(props.declared);
++    const directorySignatures = (entries) => {
++        const signatures = new Map();
++        for (const entry of entries) {
++            if (bearingDirectories === undefined) {
++                signatures.set(entry.path, entry.signature);
++                continue;
++            }
++            const key = projectDirectoryKey(props.projectRoot, entry.path);
++            if (!bearingDirectories.has(key))
++                continue;
++            signatures.set(entry.path, scopedDirectorySignature(entry, key, bearingDirectories));
++        }
++        return signatures;
++    };
++    const leftDirectories = directorySignatures(props.before.projectDirectories);
++    const rightDirectories = directorySignatures(props.snapshot.projectDirectories);
+     for (const directory of new Set([
+         ...leftDirectories.keys(),
+         ...rightDirectories.keys(),
+@@ -3199,11 +3319,16 @@ function projectWalkFailureFingerprint(snapshot, declared, projectRoot, identiti
+     const relevantUnstableFiles = declared === undefined
+         ? [...snapshot.unstableFiles]
+         : [...snapshot.unstableFiles].filter((key) => declared.has(key));
++    const bearing = declared === undefined ? undefined : inputBearingDirectories(declared);
+     const relevantFailures = snapshot.walkFailures.filter((failure) => {
+-        if (!failure.kind.startsWith("file-"))
+-            return true;
+         if (declared === undefined)
+             return true;
++        if (!failure.kind.startsWith("file-")) {
++            // Scope directory failures exactly as the completeness term scopes
++            // them, so the fingerprint cannot invalidate a generation over a
++            // failure that no longer rejects it.
++            return bearing?.has(projectDirectoryKey(projectRoot, failure.path)) === true;
++        }
+         try {
+             return declared.has(toProjectKey(projectRoot, failure.path, identities));
+         }
+@@ -3211,9 +3336,10 @@ function projectWalkFailureFingerprint(snapshot, declared, projectRoot, identiti
+             return true;
+         }
+     });
++    // `complete` already folds the scoped directory decision, so recording the
++    // raw `directoryComplete` beside it would reintroduce the unscoped signal.
+     return hashText(JSON.stringify({
+         complete: walkSnapshotComplete(snapshot, declared),
+-        directoryComplete: snapshot.directoryComplete,
+         failures: relevantFailures
+             .map((failure) => `${failure.kind}\0${path.resolve(failure.path)}`)
+             .sort(),
+@@ -3306,7 +3432,7 @@ function failedGenerationEnvironmentChanged(validation, props) {
+             validation.projectWalkFailures !==
+                 projectWalkFailureFingerprint(current, validation.declaredInputs, validation.cached.projectRoot, identities) ||
+             !sameHashes(validation.projectInputHashes, current.hashes, validation.declaredInputs) ||
+-            !sameProjectDirectories(validation.cached.projectDirectories ?? [], current.projectDirectories)) {
++            !sameProjectDirectories(validation.cached.projectDirectories ?? [], current.projectDirectories, validation.declaredInputs, validation.cached.projectRoot)) {
+             return true;
+         }
+         for (const [input, recorded] of validation.inputStates) {
+@@ -3488,7 +3614,7 @@ async function captureTransformGeneration(props) {
+             walkSnapshotComplete(inputSnapshot, declaredInputs) &&
+             sameHashes(before.hashes, inputSnapshot.hashes, declaredInputs) &&
+             sameHashes(before.fileSignatures, inputSnapshot.fileSignatures, declaredInputs) &&
+-            sameProjectDirectories(before.projectDirectories, inputSnapshot.projectDirectories) &&
++            sameProjectDirectories(before.projectDirectories, inputSnapshot.projectDirectories, declaredInputs, projectRoot) &&
+             tracker?.membershipChanged !== true &&
+             hostInputTracker?.membershipChanged !== true &&
+             candidateTracker?.membershipChanged !== true;
+diff --git a/lib/core/transform.mjs b/lib/core/transform.mjs
+index 6ec129b5c223a5c666edffe77cd009a666f9c947..dcc5a6d1b7c0a6724e7be8bb6c97ac315612c23c 100644
+--- a/lib/core/transform.mjs
++++ b/lib/core/transform.mjs
+@@ -1656,7 +1656,7 @@ function matchesCompleteInputSnapshot(cached, currentKey, source) {
+     if (!walkSnapshotComplete(current, declaredInputs)) {
+         return false;
+     }
+-    if (!sameProjectDirectories(cached.projectDirectories, current.projectDirectories)) {
++    if (!sameProjectDirectories(cached.projectDirectories, current.projectDirectories, declaredInputs, cached.projectRoot)) {
+         return false;
+     }
+     if (Object.prototype.hasOwnProperty.call(cached.inputHashes, currentKey)) {
+@@ -1956,6 +1956,10 @@ function collectProjectInputSnapshot(projectRoot, identities, filesystem = DEFAU
+     let attributed = true;
+     const walked = walkProjectInputs(projectRoot, filesystem);
+     const walkFailures = [...walked.failures];
++    // Directory-level walk failures, keyed like every other input so the
++    // completeness term can be scoped to the declared inputs instead of letting
++    // an unreadable build-output sibling taint the whole snapshot.
++    const directoryFailureKeys = new Set(walked.failures.map((failure) => projectDirectoryKey(projectRoot, failure.path)));
+     let complete = walked.complete;
+     for (const file of walked.files) {
+         try {
+@@ -2012,8 +2016,10 @@ function collectProjectInputSnapshot(projectRoot, identities, filesystem = DEFAU
+         }
+     }
+     return {
++        attributed,
+         complete,
+         directoryComplete: walked.complete && attributed,
++        directoryFailureKeys,
+         fileSignatures,
+         hashes,
+         projectDirectories: walked.directories,
+@@ -2030,7 +2036,16 @@ function collectProjectInputSnapshot(projectRoot, identities, filesystem = DEFAU
+  * unbounded call-stack depth on deep project trees. The result is sorted so
+  * that hash comparisons are deterministic across OS-level directory orderings.
+  */
++const TTSC_WALK_ROOTS_SEEN = new Set();
+ function walkProjectInputs(root, filesystem = DEFAULT_FILESYSTEM_OPERATIONS) {
++    // Which project roots a process walks is the single most useful fact when a
++    // generation will not stabilise, and it is otherwise invisible: the roots
++    // come from per-file nearest-config discovery, not from any one config.
++    if (process.env.TTSC_DEBUG_WALK_ROOTS !== undefined &&
++        !TTSC_WALK_ROOTS_SEEN.has(root)) {
++        TTSC_WALK_ROOTS_SEEN.add(root);
++        process.stderr.write(`[ttsc walk-root] ${root}\n`);
++    }
+     let complete = true;
+     const directories = [];
+     const failures = [];
+@@ -2066,8 +2081,25 @@ function walkProjectInputs(root, filesystem = DEFAULT_FILESYSTEM_OPERATIONS) {
+                 path: current,
+             });
+         }
++        const members = [];
++        for (const entry of entries) {
++            if (isIgnoredProjectDirectory(entry.name)) {
++                continue;
++            }
++            const file = path.join(current, entry.name);
++            if (entry.isDirectory()) {
++                stack.push(file);
++                members.push(`${entry.name}/`);
++            }
++            else if (entry.isFile()) {
++                files.push(file);
++                members.push(entry.name);
++            }
++        }
++        members.sort();
+         directories.push({
+             path: current,
++            members,
+             // If membership moved during enumeration, force the next delivery to
+             // replace this generation instead of blessing a torn directory/file
+             // snapshot as stable.
+@@ -2075,18 +2107,6 @@ function walkProjectInputs(root, filesystem = DEFAULT_FILESYSTEM_OPERATIONS) {
+                 ? after
+                 : `unstable:${before}:${after ?? "missing"}`,
+         });
+-        for (const entry of entries) {
+-            if (isIgnoredProjectDirectory(entry.name)) {
+-                continue;
+-            }
+-            const file = path.join(current, entry.name);
+-            if (entry.isDirectory()) {
+-                stack.push(file);
+-            }
+-            else if (entry.isFile()) {
+-                files.push(file);
+-            }
+-        }
+     }
+     directories.sort((left, right) => left.path.localeCompare(right.path));
+     files.sort();
+@@ -2116,10 +2136,88 @@ function projectDirectorySignature(directory, filesystem = DEFAULT_FILESYSTEM_OP
+     }
+ }
+ /** Compare two deterministic project-directory membership snapshots. */
+-function sameProjectDirectories(left, right) {
+-    return (left.length === right.length &&
+-        left.every((directory, index) => directory.path === right[index]?.path &&
+-            directory.signature === right[index]?.signature));
++/**
++ * Project-relative POSIX key for one walked directory, in the same spelling
++ * `toProjectKey` produces for files so the two can be compared.
++ */
++function projectDirectoryKey(root, directory) {
++    const relative = path.relative(root, directory);
++    return relative === "" ? "." : normalizePath(relative);
++}
++/**
++ * Every directory that can still bear a declared input: the project root plus
++ * each ancestor of each declared input key.
++ *
++ * Keys for inputs outside the walk keep their full spelling and contribute
++ * prefixes no walked directory key can equal, so they drop out on their own
++ * rather than needing a separate filter.
++ */
++function inputBearingDirectories(declared) {
++    const bearing = new Set(["."]);
++    for (const key of declared) {
++        const segments = key.split("/");
++        for (let depth = segments.length - 1; depth > 0; depth -= 1) {
++            bearing.add(segments.slice(0, depth).join("/"));
++        }
++    }
++    return bearing;
++}
++/**
++ * One input-bearing directory's membership, with subdirectories that bear no
++ * declared input removed.
++ *
++ * Files are always counted: a file appearing beside a declared input is a
++ * candidate input for the next program, and the membership snapshot is the only
++ * term that can see a file enter or leave the project (samchon/ttsc#1246), so
++ * its arrival must still reject the generation. A subtree holding no declared
++ * input could not have contributed to this generation, so its churn is not
++ * evidence about it.
++ */
++function scopedDirectorySignature(entry, key, bearing) {
++    if (entry.members === undefined || entry.signature.startsWith("unstable:")) {
++        return entry.signature;
++    }
++    const prefix = key === "." ? "" : `${key}/`;
++    return `members:${entry.members
++        .filter((member) => !member.endsWith("/") ||
++        bearing.has(`${prefix}${member.slice(0, -1)}`))
++        .join("\u0000")}`;
++}
++/**
++ * Compare two project-directory membership snapshots.
++ *
++ * `declared` scopes the comparison to the inputs the compiler reported, exactly
++ * as `sameHashes` is scoped. An unscoped comparison rejects a generation
++ * whenever any walked directory moves, including build-output siblings nothing
++ * compiled, which makes every project with a concurrently written sibling
++ * directory nondeterministic. Without `declared` the comparison stays exact.
++ */
++function sameProjectDirectories(left, right, declared, projectRoot) {
++    if (declared === undefined || projectRoot === undefined) {
++        return (left.length === right.length &&
++            left.every((directory, index) => directory.path === right[index]?.path &&
++                directory.signature === right[index]?.signature));
++    }
++    const bearing = inputBearingDirectories(declared);
++    const scope = (entries) => {
++        const scoped = new Map();
++        for (const entry of entries) {
++            const key = projectDirectoryKey(projectRoot, entry.path);
++            if (!bearing.has(key))
++                continue;
++            scoped.set(key, scopedDirectorySignature(entry, key, bearing));
++        }
++        return scoped;
++    };
++    const leftScoped = scope(left);
++    const rightScoped = scope(right);
++    if (leftScoped.size !== rightScoped.size)
++        return false;
++    for (const [key, signature] of leftScoped) {
++        if (rightScoped.get(key) !== signature)
++            return false;
++    }
++    return true;
+ }
+ /**
+  * Open one directory's change notification through the cache-owned watch seam,
+@@ -2993,7 +3091,15 @@ function walkSnapshotComplete(snapshot, declared) {
+         return snapshot.complete;
+     }
+     if (!snapshot.directoryComplete) {
+-        return false;
++        if (snapshot.attributed === false ||
++            snapshot.directoryFailureKeys === undefined) {
++            return false;
++        }
++        const bearing = inputBearingDirectories(declared);
++        for (const key of snapshot.directoryFailureKeys) {
++            if (bearing.has(key))
++                return false;
++        }
+     }
+     for (const key of snapshot.unstableFiles) {
+         if (declared.has(key))
+@@ -3045,14 +3151,28 @@ function recordProjectSnapshotFailures(failures, props) {
+             });
+         }
+     }
+-    const leftDirectories = new Map(props.before.projectDirectories.map((entry) => [
+-        entry.path,
+-        entry.signature,
+-    ]));
+-    const rightDirectories = new Map(props.snapshot.projectDirectories.map((entry) => [
+-        entry.path,
+-        entry.signature,
+-    ]));
++    // Report exactly the directories the decision considered. An unscoped
++    // witness would name build-output siblings that no longer reject anything,
++    // which is worse than silence: it points the reader at the wrong cause.
++    const bearingDirectories = props.declared === undefined
++        ? undefined
++        : inputBearingDirectories(props.declared);
++    const directorySignatures = (entries) => {
++        const signatures = new Map();
++        for (const entry of entries) {
++            if (bearingDirectories === undefined) {
++                signatures.set(entry.path, entry.signature);
++                continue;
++            }
++            const key = projectDirectoryKey(props.projectRoot, entry.path);
++            if (!bearingDirectories.has(key))
++                continue;
++            signatures.set(entry.path, scopedDirectorySignature(entry, key, bearingDirectories));
++        }
++        return signatures;
++    };
++    const leftDirectories = directorySignatures(props.before.projectDirectories);
++    const rightDirectories = directorySignatures(props.snapshot.projectDirectories);
+     for (const directory of new Set([
+         ...leftDirectories.keys(),
+         ...rightDirectories.keys(),
+@@ -3197,11 +3317,16 @@ function projectWalkFailureFingerprint(snapshot, declared, projectRoot, identiti
+     const relevantUnstableFiles = declared === undefined
+         ? [...snapshot.unstableFiles]
+         : [...snapshot.unstableFiles].filter((key) => declared.has(key));
++    const bearing = declared === undefined ? undefined : inputBearingDirectories(declared);
+     const relevantFailures = snapshot.walkFailures.filter((failure) => {
+-        if (!failure.kind.startsWith("file-"))
+-            return true;
+         if (declared === undefined)
+             return true;
++        if (!failure.kind.startsWith("file-")) {
++            // Scope directory failures exactly as the completeness term scopes
++            // them, so the fingerprint cannot invalidate a generation over a
++            // failure that no longer rejects it.
++            return bearing?.has(projectDirectoryKey(projectRoot, failure.path)) === true;
++        }
+         try {
+             return declared.has(toProjectKey(projectRoot, failure.path, identities));
+         }
+@@ -3209,9 +3334,10 @@ function projectWalkFailureFingerprint(snapshot, declared, projectRoot, identiti
+             return true;
+         }
+     });
++    // `complete` already folds the scoped directory decision, so recording the
++    // raw `directoryComplete` beside it would reintroduce the unscoped signal.
+     return hashText(JSON.stringify({
+         complete: walkSnapshotComplete(snapshot, declared),
+-        directoryComplete: snapshot.directoryComplete,
+         failures: relevantFailures
+             .map((failure) => `${failure.kind}\0${path.resolve(failure.path)}`)
+             .sort(),
+@@ -3304,7 +3430,7 @@ function failedGenerationEnvironmentChanged(validation, props) {
+             validation.projectWalkFailures !==
+                 projectWalkFailureFingerprint(current, validation.declaredInputs, validation.cached.projectRoot, identities) ||
+             !sameHashes(validation.projectInputHashes, current.hashes, validation.declaredInputs) ||
+-            !sameProjectDirectories(validation.cached.projectDirectories ?? [], current.projectDirectories)) {
++            !sameProjectDirectories(validation.cached.projectDirectories ?? [], current.projectDirectories, validation.declaredInputs, validation.cached.projectRoot)) {
+             return true;
+         }
+         for (const [input, recorded] of validation.inputStates) {
+@@ -3486,7 +3612,7 @@ async function captureTransformGeneration(props) {
+             walkSnapshotComplete(inputSnapshot, declaredInputs) &&
+             sameHashes(before.hashes, inputSnapshot.hashes, declaredInputs) &&
+             sameHashes(before.fileSignatures, inputSnapshot.fileSignatures, declaredInputs) &&
+-            sameProjectDirectories(before.projectDirectories, inputSnapshot.projectDirectories) &&
++            sameProjectDirectories(before.projectDirectories, inputSnapshot.projectDirectories, declaredInputs, projectRoot) &&
+             tracker?.membershipChanged !== true &&
+             hostInputTracker?.membershipChanged !== true &&
+             candidateTracker?.membershipChanged !== true;
+diff --git a/src/core/transform.ts b/src/core/transform.ts
+index cb48e8dc7211c16e0a0b2e98a6385c11c27cb4ce..e7cd3555612eb418c8a369f2a7eb3f563c274211 100644
+--- a/src/core/transform.ts
++++ b/src/core/transform.ts
+@@ -51,6 +51,14 @@ interface TtscProjectDirectorySnapshot {
+   path: string;
+   /** Metadata signature that changes when its immediate membership changes. */
+   signature: string;
++  /**
++   * Walk-visible immediate membership, sorted, directories suffixed with `/`.
++   *
++   * Recorded alongside `signature` because a directory's stat stamp moves when
++   * ANY entry is added or removed, including entries this project can never
++   * compile, while membership can be scoped to the entries that matter.
++   */
++  members?: string[];
+ }
+ 
+ /** One project-walk observation that could not prove a coherent snapshot. */
+@@ -2598,6 +2606,8 @@ function matchesCompleteInputSnapshot(
+     !sameProjectDirectories(
+       cached.projectDirectories,
+       current.projectDirectories,
++      declaredInputs,
++      cached.projectRoot,
+     )
+   ) {
+     return false;
+@@ -2976,8 +2986,10 @@ function collectProjectInputSnapshot(
+     signatures: Record<string, string>;
+   },
+ ): {
++  attributed: boolean;
+   complete: boolean;
+   directoryComplete: boolean;
++  directoryFailureKeys: Set<string>;
+   fileSignatures: Record<string, string>;
+   hashes: Record<string, string>;
+   projectDirectories: TtscProjectDirectorySnapshot[];
+@@ -2992,6 +3004,14 @@ function collectProjectInputSnapshot(
+   let attributed = true;
+   const walked = walkProjectInputs(projectRoot, filesystem);
+   const walkFailures = [...walked.failures];
++  // Directory-level walk failures, keyed like every other input so the
++  // completeness term can be scoped to the declared inputs instead of letting
++  // an unreadable build-output sibling taint the whole snapshot.
++  const directoryFailureKeys = new Set(
++    walked.failures.map((failure) =>
++      projectDirectoryKey(projectRoot, failure.path),
++    ),
++  );
+   let complete = walked.complete;
+   for (const file of walked.files) {
+     try {
+@@ -3049,8 +3069,10 @@ function collectProjectInputSnapshot(
+     }
+   }
+   return {
++    attributed,
+     complete,
+     directoryComplete: walked.complete && attributed,
++    directoryFailureKeys,
+     fileSignatures,
+     hashes,
+     projectDirectories: walked.directories,
+@@ -3068,6 +3090,8 @@ function collectProjectInputSnapshot(
+  * unbounded call-stack depth on deep project trees. The result is sorted so
+  * that hash comparisons are deterministic across OS-level directory orderings.
+  */
++const TTSC_WALK_ROOTS_SEEN = new Set<string>();
++
+ function walkProjectInputs(
+   root: string,
+   filesystem: TtscTransformFilesystemOperations = DEFAULT_FILESYSTEM_OPERATIONS,
+@@ -3077,6 +3101,16 @@ function walkProjectInputs(
+   failures: TtscProjectWalkFailure[];
+   files: string[];
+ } {
++  // Which project roots a process walks is the single most useful fact when a
++  // generation will not stabilise, and it is otherwise invisible: the roots
++  // come from per-file nearest-config discovery, not from any one config.
++  if (
++    process.env.TTSC_DEBUG_WALK_ROOTS !== undefined &&
++    !TTSC_WALK_ROOTS_SEEN.has(root)
++  ) {
++    TTSC_WALK_ROOTS_SEEN.add(root);
++    process.stderr.write(`[ttsc walk-root] ${root}\n`);
++  }
+   let complete = true;
+   const directories: TtscProjectDirectorySnapshot[] = [];
+   const failures: TtscProjectWalkFailure[] = [];
+@@ -3112,8 +3146,24 @@ function walkProjectInputs(
+         path: current,
+       });
+     }
++    const members: string[] = [];
++    for (const entry of entries) {
++      if (isIgnoredProjectDirectory(entry.name)) {
++        continue;
++      }
++      const file = path.join(current, entry.name);
++      if (entry.isDirectory()) {
++        stack.push(file);
++        members.push(`${entry.name}/`);
++      } else if (entry.isFile()) {
++        files.push(file);
++        members.push(entry.name);
++      }
++    }
++    members.sort();
+     directories.push({
+       path: current,
++      members,
+       // If membership moved during enumeration, force the next delivery to
+       // replace this generation instead of blessing a torn directory/file
+       // snapshot as stable.
+@@ -3122,17 +3172,6 @@ function walkProjectInputs(
+           ? after
+           : `unstable:${before}:${after ?? "missing"}`,
+     });
+-    for (const entry of entries) {
+-      if (isIgnoredProjectDirectory(entry.name)) {
+-        continue;
+-      }
+-      const file = path.join(current, entry.name);
+-      if (entry.isDirectory()) {
+-        stack.push(file);
+-      } else if (entry.isFile()) {
+-        files.push(file);
+-      }
+-    }
+   }
+   directories.sort((left, right) => left.path.localeCompare(right.path));
+   files.sort();
+@@ -3165,19 +3204,106 @@ function projectDirectorySignature(
+   }
+ }
+ 
+-/** Compare two deterministic project-directory membership snapshots. */
++/**
++ * Project-relative POSIX key for one walked directory, in the same spelling
++ * {@link toProjectKey} produces for files so the two can be compared.
++ */
++function projectDirectoryKey(root: string, directory: string): string {
++  const relative = path.relative(root, directory);
++  return relative === "" ? "." : normalizePath(relative);
++}
++
++/**
++ * Every directory that can still bear a declared input: the project root plus
++ * each ancestor of each declared input key.
++ *
++ * Keys for inputs outside the walk keep their full spelling and contribute
++ * prefixes no walked directory key can equal, so they drop out on their own
++ * rather than needing a separate filter.
++ */
++function inputBearingDirectories(declared: ReadonlySet<string>): Set<string> {
++  const bearing = new Set<string>(["."]);
++  for (const key of declared) {
++    const segments = key.split("/");
++    for (let depth = segments.length - 1; depth > 0; depth -= 1) {
++      bearing.add(segments.slice(0, depth).join("/"));
++    }
++  }
++  return bearing;
++}
++
++/**
++ * One input-bearing directory's membership, with subdirectories that bear no
++ * declared input removed.
++ *
++ * Files are always counted: a file appearing beside a declared input is a
++ * candidate input for the next program, and the membership snapshot is the only
++ * term that can see a file enter or leave the project (samchon/ttsc#1246), so
++ * its arrival must still reject the generation. A subtree holding no declared
++ * input could not have contributed to this generation, so its churn is not
++ * evidence about it.
++ */
++function scopedDirectorySignature(
++  entry: TtscProjectDirectorySnapshot,
++  key: string,
++  bearing: ReadonlySet<string>,
++): string {
++  if (entry.members === undefined || entry.signature.startsWith("unstable:")) {
++    return entry.signature;
++  }
++  const prefix = key === "." ? "" : `${key}/`;
++  return `members:${entry.members
++    .filter(
++      (member) =>
++        !member.endsWith("/") || bearing.has(`${prefix}${member.slice(0, -1)}`),
++    )
++    .join("\u0000")}`;
++}
++
++/**
++ * Compare two project-directory membership snapshots.
++ *
++ * `declared` scopes the comparison to the inputs the compiler reported, exactly
++ * as {@link sameHashes} is scoped. An unscoped comparison rejects a generation
++ * whenever any walked directory moves, including build-output siblings nothing
++ * compiled, which makes every project with a concurrently written sibling
++ * directory nondeterministic. Without `declared` the comparison stays exact.
++ */
+ function sameProjectDirectories(
+   left: readonly TtscProjectDirectorySnapshot[],
+   right: readonly TtscProjectDirectorySnapshot[],
++  declared?: ReadonlySet<string>,
++  projectRoot?: string,
+ ): boolean {
+-  return (
+-    left.length === right.length &&
+-    left.every(
+-      (directory, index) =>
+-        directory.path === right[index]?.path &&
+-        directory.signature === right[index]?.signature,
+-    )
+-  );
++  if (declared === undefined || projectRoot === undefined) {
++    return (
++      left.length === right.length &&
++      left.every(
++        (directory, index) =>
++          directory.path === right[index]?.path &&
++          directory.signature === right[index]?.signature,
++      )
++    );
++  }
++  const bearing = inputBearingDirectories(declared);
++  const scope = (
++    entries: readonly TtscProjectDirectorySnapshot[],
++  ): Map<string, string> => {
++    const scoped = new Map<string, string>();
++    for (const entry of entries) {
++      const key = projectDirectoryKey(projectRoot, entry.path);
++      if (!bearing.has(key)) continue;
++      scoped.set(key, scopedDirectorySignature(entry, key, bearing));
++    }
++    return scoped;
++  };
++  const leftScoped = scope(left);
++  const rightScoped = scope(right);
++  if (leftScoped.size !== rightScoped.size) return false;
++  for (const [key, signature] of leftScoped) {
++    if (rightScoped.get(key) !== signature) return false;
++  }
++  return true;
+ }
+ 
+ /**
+@@ -4215,15 +4341,19 @@ function sameHashes(
+  * (a log being appended, a coverage report being written, a generated artifact
+  * being replaced) can fail its own read sandwich while every input holds still.
+  * That is not evidence about the generation, and treating it as such costs a
+- * whole-project recompile per delivered module. A walk that could not enumerate
+- * a directory, or a file-level failure this snapshot could not attribute to a
+- * key, still taints everything: neither can be shown to leave the inputs
+- * alone.
++ * whole-project recompile per delivered module. A directory the walk could not
++ * enumerate taints the snapshot only when it could have held a declared input:
++ * an unreadable build-output sibling is no more evidence about the generation
++ * than a log being appended is. A file-level failure this snapshot could not
++ * attribute to a key still taints everything, because it cannot be shown to
++ * leave the inputs alone.
+  */
+ function walkSnapshotComplete(
+   snapshot: {
++    attributed?: boolean;
+     complete: boolean;
+     directoryComplete: boolean;
++    directoryFailureKeys?: ReadonlySet<string>;
+     unstableFiles: ReadonlySet<string>;
+   },
+   declared: ReadonlySet<string> | undefined,
+@@ -4232,7 +4362,16 @@ function walkSnapshotComplete(
+     return snapshot.complete;
+   }
+   if (!snapshot.directoryComplete) {
+-    return false;
++    if (
++      snapshot.attributed === false ||
++      snapshot.directoryFailureKeys === undefined
++    ) {
++      return false;
++    }
++    const bearing = inputBearingDirectories(declared);
++    for (const key of snapshot.directoryFailureKeys) {
++      if (bearing.has(key)) return false;
++    }
+   }
+   for (const key of snapshot.unstableFiles) {
+     if (declared.has(key)) return false;
+@@ -4305,17 +4444,34 @@ function recordProjectSnapshotFailures(
+     }
+   }
+ 
+-  const leftDirectories = new Map(
+-    props.before.projectDirectories.map((entry) => [
+-      entry.path,
+-      entry.signature,
+-    ]),
+-  );
+-  const rightDirectories = new Map(
+-    props.snapshot.projectDirectories.map((entry) => [
+-      entry.path,
+-      entry.signature,
+-    ]),
++  // Report exactly the directories the decision considered. An unscoped
++  // witness would name build-output siblings that no longer reject anything,
++  // which is worse than silence: it points the reader at the wrong cause.
++  const bearingDirectories =
++    props.declared === undefined
++      ? undefined
++      : inputBearingDirectories(props.declared);
++  const directorySignatures = (
++    entries: readonly TtscProjectDirectorySnapshot[],
++  ): Map<string, string> => {
++    const signatures = new Map<string, string>();
++    for (const entry of entries) {
++      if (bearingDirectories === undefined) {
++        signatures.set(entry.path, entry.signature);
++        continue;
++      }
++      const key = projectDirectoryKey(props.projectRoot, entry.path);
++      if (!bearingDirectories.has(key)) continue;
++      signatures.set(
++        entry.path,
++        scopedDirectorySignature(entry, key, bearingDirectories),
++      );
++    }
++    return signatures;
++  };
++  const leftDirectories = directorySignatures(props.before.projectDirectories);
++  const rightDirectories = directorySignatures(
++    props.snapshot.projectDirectories,
+   );
+   for (const directory of new Set([
+     ...leftDirectories.keys(),
+@@ -4476,8 +4632,10 @@ function mergeGenerationProofFailures(
+ /** Hash the declared-input-relevant failure shape without retaining it. */
+ function projectWalkFailureFingerprint(
+   snapshot: {
++    attributed?: boolean;
+     complete: boolean;
+     directoryComplete: boolean;
++    directoryFailureKeys?: ReadonlySet<string>;
+     unstableFiles: ReadonlySet<string>;
+     walkFailures: readonly TtscProjectWalkFailure[];
+   },
+@@ -4489,9 +4647,18 @@ function projectWalkFailureFingerprint(
+     declared === undefined
+       ? [...snapshot.unstableFiles]
+       : [...snapshot.unstableFiles].filter((key) => declared.has(key));
++  const bearing =
++    declared === undefined ? undefined : inputBearingDirectories(declared);
+   const relevantFailures = snapshot.walkFailures.filter((failure) => {
+-    if (!failure.kind.startsWith("file-")) return true;
+     if (declared === undefined) return true;
++    if (!failure.kind.startsWith("file-")) {
++      // Scope directory failures exactly as the completeness term scopes them,
++      // so the fingerprint cannot invalidate a generation over a failure that
++      // no longer rejects it.
++      return (
++        bearing?.has(projectDirectoryKey(projectRoot, failure.path)) === true
++      );
++    }
+     try {
+       return declared.has(toProjectKey(projectRoot, failure.path, identities));
+     } catch {
+@@ -4499,9 +4666,10 @@ function projectWalkFailureFingerprint(
+     }
+   });
+   return hashText(
++    // `complete` already folds the scoped directory decision, so recording the
++    // raw `directoryComplete` beside it would reintroduce the unscoped signal.
+     JSON.stringify({
+       complete: walkSnapshotComplete(snapshot, declared),
+-      directoryComplete: snapshot.directoryComplete,
+       failures: relevantFailures
+         .map((failure) => `${failure.kind}\0${path.resolve(failure.path)}`)
+         .sort(),
+@@ -4645,6 +4813,8 @@ function failedGenerationEnvironmentChanged(
+       !sameProjectDirectories(
+         validation.cached.projectDirectories ?? [],
+         current.projectDirectories,
++        validation.declaredInputs,
++        validation.cached.projectRoot,
+       )
+     ) {
+       return true;
+@@ -4909,6 +5079,8 @@ async function captureTransformGeneration(props: {
+       sameProjectDirectories(
+         before.projectDirectories,
+         inputSnapshot.projectDirectories,
++        declaredInputs,
++        projectRoot,
+       ) &&
+       tracker?.membershipChanged !== true &&
+       hostInputTracker?.membershipChanged !== true &&
