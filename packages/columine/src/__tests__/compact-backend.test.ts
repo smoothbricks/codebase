@@ -163,12 +163,14 @@ describe('Compact CPB1 packing', () => {
     const mock = createCompactMock();
     const backend = createParseCompactWasmBackend(mock.exports);
     const validityBacking = new Uint8Array([0x44, 0xff, 0x01, 0x55]);
-    const valueBacking = new Uint32Array([0xdead_beef, 1, 2, 3, 4, 5, 6, 7, 8, 0xffff_ffff, 0xcafe_babe]);
+    // Plane 1 is signed, so the hex values are bit patterns: Int32Array wraps
+    // them to the same four bytes the encoder must copy.
+    const valueBacking = new Int32Array([0xdead_beef, 1, 2, 3, 4, 5, 6, 7, 8, 0xffff_ffff, 0xcafe_babe]);
 
     backend.encode(
       batch(9, schema([1, 1]), [
         {
-          kind: 'u32',
+          kind: 'i32',
           validity: validityBacking.subarray(1, 3),
           data: valueBacking.subarray(1, 10),
         },
@@ -219,7 +221,7 @@ describe('Compact CPB1 packing', () => {
     const backend = createParseCompactWasmBackend(mock.exports);
     const initialBuffer = mock.exports.memory.buffer;
 
-    const result = backend.encode(batch(1, schema([1, 0]), [{ kind: 'u32', data: new Uint32Array([42]) }]));
+    const result = backend.encode(batch(1, schema([1, 0]), [{ kind: 'i32', data: new Int32Array([42]) }]));
     expect(mock.exports.memory.buffer).not.toBe(initialBuffer);
     expect(result).toEqual(payload);
     expect(result.buffer).not.toBe(mock.exports.memory.buffer);
@@ -255,13 +257,13 @@ describe('Compact CPB1 packing', () => {
     const backend = createParseCompactWasmBackend(mock.exports);
     const f64 = new Float64Array([-0, Number.NaN]);
     const i64 = new BigInt64Array([-(1n << 63n), -1n]);
-    const u32 = new Uint32Array([0, 0xffff_ffff]);
+    const i32 = new Int32Array([0, 0xffff_ffff]);
 
     backend.encode(
       batch(2, schema([2, 0], [6, 0], [1, 0]), [
         { kind: 'f64', data: f64 },
         { kind: 'i64', data: i64 },
-        { kind: 'u32', data: u32 },
+        { kind: 'i32', data: i32 },
       ]),
     );
 
@@ -269,7 +271,7 @@ describe('Compact CPB1 packing', () => {
     if (call === undefined) {
       throw new Error('Expected one Compact invocation');
     }
-    const sources = [new Uint8Array(f64.buffer), new Uint8Array(i64.buffer), new Uint8Array(u32.buffer)];
+    const sources = [new Uint8Array(f64.buffer), new Uint8Array(i64.buffer), new Uint8Array(i32.buffer)];
     for (let index = 0; index < sources.length; index += 1) {
       const descriptor = new DataView(call.request.buffer, call.request.byteOffset + 16 + index * 32, 32);
       const dataOffset = descriptor.getUint32(20, true);
@@ -305,7 +307,7 @@ describe('Compact validation', () => {
         'nonzero metadata padding',
         batch(0, { schemaBytes: new Uint8Array(), fieldMetadata: new Uint8Array([0, 1, 1, 0]) }, [{ kind: 'null' }]),
       ],
-      ['kind mismatch', batch(0, schema([2, 0]), [{ kind: 'u32', data: new Uint32Array() }])],
+      ['kind mismatch', batch(0, schema([2, 0]), [{ kind: 'i32', data: new Int32Array() }])],
       ['non-nullable Null', batch(0, schema([0, 0]), [{ kind: 'null' }])],
     ];
 
@@ -320,12 +322,12 @@ describe('Compact validation', () => {
 
   it('validates fixed-width arrays and nullable validity exactly', () => {
     const cases: CompactBatch[] = [
-      batch(2, schema([1, 0]), [{ kind: 'u32', data: new Uint32Array([1]) }]),
+      batch(2, schema([1, 0]), [{ kind: 'i32', data: new Int32Array([1]) }]),
       batch(1, schema([2, 0]), [{ kind: 'f64', data: new Float64Array(2) }]),
       batch(1, schema([6, 0]), [{ kind: 'i64', data: new BigInt64Array(0) }]),
-      batch(1, schema([1, 0]), [{ kind: 'u32', data: new Uint32Array([1]), validity: new Uint8Array([1]) }]),
-      batch(9, schema([1, 1]), [{ kind: 'u32', data: new Uint32Array(9), validity: new Uint8Array([0xff]) }]),
-      batch(9, schema([1, 1]), [{ kind: 'u32', data: new Uint32Array(9), validity: new Uint8Array([0xff, 0x81]) }]),
+      batch(1, schema([1, 0]), [{ kind: 'i32', data: new Int32Array([1]), validity: new Uint8Array([1]) }]),
+      batch(9, schema([1, 1]), [{ kind: 'i32', data: new Int32Array(9), validity: new Uint8Array([0xff]) }]),
+      batch(9, schema([1, 1]), [{ kind: 'i32', data: new Int32Array(9), validity: new Uint8Array([0xff, 0x81]) }]),
     ];
 
     for (const invalidBatch of cases) {
@@ -377,7 +379,7 @@ describe('Compact validation', () => {
     const result = backend.encode(
       batch(0, schema([0, 1], [1, 1], [5, 1], [3, 1]), [
         { kind: 'null' },
-        { kind: 'u32', data: new Uint32Array(), validity: new Uint8Array() },
+        { kind: 'i32', data: new Int32Array(), validity: new Uint8Array() },
         { kind: 'bool', data: new Uint8Array(), validity: new Uint8Array() },
         { kind: 'binary', offsets: new Uint32Array([0]), data: new Uint8Array(), validity: new Uint8Array() },
       ]),
@@ -483,17 +485,17 @@ describe('Compact native results and lifecycle', () => {
   it('reuses byte-identical schema and metadata and destroys the handle on a schema change', () => {
     const mock = createCompactMock();
     const backend = createParseCompactWasmBackend(mock.exports);
-    const first = batch(1, schema([1, 0]), [{ kind: 'u32', data: new Uint32Array([1]) }]);
+    const first = batch(1, schema([1, 0]), [{ kind: 'i32', data: new Int32Array([1]) }]);
     const identical = batch(
       1,
       {
         schemaBytes: first.schema.schemaBytes.slice(),
         fieldMetadata: first.schema.fieldMetadata.slice(),
       },
-      [{ kind: 'u32', data: new Uint32Array([2]) }],
+      [{ kind: 'i32', data: new Int32Array([2]) }],
     );
     const changed = batch(1, { schemaBytes: new Uint8Array([9]), fieldMetadata: new Uint8Array([1, 0, 0, 0]) }, [
-      { kind: 'u32', data: new Uint32Array([3]) },
+      { kind: 'i32', data: new Int32Array([3]) },
     ]);
 
     backend.encode(first);
