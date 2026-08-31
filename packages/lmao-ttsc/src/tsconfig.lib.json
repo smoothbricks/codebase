@@ -1,0 +1,13 @@
+{
+  "//": "Runtime-transform routing ONLY — never a build config. The bun preload picks tsconfig.lib.json for non-test sources and tsconfig.test.json for test sources, resolving each by walking up from the file, and @ttsc/unplugin then snapshots every directory under the resolved config's directory. A src-level tsconfig.test.json alone is not enough: these tests import ../index.js, which routes through the LIB config, so that one still resolved to the package root and kept plugin/, plugin/host and plugin/driver inside the walk while go-build and go-test write there. Measured 2x2 on 0.28.3, 20 runs per cell, mutating between walks: package-root test config + plugin/host churn 20 unstable; src test config + plugin/host churn 0 unstable; src test config + src-dir churn 20 unstable. Emit still comes from ../tsconfig.lib.json; this override is noEmit and non-composite so it cannot be mistaken for one.",
+  "extends": "../tsconfig.lib.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "rootDir": "."
+  },
+  "include": ["./**/*.ts", "./**/*.tsx"]
+}
