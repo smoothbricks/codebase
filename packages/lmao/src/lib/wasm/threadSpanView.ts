@@ -29,6 +29,19 @@ const KIND_BOOLEAN = THREAD_ATTRIBUTE_KINDS[2].discriminant;
 const KIND_TEXT = THREAD_ATTRIBUTE_KINDS[3].discriminant;
 const KIND_ENUM = THREAD_ATTRIBUTE_KINDS[4].discriminant;
 
+/**
+ * `_laneStore` slots. System lanes take fixed slots; a schema attribute at
+ * index `i` takes `LANE_SCHEMA_BASE + 2 * i` for values and `+ 1` for nulls.
+ */
+const LANE_MESSAGE = 0;
+const LANE_ERROR_CODE = 1;
+const LANE_EXCEPTION_STACK = 2;
+const LANE_FF_VALUE = 3;
+const LANE_SCHEMA_BASE = 4;
+
+/** Null-lane sink size: covers any row index a single span can reach. */
+const NULL_LANE_BYTES = 8192;
+
 const bits = new DataView(new ArrayBuffer(8));
 
 function f64Bits(value: number): bigint {
@@ -36,6 +49,14 @@ function f64Bits(value: number): bigint {
   return bits.getBigUint64(0, true);
 }
 
+/**
+ * A write-only indexable sink that forwards `lane[i] = v` into the row store.
+ *
+ * The target array is never populated: the native store is the only reader of
+ * these values, so mirroring them into JS would allocate a second copy of
+ * every row for nobody. `length` still tracks so generated loggers that read
+ * it back see a coherent lane.
+ */
 function laneProxy(write: (index: number, value: unknown) => void): unknown[] {
   const target: unknown[] = [];
   return new Proxy(target, {
@@ -47,7 +68,7 @@ function laneProxy(write: (index: number, value: unknown) => void): unknown[] {
       const index = typeof prop === 'string' ? Number(prop) : Number.NaN;
       if (Number.isInteger(index) && index >= 0) {
         write(index, value);
-        obj[index] = value;
+        if (index >= obj.length) obj.length = index + 1;
         return true;
       }
       Reflect.set(obj, prop, value);
@@ -56,10 +77,22 @@ function laneProxy(write: (index: number, value: unknown) => void): unknown[] {
   });
 }
 
+export interface ThreadSpanViewArgs<T extends LogSchema = LogSchema> {
+  runtime: ThreadSpanBufferRuntime;
+  binding: ThreadSpanBufferBinding;
+  schema: T;
+  traceRoot: ITraceRoot;
+  opMetadata: OpMetadata;
+  callsiteMetadata: OpMetadata;
+  parent?: AnySpanBuffer;
+  stats: SpanBufferStats;
+}
+
 export class ThreadSpanView {
   readonly [THREAD_SPAN_VIEW] = true;
   readonly runtime: ThreadSpanBufferRuntime;
   readonly binding: ThreadSpanBufferBinding;
+  readonly layout: ThreadSpanLayout;
   readonly ordinals: ReadonlyMap<string, number>;
   readonly kinds: ReadonlyMap<string, number>;
   readonly enumVariants: ReadonlyMap<string, readonly string[]>;
@@ -96,18 +129,24 @@ export class ThreadSpanView {
   readonly _identity = new Uint8Array(12);
   readonly timestamp = new BigInt64Array(2);
   readonly entry_type = new Uint8Array(2);
-  readonly message_values: (string | undefined)[];
+  /**
+   * Lazily materialized write lanes, indexed by `LANE_*` slot.
+   *
+   * Lanes are proxies whose only job is to forward `lane[i] = v` into the
+   * native row store; nothing ever reads them back. Materializing them on
+   * demand keeps every view's own-property set identical to this class's
+   * declared fields — no span pays a hidden-class transition — and a span
+   * that never touches a lane never allocates one.
+   */
+  readonly _laneStore: unknown[] = [];
   readonly line_values = new Float64Array(1);
   readonly line_nulls = new Uint8Array(1);
-  readonly error_code_values: unknown[];
   readonly error_code_nulls = new Uint8Array(1);
   readonly retry_attempt_values = new Float64Array(1);
   readonly retry_attempt_nulls = new Uint8Array(1);
   readonly retry_delay_ms_values = new Float64Array(1);
   readonly retry_delay_ms_nulls = new Uint8Array(1);
-  readonly exception_stack_values: unknown[];
   readonly exception_stack_nulls = new Uint8Array(1);
-  readonly ff_value_values: unknown[];
   readonly ff_value_nulls = new Uint8Array(1);
   readonly uint64_value_values = new BigUint64Array(1);
   readonly uint64_value_nulls = new Uint8Array(1);
@@ -118,16 +157,47 @@ export class ThreadSpanView {
   _hasParent = false;
   _spanName?: string | number;
 
-  constructor(args: {
-    runtime: ThreadSpanBufferRuntime;
-    binding: ThreadSpanBufferBinding;
-    schema: LogSchema;
-    traceRoot: ITraceRoot;
-    opMetadata: OpMetadata;
-    callsiteMetadata: OpMetadata;
-    parent?: AnySpanBuffer;
-    stats: SpanBufferStats;
-  }) {
+  get message_values(): (string | undefined)[] {
+    const existing = this._laneStore[LANE_MESSAGE];
+    if (existing !== undefined) return existing as (string | undefined)[];
+    const lane = laneProxy((index, value) => {
+      this.commitLog(index, typeof value === 'string' ? value : String(value));
+    }) as (string | undefined)[];
+    this._laneStore[LANE_MESSAGE] = lane;
+    return lane;
+  }
+
+  get error_code_values(): unknown[] {
+    const existing = this._laneStore[LANE_ERROR_CODE];
+    if (existing !== undefined) return existing as unknown[];
+    const lane = laneProxy((index, value) => {
+      this.writeNamed('error_code', this.physicalRow(index), value);
+    });
+    this._laneStore[LANE_ERROR_CODE] = lane;
+    return lane;
+  }
+
+  get exception_stack_values(): unknown[] {
+    const existing = this._laneStore[LANE_EXCEPTION_STACK];
+    if (existing !== undefined) return existing as unknown[];
+    const lane = laneProxy((index, value) => {
+      this.writeNamed('exception_stack', this.physicalRow(index), value);
+    });
+    this._laneStore[LANE_EXCEPTION_STACK] = lane;
+    return lane;
+  }
+
+  get ff_value_values(): unknown[] {
+    const existing = this._laneStore[LANE_FF_VALUE];
+    if (existing !== undefined) return existing as unknown[];
+    const lane = laneProxy((index, value) => {
+      this.writeNamed('ff_value', this.physicalRow(index), value);
+    });
+    this._laneStore[LANE_FF_VALUE] = lane;
+    return lane;
+  }
+
+  constructor(args: ThreadSpanViewArgs) {
     this.runtime = args.runtime;
     this.binding = args.binding;
     this._logSchema = args.schema;
@@ -144,63 +214,14 @@ export class ThreadSpanView {
       this.parent_span_id = args.parent.span_id;
       this.parent_thread_id = args.parent.thread_id;
     }
-    this.ordinals = schemaAttributeOrdinals(args.schema);
-    const kinds = new Map<string, number>();
-    const enums = new Map<string, readonly string[]>();
-    for (const name of args.schema._columnNames) {
-      if (isThreadSystemColumn(name)) continue;
-      const type = getSchemaType(args.schema.fields[name]);
-      if (type === undefined) continue;
-      const kind = attributeKindForSchemaType(type);
-      if (kind === undefined) continue;
-      kinds.set(name, kind);
-      if (type === 'enum') {
-        const variants = getEnumValues(args.schema.fields[name]);
-        if (variants) enums.set(name, variants);
-      }
-    }
-    this.kinds = kinds;
-    this.enumVariants = enums;
-
-    this.message_values = laneProxy((index, value) => {
-      this.commitLog(index, typeof value === 'string' ? value : String(value));
-    }) as (string | undefined)[];
-    this.error_code_values = laneProxy((index, value) => {
-      this.writeNamed('error_code', this.physicalRow(index), value);
-    });
-    this.exception_stack_values = laneProxy((index, value) => {
-      this.writeNamed('exception_stack', this.physicalRow(index), value);
-    });
-    this.ff_value_values = laneProxy((index, value) => {
-      this.writeNamed('ff_value', this.physicalRow(index), value);
-    });
-
-    for (const name of this.ordinals.keys()) {
-      Object.defineProperty(this, `${name}_values`, {
-        value: laneProxy((index, value) => {
-          this.writeNamed(name, this.physicalRow(index), value);
-        }),
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
-      Object.defineProperty(this, `${name}_nulls`, {
-        value: new Uint8Array(8192),
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
-      Object.defineProperty(this, name, {
-        value: (pos: number, val: unknown) => {
-          if (pos === 0) return this.writeTagNamed(name, val);
-          if (pos === 1) return this.writeNamed(name, this.completionRow, val);
-          return this.writeNamed(name, this.physicalRow(pos), val);
-        },
-        writable: true,
-        configurable: true,
-        enumerable: false,
-      });
-    }
+    const layout = threadSpanLayoutFor(args.schema);
+    this.layout = layout;
+    this.ordinals = layout.ordinals;
+    this.kinds = layout.kinds;
+    this.enumVariants = layout.enumVariants;
+    // Attribute lanes and writer methods live on `layout.ViewClass.prototype`;
+    // the constructor deliberately adds nothing beyond this class's declared
+    // fields, so every span of a schema shares one hidden class.
   }
 
   get span_id(): number {
@@ -369,7 +390,7 @@ export class ThreadSpanView {
     return this._parent === other;
   }
 
-  private physicalRow(index: number): number {
+  physicalRow(index: number): number {
     return this.fakeToReal.get(index) ?? index;
   }
 
@@ -380,16 +401,12 @@ export class ThreadSpanView {
     const entryType = this.pendingEntryType ?? 8;
     this.pendingEntryType = undefined;
     const timestamp = this._traceRoot._timestampNow(this._traceRoot);
-    const payload = this.runtime.writeUtf8(message);
-    const packed = this.binding.appendLogDynamic(
-      this.spanId,
-      entryType,
-      payload.ptr,
-      payload.len,
-      timestamp,
-      this.pendingLine,
-    );
-    if (packed === 0n) throw new Error('thread_span_buffer_append_log_dynamic failed');
+    // Intern to a u32 and pass the ordinal, rather than re-encoding the same
+    // message to UTF-8 on every row. Vocabulary ids are stable per handle, so
+    // a repeated message costs one Map lookup and no encode at all.
+    const messageOrdinal = this.runtime.intern(this.binding, message);
+    const packed = this.binding.appendLog(this.spanId, entryType, messageOrdinal, timestamp, this.pendingLine);
+    if (packed === 0n) throw new Error('thread_span_buffer_append_log failed');
     const row = Number(packed & 0xffffffffn);
     this.fakeToReal.set(fakeIndex, row);
     this.lastRow = row;
@@ -432,15 +449,106 @@ export function requireThreadSpanView(value: AnySpanBuffer): ThreadSpanView {
   return value;
 }
 
-export function createThreadSpanView<T extends LogSchema>(args: {
-  runtime: ThreadSpanBufferRuntime;
-  binding: ThreadSpanBufferBinding;
-  schema: T;
-  traceRoot: ITraceRoot;
-  opMetadata: OpMetadata;
-  callsiteMetadata: OpMetadata;
-  parent?: AnySpanBuffer;
-  stats: SpanBufferStats;
-}): SpanBuffer<T> {
-  return new ThreadSpanView(args) as SpanBuffer<T> & ThreadSpanView;
+/**
+ * Everything the view needs that depends only on the schema, resolved once.
+ *
+ * Building this per span was the lane's fixed floor: two Map builds over
+ * `_columnNames` plus three `Object.defineProperty` calls per attribute, all
+ * recomputing values fixed at schema-definition time.
+ */
+export interface ThreadSpanLayout {
+  readonly ordinals: ReadonlyMap<string, number>;
+  readonly kinds: ReadonlyMap<string, number>;
+  readonly enumVariants: ReadonlyMap<string, readonly string[]>;
+  readonly attributeNames: readonly string[];
+  readonly ViewClass: new (args: ThreadSpanViewArgs) => ThreadSpanView;
+}
+
+const layouts = new WeakMap<LogSchema, ThreadSpanLayout>();
+
+function buildLayout(schema: LogSchema): ThreadSpanLayout {
+  const ordinals = schemaAttributeOrdinals(schema);
+  const kinds = new Map<string, number>();
+  const enumVariants = new Map<string, readonly string[]>();
+  for (const name of schema._columnNames) {
+    if (isThreadSystemColumn(name)) continue;
+    const type = getSchemaType(schema.fields[name]);
+    if (type === undefined) continue;
+    const kind = attributeKindForSchemaType(type);
+    if (kind === undefined) continue;
+    kinds.set(name, kind);
+    if (type === 'enum') {
+      const variants = getEnumValues(schema.fields[name]);
+      if (variants) enumVariants.set(name, variants);
+    }
+  }
+
+  // One subclass per schema carries the attribute writer methods and the
+  // attribute lanes on its prototype. Doing this per span was the lane's fixed
+  // floor: three Object.defineProperty calls and two allocations per attribute
+  // on an instance that already has forty declared fields.
+  class SchemaBoundThreadSpanView extends ThreadSpanView {}
+  const descriptors: PropertyDescriptorMap = {};
+  const attributeNames = [...ordinals.keys()];
+  for (let index = 0; index < attributeNames.length; index++) {
+    const name = attributeNames[index] ?? '';
+    const valuesSlot = LANE_SCHEMA_BASE + 2 * index;
+    const nullsSlot = valuesSlot + 1;
+    descriptors[name] = {
+      value: function attributeWriter(this: ThreadSpanView, pos: number, val: unknown): ThreadSpanView {
+        if (pos === 0) return this.writeTagNamed(name, val);
+        if (pos === 1) return this.writeNamed(name, this.completionRow, val);
+        return this.writeNamed(name, this.physicalRow(pos), val);
+      },
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    };
+    descriptors[`${name}_values`] = {
+      get: function attributeLane(this: ThreadSpanView): unknown[] {
+        const existing = this._laneStore[valuesSlot];
+        if (existing !== undefined) return existing as unknown[];
+        const lane = laneProxy((rowIndex, value) => {
+          this.writeNamed(name, this.physicalRow(rowIndex), value);
+        });
+        this._laneStore[valuesSlot] = lane;
+        return lane;
+      },
+      configurable: true,
+      enumerable: false,
+    };
+    descriptors[`${name}_nulls`] = {
+      get: function attributeNulls(this: ThreadSpanView): Uint8Array {
+        const existing = this._laneStore[nullsSlot];
+        if (existing !== undefined) return existing as Uint8Array;
+        // Write-only sink: the native row store holds validity, and nothing
+        // in the flush path reads this lane. It exists so generated loggers
+        // can keep their unconditional `${name}_nulls[i >>> 3] |= …` store.
+        const lane = new Uint8Array(NULL_LANE_BYTES);
+        this._laneStore[nullsSlot] = lane;
+        return lane;
+      },
+      configurable: true,
+      enumerable: false,
+    };
+  }
+  Object.defineProperties(SchemaBoundThreadSpanView.prototype, descriptors);
+
+  const layout: ThreadSpanLayout = {
+    ordinals,
+    kinds,
+    enumVariants,
+    attributeNames,
+    ViewClass: SchemaBoundThreadSpanView,
+  };
+  layouts.set(schema, layout);
+  return layout;
+}
+
+export function threadSpanLayoutFor(schema: LogSchema): ThreadSpanLayout {
+  return layouts.get(schema) ?? buildLayout(schema);
+}
+
+export function createThreadSpanView<T extends LogSchema>(args: ThreadSpanViewArgs<T>): SpanBuffer<T> {
+  return new (threadSpanLayoutFor(args.schema).ViewClass)(args) as SpanBuffer<T> & ThreadSpanView;
 }
