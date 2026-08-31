@@ -376,6 +376,21 @@ impl ThreadSpanBuffer {
         buffer.blocks.push(ThreadSpanBlock::new(capacity, fields));
         buffer
     }
+    /// Release every row and span, keeping the interned vocabulary.
+    ///
+    /// The buffer is per-thread and long-lived: without this, a process that
+    /// traces forever grows the row store forever. Vocabulary ids survive on
+    /// purpose — they are handed out to callers that cache them, and
+    /// `intern` guarantees a stable id for the buffer's lifetime.
+    pub fn reset(&mut self) {
+        self.blocks.clear();
+        self.blocks
+            .push(ThreadSpanBlock::new(self.capacity, self.fields));
+        self.row_count = 0;
+        self.next_span_id = 1;
+        self.spans.clear();
+        self.scopes.clear();
+    }
     #[inline]
     pub const fn thread_id(&self) -> u64 {
         self.thread_id

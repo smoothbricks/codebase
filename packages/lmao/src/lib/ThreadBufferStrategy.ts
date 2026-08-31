@@ -16,7 +16,7 @@ import { getThreadId } from './threadId.js';
 import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 import { convertThreadViewToArrowTable } from './wasm/convertThreadBuffer.js';
-import type { ThreadSpanBufferBinding } from './wasm/threadSpanBuffer.js';
+import { THREAD_SPAN_BUFFER_OK, type ThreadSpanBufferBinding } from './wasm/threadSpanBuffer.js';
 import { createThreadSpanBufferRuntime, type ThreadSpanBufferRuntime } from './wasm/threadSpanBufferHost.js';
 import { createThreadSpanView, isThreadSpanView, requireThreadSpanView } from './wasm/threadSpanView.js';
 
@@ -36,6 +36,13 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
   readonly capacity: number;
   readonly threadId: bigint;
   private readonly bindings = new WeakMap<LogSchema, ThreadSpanBufferBinding>();
+  /**
+   * Bindings reachable for `reset`. The WeakMap above is the lookup; this is
+   * the iteration order, and it is what makes the row store releasable — a
+   * handle outlives every span written through it, so without an explicit
+   * reset a long-lived thread grows its row store without bound.
+   */
+  private readonly liveBindings: ThreadSpanBufferBinding[] = [];
 
   private constructor(runtime: ThreadSpanBufferRuntime, capacity: number, threadId: bigint) {
     this.runtime = runtime;
@@ -61,6 +68,7 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
     if (existing) return existing;
     const created = this.runtime.createBinding(this.threadId, this.capacity, schema);
     this.bindings.set(schema, created);
+    this.liveBindings.push(created);
     return created;
   }
 
@@ -122,5 +130,14 @@ export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements Bu
 
   releaseBuffer(buffer: AnySpanBuffer): void {
     buffer._traceRoot._topology.release();
+  }
+
+  /** Release every row and span on this thread, keeping interned vocabularies. */
+  reset(): void {
+    for (const binding of this.liveBindings) {
+      if (binding.reset() !== THREAD_SPAN_BUFFER_OK) {
+        throw new Error('thread_span_buffer_reset failed');
+      }
+    }
   }
 }
