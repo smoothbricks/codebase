@@ -44,30 +44,35 @@ const TYPESCRIPT_TOOLCHAIN_INPUTS = [
   '{workspaceRoot}/tsconfig.base.json',
 ];
 
-// The aggregate `build` pulls in platform-suffixed binary targets for THIS
-// machine only: `<tool>-<arch>-<os>` names matching the host (for example
-// cli-arm64-macos on Apple Silicon) build locally as part of `nx build`, while
-// every foreign platform stays publish-workflow-only. nx.json targetDefaults
-// cannot express "current platform" — its dependsOn lists are static — so the
-// inference plugin owns this edge.
-const HOST_PLATFORM_SUFFIX: string | null = (() => {
-  const os = process.platform === 'darwin' ? 'macos' : process.platform === 'linux' ? 'linux' : null;
-  const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : null;
-  return os !== null && arch !== null ? `-${arch}-${os}` : null;
-})();
+type NapiArchitecture = 'arm64' | 'x64';
+type NapiTargetFamily = 'linux' | 'macos';
 
-// Cross N-API targets deliberately use raw Clang with a downloaded sysroot.
-// Linux host builds need Nix's cc wrapper so native crates see host libc headers.
-const HOST_NAPI_COMPILER_ENV = process.platform === 'linux' ? Object.freeze({ CC: 'cc', CXX: 'c++' }) : undefined;
+interface NapiPlatform {
+  architecture: NapiArchitecture;
+  targetFamily: NapiTargetFamily;
+}
 
-export function hostPlatformTargetNames(targetNames: Iterable<string>): string[] {
-  if (HOST_PLATFORM_SUFFIX === null) return [];
+function napiPlatform(platform: NodeJS.Platform, architecture: string): NapiPlatform | null {
+  const targetFamily = platform === 'darwin' ? 'macos' : platform === 'linux' ? 'linux' : null;
+  const targetArchitecture = architecture === 'arm64' ? 'arm64' : architecture === 'x64' ? 'x64' : null;
+  return targetFamily !== null && targetArchitecture !== null
+    ? { architecture: targetArchitecture, targetFamily }
+    : null;
+}
+
+function sameNapiPlatform(left: NapiPlatform, right: NapiPlatform | null): boolean {
+  return left.architecture === right?.architecture && left.targetFamily === right.targetFamily;
+}
+
+function hostPlatformTargetNames(targetNames: Iterable<string>, hostPlatform: NapiPlatform | null): string[] {
+  if (hostPlatform === null) return [];
+  const suffix = `-${hostPlatform.architecture}-${hostPlatform.targetFamily}`;
   return [...new Set(targetNames)]
     .filter(
       // Binary targets only. A toolchain prerequisite carries the same platform
       // suffix but produces no artifact: the cross builds that need it depend
       // on it directly, so the aggregate stays a list of outputs.
-      (name) => name.endsWith(HOST_PLATFORM_SUFFIX) && !name.startsWith(NAPI_TOOLCHAIN_TARGET_PREFIX),
+      (name) => name.endsWith(suffix) && !name.startsWith(NAPI_TOOLCHAIN_TARGET_PREFIX),
     )
     .sort();
 }
@@ -95,11 +100,8 @@ const CARGO_INPUTS = [
 const CARGO_OUTPUT_INPUTS = [...CARGO_INPUTS, '{projectRoot}/package.json', '{workspaceRoot}/bun.lock'];
 const NAPI_INPUTS = CARGO_OUTPUT_INPUTS;
 
-interface NapiTargetConvention {
-  architecture: string;
+interface NapiTargetConvention extends NapiPlatform {
   outputName: string;
-  targetFamily: 'linux' | 'macos';
-  useNapiCross: boolean;
 }
 
 const NAPI_TARGET_CONVENTIONS: Readonly<Record<string, NapiTargetConvention>> = {
@@ -107,27 +109,38 @@ const NAPI_TARGET_CONVENTIONS: Readonly<Record<string, NapiTargetConvention>> = 
     architecture: 'arm64',
     outputName: 'darwin-arm64',
     targetFamily: 'macos',
-    useNapiCross: false,
   },
   'x86_64-apple-darwin': {
     architecture: 'x64',
     outputName: 'darwin-x64',
     targetFamily: 'macos',
-    useNapiCross: false,
   },
   'aarch64-unknown-linux-gnu': {
     architecture: 'arm64',
     outputName: 'linux-arm64-gnu',
     targetFamily: 'linux',
-    useNapiCross: true,
   },
   'x86_64-unknown-linux-gnu': {
     architecture: 'x64',
     outputName: 'linux-x64-gnu',
     targetFamily: 'linux',
-    useNapiCross: true,
   },
 };
+
+const NATIVE_LINUX_COMPILER_ENV = Object.freeze({ CC: 'cc', CXX: 'c++' });
+const CROSS_LINUX_COMPILER_ENV = Object.freeze({ TARGET_CC: 'clang', TARGET_CXX: 'clang++' });
+
+function usesNapiCross(target: NapiTargetConvention, hostPlatform: NapiPlatform | null): boolean {
+  return target.targetFamily === 'linux' && !sameNapiPlatform(target, hostPlatform);
+}
+
+function napiCompilerEnv(
+  target: NapiPlatform | null,
+  hostPlatform: NapiPlatform | null,
+): Readonly<Record<string, string>> | undefined {
+  if (target?.targetFamily !== 'linux') return undefined;
+  return sameNapiPlatform(target, hostPlatform) ? NATIVE_LINUX_COMPILER_ENV : CROSS_LINUX_COMPILER_ENV;
+}
 
 const NAPI_TOOLCHAIN_TARGET_PREFIX = 'napi-toolchain-';
 
@@ -300,9 +313,10 @@ async function addPerPackageCargoTestTargets(
   return packageTargetNames;
 }
 
-export const createNodesV2: CreateNodesV2 = [
-  '**/package.json',
-  async (projectConfigurationFiles, _options, context) => {
+type CreateNodesHandler = CreateNodesV2[1];
+
+function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandler {
+  return async (projectConfigurationFiles, _options, context) => {
     const results: CreateNodesResultV2 = [];
     const errors: Array<[file: string | null, error: Error]> = [];
 
@@ -315,7 +329,10 @@ export const createNodesV2: CreateNodesV2 = [
             results.push([packageJsonPath, {}]);
             return;
           }
-          results.push([packageJsonPath, await createProjectTargets(packageJsonPath, context.workspaceRoot)]);
+          results.push([
+            packageJsonPath,
+            await createProjectTargets(packageJsonPath, context.workspaceRoot, hostPlatform),
+          ]);
         } catch (error) {
           errors.push([packageJsonPath, error instanceof Error ? error : new Error(String(error))]);
         }
@@ -327,7 +344,16 @@ export const createNodesV2: CreateNodesV2 = [
     }
 
     return results;
-  },
+  };
+}
+
+export function createNodesV2ForPlatform(platform: NodeJS.Platform, architecture: string): CreateNodesV2 {
+  return ['**/package.json', createNodesHandler(napiPlatform(platform, architecture))];
+}
+
+export const createNodesV2: CreateNodesV2 = [
+  '**/package.json',
+  (...args) => createNodesHandler(napiPlatform(process.platform, process.arch))(...args),
 ];
 
 function isManagedPackageJsonSource(packageJsonPath: string): boolean {
@@ -347,7 +373,7 @@ interface PackageJson {
   };
 }
 
-async function createProjectTargets(packageJsonPath: string, workspaceRoot: string) {
+async function createProjectTargets(packageJsonPath: string, workspaceRoot: string, hostPlatform: NapiPlatform | null) {
   const projectRoot = dirname(packageJsonPath);
   const absoluteProjectRoot = join(workspaceRoot, projectRoot);
   const packageJson = await readPackageJson(join(workspaceRoot, packageJsonPath));
@@ -442,7 +468,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
   }
 
   if (napiConfig) {
-    Object.assign(targets, createNapiTargets(projectRoot, napiConfig));
+    Object.assign(targets, createNapiTargets(projectRoot, napiConfig, hostPlatform));
     if (
       !('napi-test' in (packageJson.nx?.targets ?? {})) &&
       existsSync(join(absoluteProjectRoot, 'src/native.test.ts'))
@@ -706,7 +732,7 @@ async function createProjectTargets(packageJsonPath: string, workspaceRoot: stri
       dependsOn: [
         '^build',
         ...BUILD_OUTPUT_DEPENDENCIES,
-        ...hostPlatformTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)]),
+        ...hostPlatformTargetNames([...Object.keys(declaredTargets), ...Object.keys(targets)], hostPlatform),
       ],
     };
   }
@@ -918,21 +944,27 @@ function resolveNapiConfig(
   return { binaryName, cargoPackage, manifestPath, targets };
 }
 
-function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Record<string, TargetConfiguration> {
+function createNapiTargets(
+  projectRoot: string,
+  config: ResolvedNapiConfig,
+  hostPlatform: NapiPlatform | null,
+): Record<string, TargetConfiguration> {
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage}`;
-  const hostPlatformTargetName = HOST_PLATFORM_SUFFIX === null ? null : `napi${HOST_PLATFORM_SUFFIX}`;
+  const hostPlatformTargetName =
+    hostPlatform === null ? null : `napi-${hostPlatform.architecture}-${hostPlatform.targetFamily}`;
   let nativeHostTargetName: string | null = null;
   if (hostPlatformTargetName !== null) {
     for (const triple of config.targets) {
       const convention = NAPI_TARGET_CONVENTIONS[triple];
       const targetName = convention ? `napi-${convention.architecture}-${convention.targetFamily}` : null;
-      if (targetName === hostPlatformTargetName && !convention?.useNapiCross) {
+      if (targetName === hostPlatformTargetName && convention && !usesNapiCross(convention, hostPlatform)) {
         nativeHostTargetName = targetName;
         break;
       }
     }
   }
   const targets: Record<string, TargetConfiguration> = {};
+  const hostCompilerEnv = napiCompilerEnv(hostPlatform, hostPlatform);
 
   // The addon the test suite loads. A dev-profile build shares target/debug
   // with cargo-test's dependency graph, so after the tests compile this is
@@ -950,7 +982,7 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
     options: {
       cwd: projectRoot,
       command: `napi build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir .cache/native-debug`,
-      env: HOST_NAPI_COMPILER_ENV,
+      ...(hostCompilerEnv ? { env: hostCompilerEnv } : {}),
     },
   };
 
@@ -968,14 +1000,14 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
       options: {
         cwd: projectRoot,
         command: `napi build --release --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir dist/native/host`,
-        env: HOST_NAPI_COMPILER_ENV,
+        ...(hostCompilerEnv ? { env: hostCompilerEnv } : {}),
       },
     };
   }
 
   for (const triple of config.targets) {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
-    if (!convention?.useNapiCross) {
+    if (!convention || !usesNapiCross(convention, hostPlatform)) {
       continue;
     }
     // One toolchain target per triple, shared by every cross build that needs
@@ -1000,20 +1032,22 @@ function createNapiTargets(projectRoot: string, config: ResolvedNapiConfig): Rec
     }
     const targetName = `napi-${convention.architecture}-${convention.targetFamily}`;
     const outputDirectory = `dist/native/${convention.outputName}`;
-    const crossFlag = convention.useNapiCross ? ' --use-napi-cross' : '';
+    const useNapiCross = usesNapiCross(convention, hostPlatform);
+    const crossFlag = useNapiCross ? ' --use-napi-cross' : '';
+    const compilerEnv = napiCompilerEnv(convention, hostPlatform);
     targets[targetName] = {
       executor: 'nx:run-commands',
       cache: true,
-      ...(convention.useNapiCross ? { dependsOn: [napiToolchainTargetName(convention)] } : {}),
+      ...(useNapiCross ? { dependsOn: [napiToolchainTargetName(convention)] } : {}),
       inputs: NAPI_INPUTS,
       outputs: [`{projectRoot}/${outputDirectory}`],
       options: {
         cwd: projectRoot,
         command: `napi build --release --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple}${crossFlag} ${commonCommand} --output-dir ${outputDirectory}`,
-        // @napi-rs recognizes Clang and supplies its downloaded GNU sysroot
-        // and toolchain flags. This keeps sccache enabled while avoiding the
-        // old bundled GCC, which rejects sccache's diagnostics-color flag.
-        ...(convention.useNapiCross ? { env: { TARGET_CC: 'clang', TARGET_CXX: 'clang++' } } : {}),
+        // Genuine Linux cross-compiles use Clang plus napi-rs's downloaded
+        // GNU sysroot. A native Linux target uses Nix's cc wrapper so C build
+        // scripts resolve the host libc headers instead.
+        ...(compilerEnv ? { env: compilerEnv } : {}),
       },
     };
   }
