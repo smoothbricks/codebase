@@ -35,7 +35,7 @@
 //! `01i` derives for the TypeScript frozen-object model, reached with a stronger
 //! mechanism: here immutability is enforced by the type, not by `Object.freeze`.
 
-use crate::columns::SharedStr;
+use crate::arena::ScopeText;
 use std::sync::Arc;
 
 /// One scope attribute value. Variants correspond 1:1 to the column kinds a schema
@@ -47,9 +47,18 @@ pub enum ScopeValue {
     Number(f64),
     Uint64(u64),
     Boolean(bool),
-    /// `category` and `text` columns. A `&'static str` value costs zero allocations;
-    /// a dynamic value rides an `Arc` refcount.
-    Text(SharedStr),
+    /// `category` and `text` columns.
+    ///
+    /// Deliberately NOT a [`crate::columns::SharedStr`]: a `SpanScope` is shared
+    /// between a parent and its children by refcount, and an arena handle is
+    /// only meaningful to the store that issued it — a child resolving its
+    /// parent's handle against its own arena would read the wrong bytes, which
+    /// is silent corruption rather than a compile error. The cold shared
+    /// snapshot and the hot row cell are different problems and get different
+    /// types. `Borrowed` keeps `'static` vocabulary free; `Owned` pays one
+    /// allocation on the scope-merge path, which already allocates. Rows intern
+    /// this into their own arena at materialization.
+    Text(ScopeText),
     /// `enum` columns: index into the schema-time dictionary.
     EnumIndex(u16),
 }
@@ -184,7 +193,7 @@ mod tests {
     use super::*;
 
     fn text(value: &'static str) -> Option<ScopeValue> {
-        Some(ScopeValue::Text(SharedStr::Static(value)))
+        Some(ScopeValue::Text(ScopeText::Borrowed(value)))
     }
 
     fn merged(current: Option<&SpanScope>, update: &[ScopeEntry]) -> SpanScope {

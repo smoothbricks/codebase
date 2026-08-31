@@ -19,7 +19,9 @@
 //! here it prints a summary so the example has no cross-crate dependency on
 //! the in-progress arrow crate.
 
-use lmao_core::{Clock, EntryType, SpanBuffer, SystemClock, TraceContext, TraceId, Transient};
+use lmao_core::{
+    Clock, EntryType, SpanBuffer, SystemClock, TextInput, TraceContext, TraceId, Transient,
+};
 use lmao_macros::define_log_schema;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +57,7 @@ async fn main() {
             );
             for call in 0..25 {
                 let (out, buf) = trace.span_with_retry(
-                    "tool-call",
+                    TextInput::Static("tool-call"),
                     None,
                     64,
                     |_delay_ms| { /* tokio::time::sleep in real async retry */ },
@@ -72,8 +74,9 @@ async fn main() {
                 let _ = out; // jcode: surface Err to the turn loop
                 for span in buf {
                     let mut traced = ToolCallSchema::from_span(span);
+                    let tool_name = format!("tool-{}", call % 5);
                     traced
-                        .tag_tool_name(format!("tool-{}", call % 5))
+                        .tag_tool_name(TextInput::Dynamic(&tool_name))
                         .tag_cache_hit(call % 3 == 0)
                         .tag_duration_ms(1.5 * (call as f64 + 1.0))
                         .tag_tokens(128 * call);

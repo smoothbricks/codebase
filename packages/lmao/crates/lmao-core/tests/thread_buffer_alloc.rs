@@ -8,7 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use lmao_core::{
-    ColumnValue, EntryType, FieldMeta, FieldStrategy, SharedStr, ThreadSpanBuffer, TraceId,
+    ColumnValue, EntryType, FieldMeta, FieldStrategy, TextInput, ThreadSpanBuffer, TraceId,
 };
 
 struct CountingAlloc;
@@ -46,10 +46,10 @@ fn trace() -> TraceId {
 #[test]
 fn open_end_log_tag_are_alloc_free_after_warmup() {
     let mut buffer = ThreadSpanBuffer::new(7, 64, FIELDS);
-    let warmup_name = SharedStr::Static("warmup");
-    let warmup_log = SharedStr::Static("warmup-log");
-    let hot_name = SharedStr::Static("hot");
-    let hot_log = SharedStr::Static("hot-log");
+    let warmup_name = TextInput::Static("warmup");
+    let warmup_log = TextInput::Static("warmup-log");
+    let hot_name = TextInput::Static("hot");
+    let hot_log = TextInput::Static("hot-log");
     let id = trace();
 
     // Warm: one span, first-touch of the message column, first-touch of the

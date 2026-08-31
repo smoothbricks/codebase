@@ -33,7 +33,7 @@
 
 use lmao_core::clock::{Clock, TraceAnchor};
 use lmao_core::{
-    EntryType, F64Column, ScopeEntry, ScopeValue, SharedStr, SpanBuffer, SpanIdentity, SpanScope,
+    EntryType, F64Column, ScopeEntry, ScopeValue, SpanBuffer, SpanIdentity, SpanScope, TextInput,
     TraceContext, TraceId,
 };
 use lmao_macros::define_log_schema;
@@ -146,7 +146,7 @@ fn any_value() -> impl Strategy<Value = ScopeValue> {
         (-1000i32..1000).prop_map(|n| ScopeValue::Number(f64::from(n))),
         (0u64..1000).prop_map(ScopeValue::Uint64),
         any::<bool>().prop_map(ScopeValue::Boolean),
-        (0usize..FIELDS.len()).prop_map(|i| ScopeValue::Text(SharedStr::Static(FIELDS[i]))),
+        (0usize..FIELDS.len()).prop_map(|i| ScopeValue::Text(FIELDS[i].into())),
     ]
 }
 
@@ -285,12 +285,12 @@ proptest! {
             expected = ts_set_scope(&expected, update);
         }
 
-        let (_, root) = t.span("parent", None, 8, |ctx| {
+        let (_, root) = t.span(TextInput::Static("parent"), None, 8, |ctx| {
             for update in &before {
                 ctx.set_scope(update);
             }
             // The child snapshots here, by reference.
-            ctx.child("kid", 8, |_| Ok::<_, ()>(()))?;
+            ctx.child(TextInput::Static("kid"), 8, |_| Ok::<_, ()>(()))?;
             // Everything from here on must be invisible to that child.
             for update in &after {
                 ctx.set_scope(update);
@@ -320,10 +320,10 @@ proptest! {
         let t = trace();
         let expected = ts_set_scope(&BTreeMap::new(), &update);
 
-        let (_, root) = t.span("parent", None, 8, |ctx| {
-            ctx.child("before", 8, |_| Ok::<_, ()>(()))?;
+        let (_, root) = t.span(TextInput::Static("parent"), None, 8, |ctx| {
+            ctx.child(TextInput::Static("before"), 8, |_| Ok::<_, ()>(()))?;
             ctx.set_scope(&update);
-            ctx.child("after", 8, |_| Ok::<_, ()>(()))?;
+            ctx.child(TextInput::Static("after"), 8, |_| Ok::<_, ()>(()))?;
             Ok::<_, ()>(())
         });
 
@@ -337,9 +337,11 @@ proptest! {
         let t = trace();
         let expected = ts_set_scope(&BTreeMap::new(), &update);
 
-        let (_, root) = t.span("root", None, 8, |ctx| {
+        let (_, root) = t.span(TextInput::Static("root"), None, 8, |ctx| {
             ctx.set_scope(&update);
-            ctx.child("mid", 8, |mid| mid.child("leaf", 8, |_| Ok::<_, ()>(())))
+            ctx.child(TextInput::Static("mid"), 8, |mid| {
+                mid.child(TextInput::Static("leaf"), 8, |_| Ok::<_, ()>(()))
+            })
         });
 
         let leaf = &root.children()[0].children()[0];
@@ -429,9 +431,9 @@ define_log_schema!(pub ParitySchema {
 #[test]
 fn generated_fill_scope_places_values_like_the_spec_table() {
     let t = trace();
-    let (_, span) = t.span("processOrder", None, 8, |ctx| {
+    let (_, span) = t.span(TextInput::Static("processOrder"), None, 8, |ctx| {
         ctx.set_scope(&[
-            ParitySchema::scope_route(Some(SharedStr::Static("processing"))),
+            ParitySchema::scope_route(Some("processing".into())),
             ParitySchema::scope_hits(Some(1.0)),
         ]);
         ctx.log(EntryType::Info, "step 1", 1);
@@ -440,8 +442,8 @@ fn generated_fill_scope_places_values_like_the_spec_table() {
     });
 
     let mut traced = ParitySchema::from_span(span);
-    traced.tag_route("started"); // row 0 direct write
-    traced.set_route(2, "validating"); // one log row direct write
+    traced.tag_route(TextInput::Static("started")); // row 0 direct write
+    traced.set_route(2, TextInput::Static("validating")); // one log row direct write
     let filled = traced.fill_scope();
 
     // Rows 0..write_index = span-start, completion, and the two log entries.
@@ -480,7 +482,7 @@ fn generated_fill_scope_places_values_like_the_spec_table() {
 #[test]
 fn generated_fill_scope_handles_enum_fields() {
     let t = trace();
-    let (_, span) = t.span("op", None, 8, |ctx| {
+    let (_, span) = t.span(TextInput::Static("op"), None, 8, |ctx| {
         ctx.set_scope(&[ParitySchema::scope_outcome(Some(2)).expect("in-range index")]);
         Ok::<_, ()>(())
     });
@@ -503,13 +505,13 @@ fn enum_scope_constructor_refuses_an_out_of_range_index() {
 #[test]
 fn overflow_chain_shares_one_scope() {
     let t = trace();
-    let (_, span) = t.span("overflowing", None, 8, |ctx| {
+    let (_, span) = t.span(TextInput::Static("overflowing"), None, 8, |ctx| {
         // Capacity 8 with rows 0..1 reserved: 6 appends fill it, the 7th overflows.
         for _ in 0..7 {
             ctx.log(EntryType::Info, "filler", 0);
         }
         // Scope set AFTER the overflow buffer already exists.
-        ctx.set_scope(&[ParitySchema::scope_route(Some(SharedStr::Static("late")))]);
+        ctx.set_scope(&[ParitySchema::scope_route(Some("late".into()))]);
         Ok::<_, ()>(())
     });
 
@@ -530,7 +532,7 @@ fn overflow_chain_shares_one_scope() {
 #[test]
 fn unknown_scope_fields_are_ignored() {
     let t = trace();
-    let (_, span) = t.span("op", None, 8, |ctx| {
+    let (_, span) = t.span(TextInput::Static("op"), None, 8, |ctx| {
         ctx.set_scope(&[("not_a_column", Some(ScopeValue::Uint64(1)))]);
         Ok::<_, ()>(())
     });
@@ -547,7 +549,7 @@ fn unknown_scope_fields_are_ignored() {
 #[should_panic(expected = "expects ScopeValue::Number")]
 fn mismatched_scope_variant_panics_in_debug() {
     let t = trace();
-    let (_, span) = t.span("op", None, 8, |ctx| {
+    let (_, span) = t.span(TextInput::Static("op"), None, 8, |ctx| {
         ctx.set_scope(&[("hits", Some(ScopeValue::Boolean(true)))]);
         Ok::<_, ()>(())
     });

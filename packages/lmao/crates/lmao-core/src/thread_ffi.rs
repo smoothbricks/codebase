@@ -6,7 +6,8 @@
 //! zero on failure; u8 status endpoints return zero on success and nonzero on
 //! failure.
 
-use crate::columns::{FieldMeta, SharedStr};
+use crate::arena::TextInput;
+use crate::columns::FieldMeta;
 use crate::entry_type::EntryType;
 use crate::identity::TraceId;
 use crate::packed_header::VocabularyId;
@@ -43,13 +44,22 @@ fn parse_trace(ptr: *const u8, len: usize) -> Option<TraceId> {
     TraceId::new(Arc::<str>::from(value)).ok()
 }
 
-fn parse_shared(ptr: *const u8, len: usize) -> Option<SharedStr> {
+/// Borrow the caller's UTF-8 for the duration of one ABI call.
+///
+/// The borrow is unbounded, which is sound only because every caller hands the
+/// result straight to a row store that copies it into its arena before
+/// returning. The bytes belong to the caller and are not retained: that is the
+/// same discipline the reverse ABI runs in `containium-realm-spans`.
+///
+/// # Safety
+/// `ptr..ptr + len` must be readable until the returned borrow is dropped.
+unsafe fn parse_text<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
     if len > 0 && ptr.is_null() {
         return None;
     }
     // SAFETY: callers promise `ptr..ptr+len` is readable storage for this call.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-    ThreadSpanBuffer::shared_utf8(bytes).ok()
+    ThreadSpanBuffer::utf8(bytes).ok()
 }
 
 fn packed_row(span_id: u32, row: u32) -> u64 {
@@ -240,14 +250,14 @@ pub unsafe extern "C" fn thread_span_buffer_open_span_dynamic(
     let Some(trace_id) = parse_trace(trace_ptr, trace_len) else {
         return 0;
     };
-    let Some(name) = parse_shared(name_ptr, name_len) else {
+    let Some(name) = (unsafe { parse_text(name_ptr, name_len) }) else {
         return 0;
     };
     let Ok(span_id) = buffer.open_span(
         trace_id,
         parent_thread_id,
         parent_span_id,
-        name,
+        TextInput::Dynamic(name),
         timestamp,
         line,
     ) else {
@@ -357,30 +367,36 @@ pub unsafe extern "C" fn thread_span_buffer_append_log_dynamic(
     let Some(entry_type) = EntryType::from_u8(entry_type) else {
         return 0;
     };
-    let Some(message) = parse_shared(message_ptr, message_len) else {
+    let Some(message) = (unsafe { parse_text(message_ptr, message_len) }) else {
         return 0;
     };
-    let Ok(row) = buffer.append_log(span_id, entry_type, Some(message), line, timestamp) else {
+    let Ok(row) = buffer.append_log(
+        span_id,
+        entry_type,
+        Some(TextInput::Dynamic(message)),
+        line,
+        timestamp,
+    ) else {
         return 0;
     };
     packed_row(span_id, row)
 }
 
-fn decode_value(buffer: &ThreadSpanBuffer, kind: u8, value: u64) -> Option<ColumnValue> {
+fn decode_value(kind: u8, value: u64) -> Option<ColumnValue> {
     match kind {
         ATTRIBUTE_KIND_NUMBER => Some(ColumnValue::Number(f64::from_bits(value))),
         ATTRIBUTE_KIND_UINT64 => Some(ColumnValue::Uint64(value)),
         ATTRIBUTE_KIND_BOOLEAN => (value <= 1).then_some(ColumnValue::Boolean(value != 0)),
-        ATTRIBUTE_KIND_TEXT => buffer
-            .interned_shared_value(u32::try_from(value).ok()?)
-            .map(ColumnValue::Text),
+        // The ABI already passes text by intern ordinal, so the row store takes
+        // the integer straight through — no string is reconstructed here.
+        ATTRIBUTE_KIND_TEXT => Some(ColumnValue::Text(u32::try_from(value).ok()?)),
         ATTRIBUTE_KIND_ENUM => Some(ColumnValue::Enum(u16::try_from(value).ok()?)),
         _ => None,
     }
 }
 
 fn write_value(buffer: &mut ThreadSpanBuffer, row: u32, ordinal: u16, kind: u8, value: u64) -> u8 {
-    let Some(value) = decode_value(buffer, kind, value) else {
+    let Some(value) = decode_value(kind, value) else {
         return 1;
     };
     buffer.write_attr(row, ordinal, value).is_err() as u8
@@ -443,15 +459,23 @@ pub unsafe extern "C" fn thread_span_buffer_set_scope(
     let Some(field) = buffer.schema_fields().get(index) else {
         return 1;
     };
-    let Some(value) = decode_value(buffer, kind, value) else {
+    let Some(value) = decode_value(kind, value) else {
         return 1;
     };
     let scope_value = match value {
         ColumnValue::Number(value) => crate::ScopeValue::Number(value),
         ColumnValue::Uint64(value) => crate::ScopeValue::Uint64(value),
         ColumnValue::Boolean(value) => crate::ScopeValue::Boolean(value),
-        ColumnValue::Text(value) => crate::ScopeValue::Text(value),
         ColumnValue::Enum(value) => crate::ScopeValue::EnumIndex(value),
+        // A scope is shared between spans by refcount, so it cannot carry an
+        // arena handle. The cold path takes one owned copy; rows re-intern it
+        // into their own arena at materialization, which is a hash hit.
+        ColumnValue::Text(ordinal) => {
+            let Some(text) = buffer.interned(ordinal) else {
+                return 1;
+            };
+            crate::ScopeValue::Text(std::borrow::Cow::Owned(text.to_owned()))
+        }
     };
     let update = [(field.name, Some(scope_value))];
     buffer.set_scope(span_id, &update).is_err() as u8

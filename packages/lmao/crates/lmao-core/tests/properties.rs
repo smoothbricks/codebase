@@ -104,7 +104,7 @@ proptest! {
 
 // --- Properties added with the full lmao-core implementation ---
 
-use lmao_core::{F64Column, StrColumn, TraceContext};
+use lmao_core::{F64Column, StrColumn, TextInput, TraceContext};
 
 proptest! {
     /// Lazy column memory accounting: bytes are 0 until first touch, then exactly
@@ -198,7 +198,7 @@ fn run(capacity_exp: usize, ops: &[(u8, u16)]) -> lmao_core::SpanBuffer {
         42,
         std::sync::Arc::new(clock),
     );
-    let (_, buf) = trace.span("root", None, 1 << capacity_exp, |ctx| {
+    let (_, buf) = trace.span(TextInput::Static("root"), None, 1 << capacity_exp, |ctx| {
         for (op, val) in ops {
             match op {
                 0 => {
@@ -211,7 +211,7 @@ fn run(capacity_exp: usize, ops: &[(u8, u16)]) -> lmao_core::SpanBuffer {
                     ctx.append(EntryType::BufferWrites);
                 }
                 _ => {
-                    ctx.child("kid", 8, |c| {
+                    ctx.child(TextInput::Static("kid"), 8, |c| {
                         c.log(EntryType::Debug, "child {v}", *val as u32);
                         Ok::<_, ()>(())
                     })?;
