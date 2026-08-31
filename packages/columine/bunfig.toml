@@ -1,5 +1,18 @@
 [test]
-preload = ["@smoothbricks/validation/bun/preload"]
+# NO ttsc preload here, deliberately. columine has zero Typia/LMAO transform
+# callsites — `grep -rn "typia\.\|createAssert\|createValidate" src` is empty, and
+# so is the library source of @smoothbricks/validation that these tests import —
+# so the preload transformed nothing while costing the entire suite runtime.
+# @ttsc/unplugin snapshots and SHA-256s the whole project-root tree on the first
+# transform per tsconfig project; measured here, holding `root` fixed and changing
+# only this line: full suite 34,662ms -> 69ms, one file 89,777ms -> 13ms, with
+# identical test counts and identical pass/fail.
+#
+# If you add a Typia or LMAO callsite to this package, restore
+# `preload = ["@smoothbricks/validation/bun/preload"]`. You will not be able to
+# miss it: an untransformed callsite fails loudly at runtime with `no transform
+# has been configured`, never silently.
+#
 # `bun test <arg>` treats its argument as a FILTER and scans the package, following
 # symlinks. `target/cargo-lint-cross-home/git` points at ~/.cargo/git, which holds a
 # git checkout of this repository, so an unscoped scan collects a stale vendored copy
