@@ -118,11 +118,12 @@
   # is part of a cache key, so two of them mean two caches.
   #
   # Pinned to the patch release ttsc vendors inside its native package, because
-  # that SDK is not overridable — ttsc exposes only TTSC_CACHE_DIR and
-  # TTSC_TSGO_BINARY — so matching it is the only way to have ONE Go rather than
-  # ours plus a dependency's. `smoo monorepo check` enforces the match and fails
-  # with both versions when they diverge, which is what makes this pin a
-  # maintained invariant instead of a comment that rots.
+  # that SDK is not overridable — ttsc exposes cache locations and
+  # TTSC_TSGO_BINARY, never the Go it builds plugins with — so matching it is the
+  # only way to have ONE Go rather than ours plus a dependency's. `smoo monorepo
+  # check` enforces the match and fails with both versions when they diverge,
+  # which is what makes this pin a maintained invariant instead of a comment that
+  # rots.
   #
   # It needs its own input because the fleet's nixpkgs does not carry that patch:
   # devenv-nixpkgs rolling ships go 1.26.5 and its `go_1_27` is a release
@@ -194,11 +195,29 @@
     #    is Go's stable way to keep absolute build paths out of the artifact, and
     #    unlike Rust's trim-paths it costs no cache reuse.
     #
-    #    ttsc's plugin builds use the Go it bundles; that is not overridable (it
-    #    exposes only TTSC_CACHE_DIR and TTSC_TSGO_BINARY), so the repository's own
-    #    Go modules and ttsc's plugin builds are two toolchains by construction.
-    #    Placing both caches in the shared store is what keeps that from costing a
-    #    rebuild per workspace.
+    #    ttsc's plugin builds use the Go it bundles rather than ours, so the
+    #    repository's own Go work and ttsc's plugin builds are two toolchains by
+    #    construction. Placing both caches in the shared store is what keeps that
+    #    from costing a rebuild per workspace.
+    #
+    #    TTSC_GO_CACHE_DIR and GOCACHE stay separate for ownership, not
+    #    correctness: both caches are content-addressed, so one directory would
+    #    compile the same bytes to the same entries. What sharing loses is an
+    #    owner. ttsc reclaims a Go build cache only when it resolved that
+    #    directory itself — `ttsc clean` takes the cache whose source is
+    #    TTSC_GO_CACHE_DIR and never one whose source is a user GOCACHE, which it
+    #    treats as someone else's property. Pointing ttsc at GOCACHE therefore
+    #    produced a directory ttsc filled and no repository verb could empty,
+    #    measured at 35G here. A dedicated directory gives ttsc's half back to
+    #    `ttsc clean` and leaves GOCACHE holding only Go work this repository does
+    #    itself, which is one module.
+    #
+    #    That buys ownership, not automatic GC: ttsc prunes opportunistically only
+    #    when it owns the whole cache root, which requires TTSC_CACHE_DIR unset,
+    #    and a pinned shared root is the point of the block below. The trade is
+    #    deliberate — one warm cache every workspace shares, reclaimed by an
+    #    explicit verb, over per-workspace caches that self-trim. Go's own build
+    #    cache trimming belongs to the go command and still applies to both.
     # 5. enter-shell.ts chdirs to the workspace root and runs setup-environment.ts;
     #    a failed bootstrap aborts shell entry instead of yielding a half-working
     #    shell.
@@ -226,11 +245,12 @@
         export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$HOME/.cowshed/caches/ttsc}"
         export GOCACHE="''${GOCACHE:-$HOME/.cowshed/caches/go/build}"
         export GOMODCACHE="''${GOMODCACHE:-$HOME/.cowshed/caches/go/mod}"
-        mkdir -p "$TTSC_CACHE_DIR" "$GOCACHE" "$GOMODCACHE"
+        mkdir -p "$GOCACHE" "$GOMODCACHE"
       else
         export TTSC_CACHE_DIR="''${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
-        mkdir -p "$TTSC_CACHE_DIR"
       fi
+      export TTSC_GO_CACHE_DIR="''${TTSC_GO_CACHE_DIR:-$TTSC_CACHE_DIR/go-build}"
+      mkdir -p "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR"
       export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
       bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
