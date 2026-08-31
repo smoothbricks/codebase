@@ -54,21 +54,28 @@ function f64Bits(value: number): bigint {
  *
  * The target array is never populated: the native store is the only reader of
  * these values, so mirroring them into JS would allocate a second copy of
- * every row for nobody. `length` still tracks so generated loggers that read
- * it back see a coherent lane.
+ * every row for nobody. `length` is a high-water mark held in a closure rather
+ * than on the target — storing it on the array reshapes indexed storage on
+ * every write and cost 39 ns of a 228 ns row, more than the ABI crossing it
+ * accompanies, for a number no reader of this lane consults.
  */
 function laneProxy(write: (index: number, value: unknown) => void): unknown[] {
   const target: unknown[] = [];
+  let highWater = 0;
   return new Proxy(target, {
+    get(obj, prop, receiver) {
+      if (prop === 'length') return highWater;
+      return Reflect.get(obj, prop, receiver);
+    },
     set(obj, prop, value) {
       if (prop === 'length') {
-        obj.length = Number(value);
+        highWater = Number(value);
         return true;
       }
       const index = typeof prop === 'string' ? Number(prop) : Number.NaN;
       if (Number.isInteger(index) && index >= 0) {
         write(index, value);
-        if (index >= obj.length) obj.length = index + 1;
+        if (index >= highWater) highWater = index + 1;
         return true;
       }
       Reflect.set(obj, prop, value);
