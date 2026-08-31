@@ -15,8 +15,8 @@ use crate::gateway_service::{
 };
 use crate::launchd::{
     ExistingPlist, InstallState, LaunchAgentSpec, LaunchAgentTarget, LaunchdExecutor,
-    LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand, SCCACHE_LABEL,
-    StoreBackedProgram, kickstart_hint, plan_install,
+    LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand, PRIVATE_PLIST_MODE,
+    SCCACHE_LABEL, StoreBackedProgram, kickstart_hint, plan_install,
 };
 use crate::output::Output;
 use crate::sccache_nix;
@@ -27,6 +27,7 @@ use cowshed_core::storage::bootstrap::ValidatedHostStorage;
 use cowshed_core::{CowshedError, NativeGatewayInventory, Result, validate_existing_host_storage};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -150,8 +151,36 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
         },
     );
     let uid = effective_uid();
+    // The definition this install is about to replace, kept whole for the length of one activation.
+    // Its ProgramArguments[0] is also written down, because after a rollback the operator's question
+    // is "which store path was I running", and a restored plist answers that only until the next
+    // install. The sibling path — refresh_gateway_binary — retains the previous *binary* for the
+    // same reason: one install path failing closed while its sibling fails open is an asymmetry
+    // that reads as deliberate to the next person.
+    let previous = observed
+        .plist
+        .as_ref()
+        .map(|plist| plist.bytes.clone())
+        .filter(|bytes| bytes != &spec.plist_bytes());
+    if let Some(bytes) = previous.as_deref() {
+        record_previous_program(&home, bytes);
+    }
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
-    activate_launch_agent(&mut executor, uid, spec.target(), written)?;
+    if let Err(error) = activate_launch_agent(&mut executor, uid, spec.target(), written) {
+        return Err(match previous {
+            Some(bytes) => {
+                let rollback = restore_previous_plist(spec.plist_path(), &bytes);
+                CowshedError::new(
+                    error.code,
+                    format!("{}; {rollback}", error.message),
+                    error.hint,
+                )
+            }
+            // No previous definition, so there is nothing to restore and deleting the new one
+            // would only hide the failed activation.
+            None => error,
+        });
+    }
 
     let deadline = tokio::time::Instant::now() + START_DEADLINE;
     loop {
@@ -170,6 +199,81 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
             ));
         }
         tokio::time::sleep(START_POLL_INTERVAL).await;
+    }
+}
+
+/// Where the program the sccache agent ran before the last install is written down.
+///
+/// Beside the plists and the GC root, under cowshed's support directory. Provenance rather than
+/// state: nothing reads it back to make a decision — the GC root is the single authority on which
+/// build is installed — but it is the only place an operator can find the store path they were
+/// running before, and a store path is not something anyone reconstructs from memory.
+const SCCACHE_PREVIOUS_PROGRAM_RECORD: &str = "sccache-previous-program";
+
+/// `ProgramArguments[0]` as the plist spells it.
+///
+/// The first `<string>` inside the first `<array>`, which for every spec this module writes is the
+/// program. Matched rather than parsed with a plist library: the file is one this module generated,
+/// its shape is asserted byte for byte by the launchd tests, and a dependency that can fail to
+/// parse would be a second way for the record to come out empty.
+pub(crate) fn plist_program(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let array = text.find("<array>")? + "<array>".len();
+    let open = text[array..].find("<string>")? + array + "<string>".len();
+    let close = text[open..].find("</string>")? + open;
+    Some(text[open..close].trim())
+}
+
+/// Write the previous program path down. Best effort, and said out loud when it fails: an install
+/// that worked is not undone because a note could not be written.
+fn record_previous_program(home: &Path, previous_plist: &[u8]) {
+    let Some(program) = plist_program(previous_plist) else {
+        return;
+    };
+    let directory = sccache_nix::gc_root(home)
+        .parent()
+        .expect("the gc root is always derived with a parent")
+        .to_path_buf();
+    // `sccache start` can run on a host whose GC root directory has not been minted yet, and a
+    // note is worthless if the only path to it is the install that would have created it anyway.
+    let record = directory.join(SCCACHE_PREVIOUS_PROGRAM_RECORD);
+    if let Err(error) =
+        fs::create_dir_all(&directory).and_then(|()| fs::write(&record, format!("{program}\n")))
+    {
+        eprintln!(
+            "cowshed: could not record the previous sccache program in {}: {error}",
+            record.display()
+        );
+    }
+}
+
+/// Put the previous agent definition back, and say whether the host was left as it was found.
+///
+/// Reported in the returned sentence rather than raised, for the same reason the gateway's binary
+/// rollback is: the caller already holds the failure that prompted this, and a rollback that itself
+/// failed must be appended to that failure rather than replacing it — the two together are the
+/// host's actual state.
+///
+/// A temporary beside the target and a rename, so no launchd read ever sees a half-written plist.
+fn restore_previous_plist(plist: &Path, previous: &[u8]) -> String {
+    let program = plist_program(previous).unwrap_or("its previous program");
+    let temporary = plist.with_extension("plist.rollback");
+    let restored = fs::write(&temporary, previous)
+        .and_then(|()| {
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(PRIVATE_PLIST_MODE))
+        })
+        .and_then(|()| fs::rename(&temporary, plist));
+    match restored {
+        Ok(()) => {
+            format!("the previous definition was restored, so the agent still names {program}")
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            format!(
+                "the previous definition could NOT be restored ({error}); {} names the new build and its agent is not loaded",
+                plist.display()
+            )
+        }
     }
 }
 
@@ -393,7 +497,6 @@ pub fn emit_sccache_status<W: Write, E: Write>(
 mod tests {
     use super::*;
     use cowshed_core::storage::bootstrap::STORE_ROOT;
-    use std::os::unix::fs::PermissionsExt as _;
 
     /// A canonical absolute home, as every host-path type requires.
     fn scratch_home(label: &str) -> PathBuf {
@@ -473,6 +576,57 @@ mod tests {
             error.message
         );
         assert_eq!(error.hint, "cowshed setup --sccache");
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A failed activation must leave the agent naming the program it named before, and the store
+    /// path it replaced must survive as a note: after a rollback the operator's question is "which
+    /// build was I running", and a store path is not something anyone reconstructs from memory.
+    ///
+    /// The sibling path retains the previous *binary* for the same reason. One install path failing
+    /// closed while its sibling fails open is an asymmetry that reads as deliberate.
+    #[test]
+    fn a_failed_activation_restores_the_previous_agent_definition() {
+        let home = scratch_home("plist-rollback");
+        let plist = home.join("Library/LaunchAgents/dev.cowshed.sccache.plist");
+        fs::create_dir_all(plist.parent().expect("LaunchAgents")).expect("LaunchAgents");
+
+        let previous = b"<plist>\n  <array>\n    <string>/nix/store/old-sccache/bin/sccache</string>\n  </array>\n</plist>\n";
+        assert_eq!(
+            plist_program(previous),
+            Some("/nix/store/old-sccache/bin/sccache")
+        );
+
+        // The install has already replaced the definition; activation then failed.
+        fs::write(&plist, b"<plist>the new build</plist>").expect("new plist");
+        let sentence = restore_previous_plist(&plist, previous);
+        assert!(
+            sentence.contains("/nix/store/old-sccache/bin/sccache"),
+            "the rollback must name the program the agent went back to; got {sentence}"
+        );
+        assert_eq!(fs::read(&plist).expect("restored"), previous);
+        assert_eq!(
+            fs::metadata(&plist).expect("restored").permissions().mode() & 0o777,
+            PRIVATE_PLIST_MODE,
+            "a restored plist is as private as one this module writes"
+        );
+
+        // The provenance note names the store path that was replaced.
+        record_previous_program(&home, previous);
+        let record = sccache_nix::gc_root(&home)
+            .parent()
+            .expect("parent")
+            .join(SCCACHE_PREVIOUS_PROGRAM_RECORD);
+        assert_eq!(
+            fs::read_to_string(&record).expect("record"),
+            "/nix/store/old-sccache/bin/sccache\n"
+        );
+
+        // A rollback that cannot happen is reported, never swallowed.
+        let sentence =
+            restore_previous_plist(&home.join("gone/dev.cowshed.sccache.plist"), previous);
+        assert!(sentence.contains("could NOT be restored"), "got {sentence}");
 
         let _ = fs::remove_dir_all(&home);
     }
