@@ -871,6 +871,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // Regular functions close over constructor args directly - no property lookups
       // Using regular function (not arrow) allows destructuring while closing over args
       if (hasScope) {
+        if (!spanLogger) throw new TypeError('SpanContext scope capability requires a logger');
         this.setScope = (attributes: ScopeUpdate<Ctx['logSchema']> | null): void => {
           spanLogger._setScope(attributes ?? {});
           if (isThreadSpanView(this._spanBuffer)) {

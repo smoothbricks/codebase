@@ -235,7 +235,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Output remapping lives separately in `_remapDescriptor` and is interpreted
    * only by cold Arrow traversal.
    */
-  readonly _columns: ReadonlyArray<[string, unknown]>;
+  readonly _columns: ReadonlyArray<readonly [string, unknown]>;
 
   /** Immutable cold-path output remapping attached to canonical child buffers. */
   _remapDescriptor?: import('./logBinding.js').RemapDescriptor;

@@ -106,7 +106,9 @@ export interface ThreadSpanBufferWasmExports {
     handle: ThreadSpanBufferHandle,
     spanId: number,
     ordinal: number,
-    kind: ThreadAttributeKind,
+    // Kind 0 is the 01i clear sentinel (`setScope({ field: null })`); every
+    // value-carrying write uses a real attribute kind.
+    kind: ThreadAttributeKind | 0,
     value: bigint,
   ): number;
 }
@@ -157,9 +159,9 @@ export interface ThreadSpanBufferBinding {
     timestamp: bigint,
     line: number,
   ): bigint;
-  writeAttr(row: number, ordinal: number, kind: number, value: bigint): number;
-  writeTag(spanId: number, ordinal: number, kind: number, value: bigint): number;
-  setScope(spanId: number, ordinal: number, kind: number, value: bigint): number;
+  writeAttr(row: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
+  writeTag(spanId: number, ordinal: number, kind: ThreadAttributeKind, value: bigint): number;
+  setScope(spanId: number, ordinal: number, kind: ThreadAttributeKind | 0, value: bigint): number;
   intern(ptr: number, len: number): number;
 }
 

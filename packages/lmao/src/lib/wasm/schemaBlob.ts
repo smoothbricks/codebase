@@ -10,11 +10,12 @@
 import type { LogSchema } from '../schema/LogSchema.js';
 import { THREAD_ATTRIBUTE_KINDS, THREAD_SYSTEM_COLUMNS } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
+import type { ThreadAttributeKind } from './threadSpanBuffer.js';
 
 const SYSTEM_NAMES: Readonly<Record<string, true>> = Object.freeze(
   Object.fromEntries(THREAD_SYSTEM_COLUMNS.map((column) => [column.name, true as const])),
 );
-const KIND_BY_NAME: Readonly<Record<string, number>> = Object.freeze(
+const KIND_BY_NAME: Readonly<Record<string, ThreadAttributeKind>> = Object.freeze(
   Object.fromEntries(THREAD_ATTRIBUTE_KINDS.map((kind) => [kind.name, kind.discriminant])),
 );
 
@@ -24,7 +25,7 @@ export function isThreadSystemColumn(name: string): boolean {
   return SYSTEM_NAMES[name] === true;
 }
 
-export function attributeKindForSchemaType(type: string): number | undefined {
+export function attributeKindForSchemaType(type: string): ThreadAttributeKind | undefined {
   switch (type) {
     case 'number':
       return KIND_BY_NAME.number;

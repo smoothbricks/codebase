@@ -6,6 +6,7 @@
  * `*_values[idx] = v` — those lanes are proxies that forward to the binding.
  */
 
+import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import type { RemapDescriptor } from '../logBinding.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { LogSchema } from '../schema/LogSchema.js';
@@ -13,6 +14,7 @@ import { THREAD_ATTRIBUTE_KINDS } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 import { getThreadId } from '../threadId.js';
+import { createTraceId, type TraceId } from '../traceId.js';
 import type { ITraceRoot } from '../traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { getVocabularyGeneration } from '../vocabularyRegistry.js';
@@ -106,8 +108,7 @@ function f64Bits(value: number): bigint {
  * unit of its own — interception exists here only because the lane is not yet
  * a real column view.
  */
-function laneProxy(write: (index: number, value: unknown) => void): unknown[] {
-  const target: unknown[] = [];
+function laneProxy<A extends object>(target: A, write: (index: number, value: unknown) => void): A {
   let highWater = 0;
   return new Proxy(target, {
     get(obj, prop, receiver) {
@@ -148,7 +149,7 @@ export class ThreadSpanView {
   readonly binding: ThreadSpanBufferBinding;
   readonly layout: ThreadSpanLayout;
   readonly ordinals: ReadonlyMap<string, number>;
-  readonly kinds: ReadonlyMap<string, number>;
+  readonly kinds: ReadonlyMap<string, ThreadAttributeKind>;
   readonly enumVariants: ReadonlyMap<string, readonly string[]>;
 
   spanId = 0;
@@ -182,7 +183,7 @@ export class ThreadSpanView {
   _scopeValues: Readonly<Record<string, unknown>> = EMPTY_SCOPE;
   _remapDescriptor?: RemapDescriptor;
   readonly _logSchema: LogSchema;
-  readonly _columns: ReadonlyArray<[string, unknown]>;
+  readonly _columns: ReadonlyArray<readonly [string, unknown]>;
   readonly _stats: SpanBufferStats;
   readonly _vocabularyGeneration = getVocabularyGeneration();
   readonly _messageLayoutFamily = 'mixed' as const;
@@ -221,10 +222,11 @@ export class ThreadSpanView {
 
   get message_values(): (string | undefined)[] {
     const existing = this._laneStore[LANE_MESSAGE];
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- heterogeneous lane store; this slot is only ever written by this getter.
     if (existing !== undefined) return existing as (string | undefined)[];
-    const lane = laneProxy((index, value) => {
+    const lane = laneProxy<(string | undefined)[]>([], (index, value) => {
       this.commitLog(index, typeof value === 'string' ? value : String(value));
-    }) as (string | undefined)[];
+    });
     this._laneStore[LANE_MESSAGE] = lane;
     return lane;
   }
@@ -247,10 +249,11 @@ export class ThreadSpanView {
    */
   get _messageIds(): Uint16Array {
     const existing = this._laneStore[LANE_MESSAGE_IDS];
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- heterogeneous lane store; this slot is only ever written by this getter.
     if (existing !== undefined) return existing as Uint16Array;
-    const lane = laneProxy((index, value) => {
+    const lane = laneProxy(new Uint16Array(0), (index, value) => {
       this.commitStaticLog(index, this.vocabularyIdFor(Number(value)));
-    }) as unknown as Uint16Array;
+    });
     this._laneStore[LANE_MESSAGE_IDS] = lane;
     return lane;
   }
@@ -288,30 +291,33 @@ export class ThreadSpanView {
     this.lastRow = row;
   }
 
-  get error_code_values(): unknown[] {
+  get error_code_values(): string[] {
     const existing = this._laneStore[LANE_ERROR_CODE];
-    if (existing !== undefined) return existing as unknown[];
-    const lane = laneProxy((index, value) => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- heterogeneous lane store; this slot is only ever written by this getter.
+    if (existing !== undefined) return existing as string[];
+    const lane = laneProxy<string[]>([], (index, value) => {
       this.writeNamed('error_code', this.physicalRow(index), value);
     });
     this._laneStore[LANE_ERROR_CODE] = lane;
     return lane;
   }
 
-  get exception_stack_values(): unknown[] {
+  get exception_stack_values(): string[] {
     const existing = this._laneStore[LANE_EXCEPTION_STACK];
-    if (existing !== undefined) return existing as unknown[];
-    const lane = laneProxy((index, value) => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- heterogeneous lane store; this slot is only ever written by this getter.
+    if (existing !== undefined) return existing as string[];
+    const lane = laneProxy<string[]>([], (index, value) => {
       this.writeNamed('exception_stack', this.physicalRow(index), value);
     });
     this._laneStore[LANE_EXCEPTION_STACK] = lane;
     return lane;
   }
 
-  get ff_value_values(): unknown[] {
+  get ff_value_values(): string[] {
     const existing = this._laneStore[LANE_FF_VALUE];
-    if (existing !== undefined) return existing as unknown[];
-    const lane = laneProxy((index, value) => {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- heterogeneous lane store; this slot is only ever written by this getter.
+    if (existing !== undefined) return existing as string[];
+    const lane = laneProxy<string[]>([], (index, value) => {
       this.writeNamed('ff_value', this.physicalRow(index), value);
     });
     this._laneStore[LANE_FF_VALUE] = lane;
@@ -349,16 +355,18 @@ export class ThreadSpanView {
     return this.spanId;
   }
 
-  get trace_id(): string {
-    return this._traceRoot.trace_id;
+  get trace_id(): TraceId {
+    // Cold accessor (flush/assertions): re-validating the root's string here is
+    // cheaper than carrying a second branded copy on every view.
+    return createTraceId(this._traceRoot.trace_id);
   }
 
-  get _spanStartTime(): bigint {
-    return this.timestamp[0] ?? 0n;
+  get _spanStartTime(): Nanoseconds {
+    return Nanoseconds.unsafe(this.timestamp[0] ?? 0n);
   }
 
-  get _lastLoggedTime(): bigint | null {
-    return this.timestamp[0] === 0n ? null : this.timestamp[0];
+  get _lastLoggedTime(): Nanoseconds | null {
+    return this.timestamp[0] === 0n ? null : Nanoseconds.unsafe(this.timestamp[0]);
   }
 
   /**
@@ -436,7 +444,7 @@ export class ThreadSpanView {
     if (ordinal === undefined || kind === undefined) return this;
     if (value === null || value === undefined) return this;
     const scalar = this.encodeValue(name, kind, value);
-    const status = this.binding.writeAttr(row, ordinal, kind as ThreadAttributeKind, scalar);
+    const status = this.binding.writeAttr(row, ordinal, kind, scalar);
     if (status !== THREAD_SPAN_BUFFER_OK) throw new Error(`thread_span_buffer_write_attr failed for ${name}`);
     return this;
   }
@@ -447,7 +455,7 @@ export class ThreadSpanView {
     if (ordinal === undefined || kind === undefined) return this;
     if (value === null || value === undefined) return this;
     const scalar = this.encodeValue(name, kind, value);
-    const status = this.binding.writeTag(this.spanId, ordinal, kind as ThreadAttributeKind, scalar);
+    const status = this.binding.writeTag(this.spanId, ordinal, kind, scalar);
     if (status !== THREAD_SPAN_BUFFER_OK) throw new Error(`thread_span_buffer_write_tag failed for ${name}`);
     return this;
   }
@@ -521,6 +529,32 @@ export class ThreadSpanView {
 
   _sealStatsChain(): void {
     this._statsSealed = true;
+  }
+
+  /**
+   * Attribute storage lives in the native row store; nothing is allocated on
+   * the JS heap, so the JS Arrow path sees no columns. The thread lane's
+   * conversion is the native `lmao_arrow` flush, never `convertToArrowTable`.
+   */
+  getColumnIfAllocated(_name: string): undefined {
+    return undefined;
+  }
+
+  getNullsIfAllocated(_name: string): undefined {
+    return undefined;
+  }
+
+  copyThreadIdTo(dest: Uint8Array, offset: number): void {
+    let bits = this.thread_id;
+    for (let i = 0; i < 8; i++) {
+      dest[offset + i] = Number(bits & 0xffn);
+      bits >>= 8n;
+    }
+  }
+
+  copyParentThreadIdTo(dest: Uint8Array, offset: number): void {
+    if (this._parent) this._parent.copyThreadIdTo(dest, offset);
+    else dest.fill(0, offset, offset + 8);
   }
 
   isParentOf(other: AnySpanBuffer): boolean {
@@ -599,7 +633,7 @@ export function requireThreadSpanView(value: AnySpanBuffer): ThreadSpanView {
  */
 export interface ThreadSpanLayout {
   readonly ordinals: ReadonlyMap<string, number>;
-  readonly kinds: ReadonlyMap<string, number>;
+  readonly kinds: ReadonlyMap<string, ThreadAttributeKind>;
   readonly enumVariants: ReadonlyMap<string, readonly string[]>;
   readonly attributeNames: readonly string[];
   readonly ViewClass: new (args: ThreadSpanViewArgs) => ThreadSpanView;
@@ -609,7 +643,7 @@ const layouts = new WeakMap<LogSchema, ThreadSpanLayout>();
 
 function buildLayout(schema: LogSchema): ThreadSpanLayout {
   const ordinals = schemaAttributeOrdinals(schema);
-  const kinds = new Map<string, number>();
+  const kinds = new Map<string, ThreadAttributeKind>();
   const enumVariants = new Map<string, readonly string[]>();
   for (const name of schema._columnNames) {
     if (isThreadSystemColumn(name)) continue;
@@ -648,8 +682,9 @@ function buildLayout(schema: LogSchema): ThreadSpanLayout {
     descriptors[`${name}_values`] = {
       get: function attributeLane(this: ThreadSpanView): unknown[] {
         const existing = this._laneStore[valuesSlot];
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- heterogeneous lane store; this slot is only ever written by this getter.
         if (existing !== undefined) return existing as unknown[];
-        const lane = laneProxy((rowIndex, value) => {
+        const lane = laneProxy<unknown[]>([], (rowIndex, value) => {
           this.writeNamed(name, this.physicalRow(rowIndex), value);
         });
         this._laneStore[valuesSlot] = lane;
@@ -661,6 +696,7 @@ function buildLayout(schema: LogSchema): ThreadSpanLayout {
     descriptors[`${name}_nulls`] = {
       get: function attributeNulls(this: ThreadSpanView): Uint8Array {
         const existing = this._laneStore[nullsSlot];
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- heterogeneous lane store; this slot is only ever written by this getter.
         if (existing !== undefined) return existing as Uint8Array;
         // Write-only sink: the native row store holds validity, and nothing
         // in the flush path reads this lane. It exists so generated loggers
@@ -691,5 +727,6 @@ export function threadSpanLayoutFor(schema: LogSchema): ThreadSpanLayout {
 }
 
 export function createThreadSpanView<T extends LogSchema>(args: ThreadSpanViewArgs<T>): SpanBuffer<T> {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- schema-bound ViewClass carries its generated lanes; the static type cannot name them per schema.
   return new (threadSpanLayoutFor(args.schema).ViewClass)(args) as SpanBuffer<T> & ThreadSpanView;
 }

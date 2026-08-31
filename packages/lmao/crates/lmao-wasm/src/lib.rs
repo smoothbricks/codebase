@@ -23,7 +23,9 @@ use lmao_arena::SizeClass;
 #[cfg(target_arch = "wasm32")]
 use lmao_arena::raw::Mem;
 use lmao_arena::raw::{self};
-mod thread_span_buffer;
+// Public on the rlib so the native build sees the adapter as reachable API;
+// the wasm artifact reaches it through its (wasm-only) unmangled exports.
+pub mod thread_span_buffer;
 
 // --- host imports (env module) ---
 #[cfg(target_arch = "wasm32")]
