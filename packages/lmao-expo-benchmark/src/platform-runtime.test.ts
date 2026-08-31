@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { isWasmSpanBufferInstance } from '@smoothbricks/lmao/wasm';
+import { isThreadSpanView } from '@smoothbricks/lmao/wasm';
 
 import {
   createScenarioTracer,
@@ -20,7 +20,7 @@ describe('Expo platform runtime', () => {
 
     const rootBuffer = tracer.rootBuffers[0];
     if (rootBuffer === undefined) throw new Error('Native scenario did not capture a root buffer');
-    expect(isWasmSpanBufferInstance(rootBuffer)).toBe(false);
+    expect(isThreadSpanView(rootBuffer)).toBe(false);
     tracer.clear();
   });
 
@@ -37,7 +37,7 @@ describe('Expo platform runtime', () => {
 
     const rootBuffer = tracer.rootBuffers[0];
     if (rootBuffer === undefined) throw new Error('Web scenario did not capture a root buffer');
-    expect(isWasmSpanBufferInstance(rootBuffer)).toBe(true);
+    expect(isThreadSpanView(rootBuffer)).toBe(true);
     tracer.clear();
 
     const allocation = runPlatformSuperblockBenchmark(runtime);
