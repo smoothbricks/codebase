@@ -1,5 +1,5 @@
-# lmao-rs task runner. Install: cargo install just cargo-mutants
-# (cd packages/lmao-rs first, or `just -f packages/lmao-rs/justfile <task>`)
+# lmao Rust task runner. Install: cargo install just cargo-mutants
+# (cd packages/lmao first, or `just -f packages/lmao/justfile <task>`)
 
 # Fast tier: unit + property tests at default case counts (runs the green suite).
 test:
@@ -14,11 +14,15 @@ mutants:
     cargo mutants --workspace
 
 # wasm32 ABI build for the TypeScript host. Needs: rustup target add wasm32-unknown-unknown
+#
+# The lmao-wasm crate's [lib] name IS `allocator`, so this only lifts cargo's
+# output out of `target/` — the one placement cargo cannot do itself. It does
+# not rename: producer and consumer agree on `allocator.wasm` end to end.
 wasm:
     cargo build -p lmao-wasm --target wasm32-unknown-unknown --release
-    mkdir -p dist
-    cp target/wasm32-unknown-unknown/release/lmao_wasm.wasm dist/lmao_wasm.wasm
-    @ls -la dist/lmao_wasm.wasm
+    @mkdir -p dist
+    @cp target/wasm32-unknown-unknown/release/allocator.wasm dist/allocator.wasm
+    @ls -la dist/allocator.wasm
 
 # Overhead gates placeholder (criterion). Real gate: traced-vs-untraced ≤20%
 # throughput delta + zero-alloc test (tests/alloc_gate.rs, currently TDD-red).

@@ -1,4 +1,0 @@
-target/
-mutants.out*/
-# NOTE: Cargo.lock is committed (deterministic builds are a project requirement).
-# NOTE: proptest-regressions/ directories are committed (they are the regression seed corpus).

@@ -67,8 +67,11 @@ test-output
 *.tsbuildinfo
 dist-test/
 
-# Rust build output (packages/columine, lmao-rs)
+# Rust build output (packages/columine, packages/cowshed, packages/lmao).
+# Cargo.lock is committed everywhere: deterministic builds are a project requirement.
 target/
+# cargo-mutants scratch trees, one per cargo workspace.
+mutants.out*/
 
 # Local tool caches (ttsc plugins) and the SQLite trace sink, which lives here
 # because project walkers and file watchers skip this directory name.

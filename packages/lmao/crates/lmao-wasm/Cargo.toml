@@ -6,7 +6,12 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# `name` is the SHIPPED artifact name, not the package name, so cargo emits
+# `allocator.wasm` directly. The TypeScript loader resolves exactly that file
+# (src/lib/wasm/wasmAllocator.ts); with producer and consumer naming agreed,
+# no downstream step renames it and no rename can serve a stale artifact.
 [lib]
+name = "allocator"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

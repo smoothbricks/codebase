@@ -186,10 +186,6 @@
         "tamagui": ">=2.0.0-rc.0",
       },
     },
-    "packages/lmao-rs": {
-      "name": "@smoothbricks/lmao-rs",
-      "version": "0.1.0",
-    },
     "packages/lmao-ttsc": {
       "name": "@smoothbricks/lmao-ttsc",
       "version": "0.1.14-next.0",
@@ -1752,8 +1748,6 @@
     "@smoothbricks/lmao-expo-benchmark": ["@smoothbricks/lmao-expo-benchmark@workspace:packages/lmao-expo-benchmark"],
 
     "@smoothbricks/lmao-inspector": ["@smoothbricks/lmao-inspector@workspace:packages/lmao-inspector"],
-
-    "@smoothbricks/lmao-rs": ["@smoothbricks/lmao-rs@workspace:packages/lmao-rs"],
 
     "@smoothbricks/lmao-ttsc": ["@smoothbricks/lmao-ttsc@workspace:packages/lmao-ttsc"],
 

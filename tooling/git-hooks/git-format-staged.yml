@@ -60,7 +60,7 @@ formatters:
       - '!*.wasm'
       - '!*.wasm.sha256'
 
-  # rustfmt for Rust files (packages/lmao-rs and future Rust workspaces)
+  # rustfmt for Rust files (packages/columine, packages/cowshed, packages/lmao)
   rustfmt:
     command: 'rustfmt --edition 2024'
     patterns:

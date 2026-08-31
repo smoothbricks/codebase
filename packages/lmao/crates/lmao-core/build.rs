@@ -6,12 +6,16 @@ use std::path::{Path, PathBuf};
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    // The TypeScript SSOT now lives in the same npm package as these crates, so
+    // the walk stops at the package root rather than at `packages/`. That is what
+    // makes the published tarball self-sufficient: `node_modules/@smoothbricks/lmao`
+    // is the package root there too, and `src/` ships alongside `crates/`.
     let package_root = manifest_dir
         .ancestors()
-        .nth(3)
-        .expect("lmao-core must live under packages/lmao-rs/crates");
-    let schema_path = package_root.join("lmao/src/lib/schema/systemSchema.ts");
-    let tuning_path = package_root.join("lmao/src/lib/capacityTuning.ts");
+        .nth(2)
+        .expect("lmao-core must live under <package>/crates/lmao-core");
+    let schema_path = package_root.join("src/lib/schema/systemSchema.ts");
+    let tuning_path = package_root.join("src/lib/capacityTuning.ts");
 
     println!("cargo:rerun-if-changed={}", schema_path.display());
     println!("cargo:rerun-if-changed={}", tuning_path.display());
