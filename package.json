@@ -42,7 +42,7 @@
   "scripts": {
     "build:all": "nx run-many -t build",
     "build:watch": "nx run-many -t build --watch",
-    "check:linux": "tooling/devenv --quiet -P linux-cross shell -- nx run-many -t cargo-lint-cross",
+    "check:linux": "nix eval --raw --file tooling/direnv/linux-compiler-env.test.nix && tooling/devenv --quiet -P linux-cross shell -- nx run-many -t cargo-lint-cross",
     "clean": "nx run-many -t clean; nx reset",
     "clean:node_modules": "rm -rf node_modules && find e* t* p* -type d -name node_modules -print0 | xargs -0 rm -rvf",
     "clean:trace-db": "rm -fv .cache/trace-results.db* packages/*/.cache/trace-results.db* targets/*/.cache/trace-results.db* tooling/.cache/trace-results.db*",
