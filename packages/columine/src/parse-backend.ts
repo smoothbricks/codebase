@@ -110,9 +110,14 @@ const COMPACT_HEADER_SIZE = 16;
 const COMPACT_DESCRIPTOR_SIZE = 32;
 const HOST_IS_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
+/**
+ * Physical plane tags — the `ArrowType` enum in columine-arrow, pinned by
+ * `parse_backend_abi.rs`. The key is the plane's name on this side of the ABI
+ * and must describe the same plane the tag selects natively.
+ */
 const COMPACT_KIND_TAG = {
   null: 0,
-  u32: 1,
+  i32: 1,
   f64: 2,
   binary: 3,
   utf8: 4,
@@ -617,9 +622,9 @@ function validateCompactBatch(batch: CompactBatch): void {
 
     const validity = validateValidity(column.validity, nullable, batch.rowCount, fieldIndex);
     switch (column.kind) {
-      case 'u32':
-        if (!(column.data instanceof Uint32Array)) {
-          throw new TypeError(`columns[${fieldIndex}].data must be a Uint32Array`);
+      case 'i32':
+        if (!(column.data instanceof Int32Array)) {
+          throw new TypeError(`columns[${fieldIndex}].data must be an Int32Array`);
         }
         if (column.data.length !== batch.rowCount) {
           throw new RangeError(`columns[${fieldIndex}].data must contain exactly rowCount values`);
@@ -694,7 +699,7 @@ function planCompactMemoryLayout(batch: CompactBatch): CompactMemoryLayout {
     switch (column.kind) {
       case 'null':
         break;
-      case 'u32':
+      case 'i32':
         bufferCount += 2;
         dataElementBytes = 4;
         data = planBuffer(typedArrayBytes(column.data), `columns[${index}].data`);
