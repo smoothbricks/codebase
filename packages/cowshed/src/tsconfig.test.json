@@ -1,0 +1,13 @@
+{
+  "//": "Runtime-transform project for @ttsc/unplugin's nearest-tsconfig discovery, mirroring packages/columine/src/tsconfig.json. The bun preload resolves the nearest tsconfig.test.json walking up from each test file, and @ttsc/unplugin then snapshots and SHA-256s EVERY regular file under that config's directory on the first transform. Resolving to the package root made the walk root packages/cowshed, whose target/ is 26 GB, so each test process hashed the entire Rust build output; its hardcoded skip list (.git .ttsc .cache .next .nuxt .svelte-kit .turbo .vite build coverage dist node_modules out temp tmp) does not include `target`. Rooting the transform project here confines the walk to source. Cargo output stays in target/ where cowshed's trampoline, gateway tests and docs expect it.",
+  "extends": "../tsconfig.test.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "emitDeclarationOnly": false,
+    "rootDir": "."
+  },
+  "include": ["./**/*.ts", "./**/*.tsx"]
+}
