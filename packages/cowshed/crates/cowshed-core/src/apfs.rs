@@ -4461,9 +4461,12 @@ mod tests {
         fs::remove_dir(directory).unwrap();
     }
 
+    /// Named `real_apfs_*` like every test that drives the host's real APFS stack: that prefix
+    /// is the filterset the `real-apfs` nextest test group serializes on, so a test opts into
+    /// serialization by being named for what it touches.
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_sparse_attach_resolves_and_verifies_the_synthesized_volume() {
+    fn real_apfs_sparse_attach_resolves_and_verifies_the_synthesized_volume() {
         let stem = temp_path("real-sparse-resolution", "stem").with_extension("");
         let image = stem.with_extension(ImageFormat::Sparse.extension());
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
@@ -4493,7 +4496,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_asif_attach_normalizes_bare_devices_and_verifies_the_volume() {
+    fn real_apfs_asif_attach_normalizes_bare_devices_and_verifies_the_volume() {
         let stem = temp_path("real-asif-resolution", "stem").with_extension("");
         let image = stem.with_extension(ImageFormat::Asif.extension());
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
