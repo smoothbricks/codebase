@@ -98,8 +98,15 @@ impl HostStableExecutable {
 /// store path, which carries the build's own content hash, so a different build is a different
 /// plist — and rewriting a plist is what boots the old server out. Naming the `--out-link` symlink
 /// instead would let a later `nix build` repoint it and leave launchd starting a different binary
-/// at the next restart, which is precisely the client/server version mismatch that reads as a
-/// broken toolchain rather than as a stale daemon.
+/// at the next restart, under a definition nobody changed.
+///
+/// That matters because of what contends, which is the socket rather than any version string. A
+/// unix bind unlinks the path first (sccache 0.17.0, server.rs:510-514), so any client that
+/// auto-starts a server takes the LaunchAgent's socket over from it. `connect_or_start_server`
+/// (commands.rs:310-348) starts one on ConnectionRefused, TimedOut, or NotFound — never on a
+/// version disagreement, which is only ever reported. So the property worth having is not "the
+/// names match", it is "there is exactly one supervised server and every client finds it", and a
+/// plist that changes when and only when the build changes is what keeps that true.
 ///
 /// The root is carried *with* the program because it is the only reason that path survives
 /// `nix store gc`. The program is derived from the rooted store path rather than passed beside it:
