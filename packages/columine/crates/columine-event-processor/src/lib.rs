@@ -26,8 +26,11 @@ use columine_arrow::{
     write_arrow_ipc_from_dynamic_columns,
 };
 use columine_parsing::{
-    ExtractionConfig, build_extraction_config, json_extractor, json_scanner, msgpack_extractor,
-    msgpack_scanner,
+    ExtractionConfig, json_extractor, json_scanner, msgpack_extractor, msgpack_scanner,
+    validate::{
+        BatchValidationError, SemanticSchemaSet, parse_schema_envelope, validate_json_batch,
+        validate_msgpack_batch,
+    },
 };
 
 /// Module version: 2 is the consumer artifact, 1 this crate's npm artifact.
@@ -221,10 +224,25 @@ const INITIAL_WORK_BUFFER_SIZE: usize = 64 * 1024;
 const INITIAL_FALLBACK_WORK_BUFFER_SIZE: usize = 16 * 1024;
 const MAX_WORK_BUFFER_SIZE: usize = MAX_VALUE_BYTES as usize;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EpInitError {
     Metadata(columine_arrow::MetadataError),
     Config(columine_parsing::ConfigError),
+    SemanticSchema(columine_parsing::validate::SchemaParseError),
+}
+
+/// Structured diagnostic for a semantic payload refusal. The result header
+/// carries the existing stage/detail lane; this owned value preserves the
+/// path/message payload for native callers and ABI adapters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayloadValidationDiagnostic {
+    pub stage: u8,
+    pub detail: u8,
+    pub event_index: u32,
+    pub signal_type: String,
+    pub path: String,
+    pub expected: String,
+    pub observed: String,
 }
 
 /// The unified event processor core.
@@ -232,6 +250,8 @@ pub struct EventProcessor {
     pub wiring: EpWiring,
     pub schema_config: DynamicSchemaConfig,
     extraction_config: Option<ExtractionConfig>,
+    semantic_schemas: Option<SemanticSchemaSet>,
+    last_validation_diagnostic: Option<PayloadValidationDiagnostic>,
     dynamic_columns: DynamicColumns,
     /// True when the schema IS the base event log and this wiring keeps the
     /// scanner path, so the four-column scanners can write by index.
@@ -241,7 +261,7 @@ pub struct EventProcessor {
     /// Reusable MessagePack workspace for declared Binary values and
     /// internal batches.
     work_buffer: Vec<u8>,
-    /// Independent workspace for an in-progress value.$extra map.
+    /// Independent workspace for an in-progress undeclared carrier map.
     fallback_work_buffer: Vec<u8>,
 }
 
@@ -269,6 +289,12 @@ impl EventProcessor {
         policy: CollisionPolicy,
         schema_config: DynamicSchemaConfig,
     ) -> Result<Self, EpInitError> {
+        let semantic_schemas = schema_config
+            .semantic_schema
+            .as_deref()
+            .map(parse_schema_envelope)
+            .transpose()
+            .map_err(EpInitError::SemanticSchema)?;
         let record_batch_metadata =
             MetadataStorage::for_fields(&schema_config.field_metadata, MetadataLimits::default())
                 .map_err(EpInitError::Metadata)?;
@@ -284,8 +310,12 @@ impl EventProcessor {
                 .map(String::as_str)
                 .collect();
             Some(
-                build_extraction_config(&schema_config.field_metadata, &names)
-                    .map_err(EpInitError::Config)?,
+                columine_parsing::build_extraction_config_with_semantic_schemas(
+                    &schema_config.field_metadata,
+                    &names,
+                    semantic_schemas.as_ref(),
+                )
+                .map_err(EpInitError::Config)?,
             )
         };
 
@@ -295,11 +325,19 @@ impl EventProcessor {
             record_batch_metadata,
             dedup_state: wiring.dedup.then(|| DedupState::new(capacity, policy)),
             extraction_config,
+            semantic_schemas,
+            last_validation_diagnostic: None,
             schema_config,
             wiring,
             work_buffer: vec![0; INITIAL_WORK_BUFFER_SIZE],
             fallback_work_buffer: vec![0; INITIAL_FALLBACK_WORK_BUFFER_SIZE],
         })
+    }
+
+    /// Last semantic validation refusal, if the most recent append was refused
+    /// by the schema-layer judgment.
+    pub fn payload_validation_diagnostic(&self) -> Option<&PayloadValidationDiagnostic> {
+        self.last_validation_diagnostic.as_ref()
     }
 
     /// Grow a workspace geometrically toward `MAX_WORK_BUFFER_SIZE`
@@ -329,7 +367,33 @@ impl EventProcessor {
         if output.len() < RESULT_HEADER_SIZE {
             return ResultCode::OutOfMemory;
         }
+        self.last_validation_diagnostic = None;
         let arrow_offset = RESULT_HEADER_SIZE as u32;
+        if let Some((event_index, event_type, violation)) = self.validate_input(input, format) {
+            self.last_validation_diagnostic = Some(PayloadValidationDiagnostic {
+                stage: diagnostic_stage::VALIDATION,
+                detail: diagnostic_detail::PAYLOAD_VIOLATION,
+                event_index: event_index as u32,
+                signal_type: event_type,
+                path: violation.path,
+                expected: violation.expected,
+                observed: violation.observed,
+            });
+            if self.wiring.diagnostics {
+                write_result_header_with_diagnostic(
+                    output,
+                    ResultCode::ParseError,
+                    &ResultDiagnostic {
+                        stage: diagnostic_stage::VALIDATION,
+                        detail: diagnostic_detail::PAYLOAD_VIOLATION,
+                        ..ResultDiagnostic::default()
+                    },
+                );
+            } else {
+                write_result_header(output, ResultCode::ParseError, 0, 0, 0, 0);
+            }
+            return ResultCode::ParseError;
+        }
 
         // The scanners write the four base event-log columns by index, so the
         // schema must BE that event log — not merely have four fields.
@@ -337,6 +401,27 @@ impl EventProcessor {
             return self.create_log_entry_base(input, format, output, arrow_offset);
         }
         self.create_log_entry_dynamic(input, format, output, arrow_offset)
+    }
+    fn validate_input(
+        &self,
+        input: &[u8],
+        format: InputFormat,
+    ) -> Option<(usize, String, columine_parsing::validate::PayloadViolation)> {
+        let schemas = self.semantic_schemas.as_ref()?;
+        let result = match format {
+            InputFormat::Json => validate_json_batch(input, schemas),
+            InputFormat::Msgpack => validate_msgpack_batch(input, schemas, false),
+            InputFormat::MsgpackStream => validate_msgpack_batch(input, schemas, true),
+            InputFormat::ArrowPassthrough => return None,
+        };
+        match result {
+            Err(BatchValidationError::Violation {
+                event_index,
+                event_type,
+                violation,
+            }) => Some((event_index, event_type, violation)),
+            Err(BatchValidationError::InvalidInput) | Ok(()) => None,
+        }
     }
 
     /// Encode one validated CPB1 column batch into `[ResultHeader][Arrow IPC]`.
@@ -1013,7 +1098,7 @@ mod tests {
     /// consumer wiring surfaces the overflow — the drift axis pinned.
     #[test]
     fn msgpack_growth_is_wiring_dependent() {
-        // A value.$extra schema forces the msgpack workspace into use with
+        // The undeclared carrier schema forces the msgpack workspace into use with
         // an undeclared field large enough to overflow the initial 64K...
         // growing 64K deliberately is slow; instead shrink the buffers to
         // make the axis observable cheaply.
@@ -1021,7 +1106,8 @@ mod tests {
             SignalSchemaField::new(ArrowType::Utf8, false),
             SignalSchemaField::new(ArrowType::Binary, true),
         ];
-        let schema = schema_with_names(&fields, b"id\0value.$extra\0");
+        let field_names = format!("id\0{}\0", columine_parsing::UNDECLARED_COLUMN_NAME);
+        let schema = schema_with_names(&fields, field_names.as_bytes());
         assert!(!schema.is_base_event_log);
 
         let mut consumer_ep = EventProcessor::new(
@@ -1059,5 +1145,47 @@ mod tests {
             ResultCode::Ok,
             "columine wiring: workspace grows and the batch succeeds"
         );
+    }
+
+    #[test]
+    fn semantic_validation_refuses_before_extraction_or_dedup() {
+        let base = DynamicSchemaConfig::from_physical_fields_with_names(
+            &[
+                SignalSchemaField::new(ArrowType::Utf8, false),
+                SignalSchemaField::new(ArrowType::Utf8, false),
+                SignalSchemaField::new(ArrowType::Int64, false),
+                SignalSchemaField::new(ArrowType::Binary, true),
+            ],
+            b"id\0type\0timestamp\0value\0",
+        )
+        .unwrap();
+        let schema = DynamicSchemaConfig {
+            semantic_schema: Some(
+                br#"{"hi":{"kind":"object","fields":{"greeting":{"kind":"string"}}}}"#.to_vec(),
+            ),
+            ..base
+        };
+        let mut ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            8,
+            CollisionPolicy::Latest,
+            schema,
+        )
+        .unwrap();
+        let input = br#"[{"id":"greeting:42","type":"hi","timestamp":1,"value":{"greeting":42}}]"#;
+        let mut output = vec![0xa5; 4096];
+        assert_eq!(
+            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ResultCode::ParseError
+        );
+        let diagnostic = ep.payload_validation_diagnostic().unwrap();
+        assert_eq!(diagnostic.path, "value.greeting");
+        assert_eq!(diagnostic.expected, "string");
+        assert_eq!(diagnostic.observed, "number");
+        assert_eq!(diagnostic.event_index, 0);
+        assert_eq!(diagnostic.signal_type, "hi");
+        assert_eq!(read_result_header(&output).0, ResultCode::ParseError as u32);
+        assert_eq!(ep.dedup_state.as_ref().unwrap().total_events, 0);
+        assert!(output[32..].iter().all(|byte| *byte == 0xa5));
     }
 }
