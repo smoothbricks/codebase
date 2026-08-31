@@ -904,9 +904,20 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
     //
     // Reconstructing cargo's dependency search path here would have to be redone at every layout
     // change, and while it was broken this gate passed nothing and proved nothing. Asking cargo
-    // cannot go stale. The cost is one cold dependency check in a probe-private target directory,
-    // warm on every subsequent run; the probe directory is deliberately *not* the shared target
-    // directory, because this runs while the outer cargo owns that one.
+    // cannot go stale.
+    //
+    // The check shares the OUTER target directory. A probe-private one costs a full cold
+    // dependency check of cowshed-core's whole tree — measured at 48s on an idle M5 Max, ~110s of
+    // CPU, and 927MB of duplicated artifacts — and that lands inside this test's bounded window on
+    // every cold CI runner, where a multi-crate check runs ~5x slower than here. Sharing reuses
+    // what `cargo test --workspace --no-run` already built in its own unbounded target: 13.7s on
+    // first check, 0.4s after, and a fifth of the CPU.
+    //
+    // The outer cargo owning this directory is not a conflict. nextest builds through cargo and
+    // then runs the test binaries itself, releasing the build lock before execution, so a `cargo
+    // check` against the shared directory while this suite is running does not block — measured at
+    // 0.401s mid-run. Fingerprints keep the probe's artifacts distinct from the outer build's
+    // rather than evicting them, so neither invalidates the other.
     //
     // If a stale-artifact failure ever reappears here, this is what it looks like: a poisoned rlib
     // left in the legacy `deps` directory, written by sccache with 0640 permissions on a cache hit,
@@ -914,7 +925,7 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
     let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .parent()
         .expect("cargo target directory")
-        .join("capability-probe");
+        .to_path_buf();
     let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capability-deny");
     fs::create_dir_all(&work).expect("deny snippet directory");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
