@@ -1,2 +1,15 @@
 [test]
 preload = ["./src/bun/preload.ts", "./src/bun/trace-preload.ts"]
+# Discovery is rooted at src because cargo puts `target/` in this project root,
+# and `target/cargo-lint-home/{registry,git}` are symlinks into the shared
+# ~/.cargo. An unrooted scan follows them and walks ~69k files, which exhausts
+# file descriptors and makes every test fail to spawn its transformer. Every
+# test in this package lives under src.
+#
+# `root` narrows discovery only; the `preload` above still runs, and the typia
+# transform it installs stays wired. Do NOT reach for `bun test -c <file>` to
+# get the same scoping: bun 1.4.0 ignores `[test].preload` from a config passed
+# with `-c`, which drops transform routing silently — the suite still passes,
+# because only one test here has a typia callsite, and it would start reporting
+# "no transform has been configured" instead of asserting anything.
+root = "src"
