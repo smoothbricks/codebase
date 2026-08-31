@@ -76,27 +76,18 @@ const HEX_BYTE: readonly string[] = Array.from(
 );
 
 /**
- * Generate a new random TraceId (W3C format: 32 hex chars).
+ * Encode 16 already-chosen bytes as a W3C trace id.
+ *
+ * Split out from [`generateTraceId`] because the encoding and the byte source
+ * are separate contracts: the table is verified over the whole 0x00-0xFF domain
+ * in all sixteen positions, and reaching it through the generator meant
+ * substituting `crypto.getRandomValues` on the host object. That descriptor is
+ * not configurable on every engine — Bun on Linux refuses the redefinition with
+ * `Attempting to change configurable attribute of unconfigurable property`, so
+ * the parity check passed on one platform and threw on the other. It is also
+ * the entry point for adopting an incoming distributed-trace id from bytes.
  */
-export function generateTraceId(): TraceId {
-  const bytes = new Uint8Array(16);
-
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(bytes);
-  } else {
-    try {
-      const nodeCrypto = require('node:crypto');
-      if (nodeCrypto?.randomFillSync) {
-        nodeCrypto.randomFillSync(bytes);
-      }
-    } catch {
-      // Fallback to Math.random (not ideal but works)
-      for (let i = 0; i < 16; i++) {
-        bytes[i] = Math.floor(Math.random() * 256);
-      }
-    }
-  }
-
+export function traceIdFromBytes(bytes: Uint8Array): TraceId {
   // 16 table loads into one rope; see HEX_BYTE for why the toString(16) loop went.
   const hex =
     HEX_BYTE[bytes[0]] +
@@ -117,6 +108,30 @@ export function generateTraceId(): TraceId {
     HEX_BYTE[bytes[15]];
 
   return brandTraceId(hex);
+}
+
+/**
+ * The byte source, bound ONCE at module load.
+ *
+ * `generateTraceId` runs once per root trace and the JSC sampling profile
+ * already puts it at 7.7% of on-CPU, so re-deciding the implementation on every
+ * call spent two `typeof` probes and a try/catch frame to reach the same
+ * function every time. Every platform this package ships an entrypoint for —
+ * `./node`, `./es`, `./wasm`, `./cloudflare` — has WebCrypto, so there is one
+ * implementation to bind and no feature test to repeat.
+ *
+ * The arms this replaces could not run. The package is ESM-only, so
+ * `require('node:crypto')` threw `ReferenceError` rather than loading Node's
+ * crypto, and the catch then produced a `Math.random` trace id: 128 bits of
+ * entropy traded away silently, on the identity every stored trace and every
+ * external correlation keys on. A host without WebCrypto now fails loudly at
+ * import instead.
+ */
+const fillRandomBytes: (bytes: Uint8Array) => Uint8Array = crypto.getRandomValues.bind(crypto);
+
+/** Generate a new random TraceId (W3C format: 32 hex chars). */
+export function generateTraceId(): TraceId {
+  return traceIdFromBytes(fillRandomBytes(new Uint8Array(16)));
 }
 //#endregion smoo/lmao!n/span-identity.trace-id
 
