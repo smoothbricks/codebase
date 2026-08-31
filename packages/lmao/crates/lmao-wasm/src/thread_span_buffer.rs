@@ -13,8 +13,8 @@ use std::{collections::HashSet, str};
 
 use lmao_core::{
     ATTRIBUTE_KIND_BOOLEAN, ATTRIBUTE_KIND_ENUM, ATTRIBUTE_KIND_NUMBER, ATTRIBUTE_KIND_TEXT,
-    ATTRIBUTE_KIND_UINT64, ColumnValue, EntryType, FieldMeta, FieldStrategy, ScopeValue, SharedStr,
-    ThreadBufferError, ThreadSpanBuffer, TraceId, VocabularyId,
+    ATTRIBUTE_KIND_UINT64, ColumnValue, ColumnValueRef, EntryType, FieldMeta, FieldStrategy,
+    ScopeValue, SharedStr, ThreadBufferError, ThreadSpanBuffer, TraceId, VocabularyId,
 };
 
 const STATUS_OK: u8 = 0;
@@ -547,6 +547,12 @@ pub extern "C" fn thread_span_buffer_set_scope(
             .schema_fields()
             .get(index)
             .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
+        // Kind 0 is the clear sentinel: 01i `setScope({ field: null })` deletes the
+        // field. Decode would refuse kind 0, so the clear path never goes through it.
+        if kind == 0 {
+            let update = [(field.name, None)];
+            return buffer.set_scope(span_id, &update);
+        }
         let value = buffer
             .decode_abi_value(kind, value)
             .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
@@ -559,6 +565,180 @@ pub extern "C" fn thread_span_buffer_set_scope(
         };
         let update = [(field.name, Some(scope_value))];
         buffer.set_scope(span_id, &update)
+    })
+    .map(|()| STATUS_OK)
+    .unwrap_or(STATUS_ERROR)
+}
+
+fn copy_out(dst: *mut u8, dst_len: usize, src: &[u8]) -> u32 {
+    let needed = u32::try_from(src.len()).unwrap_or(u32::MAX);
+    if dst.is_null() || dst_len < src.len() {
+        return needed;
+    }
+    if !src.is_empty() {
+        // SAFETY: the caller documents that `dst` is writable for `dst_len` bytes
+        // and we just checked `dst_len >= src.len()`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        }
+    }
+    needed
+}
+
+fn encode_attr(buffer: &mut ThreadSpanBuffer, row: usize, ordinal: u16) -> Option<(u8, u64)> {
+    let value = buffer.attribute_at(row, ordinal)?;
+    match value {
+        ColumnValueRef::Number(value) => Some((ATTRIBUTE_KIND_NUMBER, value.to_bits())),
+        ColumnValueRef::Uint64(value) => Some((ATTRIBUTE_KIND_UINT64, value)),
+        ColumnValueRef::Boolean(value) => Some((ATTRIBUTE_KIND_BOOLEAN, u64::from(value))),
+        ColumnValueRef::Enum(value) => Some((ATTRIBUTE_KIND_ENUM, u64::from(value))),
+        ColumnValueRef::Text(value) => {
+            let owned = value.to_owned();
+            let id = buffer.intern(&owned).ok()?;
+            Some((ATTRIBUTE_KIND_TEXT, u64::from(id)))
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_row_count(handle: u32) -> u32 {
+    with_handle(handle, |buffer| {
+        u32::try_from(buffer.row_count())
+            .map_err(|_| ThreadBufferError::InvalidRow(buffer.row_count()))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_materialize_scope(
+    handle: u32,
+    start_row: u32,
+    row_count: u32,
+) -> u8 {
+    with_handle(handle, |buffer| {
+        buffer
+            .materialize_scope_window(start_row as usize, row_count as usize)
+            .map(|_| ())
+    })
+    .map(|()| STATUS_OK)
+    .unwrap_or(STATUS_ERROR)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_read_timestamp(handle: u32, row: u32) -> i64 {
+    with_handle(handle, |buffer| {
+        buffer
+            .timestamp_at(row as usize)
+            .ok_or(ThreadBufferError::InvalidRow(row as usize))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_read_span_id(handle: u32, row: u32) -> u32 {
+    with_handle(handle, |buffer| {
+        buffer
+            .span_id_at(row as usize)
+            .ok_or(ThreadBufferError::InvalidRow(row as usize))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_read_header(handle: u32, row: u32) -> u32 {
+    with_handle(handle, |buffer| {
+        buffer
+            .packed_header_at(row as usize)
+            .ok_or(ThreadBufferError::InvalidRow(row as usize))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_read_parent_span_id(handle: u32, row: u32) -> u32 {
+    with_handle(handle, |buffer| {
+        buffer
+            .parent_span_id_at(row as usize)
+            .ok_or(ThreadBufferError::InvalidRow(row as usize))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_read_parent_thread_id(handle: u32, row: u32) -> u64 {
+    with_handle(handle, |buffer| {
+        buffer
+            .parent_thread_id_at(row as usize)
+            .ok_or(ThreadBufferError::InvalidRow(row as usize))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thread_span_buffer_read_line(handle: u32, row: u32) -> u32 {
+    with_handle(handle, |buffer| {
+        buffer
+            .line_at(row as usize)
+            .ok_or(ThreadBufferError::InvalidRow(row as usize))
+    })
+    .unwrap_or(0)
+}
+
+/// Copy the row's trace id into `out_ptr`. Returns the UTF-8 length; zero is
+/// failure. When `out_len` is too small the length is still returned and nothing
+/// is written, so the caller can grow scratch and retry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_read_trace_id(
+    handle: u32,
+    row: u32,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> u32 {
+    with_handle(handle, |buffer| {
+        let value = buffer
+            .trace_id_at(row as usize)
+            .ok_or(ThreadBufferError::InvalidRow(row as usize))?;
+        Ok(copy_out(out_ptr, out_len, value.as_bytes()))
+    })
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_read_message(
+    handle: u32,
+    row: u32,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> u32 {
+    with_handle(handle, |buffer| {
+        let value = buffer.dynamic_message_at(row as usize).unwrap_or("");
+        Ok(copy_out(out_ptr, out_len, value.as_bytes()))
+    })
+    .unwrap_or(0)
+}
+
+/// Write kind and scalar value for a present attribute. STATUS_ERROR means
+/// the cell is null or the row/ordinal is invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thread_span_buffer_read_attr(
+    handle: u32,
+    row: u32,
+    ordinal: u16,
+    out_kind: *mut u8,
+    out_value: *mut u64,
+) -> u8 {
+    if out_kind.is_null() || out_value.is_null() {
+        return STATUS_ERROR;
+    }
+    with_handle(handle, |buffer| {
+        let (kind, value) = encode_attr(buffer, row as usize, ordinal)
+            .ok_or(ThreadBufferError::InvalidColumnOrdinal(ordinal))?;
+        // SAFETY: both pointers are non-null and caller-owned for this call.
+        unsafe {
+            *out_kind = kind;
+            *out_value = value;
+        }
+        Ok(())
     })
     .map(|()| STATUS_OK)
     .unwrap_or(STATUS_ERROR)
@@ -605,6 +785,28 @@ mod tests {
         assert_eq!(thread_span_buffer_new(7, 2048), 0);
         let handle = thread_span_buffer_new(7, 1024);
         assert_ne!(handle, 0);
+        thread_span_buffer_free(handle);
+    }
+
+    #[test]
+    fn row_reads_see_open_and_appended_rows() {
+        HANDLES.with(|handles| handles.borrow_mut().clear());
+        let handle = thread_span_buffer_new(7, 8);
+        assert_ne!(handle, 0);
+        let (span_id, start_row) = open_named(handle, "root");
+        assert_eq!(thread_span_buffer_row_count(handle), 2);
+        assert_eq!(thread_span_buffer_read_span_id(handle, start_row), span_id);
+        assert_eq!(thread_span_buffer_read_timestamp(handle, start_row), 10);
+        assert_eq!(
+            thread_span_buffer_read_header(handle, start_row) & 0xff,
+            u32::from(EntryType::SpanStart.as_u8())
+        );
+        let packed = thread_span_buffer_append_log(handle, span_id, 8, 1, 11, 3);
+        assert_ne!(packed, 0);
+        let log_row = packed as u32;
+        assert_eq!(thread_span_buffer_row_count(handle), 3);
+        assert_eq!(thread_span_buffer_read_timestamp(handle, log_row), 11);
+        assert_eq!(thread_span_buffer_read_line(handle, log_row), 3);
         thread_span_buffer_free(handle);
     }
 
@@ -666,7 +868,7 @@ mod tests {
         );
         assert_eq!(
             thread_span_buffer_set_scope(handle, span_id, ordinal, 0, bits),
-            STATUS_ERROR
+            STATUS_OK
         );
         assert_eq!(
             thread_span_buffer_set_scope(handle, span_id, ordinal, ATTRIBUTE_KIND_NUMBER, bits),
