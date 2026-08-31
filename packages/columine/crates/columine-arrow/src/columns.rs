@@ -37,104 +37,172 @@ pub enum ParseError {
     OutOfMemory = 7,
 }
 
-fn read_u32(bytes: &[u8], index: usize) -> u32 {
-    let start = index * 4;
-    u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap_or([0; 4]))
+/// Read offset entry `index` from an offsets buffer of `width`-byte entries.
+///
+/// Retained variable-width data is capped at [`MAX_VALUE_BYTES`], so a 64-bit
+/// offset never uses more than its low four little-endian bytes.
+fn read_offset(bytes: &[u8], index: usize, width: u32) -> u32 {
+    let start = index * width as usize;
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&bytes[start..start + 4]);
+    u32::from_le_bytes(value)
 }
 
-fn write_u32(bytes: &mut [u8], index: usize, value: u32) {
-    let start = index * 4;
+/// Write offset entry `index`. The high four bytes of a 64-bit offset are left
+/// alone: the buffer is allocated zeroed and nothing ever writes a value that
+/// reaches them.
+fn write_offset(bytes: &mut [u8], index: usize, width: u32, value: u32) {
+    let start = index * width as usize;
     bytes[start..start + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Column type determines storage layout.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ColumnType {
-    /// Variable-length string: offsets + data.
-    Utf8,
-    /// Fixed 8 bytes per value.
-    Int64,
-    /// Fixed 8 bytes per value.
-    Float64,
-    /// Bit-packed (1 bit per value).
-    Bool,
-    /// Variable-length binary: offsets + data.
-    Binary,
+/// IEEE-754 `binary32` to `binary16`, round to nearest with ties to even.
+///
+/// Written out instead of pulling in `half`: this crate compiles to wasm and
+/// the whole conversion is bit shuffling, so the dependency would buy nothing.
+fn f16_bits_from_f32(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) as u16) & 0x8000;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x007f_ffff;
+
+    if exponent == 0xff {
+        // Infinity keeps an empty payload; a NaN must keep a nonzero one or it
+        // would round into infinity, changing the value and not its precision.
+        return sign | 0x7c00 | u16::from(mantissa != 0);
+    }
+
+    // A `binary32` subnormal (exponent 0) is smaller than 2^-126, far below
+    // the smallest `binary16` subnormal at 2^-24, so it always rounds to zero
+    // through the `extra > 24` arm below and never reaches the code that
+    // assumes an implicit leading one.
+    let exponent16 = exponent - 127 + 15;
+    if exponent16 >= 0x1f {
+        return sign | 0x7c00; // overflows `binary16`: saturate to infinity
+    }
+    let significand = mantissa | 0x0080_0000;
+    let (exponent_field, drop) = if exponent16 >= 1 {
+        (exponent16 as u32, 13u32)
+    } else {
+        // Below the smallest normal, `binary16` trades exponent range for
+        // significand bits by dropping more of them.
+        let extra = 1 - exponent16;
+        if extra > 24 {
+            return sign;
+        }
+        (0, 13 + extra as u32)
+    };
+
+    let kept = significand >> drop;
+    let remainder = significand & ((1u32 << drop) - 1);
+    let halfway = 1u32 << (drop - 1);
+    let round_up = remainder > halfway || (remainder == halfway && kept & 1 == 1);
+    // A carry out of the ten stored significand bits lands in the exponent
+    // field, which is exactly the increment the rounded value needs.
+    let packed = ((exponent_field << 10) | (kept & 0x03ff)) + u32::from(round_up);
+    sign | packed as u16
+}
+
+/// IEEE-754 `binary16` bits to `binary32`. Exact: every half is a float.
+fn f32_from_f16_bits(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let mantissa = u32::from(bits & 0x03ff);
+    if exponent == 0x1f {
+        return f32::from_bits(sign | 0x7f80_0000 | (mantissa << 13));
+    }
+    if exponent == 0 {
+        if mantissa == 0 {
+            return f32::from_bits(sign);
+        }
+        // Subnormal half: shift the leading one up into the implicit position
+        // and pay for it out of the exponent.
+        let shift = mantissa.leading_zeros() - 21;
+        let exponent32 = (127 - 15 - shift + 1) << 23;
+        return f32::from_bits(sign | exponent32 | ((mantissa << (13 + shift)) & 0x007f_ffff));
+    }
+    f32::from_bits(sign | (((exponent - 15 + 127) as u32) << 23) | (mantissa << 13))
+}
+
+/// Store the low `width` little-endian bytes of a fixed-width cell and mark it
+/// valid. Callers range-check the value against `width` first, so the low bytes
+/// are the whole value and not a truncation of it.
+fn write_cell(column: &mut ColumnStorage, row_idx: usize, width: u32, value: [u8; 8]) {
+    let start = row_idx * width as usize;
+    column.values[start..start + width as usize].copy_from_slice(&value[..width as usize]);
+    column.validity[row_idx / 8] |= 1u8 << (row_idx % 8);
 }
 
 /// Storage for a single typed column. All columns are nullable, so a validity
 /// bitmap is always present.
+///
+/// Two byte buffers, not five: `offsets` exists only for the variable-width
+/// kinds, and `values` holds whatever one row of the plane is — little-endian
+/// fixed-width values, Arrow LSB-first bits, or the variable-width payload.
+/// The plane kind says which, so no access needs a `die!` to assert that this
+/// shape really does have that buffer.
 #[derive(Clone, Debug)]
 pub struct ColumnStorage {
-    pub col_type: ColumnType,
+    pub kind: PlaneKind,
 
     /// Validity bitmap (Arrow LSB-first).
     validity: Vec<u8>,
 
-    // For utf8/binary: offsets (u32 LE bytes) and data.
-    offsets: Option<Vec<u8>>,
-    data: Option<Vec<u8>>,
+    /// Monotone offsets, `offset_width` bytes per entry; empty for the
+    /// fixed-width kinds.
+    offsets: Vec<u8>,
+
+    /// Fixed-width values, packed bits, or variable-width payload.
+    values: Vec<u8>,
+
+    /// Bytes of `values` in use. Meaningful for the variable-width kinds only;
+    /// every other kind addresses `values` by row.
     pub data_len: u32,
+
     /// Configured hard limit for retained variable-width data.
     max_data_bytes: u32,
-
-    // For int32/int64/float64: fixed-width little-endian values.
-    fixed: Option<Vec<u8>>,
-    fixed_width: u8,
-
-    // For bool: bit-packed data.
-    bool_data: Option<Vec<u8>>,
 }
 
 impl ColumnStorage {
-    pub fn new(col_type: ColumnType, capacity: u32) -> Self {
-        Self::with_variable_limit(col_type, capacity, MAX_VALUE_BYTES)
+    pub fn new(kind: PlaneKind, capacity: u32) -> Self {
+        Self::with_variable_limit(kind, capacity, MAX_VALUE_BYTES)
     }
 
-    pub fn with_variable_limit(col_type: ColumnType, capacity: u32, max_data_bytes: u32) -> Self {
-        Self::with_fixed_width(col_type, capacity, max_data_bytes, 8)
-    }
-
-    fn with_fixed_width(
-        col_type: ColumnType,
-        capacity: u32,
-        max_data_bytes: u32,
-        fixed_width: u8,
-    ) -> Self {
+    /// Storage is sized by the plane's ACTUAL per-row cost:
+    ///
+    /// - fixed-width kinds: `capacity * value_width`, exactly. An i8 column
+    ///   reserves one byte per row, not the 128 a variable-width column
+    ///   reserves, so a narrow plane is the cheapest column in a schema rather
+    ///   than tied for the most expensive.
+    /// - `Bool`: one bit per row.
+    /// - variable-width kinds: `(capacity + 1) * offset_width` for offsets and
+    ///   `min(max_data_bytes, capacity * 128)` for the payload, growing
+    ///   geometrically from there. The 128 is an estimate, and this is the only
+    ///   kind that needs one, because it is the only kind whose per-row cost
+    ///   the schema does not state.
+    /// - `Empty`: nothing at all.
+    pub fn with_variable_limit(kind: PlaneKind, capacity: u32, max_data_bytes: u32) -> Self {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH) as usize;
-        let mut storage = Self {
-            col_type,
+        let (offsets, values) = match kind {
+            PlaneKind::Empty => (Vec::new(), Vec::new()),
+            PlaneKind::Bool => (Vec::new(), vec![0; cap.div_ceil(8)]),
+            PlaneKind::SignedInt { width }
+            | PlaneKind::UnsignedInt { width }
+            | PlaneKind::Float { width }
+            | PlaneKind::FixedBytes { width } => (Vec::new(), vec![0; cap * width as usize]),
+            PlaneKind::Text { offset_width } | PlaneKind::Bytes { offset_width } => (
+                vec![0; (cap + 1) * offset_width as usize],
+                vec![0; (max_data_bytes as usize).min(cap * 128)],
+            ),
+        };
+        Self {
+            kind,
             validity: vec![0; cap.div_ceil(8)],
-            offsets: None,
-            data: None,
+            offsets,
+            values,
             data_len: 0,
             max_data_bytes,
-            fixed: None,
-            fixed_width: 0,
-            bool_data: None,
-        };
-        match col_type {
-            ColumnType::Utf8 | ColumnType::Binary => {
-                storage.offsets = Some(vec![0; (cap + 1) * 4]);
-                let initial_bytes = (max_data_bytes as usize).min(cap * 128);
-                storage.data = Some(vec![0; initial_bytes]);
-            }
-            ColumnType::Int64 | ColumnType::Float64 => {
-                storage.fixed_width = fixed_width;
-                storage.fixed = Some(vec![0; cap * fixed_width as usize]);
-            }
-            ColumnType::Bool => {
-                storage.bool_data = Some(vec![0; cap.div_ceil(8)]);
-            }
         }
-        storage
-    }
-
-    /// Int32 rides the Int64 column kind with 4-byte storage; allocate the
-    /// fixed buffer once at the right width instead of building the 8-byte
-    /// buffer via `new()` and immediately replacing it.
-    fn new_int32(capacity: u32) -> Self {
-        Self::with_fixed_width(ColumnType::Int64, capacity, MAX_VALUE_BYTES, 4)
     }
 
     /// Reset for reuse. Grown variable-width allocations are retained rather
@@ -142,12 +210,14 @@ impl ColumnStorage {
     pub fn reset(&mut self) {
         self.validity.fill(0);
         self.data_len = 0;
-        if let Some(b) = self.bool_data.as_mut() {
-            b.fill(0);
+        // Only the bit-packed kind needs clearing: `append_bool` sets bits and
+        // never clears them, while every other kind overwrites the whole cell.
+        if self.kind == PlaneKind::Bool {
+            self.values.fill(0);
         }
     }
 
-    /// Grow the variable-width data buffer geometrically, capped at
+    /// Grow the variable-width payload geometrically, capped at
     /// `max_data_bytes`. Only `preserve_end` bytes survive reallocation; bytes
     /// past it are scratch.
     fn ensure_variable_capacity_preserving(
@@ -155,10 +225,10 @@ impl ColumnStorage {
         required: usize,
         preserve_end: usize,
     ) -> Result<(), ParseError> {
-        let Some(current) = self.data.as_mut() else {
+        if self.kind.offset_width().is_none() {
             return Err(ParseError::InvalidFieldType);
-        };
-        if required <= current.len() {
+        }
+        if required <= self.values.len() {
             return Ok(());
         }
         if required > self.max_data_bytes as usize {
@@ -166,7 +236,7 @@ impl ColumnStorage {
         }
 
         let max = self.max_data_bytes as usize;
-        let mut new_capacity = current.len();
+        let mut new_capacity = self.values.len();
         while new_capacity < required {
             if new_capacity >= max {
                 return Err(ParseError::BufferOverflow);
@@ -179,9 +249,9 @@ impl ColumnStorage {
         }
 
         let mut replacement = vec![0u8; new_capacity];
-        debug_assert!(preserve_end <= current.len());
-        replacement[..preserve_end].copy_from_slice(&current[..preserve_end]);
-        *current = replacement;
+        debug_assert!(preserve_end <= self.values.len());
+        replacement[..preserve_end].copy_from_slice(&self.values[..preserve_end]);
+        self.values = replacement;
         Ok(())
     }
 
@@ -192,63 +262,112 @@ impl ColumnStorage {
     pub fn validity_bytes(&self, row_count: u32) -> &[u8] {
         &self.validity[..(row_count as usize).div_ceil(8)]
     }
+
+    /// The offsets buffer for the variable-width kinds, `None` otherwise.
     pub fn offsets_bytes(&self, row_count: u32) -> Option<&[u8]> {
-        Some(&self.offsets.as_ref()?[..(row_count as usize + 1) * 4])
-    }
-    pub fn data_bytes(&self) -> Option<&[u8]> {
-        Some(&self.data.as_ref()?[..self.data_len as usize])
-    }
-    /// Full retained data capacity, useful for checking warm reuse.
-    pub fn data_capacity(&self) -> Option<usize> {
-        Some(self.data.as_ref()?.len())
-    }
-    pub fn fixed_i32_bytes(&self, row_count: u32) -> Option<&[u8]> {
-        Some(&self.fixed.as_ref()?[..row_count as usize * 4])
-    }
-    pub fn fixed_i64_bytes(&self, row_count: u32) -> Option<&[u8]> {
-        Some(&self.fixed.as_ref()?[..row_count as usize * 8])
-    }
-    pub fn fixed_f64_bytes(&self, row_count: u32) -> Option<&[u8]> {
-        Some(&self.fixed.as_ref()?[..row_count as usize * 8])
-    }
-    pub fn bool_bytes(&self, row_count: u32) -> Option<&[u8]> {
-        Some(&self.bool_data.as_ref()?[..(row_count as usize).div_ceil(8)])
+        let width = self.kind.offset_width()? as usize;
+        Some(&self.offsets[..(row_count as usize + 1) * width])
     }
 
-    /// Read the raw four-byte plane of a 32-bit column.
-    pub fn read_fixed_i32(&self, row: u32) -> Option<i32> {
-        let fixed = self.fixed.as_ref()?;
-        let start = row as usize * 4;
-        Some(i32::from_le_bytes(fixed[start..start + 4].try_into().ok()?))
-    }
-    pub fn read_fixed_i64(&self, row: u32) -> Option<i64> {
-        let fixed = self.fixed.as_ref()?;
-        // A four-byte plane holds a signed Int32 (the only logical type that
-        // maps to `ArrowType::Int32`), so widening must sign-extend. Reading
-        // it unsigned turns every negative cell into a large positive one.
-        if self.fixed_width == 4 {
-            return self.read_fixed_i32(row).map(i64::from);
+    /// The plane's data buffer at `row_count` rows: fixed-width values, packed
+    /// bits, or the used prefix of the variable-width payload. One accessor
+    /// for every plane, because the Arrow body wants the same thing from all
+    /// of them — the bytes that back these rows.
+    pub fn value_bytes(&self, row_count: u32) -> &[u8] {
+        let rows = row_count as usize;
+        match self.kind {
+            PlaneKind::Empty => &[],
+            PlaneKind::Bool => &self.values[..rows.div_ceil(8)],
+            PlaneKind::SignedInt { width }
+            | PlaneKind::UnsignedInt { width }
+            | PlaneKind::Float { width }
+            | PlaneKind::FixedBytes { width } => &self.values[..rows * width as usize],
+            PlaneKind::Text { .. } | PlaneKind::Bytes { .. } => {
+                &self.values[..self.data_len as usize]
+            }
         }
-        let start = row as usize * 8;
-        Some(i64::from_le_bytes(fixed[start..start + 8].try_into().ok()?))
     }
-    pub fn read_fixed_f64(&self, row: u32) -> Option<f64> {
-        let fixed = self.fixed.as_ref()?;
-        let start = row as usize * 8;
-        Some(f64::from_le_bytes(fixed[start..start + 8].try_into().ok()?))
+
+    /// Full retained payload capacity, useful for checking warm reuse.
+    pub fn data_capacity(&self) -> usize {
+        self.values.len()
     }
+
+    /// The plane's `width` value bytes for `row`, little-endian, zero-extended
+    /// into a `u64`. Only for widths up to eight.
+    fn raw_value(&self, row: u32, width: u32) -> Option<u64> {
+        let start = row as usize * width as usize;
+        let cell = self.values.get(start..start + width as usize)?;
+        let mut bytes = [0u8; 8];
+        bytes.get_mut(..cell.len())?.copy_from_slice(cell);
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    /// Read a signed cell, sign-extending from the plane's width.
+    ///
+    /// Sign extension is the whole reason signed and unsigned are separate
+    /// planes: a four-byte cell holding `0xFFFF_FFFF` is -1 here and
+    /// 4294967295 in [`ColumnStorage::read_uint`], and no width check can tell
+    /// those two apart.
+    pub fn read_int(&self, row: u32) -> Option<i64> {
+        let PlaneKind::SignedInt { width } = self.kind else {
+            return None;
+        };
+        let raw = self.raw_value(row, width)?;
+        let shift = 64 - width * 8;
+        Some(((raw << shift) as i64) >> shift)
+    }
+
+    /// Read an unsigned cell, zero-extending from the plane's width.
+    pub fn read_uint(&self, row: u32) -> Option<u64> {
+        let PlaneKind::UnsignedInt { width } = self.kind else {
+            return None;
+        };
+        self.raw_value(row, width)
+    }
+
+    /// Read a float cell, widening from the plane's width. `binary16` is
+    /// decoded from its raw bits because stable Rust has no `f16`.
+    pub fn read_float(&self, row: u32) -> Option<f64> {
+        let PlaneKind::Float { width } = self.kind else {
+            return None;
+        };
+        let raw = self.raw_value(row, width)?;
+        Some(match width {
+            2 => f64::from(f32_from_f16_bits(raw as u16)),
+            4 => f64::from(f32::from_bits(raw as u32)),
+            8 => f64::from_bits(raw),
+            // `plane_kind` only ever builds Float with width 2, 4 or 8.
+            _ => return None,
+        })
+    }
+
     pub fn read_bool(&self, row: u32) -> Option<bool> {
-        let bits = self.bool_data.as_ref()?;
-        Some((bits[row as usize / 8] & (1u8 << (row as usize % 8))) != 0)
+        if self.kind != PlaneKind::Bool {
+            return None;
+        }
+        let byte = self.values.get(row as usize / 8)?;
+        Some((byte & (1u8 << (row as usize % 8))) != 0)
     }
+
+    /// Read an opaque fixed-size cell: a decimal, a wide interval, or a
+    /// fixed-size binary value. The plane does not interpret the bytes.
+    pub fn read_fixed_bytes(&self, row: u32) -> Option<&[u8]> {
+        let PlaneKind::FixedBytes { width } = self.kind else {
+            return None;
+        };
+        let start = row as usize * width as usize;
+        self.values.get(start..start + width as usize)
+    }
+
     pub fn read_variable(&self, row: u32) -> Option<&[u8]> {
-        let offsets = self.offsets.as_ref()?;
-        let data = self.data.as_ref()?;
-        let start = read_u32(offsets, row as usize) as usize;
-        let end = read_u32(offsets, row as usize + 1) as usize;
-        Some(&data[start..end])
+        let width = self.kind.offset_width()?;
+        let start = read_offset(&self.offsets, row as usize, width) as usize;
+        let end = read_offset(&self.offsets, row as usize + 1, width) as usize;
+        self.values.get(start..end)
     }
 }
+
 
 /// Errors surfaced by the transactional variable-width writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,15 +424,12 @@ impl VariableValueReservation {
             .map_err(variable_error)
     }
 
-    /// The writable tail of the column's data buffer, starting at the
-    /// reservation.
+    /// The writable tail of the column's payload buffer, starting at the
+    /// reservation. Empty when the column is not variable-width, which
+    /// `reserve_binary_value` has already ruled out.
     pub fn buffer<'a>(&self, cols: &'a mut DynamicColumns) -> &'a mut [u8] {
         let column = &mut cols.columns[self.col_idx as usize];
-        let data = column
-            .data
-            .as_mut()
-            .unwrap_or_else(|| columine_types::die!("reservation on non-variable column"));
-        &mut data[self.start as usize..]
+        &mut column.values[self.start as usize..]
     }
 
     /// Publish the cell's offset, data length, and validity after a
@@ -328,15 +444,12 @@ impl VariableValueReservation {
             .checked_add(relative_len)
             .ok_or(VariableValueError::BufferOverflow)?;
         let column = &mut cols.columns[self.col_idx as usize];
+        let offset_width = column
+            .kind
+            .offset_width()
+            .ok_or(VariableValueError::InvalidFieldType)?;
         let row = self.row_index as usize;
-        write_u32(
-            column
-                .offsets
-                .as_mut()
-                .unwrap_or_else(|| columine_types::die!("reservation on non-variable column")),
-            row,
-            self.start,
-        );
+        write_offset(&mut column.offsets, row, offset_width, self.start);
         column.data_len = end as u32;
         column.validity[row / 8] |= 1u8 << (row % 8);
         Ok(())
@@ -359,25 +472,21 @@ pub struct DynamicColumns {
     pub capacity: u32,
 }
 
-use crate::schema::{ArrowType, SignalSchemaField};
+use crate::schema::{PlaneKind, SignalSchemaField};
 
 impl DynamicColumns {
-    /// Initialize from schema field metadata: each Arrow type maps to its
-    /// storage layout; `Null` is stored as utf8 ("treat null type as empty
-    /// strings").
+    /// Initialize from schema field metadata: every field's storage follows
+    /// from its plane kind, including the byte width, so there is no per-type
+    /// dispatch left to get wrong.
     pub fn new(field_metadata: &[SignalSchemaField], capacity: u32) -> Self {
         let cap = capacity.min(MAX_EVENTS_PER_BATCH);
         let columns = field_metadata
             .iter()
-            .map(|field| match field.arrow_type {
-                ArrowType::Int32 => ColumnStorage::new_int32(cap),
-                ArrowType::Utf8 => ColumnStorage::new(ColumnType::Utf8, cap),
-                ArrowType::Binary => ColumnStorage::new(ColumnType::Binary, cap),
-                ArrowType::Int64 => ColumnStorage::new(ColumnType::Int64, cap),
-                ArrowType::Float64 => ColumnStorage::new(ColumnType::Float64, cap),
-                ArrowType::Bool => ColumnStorage::new(ColumnType::Bool, cap),
-                ArrowType::Null => ColumnStorage::new(ColumnType::Utf8, cap),
-            })
+            // The Null plane allocates nothing: it has no buffers in the Arrow
+            // body and every row of it is null. It used to be stored as an
+            // empty utf8 column, paying for offsets and a payload no reader
+            // could ever reach.
+            .map(|field| ColumnStorage::new(field.plane_kind(), cap))
             .collect::<Vec<_>>();
         Self {
             count: 0,
@@ -409,9 +518,9 @@ impl DynamicColumns {
         self.count += 1;
         let count = self.count as usize;
         for col in &mut self.columns {
-            let data_len = col.data_len;
-            if let Some(offsets) = col.offsets.as_mut() {
-                write_u32(offsets, count, data_len);
+            if let Some(width) = col.kind.offset_width() {
+                let data_len = col.data_len;
+                write_offset(&mut col.offsets, count, width, data_len);
             }
         }
     }
@@ -434,7 +543,7 @@ impl DynamicColumns {
             return Err(VariableValueError::InvalidFieldType);
         }
         let column = &self.columns[col_idx as usize];
-        if column.col_type != ColumnType::Binary {
+        if !matches!(column.kind, PlaneKind::Bytes { .. }) {
             return Err(VariableValueError::InvalidFieldType);
         }
         Ok(VariableValueReservation {
@@ -444,125 +553,131 @@ impl DynamicColumns {
         })
     }
 
-    /// Append a UTF-8 string value.
+    /// Mutable storage for the cell being appended, with the row index.
+    ///
+    /// Every typed append needs the same three things — bounds check, current
+    /// row, column — so they ask once here instead of restating it five times.
+    fn cell(&mut self, col_idx: u32) -> Result<(usize, &mut ColumnStorage), ParseError> {
+        let row_idx = self.count as usize;
+        let column = self
+            .columns
+            .get_mut(col_idx as usize)
+            .filter(|_| col_idx < self.field_count)
+            .ok_or(ParseError::InvalidFieldType)?;
+        Ok((row_idx, column))
+    }
+
+    /// Append a variable-width value: text or opaque bytes.
+    ///
+    /// UTF-8 validity is the producer's business here — the extractors hand
+    /// over bytes they already decoded, and the compact path validates them at
+    /// the boundary where they arrive from outside.
     ///
     /// Faithful append semantics: the row's offset is set to the CURRENT
     /// data_len and bytes are appended. A second append to the same cell in
     /// one row moves the offset forward and leaves the first bytes as dead
     /// data between offsets — observable in the IPC body byte image (pinned
     /// by `duplicate_append_leaves_dead_bytes`).
-    pub fn append_utf8(&mut self, col_idx: u32, value: &[u8]) -> Result<(), ParseError> {
-        if col_idx >= self.field_count {
+    pub fn append_variable(&mut self, col_idx: u32, value: &[u8]) -> Result<(), ParseError> {
+        let (row_idx, col) = self.cell(col_idx)?;
+        let Some(offset_width) = col.kind.offset_width() else {
             return Err(ParseError::InvalidFieldType);
-        }
-        let row_idx = self.count as usize;
-        let col = &mut self.columns[col_idx as usize];
-        if col.col_type != ColumnType::Utf8 && col.col_type != ColumnType::Binary {
-            return Err(ParseError::InvalidFieldType);
-        }
+        };
         let required = (col.data_len as usize)
             .checked_add(value.len())
             .ok_or(ParseError::BufferOverflow)?;
         col.ensure_variable_capacity(required)?;
 
         let data_len = col.data_len;
-        write_u32(
-            col.offsets
-                .as_mut()
-                .unwrap_or_else(|| columine_types::die!("variable column without offsets")),
-            row_idx,
-            data_len,
-        );
-        let data = col
-            .data
-            .as_mut()
-            .unwrap_or_else(|| columine_types::die!("variable column without data"));
-        data[data_len as usize..][..value.len()].copy_from_slice(value);
+        write_offset(&mut col.offsets, row_idx, offset_width, data_len);
+        col.values[data_len as usize..][..value.len()].copy_from_slice(value);
         col.data_len += value.len() as u32;
         col.validity[row_idx / 8] |= 1u8 << (row_idx % 8);
         Ok(())
     }
 
-    /// Append a signed 32-bit value into a four-byte plane.
-    pub fn append_int32(&mut self, col_idx: u32, value: i64) -> Result<(), ParseError> {
-        if self
-            .columns
-            .get(col_idx as usize)
-            .is_none_or(|column| column.fixed_width != 4)
-        {
+    /// Append into a signed integer plane, range-checked to the plane's width.
+    ///
+    /// A value that does not fit is rejected, not truncated: storing 300 in an
+    /// i8 column as 44 is a silently wrong number, and this crate does not
+    /// produce those.
+    pub fn append_int(&mut self, col_idx: u32, value: i64) -> Result<(), ParseError> {
+        let (row_idx, col) = self.cell(col_idx)?;
+        let PlaneKind::SignedInt { width } = col.kind else {
+            return Err(ParseError::InvalidFieldType);
+        };
+        if !col.kind.holds_int(value) {
             return Err(ParseError::InvalidFieldType);
         }
-        self.append_int64(col_idx, value)
-    }
-
-    /// Append an Int64 value.
-    pub fn append_int64(&mut self, col_idx: u32, value: i64) -> Result<(), ParseError> {
-        if col_idx >= self.field_count {
-            return Err(ParseError::InvalidFieldType);
-        }
-        let row_idx = self.count as usize;
-        let col = &mut self.columns[col_idx as usize];
-        let fixed = col.fixed.as_mut().ok_or(ParseError::InvalidFieldType)?;
-        match (col.col_type, col.fixed_width) {
-            (ColumnType::Int64, 4) => {
-                // A four-byte plane is a signed Int32. Accepting the unsigned
-                // upper half would store a value that no reader of this
-                // column can name.
-                let narrow = i32::try_from(value).map_err(|_| ParseError::InvalidFieldType)?;
-                fixed[row_idx * 4..row_idx * 4 + 4].copy_from_slice(&narrow.to_le_bytes());
-            }
-            (ColumnType::Int64, 8) => {
-                fixed[row_idx * 8..row_idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
-            }
-            _ => return Err(ParseError::InvalidFieldType),
-        }
-        col.validity[row_idx / 8] |= 1u8 << (row_idx % 8);
+        write_cell(col, row_idx, width, value.to_le_bytes());
         Ok(())
     }
 
-    /// Append a Float64 value.
-    pub fn append_float64(&mut self, col_idx: u32, value: f64) -> Result<(), ParseError> {
-        if col_idx >= self.field_count {
+    /// Append into an unsigned integer plane, range-checked to the plane's
+    /// width. `0xFFFF_FFFF` in a four-byte unsigned plane is 4294967295, which
+    /// is exactly the value the signed plane cannot hold.
+    pub fn append_uint(&mut self, col_idx: u32, value: u64) -> Result<(), ParseError> {
+        let (row_idx, col) = self.cell(col_idx)?;
+        let PlaneKind::UnsignedInt { width } = col.kind else {
+            return Err(ParseError::InvalidFieldType);
+        };
+        if !col.kind.holds_uint(value) {
             return Err(ParseError::InvalidFieldType);
         }
-        let row_idx = self.count as usize;
-        let col = &mut self.columns[col_idx as usize];
-        if col.col_type != ColumnType::Float64 {
+        write_cell(col, row_idx, width, value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Append into a float plane, narrowing to its width. `binary32` and
+    /// `binary16` round to nearest with ties to even, like every other
+    /// IEEE-754 narrowing.
+    pub fn append_float(&mut self, col_idx: u32, value: f64) -> Result<(), ParseError> {
+        let (row_idx, col) = self.cell(col_idx)?;
+        let PlaneKind::Float { width } = col.kind else {
+            return Err(ParseError::InvalidFieldType);
+        };
+        let raw = match width {
+            2 => u64::from(f16_bits_from_f32(value as f32)),
+            4 => u64::from((value as f32).to_bits()),
+            8 => value.to_bits(),
+            // `plane_kind` only ever builds Float with width 2, 4 or 8.
+            _ => return Err(ParseError::InvalidFieldType),
+        };
+        write_cell(col, row_idx, width, raw.to_le_bytes());
+        Ok(())
+    }
+
+    /// Append an opaque fixed-size value: a decimal, a wide interval, or a
+    /// fixed-size binary cell.
+    ///
+    /// The slice must be exactly the plane's width. A short decimal is a
+    /// different number, not a shorter one, so a length mismatch is an error
+    /// rather than a zero-fill.
+    pub fn append_fixed_bytes(&mut self, col_idx: u32, value: &[u8]) -> Result<(), ParseError> {
+        let (row_idx, col) = self.cell(col_idx)?;
+        let PlaneKind::FixedBytes { width } = col.kind else {
+            return Err(ParseError::InvalidFieldType);
+        };
+        if value.len() != width as usize {
             return Err(ParseError::InvalidFieldType);
         }
-        let fixed = col
-            .fixed
-            .as_mut()
-            .unwrap_or_else(|| columine_types::die!("float64 column without fixed storage"));
-        fixed[row_idx * 8..row_idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        let start = row_idx * width as usize;
+        col.values[start..start + value.len()].copy_from_slice(value);
         col.validity[row_idx / 8] |= 1u8 << (row_idx % 8);
         Ok(())
     }
 
     /// Append a boolean value (Arrow LSB-first).
     pub fn append_bool(&mut self, col_idx: u32, value: bool) -> Result<(), ParseError> {
-        if col_idx >= self.field_count {
-            return Err(ParseError::InvalidFieldType);
-        }
-        let row_idx = self.count as usize;
-        let col = &mut self.columns[col_idx as usize];
-        if col.col_type != ColumnType::Bool {
+        let (row_idx, col) = self.cell(col_idx)?;
+        if col.kind != PlaneKind::Bool {
             return Err(ParseError::InvalidFieldType);
         }
         if value {
-            let bits = col
-                .bool_data
-                .as_mut()
-                .unwrap_or_else(|| columine_types::die!("bool column without bit storage"));
-            bits[row_idx / 8] |= 1u8 << (row_idx % 8);
+            col.values[row_idx / 8] |= 1u8 << (row_idx % 8);
         }
         col.validity[row_idx / 8] |= 1u8 << (row_idx % 8);
         Ok(())
-    }
-
-    /// Append binary data using the same variable-width storage as UTF-8.
-    pub fn append_binary(&mut self, col_idx: u32, value: &[u8]) -> Result<(), ParseError> {
-        self.append_utf8(col_idx, value)
     }
 
     /// Append null (no-op: null is the default validity state).
@@ -635,9 +750,9 @@ mod tests {
         ];
         let mut cols = DynamicColumns::new(&fields, 10);
         assert!(cols.begin_row());
-        cols.append_utf8(0, b"id-001").unwrap();
-        cols.append_int64(1, 42).unwrap();
-        cols.append_float64(2, 99.99).unwrap();
+        cols.append_variable(0, b"id-001").unwrap();
+        cols.append_int(1, 42).unwrap();
+        cols.append_float(2, 99.99).unwrap();
         cols.append_bool(3, true).unwrap();
         cols.end_row();
         assert_eq!(cols.count, 1);
@@ -645,8 +760,8 @@ mod tests {
             assert!(!cols.is_null(col, 0));
         }
         assert_eq!(cols.columns[0].read_variable(0).unwrap(), b"id-001");
-        assert_eq!(cols.columns[1].read_fixed_i64(0).unwrap(), 42);
-        assert_eq!(cols.columns[2].read_fixed_f64(0).unwrap(), 99.99);
+        assert_eq!(cols.columns[1].read_int(0).unwrap(), 42);
+        assert_eq!(cols.columns[2].read_float(0).unwrap(), 99.99);
         assert!(cols.columns[3].read_bool(0).unwrap());
     }
 
@@ -659,7 +774,7 @@ mod tests {
         ];
         let mut cols = DynamicColumns::new(&fields, 10);
         assert!(cols.begin_row());
-        cols.append_utf8(0, b"id-001").unwrap();
+        cols.append_variable(0, b"id-001").unwrap();
         cols.append_null(1).unwrap();
         cols.end_row();
         assert!(!cols.is_null(0, 0));
@@ -676,8 +791,8 @@ mod tests {
         let mut cols = DynamicColumns::new(&fields, 10);
         for (name, count) in [("alice", 10), ("bob", 20), ("charlie", 30)] {
             assert!(cols.begin_row());
-            cols.append_utf8(0, name.as_bytes()).unwrap();
-            cols.append_int64(1, count).unwrap();
+            cols.append_variable(0, name.as_bytes()).unwrap();
+            cols.append_int(1, count).unwrap();
             cols.end_row();
         }
         assert_eq!(cols.count, 3);
@@ -692,22 +807,22 @@ mod tests {
         let mut cols = DynamicColumns::new(&fields, 8);
         for value in [0, -1, i64::from(i32::MIN), i64::from(i32::MAX)] {
             assert!(cols.begin_row());
-            cols.append_int32(0, value).unwrap();
+            cols.append_int(0, value).unwrap();
             cols.end_row();
         }
         let plane = &cols.columns[0];
-        assert_eq!(plane.read_fixed_i64(0).unwrap(), 0);
-        assert_eq!(plane.read_fixed_i64(1).unwrap(), -1);
-        assert_eq!(plane.read_fixed_i64(2).unwrap(), i64::from(i32::MIN));
-        assert_eq!(plane.read_fixed_i64(3).unwrap(), i64::from(i32::MAX));
+        assert_eq!(plane.read_int(0).unwrap(), 0);
+        assert_eq!(plane.read_int(1).unwrap(), -1);
+        assert_eq!(plane.read_int(2).unwrap(), i64::from(i32::MIN));
+        assert_eq!(plane.read_int(3).unwrap(), i64::from(i32::MAX));
 
         assert!(cols.begin_row());
         assert_eq!(
-            cols.append_int32(0, i64::from(i32::MAX) + 1),
+            cols.append_int(0, i64::from(i32::MAX) + 1),
             Err(ParseError::InvalidFieldType)
         );
         assert_eq!(
-            cols.append_int32(0, i64::from(i32::MIN) - 1),
+            cols.append_int(0, i64::from(i32::MIN) - 1),
             Err(ParseError::InvalidFieldType)
         );
     }
@@ -718,13 +833,13 @@ mod tests {
         let fields = [field(ArrowType::Utf8, false)];
         let mut cols = DynamicColumns::new(&fields, 10);
         assert!(cols.begin_row());
-        cols.append_utf8(0, b"test").unwrap();
+        cols.append_variable(0, b"test").unwrap();
         cols.end_row();
         assert_eq!(cols.count, 1);
         cols.reset();
         assert_eq!(cols.count, 0);
         assert!(cols.begin_row());
-        cols.append_utf8(0, b"new").unwrap();
+        cols.append_variable(0, b"new").unwrap();
         cols.end_row();
         assert_eq!(cols.count, 1);
         assert_eq!(cols.columns[0].read_variable(0).unwrap(), b"new");
@@ -737,7 +852,7 @@ mod tests {
         let mut cols = DynamicColumns::new(&fields, 10);
         assert!(cols.begin_row());
         assert_eq!(
-            cols.append_utf8(0, b"not an int"),
+            cols.append_variable(0, b"not an int"),
             Err(ParseError::InvalidFieldType)
         );
     }
@@ -750,20 +865,20 @@ mod tests {
         let payload = [0x5a_u8; 48_000];
         for _ in 0..2 {
             assert!(cols.begin_row());
-            cols.append_binary(0, &payload).unwrap();
+            cols.append_variable(0, &payload).unwrap();
             cols.end_row();
         }
         assert_eq!(cols.columns[0].data_len, 96_000);
-        let warm_capacity = cols.columns[0].data_capacity().unwrap();
+        let warm_capacity = cols.columns[0].data_capacity();
         for _ in 0..20 {
             cols.reset();
             for _ in 0..2 {
                 assert!(cols.begin_row());
-                cols.append_binary(0, &payload).unwrap();
+                cols.append_variable(0, &payload).unwrap();
                 cols.end_row();
             }
             // Retained capacity avoids growth during warm reuse.
-            assert_eq!(cols.columns[0].data_capacity().unwrap(), warm_capacity);
+            assert_eq!(cols.columns[0].data_capacity(), warm_capacity);
             assert_eq!(cols.columns[0].data_len, 96_000);
         }
     }
@@ -782,16 +897,16 @@ mod tests {
         let second = [b'b'; 40_000];
 
         assert!(cols.begin_row());
-        cols.append_utf8(0, &first).unwrap();
-        cols.append_binary(1, &second).unwrap();
-        cols.append_int64(2, 11).unwrap();
+        cols.append_variable(0, &first).unwrap();
+        cols.append_variable(1, &second).unwrap();
+        cols.append_int(2, 11).unwrap();
         cols.append_null(3).unwrap();
         cols.end_row();
 
         assert!(cols.begin_row());
-        cols.append_utf8(0, &second).unwrap();
-        cols.append_binary(1, &first).unwrap();
-        cols.append_int64(2, 22).unwrap();
+        cols.append_variable(0, &second).unwrap();
+        cols.append_variable(1, &first).unwrap();
+        cols.append_int(2, 22).unwrap();
         cols.append_bool(3, true).unwrap();
         cols.end_row();
 
@@ -803,8 +918,8 @@ mod tests {
         assert_eq!(text.read_variable(1).unwrap(), &second);
         assert_eq!(binary.read_variable(0).unwrap(), &second);
         assert_eq!(binary.read_variable(1).unwrap(), &first);
-        assert_eq!(read_u32(text.offsets.as_ref().unwrap(), 1), 40_000);
-        assert_eq!(read_u32(text.offsets.as_ref().unwrap(), 2), 80_000);
+        assert_eq!(read_offset(&text.offsets, 1, 4), 40_000);
+        assert_eq!(read_offset(&text.offsets, 2, 4), 80_000);
         assert!(cols.is_null(3, 0));
         assert!(!cols.is_null(3, 1));
     }
@@ -812,13 +927,13 @@ mod tests {
     // test "ColumnStorage configured maximum and reset retain grown allocation"
     #[test]
     fn column_storage_configured_maximum() {
-        let mut col = ColumnStorage::with_variable_limit(ColumnType::Binary, 2, 1024);
+        let mut col = ColumnStorage::with_variable_limit(PlaneKind::Bytes { offset_width: 4 }, 2, 1024);
         col.ensure_variable_capacity(1024).unwrap();
-        assert_eq!(col.data_capacity().unwrap(), 1024);
+        assert_eq!(col.data_capacity(), 1024);
         for _ in 0..20 {
             col.reset();
             col.ensure_variable_capacity(1024).unwrap();
-            assert_eq!(col.data_capacity().unwrap(), 1024);
+            assert_eq!(col.data_capacity(), 1024);
             col.data_len = 1024;
         }
         col.reset();
@@ -826,7 +941,7 @@ mod tests {
             col.ensure_variable_capacity(1025),
             Err(ParseError::BufferOverflow)
         );
-        assert_eq!(col.data_capacity().unwrap(), 1024);
+        assert_eq!(col.data_capacity(), 1024);
         assert_eq!(col.data_len, 0);
     }
 
@@ -838,14 +953,14 @@ mod tests {
         let fields = [field(ArrowType::Utf8, false)];
         let mut cols = DynamicColumns::new(&fields, 4);
         assert!(cols.begin_row());
-        cols.append_utf8(0, b"first").unwrap();
-        cols.append_utf8(0, b"second").unwrap();
+        cols.append_variable(0, b"first").unwrap();
+        cols.append_variable(0, b"second").unwrap();
         cols.end_row();
         // The cell reads as the LAST append...
         assert_eq!(cols.columns[0].read_variable(0).unwrap(), b"second");
         // ...but data_len includes the dead first append (5 + 6 bytes).
         assert_eq!(cols.columns[0].data_len, 11);
-        assert_eq!(read_u32(cols.columns[0].offsets.as_ref().unwrap(), 0), 5);
+        assert_eq!(read_offset(&cols.columns[0].offsets, 0, 4), 5);
     }
 
     /// A null append is a no-op, so appending binary data afterward publishes
@@ -856,11 +971,11 @@ mod tests {
         let mut cols = DynamicColumns::new(&fields, 4);
         assert!(cols.begin_row());
         cols.append_null(0).unwrap();
-        cols.append_binary(0, b"\xdf\0\0\0\0").unwrap();
+        cols.append_variable(0, b"\xdf\0\0\0\0").unwrap();
         cols.end_row();
         assert!(!cols.is_null(0, 0));
         assert_eq!(cols.columns[0].data_len, 5);
-        assert_eq!(read_u32(cols.columns[0].offsets.as_ref().unwrap(), 0), 0);
+        assert_eq!(read_offset(&cols.columns[0].offsets, 0, 4), 0);
     }
 
     /// Transactional reservation: nothing publishes until commit.

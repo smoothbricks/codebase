@@ -2,8 +2,9 @@
 
 use crate::msgpack_scanner::Reader;
 use crate::{
-    ArrowType, ColumnValue, DynamicColumns, ExtractionConfig, ParseError,
-    json_extractor::ExtractionError, json_scanner::parse_iso8601_to_micros,
+    ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind,
+    SignalSchemaField, json_extractor::ExtractionError,
+    json_scanner::parse_iso8601_to_micros,
 };
 
 /// Extracts either a concatenated MessagePack map stream or an array of maps.
@@ -97,7 +98,7 @@ fn extract_msgpack_fields(
             .ok()
             .and_then(|name| config.field_map.get(name));
         if let Some(lookup) = lookup {
-            extract_typed_value(reader, lookup.arrow_type, columns, lookup.column)?;
+            extract_typed_value(reader, lookup.field, columns, lookup.column)?;
             columns.columns_seen[lookup.column] = true;
         } else if extra_active {
             let value_start = reader.position();
@@ -149,9 +150,15 @@ fn extract_msgpack_fields(
     Ok(())
 }
 
+/// Coerce one MessagePack value into one column.
+///
+/// The Arrow-plane coercion table is one contract, shared in spirit with
+/// `json_extractor::extract_typed_value`, and keyed on plane KIND so that
+/// twenty-three planes reduce to eight coercions. MessagePack carries markers
+/// that prove an integer is an integer, so nothing here truncates a float.
 fn extract_typed_value(
     reader: &mut Reader<'_>,
-    kind: ArrowType,
+    field: SignalSchemaField,
     columns: &mut DynamicColumns,
     column: usize,
 ) -> Result<(), ExtractionError> {
@@ -159,8 +166,9 @@ fn extract_typed_value(
         .input()
         .get(reader.position())
         .ok_or(ExtractionError::InvalidJson)?;
+    let kind = field.plane_kind();
     let value = match kind {
-        ArrowType::Utf8 => {
+        PlaneKind::Text { .. } => {
             if first == 0xc0 {
                 reader.skip_value();
                 None
@@ -176,13 +184,13 @@ fn extract_typed_value(
                 ))
             }
         }
-        // The Arrow-type coercion table is one contract, shared with
-        // `json_extractor::extract_typed_value`: Int32 takes integers in i32
-        // range only; Int64 additionally takes bigint-as-string and ISO-8601
-        // instants, because a 64-bit value does not survive a JSON number.
-        // Neither truncates a float — a producer that sent 1.5 did not send
-        // an integer, and MessagePack carries the marker that proves it.
-        ArrowType::Int32 => {
+        // Integer planes take integers only, range-checked to the plane's
+        // width. The eight-byte signed plane additionally takes
+        // bigint-as-string and ISO-8601 instants, because a 64-bit value does
+        // not survive a JSON number and the cross-format contract keeps the
+        // two extractors interchangeable; the eight-byte unsigned plane takes
+        // the string form for the same reason.
+        PlaneKind::SignedInt { width } => {
             if first == 0xc0 {
                 reader.skip_value();
                 None
@@ -190,23 +198,11 @@ fn extract_typed_value(
                 let wide = reader
                     .read_integer()
                     .ok_or(ExtractionError::InvalidFieldType)?;
-                let narrow = i32::try_from(wide).map_err(|_| ExtractionError::InvalidFieldType)?;
-                Some(ColumnValue::Int64(i64::from(narrow)))
-            } else {
-                return Err(ExtractionError::InvalidFieldType);
-            }
-        }
-        ArrowType::Int64 => {
-            if first == 0xc0 {
-                reader.skip_value();
-                None
-            } else if Reader::is_integer(first) {
-                Some(ColumnValue::Int64(
-                    reader
-                        .read_integer()
-                        .ok_or(ExtractionError::InvalidFieldType)?,
-                ))
-            } else if Reader::is_string(first) {
+                if !kind.holds_int(wide) {
+                    return Err(ExtractionError::InvalidFieldType);
+                }
+                Some(ColumnValue::Int(wide))
+            } else if width == 8 && Reader::is_string(first) {
                 let text = std::str::from_utf8(
                     reader
                         .read_string()
@@ -218,23 +214,52 @@ fn extract_typed_value(
                     Err(_) => parse_iso8601_to_micros(text)
                         .map_err(|_| ExtractionError::InvalidFieldType)?,
                 };
-                Some(ColumnValue::Int64(micros))
+                Some(ColumnValue::Int(micros))
             } else {
                 return Err(ExtractionError::InvalidFieldType);
             }
         }
-        ArrowType::Float64 => {
+        PlaneKind::UnsignedInt { width } => {
+            if first == 0xc0 {
+                reader.skip_value();
+                None
+            } else if Reader::is_integer(first) {
+                // `read_unsigned_integer` and not `read_integer`: a
+                // MessagePack `uint64` above `i64::MAX` is exactly the value
+                // the unsigned planes exist to carry.
+                let wide = reader
+                    .read_unsigned_integer()
+                    .ok_or(ExtractionError::InvalidFieldType)?;
+                if !kind.holds_uint(wide) {
+                    return Err(ExtractionError::InvalidFieldType);
+                }
+                Some(ColumnValue::UInt(wide))
+            } else if width == 8 && Reader::is_string(first) {
+                let text = std::str::from_utf8(
+                    reader
+                        .read_string()
+                        .ok_or(ExtractionError::InvalidFieldType)?,
+                )
+                .map_err(|_| ExtractionError::InvalidFieldType)?;
+                Some(ColumnValue::UInt(
+                    text.parse().map_err(|_| ExtractionError::InvalidFieldType)?,
+                ))
+            } else {
+                return Err(ExtractionError::InvalidFieldType);
+            }
+        }
+        PlaneKind::Float { .. } => {
             if first == 0xc0 {
                 reader.skip_value();
                 None
             } else if Reader::is_float(first) {
-                Some(ColumnValue::Float64(
+                Some(ColumnValue::Float(
                     reader
                         .read_float()
                         .ok_or(ExtractionError::InvalidFieldType)?,
                 ))
             } else if Reader::is_integer(first) {
-                Some(ColumnValue::Float64(
+                Some(ColumnValue::Float(
                     reader
                         .read_integer()
                         .ok_or(ExtractionError::InvalidFieldType)? as f64,
@@ -243,7 +268,7 @@ fn extract_typed_value(
                 return Err(ExtractionError::InvalidFieldType);
             }
         }
-        ArrowType::Bool => match first {
+        PlaneKind::Bool => match first {
             0xc0 => {
                 reader.skip_value();
                 None
@@ -258,7 +283,23 @@ fn extract_typed_value(
             }
             _ => return Err(ExtractionError::InvalidFieldType),
         },
-        ArrowType::Binary => {
+        // MessagePack has a real byte string, so an exactly-width plane takes
+        // a `bin` of exactly that many bytes — no hex detour, unlike JSON.
+        PlaneKind::FixedBytes { width } => {
+            if first == 0xc0 {
+                reader.skip_value();
+                None
+            } else if matches!(first, 0xc4..=0xc6) {
+                let payload = reader.read_bin().ok_or(ExtractionError::InvalidJson)?;
+                if payload.len() != width as usize {
+                    return Err(ExtractionError::InvalidFieldType);
+                }
+                Some(ColumnValue::FixedBytes(payload.to_vec()))
+            } else {
+                return Err(ExtractionError::InvalidFieldType);
+            }
+        }
+        PlaneKind::Bytes { .. } => {
             if first == 0xc0 {
                 reader.skip_value();
                 None
@@ -280,7 +321,7 @@ fn extract_typed_value(
                 ))
             }
         }
-        ArrowType::Null => {
+        PlaneKind::Empty => {
             reader.skip_value().ok_or(ExtractionError::InvalidJson)?;
             None
         }
@@ -301,7 +342,7 @@ fn append(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CellExt, SignalSchemaField, build_extraction_config};
+    use crate::{ArrowType, CellExt, SignalSchemaField, build_extraction_config};
     fn field(arrow_type: ArrowType) -> SignalSchemaField {
         SignalSchemaField::new(arrow_type, true)
     }

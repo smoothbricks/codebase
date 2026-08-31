@@ -17,8 +17,8 @@ pub mod msgpack_scanner;
 pub mod scan;
 
 pub use columine_arrow::{
-    ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, ColumnStorage, ColumnType,
-    DynamicColumns, MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES, ParseError, SignalSchemaField,
+    ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, ColumnStorage, DynamicColumns,
+    MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES, ParseError, PlaneKind, SignalSchemaField,
 };
 
 /// Column indices of the base event log, matching
@@ -45,11 +45,11 @@ pub(crate) fn commit_base_event(
         return Err(ParseError::TooManyEvents);
     }
     let result = (|| {
-        columns.append_utf8(base_column::ID, id)?;
-        columns.append_utf8(base_column::TYPE, event_type)?;
-        columns.append_int64(base_column::TIMESTAMP, timestamp_micros)?;
+        columns.append_variable(base_column::ID, id)?;
+        columns.append_variable(base_column::TYPE, event_type)?;
+        columns.append_int(base_column::TIMESTAMP, timestamp_micros)?;
         match value {
-            Some(bytes) => columns.append_binary(base_column::VALUE, bytes),
+            Some(bytes) => columns.append_variable(base_column::VALUE, bytes),
             None => columns.append_null(base_column::VALUE),
         }
     })();
@@ -92,7 +92,7 @@ pub fn parsed_event(columns: &DynamicColumns, row: u32) -> Option<ParsedEvent> {
         event_type: text(base_column::TYPE)?,
         timestamp_micros: columns
             .get_column(base_column::TIMESTAMP)?
-            .read_fixed_i64(row)?,
+            .read_int(row)?,
         value: (!columns.is_null(base_column::VALUE, row))
             .then(|| {
                 columns
@@ -105,13 +105,27 @@ pub fn parsed_event(columns: &DynamicColumns, row: u32) -> Option<ParsedEvent> {
 }
 
 /// Typed value carrier between the token stream and the typed appends.
+///
+/// One variant per plane KIND, not per plane: the column knows its own width,
+/// so a producer says "this is a signed integer" and the plane decides whether
+/// that integer fits. Twenty-three planes therefore need seven carriers.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ColumnValue {
+    /// Text for the Utf8 and LargeUtf8 planes.
     Utf8(String),
-    Int64(i64),
-    Float64(f64),
-    Bool(bool),
+    /// Opaque bytes for the Binary and LargeBinary planes.
     Binary(Vec<u8>),
+    /// Signed integer for the Int8/16/32/64 and IntervalYearMonth planes,
+    /// which is also every temporal plane.
+    Int(i64),
+    /// Unsigned integer for the UInt8/16/32/64 planes.
+    UInt(u64),
+    /// Float for the Float16/32/64 planes.
+    Float(f64),
+    Bool(bool),
+    /// Exactly-width bytes for the decimal, wide-interval and fixed-size
+    /// binary planes, which the plane does not interpret.
+    FixedBytes(Vec<u8>),
 }
 
 /// Dispatch an extracted value to the matching typed append operation.
@@ -126,11 +140,13 @@ pub(crate) fn append_cell(
     let column = column as u32;
     match value {
         None => columns.append_null(column),
-        Some(ColumnValue::Utf8(s)) => columns.append_utf8(column, s.as_bytes()),
-        Some(ColumnValue::Int64(v)) => columns.append_int64(column, v),
-        Some(ColumnValue::Float64(v)) => columns.append_float64(column, v),
-        Some(ColumnValue::Bool(v)) => columns.append_bool(column, v),
-        Some(ColumnValue::Binary(b)) => columns.append_binary(column, &b),
+        Some(ColumnValue::Utf8(text)) => columns.append_variable(column, text.as_bytes()),
+        Some(ColumnValue::Binary(bytes)) => columns.append_variable(column, &bytes),
+        Some(ColumnValue::Int(value)) => columns.append_int(column, value),
+        Some(ColumnValue::UInt(value)) => columns.append_uint(column, value),
+        Some(ColumnValue::Float(value)) => columns.append_float(column, value),
+        Some(ColumnValue::Bool(value)) => columns.append_bool(column, value),
+        Some(ColumnValue::FixedBytes(bytes)) => columns.append_fixed_bytes(column, &bytes),
     }
 }
 
@@ -142,28 +158,38 @@ pub fn read_cell(columns: &DynamicColumns, column: usize, row: usize) -> Option<
         return None;
     }
     let storage = columns.get_column(col_idx)?;
-    Some(match storage.col_type {
-        ColumnType::Utf8 => {
+    Some(match storage.kind {
+        // Every row of the Null plane is null, so `is_null` already returned;
+        // reaching here would mean a validity bit was set on a plane that has
+        // no value to be valid.
+        PlaneKind::Empty => return None,
+        PlaneKind::Bool => ColumnValue::Bool(storage.read_bool(row_idx)?),
+        PlaneKind::SignedInt { .. } => ColumnValue::Int(storage.read_int(row_idx)?),
+        PlaneKind::UnsignedInt { .. } => ColumnValue::UInt(storage.read_uint(row_idx)?),
+        PlaneKind::Float { .. } => ColumnValue::Float(storage.read_float(row_idx)?),
+        PlaneKind::FixedBytes { .. } => {
+            ColumnValue::FixedBytes(storage.read_fixed_bytes(row_idx)?.to_vec())
+        }
+        PlaneKind::Text { .. } => {
             ColumnValue::Utf8(String::from_utf8_lossy(storage.read_variable(row_idx)?).into_owned())
         }
-        ColumnType::Binary => ColumnValue::Binary(storage.read_variable(row_idx)?.to_vec()),
-        ColumnType::Int64 => ColumnValue::Int64(storage.read_fixed_i64(row_idx)?),
-        ColumnType::Float64 => ColumnValue::Float64(storage.read_fixed_f64(row_idx)?),
-        ColumnType::Bool => ColumnValue::Bool(storage.read_bool(row_idx)?),
+        PlaneKind::Bytes { .. } => ColumnValue::Binary(storage.read_variable(row_idx)?.to_vec()),
     })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FieldLookup {
     pub column: usize,
-    pub arrow_type: ArrowType,
+    /// The whole field descriptor, not just its tag: the extractors coerce by
+    /// plane kind, and one plane's kind depends on its `type_param`.
+    pub field: SignalSchemaField,
 }
 
 /// Schema-name lookup for extraction: O(1) name → column/type, plus the
 /// `value.$extra` fallback column when declared.
 #[derive(Clone, Debug)]
 pub struct ExtractionConfig {
-    pub(crate) field_entries: Vec<(usize, ArrowType)>,
+    pub(crate) field_entries: Vec<(usize, SignalSchemaField)>,
     pub(crate) field_map: HashMap<String, FieldLookup>,
     pub(crate) fallback_column: Option<usize>,
     pub(crate) presence_entries: Vec<(usize, usize)>,
@@ -221,7 +247,7 @@ pub fn build_extraction_config(
                 return Err(ConfigError::InvalidPresenceField);
             }
             unresolved_presence.push((column, source_name));
-            field_entries.push((column, field.arrow_type));
+            field_entries.push((column, *field));
             continue;
         }
         if field_map
@@ -229,7 +255,7 @@ pub fn build_extraction_config(
                 (*name).to_owned(),
                 FieldLookup {
                     column,
-                    arrow_type: field.arrow_type,
+                    field: *field,
                 },
             )
             .is_some()
@@ -239,7 +265,7 @@ pub fn build_extraction_config(
         if *name == "value.$extra" {
             fallback_column = Some(column);
         }
-        field_entries.push((column, field.arrow_type));
+        field_entries.push((column, *field));
     }
     let mut presence_entries = Vec::with_capacity(unresolved_presence.len());
     for (presence_column, source_name) in unresolved_presence {
@@ -387,8 +413,8 @@ mod properties {
             assert_eq!(msgpack_extractor::extract_msgpack_events(&input, &config, &mut typed, &mut work, true).unwrap(), 1);
             assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id)));
             assert_eq!(read_cell(&typed, 1, 0), Some(ColumnValue::Utf8(event_type)));
-            assert_eq!(read_cell(&typed, 2, 0), Some(ColumnValue::Int64(timestamp)));
-            assert_eq!(read_cell(&typed, 3, 0), Some(ColumnValue::Int64(quantity)));
+            assert_eq!(read_cell(&typed, 2, 0), Some(ColumnValue::Int(timestamp)));
+            assert_eq!(read_cell(&typed, 3, 0), Some(ColumnValue::Int(quantity)));
         }
 
         /// skip_value consumes exactly one well-formed value: the reader's
@@ -431,7 +457,7 @@ mod properties {
                 1
             );
             prop_assert_eq!(read_cell(&typed, 0, 0), Some(ColumnValue::Utf8(id)));
-            prop_assert_eq!(read_cell(&typed, 1, 0), Some(ColumnValue::Int64(quantity)));
+            prop_assert_eq!(read_cell(&typed, 1, 0), Some(ColumnValue::Int(quantity)));
             let mut expected = vec![0xdf, 0, 0, 0, 1];
             expected.push(0xa0 | u8::try_from(extra_key.len() + 1).unwrap());
             expected.push(b'x');

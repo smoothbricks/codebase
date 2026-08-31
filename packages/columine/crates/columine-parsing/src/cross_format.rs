@@ -77,16 +77,16 @@ pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnVa
     match (kind, value) {
         (ArrowType::Utf8, Logical::Text(text)) => Ok(Some(ColumnValue::Utf8(text.clone()))),
         (ArrowType::Int32, Logical::Int(value)) => i32::try_from(*value)
-            .map(|narrow| Some(ColumnValue::Int64(i64::from(narrow))))
+            .map(|narrow| Some(ColumnValue::Int(i64::from(narrow))))
             .map_err(|_| ()),
-        (ArrowType::Int64, Logical::Int(value)) => Ok(Some(ColumnValue::Int64(*value))),
+        (ArrowType::Int64, Logical::Int(value)) => Ok(Some(ColumnValue::Int(*value))),
         (ArrowType::Int64, Logical::Text(text)) => text
             .parse::<i64>()
             .or_else(|_| parse_iso8601_to_micros(text).map_err(|_| ()))
-            .map(|micros| Some(ColumnValue::Int64(micros)))
+            .map(|micros| Some(ColumnValue::Int(micros)))
             .map_err(|_| ()),
-        (ArrowType::Float64, Logical::Int(value)) => Ok(Some(ColumnValue::Float64(*value as f64))),
-        (ArrowType::Float64, Logical::Float(value)) => Ok(Some(ColumnValue::Float64(*value))),
+        (ArrowType::Float64, Logical::Int(value)) => Ok(Some(ColumnValue::Float(*value as f64))),
+        (ArrowType::Float64, Logical::Float(value)) => Ok(Some(ColumnValue::Float(*value))),
         (ArrowType::Bool, Logical::Bool(value)) => Ok(Some(ColumnValue::Bool(*value))),
         (ArrowType::Binary, value) => {
             Ok(Some(ColumnValue::Binary(canonical_msgpack(&value.json()))))
@@ -275,21 +275,21 @@ mod pins {
         // Int64 takes bigint-as-string on both wires.
         assert_eq!(
             via_json(ArrowType::Int64, "\"12345\""),
-            Ok(Some(ColumnValue::Int64(12345)))
+            Ok(Some(ColumnValue::Int(12345)))
         );
         assert_eq!(
             via_msgpack(ArrowType::Int64, "\"12345\""),
-            Ok(Some(ColumnValue::Int64(12345)))
+            Ok(Some(ColumnValue::Int(12345)))
         );
         // Int64 takes ISO-8601 on both wires.
         let micros = parse_iso8601_to_micros("2024-01-15T10:30:00Z").unwrap();
         assert_eq!(
             via_json(ArrowType::Int64, "\"2024-01-15T10:30:00Z\""),
-            Ok(Some(ColumnValue::Int64(micros)))
+            Ok(Some(ColumnValue::Int(micros)))
         );
         assert_eq!(
             via_msgpack(ArrowType::Int64, "\"2024-01-15T10:30:00Z\""),
-            Ok(Some(ColumnValue::Int64(micros)))
+            Ok(Some(ColumnValue::Int(micros)))
         );
         // Int64 takes no floats.
         assert_eq!(
@@ -308,15 +308,15 @@ mod pins {
     fn negative_int32_round_trips_signed() {
         assert_eq!(
             via_json(ArrowType::Int32, "-1"),
-            Ok(Some(ColumnValue::Int64(-1)))
+            Ok(Some(ColumnValue::Int(-1)))
         );
         assert_eq!(
             via_msgpack(ArrowType::Int32, "-1"),
-            Ok(Some(ColumnValue::Int64(-1)))
+            Ok(Some(ColumnValue::Int(-1)))
         );
         assert_eq!(
             via_json(ArrowType::Int32, "-2147483648"),
-            Ok(Some(ColumnValue::Int64(i64::from(i32::MIN))))
+            Ok(Some(ColumnValue::Int(i64::from(i32::MIN))))
         );
     }
 }

@@ -6,7 +6,7 @@
 
 use columine_arrow::{
     ArrowType, DynamicColumn, DynamicSchemaConfig, IpcError, MAX_EVENTS_PER_BATCH,
-    MAX_SCHEMA_FIELDS, MAX_VALUE_BYTES,
+    MAX_SCHEMA_FIELDS, MAX_VALUE_BYTES, PlaneKind,
 };
 use columine_parsing::json_extractor::diagnostic_stage;
 
@@ -235,8 +235,8 @@ impl<'a> CompactBatchView<'a> {
                 ));
             }
 
-            match field.arrow_type {
-                ArrowType::Null => {
+            match field.plane_kind() {
+                PlaneKind::Empty => {
                     if validity_present
                         || descriptor.offsets_offset != 0
                         || descriptor.offsets_len != 0
@@ -250,16 +250,18 @@ impl<'a> CompactBatchView<'a> {
                         ));
                     }
                 }
-                ArrowType::Int32 | ArrowType::Float64 | ArrowType::Int64 => {
+                // Every fixed-width plane is `row_count * width` bytes, and
+                // the width comes from the plane rather than from a special
+                // case per type — which is what makes a one-byte plane cost
+                // one byte per row instead of eight.
+                PlaneKind::SignedInt { width }
+                | PlaneKind::UnsignedInt { width }
+                | PlaneKind::Float { width }
+                | PlaneKind::FixedBytes { width } => {
                     require_no_offsets(descriptor, field_index)?;
-                    let width = if field.arrow_type == ArrowType::Int32 {
-                        4
-                    } else {
-                        8
-                    };
                     let expected = usize::try_from(row_count)
                         .ok()
-                        .and_then(|rows| rows.checked_mul(width))
+                        .and_then(|rows| rows.checked_mul(width as usize))
                         .ok_or_else(|| {
                             CompactValidationError::invalid(
                                 compact_detail::BAD_FIXED_DATA,
@@ -278,7 +280,7 @@ impl<'a> CompactBatchView<'a> {
                         field_index,
                     )?;
                 }
-                ArrowType::Bool => {
+                PlaneKind::Bool => {
                     require_no_offsets(descriptor, field_index)?;
                     require_data_length(descriptor, bitmap_len, field_index)?;
                     let data = checked_range(
@@ -298,11 +300,11 @@ impl<'a> CompactBatchView<'a> {
                         ));
                     }
                 }
-                ArrowType::Utf8 | ArrowType::Binary => {
+                PlaneKind::Text { offset_width } | PlaneKind::Bytes { offset_width } => {
                     let expected_offsets = usize::try_from(row_count)
                         .ok()
                         .and_then(|rows| rows.checked_add(1))
-                        .and_then(|entries| entries.checked_mul(4))
+                        .and_then(|entries| entries.checked_mul(offset_width as usize))
                         .ok_or_else(|| {
                             CompactValidationError::invalid(
                                 compact_detail::BAD_OFFSETS,
@@ -347,7 +349,8 @@ impl<'a> CompactBatchView<'a> {
                         data,
                         validity(bytes, descriptor),
                         row_count,
-                        field.arrow_type == ArrowType::Utf8,
+                        offset_width,
+                        matches!(field.plane_kind(), PlaneKind::Text { .. }),
                         field_index,
                     )?;
                 }
@@ -376,45 +379,33 @@ impl<'a> CompactBatchView<'a> {
     ) -> Result<DynamicColumn<'a>, IpcError> {
         let descriptor =
             decode_descriptor(self.bytes, field_index).map_err(|_| IpcError::InvalidColumn)?;
-        let field = schema
+        let field = *schema
             .field_metadata
             .get(field_index)
             .ok_or(IpcError::InvalidColumn)?;
-        let validity = validity(self.bytes, descriptor);
-        let offsets = buffer(
-            self.bytes,
-            descriptor.offsets_offset,
-            descriptor.offsets_len,
-        );
-        let data = buffer(self.bytes, descriptor.data_offset, descriptor.data_len);
         let field_index = u32::try_from(field_index).map_err(|_| IpcError::InvalidColumn)?;
-        Ok(match field.arrow_type {
-            ArrowType::Null => DynamicColumn {
-                field_idx: field_index,
-                arrow_type: ArrowType::Null,
-                nullable: true,
-                validity: None,
-                data: &[],
-                offsets: None,
-            },
-            ArrowType::Int32 => {
-                DynamicColumn::int32(field_index, field.is_nullable(), validity, data)
-            }
-            ArrowType::Float64 => {
-                DynamicColumn::float64(field_index, field.is_nullable(), validity, data)
-            }
-            ArrowType::Int64 => {
-                DynamicColumn::int64(field_index, field.is_nullable(), validity, data)
-            }
-            ArrowType::Bool => {
-                DynamicColumn::boolean(field_index, field.is_nullable(), validity, data)
-            }
-            ArrowType::Binary => {
-                DynamicColumn::binary(field_index, field.is_nullable(), validity, offsets, data)
-            }
-            ArrowType::Utf8 => {
-                DynamicColumn::utf8(field_index, field.is_nullable(), validity, offsets, data)
-            }
+
+        // The Null plane carries a field node and nothing else, so it takes
+        // neither the validity bitmap nor any data even though it is nullable.
+        if field.plane_kind() == PlaneKind::Empty {
+            return Ok(DynamicColumn::fixed(field_index, field, None, &[]));
+        }
+
+        let validity = validity(self.bytes, descriptor);
+        let data = buffer(self.bytes, descriptor.data_offset, descriptor.data_len);
+        Ok(match field.plane_kind().offset_width() {
+            Some(_) => DynamicColumn::variable(
+                field_index,
+                field,
+                validity,
+                buffer(
+                    self.bytes,
+                    descriptor.offsets_offset,
+                    descriptor.offsets_len,
+                ),
+                data,
+            ),
+            None => DynamicColumn::fixed(field_index, field, validity, data),
         })
     }
 
@@ -560,10 +551,11 @@ fn validate_variable(
     data: &[u8],
     validity: Option<&[u8]>,
     row_count: u32,
+    offset_width: u32,
     utf8: bool,
     field_index: usize,
 ) -> Result<(), CompactValidationError> {
-    if offset_at(offsets, 0) != Some(0) {
+    if offset_at(offsets, 0, offset_width) != Some(0) {
         return Err(CompactValidationError::invalid(
             compact_detail::BAD_OFFSETS,
             field_index,
@@ -572,7 +564,7 @@ fn validate_variable(
     }
     let mut previous = 0usize;
     for row in 0..row_count as usize {
-        let next = offset_at(offsets, row + 1).ok_or_else(|| {
+        let next = offset_at(offsets, row + 1, offset_width).ok_or_else(|| {
             CompactValidationError::invalid(compact_detail::BAD_OFFSETS, field_index, row)
         })? as usize;
         if next < previous || next > data.len() {
@@ -636,11 +628,20 @@ fn buffer(bytes: &[u8], offset: u32, length: u32) -> &[u8] {
     bytes.get(start..end).unwrap_or(&[])
 }
 
-fn offset_at(offsets: &[u8], index: usize) -> Option<u32> {
-    let start = index.checked_mul(4)?;
-    Some(u32::from_le_bytes(
-        offsets.get(start..start + 4)?.try_into().ok()?,
-    ))
+/// Read offset entry `index` from a buffer of `width`-byte little-endian
+/// entries.
+///
+/// The large-offset planes declare 64-bit offsets, but retained data is capped
+/// at `MAX_VALUE_BYTES`, so a value that needs the high four bytes is out of
+/// range by definition and is rejected here rather than truncated.
+fn offset_at(offsets: &[u8], index: usize, width: u32) -> Option<u32> {
+    let start = index.checked_mul(width as usize)?;
+    let cell = offsets.get(start..start + width as usize)?;
+    let (low, high) = cell.split_at(4);
+    if high.iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    Some(u32::from_le_bytes(low.try_into().ok()?))
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
