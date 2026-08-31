@@ -56,7 +56,9 @@ fn append_within_capacity_is_alloc_free() {
     let anchor = TraceAnchor::capture(&clock);
     let identity = Arc::new(SpanIdentity {
         thread_id: 1,
-        span_id: 0,
+        // Nonzero: zero is the reserved "no parent" sentinel and no real span
+        // carries it (see `identity::successor`).
+        span_id: 1,
         trace_id: TraceId::new("alloc-gate").unwrap(),
         parent: None,
     });
