@@ -1,7 +1,7 @@
 {
   "version": 2,
   "title": "Bounded Exec",
-  "description": "Run one shell command with a hard timeout and process-tree cleanup.",
+  "description": "Run one shell command under an absolute ceiling and a no-progress bound, with process-tree cleanup.",
   "type": "object",
   "cli": "nx",
   "outputCapture": "pipe",
@@ -26,7 +26,12 @@
     "timeoutMs": {
       "type": "number",
       "minimum": 1,
-      "description": "Hard wall-clock timeout in milliseconds."
+      "description": "Absolute wall-clock ceiling in milliseconds. A backstop against an unbounded run, not a performance budget."
+    },
+    "idleTimeoutMs": {
+      "type": "number",
+      "minimum": 1,
+      "description": "Kill the process tree after this many milliseconds with no stdout or stderr. Detects a wedged process independently of machine speed and load. Omit for no progress bound."
     },
     "killAfterMs": {
       "type": "number",

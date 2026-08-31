@@ -20,9 +20,22 @@ export interface BoundedExecResult {
   terminalOutput: string;
 }
 
+/**
+ * Which bound ended the run.
+ *
+ * `total` is a wall-clock ceiling: it answers "is this run unbounded?".
+ * `idle` is a no-progress bound: it answers "is this run wedged?".
+ *
+ * These are different questions and one number cannot answer both. A ceiling
+ * tight enough to catch a wedge promptly is also tight enough to fail a correct
+ * run on a busy machine; a ceiling loose enough never to do that cannot catch a
+ * wedge promptly. Keeping the two bounds separate is what makes each honest.
+ */
+type ExpiredBound = { kind: 'total' | 'idle'; limitMs: number };
+
 interface RunState {
   settled: boolean;
-  timedOut: boolean;
+  expiry: ExpiredBound | null;
   forceKillNeeded: boolean;
 }
 
@@ -45,10 +58,11 @@ export async function runBoundedExec(
   const cwd = resolveCwd(options.cwd, context.root);
   const command = buildCommand(options);
   const timeoutMs = options.timeoutMs;
+  const idleTimeoutMs = options.idleTimeoutMs;
   const killAfterMs = options.killAfterMs ?? DEFAULT_KILL_AFTER_MS;
   const startedAt = Date.now();
   const outputChunks: string[] = [];
-  const state: RunState = { settled: false, timedOut: false, forceKillNeeded: false };
+  const state: RunState = { settled: false, expiry: null, forceKillNeeded: false };
 
   const child = spawn(command, [], {
     cwd,
@@ -69,8 +83,26 @@ export async function runBoundedExec(
     process.stderr.write(text);
   };
 
-  child.stdout?.on('data', appendStdout);
-  child.stderr?.on('data', appendStderr);
+  let idleTimer: NodeJS.Timeout | undefined;
+  const armIdleTimer = (): void => {
+    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null) {
+      return;
+    }
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs: idleTimeoutMs }), idleTimeoutMs);
+  };
+
+  // Only the CHILD's own output counts as progress. The diagnostics below go
+  // through appendStderr as well, and re-arming on those would let a teardown
+  // message extend the very bound that just fired.
+  child.stdout?.on('data', (chunk: Buffer | string) => {
+    armIdleTimer();
+    appendStdout(chunk);
+  });
+  child.stderr?.on('data', (chunk: Buffer | string) => {
+    armIdleTimer();
+    appendStderr(chunk);
+  });
 
   const killChildTree = async (force: boolean): Promise<void> => {
     const pid = child.pid;
@@ -102,6 +134,8 @@ export async function runBoundedExec(
   process.on('SIGTERM', onSigterm);
   process.on('SIGHUP', onSighup);
 
+  // `Promise.withResolvers` would read better here but needs lib es2024; this
+  // package inherits lib es2022 from tsconfig.base.json.
   let resolveExit!: (value: { code: number | null; signal: NodeJS.Signals | null }) => void;
   const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     resolveExit = resolve;
@@ -116,10 +150,23 @@ export async function runBoundedExec(
     });
   });
 
-  const timeout = setTimeout(() => {
-    state.timedOut = true;
+  // Both bounds escalate through one path, so a run expires at most once and
+  // the report always names which bound did it. A bare "timed out" would leave
+  // the reader unable to tell a wedged toolchain from a loaded machine — the
+  // two have opposite fixes.
+  const expire = (bound: ExpiredBound): void => {
+    if (state.settled || state.expiry !== null) {
+      return;
+    }
+    state.expiry = bound;
+    clearTimeout(totalTimer);
+    clearTimeout(idleTimer);
     const elapsedMs = Date.now() - startedAt;
-    appendStderr(`\nCommand timed out after ${elapsedMs}ms (timeoutMs=${timeoutMs}, cwd=${cwd}): ${command}\n`);
+    appendStderr(
+      bound.kind === 'idle'
+        ? `\nCommand made no progress: no output for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime (cwd=${cwd}): ${command}\n`
+        : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
+    );
     void (async () => {
       await ignoreKillError(killChildTree(false));
       if (!state.settled && killAfterMs > 0) {
@@ -135,23 +182,27 @@ export async function runBoundedExec(
         resolveExit({ code: 1, signal: 'SIGKILL' });
       }
     })();
-  }, timeoutMs);
+  };
 
-  const exit = await exitPromise;
-  clearTimeout(timeout);
+  const totalTimer = setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
+  armIdleTimer();
+
+  const { code: exitCode, signal: exitSignal } = await exitPromise;
+  clearTimeout(totalTimer);
+  clearTimeout(idleTimer);
   removeSignalHandlers();
 
-  const code = exit.code ?? signalToExitCode(exit.signal);
-  if (code !== 0 && !state.timedOut) {
+  const code = exitCode ?? signalToExitCode(exitSignal);
+  if (code !== 0 && state.expiry === null) {
     appendStderr(`Command exited with status ${code}: ${command}\n`);
   }
 
-  if (state.timedOut && !state.forceKillNeeded) {
+  if (state.expiry !== null && !state.forceKillNeeded) {
     appendStderr(`Timed out command exited after graceful termination: ${command}\n`);
   }
 
   return {
-    success: !state.timedOut && code === 0,
+    success: state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),
   };
 }

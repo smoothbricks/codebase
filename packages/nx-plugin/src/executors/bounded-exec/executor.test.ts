@@ -92,6 +92,106 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain(`cwd=${workspace.root}`);
   });
 
+  it('kills a silent command on the progress bound while the absolute ceiling is far away', async () => {
+    const workspace = await createWorkspace();
+
+    const result = await runBoundedExec(
+      { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 30_000, idleTimeoutMs: 100, killAfterMs: 0 },
+      workspace.context,
+      createProcessTreeKiller(),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Command made no progress: no output for 100ms');
+    expect(result.terminalOutput).toContain('idleTimeoutMs=100');
+    // The bound that fired is named, so a wedge is never reported as a slow run.
+    expect(result.terminalOutput).not.toContain('Command timed out after');
+  });
+
+  it('lets a slow but talking command outlive its progress bound many times over', async () => {
+    const workspace = await createWorkspace();
+    // Six 120ms gaps under a 400ms progress bound: total runtime is well past
+    // idleTimeoutMs, so passing proves the bound measures silence, not duration.
+    await workspace.write(
+      'chatty.js',
+      [
+        'let ticks = 0;',
+        'const timer = setInterval(() => {',
+        '  console.log(`tick ${++ticks}`);',
+        '  if (ticks === 6) {',
+        '    clearInterval(timer);',
+        '  }',
+        '}, 120);',
+        '',
+      ].join('\n'),
+    );
+
+    const result = await runBoundedExec(
+      { command: 'node chatty.js', timeoutMs: 30_000, idleTimeoutMs: 400 },
+      workspace.context,
+      createProcessTreeKiller(),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('tick 6');
+    expect(result.terminalOutput).not.toContain('made no progress');
+  });
+
+  it('treats output on stderr alone as progress', async () => {
+    const workspace = await createWorkspace();
+    await workspace.write(
+      'chatty-stderr.js',
+      [
+        'let ticks = 0;',
+        'const timer = setInterval(() => {',
+        '  console.error(`tick ${++ticks}`);',
+        '  if (ticks === 5) {',
+        '    clearInterval(timer);',
+        '  }',
+        '}, 120);',
+        '',
+      ].join('\n'),
+    );
+
+    const result = await runBoundedExec(
+      { command: 'node chatty-stderr.js', timeoutMs: 30_000, idleTimeoutMs: 400 },
+      workspace.context,
+      createProcessTreeKiller(),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('tick 5');
+  });
+
+  it('applies the absolute ceiling to a command that keeps talking forever', async () => {
+    const workspace = await createWorkspace();
+    await workspace.write('runaway.js', ["setInterval(() => console.log('still here'), 10);", ''].join('\n'));
+
+    const result = await runBoundedExec(
+      { command: 'node runaway.js', timeoutMs: 300, idleTimeoutMs: 30_000, killAfterMs: 0 },
+      workspace.context,
+      createProcessTreeKiller(),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain('Command timed out after');
+    expect(result.terminalOutput).toContain('timeoutMs=300');
+    expect(result.terminalOutput).not.toContain('made no progress');
+  });
+
+  it('imposes no progress bound when idleTimeoutMs is omitted', async () => {
+    const workspace = await createWorkspace();
+
+    const result = await runBoundedExec(
+      { command: 'node -e "setTimeout(() => console.log(\'late\'), 400)"', timeoutMs: 30_000 },
+      workspace.context,
+      createProcessTreeKiller(),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.terminalOutput).toContain('late');
+  });
+
   it('uses graceful timeout termination before force-killing on POSIX', async () => {
     if (process.platform === 'win32') {
       return;
