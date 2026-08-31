@@ -11,10 +11,10 @@ let
     };
   };
   expected = {
-    CC = "/nix/store/native-cc/bin/cc";
-    CXX = "/nix/store/native-cc/bin/c++";
+    CC_x86_64_unknown_linux_gnu = "/nix/store/native-cc/bin/cc";
+    CXX_x86_64_unknown_linux_gnu = "/nix/store/native-cc/bin/c++";
   };
 in
   if config ? env && config.env == expected
-  then "Linux compiler environment uses the Nix wrapper\n"
-  else builtins.throw "Linux compiler environment does not use the Nix wrapper"
+  then "Linux target compiler environment uses the Nix wrapper\n"
+  else builtins.throw "Linux target compiler environment does not use the Nix wrapper"
