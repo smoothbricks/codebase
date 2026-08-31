@@ -1,15 +1,9 @@
 /**
  * Phase-2 jurisdiction arm: nested dynamic span tree with message reuse.
  *
- * 4-deep tree, 128 log rows, 8 distinct messages reused across rows and
- * iterations. Warm arm is the Op-execution shape (heavy repetition). Cold
- * arm emits a never-seen string per row (intern/StringArena miss).
- *
- * `_infoTemplate` / `appendLogStatic` is not on this arm: ThreadSpanView has
- * no `_messageIds` lane, so the generated static-template writer throws
- * `this._state._buffer._messageIds[idx] = localMessageId`. Both lanes use
- * `log.info(literal)` so the comparison stays the same workload. Wire
- * appendLogStatic before claiming a static-vocab number from this file.
+ * 4-deep tree, 128 log rows, 8 distinct messages. Half go through
+ * `_infoTemplate` (static vocabulary / `_messageIds`); half through
+ * `log.info` (repeated dynamic literals). Cold arm: unique string per row.
  */
 import { bench, group, run } from 'mitata';
 import { defineOpContext } from '../src/lib/defineOpContext.js';
@@ -53,10 +47,20 @@ const HINT =
   CAPACITY;
 
 function writeWarmRows(span: { log: { info(message: string): { n(value: number): unknown } } }, start: number): void {
+  const logger = Reflect.get(span, '_spanLogger') as {
+    _infoTemplate(vocabularyIndex: number): { n(value: number): unknown };
+  };
   for (let i = 0; i < 32; i++) {
-    const message = REUSED_MESSAGES[(start + i) & 7];
-    if (message === undefined) throw new Error('reused message slot missing');
-    span.log.info(message).n(i);
+    const slot = (start + i) & 7;
+    if (slot < 4) {
+      const dense = VOCAB[slot];
+      if (dense === undefined) throw new Error(`missing vocab slot ${slot}`);
+      logger._infoTemplate(dense).n(i);
+    } else {
+      const message = REUSED_MESSAGES[slot];
+      if (message === undefined) throw new Error('reused message slot missing');
+      span.log.info(message).n(i);
+    }
   }
 }
 
