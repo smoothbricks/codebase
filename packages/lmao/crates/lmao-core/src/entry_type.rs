@@ -1,4 +1,4 @@
-//! The 24 entry types, aligned exactly with the TypeScript runtime mapping.
+//! The entry types, aligned exactly with the TypeScript runtime mapping.
 //!
 //! Everything — user logs AND internal metrics — flows through the same table and
 //! flush path as one dense entry-type lane in the packed row header. Discriminants
