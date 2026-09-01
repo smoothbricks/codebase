@@ -17,19 +17,13 @@ import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { RemapDescriptor } from './logBinding.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from './opContext/types.js';
-import type {
-  ArrowExposurePlan,
-  CallsitePlan,
-  EagerColumnDescriptor,
-  PhysicalAppenders,
-} from './physicalLayoutPlan.js';
+import type { CallsitePlan, EagerColumnDescriptor } from './physicalLayoutPlan.js';
 import { getPhysicalLayoutPlan, sealCallsitePlan } from './physicalLayoutPlan.js';
 import type { AnyResult } from './result.js';
 import { decodeRuntimeHint } from './runtimeHint.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import { createSpanContextClass } from './spanContext.js';
-import type { TimestampAppendPrimitive } from './traceRoot.js';
 import type { VocabularyGeneration } from './vocabularyRegistry.js';
 import type { WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 
@@ -83,9 +77,6 @@ export interface OpMetadata<T extends LogSchema = LogSchema> {
     readonly localMessageDictionary: readonly number[];
     readonly encodeLocalMessage: (globalDenseIndex: number) => number;
     readonly wasmLayout: WasmLayoutTemplate;
-    readonly appendLogEntry: TimestampAppendPrimitive;
-    readonly arrowExposure: ArrowExposurePlan;
-    readonly appenders: PhysicalAppenders;
   };
 }
 //#endregion smoo/lmao!n/opcontext-hierarchy
@@ -162,7 +153,6 @@ export class Op<
       runtimeHint,
       SpanContextClass,
       remapDescriptor,
-      'strategy-selected',
       layoutKey,
       eagerColumns,
       localMessageDictionary,

@@ -173,7 +173,7 @@ function writeWorkload(
       for (let row = 0; row < references.length; row++) Reflect.deleteProperty(references, row);
     }
     for (let row = 0; row < workload.messages.length; row++) {
-      const outputRow = plan.appenders.writeLogEntry(buffer, ENTRY_TYPE_INFO);
+      const outputRow = buffer._appenders.writeLogEntry(buffer, ENTRY_TYPE_INFO);
       if (outputRow !== row) throw new Error(`Appender produced row ${outputRow}, expected ${row}`);
       const message = workload.messages[row];
       if (message !== undefined) {

@@ -18,13 +18,14 @@ import type {
   Nanoseconds,
   TypedArray,
 } from '@smoothbricks/arrow-builder';
+import type { PhysicalAppenders } from './lifecycleAppenders.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { MessageLayoutFamily, MessagePhysicalLayout } from './runtimeHint.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { InferSchema } from './schema/types.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import type { TraceId } from './traceId.js';
-import type { ITraceRoot } from './traceRoot.js';
+import type { ITraceRoot, TimestampAppendPrimitive } from './traceRoot.js';
 import type { VocabularyGeneration } from './vocabularyRegistry.js';
 
 // Re-export infrastructure types
@@ -132,6 +133,17 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   _spanStartedAtAllocation?: boolean;
   /** Concrete physical row layout selected once for this buffer constructor. */
   readonly _messagePhysicalLayout: MessagePhysicalLayout;
+
+  /**
+   * Span lifecycle writers, installed once on the buffer class prototype.
+   * Layout-derived for js-heap/wasm classes, binding-backed for ThreadSpanView —
+   * the class encodes both the message layout (definition time) and the physical
+   * backend (the strategy chose which class to instantiate).
+   */
+  readonly _appenders: PhysicalAppenders;
+
+  /** Timestamped log-row append primitive paired with `_appenders`, same carrier. */
+  readonly _appendLogEntry: TimestampAppendPrimitive;
 
   /** Dedicated row-0 span name used when the selected capacity lane cannot represent it. */
   _spanName?: string | number;

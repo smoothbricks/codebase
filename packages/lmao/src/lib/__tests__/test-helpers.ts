@@ -281,12 +281,11 @@ export function createTestSpanContext<
           RUNTIME_HINT_FULL_CAPABILITIES,
         ),
         undefined,
-        'strategy-selected',
         `test-writer-context:${testWriterContextPlanId++}`,
       ),
       DEFAULT_METADATA,
     );
-  resolvedPlan.appenders.writeSpanStart(buffer, 'test-writer-context');
+  buffer._appenders.writeSpanStart(buffer, 'test-writer-context');
   return new resolvedPlan.SpanContextClass(buffer, schema, resolvedPlan);
 }
 /**

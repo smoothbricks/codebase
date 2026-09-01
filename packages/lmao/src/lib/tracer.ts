@@ -68,7 +68,6 @@ import {
   type CallsitePlan,
   getPhysicalLayoutPlan,
   type PhysicalLayoutPlan,
-  resolveCallsitePlanBackend,
   sealCallsitePlan,
 } from './physicalLayoutPlan.js';
 import { type AnyResult, Err, Ok, type Result } from './result.js';
@@ -304,7 +303,6 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       0,
       this.SpanContextClass,
       undefined,
-      options.bufferStrategy.physicalBackend ?? 'strategy-selected',
       userContextKeys.join('\u0000'),
     );
 
@@ -709,12 +707,8 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     _line: number,
     name: string,
     overrides: Record<string, unknown>,
-    definedCallsitePlan: CallsitePlan<B['logBinding']['logSchema'], OpContextOf<B>>,
+    callsitePlan: CallsitePlan<B['logBinding']['logSchema'], OpContextOf<B>>,
   ): SpanContextInstance<OpContextOf<B>> {
-    // Ops seal their plan at define time, before any tracer exists; discharge
-    // that deferred backend decision against this tracer's strategy, once per
-    // (plan, backend) — never per call.
-    const callsitePlan = resolveCallsitePlanBackend(definedCallsitePlan, this.physicalLayoutPlan.backendKind);
     // Extract trace_id from overrides if present
     const traceId: TraceId = isValidTraceId(overrides.trace_id) ? overrides.trace_id : generateTraceId();
     const schema = callsitePlan.schema;
@@ -734,8 +728,8 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
       callsitePlan.SpanBufferClass,
     );
 
-    // Write span-start entry (row 0)
-    callsitePlan.appenders.writeSpanStart(buffer, name);
+    // Write span-start entry (row 0) through the buffer's class-carried writers
+    buffer._appenders.writeSpanStart(buffer, name);
 
     return new callsitePlan.SpanContextClass(
       buffer,
@@ -787,7 +781,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     fn: (ctx: SpanContext<OpContextOf<B>>) => Result<S, E> | Promise<Result<S, E>>,
   ): Result<S, E> | Promise<Result<S, E>> {
     const buffer = ctx._spanBuffer;
-    const writeSpanEndEntry = ctx._physicalLayoutPlan.appenders.writeSpanEnd;
+    const writeSpanEndEntry = buffer._appenders.writeSpanEnd;
 
     this.onTraceStart(buffer);
 
@@ -846,7 +840,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding>
     fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
   ): unknown {
     const buffer = ctx._spanBuffer;
-    const writeSpanEndEntry = ctx._physicalLayoutPlan.appenders.writeSpanEnd;
+    const writeSpanEndEntry = buffer._appenders.writeSpanEnd;
 
     // Call trace start hook
     this.onTraceStart(buffer);

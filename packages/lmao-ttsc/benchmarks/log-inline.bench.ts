@@ -157,7 +157,7 @@ function makeLogBundle(family: MessageLayoutFamily): LogBundle {
   }
   const traceRoot = createTraceRoot(`log-inline-${family}-${id}`, tracer);
   const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
-  plan.appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
+  buffer._appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
   const context = new plan.SpanContextClass(buffer, plan.schema, plan);
   return { buffer, context, views: numericViews(buffer) };
 }
@@ -172,7 +172,7 @@ function makeResultBundle(): ResultBundle {
   const plan = benchmarkOp.callsitePlan;
   const traceRoot = createTraceRoot(`result-inline-${id}`, tracer);
   const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
-  plan.appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
+  buffer._appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
   const context = new plan.SpanContextClass(buffer, plan.schema, plan);
   return { buffer, context, views: numericViews(buffer) };
 }

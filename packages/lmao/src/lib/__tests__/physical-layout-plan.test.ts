@@ -27,7 +27,7 @@ const HOT_CHILD_HINT =
   RUNTIME_HINT_ANALYZED_VALID | RUNTIME_HINT_TAG | RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT | CAPACITY_TIER;
 
 describe('PhysicalLayoutPlan', () => {
-  it('reuses one immutable plan per schema, capability set, context layout, remap, and backend', () => {
+  it('reuses one immutable plan per schema, capability set, context layout, and remap', () => {
     const schema = defineLogSchema({ userId: S.category() });
     const otherSchema = defineLogSchema({ userId: S.category(), duration: S.number() });
     const SpanBufferClass = getSpanBufferClass(schema);
@@ -56,29 +56,20 @@ describe('PhysicalLayoutPlan', () => {
     const layout = createRemapDescriptor(schema, { app_user_id: 'userId' });
     const otherLayout = createRemapDescriptor(schema, { lib_user_id: 'userId' });
 
-    const first = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout, 'js-heap');
-    const identical = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout, 'js-heap');
+    const first = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout);
+    const identical = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout);
     const differentCapabilities = getPhysicalLayoutPlan(
       SpanBufferClass,
       HOT_CHILD_HINT ^ RUNTIME_HINT_LOG,
       differentCapabilityContextClass,
       layout,
-      'js-heap',
     );
-    const differentBackend = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, layout, 'wasm');
-    const differentRemap = getPhysicalLayoutPlan(
-      SpanBufferClass,
-      HOT_CHILD_HINT,
-      SpanContextClass,
-      otherLayout,
-      'js-heap',
-    );
+    const differentRemap = getPhysicalLayoutPlan(SpanBufferClass, HOT_CHILD_HINT, SpanContextClass, otherLayout);
     const differentContextLayout = getPhysicalLayoutPlan(
       SpanBufferClass,
       HOT_CHILD_HINT,
       differentLayoutContextClass,
       layout,
-      'js-heap',
       'requestId',
     );
     const differentSchema = getPhysicalLayoutPlan(
@@ -86,7 +77,6 @@ describe('PhysicalLayoutPlan', () => {
       HOT_CHILD_HINT,
       otherSchemaContextClass,
       undefined,
-      'js-heap',
     );
 
     expect(identical).toBe(first);
@@ -94,20 +84,18 @@ describe('PhysicalLayoutPlan', () => {
     expect(first.SpanContextClass).toBe(SpanContextClass);
     expect(first.remapDescriptor).toBe(layout);
     expect(differentCapabilities).not.toBe(first);
-    expect(differentBackend).not.toBe(first);
     expect(differentRemap).not.toBe(first);
     expect(differentContextLayout).not.toBe(first);
     expect(differentSchema).not.toBe(first);
     expect(differentCapabilities.capabilities).toBe(first.capabilities ^ RUNTIME_HINT_LOG);
     expect(differentCapabilities.SpanContextClass).toBe(differentCapabilityContextClass);
-    expect(differentBackend.backendKind).toBe('wasm');
     expect(differentRemap.remapDescriptor).toBe(otherLayout);
     expect(differentContextLayout.contextLayoutKey).toBe('requestId');
     expect(differentContextLayout.SpanContextClass).toBe(differentLayoutContextClass);
     expect(differentSchema.schema).toBe(otherSchema);
   });
 
-  it('owns the schema-specific constructors, capacity, and appenders', () => {
+  it('owns the schema-specific constructors, capacity, and class-carried appenders', () => {
     const schema = defineLogSchema({ userId: S.category() });
     const SpanBufferClass = getSpanBufferClass(schema);
     const SpanContextClass = createSpanContextClass<OpContext<typeof schema>>(
@@ -129,9 +117,12 @@ describe('PhysicalLayoutPlan', () => {
     expect(plan.clock.kind).toBe('trace-root');
     expect(plan.poolRef).toBeNull();
     expect(reusedPlan.clock).toBe(plan.clock);
-    expect(reusedPlan.appenders).toBe(plan.appenders);
     expect(Object.isFrozen(plan.clock)).toBe(true);
-    expect(Object.isFrozen(plan.appenders)).toBe(true);
+    const prototypeAppenders = Reflect.get(SpanBufferClass.prototype, '_appenders');
+    expect(prototypeAppenders).toBe(
+      Reflect.get(getSpanBufferClass(schema, 'mixed', 'current').prototype, '_appenders'),
+    );
+    expect(Object.isFrozen(prototypeAppenders)).toBe(true);
   });
 
   it('reuses matching SpanBuffer metadata and materializes one constructor for a mismatch', () => {
@@ -219,7 +210,6 @@ describe('PhysicalLayoutPlan', () => {
 
     const ownedLogger = plan.SpanLoggerClass;
     const ownedTagWriter = plan.TagWriterClass;
-    const ownedAppenders = plan.appenders;
     const tracer = new TestTracer(opContext, createTestTracerOptions());
 
     await tracer.trace('root', parentOp);
@@ -237,7 +227,6 @@ describe('PhysicalLayoutPlan', () => {
     expect(writtenMessages).toEqual(['planned-log', 'planned-log']);
     expect(plan.SpanLoggerClass).toBe(ownedLogger);
     expect(plan.TagWriterClass).toBe(ownedTagWriter);
-    expect(plan.appenders).toBe(ownedAppenders);
   });
   it('reuses one monomorphic CallsitePlan across sync and async calls while separating capability and schema plans', async () => {
     const schema = defineLogSchema({ userId: S.category() });

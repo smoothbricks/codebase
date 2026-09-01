@@ -89,7 +89,7 @@ function createBenchmarkSpanLogger(root: BenchmarkSpanBuffer): {
   const state: BenchmarkWriterState = {
     _spanBuffer: root,
     _buffer: root,
-    _appendLogEntry: callsitePlan.appendLogEntry,
+    _appendLogEntry: root._appendLogEntry,
     _physicalLayoutPlan: callsitePlan,
     _appendWriterEntry(entryType: number): number {
       if (state._buffer._writeIndex >= state._buffer._capacity) {

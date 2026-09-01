@@ -142,17 +142,17 @@ describe('compiler-proven eager user columns', () => {
       RUNTIME_HINT_LOG | RUNTIME_HINT_RESULT,
     );
     const remap = createRemapDescriptor(schema, { local_number: 'provenNumber' });
-    const plan = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, 'js-heap', '', [
+    const plan = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, '', [
       'provenString',
       'provenNumber',
       'provenString',
     ]);
-    const identical = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, 'js-heap', '', [
+    const identical = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, '', [
       'provenNumber',
       'provenString',
     ]);
-    const lazyPlan = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, undefined, 'js-heap');
-    const remapped = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, remap, 'js-heap', '', [
+    const lazyPlan = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass);
+    const remapped = getPhysicalLayoutPlan(baseClass, HINT, SpanContextClass, remap, '', [
       'provenNumber',
       'provenString',
     ]);

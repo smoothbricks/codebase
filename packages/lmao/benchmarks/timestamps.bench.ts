@@ -35,7 +35,7 @@ const esTracer = new TestTracer(benchmarkContext, {
 
 function makeBuffer(traceRoot: NodeTraceRoot | EsTraceRoot, label: string): AnySpanBuffer {
   const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
-  plan.appenders.writeSpanStart(buffer, label);
+  buffer._appenders.writeSpanStart(buffer, label);
   return buffer;
 }
 
@@ -67,7 +67,7 @@ function nodeBeforeModel(root: NodeTraceRoot, buffer: AnySpanBuffer): number {
 }
 
 function planCandidate(buffer: AnySpanBuffer): number {
-  const append = plan.appenders.writeLogEntry;
+  const append = buffer._appenders.writeLogEntry;
   buffer._writeIndex = 2;
   let checksum = 0;
   for (let row = 0; row < ROWS; row++) {
@@ -184,11 +184,11 @@ const wasmBuffer = wasmStrategy.createSpanBuffer(
 );
 
 function wasmBatch(candidate: boolean): number {
-  plan.appenders.writeSpanStart(wasmBuffer, 'timestamp-wasm');
+  wasmBuffer._appenders.writeSpanStart(wasmBuffer, 'timestamp-wasm');
   let checksum = 0;
   for (let row = 0; row < ROWS; row++) {
     const index = candidate
-      ? plan.appenders.writeLogEntry(wasmBuffer, ENTRY_TYPE)
+      ? wasmBuffer._appenders.writeLogEntry(wasmBuffer, ENTRY_TYPE)
       : wasmRoot.writeLogEntry(wasmBuffer, ENTRY_TYPE);
     checksum = Math.imul(checksum ^ index ^ ENTRY_TYPE, 16_777_619) >>> 0;
   }

@@ -157,7 +157,7 @@ function makeRuntimeBundle(label: string, dynamic: boolean, implementation: Impl
   }
   const traceRoot = createTraceRoot(`structured-template-${label}`, tracer);
   const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
-  plan.appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
+  buffer._appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
   const context = new plan.SpanContextClass(buffer, plan.schema, plan);
   return { buffer, context, staticLowered, staticMessageId, views: attributeViews(buffer) };
 }

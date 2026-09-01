@@ -91,13 +91,13 @@ function createBufferPlan(fields: Record<string, SchemaWithMetadata>, label: str
         CAPACITY,
         plan.SpanBufferClass,
       );
-      plan.appenders.writeSpanStart(root, `${label}-root`);
+      root._appenders.writeSpanStart(root, `${label}-root`);
       root._writeIndex = 1;
       return root;
     },
     createChild(parent, spanName) {
       const child = createChildSpanBuffer(parent, plan.SpanBufferClass, plan.metadata, plan.metadata, CAPACITY);
-      plan.appenders.writeSpanStart(child, spanName);
+      child._appenders.writeSpanStart(child, spanName);
       return child;
     },
   };

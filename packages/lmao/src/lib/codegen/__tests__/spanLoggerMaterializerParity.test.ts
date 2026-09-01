@@ -265,7 +265,7 @@ function setUpScenario<T extends LogSchema, Ctx extends OpContext<T>>(
     op.callsitePlan.SpanBufferClass,
   );
   const spanContext = new op.callsitePlan.SpanContextClass(buffer, rtSchema, op.callsitePlan);
-  op.callsitePlan.appenders.writeSpanStart(buffer, parityCase.family === 'static-only' ? DENSE_INDEX : 'parity root');
+  buffer._appenders.writeSpanStart(buffer, parityCase.family === 'static-only' ? DENSE_INDEX : 'parity root');
   const state = Reflect.get(spanContext._spanLogger, '_state');
   if (!isWriterStateValue(state)) throw new TypeError('Expected writer state on the span logger');
 
