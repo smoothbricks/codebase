@@ -7,6 +7,7 @@
  */
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
+import type { PhysicalAppenders } from '../lifecycleAppenders.js';
 import type { RemapDescriptor } from '../logBinding.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { LogSchema } from '../schema/LogSchema.js';
@@ -15,7 +16,7 @@ import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 import { getThreadId } from '../threadId.js';
 import { createTraceId, type TraceId } from '../traceId.js';
-import type { ITraceRoot } from '../traceRoot.js';
+import type { ITraceRoot, TimestampAppendPrimitive } from '../traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { getVocabularyGeneration } from '../vocabularyRegistry.js';
 import { attributeKindForSchemaType, isThreadSystemColumn, schemaAttributeOrdinals } from './schemaBlob.js';
@@ -222,6 +223,11 @@ export class ThreadSpanView {
   parent_thread_id = 0n;
   _hasParent = false;
   _spanName?: string | number;
+
+  /** Binding-backed lifecycle writers, installed once on this prototype below. */
+  declare readonly _appenders: PhysicalAppenders;
+  /** Binding-backed log-append primitive; the traceRoot operand is unused on this lane. */
+  declare readonly _appendLogEntry: TimestampAppendPrimitive;
 
   get message_values(): (string | undefined)[] {
     const existing = this._laneStore[LANE_MESSAGE];
@@ -654,6 +660,30 @@ export class ThreadSpanView {
 export function isThreadSpanView(value: unknown): value is ThreadSpanView {
   return typeof value === 'object' && value !== null && THREAD_SPAN_VIEW in value;
 }
+
+/**
+ * The thread lane's lifecycle writers cross the row-store binding directly;
+ * message layout does not apply because the store owns the row format.
+ */
+const THREAD_BUFFER_APPENDERS: PhysicalAppenders = Object.freeze({
+  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
+    requireThreadSpanView(buffer).openSpan(name);
+  },
+  writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
+    requireThreadSpanView(buffer).end(entryType);
+  },
+  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
+    return requireThreadSpanView(buffer).beginLog(entryType);
+  },
+});
+
+const THREAD_APPEND_LOG_ENTRY: TimestampAppendPrimitive = (_traceRoot, buffer, entryType) =>
+  requireThreadSpanView(buffer).beginLog(entryType);
+
+Object.defineProperties(ThreadSpanView.prototype, {
+  _appenders: { value: THREAD_BUFFER_APPENDERS },
+  _appendLogEntry: { value: THREAD_APPEND_LOG_ENTRY },
+});
 
 export function requireThreadSpanView(value: AnySpanBuffer): ThreadSpanView {
   if (!isThreadSpanView(value)) throw new TypeError('expected ThreadSpanView');

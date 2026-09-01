@@ -140,7 +140,7 @@ function writeRows(
 ): number {
   let checksum = 2_166_136_261;
   for (let row = 0; row < rows; row++) {
-    const outputRow = plan.appenders.writeLogEntry(buffer, ENTRY_TYPE_INFO);
+    const outputRow = buffer._appenders.writeLogEntry(buffer, ENTRY_TYPE_INFO);
     const message = `request-${request}/row-${row}`;
     buffer.message(outputRow, message);
     buffer.value(outputRow, request * 1_000 + row + 0.25);
