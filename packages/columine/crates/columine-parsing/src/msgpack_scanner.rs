@@ -183,6 +183,28 @@ impl<'a> Reader<'a> {
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
     }
+    /// Whether `byte` opens an extension value (`fixext 1..16`, `ext 8/16/32`).
+    pub(crate) fn is_ext(byte: u8) -> bool {
+        matches!(byte, 0xc7..=0xc9 | 0xd4..=0xd8)
+    }
+    /// Read one extension value as `(type, payload)`.
+    pub(crate) fn read_ext(&mut self) -> Option<(i8, &'a [u8])> {
+        let byte = self.take()?;
+        let length = match byte {
+            0xd4 => 1,
+            0xd5 => 2,
+            0xd6 => 4,
+            0xd7 => 8,
+            0xd8 => 16,
+            0xc7 => usize::from(self.take()?),
+            0xc8 => usize::from(self.read_be_u16()?),
+            0xc9 => usize::try_from(self.read_be_u32()?).ok()?,
+            _ => return None,
+        };
+        let kind = i8::from_ne_bytes([self.take()?]);
+        let payload = self.take_slice(length)?;
+        Some((kind, payload))
+    }
     pub(crate) fn is_integer(byte: u8) -> bool {
         byte & 0x80 == 0 || byte & 0xe0 == 0xe0 || (0xcc..=0xd3).contains(&byte)
     }
@@ -381,6 +403,48 @@ impl<'a> Reader<'a> {
         };
         (self.pos <= self.input.len()).then_some(())
     }
+}
+
+/// The canonical bigint extension type: one sign byte (`0`/`1`) then the
+/// big-endian magnitude. One spelling with `canonical-msgpack.ts`'s
+/// `BIGINT_EXTENSION`; it is how a bigint travels on both wires, so the
+/// 64-bit integer markers stay what a plain number above u32 encodes to.
+pub(crate) const BIGINT_EXTENSION: i8 = 20;
+
+/// Decode a bigint extension payload that fits `i64`; a wider magnitude or a
+/// malformed sign byte is `None`.
+pub(crate) fn bigint_ext_i64(payload: &[u8]) -> Option<i64> {
+    let (sign, magnitude) = payload.split_first()?;
+    if *sign > 1 || magnitude.len() > 8 {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in magnitude {
+        value = (value << 8) | u64::from(*byte);
+    }
+    if *sign == 1 {
+        // `-2^63` is the one negative whose magnitude does not fit `i64`.
+        if value == 1u64 << 63 {
+            return Some(i64::MIN);
+        }
+        i64::try_from(value).ok().map(|value| -value)
+    } else {
+        i64::try_from(value).ok()
+    }
+}
+
+/// Decode a bigint extension payload that fits `u64`: non-negative, at most
+/// eight magnitude bytes.
+pub(crate) fn bigint_ext_u64(payload: &[u8]) -> Option<u64> {
+    let (sign, magnitude) = payload.split_first()?;
+    if *sign != 0 || magnitude.len() > 8 {
+        return None;
+    }
+    Some(
+        magnitude
+            .iter()
+            .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte)),
+    )
 }
 
 #[cfg(test)]
