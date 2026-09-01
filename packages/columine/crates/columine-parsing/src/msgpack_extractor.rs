@@ -95,10 +95,21 @@ fn extract_msgpack_fields(
     let mut saw_nested_value = false;
     let mut saw_flat_value_key = false;
     let mut column_name = String::new();
+    // The discriminant, once its key has been read: discriminated columns and
+    // enum ordinals resolve against it. Canonical encoders sort keys, so a
+    // discriminator key that sorts before `value` is always seen first; a
+    // producer that spells `value` earlier resolves undiscriminated.
+    let mut discriminant: Option<&str> = None;
     for _ in 0..fields {
         let key_start = reader.position();
         let key = reader.read_string().ok_or(ExtractionError::InvalidJson)?;
         let key_end = reader.position();
+        if config.is_discriminator_key(key) {
+            let mut probe = Reader::new(&reader.input()[reader.position()..]);
+            discriminant = probe
+                .read_string()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        }
         if saw_nested_value && key.starts_with(b"value.")
             || saw_flat_value_key && key == b"value" && config.has_value_fields
         {
@@ -143,6 +154,7 @@ fn extract_msgpack_fields(
                     columns,
                     work_buffer,
                     &mut state,
+                    discriminant,
                     lookup_name,
                     member,
                     member_start,
@@ -158,6 +170,7 @@ fn extract_msgpack_fields(
             columns,
             work_buffer,
             &mut state,
+            None,
             lookup_name,
             key,
             key_start,
@@ -256,16 +269,19 @@ fn extract_msgpack_member(
     columns: &mut DynamicColumns,
     work_buffer: &mut [u8],
     state: &mut ExtraState,
+    discriminant: Option<&str>,
     lookup_name: Option<&str>,
     key: &[u8],
     key_start: usize,
     key_end: usize,
 ) -> Result<(), ExtractionError> {
+    let member = std::str::from_utf8(key).ok();
     let lookup = lookup_name
-        .and_then(|name| config.lookup_field(name))
+        .and_then(|name| config.lookup_payload_member(discriminant, member.unwrap_or(name), name))
         .filter(|lookup| Some(lookup.column) != config.fallback_column);
     if let Some(lookup) = lookup {
-        extract_typed_value(reader, lookup.field, columns, lookup.column)?;
+        let variants = member.and_then(|member| config.enum_ordinals(discriminant, member));
+        extract_typed_value(reader, lookup.field, columns, lookup.column, variants)?;
         columns.columns_seen[lookup.column] = true;
         return Ok(());
     }
@@ -326,6 +342,7 @@ fn extract_typed_value(
     field: SignalSchemaField,
     columns: &mut DynamicColumns,
     column: usize,
+    enum_variants: Option<&[String]>,
 ) -> Result<(), ExtractionError> {
     let first = *reader
         .input()
@@ -378,6 +395,19 @@ fn extract_typed_value(
                     return Err(ExtractionError::InvalidFieldType);
                 }
                 Some(ColumnValue::Int(wide))
+            } else if let Some(variants) = enum_variants.filter(|_| Reader::is_string(first)) {
+                // The admission wire spells an enum as its string; the column
+                // holds the ordinal, which is the variant's declared index.
+                let text = reader
+                    .read_string()
+                    .ok_or(ExtractionError::InvalidFieldType)?;
+                let ordinal = variants
+                    .iter()
+                    .position(|variant| variant.as_bytes() == text)
+                    .ok_or(ExtractionError::InvalidFieldType)?;
+                Some(ColumnValue::Int(
+                    i64::try_from(ordinal).map_err(|_| ExtractionError::InvalidFieldType)?,
+                ))
             } else if width == 8 && Reader::is_string(first) {
                 let text = std::str::from_utf8(
                     reader
@@ -587,6 +617,121 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 2);
         assert_eq!(
             extract_msgpack_events(&fraction, &config, &mut columns, &mut work, true),
+            Err(ExtractionError::InvalidFieldType)
+        );
+    }
+
+    /// An admitted nested payload spells an enum as its string and a
+    /// discriminated member under its plain name; both must land in the
+    /// column the flat lane writes, selected by the discriminant.
+    #[test]
+    fn nested_payload_resolves_discriminated_columns_and_enum_ordinals() {
+        use crate::validate::parse_schema_envelope;
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Int32),
+            field(ArrowType::Int32),
+            field(ArrowType::Utf8),
+        ];
+        let names = [
+            "id",
+            "type",
+            "value.outcome",
+            "authorRole@close",
+            "authorRole@open",
+        ];
+        let envelope = parse_schema_envelope(
+            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"nullable","value":{"kind":"string"}}}}}"#,
+        )
+        .unwrap();
+        let discriminator = crate::PayloadDiscriminator {
+            key: "type".into(),
+            members: vec![
+                crate::DiscriminatedMember {
+                    discriminant: "close".into(),
+                    member: "authorRole".into(),
+                    column: 3,
+                },
+                crate::DiscriminatedMember {
+                    discriminant: "open".into(),
+                    member: "authorRole".into(),
+                    column: 4,
+                },
+            ],
+        };
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &names,
+            Some(&envelope),
+            Some(&discriminator),
+        )
+        .unwrap();
+        // {"id":"e","type":"close","value":{"authorRole":"human","outcome":"stuck"}}
+        let mut input = vec![0x83];
+        str_(&mut input, "id");
+        str_(&mut input, "e");
+        str_(&mut input, "type");
+        str_(&mut input, "close");
+        str_(&mut input, "value");
+        input.push(0x82);
+        str_(&mut input, "authorRole");
+        str_(&mut input, "human");
+        str_(&mut input, "outcome");
+        str_(&mut input, "stuck");
+        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 256];
+        assert_eq!(
+            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            Ok(1)
+        );
+        assert_eq!(
+            columns.cell(2, 0),
+            Some(ColumnValue::Int(1)),
+            "enum string became its ordinal"
+        );
+        assert_eq!(
+            columns.cell(3, 0),
+            Some(ColumnValue::Int(0)),
+            "close's authorRole landed in close's column"
+        );
+        assert_eq!(
+            columns.cell(4, 0),
+            None,
+            "open's column stays empty for a close event"
+        );
+
+        // The same member for the other type resolves to the other column, as text.
+        let mut other = vec![0x83];
+        str_(&mut other, "id");
+        str_(&mut other, "e2");
+        str_(&mut other, "type");
+        str_(&mut other, "open");
+        str_(&mut other, "value");
+        other.push(0x81);
+        str_(&mut other, "authorRole");
+        str_(&mut other, "agent");
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_msgpack_events(&other, &config, &mut columns, &mut work, true),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(4, 0), Some(ColumnValue::Utf8("agent".into())));
+        assert_eq!(columns.cell(3, 0), None);
+
+        // A string outside the declared variants is not an ordinal.
+        let mut bad = vec![0x83];
+        str_(&mut bad, "id");
+        str_(&mut bad, "e3");
+        str_(&mut bad, "type");
+        str_(&mut bad, "close");
+        str_(&mut bad, "value");
+        bad.push(0x81);
+        str_(&mut bad, "outcome");
+        str_(&mut bad, "abandoned");
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_msgpack_events(&bad, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
         );
     }
