@@ -1876,9 +1876,10 @@ const GC: CommandSpec = CommandSpec {
     trailing: "",
     summary: "free storage",
     about: &[
-        "Reclaims five kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned` and `freedBytes`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
+        "Reclaims six kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned`, `retainedActive` and `freedBytes`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
         "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main or were deliberately abandoned. Safe. Note what is *not* in this category: the `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are never reclaimed, so abandoned commits stay fetchable and their disk use accumulates until you delete them yourself.",
-        "`orphanStagingImage` and `orphanStagingMetadata` — an image with no metadata sidecar, or a sidecar with no image, under `sessions/.staging/`. Each is half of a lifecycle transaction — create, fork, restore — that died between writing the image and publishing it. Neither half was ever published under a workspace name, so nothing ever used it. Safe.",
+        "`orphanStagingImage` and `orphanStagingMetadata` — a staged image, with or without its grants sidecar, or a sidecar with no image, under the project's `.staging/` in the store. Each is a lifecycle transaction — create, fork, restore — that died between writing the image and publishing it. The one sign a transaction is still running is its workspace lifecycle lock: an entry whose lock is held is retained and counted in `retainedActive`; an entry whose lock is free was never published under a workspace name, so nothing uses it. Safe.",
+        "`orphanStagingMount` — a mountpoint under the mount root's `.staging/` whose image is gone or was never published: an empty directory, or a volume an interrupted operation left attached. Attached volumes are detached before the directory goes, so an orphan that held tens of gigabytes stops charging for them. Safe; the same lock rule retains a mountpoint an operation still owns.",
         "`expiredCheckpoint` — an automatic checkpoint that is neither one of the five most recent for its workspace nor younger than fourteen days. This is the category that can delete something you still want: an automatic checkpoint is a real crash-consistent copy of that workspace, and past those two thresholds it goes. Pinned checkpoints are never candidates, and `cowshed checkpoint --keep` or any explicitly labelled checkpoint is pinned; `retainedPinned` in the report counts what was spared for that reason.",
         "`detachedImageCompaction` — punches holes in an unmounted sparse image so the filesystem stops charging for blocks the image no longer uses. This deletes no data: the image's contents are unchanged and it stays fully usable. Only unmounted sparse images qualify.",
     ],
@@ -2024,12 +2025,12 @@ const DOCTOR: CommandSpec = CommandSpec {
     trailing: "",
     summary: "check invariants",
     about: &[
-        "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh. Exit 0 when healthy, otherwise 5.",
-        "With `--repair`, first validates every mounted workspace artifact frame. Duplicate or regressed sequences are refused because resequencing would change store identity and make the rewritten log attest to itself; create a fresh store instead.",
+        "Checks the invariants a healthy host holds: every image has a marker, every mount matches an image, grants files parse, the caches volume and the gateway answer, autosave is fresh, and nothing reclaimable is stranded — retired trash, and staging entries (images, sidecars, mountpoints, attached volumes) that no running operation owns are each a finding with their byte count. Exit 0 when healthy, otherwise 5.",
+        "With `--repair`, first validates every mounted workspace artifact frame. Duplicate or regressed sequences are refused because resequencing would change store identity and make the rewritten log attest to itself; create a fresh store instead. Repair then runs the same sweep `gc` runs, so stranded trash and orphaned staging are retired under gc's rules and reported.",
     ],
     options: &[Opt {
         spelling: "--repair",
-        meaning: "validate artifact ordering and refuse identity-changing sequence rewrites",
+        meaning: "validate artifact ordering, refuse identity-changing sequence rewrites, then reclaim what gc would",
     }],
 };
 

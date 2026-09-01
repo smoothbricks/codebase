@@ -224,6 +224,7 @@ impl CliService for FakeService {
             examined: 9,
             reclaimed: u64::from(!options.dry_run) * 3,
             retained_pinned: 2,
+            retained_active: 0,
             freed_bytes: if options.dry_run {
                 candidate_bytes
             } else {
@@ -1088,7 +1089,7 @@ async fn gc_dry_run_zero_and_unicode_candidates_keep_streams_separate() {
     assert_eq!(
         stdout,
         format!(
-            "{{\"ok\":true,\"result\":{{\"examined\":9,\"reclaimed\":0,\"retainedPinned\":2,\"freedBytes\":1234,\"dryRun\":true,\"candidates\":[{{\"identity\":\"{}\",\"path\":\"/tmp/回收 space/checkpoint\",\"bytes\":1234,\"reason\":\"expiredCheckpoint\"}}]}}}}\n",
+            "{{\"ok\":true,\"result\":{{\"examined\":9,\"reclaimed\":0,\"retainedPinned\":2,\"retainedActive\":0,\"freedBytes\":1234,\"dryRun\":true,\"candidates\":[{{\"identity\":\"{}\",\"path\":\"/tmp/回收 space/checkpoint\",\"bytes\":1234,\"reason\":\"expiredCheckpoint\"}}]}}}}\n",
             "ab".repeat(32)
         )
         .as_bytes()

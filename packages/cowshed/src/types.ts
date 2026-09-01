@@ -240,6 +240,7 @@ export interface GcCandidate {
     | 'retiredWorkspace'
     | 'orphanStagingImage'
     | 'orphanStagingMetadata'
+    | 'orphanStagingMount'
     | 'expiredCheckpoint'
     | 'detachedImageCompaction';
 }
@@ -248,6 +249,8 @@ export interface GcReport {
   readonly examined: number;
   readonly reclaimed: number;
   readonly retainedPinned: number;
+  /** Staging entries an operation still holds the lifecycle lock for: not garbage yet. */
+  readonly retainedActive: number;
   readonly freedBytes: number;
   readonly dryRun: boolean;
   readonly candidates: readonly GcCandidate[];

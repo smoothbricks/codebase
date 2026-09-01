@@ -5656,6 +5656,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     StorageGcReason::OrphanStagingMetadata => {
                         crate::api::dto::GcReason::OrphanStagingMetadata
                     }
+                    StorageGcReason::OrphanStagingMount => {
+                        crate::api::dto::GcReason::OrphanStagingMount
+                    }
                     StorageGcReason::ExpiredCheckpoint => {
                         crate::api::dto::GcReason::ExpiredCheckpoint
                     }
@@ -5675,6 +5678,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 reclaimed: 0,
                 retained_pinned: u64::try_from(plan.retained_pinned())
+                    .map_err(|_| CowshedError::internal("GC count overflow"))?,
+                retained_active: u64::try_from(plan.retained_active())
                     .map_err(|_| CowshedError::internal("GC count overflow"))?,
                 freed_bytes,
                 dry_run: true,
@@ -5711,6 +5716,8 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             reclaimed: u64::try_from(report.reclaimed)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
             retained_pinned: u64::try_from(report.retained_pinned)
+                .map_err(|_| CowshedError::internal("GC count overflow"))?,
+            retained_active: u64::try_from(report.retained_active)
                 .map_err(|_| CowshedError::internal("GC count overflow"))?,
             freed_bytes: report.freed_bytes,
             dry_run: false,
@@ -6319,6 +6326,61 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // leaves the operator with no next move.
         match self.substrate.preview_gc(&self.descriptor.repo_id).await {
             Ok(plan) => {
+                let orphaned = plan
+                    .candidates()
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            candidate.reason(),
+                            StorageGcReason::OrphanStagingImage
+                                | StorageGcReason::OrphanStagingMetadata
+                                | StorageGcReason::OrphanStagingMount
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(first) = orphaned.first() {
+                    let bytes = orphaned
+                        .iter()
+                        .try_fold(0_u64, |sum, candidate| sum.checked_add(candidate.bytes()))
+                        .ok_or_else(|| {
+                            CowshedError::internal("GC candidate byte accounting overflow")
+                        })?;
+                    let mounts = orphaned
+                        .iter()
+                        .filter(|candidate| {
+                            matches!(candidate.reason(), StorageGcReason::OrphanStagingMount)
+                        })
+                        .count();
+                    findings.push(crate::api::dto::Finding {
+                        code: "staging-orphans".into(),
+                        severity: crate::api::dto::FindingSeverity::Warning,
+                        message: format!(
+                            "staging holds {} orphaned {} totalling {bytes} bytes, {mounts} of them {} no operation owns",
+                            orphaned.len(),
+                            if orphaned.len() == 1 { "entry" } else { "entries" },
+                            if mounts == 1 { "a mountpoint" } else { "mountpoints" }
+                        ),
+                        hint: "cowshed gc (or cowshed doctor --repair)".into(),
+                        path: Some(first.path().to_owned()),
+                    });
+                }
+                if plan.retained_active() > 0 {
+                    findings.push(crate::api::dto::Finding {
+                        code: "staging-active".into(),
+                        severity: crate::api::dto::FindingSeverity::Info,
+                        message: format!(
+                            "{} staging {} an operation still holds the lifecycle lock for",
+                            plan.retained_active(),
+                            if plan.retained_active() == 1 {
+                                "entry"
+                            } else {
+                                "entries"
+                            }
+                        ),
+                        hint: "nothing to do; gc retains them until the lock is released".into(),
+                        path: None,
+                    });
+                }
                 let stranded = plan
                     .candidates()
                     .iter()

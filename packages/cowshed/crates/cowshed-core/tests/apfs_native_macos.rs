@@ -2538,30 +2538,141 @@ fn an_imageless_publication_with_a_restore_in_flight_keeps_its_evidence_and_stil
     );
 }
 
+/// Staging is judged by ownership, not by shape: an image with its grants sidecar and one
+/// without are both garbage once nothing runs and nothing publishes them, while a staged image a
+/// crashed sidecar-first publication still names is recovery's evidence and stays.
 #[test]
-fn gc_reclaims_sidecarless_staging_crash_images_but_preserves_recoverable_pairs() {
+fn gc_reclaims_unowned_staging_pairs_and_keeps_a_recoverable_publication() {
     let fixture = Fixture::new("staging-orphan");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let staging = layout.project().project_root.join(".staging");
     let orphan = staging.join("session-a-00000000000000000000000000000002.asif");
     std::fs::create_dir_all(&staging).expect("staging directory");
     std::fs::write(&orphan, b"crashed before metadata").expect("orphan staged image");
+    let abandoned = staging.join("session-b-00000000000000000000000000000003.sparseimage");
+    create_image(&abandoned, ImageFormat::Sparse);
     let recoverable = staging.join("main-00000000000000000000000000000001.sparseimage");
-    create_image(&recoverable, ImageFormat::Sparse);
+    std::fs::write(&recoverable, b"published generation").expect("recoverable staged image");
+    let canonical = layout.main_image(ImageFormat::Sparse).expect("canonical");
+    metadata(ImageFormat::Sparse)
+        .write_for_image(canonical.image())
+        .expect("canonical sidecar of a sidecar-first publication whose rename never ran");
 
-    let report = execute_gc(
-        &native_host(&fixture, RecordingRunner::default()),
-        &fixture.config(),
-    )
-    .expect("staging gc");
-
-    assert_eq!(report.reclaimed, 1);
-    assert!(!orphan.exists(), "sidecarless crash image is reclaimed");
-    assert!(recoverable.exists(), "recoverable staged image is retained");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let plan = host.preview_gc(&fixture.config(), &repo()).expect("plan");
     assert_eq!(
-        DetachedWorkspaceMetadata::read_for_image(&recoverable)
-            .expect("recoverable staged metadata"),
-        metadata(ImageFormat::Sparse)
+        plan.retained_active(),
+        1,
+        "the recoverable publication is owned"
+    );
+    let report = host
+        .execute_gc(&fixture.config(), plan)
+        .expect("staging gc");
+
+    assert_eq!(report.examined, 3);
+    assert_eq!(report.reclaimed, 2);
+    assert_eq!(report.retained_active, 1);
+    assert!(!orphan.exists(), "sidecarless crash image is reclaimed");
+    assert!(
+        !abandoned.exists(),
+        "an abandoned image is reclaimed with its sidecar"
+    );
+    assert!(!sidecar_path(&abandoned).exists());
+    assert!(!ca_key_path(&abandoned).exists());
+    assert!(
+        recoverable.exists(),
+        "a staged image a canonical sidecar names is evidence"
+    );
+    assert!(sidecar_path(canonical.image()).exists());
+}
+
+/// A mountpoint under the mount root's staging directory with no image behind it is the debris
+/// of an interrupted operation; one whose volume the kernel still holds is detached first, and
+/// one an operation still owns (its lifecycle lock is held) is retained and counted.
+#[test]
+fn gc_retires_orphaned_staging_mountpoints_and_detaches_the_ones_still_attached() {
+    let fixture = Fixture::new("staging-mounts");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let staging_mounts = layout.project().mount_root.join(".staging");
+    let empty = staging_mounts.join("session-a-00000000000000000000000000000002");
+    let attached = staging_mounts.join("session-b-00000000000000000000000000000003");
+    let owned = staging_mounts.join("session-c-00000000000000000000000000000004");
+    for directory in [&empty, &attached, &owned] {
+        std::fs::create_dir_all(directory).expect("staging mountpoint");
+    }
+    std::fs::write(staging_mounts.join("not-a-staging-name"), b"ignored").expect("noise");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/session-b-00000000000000000000000000000003.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    let owned_lock = layout
+        .session_image(
+            &WorkspaceName::session("session-c").expect("session-c"),
+            ImageFormat::Sparse,
+        )
+        .expect("session-c image")
+        .lock()
+        .to_owned();
+
+    let runner = RecordingRunner::default();
+    let host = native_host_with_mounts(
+        &fixture,
+        runner.clone(),
+        vec![KernelMountSnapshot::new(
+            7,
+            attached.clone(),
+            "/dev/disk9s1",
+            true,
+            true,
+        )],
+    );
+    let owner = native_host_at(&fixture.root);
+    let guard = owner
+        .lock_images(std::slice::from_ref(&owned_lock), LockMode::Wait)
+        .expect("owner lock")
+        .expect("blocking owner lock");
+
+    let plan = host.preview_gc(&fixture.config(), &repo()).expect("plan");
+    let reasons: Vec<_> = plan
+        .candidates()
+        .iter()
+        .map(|candidate| (candidate.path().to_owned(), candidate.reason()))
+        .collect();
+    assert!(reasons.contains(&(empty.clone(), StorageGcReason::OrphanStagingMount)));
+    assert!(reasons.contains(&(staged.clone(), StorageGcReason::OrphanStagingImage)));
+    assert!(
+        !reasons.iter().any(|(path, _)| path == &owned),
+        "a mountpoint an operation still owns is not a candidate"
+    );
+    assert_eq!(plan.retained_active(), 1);
+    let report = host
+        .execute_gc(&fixture.config(), plan)
+        .expect("staging mount gc");
+    drop(guard);
+
+    assert_eq!(report.reclaimed, 2);
+    assert!(!empty.exists(), "the empty mountpoint is removed");
+    assert!(
+        !attached.exists(),
+        "the attached mountpoint is removed after detach"
+    );
+    assert!(!staged.exists(), "the attached image is reclaimed");
+    assert!(owned.exists(), "the owned mountpoint is retained");
+    let detached = runner.requests().into_iter().any(|request| {
+        request.program == Path::new("/usr/bin/hdiutil")
+            && request
+                .args
+                .first()
+                .is_some_and(|argument| argument == "detach")
+            && request
+                .args
+                .last()
+                .is_some_and(|argument| argument == attached.as_os_str())
+    });
+    assert!(
+        detached,
+        "the kernel-held volume is detached before its mountpoint goes"
     );
 }
 
@@ -3935,8 +4046,12 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
         .expect("owner lock")
         .expect("blocking owner lock");
 
-    let error = execute_gc(&collector, &fixture.config()).expect_err("contended GC plan");
-    assert!(matches!(error, ApfsStorageError::GcPlanStale));
+    // Owned staging is retained and reported, not a stale plan: the sweep reads the held lock
+    // as the operation's ownership rather than tripping over it at execution.
+    let report = execute_gc(&collector, &fixture.config()).expect("owned staging is retained");
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.reclaimed, 0);
+    assert_eq!(report.retained_active, 1);
     assert!(staged.exists());
     assert!(!sidecar_path(&staged).exists());
 
@@ -3944,6 +4059,7 @@ fn gc_skips_staging_owned_by_an_active_lifecycle_lock() {
     let report = execute_gc(&collector, &fixture.config()).expect("released gc");
     assert_eq!(report.examined, 1);
     assert_eq!(report.reclaimed, 1);
+    assert_eq!(report.retained_active, 0);
     assert!(!staged.exists());
     assert!(!sidecar_path(&staged).exists());
 }

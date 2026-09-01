@@ -674,6 +674,7 @@ pub enum GcReason {
     RetiredWorkspace,
     OrphanStagingImage,
     OrphanStagingMetadata,
+    OrphanStagingMount,
     ExpiredCheckpoint,
     DetachedImageCompaction,
 }
@@ -693,6 +694,8 @@ pub struct GcReport {
     pub examined: u64,
     pub reclaimed: u64,
     pub retained_pinned: u64,
+    /// Staging entries an operation still holds the lifecycle lock for: not garbage yet.
+    pub retained_active: u64,
     pub freed_bytes: u64,
     pub dry_run: bool,
     pub candidates: Vec<GcCandidate>,

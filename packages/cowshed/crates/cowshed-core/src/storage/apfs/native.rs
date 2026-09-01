@@ -38,7 +38,7 @@ use super::super::bootstrap::is_reserved_store_namespace;
 use super::super::lifecycle::{
     CheckpointFact, KernelMountFact, LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin,
     ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
-    StorageGcReason, StorageGcReport, SubstrateStats,
+    StorageGcReason, StorageGcReport, StorageGcRetained, SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -396,6 +396,7 @@ fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
         StorageGcReason::RetiredWorkspace => b"retired-workspace",
         StorageGcReason::OrphanStagingImage => b"orphan-staging-image",
         StorageGcReason::OrphanStagingMetadata => b"orphan-staging-metadata",
+        StorageGcReason::OrphanStagingMount => b"orphan-staging-mount",
         StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
         StorageGcReason::DetachedImageCompaction => b"detached-image-compaction",
     }
@@ -902,10 +903,17 @@ fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageEr
 fn staged_image_format(path: &Path) -> Option<ImageFormat> {
     let format = ImageFormat::from_image_path(path).ok()?;
     let stem = path.file_stem()?.to_str()?;
-    let (workspace, incarnation) = stem.rsplit_once('-')?;
-    WorkspaceName::new(workspace).ok()?;
-    WorkspaceIncarnation::new(incarnation).ok()?;
+    staged_stem_workspace(stem)?;
     Some(format)
+}
+
+/// The workspace a staging stem (`<name>-<incarnation>`, or the `recover-` prefixed form recovery
+/// mounts under) belongs to. `None` for a name staging never produces, which the sweeps leave alone.
+fn staged_stem_workspace(stem: &str) -> Option<WorkspaceName> {
+    let stem = stem.strip_prefix("recover-").unwrap_or(stem);
+    let (workspace, incarnation) = stem.rsplit_once('-')?;
+    WorkspaceIncarnation::new(incarnation).ok()?;
+    WorkspaceName::new(workspace).ok()
 }
 fn is_project_owner_directory(path: &Path) -> bool {
     path.file_name()
@@ -2042,11 +2050,103 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(images.into_iter().collect())
     }
 
+    /// The staging stems a crashed publication still names: a canonical sidecar in the project
+    /// or its sessions whose image is missing was renamed first (sidecar-first publication), and
+    /// `recover_pending` completes it from the staged image `<workspace>-<incarnation>` on the next
+    /// lifecycle verb. Such a staged image is evidence, not garbage, sidecar or no sidecar.
+    fn recoverable_staged_stems(
+        &self,
+        project: &Path,
+        repo: &RepoId,
+    ) -> Result<BTreeSet<String>, ApfsStorageError> {
+        let mut stems = BTreeSet::new();
+        let sessions = project.join(SESSIONS_DIRECTORY);
+        for directory in [project, sessions.as_path()] {
+            for sidecar in regular_file_children(directory)? {
+                if !sidecar
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(GRANTS_SIDECAR_SUFFIX))
+                {
+                    continue;
+                }
+                let canonical = image_from_sidecar(&sidecar)?;
+                if canonical.exists() || ImageFormat::from_image_path(&canonical).is_err() {
+                    continue;
+                }
+                let Ok(metadata) = DetachedWorkspaceMetadata::read_for_image(&canonical) else {
+                    continue;
+                };
+                if metadata.repo_id != *repo {
+                    continue;
+                }
+                stems.insert(format!(
+                    "{}-{}",
+                    metadata.workspace, metadata.workspace_incarnation
+                ));
+            }
+        }
+        Ok(stems)
+    }
+
+    /// Whether a lifecycle lock is free to take. `held` names the locks the caller already holds
+    /// (an executing plan re-previews under its own locks), which a probe must not read as another
+    /// operation's.
+    fn lock_is_free(&self, lock: &Path, held: &[PathBuf]) -> Result<bool, ApfsStorageError> {
+        if held.iter().any(|path| path == lock) {
+            return Ok(true);
+        }
+        Ok(
+            acquire_image_locks(&self.config.store_root, &[lock.to_owned()], LockMode::Try)?
+                .is_some(),
+        )
+    }
+
+    /// The mountpoint a staging stem is attached at while its operation runs.
+    fn staging_mount_point(&self, repo: &RepoId, stem: &str) -> Result<PathBuf, ApfsStorageError> {
+        Ok(layout(&self.config, repo)?
+            .project()
+            .mount_root
+            .join(super::STAGING_NAMESPACE)
+            .join(stem))
+    }
+
+    /// Detach a staging mountpoint if the kernel still holds a volume there, then remove the
+    /// directory. The format picks the detach tool; a mount whose image is gone is detached as a
+    /// sparse image, the only format `hdiutil` attaches under a plain mountpoint.
+    fn retire_staging_mount(
+        &self,
+        mount_point: &Path,
+        format: ImageFormat,
+    ) -> Result<(), ApfsStorageError>
+    where
+        R: CommandRunner,
+    {
+        let mounted = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .any(|mount| mount.mount_point == mount_point);
+        if mounted {
+            self.backend.detach_target(
+                format,
+                DetachTarget::MountPoint(mount_point),
+                DetachIntent::Release,
+            )?;
+        }
+        match fs::remove_dir(mount_point) {
+            Ok(()) => sync_parent_path(mount_point),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("remove staging mountpoint", mount_point, error)),
+        }
+    }
+
     fn preview_gc_project(
         &self,
         project: &Path,
         repo: &RepoId,
         observed_at: std::time::SystemTime,
+        held_locks: &[PathBuf],
     ) -> Result<StorageGcPlan, ApfsStorageError>
     where
         R: CommandRunner + Send + Sync + 'static,
@@ -2068,6 +2168,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let mut examined = 0_usize;
         let mut retained_pinned = 0_usize;
         let mut retained_recent = 0_usize;
+        let mut retained_active = 0_usize;
 
         let trash = sessions.join(super::TRASH_NAMESPACE);
         let trash_images = self.retired_trash_images(&trash)?;
@@ -2103,6 +2204,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             )?);
         }
 
+        // Staging is the half-written half of a lifecycle transaction — create, fork, restore —
+        // and the signs that one still owns an entry are its workspace lifecycle lock (running)
+        // and a canonical sidecar naming it (a crashed publication `recover_pending` will
+        // finish). An image beside its grants sidecar looks exactly like an in-flight clone and
+        // exactly like a clone whose session died before publication; treating the pair as in
+        // flight forever silently retained every abandoned image, and their mountpoints under
+        // the mount root were never enumerated at all. So every staging entry is judged by
+        // those two signs: owned is retained (and counted), unowned is garbage.
         let staging = project.join(super::STAGING_NAMESPACE);
         let mut staged_images = BTreeMap::new();
         let mut staged_sidecars = BTreeMap::new();
@@ -2122,14 +2231,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 }
             }
         }
+        let recoverable = self.recoverable_staged_stems(project, repo)?;
+        let mut staged_stems = BTreeSet::new();
         for (image, format) in &staged_images {
             examined = examined
                 .checked_add(1)
                 .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
-            if staged_sidecars.contains_key(image) {
+            let stem = image
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+                .unwrap_or_default();
+            staged_stems.insert(stem.clone());
+            let lock = Self::transient_lock_path(project, image, *format)?;
+            if recoverable.contains(&stem) || !self.lock_is_free(&lock, held_locks)? {
+                retained_active = retained_active
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
                 continue;
             }
-            lock_paths.push(Self::transient_lock_path(project, image, *format)?);
+            lock_paths.push(lock);
             candidates.push(gc_candidate(
                 StorageGcReason::OrphanStagingImage,
                 image,
@@ -2148,11 +2269,63 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             let Some(format) = staged_image_format(image) else {
                 continue;
             };
-            lock_paths.push(Self::transient_lock_path(project, image, format)?);
+            let lock = Self::transient_lock_path(project, image, format)?;
+            if !self.lock_is_free(&lock, held_locks)? {
+                retained_active = retained_active
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
+                continue;
+            }
+            lock_paths.push(lock);
             candidates.push(gc_candidate(
                 StorageGcReason::OrphanStagingMetadata,
                 sidecar,
                 std::slice::from_ref(sidecar),
+                None,
+                &[],
+            )?);
+        }
+        // The mountpoints: a stem whose image is still in the store is retired with that image;
+        // one without an image is a directory an interrupted operation left behind, possibly
+        // with its volume still attached.
+        let staging_mounts = layout(&self.config, repo)?
+            .project()
+            .mount_root
+            .join(super::STAGING_NAMESPACE);
+        for mount_point in directory_children(&staging_mounts)? {
+            let Some(stem) = mount_point.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(workspace) = staged_stem_workspace(stem) else {
+                continue;
+            };
+            if staged_stems.contains(stem) {
+                continue;
+            }
+            examined = examined
+                .checked_add(1)
+                .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+            let locks = [
+                super::workspace_lock_path(&self.config, repo, &workspace, ImageFormat::Sparse)?,
+                super::workspace_lock_path(&self.config, repo, &workspace, ImageFormat::Asif)?,
+            ];
+            let mut free = true;
+            for lock in &locks {
+                if !self.lock_is_free(lock, held_locks)? {
+                    free = false;
+                }
+            }
+            if !free {
+                retained_active = retained_active
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC retained count overflow"))?;
+                continue;
+            }
+            lock_paths.extend(locks);
+            candidates.push(gc_candidate(
+                StorageGcReason::OrphanStagingMount,
+                &mount_point,
+                &[],
                 None,
                 &[],
             )?);
@@ -2299,8 +2472,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             candidates,
             lock_paths,
             examined,
-            retained_pinned,
-            retained_recent,
+            StorageGcRetained {
+                pinned: retained_pinned,
+                recent: retained_recent,
+                active: retained_active,
+            },
         ))
     }
 
@@ -2315,7 +2491,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let _guard =
             acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
                 .ok_or(ApfsStorageError::GcPlanStale)?;
-        let current = self.preview_gc_project(project, plan.repo(), plan.observed_at())?;
+        let current =
+            self.preview_gc_project(project, plan.repo(), plan.observed_at(), plan.lock_paths())?;
         if current != plan {
             return Err(ApfsStorageError::GcPlanStale);
         }
@@ -2323,6 +2500,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             examined: plan.examined(),
             retained_pinned: plan.retained_pinned(),
             retained_recent: plan.retained_recent(),
+            retained_active: plan.retained_active(),
             ..StorageGcReport::default()
         };
         for candidate in plan.candidates() {
@@ -2342,7 +2520,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
                     )?;
                 }
-                StorageGcReason::OrphanStagingImage | StorageGcReason::ExpiredCheckpoint => {
+                StorageGcReason::OrphanStagingImage => {
+                    let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
+                        "image GC candidate has no format",
+                    ))?;
+                    // The volume first: an image deleted under a live attachment keeps its
+                    // blocks until the kernel lets go, and the mountpoint would outlive it.
+                    if let Some(stem) = candidate.path().file_stem().and_then(|stem| stem.to_str())
+                    {
+                        let mount_point = self.staging_mount_point(plan.repo(), stem)?;
+                        self.retire_staging_mount(&mount_point, format)?;
+                    }
+                    self.reclaim_image(candidate.path(), format)?;
+                    report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                        ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                    )?;
+                }
+                StorageGcReason::OrphanStagingMount => {
+                    self.retire_staging_mount(candidate.path(), ImageFormat::Sparse)?;
+                }
+                StorageGcReason::ExpiredCheckpoint => {
                     let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
                         "image GC candidate has no format",
                     ))?;
@@ -4810,7 +5007,7 @@ where
             ));
         }
         let project = layout(config, repo)?.project().project_root.clone();
-        self.preview_gc_project(&project, repo, std::time::SystemTime::now())
+        self.preview_gc_project(&project, repo, std::time::SystemTime::now(), &[])
     }
 
     fn execute_gc(

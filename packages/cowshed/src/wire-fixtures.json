@@ -54,28 +54,36 @@
           "bytes": 4096,
           "identity": "084fed08b978af4d7d196a7446a86b58009e636b611db16211b65a9aadff29c5",
           "path": "/Users/fixture/Dev/.cowshed/gc/3",
-          "reason": "expiredCheckpoint"
+          "reason": "orphanStagingMount"
         },
         {
           "bytes": 5120,
           "identity": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71",
           "path": "/Users/fixture/Dev/.cowshed/gc/4",
+          "reason": "expiredCheckpoint"
+        },
+        {
+          "bytes": 6144,
+          "identity": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db",
+          "path": "/Users/fixture/Dev/.cowshed/gc/5",
           "reason": "detachedImageCompaction"
         }
       ],
       "dryRun": true,
-      "examined": 5,
+      "examined": 6,
       "freedBytes": 0,
       "reclaimed": 0,
-      "retainedPinned": 1
+      "retainedPinned": 1,
+      "retainedActive": 1
     },
     "swept": {
       "candidates": [],
       "dryRun": false,
-      "examined": 5,
-      "freedBytes": 15360,
-      "reclaimed": 4,
-      "retainedPinned": 1
+      "examined": 6,
+      "freedBytes": 21504,
+      "reclaimed": 5,
+      "retainedPinned": 1,
+      "retainedActive": 1
     }
   },
   "GrantSet": {

@@ -459,15 +459,17 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
     // One candidate per `GcReason`: a reason absent here is a reason the TypeScript union is not
     // checked against.
     let gc_dry_run = GcReport {
-        examined: 5,
+        examined: 6,
         reclaimed: 0,
         retained_pinned: 1,
+        retained_active: 1,
         freed_bytes: 0,
         dry_run: true,
         candidates: [
             GcReason::RetiredWorkspace,
             GcReason::OrphanStagingImage,
             GcReason::OrphanStagingMetadata,
+            GcReason::OrphanStagingMount,
             GcReason::ExpiredCheckpoint,
             GcReason::DetachedImageCompaction,
         ]
@@ -482,10 +484,11 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         .collect(),
     };
     let gc_swept = GcReport {
-        examined: 5,
-        reclaimed: 4,
+        examined: 6,
+        reclaimed: 5,
         retained_pinned: 1,
-        freed_bytes: 15_360,
+        retained_active: 1,
+        freed_bytes: 21_504,
         dry_run: false,
         candidates: Vec::new(),
     };
