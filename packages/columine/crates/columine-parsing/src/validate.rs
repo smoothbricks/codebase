@@ -996,26 +996,26 @@ fn parse_msgpack_value(
         .get(reader.position())
         .ok_or(ValueParseError::InvalidMsgpack)?;
     if Reader::is_integer(first) {
-        // The 64-bit markers are the bigint spelling on this wire: a
-        // standard-MessagePack encoder writes a JavaScript number as a
-        // narrower integer or a float64 and reserves `uint64`/`int64` for
-        // BigInt, so their width is the author's type, not the value's size.
         if first == 0xcf {
-            reader
+            return reader
                 .read_unsigned_integer()
-                .ok_or(ValueParseError::InvalidMsgpack)?;
-            return Ok(JsonValue::BigInt);
-        }
-        if first == 0xd3 {
-            reader
-                .read_integer()
-                .ok_or(ValueParseError::InvalidMsgpack)?;
-            return Ok(JsonValue::BigInt);
+                .map(|value| JsonValue::Number(NumberValue::Unsigned(u128::from(value))))
+                .ok_or(ValueParseError::InvalidMsgpack);
         }
         return reader
             .read_integer()
             .map(|value| JsonValue::Number(NumberValue::Signed(i128::from(value))))
             .ok_or(ValueParseError::InvalidMsgpack);
+    }
+    if Reader::is_ext(first) {
+        // A bigint travels as the canonical bigint extension on both wires;
+        // any other extension is opaque to the judgment.
+        let (kind, _payload) = reader.read_ext().ok_or(ValueParseError::InvalidMsgpack)?;
+        return Ok(if kind == crate::msgpack_scanner::BIGINT_EXTENSION {
+            JsonValue::BigInt
+        } else {
+            JsonValue::Unknown
+        });
     }
     if Reader::is_string(first) {
         let bytes = reader
@@ -1099,10 +1099,10 @@ mod tests {
     }
 
     #[test]
-    fn msgpack_sixty_four_bit_markers_are_bigints_and_narrower_ones_are_numbers() {
+    fn msgpack_bigint_extension_is_a_bigint_and_integer_markers_are_numbers() {
         let mut bigint_row = vec![0x81];
-        bigint_row.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0xd3]);
-        bigint_row.extend(5_i64.to_be_bytes());
+        // fixext 2, type 20, sign 0, magnitude 5
+        bigint_row.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0xd5, 20, 0, 5]);
         let mut reader = Reader::new(&bigint_row);
         let event = parse_msgpack_event(&mut reader).unwrap();
         let JsonValue::Object(fields) = &event else {
