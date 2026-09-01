@@ -1,6 +1,6 @@
 //! MessagePack event extraction into typed columns.
 
-use crate::msgpack_scanner::Reader;
+use crate::msgpack_scanner::{BIGINT_EXTENSION, Reader, bigint_ext_i64, bigint_ext_u64};
 use crate::validate::encode_path_segment;
 use crate::{
     ColumnValue, DynamicColumns, ExtractionConfig, ParseError, PlaneKind, SignalSchemaField,
@@ -408,6 +408,16 @@ fn extract_typed_value(
                 Some(ColumnValue::Int(
                     i64::try_from(ordinal).map_err(|_| ExtractionError::InvalidFieldType)?,
                 ))
+            } else if width == 8 && Reader::is_ext(first) {
+                // The canonical bigint extension, the bigint spelling on both
+                // wires; a magnitude past i64 does not fit the plane.
+                let (kind, payload) = reader.read_ext().ok_or(ExtractionError::InvalidFieldType)?;
+                if kind != BIGINT_EXTENSION {
+                    return Err(ExtractionError::InvalidFieldType);
+                }
+                Some(ColumnValue::Int(
+                    bigint_ext_i64(payload).ok_or(ExtractionError::InvalidFieldType)?,
+                ))
             } else if width == 8 && Reader::is_string(first) {
                 let text = std::str::from_utf8(
                     reader
@@ -448,6 +458,14 @@ fn extract_typed_value(
                     return Err(ExtractionError::InvalidFieldType);
                 }
                 Some(ColumnValue::UInt(wide))
+            } else if width == 8 && Reader::is_ext(first) {
+                let (kind, payload) = reader.read_ext().ok_or(ExtractionError::InvalidFieldType)?;
+                if kind != BIGINT_EXTENSION {
+                    return Err(ExtractionError::InvalidFieldType);
+                }
+                Some(ColumnValue::UInt(
+                    bigint_ext_u64(payload).ok_or(ExtractionError::InvalidFieldType)?,
+                ))
             } else if width == 8 && Reader::is_string(first) {
                 let text = std::str::from_utf8(
                     reader
@@ -732,6 +750,39 @@ mod tests {
         let mut columns = DynamicColumns::new(&fields, 2);
         assert_eq!(
             extract_msgpack_events(&bad, &config, &mut columns, &mut work, true),
+            Err(ExtractionError::InvalidFieldType)
+        );
+    }
+
+    /// A bigint arrives as the canonical bigint extension on the eight-byte
+    /// planes; the 64-bit integer markers remain plain integers.
+    #[test]
+    fn a_bigint_extension_lands_in_an_int64_plane() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Int64)];
+        let config = config(&fields, &["id", "value.amount"]);
+        let mut row = vec![0x82];
+        str_(&mut row, "id");
+        str_(&mut row, "e");
+        str_(&mut row, "value.amount");
+        // ext 8, length 2, type 20, sign 1, magnitude 7 → -7
+        row.extend([0xc7, 2, 20, 1, 7]);
+        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 64];
+        assert_eq!(
+            extract_msgpack_events(&row, &config, &mut columns, &mut work, true),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(1, 0), Some(ColumnValue::Int(-7)));
+
+        let mut wide = vec![0x82];
+        str_(&mut wide, "id");
+        str_(&mut wide, "e2");
+        str_(&mut wide, "value.amount");
+        wide.extend([0xc7, 10, 20, 0]);
+        wide.extend([1; 9]);
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_msgpack_events(&wide, &config, &mut columns, &mut work, true),
             Err(ExtractionError::InvalidFieldType)
         );
     }
