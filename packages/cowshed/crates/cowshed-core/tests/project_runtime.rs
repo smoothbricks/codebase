@@ -826,6 +826,7 @@ impl ProjectRuntimeHost for FakeHost {
             examined: u64::try_from(self.state.workspaces.len()).expect("test length"),
             reclaimed: 0,
             retained_pinned: 0,
+            retained_active: 0,
             freed_bytes: 0,
             dry_run: options.dry_run,
             candidates: Vec::new(),

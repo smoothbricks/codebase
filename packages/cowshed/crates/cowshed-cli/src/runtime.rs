@@ -1088,13 +1088,24 @@ where
             }
             Ok(success())
         }
-        Command::Doctor(_) => {
+        Command::Doctor(args) => {
             let report = service.doctor().await?;
             let healthy = report.healthy;
             if json {
                 output.success(report).map_err(output_error)?;
             } else {
                 emit_doctor(output, &report)?;
+            }
+            // Repair retires what doctor named as reclaimable the same way `gc` does — one
+            // sweep, one set of reasons — rather than a second deleter with its own rules.
+            if args.repair {
+                let swept = service.gc(GcOptions { dry_run: false }).await?;
+                output
+                    .guidance(&format!(
+                        "repair examined {} objects; reclaimed {}, {} bytes freed, {} retained for a running operation",
+                        swept.examined, swept.reclaimed, swept.freed_bytes, swept.retained_active
+                    ))
+                    .map_err(output_error)?;
             }
             Ok(DispatchExit {
                 code: if healthy { 0 } else { 5 },
@@ -1994,6 +2005,7 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::RetiredWorkspace => "workspace was retired",
         GcReason::OrphanStagingImage => "orphaned staging image",
         GcReason::OrphanStagingMetadata => "orphaned staging metadata",
+        GcReason::OrphanStagingMount => "orphaned staging mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
         GcReason::DetachedImageCompaction => "detached image compaction",
     }
