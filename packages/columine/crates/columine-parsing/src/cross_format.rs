@@ -80,6 +80,29 @@ pub(crate) fn coerce(kind: ArrowType, value: &Logical) -> Result<Option<ColumnVa
             .map(|narrow| Some(ColumnValue::Int(i64::from(narrow))))
             .map_err(|_| ()),
         (ArrowType::Int64, Logical::Int(value)) => Ok(Some(ColumnValue::Int(*value))),
+        // An integral number is an integer on either wire: standard
+        // MessagePack spells a JavaScript number above u32 as float64 (the
+        // 64-bit integer markers are reserved for BigInt), and JSON has one
+        // number token. Only a fraction or a value outside the plane refuses.
+        (ArrowType::Int32 | ArrowType::Int64, Logical::Float(value)) => {
+            let integral = value.fract() == 0.0 && value.is_finite();
+            let bound = 9_223_372_036_854_775_808.0_f64;
+            if !integral || *value >= bound || *value < -bound {
+                return Err(());
+            }
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "integral and range-checked against i64 just above"
+            )]
+            let wide = *value as i64;
+            if kind == ArrowType::Int32 {
+                i32::try_from(wide)
+                    .map(|narrow| Some(ColumnValue::Int(i64::from(narrow))))
+                    .map_err(|_| ())
+            } else {
+                Ok(Some(ColumnValue::Int(wide)))
+            }
+        }
         (ArrowType::Int64, Logical::Text(text)) => text
             .parse::<i64>()
             .or_else(|_| parse_iso8601_to_micros(text).map_err(|_| ()))

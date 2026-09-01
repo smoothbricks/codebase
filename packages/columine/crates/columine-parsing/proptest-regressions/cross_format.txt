@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a6e94e9eb9cde7853a95dc7f229a08f0aad7d24f52a61865653099162c972b2e # shrinks to kind = Int64, value = Float(0.0)
+cc 97d67188ee62cd6b26eef4200ba7f4128015308a7f238f9ff29c64ede4313356 # shrinks to kind = Int32, value = Float(1.0)

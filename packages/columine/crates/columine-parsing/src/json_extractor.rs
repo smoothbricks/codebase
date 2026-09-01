@@ -662,6 +662,10 @@ fn extract_typed_value_with_capture(
                 value
                     .parse::<i64>()
                     .ok()
+                    // `1.0` and `4294967296.0` are integers spelled as floats;
+                    // the msgpack twin accepts the same values under a float
+                    // marker, so this token must too (cross_format::coerce).
+                    .or_else(|| integral_number(&value))
                     .filter(|parsed| kind.holds_int(*parsed))
                     .ok_or_else(|| {
                         invalid_number(diagnostic, column as u32, arrow_type, actual, row)
@@ -691,6 +695,7 @@ fn extract_typed_value_with_capture(
                 value
                     .parse::<u64>()
                     .ok()
+                    .or_else(|| integral_number(&value).and_then(|wide| u64::try_from(wide).ok()))
                     .filter(|parsed| kind.holds_uint(*parsed))
                     .ok_or_else(|| {
                         invalid_number(diagnostic, column as u32, arrow_type, actual, row)
@@ -1222,6 +1227,21 @@ impl<'a> MsgpackValueWriter<'a> {
 /// and the 1970..=2099 year range.
 pub fn parse_timestamp_to_micros(value: &str) -> Option<i64> {
     crate::json_scanner::parse_iso8601_to_micros(value).ok()
+}
+
+/// A JSON number token that spells an integer through a float form
+/// (`1.0`, `1e3`): finite, integral, inside `i64`. Anything else is `None`.
+fn integral_number(text: &str) -> Option<i64> {
+    let value: f64 = text.parse().ok()?;
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if !value.is_finite() || value.fract() != 0.0 || value >= LIMIT || value < -LIMIT {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "integral and range-checked against i64 one line above"
+    )]
+    Some(value as i64)
 }
 
 #[cfg(test)]
