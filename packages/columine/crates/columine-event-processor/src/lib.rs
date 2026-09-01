@@ -314,6 +314,7 @@ impl EventProcessor {
                     &schema_config.field_metadata,
                     &names,
                     semantic_schemas.as_ref(),
+                    schema_config.payload_discriminator.as_ref(),
                 )
                 .map_err(EpInitError::Config)?,
             )

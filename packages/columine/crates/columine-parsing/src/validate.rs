@@ -311,6 +311,26 @@ impl SemanticSchema {
     }
 }
 
+/// Visit every top-level payload member declared as an enum (directly or
+/// under `optional`/`nullable`) with its variants in ordinal order.
+pub(crate) fn collect_enum_members(
+    schema: &SemanticSchema,
+    mut visit: impl FnMut(&str, &[String]),
+) {
+    let SemanticSchema::Object { fields, .. } = schema else {
+        return;
+    };
+    for (name, field) in fields {
+        let mut inner = field;
+        while let SemanticSchema::Optional(next) | SemanticSchema::Nullable(next) = inner {
+            inner = next;
+        }
+        if let SemanticSchema::Enum(variants) = inner {
+            visit(name, variants);
+        }
+    }
+}
+
 pub(crate) fn collect_open_paths(schema: &SemanticSchema, path: &str, output: &mut Vec<String>) {
     match schema {
         SemanticSchema::Object { fields, open } => {
