@@ -1177,6 +1177,73 @@ async fn link_cargo_registry(private_home: &Path, host_home: &Path) -> Result<()
     Ok(())
 }
 
+/// The shared nix client cache every sandbox reads and writes: `/private/cowshed/caches/nix/cache`.
+///
+/// Nix keeps its fetcher cache (URL and lock-hash to store path), tarball cache, git cache and
+/// evaluation cache under `$XDG_CACHE_HOME/nix`. cowshed hands every child a private
+/// `XDG_CACHE_HOME`, so a freshly minted workspace starts with an EMPTY nix cache and the sandboxed
+/// `devenv print-dev-env` evaluation re-fetches every flake input the lock names — through the
+/// gateway proxy, which admits nothing without an egress grant. The store paths already exist
+/// (the host fetched them), only the client-side index is missing. Sharing one cache directory on
+/// the caches volume, which the executed-child profile carves back read-write beside the cargo
+/// registry, lets every workspace see what any one of them has fetched; nix serialises access to
+/// its sqlite indexes itself.
+pub fn shared_nix_cache_directory() -> PathBuf {
+    Path::new(crate::storage::bootstrap::CACHES_ROOT).join("nix/cache")
+}
+
+/// Point the private `XDG_CACHE_HOME/nix` at [`shared_nix_cache_directory`].
+///
+/// Same posture as [`link_cargo_registry`]: a link that already resolves to the shared directory
+/// is kept, a stale link is replaced, and a real directory a workspace already owns is left alone.
+async fn link_nix_cache(private_cache: &Path) -> Result<()> {
+    let target = shared_nix_cache_directory();
+    tokio::fs::create_dir_all(&target).await.map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot prepare the shared nix cache {}: {error}",
+                target.display()
+            ),
+            "run cowshed setup to repair the caches volume, then retry",
+        )
+    })?;
+    let link = private_cache.join("nix");
+    match tokio::fs::read_link(&link).await {
+        Ok(existing) if existing == target => return Ok(()),
+        Ok(_) => tokio::fs::remove_file(&link).await.map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot replace stale sandbox nix cache link {}: {error}",
+                    link.display()
+                ),
+                "reattach the workspace and retry",
+            )
+        })?,
+        Err(_) if link.exists() => return Ok(()),
+        Err(_) => {}
+    }
+    tokio::fs::symlink(&target, &link).await.map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot link sandbox nix cache {}: {error}", link.display()),
+            "reattach the workspace and retry",
+        )
+    })
+}
+
+/// The runtime directory a sandboxed child sees as `XDG_RUNTIME_DIR`: `<mount>/.cowshed/run`.
+///
+/// It lives beside the private HOME because that is the one tree the executed-child profile
+/// grants writes to after every store-wide deny (SBPL is last-match-wins, and both
+/// `/private/cowshed` and the project root are denied AFTER the `exec_temp_dir` allow, so a
+/// runtime dir under the quarantine would be unwritable). The path is deliberately short of the
+/// 104-byte `sun_path` ceiling for the sockets devenv keeps under `devenv-<hash>/`: a mount at
+/// `<mount root>/<owner>/<repo>/<workspace>` leaves roughly twenty bytes for a socket name, which
+/// is what `devenv up` needs and what a shorter, symlinked root would have to restore for longer
+/// mount roots.
+pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
+    sandbox.workspace_mount.join(".cowshed/run")
+}
+
 /// Build the sandboxed `Command` for a child of this workspace.
 ///
 /// Every process the supervisor launches goes through here, including the `devenv print-dev-env`
@@ -1197,6 +1264,7 @@ async fn sandboxed_command(
     let private_home = private_root.join("home");
     let private_config = private_root.join("config");
     let private_cache = private_root.join("cache");
+    let private_runtime = sandbox_runtime_dir(sandbox);
     // exec_temp_dir joins the loop because it is exported as TMPDIR below.
     // Exporting a directory without creating it makes every child that
     // shells out to mktemp fail on a path the child never chose, and the
@@ -1205,6 +1273,7 @@ async fn sandboxed_command(
         &private_home,
         &private_config,
         &private_cache,
+        &private_runtime,
         &sandbox.exec_temp_dir,
     ] {
         tokio::fs::create_dir_all(directory)
@@ -1243,6 +1312,7 @@ async fn sandboxed_command(
         )
     })?;
     link_cargo_registry(&private_home, &sandbox.home).await?;
+    link_nix_cache(&private_cache).await?;
     let path = sandbox_path(sandbox, devenv_dir)?;
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
@@ -1262,6 +1332,14 @@ async fn sandboxed_command(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("TMPDIR", &sandbox.exec_temp_dir)
+        // devenv resolves its runtime directory as `$XDG_RUNTIME_DIR/devenv-<hash>`, falling
+        // back to `/tmp` when the variable is unset, and ignores TMPDIR by design (its runtime
+        // dir must rendezvous across invocations that may carry different TMPDIRs). The
+        // executed-child profile grants nothing under `/private/tmp`, so with `env_clear` the
+        // sandboxed evaluation died on `Failed to create /tmp/devenv-<hash>` before any
+        // subcommand ran. A workspace is its own volume and carries its own runtime dir, in the
+        // same private metadata tree as HOME and the caches.
+        .env("XDG_RUNTIME_DIR", &private_runtime)
         .env("PWD", &plan.cwd)
         .env(GO_ENV, private_cache.join("go/env"))
         // rustc-wrapper clients speak to the host-owned sccache daemon; the
