@@ -375,10 +375,20 @@ fn extract_json_event_open(
     let mut extra_count = 0;
     let mut saw_nested_value = false;
     let mut saw_flat_value_key = false;
+    // The discriminant, once its key has been read: discriminated columns and
+    // enum ordinals resolve against it. Canonical encoders sort keys, so a
+    // discriminator key that sorts before `value` is always seen first; a
+    // producer that spells `value` earlier resolves undiscriminated.
+    let mut discriminant: Option<String> = None;
     while !parser.is_object_end() {
         let name = parser
             .expect_field_name()
             .map_err(|_| ExtractionError::InvalidJson)?;
+        if config.is_discriminator_key(name.as_bytes())
+            && let Ok(Token::String(value)) = parser.peek_token()
+        {
+            discriminant = Some(value);
+        }
         if saw_nested_value && name.starts_with("value.")
             || saw_flat_value_key && name == "value" && config.has_value_fields
         {
@@ -424,6 +434,7 @@ fn extract_json_event_open(
                     diagnostic,
                     &mut extra,
                     &mut extra_count,
+                    discriminant.as_deref(),
                     &column_name,
                     &member,
                 )?;
@@ -440,6 +451,7 @@ fn extract_json_event_open(
             diagnostic,
             &mut extra,
             &mut extra_count,
+            None,
             &name,
             &name,
         )?;
@@ -503,16 +515,18 @@ fn extract_named_member(
     diagnostic: &mut ExtractionDiagnostic,
     extra: &mut Option<MsgpackValueWriter<'_>>,
     extra_count: &mut u32,
+    discriminant: Option<&str>,
     column_name: &str,
     payload_name: &str,
 ) -> Result<(), ExtractionError> {
     let lookup = config
-        .lookup_field(column_name)
+        .lookup_payload_member(discriminant, payload_name, column_name)
         .filter(|lookup| Some(lookup.column) != config.fallback_column);
     if let Some(lookup) = lookup {
         let capture_schema = config
             .semantic_field_schema(column_name)
             .filter(|_| config.is_open_payload_path(payload_name));
+        let variants = config.enum_ordinals(discriminant, payload_name);
         let extraction_result = match (capture_schema, extra.as_mut()) {
             (Some(schema), Some(extra_writer)) => {
                 let mut path = vec![payload_name.to_owned()];
@@ -523,9 +537,18 @@ fn extract_named_member(
                     lookup.column,
                     diagnostic,
                     Some((extra_writer, extra_count, &mut path, schema)),
+                    variants,
                 )
             }
-            _ => extract_typed_value(parser, lookup.field, columns, lookup.column, diagnostic),
+            _ => extract_typed_value_with_capture(
+                parser,
+                lookup.field,
+                columns,
+                lookup.column,
+                diagnostic,
+                None,
+                variants,
+            ),
         };
         if let Err(err) = extraction_result {
             // Fill in diagnostic context that the typed-value failure did
@@ -606,14 +629,16 @@ fn extract_named_member(
 /// eight coercions because the plane's width does the narrowing. Adding a
 /// plane to an existing kind needs no change here, and adding a kind will not
 /// compile until it does.
-pub(crate) fn extract_typed_value(
+/// The plain typed coercion, kept for the unit tests that exercise one plane at a time.
+#[cfg(test)]
+fn extract_typed_value(
     parser: &mut JsonParser<'_>,
     field: SignalSchemaField,
     columns: &mut DynamicColumns,
     column: usize,
     diagnostic: &mut ExtractionDiagnostic,
 ) -> Result<(), ExtractionError> {
-    extract_typed_value_with_capture(parser, field, columns, column, diagnostic, None)
+    extract_typed_value_with_capture(parser, field, columns, column, diagnostic, None, None)
 }
 
 fn extract_typed_value_with_capture(
@@ -628,6 +653,7 @@ fn extract_typed_value_with_capture(
         &mut Vec<String>,
         &SemanticSchema,
     )>,
+    enum_variants: Option<&[String]>,
 ) -> Result<(), ExtractionError> {
     let arrow_type = field.arrow_type;
     let token = parser
@@ -658,6 +684,16 @@ fn extract_typed_value_with_capture(
         // ISO-8601 instant, which is how every temporal type on that plane is
         // written.
         PlaneKind::SignedInt { width } => match token {
+            // The admission wire spells an enum as its string; the column
+            // holds the ordinal, which is the variant's declared index.
+            Token::String(value) if enum_variants.is_some() => Some(ColumnValue::Int(
+                enum_variants
+                    .and_then(|variants| variants.iter().position(|variant| *variant == value))
+                    .and_then(|ordinal| i64::try_from(ordinal).ok())
+                    .ok_or_else(|| {
+                        invalid_field_type(diagnostic, column as u32, arrow_type, actual, row)
+                    })?,
+            )),
             Token::Number(value) => Some(ColumnValue::Int(
                 value
                     .parse::<i64>()
@@ -1251,6 +1287,26 @@ mod tests {
     fn config(fields: &[SignalSchemaField], names: &[&str]) -> ExtractionConfig {
         build_extraction_config(fields, names).unwrap()
     }
+
+    /// `authorRole` lives in column 3 for `close` events and column 4 for
+    /// `open` events, selected by the envelope's `type`.
+    fn discriminator() -> crate::PayloadDiscriminator {
+        crate::PayloadDiscriminator {
+            key: "type".into(),
+            members: vec![
+                crate::DiscriminatedMember {
+                    discriminant: "close".into(),
+                    member: "authorRole".into(),
+                    column: 3,
+                },
+                crate::DiscriminatedMember {
+                    discriminant: "open".into(),
+                    member: "authorRole".into(),
+                    column: 4,
+                },
+            ],
+        }
+    }
     fn field(kind: ArrowType) -> SignalSchemaField {
         SignalSchemaField::new(kind, true)
     }
@@ -1282,6 +1338,79 @@ mod tests {
         )
         .map(|_| ())
     }
+    /// The JSON twin of the msgpack lane's discriminated/enum resolution: the
+    /// same nested payload, the same columns, the same ordinals.
+    #[test]
+    fn nested_payload_resolves_discriminated_columns_and_enum_ordinals() {
+        use crate::validate::parse_schema_envelope;
+        let fields = [
+            field(ArrowType::Utf8),
+            field(ArrowType::Utf8),
+            field(ArrowType::Int32),
+            field(ArrowType::Int32),
+            field(ArrowType::Utf8),
+        ];
+        let names = [
+            "id",
+            "type",
+            "value.outcome",
+            "authorRole@close",
+            "authorRole@open",
+        ];
+        let envelope = parse_schema_envelope(
+            br#"{"close":{"kind":"object","fields":{"outcome":{"kind":"enum","variants":["achieved","stuck"]},"authorRole":{"kind":"enum","variants":["human"]}}},"open":{"kind":"object","fields":{"authorRole":{"kind":"nullable","value":{"kind":"string"}}}}}"#,
+        )
+        .unwrap();
+        let config = crate::build_extraction_config_with_semantic_schemas(
+            &fields,
+            &names,
+            Some(&envelope),
+            Some(&discriminator()),
+        )
+        .unwrap();
+        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 256];
+        let mut diagnostic = ExtractionDiagnostic::default();
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"e","type":"close","value":{"authorRole":"human","outcome":"stuck"}}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut diagnostic,
+            ),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(2, 0), Some(ColumnValue::Int(1)));
+        assert_eq!(columns.cell(3, 0), Some(ColumnValue::Int(0)));
+        assert_eq!(columns.cell(4, 0), None);
+
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"e2","type":"open","value":{"authorRole":"agent"}}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut diagnostic,
+            ),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(4, 0), Some(ColumnValue::Utf8("agent".into())));
+
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_json_events(
+                br#"[{"id":"e3","type":"close","value":{"outcome":"abandoned"}}]"#,
+                &config,
+                &mut columns,
+                &mut work,
+                &mut diagnostic,
+            ),
+            Err(ExtractionError::InvalidFieldType)
+        );
+    }
+
     #[test]
     fn populates_presence_columns_for_explicit_null_false_and_absent_fields() {
         let fields = [
@@ -1741,6 +1870,7 @@ mod tests {
             &fields,
             &["value.user", crate::UNDECLARED_COLUMN_NAME],
             Some(&schemas),
+            None,
         )
         .unwrap();
         let mut columns = DynamicColumns::new(&fields, 1);

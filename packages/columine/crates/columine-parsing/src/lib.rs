@@ -17,6 +17,7 @@ pub mod msgpack_scanner;
 pub mod scan;
 pub mod validate;
 
+pub use columine_arrow::schema::{DiscriminatedMember, PayloadDiscriminator};
 pub use columine_arrow::{
     ArrowType, BASE_EVENT_LOG_FIELDS, BASE_EVENT_LOG_NAMES, ColumnStorage, DynamicColumns,
     MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES, ParseError, PlaneKind, SignalSchemaField,
@@ -197,6 +198,20 @@ pub struct ExtractionConfig {
     /// Whether any column names a `value.<field>` payload path — the arming
     /// condition for the nested-envelope descent in the extractors.
     pub(crate) has_value_fields: bool,
+    /// The envelope key whose string value discriminates payload members;
+    /// `None` leaves every nested member resolving by its plain name.
+    pub(crate) discriminator_key: Option<String>,
+    /// `(discriminant, payload member)` → its discriminated column, from the
+    /// caller's [`PayloadDiscriminator`]. A member whose physical type differs
+    /// between discriminants lives in a column of its own on the flat lane,
+    /// and an admitted nested payload must land in that same column or the
+    /// member is silently lost to the carrier.
+    pub(crate) variant_map: HashMap<(String, String), FieldLookup>,
+    /// `(discriminant, payload member)` → the enum's variants in ordinal
+    /// order, from the semantic schema armed under that discriminant. The
+    /// admission wire spells an enum as its string; the column holds the
+    /// ordinal, which is the variant's index in the declared list.
+    pub(crate) enum_variants: HashMap<(String, String), Vec<String>>,
 }
 
 impl ExtractionConfig {
@@ -224,6 +239,46 @@ impl ExtractionConfig {
             self.field_map.get(&prefixed)
         })
     }
+
+    /// Whether `name` is the envelope member carrying the discriminant.
+    pub(crate) fn is_discriminator_key(&self, name: &[u8]) -> bool {
+        self.discriminator_key.as_deref().map(str::as_bytes) == Some(name)
+    }
+
+    /// Resolve one nested-payload member: its discriminated column for this
+    /// discriminant first, then the plain `value.<member>` column.
+    pub(crate) fn lookup_payload_member(
+        &self,
+        discriminant: Option<&str>,
+        member: &str,
+        column_name: &str,
+    ) -> Option<&FieldLookup> {
+        if let Some(discriminant) = discriminant
+            && !self.variant_map.is_empty()
+            && let Some(lookup) = self
+                .variant_map
+                .get(&(discriminant.to_owned(), member.to_owned()))
+        {
+            return Some(lookup);
+        }
+        self.lookup_field(column_name)
+    }
+
+    /// The enum variants an admitted string must be one of, for this
+    /// discriminant's member; `None` when the member is not a declared enum.
+    pub(crate) fn enum_ordinals(
+        &self,
+        discriminant: Option<&str>,
+        member: &str,
+    ) -> Option<&[String]> {
+        let discriminant = discriminant?;
+        if self.enum_variants.is_empty() {
+            return None;
+        }
+        self.enum_variants
+            .get(&(discriminant.to_owned(), member.to_owned()))
+            .map(Vec::as_slice)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +286,8 @@ pub enum ConfigError {
     FieldNameCountMismatch,
     DuplicateFieldName,
     InvalidPresenceField,
+    /// A [`PayloadDiscriminator`] member names a column the schema lacks.
+    InvalidDiscriminatedColumn,
 }
 
 const VALUE_PRESENCE_PREFIX: &str = "event_value_present.";
@@ -268,13 +325,14 @@ pub fn build_extraction_config(
     fields: &[SignalSchemaField],
     names: &[&str],
 ) -> Result<ExtractionConfig, ConfigError> {
-    build_extraction_config_with_semantic_schemas(fields, names, None)
+    build_extraction_config_with_semantic_schemas(fields, names, None, None)
 }
 
 pub fn build_extraction_config_with_semantic_schemas(
     fields: &[SignalSchemaField],
     names: &[&str],
     semantic_schemas: Option<&crate::validate::SemanticSchemaSet>,
+    discriminator: Option<&PayloadDiscriminator>,
 ) -> Result<ExtractionConfig, ConfigError> {
     if fields.len() != names.len() {
         return Err(ConfigError::FieldNameCountMismatch);
@@ -329,6 +387,33 @@ pub fn build_extraction_config_with_semantic_schemas(
     // `value` member (an op result's unwrapped scalar, say) must keep its
     // undeclared handling instead of being walked as a payload object.
     let has_value_fields = field_map.keys().any(|name| name.starts_with("value."));
+    // Discriminated resolution arms only when the caller names the key: the
+    // enum-ordinal table is keyed by discriminant, so without one there is
+    // no way to pick the schema an admitted string is judged against.
+    let mut variant_map = HashMap::new();
+    let mut enum_variants = HashMap::new();
+    if let Some(discriminator) = discriminator {
+        for member in &discriminator.members {
+            let field = fields
+                .get(member.column)
+                .ok_or(ConfigError::InvalidDiscriminatedColumn)?;
+            variant_map.insert(
+                (member.discriminant.clone(), member.member.clone()),
+                FieldLookup {
+                    column: member.column,
+                    field: *field,
+                },
+            );
+        }
+        if let Some(semantic_schemas) = semantic_schemas {
+            for (discriminant, schema) in semantic_schemas {
+                crate::validate::collect_enum_members(schema, |member, variants| {
+                    enum_variants
+                        .insert((discriminant.clone(), member.to_owned()), variants.to_vec());
+                });
+            }
+        }
+    }
     Ok(ExtractionConfig {
         field_entries,
         field_map,
@@ -337,6 +422,9 @@ pub fn build_extraction_config_with_semantic_schemas(
         open_paths,
         semantic_schemas: semantic_schemas.cloned(),
         has_value_fields,
+        discriminator_key: discriminator.map(|discriminator| discriminator.key.clone()),
+        variant_map,
+        enum_variants,
     })
 }
 

@@ -453,6 +453,30 @@ pub enum SchemaError {
     InvalidFieldNames,
 }
 
+/// Payload members whose column depends on the value of one envelope member.
+///
+/// The extractors read the envelope member named `key`; its string value is
+/// the discriminant. A nested payload member then resolves to the column
+/// `members` names for `(discriminant, member)` before the plain
+/// `value.<member>` column, and a member the semantic schema armed under the
+/// same discriminant declares as an enum lands as the ordinal of the variant
+/// string the wire spells. Which columns are discriminated, and how their
+/// names encode that, is the caller's convention: this table is its result,
+/// not its rule.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PayloadDiscriminator {
+    pub key: String,
+    pub members: Vec<DiscriminatedMember>,
+}
+
+/// One `(discriminant, payload member)` → column binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscriminatedMember {
+    pub discriminant: String,
+    pub member: String,
+    pub column: usize,
+}
+
 /// Owned, validated schema configuration retained by an EventProcessor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DynamicSchemaConfig {
@@ -471,6 +495,9 @@ pub struct DynamicSchemaConfig {
     /// anything else must go through schema-driven extraction.
     pub is_base_event_log: bool,
     pub field_names: Vec<String>,
+    /// Discriminated payload columns and the envelope key that selects them;
+    /// `None` resolves every nested payload member by its plain name.
+    pub payload_discriminator: Option<PayloadDiscriminator>,
 }
 
 impl DynamicSchemaConfig {
@@ -572,6 +599,7 @@ impl DynamicSchemaConfig {
 
         Ok(Self {
             is_base_event_log,
+            payload_discriminator: None,
             schema_bytes: schema_bytes.to_vec(),
             field_metadata,
             logical_types,
