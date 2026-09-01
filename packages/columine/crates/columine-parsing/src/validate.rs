@@ -976,11 +976,21 @@ fn parse_msgpack_value(
         .get(reader.position())
         .ok_or(ValueParseError::InvalidMsgpack)?;
     if Reader::is_integer(first) {
+        // The 64-bit markers are the bigint spelling on this wire: a
+        // standard-MessagePack encoder writes a JavaScript number as a
+        // narrower integer or a float64 and reserves `uint64`/`int64` for
+        // BigInt, so their width is the author's type, not the value's size.
         if first == 0xcf {
-            return reader
+            reader
                 .read_unsigned_integer()
-                .map(|value| JsonValue::Number(NumberValue::Unsigned(u128::from(value))))
-                .ok_or(ValueParseError::InvalidMsgpack);
+                .ok_or(ValueParseError::InvalidMsgpack)?;
+            return Ok(JsonValue::BigInt);
+        }
+        if first == 0xd3 {
+            reader
+                .read_integer()
+                .ok_or(ValueParseError::InvalidMsgpack)?;
+            return Ok(JsonValue::BigInt);
         }
         return reader
             .read_integer()
@@ -1066,6 +1076,32 @@ mod tests {
             let error = validate_value(&bigint, &json(bad)).unwrap_err();
             assert_eq!(error.expected, "bigint", "{bad} must refuse");
         }
+    }
+
+    #[test]
+    fn msgpack_sixty_four_bit_markers_are_bigints_and_narrower_ones_are_numbers() {
+        let mut bigint_row = vec![0x81];
+        bigint_row.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0xd3]);
+        bigint_row.extend(5_i64.to_be_bytes());
+        let mut reader = Reader::new(&bigint_row);
+        let event = parse_msgpack_event(&mut reader).unwrap();
+        let JsonValue::Object(fields) = &event else {
+            panic!("event is an object")
+        };
+        assert_eq!(field(fields, "value"), Some(&JsonValue::BigInt));
+
+        let mut number_row = vec![0x81];
+        number_row.extend([0xa5, b'v', b'a', b'l', b'u', b'e', 0xce]);
+        number_row.extend(5_u32.to_be_bytes());
+        let mut reader = Reader::new(&number_row);
+        let event = parse_msgpack_event(&mut reader).unwrap();
+        let JsonValue::Object(fields) = &event else {
+            panic!("event is an object")
+        };
+        assert_eq!(
+            field(fields, "value"),
+            Some(&JsonValue::Number(NumberValue::Signed(5)))
+        );
     }
     #[test]
     fn declared_scalar_type_is_checked() {
