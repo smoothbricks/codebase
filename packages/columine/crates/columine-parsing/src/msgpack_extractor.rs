@@ -367,6 +367,17 @@ fn extract_typed_value(
                     return Err(ExtractionError::InvalidFieldType);
                 }
                 Some(ColumnValue::Int(wide))
+            } else if Reader::is_float(first) {
+                // An integral float is the standard-MessagePack spelling of an
+                // integer above u32 from a JavaScript number (the encoder
+                // reserves the 64-bit markers for BigInt), and the JSON twin
+                // accepts the same digits as a number token. A fractional or
+                // out-of-range float is still not an integer.
+                let wide = integral_float(reader)?;
+                if !kind.holds_int(wide) {
+                    return Err(ExtractionError::InvalidFieldType);
+                }
+                Some(ColumnValue::Int(wide))
             } else if width == 8 && Reader::is_string(first) {
                 let text = std::str::from_utf8(
                     reader
@@ -395,6 +406,14 @@ fn extract_typed_value(
                 let wide = reader
                     .read_unsigned_integer()
                     .ok_or(ExtractionError::InvalidFieldType)?;
+                if !kind.holds_uint(wide) {
+                    return Err(ExtractionError::InvalidFieldType);
+                }
+                Some(ColumnValue::UInt(wide))
+            } else if Reader::is_float(first) {
+                // Same integral-float spelling as the signed plane, above.
+                let wide = u64::try_from(integral_float(reader)?)
+                    .map_err(|_| ExtractionError::InvalidFieldType)?;
                 if !kind.holds_uint(wide) {
                     return Err(ExtractionError::InvalidFieldType);
                 }
@@ -505,6 +524,24 @@ fn append(
     })
 }
 
+/// Read a float marker that spells an integer: finite, integral, and inside
+/// `i64`. Anything else is not an integer, whatever plane asked.
+fn integral_float(reader: &mut Reader<'_>) -> Result<i64, ExtractionError> {
+    let value = reader
+        .read_float()
+        .ok_or(ExtractionError::InvalidFieldType)?;
+    // 2^63 is exactly representable and is the first f64 i64 cannot hold.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if !value.is_finite() || value.fract() != 0.0 || value >= LIMIT || value < -LIMIT {
+        return Err(ExtractionError::InvalidFieldType);
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "integral and range-checked against i64 one line above"
+    )]
+    Ok(value as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +555,40 @@ mod tests {
     }
     fn config(fields: &[SignalSchemaField], names: &[&str]) -> ExtractionConfig {
         build_extraction_config(fields, names).unwrap()
+    }
+
+    /// A JavaScript number above u32 arrives as float64 under standard
+    /// MessagePack (the 64-bit integer markers are reserved for BigInt), and
+    /// every microsecond timestamp is such a number.
+    #[test]
+    fn an_integral_float_lands_in_an_integer_plane_and_a_fraction_does_not() {
+        let fields = [field(ArrowType::Utf8), field(ArrowType::Int64)];
+        let mut input = vec![0x82];
+        str_(&mut input, "id");
+        str_(&mut input, "ev-1");
+        str_(&mut input, "timestamp");
+        input.push(0xcb);
+        input.extend(4_294_967_296.0_f64.to_be_bytes());
+        let mut columns = DynamicColumns::new(&fields, 2);
+        let mut work = [0; 64];
+        let config = config(&fields, &["id", "timestamp"]);
+        assert_eq!(
+            extract_msgpack_events(&input, &config, &mut columns, &mut work, true),
+            Ok(1)
+        );
+        assert_eq!(columns.cell(1, 0), Some(ColumnValue::Int(4_294_967_296)));
+
+        let mut fraction = vec![0x82];
+        str_(&mut fraction, "id");
+        str_(&mut fraction, "ev-2");
+        str_(&mut fraction, "timestamp");
+        fraction.push(0xcb);
+        fraction.extend(1.5_f64.to_be_bytes());
+        let mut columns = DynamicColumns::new(&fields, 2);
+        assert_eq!(
+            extract_msgpack_events(&fraction, &config, &mut columns, &mut work, true),
+            Err(ExtractionError::InvalidFieldType)
+        );
     }
     #[test]
     fn extract_msgpack_events_stream_format_with_typed_extraction() {
