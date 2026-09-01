@@ -2498,6 +2498,86 @@ fn an_imageless_sibling_publication_is_reconciled_instead_of_failing_every_other
         .expect("repeated recovery is idempotent");
 }
 
+/// A session create that died between its grants sidecar and its CA key leaves a staged image with
+/// a sidecar and no companion (`prepare_clone_stage`: `publish_metadata` lands before attach, mount
+/// and `mint_workspace_credentials`). Nothing names that image for publication, so recovery has
+/// nothing to complete; refusing instead failed every verb of the project, including the gc that
+/// reclaims it. Reproduced on a real host: one interrupted `cowshed new` made `ls`, `land` and
+/// `doctor` all exit with "staged session publication image is missing its CA companion".
+#[test]
+fn a_keyless_staged_session_image_is_left_to_gc_instead_of_failing_every_verb() {
+    let fixture = Fixture::new("staging-keyless-session");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+
+    let live = WorkspaceName::new("session-live").expect("live session");
+    let live_canonical = layout
+        .session_image(&live, ImageFormat::Sparse)
+        .expect("live canonical");
+    create_image(live_canonical.image(), ImageFormat::Sparse);
+    let mut live_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut live_metadata, live.clone());
+    live_metadata
+        .write_for_image(live_canonical.image())
+        .expect("live metadata");
+
+    let dead = WorkspaceName::new("session-dead").expect("dead session");
+    let staged = layout
+        .project()
+        .project_root
+        .join(".staging/session-dead-00000000000000000000000000000002.sparseimage");
+    create_image(&staged, ImageFormat::Sparse);
+    let mut dead_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut dead_metadata, dead.clone());
+    dead_metadata.workspace_incarnation =
+        WorkspaceIncarnation::new("00000000000000000000000000000002").expect("incarnation");
+    dead_metadata
+        .write_for_image(&staged)
+        .expect("staged metadata");
+    std::fs::remove_file(ca_key_path(&staged)).expect("die before the CA key is minted");
+    assert!(sidecar_path(&staged).exists());
+    assert!(!ca_key_path(&staged).exists());
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.recover_pending(&fixture.config(), &[])
+        .expect("a keyless staged session image must not fail project recovery");
+    assert!(
+        staged.exists(),
+        "recovery does not decide the orphan's fate"
+    );
+    assert!(sidecar_path(&staged).exists());
+    let listed = host
+        .list(&repo())
+        .expect("recovery leaves the project enumerable")
+        .into_iter()
+        .map(|fact| fact.workspace.name().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(listed, vec![live], "the live sibling stays enumerable");
+
+    let plan = host.preview_gc(&fixture.config(), &repo()).expect("plan");
+    let orphans = plan
+        .candidates()
+        .iter()
+        .filter(|candidate| candidate.reason() == StorageGcReason::OrphanStagingImage)
+        .map(|candidate| candidate.path().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        orphans,
+        vec![staged.clone()],
+        "the orphan is the sweep's, not recovery's"
+    );
+    host.execute_gc(&fixture.config(), plan)
+        .expect("staging gc");
+    assert!(!staged.exists(), "the keyless staged image is reclaimed");
+    assert!(!sidecar_path(&staged).exists());
+    assert_eq!(
+        std::fs::read(live_canonical.image()).expect("live image"),
+        b"fixture",
+        "the sweep must not touch the live sibling's payload"
+    );
+    host.recover_pending(&fixture.config(), &[])
+        .expect("repeated recovery is idempotent");
+}
+
 /// The boundary of the reconciliation above: an in-flight restore is the one reading of a missing
 /// canonical image that is not "the payload is gone", so it keeps its evidence and still refuses.
 #[test]
