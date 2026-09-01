@@ -373,6 +373,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
         examined: 9,
         reclaimed: 3,
         retained_pinned: 2,
+        retained_active: 0,
         freed_bytes: 4096,
         dry_run: true,
         candidates: vec![GcCandidate {
@@ -388,6 +389,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
             "examined":9,
             "reclaimed":3,
             "retainedPinned":2,
+            "retainedActive":0,
             "freedBytes":4096,
             "dryRun":true,
             "candidates":[{

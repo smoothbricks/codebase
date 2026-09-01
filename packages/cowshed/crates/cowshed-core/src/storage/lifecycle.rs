@@ -556,6 +556,9 @@ pub enum StorageGcReason {
     RetiredWorkspace,
     OrphanStagingImage,
     OrphanStagingMetadata,
+    /// A staging mountpoint under the mount root whose image is gone or never published:
+    /// an empty directory, or a volume still attached from an interrupted operation.
+    OrphanStagingMount,
     ExpiredCheckpoint,
     DetachedImageCompaction,
 }
@@ -614,8 +617,19 @@ pub struct StorageGcPlan {
     candidates: Vec<StorageGcCandidate>,
     lock_paths: Vec<PathBuf>,
     examined: usize,
-    retained_pinned: usize,
-    retained_recent: usize,
+    retained: StorageGcRetained,
+}
+
+/// What a sweep examined and deliberately left alone, by the rule that spared it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageGcRetained {
+    /// Checkpoints pinned by label or `--keep`.
+    pub pinned: usize,
+    /// Automatic checkpoints inside the recency window.
+    pub recent: usize,
+    /// Staging entries whose workspace lifecycle lock is held: an operation is still
+    /// writing them, so they are not garbage yet.
+    pub active: usize,
 }
 
 impl StorageGcPlan {
@@ -625,8 +639,7 @@ impl StorageGcPlan {
         candidates: Vec<StorageGcCandidate>,
         lock_paths: Vec<PathBuf>,
         examined: usize,
-        retained_pinned: usize,
-        retained_recent: usize,
+        retained: StorageGcRetained,
     ) -> Self {
         Self {
             repo,
@@ -634,8 +647,7 @@ impl StorageGcPlan {
             candidates,
             lock_paths,
             examined,
-            retained_pinned,
-            retained_recent,
+            retained,
         }
     }
 
@@ -646,8 +658,7 @@ impl StorageGcPlan {
             Vec::new(),
             Vec::new(),
             0,
-            0,
-            0,
+            StorageGcRetained::default(),
         )
     }
 
@@ -672,11 +683,15 @@ impl StorageGcPlan {
     }
 
     pub const fn retained_pinned(&self) -> usize {
-        self.retained_pinned
+        self.retained.pinned
     }
 
     pub const fn retained_recent(&self) -> usize {
-        self.retained_recent
+        self.retained.recent
+    }
+
+    pub const fn retained_active(&self) -> usize {
+        self.retained.active
     }
 }
 
@@ -686,6 +701,7 @@ pub struct StorageGcReport {
     pub reclaimed: usize,
     pub retained_pinned: usize,
     pub retained_recent: usize,
+    pub retained_active: usize,
     pub freed_bytes: u64,
 }
 

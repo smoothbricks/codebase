@@ -828,6 +828,7 @@ impl ApfsExecutionHost for FakeHost {
             examined: 2,
             reclaimed: 1,
             retained_pinned: 1,
+            retained_active: 0,
             retained_recent: 0,
             freed_bytes: 1024,
         })
