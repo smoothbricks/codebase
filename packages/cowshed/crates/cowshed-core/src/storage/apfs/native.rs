@@ -4519,7 +4519,21 @@ where
                         }
                         self.ensure_adopt_mountpoint(&canonical_mount)?;
                     } else if staged.exists() {
-                        self.recovery_companion(&staged, "staged session publication image")?;
+                        // A staged session image beside its grants sidecar and without its CA
+                        // companion is the window `prepare_clone_stage` leaves open between
+                        // `publish_metadata` and `mint_workspace_credentials`: the sidecar is
+                        // durable before the volume is attached, mounted, relabelled and its key
+                        // minted, so a create or fork that dies inside that window leaves exactly
+                        // this shape, and every error path there reclaims the image itself. No
+                        // canonical sidecar names it, so there is nothing here to complete: it is
+                        // an orphan the gc sweep judges by its lock and reclaims
+                        // (`OrphanStagingImage`), and doctor names as a staging orphan. Refusing
+                        // instead was the same over-breadth the canonical branch above retired -
+                        // this pass runs before every verb, so one dead create failed `ls`, `land`
+                        // and the very `gc` that clears it, for every other workspace.
+                        if companion_path(&staged).exists() {
+                            self.recovery_companion(&staged, "staged session publication image")?;
+                        }
                         continue;
                     }
                     if canonical.exists() && !sidecar_path(&canonical).exists() {
