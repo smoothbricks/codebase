@@ -31,7 +31,6 @@ function statsFor(schema: LogSchema, capacity: number): SpanBufferStats {
 }
 
 export class ThreadBufferStrategy<T extends LogSchema = LogSchema> implements BufferStrategy<T> {
-  readonly physicalBackend = 'thread-buffer' as const;
   readonly runtime: ThreadSpanBufferRuntime;
   readonly capacity: number;
   readonly threadId: bigint;

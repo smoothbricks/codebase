@@ -91,7 +91,13 @@ if (root._messageLayoutFamily !== 'mixed' || root.message_values === undefined) 
   throw new Error('Specialized parity requires mixed-family raw message storage');
 }
 const plan = specializedParityOp.callsitePlan;
-const messageIdentityStorage = plan.arrowExposure.messageIdentityStorage;
+// Arrow message-identity storage is derived from the buffer's physical layout at conversion.
+const messageIdentityStorage =
+  root._messagePhysicalLayout === 'current'
+    ? 'local-u16'
+    : root._messagePhysicalLayout === 'specialized'
+      ? 'global-u32'
+      : 'packed-row-headers';
 const rawMessageSentinels = [root.message_values[2] ?? null, root.message_values[33] ?? null];
 const logFacts = extractFacts(root).byNamespace('log');
 const segments = [

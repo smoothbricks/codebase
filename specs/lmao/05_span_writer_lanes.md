@@ -83,8 +83,9 @@ the complete protocol, and Bun preloads / containium's pre-authored host scripts
 **Decision: span start lives with the buffer allocator of each lane; the compiler never emits it.** Verified: ttsc's
 only span-adjacent output is the generated `span_id` getter (`packages/lmao-ttsc/plugin/driver/spanbuffer_aot.go:392`).
 
-- **Browser / Node / react-native (JS heap):** `writeSpanStart` primitive at buffer creation (`tracer.ts:733` calls
-  `callsitePlan.appenders.writeSpanStart`), rows 0/1 pre-armed in TypedArrays (`traceRoot.node.ts:90-100`,
+- **Browser / Node / react-native (JS heap):** `writeSpanStart` at buffer creation through the class-carried lifecycle
+  writers (`buffer._appenders.writeSpanStart`, installed once per generated buffer class prototype by
+  `src/lib/lifecycleAppenders.ts`), rows 0/1 pre-armed in TypedArrays (`traceRoot.node.ts:90-100`,
   `traceRoot.es.ts:92-102`).
 - **WASM-core lanes:** span start happens _inside the allocation export_ — `createAndStartSpan` pre-arms rows 0/1 in one
   WASM call (`src/lib/wasm/wasmSpanBuffer.ts:876-904` sets `_spanStartedAtAllocation`), and the primitive consumes the

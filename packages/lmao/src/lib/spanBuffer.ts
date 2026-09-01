@@ -33,6 +33,7 @@ import {
   type SchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from './capacityTuning.js';
+import { installLifecycleAppenders } from './lifecycleAppenders.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { EagerColumnDescriptor } from './physicalLayoutPlan.js';
 import type { MessageLayoutFamily, MessagePhysicalLayout } from './runtimeHint.js';
@@ -204,6 +205,7 @@ function createSpanBufferConstructor<T extends LogSchema>(
   generatedClass: GeneratedSpanBufferClass<T>,
   eagerColumns: EagerColumnDescriptor,
 ): SpanBufferConstructor<T> {
+  installLifecycleAppenders(generatedClass.prototype, messageLayoutFamily, messagePhysicalLayout);
   Object.defineProperties(generatedClass, {
     schema: { value: schema, enumerable: true },
     messageLayoutFamily: { value: messageLayoutFamily, enumerable: true },

@@ -13,6 +13,7 @@
 import type { ColumnValueType } from '@smoothbricks/arrow-builder';
 import { getSchemaType } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from '../capacityTuning.js';
+import { installLifecycleAppenders } from '../lifecycleAppenders.js';
 import type { OpMetadata } from '../op.js';
 import type { EagerColumnDescriptor } from '../physicalLayoutPlan.js';
 import type { MessageLayoutFamily, MessagePhysicalLayout } from '../runtimeHint.js';
@@ -1061,6 +1062,7 @@ return WasmSpanBuffer;
   WasmSpanBufferClass.prototype._sealStats = wasmSealStats;
   WasmSpanBufferClass.prototype._sealStatsChain = wasmSealStatsChain;
   WasmSpanBufferClass.prototype[Symbol.for('nodejs.util.inspect.custom')] = wasmInspect;
+  installLifecycleAppenders(WasmSpanBufferClass.prototype, messageLayoutFamily, messagePhysicalLayout);
 
   // Add static schema property
   Object.defineProperty(WasmSpanBufferClass, 'schema', {

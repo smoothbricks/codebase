@@ -16,7 +16,7 @@ import { resolveEnumLookupDescriptor, type SchemaEnumLookupDescriptor } from './
 import type { RemapDescriptor } from './logBinding.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { OpContext } from './opContext/types.js';
-import { decodeVocabularyMessage, MAX_PACKED_MESSAGE_DENSE_INDEX } from './resolveMessage.js';
+import { MAX_PACKED_MESSAGE_DENSE_INDEX } from './resolveMessage.js';
 import {
   isRuntimeHintAnalyzed,
   type MessageLayoutFamily,
@@ -32,19 +32,13 @@ import {
   runtimeHintMessagePhysicalLayout,
 } from './runtimeHint.js';
 import type { LogSchema } from './schema/LogSchema.js';
-import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import { getSpanBufferClass, type SpanBufferConstructor } from './spanBuffer.js';
 import type { SpanContextClass } from './spanContext.js';
-import { consumeSpanStartedAtAllocation, type TimestampAppendPrimitive } from './traceRoot.js';
 import type { AnySpanBuffer } from './types.js';
 import { getVocabularyGeneration, type VocabularyGeneration } from './vocabularyRegistry.js';
-import { requireThreadSpanView } from './wasm/threadSpanView.js';
 import { createWasmLayoutTemplate, type WasmLayoutTemplate } from './wasm/wasmPhysicalLayout.js';
 
 export const PHYSICAL_LAYOUT_VERSION = 1;
-
-/** Concrete backends may bind the same physical schema to distinct immutable plans. */
-export type PhysicalBackendKind = 'strategy-selected' | 'js-heap' | 'wasm' | 'thread-buffer';
 
 /** Canonical schema-ordered eager column selection for generated storage and cache identity. */
 export interface EagerColumnDescriptor {
@@ -52,61 +46,6 @@ export interface EagerColumnDescriptor {
   readonly words: readonly number[];
   readonly key: string;
 }
-
-export interface ArrowExposurePlan {
-  readonly version: 1;
-  readonly primitiveStorage: 'borrowed-chunks' | 'owned-copy';
-  readonly dictionaryStorage: 'pinned-generation-prefix';
-  readonly entryTypeStorage: 'borrowed-u8' | 'derived-row-headers' | 'owned-copy';
-  readonly messageIdentityStorage: 'local-u16' | 'global-u32' | 'packed-row-headers';
-}
-
-const JS_ARROW_EXPOSURE_BY_LAYOUT: Readonly<Record<MessagePhysicalLayout, ArrowExposurePlan>> = Object.freeze({
-  current: Object.freeze({
-    version: 1,
-    primitiveStorage: 'borrowed-chunks',
-    dictionaryStorage: 'pinned-generation-prefix',
-    entryTypeStorage: 'borrowed-u8',
-    messageIdentityStorage: 'local-u16',
-  }),
-  specialized: Object.freeze({
-    version: 1,
-    primitiveStorage: 'borrowed-chunks',
-    dictionaryStorage: 'pinned-generation-prefix',
-    entryTypeStorage: 'borrowed-u8',
-    messageIdentityStorage: 'global-u32',
-  }),
-  packed: Object.freeze({
-    version: 1,
-    primitiveStorage: 'borrowed-chunks',
-    dictionaryStorage: 'pinned-generation-prefix',
-    entryTypeStorage: 'derived-row-headers',
-    messageIdentityStorage: 'packed-row-headers',
-  }),
-});
-const WASM_ARROW_EXPOSURE_BY_LAYOUT: Readonly<Record<MessagePhysicalLayout, ArrowExposurePlan>> = Object.freeze({
-  current: Object.freeze({
-    version: 1,
-    primitiveStorage: 'owned-copy',
-    dictionaryStorage: 'pinned-generation-prefix',
-    entryTypeStorage: 'owned-copy',
-    messageIdentityStorage: 'local-u16',
-  }),
-  specialized: Object.freeze({
-    version: 1,
-    primitiveStorage: 'owned-copy',
-    dictionaryStorage: 'pinned-generation-prefix',
-    entryTypeStorage: 'owned-copy',
-    messageIdentityStorage: 'global-u32',
-  }),
-  packed: Object.freeze({
-    version: 1,
-    primitiveStorage: 'owned-copy',
-    dictionaryStorage: 'pinned-generation-prefix',
-    entryTypeStorage: 'derived-row-headers',
-    messageIdentityStorage: 'packed-row-headers',
-  }),
-});
 
 const EMPTY_EAGER_COLUMNS: EagerColumnDescriptor = Object.freeze({
   names: Object.freeze([]),
@@ -143,15 +82,8 @@ export interface PhysicalClock {
   now(buffer: AnySpanBuffer): Nanoseconds;
 }
 
-export interface PhysicalAppenders {
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void;
-  writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void;
-  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number;
-}
-
 export interface PhysicalLayoutPlan<T extends LogSchema = LogSchema, Ctx extends OpContext<T> = OpContext<T>> {
   readonly version: typeof PHYSICAL_LAYOUT_VERSION;
-  readonly backendKind: PhysicalBackendKind;
   readonly schema: T;
   readonly runtimeHint: number;
   readonly capabilities: number;
@@ -171,14 +103,10 @@ export interface PhysicalLayoutPlan<T extends LogSchema = LogSchema, Ctx extends
   readonly TagWriterClass: TagWriterConstructor<T> | undefined;
   readonly ResultWriterClass: ResultWriterConstructor;
   readonly clock: PhysicalClock;
-  readonly appenders: PhysicalAppenders;
-  readonly appendLogEntry: TimestampAppendPrimitive;
   /** Immutable global vocabulary generation used by dense row identities in this plan. */
   readonly vocabularyGeneration: VocabularyGeneration;
-  /** Startup-fixed ownership policy used by leased Arrow conversion. */
   /** Current-mode local ID minus one maps to a global vocabulary dense index. */
   readonly localMessageDictionary: readonly number[];
-  readonly arrowExposure: ArrowExposurePlan;
   /** Allocation-free hot lookup from global dense identity to 1-based local ID. */
   readonly encodeLocalMessage: (globalDenseIndex: number) => number;
   /** Reserved immutable ownership slot; buffer pooling is a later task. */
@@ -225,277 +153,6 @@ const TRACE_ROOT_CLOCK: PhysicalClock = Object.freeze({
   },
 });
 
-const SPLIT_APPEND_LOG_ENTRY: TimestampAppendPrimitive = (traceRoot, buffer, entryType) =>
-  traceRoot._appendLogEntry(traceRoot, buffer, entryType);
-
-const PACKED_APPEND_LOG_ENTRY: TimestampAppendPrimitive = (traceRoot, buffer, entryType) => {
-  const row = buffer._writeIndex;
-  const headers = buffer._rowHeaders;
-  if (headers === undefined) throw new TypeError('Packed layout is missing row headers');
-  buffer.timestamp[row] = traceRoot._timestampNow(traceRoot);
-  headers[row] = entryType;
-  buffer._writeIndex = row + 1;
-  return row;
-};
-
-const CURRENT_BASE_APPENDERS = {
-  writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
-    const traceRoot = buffer._traceRoot;
-    traceRoot._writeSpanEnd(traceRoot, buffer, entryType);
-  },
-  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
-    return SPLIT_APPEND_LOG_ENTRY(buffer._traceRoot, buffer, entryType);
-  },
-};
-
-function initializeCurrentSpan(buffer: AnySpanBuffer): Uint8Array {
-  const entryTypes = buffer.entry_type;
-  if (entryTypes === undefined) throw new TypeError('Current layout is missing entry types');
-  if (!consumeSpanStartedAtAllocation(buffer)) {
-    const traceRoot = buffer._traceRoot;
-    buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-    entryTypes[0] = ENTRY_TYPE_SPAN_START;
-    entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-    buffer.timestamp[1] = 0n;
-    buffer._writeIndex = 2;
-  }
-  return entryTypes;
-}
-
-const CURRENT_MIXED_APPENDERS: PhysicalAppenders = Object.freeze({
-  ...CURRENT_BASE_APPENDERS,
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-    initializeCurrentSpan(buffer);
-    if (typeof name === 'string') {
-      buffer.message(0, name);
-      return;
-    }
-    const localId = buffer._opMetadata._physicalLayoutPlan?.encodeLocalMessage(name) ?? 0;
-    if (localId === 0) {
-      const rawMessages = buffer.message_values;
-      if (rawMessages === undefined) throw new TypeError('Current mixed layout is missing raw message storage');
-      rawMessages[0] = decodeVocabularyMessage(buffer._vocabularyGeneration, name);
-    } else {
-      const messageIds = buffer._messageIds;
-      if (messageIds === undefined) throw new TypeError('Current mixed layout is missing local message storage');
-      messageIds[0] = localId;
-    }
-  },
-});
-
-const CURRENT_STATIC_APPENDERS: PhysicalAppenders = Object.freeze({
-  ...CURRENT_BASE_APPENDERS,
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-    initializeCurrentSpan(buffer);
-    if (typeof name === 'string') {
-      buffer._spanName = name;
-      return;
-    }
-    const localId = buffer._opMetadata._physicalLayoutPlan?.encodeLocalMessage(name) ?? 0;
-    if (localId === 0) {
-      buffer._spanName = name;
-      return;
-    }
-    const messageIds = buffer._messageIds;
-    if (messageIds === undefined) throw new TypeError('Current static layout is missing local message storage');
-    messageIds[0] = localId;
-  },
-});
-
-const CURRENT_DYNAMIC_APPENDERS: PhysicalAppenders = Object.freeze({
-  ...CURRENT_BASE_APPENDERS,
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-    initializeCurrentSpan(buffer);
-    buffer._spanName = name;
-  },
-});
-
-const SPLIT_MIXED_APPENDERS: PhysicalAppenders = Object.freeze({
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-    if (typeof name === 'number') {
-      const entryTypes = buffer.entry_type;
-      const headers = buffer._logHeaders;
-      if (entryTypes === undefined || headers === undefined) throw new TypeError('Split mixed layout is incomplete');
-      if (!consumeSpanStartedAtAllocation(buffer)) {
-        const traceRoot = buffer._traceRoot;
-        buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-        entryTypes[0] = ENTRY_TYPE_SPAN_START;
-        entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-        buffer.timestamp[1] = 0n;
-        buffer._writeIndex = 2;
-      }
-      headers[0] = name + 1;
-      return;
-    }
-    const traceRoot = buffer._traceRoot;
-    traceRoot._writeSpanStart(traceRoot, buffer, name);
-  },
-  writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
-    const traceRoot = buffer._traceRoot;
-    traceRoot._writeSpanEnd(traceRoot, buffer, entryType);
-  },
-  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
-    return SPLIT_APPEND_LOG_ENTRY(buffer._traceRoot, buffer, entryType);
-  },
-});
-
-const SPLIT_STATIC_APPENDERS: PhysicalAppenders = Object.freeze({
-  ...SPLIT_MIXED_APPENDERS,
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-    const entryTypes = buffer.entry_type;
-    const headers = buffer._logHeaders;
-    if (entryTypes === undefined || headers === undefined) throw new TypeError('Split static layout is incomplete');
-    if (!consumeSpanStartedAtAllocation(buffer)) {
-      const traceRoot = buffer._traceRoot;
-      buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-      entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-      buffer.timestamp[1] = 0n;
-      buffer._writeIndex = 2;
-    }
-    if (typeof name === 'number') {
-      headers[0] = name + 1;
-    } else {
-      buffer._spanName = name;
-    }
-  },
-});
-
-const SPLIT_DYNAMIC_APPENDERS: PhysicalAppenders = Object.freeze({
-  ...SPLIT_MIXED_APPENDERS,
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-    const entryTypes = buffer.entry_type;
-    if (entryTypes === undefined) throw new TypeError('Split dynamic layout is missing entry types');
-    if (!consumeSpanStartedAtAllocation(buffer)) {
-      const traceRoot = buffer._traceRoot;
-      buffer.timestamp[0] = traceRoot._timestampNow(traceRoot);
-      entryTypes[0] = ENTRY_TYPE_SPAN_START;
-      entryTypes[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-      buffer.timestamp[1] = 0n;
-      buffer._writeIndex = 2;
-    }
-    buffer._spanName = name;
-  },
-});
-
-function packedAppenders(messageLayoutFamily: MessageLayoutFamily): PhysicalAppenders {
-  return Object.freeze({
-    writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-      const headers = buffer._rowHeaders;
-      if (headers === undefined) throw new TypeError('Packed layout is missing row headers');
-      const startedAtAllocation = consumeSpanStartedAtAllocation(buffer);
-      if (!startedAtAllocation) buffer.timestamp[0] = buffer._traceRoot._timestampNow(buffer._traceRoot);
-      if (typeof name === 'number') {
-        if (name > MAX_PACKED_MESSAGE_DENSE_INDEX) throw new RangeError('Packed message dense index exceeds 0xFFFFFE');
-        headers[0] = (((name + 1) << 8) | ENTRY_TYPE_SPAN_START) >>> 0;
-      } else {
-        headers[0] = ENTRY_TYPE_SPAN_START;
-        if (messageLayoutFamily === 'static-only' || messageLayoutFamily === 'dynamic-only') {
-          buffer._spanName = name;
-        } else {
-          const rawMessages = buffer.message_values;
-          if (rawMessages === undefined) throw new TypeError('Packed mixed layout is missing raw message storage');
-          if (typeof name !== 'string') throw new TypeError('Packed mixed numeric span name was not encoded');
-          rawMessages[0] = name;
-        }
-      }
-      if (!startedAtAllocation) {
-        headers[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-        buffer.timestamp[1] = 0n;
-        buffer._writeIndex = 2;
-      }
-    },
-    writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
-      const headers = buffer._rowHeaders;
-      if (headers === undefined) throw new TypeError('Packed layout is missing row headers');
-      const traceRoot = buffer._traceRoot;
-      buffer.timestamp[1] = traceRoot._timestampNow(traceRoot);
-      headers[1] = entryType;
-      buffer._sealStatsChain();
-    },
-    writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
-      return PACKED_APPEND_LOG_ENTRY(buffer._traceRoot, buffer, entryType);
-    },
-  });
-}
-
-const APPENDERS_BY_MESSAGE_LAYOUT: Readonly<Record<string, PhysicalAppenders>> = Object.freeze({
-  'static-only:current': CURRENT_STATIC_APPENDERS,
-  'mixed:current': CURRENT_MIXED_APPENDERS,
-  'dynamic-only:current': CURRENT_DYNAMIC_APPENDERS,
-  'static-only:specialized': SPLIT_STATIC_APPENDERS,
-  'mixed:specialized': SPLIT_MIXED_APPENDERS,
-  'dynamic-only:specialized': SPLIT_DYNAMIC_APPENDERS,
-  'static-only:packed': packedAppenders('static-only'),
-  'mixed:packed': packedAppenders('mixed'),
-  'dynamic-only:packed': packedAppenders('dynamic-only'),
-});
-
-const THREAD_APPEND_LOG_ENTRY: TimestampAppendPrimitive = (_traceRoot, buffer, entryType) =>
-  requireThreadSpanView(buffer).beginLog(entryType);
-
-const THREAD_BUFFER_APPENDERS: PhysicalAppenders = Object.freeze({
-  writeSpanStart(buffer: AnySpanBuffer, name: string | number): void {
-    requireThreadSpanView(buffer).openSpan(name);
-  },
-  writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void {
-    requireThreadSpanView(buffer).end(entryType);
-  },
-  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
-    return requireThreadSpanView(buffer).beginLog(entryType);
-  },
-});
-
-/** Rebound plans, one per (define-time plan, tracer backend) — decided once. */
-const REBOUND_CALLSITE_PLANS = new WeakMap<object, Map<PhysicalBackendKind, unknown>>();
-
-/**
- * Resolve a define-time callsite plan against the tracer's physical backend.
- *
- * Ops seal their plan when they are defined, before any tracer exists, so the
- * plan is built with `'strategy-selected'` — a deferred decision this function
- * discharges exactly once per (plan, backend). Only the fields that key on the
- * backend move: the appenders, the log-append primitive, and the Arrow
- * exposure. Everything else — generated classes, dictionaries, layout — is
- * backend-independent and shared by identity.
- */
-export function resolveCallsitePlanBackend<T extends LogSchema, Ctx extends OpContext<T>>(
-  plan: CallsitePlan<T, Ctx>,
-  backendKind: PhysicalBackendKind,
-): CallsitePlan<T, Ctx> {
-  if (backendKind === 'strategy-selected' || backendKind === plan.backendKind) return plan;
-  const byBackend = REBOUND_CALLSITE_PLANS.get(plan) ?? new Map<PhysicalBackendKind, unknown>();
-  REBOUND_CALLSITE_PLANS.set(plan, byBackend);
-  const cached = byBackend.get(backendKind);
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- the map slot is only ever written below with a rebound copy of this exact plan type.
-  if (cached !== undefined) return cached as CallsitePlan<T, Ctx>;
-  const { metadata, ...bare } = plan;
-  const rebound = Object.freeze({
-    ...bare,
-    backendKind,
-    appendLogEntry:
-      backendKind === 'thread-buffer'
-        ? THREAD_APPEND_LOG_ENTRY
-        : plan.messagePhysicalLayout === 'packed'
-          ? PACKED_APPEND_LOG_ENTRY
-          : SPLIT_APPEND_LOG_ENTRY,
-    appenders:
-      backendKind === 'thread-buffer'
-        ? THREAD_BUFFER_APPENDERS
-        : APPENDERS_BY_MESSAGE_LAYOUT[`${plan.messageLayoutFamily}:${plan.messagePhysicalLayout}`],
-    arrowExposure:
-      backendKind === 'wasm'
-        ? WASM_ARROW_EXPOSURE_BY_LAYOUT[plan.messagePhysicalLayout]
-        : JS_ARROW_EXPOSURE_BY_LAYOUT[plan.messagePhysicalLayout],
-  });
-  const sealed: CallsitePlan<T, Ctx> = Object.freeze({
-    ...rebound,
-    metadata: Object.freeze({ ...metadata, _physicalLayoutPlan: rebound }),
-  });
-  byBackend.set(backendKind, sealed);
-  return sealed;
-}
-
 const EMPTY_LOCAL_MESSAGE_DICTIONARY: readonly number[] = Object.freeze([]);
 const NO_LOCAL_MESSAGE = (_globalDenseIndex: number): number => 0;
 
@@ -513,7 +170,6 @@ const remappedPlans = new WeakMap<object, WeakMap<RemapDescriptor, object>>();
 function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
   SpanBufferClass: SpanBufferConstructor<T>,
   runtimeHint: number,
-  backendKind: PhysicalBackendKind,
   SpanContextClass: SpanContextClass<Ctx>,
   contextLayoutKey: string,
   vocabularyGeneration: VocabularyGeneration,
@@ -549,7 +205,6 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
 
   return Object.freeze({
     version: PHYSICAL_LAYOUT_VERSION,
-    backendKind,
     schema,
     runtimeHint,
     capabilities,
@@ -566,22 +221,8 @@ function createBasePlan<T extends LogSchema, Ctx extends OpContext<T>>(
     TagWriterClass,
     ResultWriterClass,
     clock: TRACE_ROOT_CLOCK,
-    appendLogEntry:
-      backendKind === 'thread-buffer'
-        ? THREAD_APPEND_LOG_ENTRY
-        : messagePhysicalLayout === 'packed'
-          ? PACKED_APPEND_LOG_ENTRY
-          : SPLIT_APPEND_LOG_ENTRY,
-    appenders:
-      backendKind === 'thread-buffer'
-        ? THREAD_BUFFER_APPENDERS
-        : APPENDERS_BY_MESSAGE_LAYOUT[`${messageLayoutFamily}:${messagePhysicalLayout}`],
     localMessageDictionary,
     vocabularyGeneration,
-    arrowExposure:
-      backendKind === 'wasm'
-        ? WASM_ARROW_EXPOSURE_BY_LAYOUT[messagePhysicalLayout]
-        : JS_ARROW_EXPOSURE_BY_LAYOUT[messagePhysicalLayout],
     poolRef: null,
     remapDescriptor: null,
     newCtx0,
@@ -597,7 +238,6 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
   runtimeHint: number,
   SpanContextClass: SpanContextClass<Ctx>,
   remapDescriptor?: RemapDescriptor,
-  backendKind: PhysicalBackendKind = 'strategy-selected',
   contextLayoutKey = '',
   eagerColumnNames: readonly string[] = [],
   localMessageDictionary: readonly number[] = Object.freeze([]),
@@ -628,14 +268,13 @@ export function getPhysicalLayoutPlan<T extends LogSchema, Ctx extends OpContext
     requestedPhysicalLayout === 'packed' && vocabularyGeneration.ids.length - 1 > MAX_PACKED_MESSAGE_DENSE_INDEX
       ? 'specialized'
       : requestedPhysicalLayout;
-  const key = `${PHYSICAL_LAYOUT_VERSION}:${backendKind}:${runtimeHint}:${messageLayoutFamily}:${messagePhysicalLayout}:${contextLayoutKey}:${vocabularyGeneration.generation}:${eagerColumns.key}:${resolvedLocalMessageDictionary.join(',')}`;
+  const key = `${PHYSICAL_LAYOUT_VERSION}:${runtimeHint}:${messageLayoutFamily}:${messagePhysicalLayout}:${contextLayoutKey}:${vocabularyGeneration.generation}:${eagerColumns.key}:${resolvedLocalMessageDictionary.join(',')}`;
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- cache keys encode schema/context/runtime identity for this erased store.
   let base = byKey.get(key) as PhysicalLayoutPlan<T, Ctx> | undefined;
   if (!base) {
     base = createBasePlan(
       SpanBufferClass,
       runtimeHint,
-      backendKind,
       SpanContextClass,
       contextLayoutKey,
       vocabularyGeneration,

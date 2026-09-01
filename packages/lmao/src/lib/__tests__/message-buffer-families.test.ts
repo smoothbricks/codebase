@@ -285,8 +285,9 @@ describe('specialized message buffer families', () => {
     expect(packedStaticOp.callsitePlan.messagePhysicalLayout).toBe('packed');
     expect(packedDynamicOp.callsitePlan.messagePhysicalLayout).toBe('packed');
     expect(packedMixedOp.callsitePlan.messagePhysicalLayout).toBe('packed');
-    expect(specializedMixedOp.callsitePlan.arrowExposure.entryTypeStorage).toBe('borrowed-u8');
-    expect(packedMixedOp.callsitePlan.arrowExposure.entryTypeStorage).toBe('derived-row-headers');
+    // Arrow exposure is now derived from the buffer at conversion time: specialized
+    // buffers expose a borrowable entry_type lane; packed buffers derive entry types
+    // from row headers (asserted per-buffer in the layout suites below).
   });
 
   it('packs low-8 entry types and dense-plus-one high-24 messages with exact lane omissions', () => {
@@ -305,7 +306,7 @@ describe('specialized message buffer families', () => {
       if (family === 'static-only') expect('message_values' in buffer).toBe(false);
       else expect(buffer.message_values).toBeInstanceOf(Array);
 
-      op.callsitePlan.appenders.writeSpanStart(buffer, FAMILY_DENSE_INDEX);
+      buffer._appenders.writeSpanStart(buffer, FAMILY_DENSE_INDEX);
       expect(buffer._rowHeaders[0] & 0xff).toBe(ENTRY_TYPE_SPAN_START);
       expect(buffer._rowHeaders[0] >>> 8).toBe(FAMILY_DENSE_INDEX + 1);
       expect(buffer._rowHeaders[1] & 0xff).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
@@ -313,7 +314,7 @@ describe('specialized message buffer families', () => {
       expect(resolveMessage(buffer, 0)).toBe(denseZeroText);
 
       if (family !== 'static-only') {
-        const nullRow = op.callsitePlan.appenders.writeLogEntry(buffer, ENTRY_TYPE_DEBUG);
+        const nullRow = buffer._appenders.writeLogEntry(buffer, ENTRY_TYPE_DEBUG);
         expect(buffer._rowHeaders[nullRow]).toBe(ENTRY_TYPE_DEBUG);
         expect(resolveMessage(buffer, nullRow)).toBeUndefined();
         buffer.message(nullRow, `raw-${family}`);
@@ -326,11 +327,9 @@ describe('specialized message buffer families', () => {
   it('accepts the maximum packed dense index, rejects the next index, and preserves topology', () => {
     const root = createPlannedBuffer('mixed', packedMixedOp.callsitePlan.SpanBufferClass, packedMixedOp.metadata);
     if (root._rowHeaders === undefined) throw new Error('Expected root packed row headers');
-    packedMixedOp.callsitePlan.appenders.writeSpanStart(root, MAX_PACKED_MESSAGE_DENSE_INDEX);
+    root._appenders.writeSpanStart(root, MAX_PACKED_MESSAGE_DENSE_INDEX);
     expect(root._rowHeaders[0] >>> 8).toBe(0x00ffffff);
-    expect(() => packedMixedOp.callsitePlan.appenders.writeSpanStart(root, MAX_PACKED_MESSAGE_DENSE_INDEX + 1)).toThrow(
-      '0xFFFFFE',
-    );
+    expect(() => root._appenders.writeSpanStart(root, MAX_PACKED_MESSAGE_DENSE_INDEX + 1)).toThrow('0xFFFFFE');
 
     const child = createChildSpanBuffer(
       root,
@@ -358,10 +357,10 @@ describe('specialized message buffer families', () => {
       runtimeSchema,
       packedMixedOp.callsitePlan,
     );
-    packedMixedOp.callsitePlan.appenders.writeSpanStart(root, 'packed root');
+    root._appenders.writeSpanStart(root, 'packed root');
     rootContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
     rootContext._spanLogger.debug('packed raw');
-    packedMixedOp.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
+    root._appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
     expect(Array.from({ length: root._writeIndex }, (_, row) => resolveEntryType(root, row))).toEqual([
       ENTRY_TYPE_SPAN_START,
@@ -432,7 +431,7 @@ describe('specialized message buffer families', () => {
       runtimeSchema,
       fallbackCurrentOp.callsitePlan,
     );
-    fallbackCurrentOp.callsitePlan.appenders.writeSpanStart(root, 'fallback root');
+    root._appenders.writeSpanStart(root, 'fallback root');
     expect(() => rootContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX)).not.toThrow();
     const row = root._writeIndex - 1;
     if (root._messageIds === undefined || root.message_values === undefined) {
@@ -658,25 +657,25 @@ describe('specialized message buffer families', () => {
     ]) {
       const root = createPlannedBuffer('mixed', op.callsitePlan.SpanBufferClass, op.metadata);
       const rootContext = new op.callsitePlan.SpanContextClass(root, runtimeSchema, op.callsitePlan);
-      op.callsitePlan.appenders.writeSpanStart(root, `${mode} root`);
+      root._appenders.writeSpanStart(root, `${mode} root`);
       rootContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
       rootContext._spanLogger.debug(`${mode} root raw`);
-      op.callsitePlan.appenders.writeLogEntry(root, ENTRY_TYPE_DEBUG);
-      op.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
+      root._appenders.writeLogEntry(root, ENTRY_TYPE_DEBUG);
+      root._appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
       const child = createChildSpanBuffer(root, op.callsitePlan.SpanBufferClass, op.metadata, op.metadata, CAPACITY);
       const childContext = new op.callsitePlan.SpanContextClass(child, runtimeSchema, op.callsitePlan);
-      op.callsitePlan.appenders.writeSpanStart(child, `${mode} child`);
+      child._appenders.writeSpanStart(child, `${mode} child`);
       childContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
       childContext._spanLogger.debug(`${mode} child raw`);
-      op.callsitePlan.appenders.writeLogEntry(child, ENTRY_TYPE_DEBUG);
-      op.callsitePlan.appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_OK);
+      child._appenders.writeLogEntry(child, ENTRY_TYPE_DEBUG);
+      child._appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_OK);
 
       const overflow = createOverflowBuffer(child);
       const overflowContext = new op.callsitePlan.SpanContextClass(overflow, runtimeSchema, op.callsitePlan);
       overflowContext._spanLogger._infoTemplate(FAMILY_DENSE_INDEX);
       overflowContext._spanLogger.debug(`${mode} overflow raw`);
-      op.callsitePlan.appenders.writeLogEntry(overflow, ENTRY_TYPE_DEBUG);
+      overflow._appenders.writeLogEntry(overflow, ENTRY_TYPE_DEBUG);
 
       const table = convertSpanTreeToArrowTable(root);
       const messages = table.getChild('message');
@@ -713,14 +712,14 @@ describe('specialized message buffer families', () => {
 
     for (const { family, op } of cases) {
       const denseName = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
-      op.callsitePlan.appenders.writeSpanStart(denseName, FAMILY_DENSE_INDEX);
+      denseName._appenders.writeSpanStart(denseName, FAMILY_DENSE_INDEX);
       expect(resolveEntryType(denseName, 0)).toBe(ENTRY_TYPE_SPAN_START);
       expect(resolveMessage(denseName, 0)).toBe(denseZeroText);
       expectPhysicalShape(denseName, 'current');
       expect(Object.hasOwn(denseName, '_messageDictionary')).toBe(false);
 
       const dynamicName = createPlannedBuffer(family, op.callsitePlan.SpanBufferClass, op.metadata);
-      op.callsitePlan.appenders.writeSpanStart(dynamicName, `raw ${family} span`);
+      dynamicName._appenders.writeSpanStart(dynamicName, `raw ${family} span`);
       expect(resolveMessage(dynamicName, 0)).toBe(`raw ${family} span`);
       expect(resolveMessage(dynamicName, 1)).toBeUndefined();
       dynamicName.message(1, `terminal ${family}`);
@@ -729,9 +728,9 @@ describe('specialized message buffer families', () => {
       if (family === 'static-only') {
         expect(() => dynamicName.message(2, 'forbidden raw log')).toThrow('rows 0 and 1');
       } else {
-        const nullRow = op.callsitePlan.appenders.writeLogEntry(dynamicName, ENTRY_TYPE_DEBUG);
+        const nullRow = dynamicName._appenders.writeLogEntry(dynamicName, ENTRY_TYPE_DEBUG);
         expect(resolveMessage(dynamicName, nullRow)).toBeUndefined();
-        const rawRow = op.callsitePlan.appenders.writeLogEntry(dynamicName, ENTRY_TYPE_DEBUG);
+        const rawRow = dynamicName._appenders.writeLogEntry(dynamicName, ENTRY_TYPE_DEBUG);
         dynamicName.message(rawRow, `raw ${family} log`);
         expect(resolveMessage(dynamicName, rawRow)).toBe(`raw ${family} log`);
       }
@@ -761,11 +760,11 @@ describe('specialized message buffer families', () => {
     const denseZeroText = textAtFamilyBinding();
     const root = createPlannedBuffer('mixed', mixedOp.callsitePlan.SpanBufferClass, mixedOp.metadata);
     const rootContext = new mixedOp.callsitePlan.SpanContextClass(root, runtimeSchema, mixedOp.callsitePlan);
-    mixedOp.callsitePlan.appenders.writeSpanStart(root, 'mixed root');
+    root._appenders.writeSpanStart(root, 'mixed root');
     const rootLogger = rootContext._spanLogger;
     rootLogger._infoTemplate(FAMILY_DENSE_INDEX);
     rootLogger.debug('root raw');
-    mixedOp.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
+    root._appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
     const child = createChildSpanBuffer(
       root,
@@ -775,11 +774,11 @@ describe('specialized message buffer families', () => {
       CAPACITY,
     );
     const childContext = new staticOp.callsitePlan.SpanContextClass(child, runtimeSchema, staticOp.callsitePlan);
-    staticOp.callsitePlan.appenders.writeSpanStart(child, FAMILY_DENSE_INDEX);
+    child._appenders.writeSpanStart(child, FAMILY_DENSE_INDEX);
     const childLogger = childContext._spanLogger;
     childLogger._infoTemplate(FAMILY_DENSE_INDEX);
     child.message(1, 'child boom');
-    staticOp.callsitePlan.appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_EXCEPTION);
+    child._appenders.writeSpanEnd(child, ENTRY_TYPE_SPAN_EXCEPTION);
 
     expect(Array.from(extractFacts(root, { includeMetrics: false }))).toEqual([
       'span:mixed root: started',
@@ -832,7 +831,7 @@ describe('specialized message buffer families', () => {
               runtimeSchema,
               testCase.op.callsitePlan,
             );
-            testCase.op.callsitePlan.appenders.writeSpanStart(root, `${testCase.name} root`);
+            root._appenders.writeSpanStart(root, `${testCase.name} root`);
             const logger = rootContext._spanLogger;
             for (const operation of operations) {
               if (operation.kind === 'static') {
@@ -842,7 +841,7 @@ describe('specialized message buffer families', () => {
                 logger.debug(operation.text);
               }
             }
-            testCase.op.callsitePlan.appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
+            root._appenders.writeSpanEnd(root, ENTRY_TYPE_SPAN_OK);
 
             const actual = collectLogRows(root);
             expect(actual.map((row) => row.message)).toEqual(operations.map((operation) => operation.text));

@@ -21,7 +21,6 @@
 
 import type { Table } from '@uwdata/flechette';
 import type { OpMetadata } from './opContext/opTypes.js';
-import type { PhysicalBackendKind } from './physicalLayoutPlan.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { ITraceRoot } from './traceRoot.js';
@@ -38,9 +37,6 @@ import type { AnySpanBuffer, SpanBuffer } from './types.js';
  * @typeParam T - LogSchema type for type-safe buffer access
  */
 export interface BufferStrategy<T extends LogSchema = LogSchema> {
-  /** Physical writer backend this strategy installs into the layout plan. */
-  readonly physicalBackend?: PhysicalBackendKind;
-
   /**
    * Create a root SpanBuffer for a new trace.
    *

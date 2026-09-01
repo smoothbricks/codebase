@@ -299,14 +299,12 @@ function buildMessageColumn(
   let suffixIndices: Map<string, number> | undefined;
 
   for (const buffer of buffers) {
-    const plannedStorage = buffer._opMetadata._physicalLayoutPlan?.arrowExposure.messageIdentityStorage;
     const messageIdentityStorage =
-      plannedStorage ??
-      (buffer._messagePhysicalLayout === 'current'
+      buffer._messagePhysicalLayout === 'current'
         ? 'local-u16'
         : buffer._messagePhysicalLayout === 'specialized'
           ? 'global-u32'
-          : 'packed-row-headers');
+          : 'packed-row-headers';
     for (let row = 0; row < buffer._writeIndex; row++) {
       const outputRow = rowOffset + row;
       const hasDedicatedMessage =
@@ -561,13 +559,7 @@ function buildTimestampColumn(
 }
 
 function canBorrowEntryTypeChunks(buffers: AnySpanBuffer[], borrowChunks: boolean): boolean {
-  return (
-    borrowChunks &&
-    buffers.every((buffer) => {
-      const declared = buffer._opMetadata._physicalLayoutPlan?.arrowExposure.entryTypeStorage;
-      return declared === 'borrowed-u8' || (declared === undefined && buffer.entry_type !== undefined);
-    })
-  );
+  return borrowChunks && buffers.every((buffer) => buffer.entry_type !== undefined);
 }
 
 function buildEntryTypeColumn(

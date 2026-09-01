@@ -93,7 +93,7 @@ function float64Values(value: unknown, name: string): Float64Array {
 function makeBundle(label: string): Bundle {
   const traceRoot = createTraceRoot(`inline-vs-codegen-${label}`, tracer);
   const buffer = createSpanBuffer(plan.schema, traceRoot, plan.metadata, CAPACITY, plan.SpanBufferClass);
-  plan.appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
+  buffer._appenders.writeSpanStart(buffer, benchmarkOp.metadata.name);
   const context = new plan.SpanContextClass(buffer, plan.schema, plan);
   const views: TagViews = {
     operationNulls: uint8Values(buffer.operation_nulls, 'operation_nulls'),
