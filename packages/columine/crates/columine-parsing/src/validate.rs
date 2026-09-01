@@ -484,7 +484,7 @@ fn validate_at(
         SemanticSchema::String => require_kind(path, value, ValueKind::String),
         SemanticSchema::Boolean => require_kind(path, value, ValueKind::Boolean),
         SemanticSchema::Binary => require_kind(path, value, ValueKind::Binary),
-        SemanticSchema::BigInt => require_kind(path, value, ValueKind::BigInt),
+        SemanticSchema::BigInt => validate_bigint(path, value),
         SemanticSchema::Number => validate_number(path, value),
         SemanticSchema::I32 => validate_i32(path, value),
         SemanticSchema::U32 => validate_u32(path, value),
@@ -621,6 +621,29 @@ fn require_kind(
         Ok(())
     } else {
         Err(PayloadViolation::shape(path, expected.as_str(), value))
+    }
+}
+
+/// A bigint is a native bigint where the wire has one, and otherwise its
+/// decimal string: canonical JSON cannot spell a bigint, so the JSON lane
+/// carries `"5000000000"`, the bigint-as-string form both extractors accept
+/// on the eight-byte planes. A JSON number is refused by the shared corpus
+/// (`bigint-wrong-number`): a number that fits a double is not evidence the
+/// author meant a bigint, and one that does not fit has already lost bits.
+fn validate_bigint(path: &str, value: &dyn ValueView) -> Result<(), PayloadViolation> {
+    match value.kind() {
+        ValueKind::BigInt => Ok(()),
+        ValueKind::String => {
+            let text = value.as_str().unwrap_or_default();
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            let decimal = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
+            if decimal && (text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok()) {
+                Ok(())
+            } else {
+                Err(PayloadViolation::shape(path, "bigint", value))
+            }
+        }
+        _ => Err(PayloadViolation::shape(path, "bigint", value)),
     }
 }
 
@@ -1033,6 +1056,17 @@ mod tests {
         JsonValue::parse(value.as_bytes()).unwrap()
     }
 
+    #[test]
+    fn bigint_accepts_its_json_spellings_and_refuses_the_rest() {
+        let bigint = schema(r#"{"kind":"bigint"}"#);
+        assert!(validate_value(&bigint, &json(r#""5000000000""#)).is_ok());
+        assert!(validate_value(&bigint, &json(r#""-42""#)).is_ok());
+        assert!(validate_value(&bigint, &JsonValue::BigInt).is_ok());
+        for bad in [r#""1.5""#, r#""abc""#, "5000000000", "1.5", "true", r#""""#] {
+            let error = validate_value(&bigint, &json(bad)).unwrap_err();
+            assert_eq!(error.expected, "bigint", "{bad} must refuse");
+        }
+    }
     #[test]
     fn declared_scalar_type_is_checked() {
         let result = validate_value(&schema(r#"{"kind":"string"}"#), &json("42"));
