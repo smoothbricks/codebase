@@ -1194,9 +1194,15 @@ pub fn shared_nix_cache_directory() -> PathBuf {
 
 /// Point the private `XDG_CACHE_HOME/nix` at [`shared_nix_cache_directory`].
 ///
-/// Same posture as [`link_cargo_registry`]: a link that already resolves to the shared directory
-/// is kept, a stale link is replaced, and a real directory a workspace already owns is left alone.
+/// Same posture as [`link_cargo_registry`]: a host without the shared resource gets no link and
+/// the private cache stands (a CI runner or a box before `cowshed setup` has no caches volume,
+/// and an environment that cannot be shared must not fail the spawn), a link that already
+/// resolves to the shared directory is kept, a stale link is replaced, and a real directory a
+/// workspace already owns is left alone.
 async fn link_nix_cache(private_cache: &Path) -> Result<()> {
+    if !Path::new(crate::storage::bootstrap::CACHES_ROOT).is_dir() {
+        return Ok(());
+    }
     let target = shared_nix_cache_directory();
     tokio::fs::create_dir_all(&target).await.map_err(|error| {
         CowshedError::environment_missing(
