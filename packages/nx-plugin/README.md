@@ -107,6 +107,31 @@ mode. Smoo validation creates/requires this config for test runners that do not 
 against, but the package root `tsconfig.json` should not reference `./tsconfig.test.json`. Nx runs test typechecking
 through the inferred `typecheck-tests` target, not through `tsc --build`.
 
+## Ensure a Target Before Executing Its Binary
+
+`ensureBuilt` checks a target and its task dependencies against Nx's local cache and the daemon's recorded output
+hashes. A full hit returns without running tasks or printing output. A miss runs the task graph through Nx's in-process
+runner with streaming output; only a workspace with the daemon disabled falls back to its checkout-local `nx` CLI.
+
+```typescript
+import { ensureBuilt } from '@smoothbricks/nx-plugin/ensure-built';
+
+const result = await ensureBuilt({ target: 'my-cli:build', cwd: workspaceRoot });
+if (result.disposition === 'failed') {
+  process.exit(result.exitCode);
+}
+```
+
+The packaged wrapper performs the build check and then replaces itself with the binary, preserving the binary's
+arguments, exit status, and signals:
+
+```bash
+smoothbricks-ensure-built my-cli:build -- ./packages/my-cli/dist/my-cli argument
+```
+
+Pass `--workspace-root <dir>` before `--` when invoking the wrapper outside the workspace. The binary path resolves
+against the caller's current directory.
+
 ## Bun Test Tracing Generator
 
 Configure a package for the Bun test tracing + no-emit test typechecking pattern used in this repo.

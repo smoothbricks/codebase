@@ -184,9 +184,18 @@ interface BinRun {
  * the behaviour under test.
  */
 function runBin(workspace: string, args: readonly string[], env: Record<string, string> = {}): Promise<BinRun> {
+  const childEnv = { ...process.env };
+  for (const key of LEAKABLE) {
+    delete childEnv[key];
+  }
+  // The parent Nx process may set FORCE_COLOR while the shell exports
+  // NO_COLOR. Passing both to Bun emits a warning, which would make a genuine
+  // full hit look noisy.
+  delete childEnv.NO_COLOR;
+  Object.assign(childEnv, { CI: '', NX_DAEMON: 'true' }, env);
   const child = spawn('bun', [binEntry, ...args], {
     cwd: workspace,
-    env: { ...process.env, CI: '', NX_DAEMON: 'true', ...env },
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
