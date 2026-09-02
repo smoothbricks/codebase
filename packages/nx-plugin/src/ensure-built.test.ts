@@ -165,6 +165,7 @@ describe('cliExitOutcome', () => {
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(packageRoot));
 const binEntry = join(packageRoot, 'src', 'bin', 'ensure-built.ts');
+const builtBinEntry = join(packageRoot, 'dist', 'bin', 'ensure-built.js');
 const MARKER = 'EXEC_OK';
 /** Nx configures itself through these; the exec'd binary must not inherit them. */
 const LEAKABLE = ['NX_WORKSPACE_ROOT_PATH', 'NX_STREAM_OUTPUT', 'NX_PREFIX_OUTPUT', 'NX_LOAD_DOT_ENV_FILES'];
@@ -183,7 +184,13 @@ interface BinRun {
  * workspace and then anything else; and `execve` replaces the process, which is
  * the behaviour under test.
  */
-function runBin(workspace: string, args: readonly string[], env: Record<string, string> = {}): Promise<BinRun> {
+function runBinWith(
+  runtime: 'bun' | 'node',
+  entry: string,
+  workspace: string,
+  args: readonly string[],
+  env: Record<string, string>,
+): Promise<BinRun> {
   const childEnv = { ...process.env };
   for (const key of LEAKABLE) {
     delete childEnv[key];
@@ -193,7 +200,7 @@ function runBin(workspace: string, args: readonly string[], env: Record<string, 
   // full hit look noisy.
   delete childEnv.NO_COLOR;
   Object.assign(childEnv, { CI: '', NX_DAEMON: 'true' }, env);
-  const child = spawn('bun', [binEntry, ...args], {
+  const child = spawn(runtime, [entry, ...args], {
     cwd: workspace,
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -212,6 +219,14 @@ function runBin(workspace: string, args: readonly string[], env: Record<string, 
     child.once('error', reject);
     child.once('close', (code, signal) => settle({ code, signal, stdout, stderr }));
   });
+}
+
+function runBin(workspace: string, args: readonly string[], env: Record<string, string> = {}): Promise<BinRun> {
+  return runBinWith('bun', binEntry, workspace, args, env);
+}
+
+function runBuiltBin(workspace: string, args: readonly string[]): Promise<BinRun> {
+  return runBinWith('node', builtBinEntry, workspace, args, {});
 }
 
 function nx(workspace: string, args: readonly string[]): Promise<number | null> {
@@ -317,6 +332,13 @@ describe('smoothbricks-ensure-built', () => {
     // Nothing but the exec'd binary's own output: no Nx banner, no task log.
     expect(run.stdout.split('\n')[0]).toBe(MARKER);
     expect(run.stdout).not.toContain('nx run');
+  });
+
+  it('runs the emitted wrapper under Node without losing the hot path', async () => {
+    const run = await runBuiltBin(workspace, ['app:build', '--', './report']);
+    expect(run.code).toBe(0);
+    expect(run.stderr).toBe('');
+    expect(run.stdout.split('\n')[0]).toBe(MARKER);
   });
 
   it('leaves the exec\u0027d binary the caller\u0027s cwd and none of Nx\u0027s environment', async () => {

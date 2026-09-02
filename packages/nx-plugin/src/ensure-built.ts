@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -229,14 +230,12 @@ async function ensureBuiltInWorkspace(
     return runViaCli(workspaceRoot, selector);
   }
 
-  const [{ readNxJson }, { splitArgsIntoNxArgsAndOverrides }, { setEnvVarsBasedOnArgs }, { hashArray }, hooks] =
-    await Promise.all([
-      import('nx/src/config/nx-json'),
-      import('nx/src/utils/command-line-utils'),
-      import('nx/src/tasks-runner/run-command'),
-      import('nx/src/native'),
-      import('nx/src/project-graph/plugins/tasks-execution-hooks'),
-    ]);
+  const [{ readNxJson }, { splitArgsIntoNxArgsAndOverrides }, { setEnvVarsBasedOnArgs }, hooks] = await Promise.all([
+    import('nx/src/config/nx-json'),
+    import('nx/src/utils/command-line-utils'),
+    import('nx/src/tasks-runner/run-command'),
+    import('nx/src/project-graph/plugins/tasks-execution-hooks'),
+  ]);
 
   const nxJson = readNxJson();
   // Reproduce `nx run <selector> --outputStyle=<style>` exactly. Task hashes
@@ -255,7 +254,7 @@ async function ensureBuiltInWorkspace(
   // the probe keys differently from the CLI.
   setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
 
-  const runId = hashArray([...process.argv, Date.now().toString()]);
+  const runId = randomUUID();
   const startTime = Date.now();
   // Plugin `preTasksExecution` hooks inject environment variables, and declared
   // `env` inputs hash against them. Skipping the hook would not merely cost
