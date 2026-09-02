@@ -49,12 +49,21 @@
       "import": "./dist/typecheck-test-policy.js",
       "default": "./dist/typecheck-test-policy.js"
     },
+    "./ensure-built": {
+      "types": "./dist/ensure-built.d.ts",
+      "development": "./src/ensure-built.ts",
+      "import": "./dist/ensure-built.js",
+      "default": "./dist/ensure-built.js"
+    },
     "./cross-check-policy": {
       "types": "./dist/cross-check-policy.d.ts",
       "development": "./src/cross-check-policy.ts",
       "import": "./dist/cross-check-policy.js",
       "default": "./dist/cross-check-policy.js"
     }
+  },
+  "bin": {
+    "smoothbricks-ensure-built": "./dist/bin/ensure-built.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",
