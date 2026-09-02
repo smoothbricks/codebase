@@ -118,6 +118,9 @@ import { ensureBuilt } from '@smoothbricks/nx-plugin/ensure-built';
 
 const result = await ensureBuilt({ target: 'my-cli:build', cwd: workspaceRoot });
 if (result.disposition === 'failed') {
+  if (result.signal !== null) {
+    process.kill(process.pid, result.signal);
+  }
   process.exit(result.exitCode);
 }
 ```
