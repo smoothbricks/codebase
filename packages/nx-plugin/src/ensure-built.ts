@@ -101,7 +101,7 @@ export function describeMiss(reason: MissReason): string {
     case 'uncacheable':
       return `${reason.taskId} is not cacheable, so it must run`;
     case 'unhashable':
-      return `${reason.taskId} cannot be hashed before its dependencies run`;
+      return `${reason.taskId} did not produce a task hash`;
     case 'not-cached':
       return `${reason.taskId} has no cached result for its current inputs`;
     case 'cached-failure':
@@ -130,9 +130,8 @@ export function firstCacheMiss(
     if (!task.cache) {
       return { kind: 'uncacheable', taskId: task.id };
     }
-    // Nx leaves `hash` unset for tasks whose inputs include another task's
-    // outputs, and for tasks with a custom hasher. Those are only knowable
-    // mid-run, so they can never be cleared in advance.
+    // A custom hasher is outside Nx's type guarantees and may return an empty
+    // value. Without a hash there is no cache key to query.
     if (!task.hash) {
       return { kind: 'unhashable', taskId: task.id };
     }
