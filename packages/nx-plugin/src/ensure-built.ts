@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
@@ -8,6 +9,36 @@ import type { ProjectGraph, ProjectGraphProjectNode } from 'nx/src/config/projec
 import type { Task } from 'nx/src/config/task-graph';
 import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
 import type { NxArgs } from 'nx/src/utils/command-line-utils';
+
+interface NxRuntimeModules {
+  readonly 'nx/src/config/nx-json': typeof import('nx/src/config/nx-json');
+  readonly 'nx/src/daemon/client/client': typeof import('nx/src/daemon/client/client');
+  readonly 'nx/src/hasher/hash-task': typeof import('nx/src/hasher/hash-task');
+  readonly 'nx/src/hasher/task-hasher': typeof import('nx/src/hasher/task-hasher');
+  readonly 'nx/src/project-graph/plugins/tasks-execution-hooks': typeof import('nx/src/project-graph/plugins/tasks-execution-hooks');
+  readonly 'nx/src/project-graph/project-graph': typeof import('nx/src/project-graph/project-graph');
+  readonly 'nx/src/tasks-runner/cache': typeof import('nx/src/tasks-runner/cache');
+  readonly 'nx/src/tasks-runner/create-task-graph': typeof import('nx/src/tasks-runner/create-task-graph');
+  readonly 'nx/src/tasks-runner/run-command': typeof import('nx/src/tasks-runner/run-command');
+  readonly 'nx/src/tasks-runner/task-env': typeof import('nx/src/tasks-runner/task-env');
+  readonly 'nx/src/utils/command-line-utils': typeof import('nx/src/utils/command-line-utils');
+  readonly 'nx/src/utils/exit-codes': typeof import('nx/src/utils/exit-codes');
+  readonly 'nx/src/utils/perf-logging': typeof import('nx/src/utils/perf-logging');
+  readonly 'nx/src/utils/workspace-root': typeof import('nx/src/utils/workspace-root');
+}
+
+type WorkspaceNxRequire = <Specifier extends keyof NxRuntimeModules>(
+  specifier: Specifier,
+) => NxRuntimeModules[Specifier];
+
+function createWorkspaceNxRequire(workspaceRoot: string): WorkspaceNxRequire {
+  const requireFromWorkspace = createRequire(join(workspaceRoot, 'package.json'));
+  return function requireNx<Specifier extends keyof NxRuntimeModules>(
+    specifier: Specifier,
+  ): NxRuntimeModules[Specifier] {
+    return requireFromWorkspace(specifier);
+  };
+}
 
 /**
  * A `project:target` or `project:target:configuration` selector.
@@ -220,22 +251,27 @@ async function ensureBuiltInWorkspace(
   selector: TargetSelector,
   onMiss: 'stream',
 ): Promise<EnsureBuiltResult> {
-  // Every Nx import in this file is dynamic, and every one of them runs after
-  // bindWorkspaceRoot, because Nx resolves its workspace root once at module
-  // load; see bindWorkspaceRoot. Repeat imports of the same specifier are
-  // module-cache lookups, so each function names exactly what it needs.
-  await bindWorkspaceRoot(workspaceRoot);
-  const { daemonClient } = await import('nx/src/daemon/client/client');
+  // The environment has precedence over nx.json. Avoid loading Nx at all on
+  // this explicit fallback path, which also lets a deliberately minimal
+  // checkout-local CLI stand in for Nx.
+  if (process.env.NX_DAEMON === 'false') {
+    return runViaCli(workspaceRoot, selector);
+  }
+  // Nx rejects daemon access when the client package's version differs from
+  // the workspace's running daemon. Resolve every runtime module from the
+  // target checkout rather than this package's own dependency: a reusable
+  // wrapper must keep using the daemon after the workspace takes an Nx patch.
+  const requireNx = createWorkspaceNxRequire(workspaceRoot);
+  bindWorkspaceRoot(workspaceRoot, requireNx);
+  const { daemonClient } = requireNx('nx/src/daemon/client/client');
   if (!daemonClient.enabled()) {
     return runViaCli(workspaceRoot, selector);
   }
 
-  const [{ readNxJson }, { splitArgsIntoNxArgsAndOverrides }, { setEnvVarsBasedOnArgs }, hooks] = await Promise.all([
-    import('nx/src/config/nx-json'),
-    import('nx/src/utils/command-line-utils'),
-    import('nx/src/tasks-runner/run-command'),
-    import('nx/src/project-graph/plugins/tasks-execution-hooks'),
-  ]);
+  const { readNxJson } = requireNx('nx/src/config/nx-json');
+  const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
+  const { setEnvVarsBasedOnArgs } = requireNx('nx/src/tasks-runner/run-command');
+  const hooks = requireNx('nx/src/project-graph/plugins/tasks-execution-hooks');
 
   const nxJson = readNxJson();
   // Reproduce `nx run <selector> --outputStyle=<style>` exactly. Task hashes
@@ -268,12 +304,12 @@ async function ensureBuiltInWorkspace(
   });
 
   performance.mark('ensureBuilt:probe:start');
-  const reason = await probe(nxJson, nxArgs, overrides, selector);
+  const reason = await probe(nxJson, nxArgs, overrides, selector, requireNx);
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   const outcome =
     reason === null
       ? { result: HIT, taskResults: NO_TASK_RESULTS }
-      : await runTarget(nxJson, nxArgs, overrides, selector, reason);
+      : await runTarget(nxJson, nxArgs, overrides, selector, reason, requireNx);
   await hooks.runPostTasksExecution({
     id: runId,
     taskResults: outcome.taskResults,
@@ -294,15 +330,15 @@ async function ensureBuiltInWorkspace(
  * imports Nx dynamically throughout. A static import at the top of the file
  * would bind the caller's launch directory instead.
  */
-async function bindWorkspaceRoot(workspaceRoot: string): Promise<void> {
+function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire): void {
   process.env.NX_WORKSPACE_ROOT_PATH = workspaceRoot;
   if (process.env.NX_PERF_LOGGING === 'true') {
     // Installs Nx's PerformanceObserver, which reports every `performance
-    // .measure` this module and Nx itself record. Importing it unconditionally
+    // .measure` this module and Nx itself record. Loading it unconditionally
     // would add an observer to hot paths that never want one.
-    await import('nx/src/utils/perf-logging');
+    requireNx('nx/src/utils/perf-logging');
   }
-  const { workspaceRoot: boundRoot } = await import('nx/src/utils/workspace-root');
+  const { workspaceRoot: boundRoot } = requireNx('nx/src/utils/workspace-root');
   if (boundRoot !== workspaceRoot) {
     // One process cannot serve two workspaces: the constant and the daemon
     // client singleton are already bound. Say so rather than silently probing
@@ -319,24 +355,15 @@ async function probe(
   nxArgs: NxArgs,
   overrides: Record<string, unknown>,
   selector: TargetSelector,
+  requireNx: WorkspaceNxRequire,
 ): Promise<MissReason | null> {
-  const [
-    { daemonClient },
-    { createTaskGraph },
-    { DaemonBasedTaskHasher },
-    { getTaskDetails, hashTasks },
-    { getTaskSpecificEnv },
-    { getCache },
-    { getRunnerOptions },
-  ] = await Promise.all([
-    import('nx/src/daemon/client/client'),
-    import('nx/src/tasks-runner/create-task-graph'),
-    import('nx/src/hasher/task-hasher'),
-    import('nx/src/hasher/hash-task'),
-    import('nx/src/tasks-runner/task-env'),
-    import('nx/src/tasks-runner/cache'),
-    import('nx/src/tasks-runner/run-command'),
-  ]);
+  const { daemonClient } = requireNx('nx/src/daemon/client/client');
+  const { createTaskGraph } = requireNx('nx/src/tasks-runner/create-task-graph');
+  const { DaemonBasedTaskHasher } = requireNx('nx/src/hasher/task-hasher');
+  const { getTaskDetails, hashTasks } = requireNx('nx/src/hasher/hash-task');
+  const { getTaskSpecificEnv } = requireNx('nx/src/tasks-runner/task-env');
+  const { getCache } = requireNx('nx/src/tasks-runner/cache');
+  const { getRunnerOptions } = requireNx('nx/src/tasks-runner/run-command');
 
   performance.mark('ensureBuilt:graph:start');
   const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
@@ -430,12 +457,11 @@ async function runTarget(
   overrides: Record<string, unknown>,
   selector: TargetSelector,
   reason: MissReason,
+  requireNx: WorkspaceNxRequire,
 ): Promise<CompletedRun> {
-  const [{ runCommandForTasks }, { createProjectGraphAsync }, { signalToCode }] = await Promise.all([
-    import('nx/src/tasks-runner/run-command'),
-    import('nx/src/project-graph/project-graph'),
-    import('nx/src/utils/exit-codes'),
-  ]);
+  const { runCommandForTasks } = requireNx('nx/src/tasks-runner/run-command');
+  const { createProjectGraphAsync } = requireNx('nx/src/project-graph/project-graph');
+  const { signalToCode } = requireNx('nx/src/utils/exit-codes');
   // `runCommandForTasks` derives its own task graph and hashes, so the probe's
   // work is not reusable. That duplication is one daemon round-trip on a path
   // that is about to run a build.
@@ -488,7 +514,7 @@ async function runViaCli(workspaceRoot: string, selector: TargetSelector): Promi
   const targetSpec = selector.configuration
     ? `${selector.project}:${selector.target}:${selector.configuration}`
     : `${selector.project}:${selector.target}`;
-  const { signalToCode } = await import('nx/src/utils/exit-codes');
+  const signalToCode = nxSignalToCode;
   const child = spawn(nxCli, ['run', targetSpec, '--outputStyle=stream'], {
     cwd: workspaceRoot,
     stdio: 'inherit',
@@ -500,6 +526,21 @@ async function runViaCli(workspaceRoot: string, selector: TargetSelector): Promi
     child.once('exit', (code, signal) => settle({ code, signal }));
   });
   return cliExitOutcome(reason, exit, signalToCode);
+}
+
+function nxSignalToCode(signal: NodeJS.Signals | null): number {
+  switch (signal) {
+    case 'SIGHUP':
+      return 129;
+    case 'SIGINT':
+      return 130;
+    case 'SIGQUIT':
+      return 131;
+    case 'SIGTERM':
+      return 143;
+    default:
+      return 128;
+  }
 }
 
 export interface ChildExit {
