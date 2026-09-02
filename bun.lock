@@ -71,7 +71,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.1.11-next.0",
+      "version": "0.1.11",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "@uwdata/flechette": "^2.3.0",
@@ -80,7 +80,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.1.9-next.0",
+      "version": "0.1.9",
       "bin": {
         "cowshed": "./dist/ts/cli.js",
       },
