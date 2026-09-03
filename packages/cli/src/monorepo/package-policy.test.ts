@@ -235,6 +235,22 @@ describe('test file location policy', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('accepts nested test files covered by an ancestor glob', async () => {
+    const root = await createWorkspace({
+      rootName: '@smoothbricks/codebase',
+      packages: [{ dir: 'app', name: '@smoothbricks/app' }],
+    });
+    try {
+      const app = join(root, 'packages/app');
+      await writeFile(join(app, 'tsconfig.json'), JSON.stringify({ include: ['conformance/**/*.ts'] }));
+      await writeSource(join(app, 'conformance/src/contract.test.ts'));
+
+      expect(validateTestFileLocations(root)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('stale test output policy', () => {

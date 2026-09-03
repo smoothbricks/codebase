@@ -430,8 +430,14 @@ function wiredConfigText(packagePath: string): string {
 function isWired(configText: string, relativePath: string): boolean {
   const posix = relativePath.split(sep).join('/');
   if (configText.includes(posix)) return true;
-  const dir = dirname(posix);
-  return configText.includes(`${dir}/**`);
+  let dir = dirname(posix);
+  while (dir !== '.') {
+    if (configText.includes(`${dir}/**`)) return true;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return false;
 }
 
 function hasOwnTsconfig(directory: string): boolean {
