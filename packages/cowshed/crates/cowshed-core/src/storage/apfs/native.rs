@@ -1933,8 +1933,15 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         })
     }
 
-    /// The mountpoint a retirement is entitled to remove, which must be an empty directory or
-    /// already absent: anything with contents is a live mount, and gc never removes those.
+    /// The mountpoint a retirement is entitled to remove.
+    ///
+    /// A LIVE mount - a filesystem at that path, told apart from its parent by device - is
+    /// never touched. An unmounted directory that is not empty holds strays: files a process
+    /// wrote there after the volume left (an nx daemon's logs, a build's outputs, a generator
+    /// still running). Workspace data lives on the volume, so a stray is junk when it is
+    /// hidden (a `.` component) or gitignored by the project's own rules, and is deleted; a
+    /// visible file the rules do not ignore is someone's work landing in the wrong place and
+    /// the reclaim refuses by naming it.
     fn retired_mount_point(&self, retired: &RetiredRef) -> Result<PathBuf, ApfsStorageError> {
         let mount_point = layout(&self.config, retired.workspace().repo())?
             .project()
@@ -1942,14 +1949,26 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .join(retired.workspace().name().as_str());
         match fs::symlink_metadata(&mount_point) {
             Ok(metadata) if metadata.file_type().is_dir() => {
-                if fs::read_dir(&mount_point)
-                    .map_err(|error| io_error("enumerate retired mountpoint", &mount_point, error))?
-                    .next()
-                    .is_some()
-                {
+                let parent = mount_point.parent().unwrap_or(&mount_point);
+                let parent_device = fs::metadata(parent)
+                    .map_err(|error| io_error("inspect retired mountpoint parent", parent, error))?
+                    .dev();
+                if metadata.dev() != parent_device {
                     return Err(ApfsStorageError::Host(format!(
-                        "retired mountpoint is not empty: {}",
+                        "retired mountpoint still carries a mounted filesystem: {}",
                         mount_point.display()
+                    )));
+                }
+                let kept = remove_stray_junk(&mount_point, &self.config.checkout_path)?;
+                if !kept.is_empty() {
+                    return Err(ApfsStorageError::Host(format!(
+                        "retired mountpoint {} holds files written after its volume was retired that \
+                         are neither hidden nor ignored by the project: {}; move or delete them",
+                        mount_point.display(),
+                        kept.iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )));
                 }
             }
@@ -5060,6 +5079,79 @@ fn metadata_workspace_ref(
     .map_err(|_| ApfsStorageError::Host("invalid detached workspace identity".to_owned()))
 }
 
+/// Deletes every stray under an unmounted mountpoint that is junk - hidden, or ignored by the
+/// project's gitignore rules judged from its checkout - and returns the paths that were kept
+/// because they are neither. Empty directories left behind by deleted junk are removed too.
+fn remove_stray_junk(
+    mount_point: &Path,
+    checkout: &Path,
+) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    let mut kept = Vec::new();
+    let mut stack = vec![mount_point.to_path_buf()];
+    let mut visited = Vec::new();
+    while let Some(dir) = stack.pop() {
+        visited.push(dir.clone());
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| io_error("enumerate retired mountpoint", &dir, error))?
+        {
+            let entry =
+                entry.map_err(|error| io_error("enumerate retired mountpoint", &dir, error))?;
+            let path = entry.path();
+            let relative = path.strip_prefix(mount_point).unwrap_or(&path);
+            let hidden = crate::git::is_hidden_path(relative.as_os_str().as_bytes());
+            let file_type = entry
+                .file_type()
+                .map_err(|error| io_error("inspect stray", &path, error))?;
+            // A directory pattern (`generated/`) only matches a path git knows is a directory;
+            // the path does not exist under the checkout, so the trailing slash says so.
+            let mut judged = relative.as_os_str().to_owned();
+            if file_type.is_dir() {
+                judged.push("/");
+            }
+            if hidden || stray_is_ignored(checkout, Path::new(&judged)) {
+                let removed = if file_type.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                removed.map_err(|error| io_error("remove stray junk", &path, error))?;
+                eprintln!(
+                    "cowshed: removed stray {} from retired mountpoint",
+                    path.display()
+                );
+            } else if file_type.is_dir() {
+                stack.push(path);
+            } else {
+                kept.push(path);
+            }
+        }
+    }
+    // Directories are emptied bottom-up only when nothing under them was kept.
+    if kept.is_empty() {
+        for dir in visited.into_iter().rev() {
+            if dir != mount_point {
+                let _ = fs::remove_dir(&dir);
+            }
+        }
+    }
+    Ok(kept)
+}
+
+/// Whether the project's own gitignore rules ignore `relative` - `git check-ignore` from the
+/// adopted checkout, index-blind, so a stray is judged exactly as a fresh file in the tree
+/// would be.
+fn stray_is_ignored(checkout: &Path, relative: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["check-ignore", "-q", "--no-index", "--"])
+        .arg(relative)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStorageError {
     ApfsStorageError::Io {
         operation,
@@ -5124,6 +5216,61 @@ fn clone_lineage_from(marker_path: &Path, repo: &RepoId) -> Vec<WorkspaceIncarna
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retired mountpoint's strays: hidden and gitignored ones go, a visible file the
+    /// project's rules do not ignore stays and is named.
+    #[test]
+    fn stray_junk_is_deleted_and_work_is_kept() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-stray-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let checkout = root.join("checkout");
+        let mount = root.join("mount");
+        fs::create_dir_all(&checkout).expect("checkout");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&checkout)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        fs::write(
+            checkout.join(".gitignore"),
+            "generated/
+*.log
+",
+        )
+        .expect("gitignore");
+        fs::create_dir_all(mount.join(".nx/d")).expect("nx");
+        fs::write(mount.join(".nx/d/daemon.log"), "log").expect("hidden");
+        fs::create_dir_all(mount.join("packages/wire/generated")).expect("generated");
+        fs::write(mount.join("packages/wire/generated/vo1gen.ts"), "x").expect("ignored");
+        fs::write(mount.join("packages/wire/build.log"), "x").expect("ignored by glob");
+        fs::create_dir_all(mount.join("packages/wire/src")).expect("src");
+        fs::write(mount.join("packages/wire/src/lib.rs"), "fn a() {}").expect("work");
+
+        let kept = remove_stray_junk(&mount, &checkout).expect("sweep");
+        assert_eq!(kept, vec![mount.join("packages/wire/src/lib.rs")]);
+        assert!(!mount.join(".nx").exists());
+        assert!(!mount.join("packages/wire/generated").exists());
+        assert!(!mount.join("packages/wire/build.log").exists());
+        assert!(mount.join("packages/wire/src/lib.rs").exists());
+
+        fs::remove_file(mount.join("packages/wire/src/lib.rs")).expect("clear work");
+        assert!(
+            remove_stray_junk(&mount, &checkout)
+                .expect("sweep")
+                .is_empty()
+        );
+        assert!(
+            fs::read_dir(&mount).expect("mount").next().is_none(),
+            "emptied bottom-up"
+        );
+        fs::remove_dir_all(root).expect("fixture");
+    }
 
     #[test]
     fn a_clone_inherits_the_source_markers_lineage_and_ignores_foreign_or_absent_markers() {
