@@ -1119,6 +1119,35 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         parse_volume_list_plist(candidate, &output.stdout)
     }
 
+    /// Recover the one attachment a killed process may have left for `image`.
+    ///
+    /// This never attaches a second device. An absent mapping returns `None`; more than one
+    /// mapping is ambiguous and fails closed. The caller decides whether an unmounted survivor
+    /// must be detached and verified afresh before use.
+    pub(crate) fn existing_attachment(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+    ) -> Result<Option<AttachedImage>, ApfsError> {
+        validate_image_path(image, format)?;
+        let image = attachment_inventory_path(image)?;
+        let output = self.run_checked(
+            "inventory attached disk images",
+            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
+        )?;
+        let Some((whole_device, candidate)) = parse_existing_attachment(&image, &output.stdout)?
+        else {
+            return Ok(None);
+        };
+        let volume_device = self.resolve_apfs_volume(&candidate)?;
+        Ok(Some(AttachedImage {
+            image,
+            format,
+            whole_device,
+            volume_device,
+        }))
+    }
+
     fn attach_without_mounting(
         &self,
         image: &Path,
@@ -1887,6 +1916,50 @@ fn parse_attachment_inventory(image: &Path, bytes: &[u8]) -> Result<BTreeSet<Str
     Ok(parse_hdiutil_images(image, bytes)?.devices)
 }
 
+fn parse_existing_attachment(
+    image: &Path,
+    bytes: &[u8],
+) -> Result<Option<(String, String)>, ApfsError> {
+    let expected = image.to_str().ok_or_else(|| {
+        ApfsError::InvalidAttachmentInventory("image path is not valid UTF-8".into())
+    })?;
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
+    let images = value
+        .as_dictionary()
+        .and_then(|root| root.get("images"))
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
+    let mut attachment = None;
+    for entry in images {
+        let dictionary = entry.as_dictionary().ok_or_else(|| {
+            ApfsError::InvalidAttachmentInventory("images entry is not a dictionary".into())
+        })?;
+        if dictionary
+            .get("image-path")
+            .and_then(plist::Value::as_string)
+            != Some(expected)
+        {
+            continue;
+        }
+        let entities = dictionary
+            .get("system-entities")
+            .and_then(plist::Value::as_array)
+            .ok_or_else(|| {
+                ApfsError::InvalidAttachmentInventory(
+                    "matching image has no system-entities array".into(),
+                )
+            })?;
+        let candidate = parse_attachment_entities(entities)?;
+        if attachment.replace(candidate).is_some() {
+            return Err(ApfsError::InvalidAttachmentInventory(
+                "matching image has multiple inventory entries".into(),
+            ));
+        }
+    }
+    Ok(attachment)
+}
+
 /// Every whole device `hdiutil info -plist` currently attaches, across all images. The
 /// detach-settle check keys on the device rather than scoping by image: after a detach there
 /// may be no image to scope by, and the question is whether the device is gone at all.
@@ -2036,6 +2109,12 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
         .and_then(|root| root.get("system-entities"))
         .and_then(plist::Value::as_array)
         .ok_or_else(|| ApfsError::InvalidAttachmentPlist("missing system-entities array".into()))?;
+    parse_attachment_entities(system_entities)
+}
+
+fn parse_attachment_entities(
+    system_entities: &[plist::Value],
+) -> Result<(String, String), ApfsError> {
     let mut entities = Vec::new();
     for entity in system_entities {
         let dictionary = entity.as_dictionary().ok_or_else(|| {
@@ -5023,6 +5102,41 @@ mod tests {
                 .unwrap()
                 .devices
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn existing_attachment_reuses_one_inventory_mapping_without_attaching_again() {
+        let inventory = r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict>
+          <key>image-path</key><string>/tmp/cowshed-target.sparseimage</string>
+          <key>system-entities</key><array>
+            <dict><key>dev-entry</key><string>/dev/disk4</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
+            <dict><key>dev-entry</key><string>/dev/disk4s1</string><key>content-hint</key><string>Apple_APFS</string></dict>
+          </array>
+        </dict></array></dict></plist>"#;
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            CommandOutput::success(inventory),
+            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
+            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
+        ]));
+
+        let attachment = backend
+            .existing_attachment(
+                Path::new("/tmp/cowshed-target.sparseimage"),
+                ImageFormat::Sparse,
+            )
+            .expect("inventory")
+            .expect("existing attachment");
+        assert_eq!(attachment.whole_device(), "/dev/disk4");
+        assert_eq!(attachment.volume_device(), "/dev/disk5s2");
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(argv(&requests[0]), ["info", "-plist"]);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !argv(request).iter().any(|arg| *arg == "attach")),
+            "resume inventory must not create a duplicate attachment"
         );
     }
 

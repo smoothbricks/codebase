@@ -1960,6 +1960,7 @@ impl NativeProjectRuntimeHost {
     /// authorization to delete on every later command. Reports whether recovery mutated images or
     /// mounts, so a caller can discard an inventory read only when necessary.
     async fn recover_lifecycle_intents(&mut self) -> Result<bool> {
+        use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::recovery::{
             LifecycleIntent, LifecycleIntentCompletion, LifecycleIntentPhase,
         };
@@ -1995,6 +1996,22 @@ impl NativeProjectRuntimeHost {
                     LifecycleIntent::Create { workspace, options } => {
                         match self.current(&workspace).await {
                             Ok(current) => {
+                                // Activation is the image fence, not the end of the verb. Resume
+                                // host-side registration and the commitment before completing the
+                                // intent; both sinks are idempotent/append-safe on replay.
+                                if options.register {
+                                    self.register_workspace_in_main(&workspace).await?;
+                                }
+                                self.commitments
+                                    .record(CommitmentDraft::WorkspaceIntroduced {
+                                        repo_id: self.descriptor.repo_id.clone(),
+                                        workspace_incarnation: current
+                                            .derived
+                                            .workspace
+                                            .incarnation()
+                                            .clone(),
+                                    })
+                                    .await?;
                                 self.complete_lifecycle_intent(
                                     &workspace,
                                     LifecycleIntentCompletion::Workspace(
@@ -2014,6 +2031,24 @@ impl NativeProjectRuntimeHost {
                         destination,
                     } => match self.current(&destination).await {
                         Ok(current) => {
+                            let source_incarnation = self
+                                .current(&source)
+                                .await?
+                                .derived
+                                .workspace
+                                .incarnation()
+                                .clone();
+                            self.commitments
+                                .record(CommitmentDraft::Fork {
+                                    repo_id: self.descriptor.repo_id.clone(),
+                                    source_incarnation,
+                                    destination_incarnation: current
+                                        .derived
+                                        .workspace
+                                        .incarnation()
+                                        .clone(),
+                                })
+                                .await?;
                             self.complete_lifecycle_intent(
                                 &destination,
                                 LifecycleIntentCompletion::Workspace(
@@ -4458,8 +4493,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             ));
         }
         // The slot is recorded before anything derives a mount path, because the record is what
-        // decides where this workspace mounts. A failure after this point has to give the slot
-        // back: a binding without a workspace would keep the next tenant out for good.
+        // decides where this workspace mounts. It is part of the durable lifecycle intent: an
+        // exact retry binds it idempotently, while releasing it after a PendingFence clone exists
+        // could let another workspace claim the slot and make recovery impossible.
         let slot = options
             .slot
             .map(crate::metadata::SlotId::new)
@@ -4474,7 +4510,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         if let Some(slot) = slot {
             self.bind_slot(&workspace, slot).await?;
         }
-        let created = async {
+        async {
             let reservation = self.fresh_grants().await?;
             let identity = self
                 .operation_identity(
@@ -4508,21 +4544,27 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 .execute_create_staged(plan, move |stage| async move {
                     crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
                     let repository = crate::git::GitRepository::from_root(&stage.mount_point);
-                    repository.ensure_workspace_environment_wiring().await?;
                     if git_worktree {
+                        // Registration may have replaced the cloned `.git` directory with a
+                        // pointer before a kill. Resume that state machine before asking Git in
+                        // the workspace to inspect the environment hook.
                         repository
-                            .adopt_as_linked_worktree(
+                            .adopt_as_linked_worktree_resumable(
                                 &destination.to_string(),
                                 &main_mount,
                                 start.as_deref(),
+                                stage.resuming,
                             )
-                            .await
+                            .await?;
+                        repository.ensure_workspace_environment_wiring().await
                     } else {
+                        repository.ensure_workspace_environment_wiring().await?;
                         repository
-                            .prepare_workspace(
+                            .prepare_workspace_resumable(
                                 &destination.to_string(),
                                 &main_mount,
                                 start.as_deref(),
+                                stage.resuming,
                             )
                             .await
                             .map(|_| ())
@@ -4549,11 +4591,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             self.ensure_supervisor(&workspace).await?;
             self.snapshot_named(&workspace).await
         }
-        .await;
-        if created.is_err() && slot.is_some() {
-            let _ = self.release_slot(&workspace).await;
-        }
-        created
+        .await
     }
 
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot> {
@@ -4692,13 +4730,17 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .execute_fork_staged(plan, move |stage| async move {
                 crate::inherited_daemons::macos::discard_in(&stage.mount_point).await?;
                 let repository = crate::git::GitRepository::from_root(&stage.mount_point);
-                repository.ensure_workspace_environment_wiring().await?;
-                if !source_is_git_worktree {
-                    return Ok(());
+                if source_is_git_worktree {
+                    repository
+                        .adopt_as_linked_worktree_resumable(
+                            &forked.to_string(),
+                            &main_mount,
+                            None,
+                            stage.resuming,
+                        )
+                        .await?;
                 }
-                repository
-                    .adopt_as_linked_worktree(&forked.to_string(), &main_mount, None)
-                    .await
+                repository.ensure_workspace_environment_wiring().await
             })
             .await
             .map_err(native_staged_error)?;
@@ -5823,13 +5865,13 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             .await
             .map_err(native_storage_error)??;
 
-        if let Some(config) = replacement_config {
-            if let Some(handle) = self.supervisors.remove(&workspace) {
-                let replacement = handle
-                    .advance_authority(published.revision, topology_revision, config)
-                    .await?;
-                self.supervisors.insert(workspace, replacement);
-            }
+        if let Some(config) = replacement_config
+            && let Some(handle) = self.supervisors.remove(&workspace)
+        {
+            let replacement = handle
+                .advance_authority(published.revision, topology_revision, config)
+                .await?;
+            self.supervisors.insert(workspace, replacement);
         }
         Ok(published)
     }

@@ -137,6 +137,7 @@ impl IncarnationSource for UuidIncarnationSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataPolicy {
     Fresh,
+    FreshPendingFence,
     Preserve,
     PendingFence,
 }
@@ -191,6 +192,10 @@ pub struct WorkspaceStage {
     pub workspace: LifecycleWorkspace,
     pub mount_point: PathBuf,
     pub companion: PathBuf,
+    /// True when this callback is continuing a durable pending clone rather than initializing
+    /// bytes created by this invocation. Callers use this proof to admit only their own prior
+    /// branch/worktree state; a fresh operation must still reject pre-existing state.
+    pub resuming: bool,
 }
 
 pub type AdoptStage = WorkspaceStage;
@@ -228,6 +233,13 @@ pub struct PendingPublicationFact {
 pub struct ResumableStage {
     pub image: PathBuf,
     pub format: ImageFormat,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumableClone {
+    pub workspace: LifecycleWorkspace,
+    pub identity: OperationIdentity,
+    pub image: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -391,6 +403,25 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsStorageError>;
+    fn resumable_clone(
+        &self,
+        config: &ApfsSubstrateConfig,
+        source: &LifecycleWorkspace,
+        destination: &WorkspaceName,
+        destination_topology: Revision,
+        format: ImageFormat,
+        identity: &OperationIdentity,
+    ) -> Result<Option<ResumableClone>, ApfsStorageError> {
+        let _ = (
+            config,
+            source,
+            destination,
+            destination_topology,
+            format,
+            identity,
+        );
+        Ok(None)
+    }
     fn resumable_staged_adopt(
         &self,
         config: &ApfsSubstrateConfig,
@@ -413,6 +444,29 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsStorageError>;
+    /// Attach and mount a pending canonical clone, reusing an exact surviving kernel mount and
+    /// otherwise replacing an unmounted crash-left attachment before mounting. Implementations
+    /// own cleanup when either the mount or replacement attach fails.
+    fn attach_and_mount_resumable(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+        mount_point: &Path,
+        _workspace: &LifecycleWorkspace,
+    ) -> Result<Self::Attachment, ApfsStorageError> {
+        let attachment = self.attach_verified(image, format)?;
+        match self.mount(&attachment, mount_point, MountAccess::ReadWrite, false) {
+            Ok(()) => Ok(attachment),
+            Err(primary) => match self.detach(attachment, DetachIntent::Release) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(ApfsStorageError::Cleanup {
+                    operation: "pending clone mount",
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }),
+            },
+        }
+    }
     fn chown_volume_root(&self, mount_point: &Path) -> Result<(), ApfsStorageError>;
     fn rename_volume(&self, mount_point: &Path, volume_name: &str) -> Result<(), ApfsStorageError>;
     fn mint_workspace_credentials(
@@ -524,6 +578,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         identity: Option<&OperationIdentity>,
         source_image: Option<&Path>,
     ) -> Result<(), ApfsStorageError>;
+    fn activate_pending_clone(
+        &self,
+        image: &Path,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<(), ApfsStorageError> {
+        let _ = (image, workspace);
+        Ok(())
+    }
     fn publish_checkpoint_fact(
         &self,
         image: &Path,
@@ -971,31 +1033,27 @@ where
                 )
             })
             .await?;
-        let prepared =
-            StagedCallbackGuard::new(Arc::clone(&self.host), prepared, abort_prepared_clone::<H>);
+        let prepared = StagedCallbackGuard::new(
+            Arc::clone(&self.host),
+            prepared,
+            preserve_prepared_clone::<H>,
+        );
 
-        eprintln!("cowshed: apfs staging/init start");
+        eprintln!("cowshed: apfs canonical/init start");
         let init_started = Instant::now();
         let initialized = initialize(prepared.get().stage.clone()).await;
         eprintln!(
-            "cowshed: apfs staging/init done elapsed={:?} status={}",
+            "cowshed: apfs canonical/init done elapsed={:?} status={}",
             init_started.elapsed(),
             if initialized.is_ok() { "ok" } else { "err" }
         );
         if let Err(initializer) = initialized {
-            let prepared = prepared.into_prepared();
-            let host = Arc::clone(&self.host);
-            let cleanup = self
-                .lane
-                .dispatch(move || abort_prepared_clone(host.as_ref(), prepared))
-                .await;
-            return Err(match cleanup {
-                Ok(()) => StagedExecutionError::Initializer(initializer),
-                Err(cleanup) => StagedExecutionError::InitializerCleanup {
-                    initializer,
-                    cleanup,
-                },
-            });
+            // The callback can already have changed state outside the image (Git branches,
+            // worktree registrations, remotes). The PendingFence is the rollback boundary: keep
+            // the exact mounted clone so the durable lifecycle intent can re-enter the
+            // initializer with resume authority rather than orphaning those external effects.
+            let _prepared = prepared.into_prepared();
+            return Err(StagedExecutionError::Initializer(initializer));
         }
         let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);
@@ -1725,9 +1783,7 @@ enum CloneKind {
 struct PreparedClone<A> {
     stage: WorkspaceStage,
     attachment: A,
-    staged_image: PathBuf,
-    canonical_image: PathBuf,
-    canonical_mount: PathBuf,
+    image: PathBuf,
 }
 
 struct PendingRestore {
@@ -2029,6 +2085,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
             workspace,
             mount_point,
             companion: staged_companion,
+            resuming: false,
         },
         attachment,
         staged_image: created.path,
@@ -2173,90 +2230,103 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         destination: destination_name,
         format,
         fork,
-        identity,
+        identity: requested_identity,
     } = execution;
     let source = active_expected(expected, source_name, format)?;
     let destination_topology = absent_expected(expected)?;
-    let workspace = LifecycleWorkspace::new(
-        source.repo().clone(),
-        destination_name.clone(),
-        incarnations.mint()?,
-        Revision::new(source.revision().get() + 1),
-        Revision::new(destination_topology.get() + 1),
-        WorkspaceRole::Workspace,
+    let resumed = host.resumable_clone(
+        config,
+        &source,
+        destination_name,
+        destination_topology,
         format,
-    )
-    .map_err(|_| ApfsStorageError::InvalidPlan("invalid cloned workspace identity"))?;
-    let source_image = canonical_image_path(config, &source)?;
-    let canonical_image = canonical_image_path(config, &workspace)?;
-    let canonical_mount = mount_point(config, &workspace)?;
-    let staged_image = staging_image(config, &workspace)?;
-    let staging_mount = staging_mount(config, &workspace)?;
-    let staged_companion = companion_path(&staged_image);
-
-    // No span here: the backend times sync+clonefile itself, and a second staging/clone
-    // pair would read as one nested step. Same rule for attach (attach+fsck) and mount
-    // below — storage spans only the logical legs the backend does not time.
-    host.clone_image(&source_image, &staged_image, format)?;
-    if let Err(primary) = timed_apfs_step("staging", "metadata", || {
-        host.publish_metadata(
-            &staged_image,
-            &workspace,
-            workspace.revision(),
-            MetadataPolicy::Fresh,
-            Some(identity),
-            Some(&source_image),
-        )
-    }) {
-        return combine_cleanup(
-            "clone staging metadata",
-            primary,
-            host.reclaim_image(&staged_image, format),
-        );
-    }
-    let attachment = match host.attach_verified(&staged_image, format) {
-        Ok(attachment) => attachment,
-        Err(primary) => {
-            return combine_cleanup(
-                "clone staging attachment",
-                primary,
-                host.reclaim_image(&staged_image, format),
-            );
+        requested_identity,
+    )?;
+    let (workspace, identity, canonical_image, resuming) = match resumed {
+        Some(resumed) => (resumed.workspace, resumed.identity, resumed.image, true),
+        None => {
+            let workspace = LifecycleWorkspace::new(
+                source.repo().clone(),
+                destination_name.clone(),
+                incarnations.mint()?,
+                Revision::new(source.revision().get() + 1),
+                Revision::new(destination_topology.get() + 1),
+                WorkspaceRole::Workspace,
+                format,
+            )
+            .map_err(|_| ApfsStorageError::InvalidPlan("invalid cloned workspace identity"))?;
+            let canonical_image = canonical_image_path(config, &workspace)?;
+            (
+                workspace,
+                requested_identity.clone(),
+                canonical_image,
+                false,
+            )
         }
     };
-    let prepared = host
-        .mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
-        .and_then(|()| {
-            timed_apfs_step("staging", "rename", || {
-                host.rename_volume(
-                    &staging_mount,
-                    &volume_label(workspace.repo(), workspace.name()),
-                )
-            })?;
-            timed_apfs_step("staging", "creds", || {
-                host.mint_workspace_credentials(
-                    &workspace,
-                    &staged_image,
-                    &staging_mount,
-                    &canonical_mount,
-                    &staged_companion,
-                )
-            })?;
-            timed_apfs_step("staging", "marker", || {
-                host.write_marker(
-                    &staging_mount,
-                    &workspace,
-                    fork.then_some(source.name()),
-                    identity,
-                )
-            })?;
-            timed_apfs_step("staging", "validate", || {
-                host.validate_marker(
-                    &staging_mount,
-                    &MarkerExpectation::freshly_stamped(&workspace),
-                )
-            })
-        });
+    let source_image = canonical_image_path(config, &source)?;
+    let canonical_mount = mount_point(config, &workspace)?;
+    let canonical_companion = companion_path(&canonical_image);
+
+    if !resuming {
+        // The sidecar is the publication fence and is durable before the canonical payload name
+        // appears. A crash in the gap leaves a sidecar-only record that recover_pending removes;
+        // once the payload exists, PendingFence keeps it out of enumeration until init completes.
+        timed_apfs_step("canonical", "metadata-pending", || {
+            host.publish_metadata(
+                &canonical_image,
+                &workspace,
+                workspace.revision(),
+                MetadataPolicy::FreshPendingFence,
+                Some(&identity),
+                Some(&source_image),
+            )
+        })?;
+        if let Err(primary) = host.clone_image(&source_image, &canonical_image, format) {
+            return combine_cleanup(
+                "clone canonical payload",
+                primary,
+                host.reclaim_image(&canonical_image, format),
+            );
+        }
+    }
+
+    // An attach/mount refusal can be reporting a crash-left live kernel mount or ambiguous
+    // inventory. Preserve the PendingFence payload for the next authoritative recovery pass;
+    // reclaiming a possibly mounted backing image would trade a diagnosable retry for data loss.
+    let attachment =
+        host.attach_and_mount_resumable(&canonical_image, format, &canonical_mount, &workspace)?;
+    let prepared = timed_apfs_step("canonical", "rename", || {
+        host.rename_volume(
+            &canonical_mount,
+            &volume_label(workspace.repo(), workspace.name()),
+        )
+    })
+    .and_then(|()| {
+        timed_apfs_step("canonical", "creds", || {
+            host.mint_workspace_credentials(
+                &workspace,
+                &canonical_image,
+                &canonical_mount,
+                &canonical_mount,
+                &canonical_companion,
+            )
+        })?;
+        timed_apfs_step("canonical", "marker", || {
+            host.write_marker(
+                &canonical_mount,
+                &workspace,
+                fork.then_some(source.name()),
+                &identity,
+            )
+        })?;
+        timed_apfs_step("canonical", "validate", || {
+            host.validate_marker(
+                &canonical_mount,
+                &MarkerExpectation::freshly_stamped(&workspace),
+            )
+        })
+    });
     if let Err(primary) = prepared {
         return combine_cleanup(
             "clone preparation",
@@ -2264,100 +2334,65 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             detach_and_reclaim(
                 host,
                 attachment,
-                &staged_image,
+                &canonical_image,
                 format,
-                "clone staging detach",
+                "clone canonical detach",
             ),
         );
     }
     Ok(PreparedClone {
         stage: WorkspaceStage {
             workspace,
-            mount_point: staging_mount,
-            companion: staged_companion,
+            mount_point: canonical_mount,
+            companion: canonical_companion,
+            resuming,
         },
         attachment,
-        staged_image,
-        canonical_image,
-        canonical_mount,
+        image: canonical_image,
     })
 }
 
-fn abort_prepared_clone<H: ApfsExecutionHost>(
-    host: &H,
-    prepared: PreparedClone<H::Attachment>,
+fn preserve_prepared_clone<H: ApfsExecutionHost>(
+    _host: &H,
+    _prepared: PreparedClone<H::Attachment>,
 ) -> Result<(), ApfsStorageError> {
-    detach_and_reclaim(
-        host,
-        prepared.attachment,
-        &prepared.staged_image,
-        prepared.stage.workspace.format(),
-        "clone staging detach",
-    )
+    // Cancellation can occur after the initializer changed Git state outside this image. Dropping
+    // the userspace attachment handle leaves the kernel mount and PendingFence intact for the
+    // durable lifecycle intent to resume; detaching and reclaiming here would orphan those effects.
+    Ok(())
 }
 
 fn commit_prepared_clone<H: ApfsExecutionHost>(
     host: &H,
-    config: &ApfsSubstrateConfig,
+    _config: &ApfsSubstrateConfig,
     prepared: PreparedClone<H::Attachment>,
 ) -> Result<Applied, ApfsStorageError> {
     let PreparedClone {
         stage,
         attachment,
-        staged_image,
-        canonical_image,
-        canonical_mount,
+        image,
     } = prepared;
-    if let Err(primary) = timed_apfs_step("staging", "validate-companion", || {
+    // The callback has already run and may have changed external Git state. On failure, `?`
+    // leaves the exact PendingFence clone mounted so recovery can rerun initialization and
+    // validation.
+    timed_apfs_step("canonical", "validate-companion", || {
         host.validate_staged_companion(&stage.companion)
     })
     .and_then(|()| {
-        timed_apfs_step("staging", "validate", || {
+        timed_apfs_step("canonical", "validate", || {
             host.validate_marker(
                 &stage.mount_point,
                 &MarkerExpectation::freshly_stamped(&stage.workspace),
             )
         })
-    }) {
-        return combine_cleanup(
-            "clone post-callback validation",
-            primary,
-            detach_and_reclaim(
-                host,
-                attachment,
-                &staged_image,
-                stage.workspace.format(),
-                "clone staging detach",
-            ),
-        );
-    }
-    if let Err(primary) = timed_apfs_step("staging", "detach", || {
-        host.detach(attachment, DetachIntent::Release)
-    }) {
-        return combine_cleanup(
-            "clone staging detach",
-            primary,
-            host.reclaim_image(&staged_image, stage.workspace.format()),
-        );
-    }
-    if let Err(primary) = timed_apfs_step("canonical", "publish", || {
-        host.publish_image(&staged_image, &canonical_image)
-    }) {
-        let cleanup = match primary.disposition() {
-            PublicationDisposition::RolledBack => {
-                host.reclaim_image(&staged_image, stage.workspace.format())
-            }
-            PublicationDisposition::ForwardOnly => Ok(()),
-        };
-        return combine_cleanup("clone publication", primary.into_source(), cleanup);
-    }
-    mount_canonical(
-        host,
-        config,
-        &canonical_image,
-        &canonical_mount,
-        &stage.workspace,
-    )?;
+    })?;
+    timed_apfs_step("canonical", "activate", || {
+        host.activate_pending_clone(&image, &stage.workspace)
+    })?;
+    timed_apfs_step("canonical", "retain", || {
+        host.retain_mounted(&stage.workspace, attachment)
+    })
+    .map(|_| ())?;
     Ok(Applied::Lifecycle(LifecycleReceipt {
         resulting_revision: stage.workspace.revision(),
         workspace: stage.workspace,
@@ -2570,6 +2605,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
             workspace: replacement,
             mount_point: staging_mount,
             companion: staged_companion,
+            resuming: false,
         },
         attachment,
         staged_image,

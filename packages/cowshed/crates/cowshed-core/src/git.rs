@@ -1330,17 +1330,67 @@ impl GitRepository {
         ensure_git_success("create workspace branch", output)
     }
 
-    /// Configure local-only workspace Git and create its session branch.
-    ///
-    /// `main_mount` is main's *canonical mount*, never the recorded checkout path. Under the
-    /// symlink layout those differ, and the checkout path is a symlink outside the workspace's read
-    /// grants that dangles the moment the checkout moves; the canonical mount is the path the
-    /// substrate owns, the grants cover, and `cowshed mv` maintains.
+    async fn ensure_workspace_branch_checked_out(
+        &self,
+        branch: &str,
+        branch_ref: &str,
+    ) -> Result<()> {
+        let current = self.run(["symbolic-ref", "--quiet", "HEAD"]).await?;
+        if current.status.success() {
+            let current = parse_one_string(&current.stdout, "resumed workspace branch")?;
+            if current == branch_ref {
+                return Ok(());
+            }
+        } else if current.status.code() != Some(1) {
+            return Err(git_internal("resolve resumed workspace branch", &current));
+        }
+        let switched = self.run(["switch", branch]).await?;
+        ensure_git_success("resume workspace branch", switched)
+    }
+
+    async fn workspace_branch_for_initialization(
+        &self,
+        name: &str,
+        holder: &str,
+        retry: String,
+        resuming: bool,
+    ) -> Result<(String, bool)> {
+        let (branch, branch_ref) = workspace_branch(name);
+        if !resuming {
+            return self
+                .ensure_workspace_branch_absent(name, holder, retry)
+                .await
+                .map(|branch| (branch, false));
+        }
+        let exists = self
+            .run(["show-ref", "--verify", "--quiet", branch_ref.as_str()])
+            .await?;
+        match exists.status.code() {
+            Some(1) => Ok((branch, false)),
+            Some(0) => Ok((branch, true)),
+            _ => Err(git_internal("check resumed workspace branch", &exists)),
+        }
+    }
+
+    /// Configure a fresh standalone workspace. Branch collisions remain strict.
     pub async fn prepare_workspace(
         &self,
         name: &str,
         main_mount: &Path,
         start: Option<&str>,
+    ) -> Result<MainRemote> {
+        self.prepare_workspace_resumable(name, main_mount, start, false)
+            .await
+    }
+
+    /// Configure local-only workspace Git, continuing this clone's branch only when `resuming`
+    /// proves the canonical image came from the pending lifecycle record.
+    pub async fn prepare_workspace_resumable(
+        &self,
+        name: &str,
+        main_mount: &Path,
+        start: Option<&str>,
+        resuming: bool,
     ) -> Result<MainRemote> {
         if !main_mount.is_absolute() {
             return Err(CowshedError::usage(
@@ -1348,33 +1398,28 @@ impl GitRepository {
                 "retry from a resolved repository root",
             ));
         }
-        let branch = self
-            .ensure_workspace_branch_absent(
-                name,
-                "the cloned workspace",
-                format!("remove or rename cowshed/{name}, then retry: cowshed new {name}"),
-            )
+        let retry = format!("remove or rename cowshed/{name}, then retry: cowshed new {name}");
+        let (branch, branch_ready) = self
+            .workspace_branch_for_initialization(name, "the cloned workspace", retry, resuming)
             .await?;
 
         // The `.git` directory arrived by CoW carrying every remote main had, including network
-        // URLs. Sandboxed git speaks only local paths, so a fresh mint drops the lot before
-        // configuring its own upstream — this is the "no remote URL ever exists inside a sandbox"
-        // invariant, not a clobber of user intent: nothing in this repository is the user's yet.
+        // URLs. Replaying this loop is safe: an earlier pass leaves either no remotes or the local
+        // cowshed-owned `main`, which configure_main_remote recreates below.
         for remote in self.remote_names().await? {
             let output = self.run(["remote", "remove", remote.as_str()]).await?;
             ensure_git_success("remove inherited remote", output)?;
         }
-
-        // The working tree arrived by CoW for the same reason, and carries the same hazard one
-        // layer out: a symlink whose target climbs above the tree root was computed against
-        // main's depth, so here it lands somewhere else entirely — dangling, or silently
-        // resolving onto a directory main never meant. Restoring those is the same repair as
-        // the remotes above, and it is confined to links that escape: an in-tree link is
-        // correct at any depth already ([`crate::inherited_links`]).
         self.restore_inherited_links(main_mount).await?;
         let main_remote = self.configure_main_remote(main_mount).await?;
 
-        self.switch_to_workspace_branch(&branch, start).await?;
+        if branch_ready {
+            let (_, branch_ref) = workspace_branch(name);
+            self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
+                .await?;
+        } else {
+            self.switch_to_workspace_branch(&branch, start).await?;
+        }
         Ok(main_remote)
     }
 
@@ -1739,6 +1784,19 @@ impl GitRepository {
         main_mount: &Path,
         start: Option<&str>,
     ) -> Result<()> {
+        self.adopt_as_linked_worktree_resumable(name, main_mount, start, false)
+            .await
+    }
+
+    /// Continue the exact linked-worktree registration left by a pending canonical clone.
+    /// `resuming` is not inferred from Git state: only the storage lifecycle fence may grant it.
+    pub async fn adopt_as_linked_worktree_resumable(
+        &self,
+        name: &str,
+        main_mount: &Path,
+        start: Option<&str>,
+        resuming: bool,
+    ) -> Result<()> {
         if !main_mount.is_absolute() {
             return Err(CowshedError::usage(
                 "linked worktree repository must be an absolute local path",
@@ -1746,65 +1804,84 @@ impl GitRepository {
             ));
         }
         let main = Self::from_root(main_mount);
-        // The branch is created in main's ref namespace, so the collision to check is main's, not
-        // this image's — the image is about to stop having a ref namespace of its own.
-        let branch = main
-            .ensure_workspace_branch_absent(
-                name,
-                "main's repository",
-                format!(
-                    "remove or rename cowshed/{name}, then retry: cowshed new {name} --git-worktree"
-                ),
-            )
+        let retry = format!(
+            "remove or rename cowshed/{name}, then retry: cowshed new {name} --git-worktree"
+        );
+        let (branch, branch_ref) = workspace_branch(name);
+        let branch_exists = main
+            .run(["show-ref", "--verify", "--quiet", branch_ref.as_str()])
             .await?;
+        let branch_ready = match branch_exists.status.code() {
+            Some(0) if resuming => true,
+            Some(0) => {
+                return Err(CowshedError::conflict(
+                    format!("branch {branch} already exists in main's repository"),
+                    retry,
+                ));
+            }
+            Some(1) => false,
+            _ => return Err(git_internal("check linked-worktree branch", &branch_exists)),
+        };
+
         let admin = main.worktree_admin_dir(name).await?;
-        if admin.exists() {
+        let mount = self.root.clone();
+        let staging = mount.join(WORKTREE_STAGING);
+        let staged = staging.join(name);
+        let staged_dot_git = staged.join(".git");
+        let dot_git = mount.join(".git");
+
+        if admin.exists() && !resuming {
             return Err(CowshedError::conflict(
                 format!("main already registers a linked worktree named {name}"),
                 format!("cowshed rm {name}"),
             ));
         }
+        if branch_ready && !admin.is_dir() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "resumed branch {branch} exists without linked-worktree registration {name}"
+                ),
+                "cowshed doctor --json",
+            ));
+        }
 
-        let head = main.head_oid().await?;
-        let mount = self.root.clone();
-        let staging = mount.join(WORKTREE_STAGING);
-        let staged = staging.join(name);
-        let dot_git = mount.join(".git");
-        tokio::task::spawn_blocking({
-            let dot_git = dot_git.clone();
-            let staging = staging.clone();
-            move || -> std::io::Result<()> {
-                if dot_git.is_dir() {
-                    fs::remove_dir_all(&dot_git)?;
-                } else if dot_git.exists() {
-                    fs::remove_file(&dot_git)?;
+        if !admin.exists() {
+            let head = main.head_oid().await?;
+            tokio::task::spawn_blocking({
+                let dot_git = dot_git.clone();
+                let staging = staging.clone();
+                move || -> std::io::Result<()> {
+                    if dot_git.is_dir() {
+                        fs::remove_dir_all(&dot_git)?;
+                    } else if dot_git.exists() {
+                        fs::remove_file(&dot_git)?;
+                    }
+                    if staging.exists() {
+                        fs::remove_dir_all(&staging)?;
+                    }
+                    fs::create_dir_all(&staging)
                 }
-                if staging.exists() {
-                    fs::remove_dir_all(&staging)?;
-                }
-                fs::create_dir_all(&staging)
-            }
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("prepare worktree staging: {error}")))?
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "prepare worktree staging at {}: {error}",
-                staging.display()
-            ))
-        })?;
-
-        let output = main
-            .run([
-                OsStr::new("worktree"),
-                OsStr::new("add"),
-                OsStr::new("--no-checkout"),
-                OsStr::new("--detach"),
-                staged.as_os_str(),
-                OsStr::new(head.as_str()),
-            ])
-            .await?;
-        ensure_git_success("register linked worktree", output)?;
+            })
+            .await
+            .map_err(|error| CowshedError::internal(format!("prepare worktree staging: {error}")))?
+            .map_err(|error| {
+                CowshedError::internal(format!(
+                    "prepare worktree staging at {}: {error}",
+                    staging.display()
+                ))
+            })?;
+            let output = main
+                .run([
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--no-checkout"),
+                    OsStr::new("--detach"),
+                    staged.as_os_str(),
+                    OsStr::new(head.as_str()),
+                ])
+                .await?;
+            ensure_git_success("register linked worktree", output)?;
+        }
         if !admin.is_dir() {
             return Err(CowshedError::integrity(
                 format!("git registered the linked worktree for {name} under another id"),
@@ -1812,34 +1889,60 @@ impl GitRepository {
             ));
         }
 
-        tokio::task::spawn_blocking({
-            let staged = staged.clone();
-            let staging = staging.clone();
-            move || -> std::io::Result<()> {
-                fs::rename(staged.join(".git"), &dot_git)?;
-                fs::remove_dir_all(&staging)
+        if dot_git.is_dir() {
+            return Err(CowshedError::integrity(
+                format!("linked-worktree registration {name} exists beside a full .git directory"),
+                "cowshed doctor --json",
+            ));
+        }
+        if !dot_git.exists() {
+            if !staged_dot_git.is_file() {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "linked-worktree registration {name} has neither canonical nor staged .git pointer"
+                    ),
+                    "cowshed doctor --json",
+                ));
             }
-        })
-        .await
-        .map_err(|error| CowshedError::internal(format!("relocate worktree pointer: {error}")))?
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "relocate worktree pointer onto {}: {error}",
-                mount.display()
-            ))
-        })?;
+            tokio::task::spawn_blocking({
+                let dot_git = dot_git.clone();
+                let staged_dot_git = staged_dot_git.clone();
+                move || fs::rename(staged_dot_git, dot_git)
+            })
+            .await
+            .map_err(|error| CowshedError::internal(format!("relocate worktree pointer: {error}")))?
+            .map_err(|error| {
+                CowshedError::internal(format!(
+                    "relocate worktree pointer onto {}: {error}",
+                    mount.display()
+                ))
+            })?;
+        }
+        if staging.exists() {
+            let staging_for_remove = staging.clone();
+            tokio::task::spawn_blocking(move || fs::remove_dir_all(staging_for_remove))
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("remove worktree staging: {error}"))
+                })?
+                .map_err(|error| {
+                    CowshedError::internal(format!(
+                        "remove worktree staging at {}: {error}",
+                        staging.display()
+                    ))
+                })?;
+        }
 
-        // Reconcile the other direction: the admin directory still records the staging path.
         main.repair_linked_worktree(&mount).await?;
-
-        // `--no-checkout` left the index empty, so every file the clone brought would read as
-        // deleted. A mixed reset refills the index from HEAD without touching the tree, which
-        // leaves main's uncommitted edits showing as modified — exactly what a standalone clone of
-        // the same image shows.
         let reset = self.run(["reset", "-q"]).await?;
         ensure_git_success("populate linked worktree index", reset)?;
-
-        self.switch_to_workspace_branch(&branch, start).await?;
+        if branch_ready {
+            let (_, branch_ref) = workspace_branch(name);
+            self.ensure_workspace_branch_checked_out(&branch, &branch_ref)
+                .await?;
+        } else {
+            self.switch_to_workspace_branch(&branch, start).await?;
+        }
         Ok(())
     }
 
@@ -2576,6 +2679,39 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
+    #[tokio::test]
+    async fn standalone_workspace_resume_accepts_only_its_current_branch() {
+        let root = repository();
+        let repo = GitRepository::from_root(&root);
+        repo.prepare_workspace("raven", &root, Some("main"))
+            .await
+            .expect("initial preparation");
+
+        let switched = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["switch", "--quiet", "main"])
+            .status()
+            .expect("move HEAD away after branch creation");
+        assert!(switched.success());
+        repo.prepare_workspace_resumable("raven", &root, Some("main"), true)
+            .await
+            .expect("resume current workspace branch");
+        assert_eq!(
+            repo.current_branch()
+                .await
+                .expect("current branch")
+                .as_deref(),
+            Some("cowshed/raven")
+        );
+        let error = repo
+            .prepare_workspace("raven", &root, Some("main"))
+            .await
+            .expect_err("fresh operation still refuses the existing branch");
+        assert_eq!(error.code.as_str(), "conflict");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
     /// Clone main's tree the way the substrate does — files and all, `.git` included — so the
     /// mint step under test starts from exactly what a CoW clone hands it.
     fn clone_image(main: &Path) -> PathBuf {
@@ -2666,6 +2802,35 @@ mod tests {
 
         fs::remove_dir_all(main).expect("remove fixture");
         fs::remove_dir_all(mount).expect("remove clone");
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_resume_reuses_completed_registration() {
+        let main = repository();
+        let mount = clone_image(&main);
+        let workspace = GitRepository::from_root(&mount);
+        workspace
+            .adopt_as_linked_worktree("raven", &main, None)
+            .await
+            .expect("initial linked worktree");
+
+        workspace
+            .adopt_as_linked_worktree_resumable("raven", &main, None, true)
+            .await
+            .expect("resume linked worktree");
+        assert_eq!(
+            workspace
+                .current_branch()
+                .await
+                .expect("current branch")
+                .as_deref(),
+            Some("cowshed/raven")
+        );
+        assert!(main.join(".git/worktrees/raven").is_dir());
+        assert!(mount.join(".git").is_file());
+        assert!(!mount.join(".cowshed/worktree-staging").exists());
+        fs::remove_dir_all(main).expect("remove main");
+        fs::remove_dir_all(mount).expect("remove workspace");
     }
 
     /// Unregistering one workspace must leave every other registration alone — including one whose
