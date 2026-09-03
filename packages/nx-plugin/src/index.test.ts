@@ -366,6 +366,142 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('attributes one repository-root Cargo workspace across package projects', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('package.json', '{"name":"@axe.sc/codebase"}\n');
+      await workspace.write('packages/runtime/package.json', '{"name":"@axe.sc/runtime","nx":{"name":"runtime"}}\n');
+      await workspace.write('packages/wasm/package.json', '{"name":"@axe.sc/wasm","nx":{"name":"wasm"}}\n');
+      await workspace.write(
+        'packages/native/package.json',
+        JSON.stringify({
+          name: '@axe.sc/native',
+          nx: { name: 'native' },
+          napi: {
+            binaryName: 'native',
+            targets: ['aarch64-apple-darwin'],
+          },
+        }),
+      );
+      await workspace.write(
+        'Cargo.toml',
+        [
+          '[workspace]',
+          'members = ["packages/runtime/crates/*", "packages/wasm", "packages/native/crates/*"]',
+          '',
+        ].join('\n'),
+      );
+      await workspace.write('Cargo.lock', 'version = 4\n');
+      await workspace.write(
+        'packages/runtime/crates/runtime-core/Cargo.toml',
+        '[package]\nname = "runtime-core"\n\n[package.metadata.smoothbricks.test]\nshards = 2\n',
+      );
+      await workspace.write(
+        'packages/wasm/Cargo.toml',
+        [
+          '[package]',
+          'name = "runtime-wasm"',
+          '',
+          '[lib]',
+          'crate-type = ["cdylib", "rlib"]',
+          '',
+          '[package.metadata.smoothbricks.wasm-bindgen]',
+          'targets = ["web"]',
+          '',
+        ].join('\n'),
+      );
+      await workspace.write(
+        'packages/native/crates/native-napi/Cargo.toml',
+        '[package]\nname = "native-napi"\n\n[lib]\ncrate-type = ["cdylib"]\n',
+      );
+
+      const inferred = await inferTargets(
+        ['package.json', 'packages/runtime/package.json', 'packages/wasm/package.json', 'packages/native/package.json'],
+        undefined,
+        workspace.context,
+      );
+      const projects = new Map(inferred.flatMap(([, result]) => Object.entries(result.projects ?? {})));
+      const root = projects.get('.')?.targets ?? {};
+      const runtime = projects.get('packages/runtime')?.targets ?? {};
+      const wasm = projects.get('packages/wasm')?.targets ?? {};
+      const native = projects.get('packages/native')?.targets ?? {};
+      const rootProject = '@axe.sc/codebase';
+      const rootFetch = { projects: [rootProject], target: 'cargo-fetch' };
+      const rootCompile = { projects: [rootProject], target: 'cargo-test-compile' };
+
+      expect(
+        [...projects]
+          .filter(([, project]) => project.targets?.['cargo-test-compile'])
+          .map(([projectRoot]) => projectRoot),
+      ).toEqual(['.']);
+      expect(root['cargo-fetch']?.options).toEqual({
+        commands: ['cargo fetch --locked'],
+        cwd: '.',
+        parallel: false,
+      });
+      expect(root['cargo-test-compile']?.options).toMatchObject({
+        command: 'cargo --frozen test --workspace --no-run',
+        cwd: '.',
+      });
+      expect(root['cargo-lint']?.options).toMatchObject({ cwd: '.' });
+      expect(root['cargo-test']?.dependsOn).toHaveLength(5);
+
+      expect(runtime['cargo-test-runtime-core-shard1']?.dependsOn).toEqual([
+        rootFetch,
+        { projects: ['native'], target: 'cargo-test-native-napi' },
+      ]);
+      expect(runtime['cargo-test-runtime-core-shard2']?.dependsOn).toEqual([
+        rootFetch,
+        'cargo-test-runtime-core-shard1',
+      ]);
+      expect(runtime['cargo-test-runtime-core-exceptions']?.dependsOn).toEqual([
+        rootFetch,
+        'cargo-test-runtime-core-shard2',
+      ]);
+      expect(runtime['cargo-test-runtime-core-shard1']?.options).toMatchObject({ cwd: '.' });
+      expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
+        'nextest run --workspace -p runtime-core',
+      );
+      expect(runtime['cargo-test']?.dependsOn).toEqual([
+        'cargo-test-runtime-core-shard1',
+        'cargo-test-runtime-core-shard2',
+        'cargo-test-runtime-core-exceptions',
+      ]);
+      expect(runtime['cargo-lint']).toBeUndefined();
+      expect(runtime.clean).toBeUndefined();
+
+      expect(wasm['cargo-test-runtime-wasm']?.dependsOn).toEqual([
+        rootFetch,
+        { projects: ['runtime'], target: 'cargo-test-runtime-core-exceptions' },
+      ]);
+      expect(wasm['cargo-wasm']?.options).toMatchObject({ cwd: '.' });
+      expect(wasm['cargo-wasm']?.options?.commands).toContain(
+        'cargo --frozen build --release --target wasm32-unknown-unknown --target-dir target/cargo-wasm -p runtime-wasm',
+      );
+      expect(wasm['cargo-wasm']?.outputs).toEqual(['{projectRoot}/dist-wasm']);
+      expect(wasm['cargo-wasm']?.dependsOn).toEqual([rootFetch, '^build']);
+      expect(wasm.build?.dependsOn).toContainEqual(rootCompile);
+      expect(wasm.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+
+      expect(native['cargo-test-native-napi']?.dependsOn).toEqual([rootFetch, 'napi-debug']);
+      expect(native['napi-debug']?.dependsOn).toContainEqual(rootCompile);
+      expect(native['napi-debug']?.options).toMatchObject({
+        cwd: '.',
+        command:
+          'napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/.cache/native-debug',
+      });
+      expect(native['napi-arm64-macos']?.options).toMatchObject({
+        cwd: '.',
+        command:
+          'napi build --release --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/dist/native/darwin-arm64',
+      });
+      expect(native.build?.dependsOn).toContainEqual(rootCompile);
+      expect(native.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('scopes each per-crate cargo-test command to exactly one package', async () => {
     const workspace = await createWorkspace();
     try {

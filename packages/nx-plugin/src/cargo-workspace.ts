@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, normalize, posix, relative, sep } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
@@ -13,6 +13,16 @@ export interface CargoWorkspacePackage {
   testShards: number;
 }
 
+export interface CargoWorkspaceProject {
+  name: string;
+  root: string;
+}
+
+export interface AttributedCargoWorkspacePackage extends CargoWorkspacePackage {
+  projectName: string;
+  projectRoot: string;
+}
+
 export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWorkspacePackage[] {
   const workspaceTomlPath = join(absoluteProjectRoot, 'Cargo.toml');
   if (!existsSync(workspaceTomlPath)) {
@@ -22,12 +32,30 @@ export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWo
   if (!isRecord(parsed) || !isRecord(parsed.workspace) || !Array.isArray(parsed.workspace.members)) {
     return [];
   }
-  const packages: CargoWorkspacePackage[] = [];
+  const excludedDirs = new Set<string>();
+  if (Array.isArray(parsed.workspace.exclude)) {
+    for (const excluded of parsed.workspace.exclude) {
+      if (typeof excluded === 'string' && excluded.length > 0) {
+        for (const excludedDir of expandCargoMemberDirs(absoluteProjectRoot, excluded, false)) {
+          excludedDirs.add(excludedDir);
+        }
+      }
+    }
+  }
+  const packageDirs = new Set<string>();
   for (const member of parsed.workspace.members) {
     if (typeof member !== 'string' || member.length === 0) {
       continue;
     }
-    const crateTomlPath = join(absoluteProjectRoot, member, 'Cargo.toml');
+    for (const memberDir of expandCargoMemberDirs(absoluteProjectRoot, member)) {
+      if (!isExcludedCargoMember(memberDir, excludedDirs)) {
+        packageDirs.add(memberDir);
+      }
+    }
+  }
+  const packages: CargoWorkspacePackage[] = [];
+  for (const memberDir of packageDirs) {
+    const crateTomlPath = join(absoluteProjectRoot, memberDir, 'Cargo.toml');
     if (!existsSync(crateTomlPath)) {
       continue;
     }
@@ -37,7 +65,7 @@ export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWo
     }
     packages.push({
       name: crateParsed.package.name,
-      dir: member.split('\\').join('/'),
+      dir: memberDir,
       testShards: readTestShards(crateParsed.package, crateTomlPath),
     });
   }
@@ -45,7 +73,108 @@ export function listCargoWorkspacePackages(absoluteProjectRoot: string): CargoWo
   return packages;
 }
 
-export async function cargoPackageTestInputs(absoluteProjectRoot: string, memberDir: string): Promise<string[]> {
+function isExcludedCargoMember(memberDir: string, excludedDirs: ReadonlySet<string>): boolean {
+  for (const excludedDir of excludedDirs) {
+    if (memberDir === excludedDir || memberDir.startsWith(`${excludedDir}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Cargo accepts glob patterns at any depth in `workspace.members` and
+ * `workspace.exclude`. Walk one path segment at a time so patterns with
+ * wildcards in multiple segments cannot silently erase every crate from the
+ * Nx graph.
+ */
+function expandCargoMemberDirs(absoluteProjectRoot: string, member: string, requireGlobMatch = true): string[] {
+  const normalized = member.split('\\').join('/').replace(/\/+$/, '');
+  const segments = normalized.split('/');
+  if (
+    normalized.length === 0 ||
+    normalized.startsWith('/') ||
+    segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')
+  ) {
+    throw new Error(`Cargo workspace member must be a non-empty relative path: ${member}`);
+  }
+  if (segments.some((segment) => segment === '**' || /[[\]{}!]/.test(segment))) {
+    throw new Error(`Cargo workspace member uses an unsupported glob pattern: ${member}`);
+  }
+
+  const hasGlob = segments.some((segment) => segment.includes('*') || segment.includes('?'));
+  let candidates = [''];
+  for (const segment of segments) {
+    if (!segment.includes('*') && !segment.includes('?')) {
+      candidates = candidates.map((candidate) => posix.join(candidate, segment));
+      continue;
+    }
+    const matcher = cargoGlobSegmentMatcher(segment);
+    const expanded: string[] = [];
+    for (const candidate of candidates) {
+      const absoluteParent = join(absoluteProjectRoot, candidate);
+      if (!existsSync(absoluteParent)) {
+        continue;
+      }
+      for (const entry of readdirSync(absoluteParent, { withFileTypes: true })) {
+        if (entry.isDirectory() && matcher.test(entry.name)) {
+          expanded.push(posix.join(candidate, entry.name));
+        }
+      }
+    }
+    candidates = expanded;
+  }
+  if (requireGlobMatch && hasGlob && candidates.length === 0) {
+    throw new Error(`Cargo workspace member glob matched no directories: ${member}`);
+  }
+  return candidates.sort((left, right) => left.localeCompare(right));
+}
+
+function cargoGlobSegmentMatcher(segment: string): RegExp {
+  let source = '^';
+  for (const character of segment) {
+    if (character === '*') {
+      source += '.*';
+    } else if (character === '?') {
+      source += '.';
+    } else {
+      source += character.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+    }
+  }
+  return new RegExp(`${source}$`);
+}
+
+/**
+ * Assign each workspace crate to the most specific Nx project that contains
+ * its directory. The repository root is the fallback owner; a nested package
+ * wins by path depth so projects under `packages/*` own their own crates.
+ */
+export function attributeCargoWorkspacePackages(
+  packages: readonly CargoWorkspacePackage[],
+  projects: readonly CargoWorkspaceProject[],
+): AttributedCargoWorkspacePackage[] {
+  const bySpecificity = [...projects].sort((left, right) => {
+    const leftDepth = left.root === '.' ? 0 : left.root.split('/').length;
+    const rightDepth = right.root === '.' ? 0 : right.root.split('/').length;
+    return rightDepth - leftDepth || left.name.localeCompare(right.name);
+  });
+  const attributed: AttributedCargoWorkspacePackage[] = [];
+  for (const pkg of packages) {
+    const owner = bySpecificity.find(
+      (project) => project.root === '.' || pkg.dir === project.root || pkg.dir.startsWith(`${project.root}/`),
+    );
+    if (owner) {
+      attributed.push({ ...pkg, projectName: owner.name, projectRoot: owner.root });
+    }
+  }
+  return attributed;
+}
+
+export async function cargoPackageTestInputs(
+  absoluteProjectRoot: string,
+  memberDir: string,
+  inputRoot = '{projectRoot}',
+): Promise<string[]> {
   const workspacePathDeps = await workspacePathDependencies(absoluteProjectRoot);
   const dirs = new Set<string>([memberDir.split('\\').join('/')]);
   const crateParsed: unknown = parseToml(await readFile(join(absoluteProjectRoot, memberDir, 'Cargo.toml'), 'utf-8'));
@@ -63,11 +192,11 @@ export async function cargoPackageTestInputs(absoluteProjectRoot: string, member
       }
     }
   }
-  const inputs: string[] = ['{projectRoot}/Cargo.toml', '{projectRoot}/Cargo.lock'];
+  const inputs: string[] = [`${inputRoot}/Cargo.toml`, `${inputRoot}/Cargo.lock`];
   for (const dir of [...dirs].sort()) {
-    inputs.push(`{projectRoot}/${dir}/**/*.rs`, `{projectRoot}/${dir}/Cargo.toml`);
+    inputs.push(`${inputRoot}/${dir}/**/*.rs`, `${inputRoot}/${dir}/Cargo.toml`);
   }
-  inputs.push('{projectRoot}/**/.cargo/config.toml', '{projectRoot}/scripts/*.sh', '!{projectRoot}/**/target/**');
+  inputs.push(`${inputRoot}/**/.cargo/config.toml`, `${inputRoot}/scripts/*.sh`, `!${inputRoot}/**/target/**`);
   return inputs;
 }
 
