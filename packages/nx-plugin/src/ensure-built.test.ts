@@ -123,6 +123,7 @@ describe('describeMiss', () => {
       describeMiss({ kind: 'not-cached', taskId: 'app:build' }),
       describeMiss({ kind: 'cached-failure', taskId: 'app:build', code: 7 }),
       describeMiss({ kind: 'stale-outputs', taskId: 'app:build' }),
+      describeMiss({ kind: 'cache-disabled', taskId: 'app:build' }),
       describeMiss({ kind: 'no-daemon', taskId: 'app:build' }),
     ];
     for (const reason of reasons) {
@@ -196,7 +197,7 @@ function runBinWith(
   entry: string,
   workspace: string,
   args: readonly string[],
-  env: Record<string, string>,
+  env: Readonly<NodeJS.ProcessEnv>,
 ): Promise<BinRun> {
   const childEnv = { ...process.env };
   for (const key of NX_ENV_KEYS) {
@@ -206,7 +207,15 @@ function runBinWith(
   // NO_COLOR. Passing both to Bun emits a warning, which would make a genuine
   // full hit look noisy.
   delete childEnv.NO_COLOR;
-  Object.assign(childEnv, { CI: '', NX_DAEMON: 'true' }, env);
+  childEnv.CI = '';
+  childEnv.NX_DAEMON = 'true';
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) {
+      delete childEnv[key];
+    } else {
+      childEnv[key] = value;
+    }
+  }
   const child = spawn(runtime, [entry, ...args], {
     cwd: workspace,
     env: childEnv,
@@ -228,7 +237,7 @@ function runBinWith(
   });
 }
 
-function runBin(workspace: string, args: readonly string[], env: Record<string, string> = {}): Promise<BinRun> {
+function runBin(workspace: string, args: readonly string[], env: Readonly<NodeJS.ProcessEnv> = {}): Promise<BinRun> {
   return runBinWith('bun', binEntry, workspace, args, env);
 }
 
@@ -374,6 +383,19 @@ describe('smoo-nx-exec', () => {
     expect(run.stderr).toBe('');
     expect(run.stdout).toContain('NX_SKIP_NX_CACHE=caller-skip');
     expect(run.stdout).toContain('NX_DISABLE_NX_CACHE=caller-disable');
+  });
+
+  it('honors a user cache bypass outside an Nx task child', async () => {
+    const run = await runBin(workspace, ['app:build', '--', './report'], {
+      NX_TASK_TARGET_PROJECT: undefined,
+      NX_TASK_TARGET_TARGET: undefined,
+      NX_SKIP_NX_CACHE: 'true',
+      NX_VERBOSE_LOGGING: 'true',
+    });
+    expect(run.code).toBe(0);
+    expect(run.stderr).toContain('the Nx cache is disabled, so app:build must run');
+    expect(run.stdout).toContain(MARKER);
+    expect(run.stdout).toContain('NX_SKIP_NX_CACHE=true');
   });
 
   it('runs again once a recorded output is gone from the working tree', async () => {

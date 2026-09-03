@@ -66,6 +66,7 @@ export type MissReason =
   | { readonly kind: 'not-cached'; readonly taskId: string }
   | { readonly kind: 'cached-failure'; readonly taskId: string; readonly code: number }
   | { readonly kind: 'stale-outputs'; readonly taskId: string }
+  | { readonly kind: 'cache-disabled'; readonly taskId: string }
   | { readonly kind: 'no-daemon'; readonly taskId: string };
 
 /**
@@ -140,6 +141,8 @@ export function describeMiss(reason: MissReason): string {
       return `${reason.taskId} last failed with exit code ${reason.code}`;
     case 'stale-outputs':
       return `${reason.taskId} outputs are missing or modified on disk`;
+    case 'cache-disabled':
+      return `the Nx cache is disabled, so ${reason.taskId} must run`;
     case 'no-daemon':
       return `the Nx daemon is disabled, so ${reason.taskId} cannot be checked without running it`;
   }
@@ -268,12 +271,15 @@ async function ensureBuiltInWorkspace(
     return runViaCli(workspaceRoot, selector);
   }
 
-  // This process is often launched by an outer Nx task whose own cache was
-  // deliberately bypassed. Those variables describe that outer run, not the
-  // target managed here: inheriting them makes the inner runner refuse both
-  // cache reads and writes, so no invocation can ever become a hit.
-  delete process.env.NX_SKIP_NX_CACHE;
-  delete process.env.NX_DISABLE_NX_CACHE;
+  // An outer Nx task exports its own cache-bypass setting to the process it
+  // launches. That setting describes the outer task, not the nested target:
+  // inheriting it makes the inner runner refuse cache writes forever. Outside
+  // an Nx task child, however, the same variables are the caller's explicit
+  // request to force this target to rebuild and must remain authoritative.
+  if (process.env.NX_TASK_TARGET_PROJECT !== undefined || process.env.NX_TASK_TARGET_TARGET !== undefined) {
+    delete process.env.NX_SKIP_NX_CACHE;
+    delete process.env.NX_DISABLE_NX_CACHE;
+  }
 
   const { readNxJson } = requireNx('nx/src/config/nx-json');
   const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
@@ -311,7 +317,16 @@ async function ensureBuiltInWorkspace(
   });
 
   performance.mark('ensureBuilt:probe:start');
-  const reason = await probe(nxJson, nxArgs, overrides, selector, requireNx);
+  let reason: MissReason | null;
+  if (process.env.NX_SKIP_NX_CACHE === 'true' || process.env.NX_DISABLE_NX_CACHE === 'true') {
+    const taskId =
+      selector.configuration === undefined
+        ? `${selector.project}:${selector.target}`
+        : `${selector.project}:${selector.target}:${selector.configuration}`;
+    reason = { kind: 'cache-disabled', taskId };
+  } else {
+    reason = await probe(nxJson, nxArgs, overrides, selector, requireNx);
+  }
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   const outcome =
     reason === null
