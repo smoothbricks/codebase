@@ -2,7 +2,7 @@
  * Bun's native provider for the shared per-thread span buffer ABI.
  *
  * The shared library is loaded once when this Bun-only entrypoint is imported.
- * Development resolves the package-local Cargo release artifact; published
+ * Development resolves the repository-root Cargo release artifact; published
  * consumers supply `LMAO_THREAD_FFI_DYLIB` because npm packages do not ship
  * platform-native build output.
  */
@@ -59,7 +59,7 @@ const configuredPath = process.env.LMAO_THREAD_FFI_DYLIB;
 export const THREAD_SPAN_BUFFER_FFI_DYLIB_PATH =
   configuredPath && configuredPath.length > 0
     ? configuredPath
-    : fileURLToPath(new URL(`../../target/release/${dylibName}`, import.meta.url));
+    : fileURLToPath(new URL(`../../../../target/release/${dylibName}`, import.meta.url));
 
 const nativeSymbols = {
   thread_span_buffer_new: {

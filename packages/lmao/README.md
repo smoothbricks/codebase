@@ -253,8 +253,9 @@ recipes.
 
 ## Rust crates
 
-`crates/` is a Cargo workspace that ships inside this npm package. It is not a separate project: the wasm the TypeScript
-loads and the crates that produced it carry one version number and are built from one tree, so they cannot disagree.
+`crates/` belongs to the repository-root Cargo workspace and ships inside this npm package as a generated `dist/rust`
+workspace. It is not a separate project: the wasm the TypeScript loads and the crates that produced it carry one version
+number and are built from one tree, so they cannot disagree.
 
 `lmao-wasm` is the production allocator. Its `[lib] name` is `allocator`, so `cargo build` emits `allocator.wasm`
 directly and `nx run lmao:cargo-wasm` only lifts it out of `target/` into `dist/allocator.wasm` — the exact path
@@ -282,12 +283,12 @@ The crate sources ship in the tarball, so a Rust consumer pins a released VERSIO
 
 ```toml
 [dependencies]
-lmao-core = { path = "node_modules/@smoothbricks/lmao/crates/lmao-core" }
+lmao-core = { path = "node_modules/@smoothbricks/lmao/dist/rust/crates/lmao-core" }
 ```
 
-The workspace `Cargo.toml`, `Cargo.lock` and `.cargo/config.toml` ship alongside `crates/`, so the workspace inheritance
-those manifests use (`version.workspace = true`) resolves inside the installed package. Build output (`target/`) is
-excluded.
+`nx build lmao` derives `dist/rust/Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`, and `crates/` from the root
+workspace. Workspace inheritance (`version.workspace = true`) therefore resolves inside the installed package without
+maintaining a second source workspace. Build output (`target/`) is excluded.
 
 ### Determinism constraints (non-negotiable design rules)
 

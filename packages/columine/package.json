@@ -53,6 +53,18 @@
           "cargo-wasm"
         ]
       },
+      "cargo-test-columine-ep-wasm": {
+        "dependsOn": [
+          "...",
+          "cargo-wasm"
+        ]
+      },
+      "cargo-test-columine-wasm": {
+        "dependsOn": [
+          "...",
+          "cargo-wasm"
+        ]
+      },
       "cargo-wasm": {
         "executor": "nx:run-commands",
         "cache": true,
@@ -62,16 +74,16 @@
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
-          "{projectRoot}/.cargo/config.toml",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/justfile"
         ],
         "outputs": [
           "{projectRoot}/dist/columine.wasm",
           "{projectRoot}/dist/event_processor.wasm",
-          "{projectRoot}/target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm",
-          "{projectRoot}/target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
+          "{workspaceRoot}/target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm",
+          "{workspaceRoot}/target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
         ],
         "options": {
           "command": "just wasm && just wasm-ep",

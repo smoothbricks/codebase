@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 const ARTIFACT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
+    "/../../../../target/wasm32-unknown-unknown/wasm-release/columine_ep_wasm.wasm"
 );
 
 const PARSE_BACKEND_TS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/parse-backend.ts");

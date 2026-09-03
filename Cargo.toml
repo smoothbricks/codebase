@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = [
+  "packages/columine/crates/*",
+  "packages/cowshed/crates/*",
+  "packages/lmao/crates/*",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+repository = "https://github.com/smoothbricks/smoothbricks"
+
+[workspace.dependencies]
+columine-types = { path = "packages/columine/crates/columine-types" }
+columine-vm = { path = "packages/columine/crates/columine-vm" }
+cowshed-core = { path = "packages/cowshed/crates/cowshed-core" }
+lmao-core = { path = "packages/lmao/crates/lmao-core" }
+lmao-arena = { path = "packages/lmao/crates/lmao-arena" }
+arrow-array = { version = "56", default-features = false }
+arrow-buffer = { version = "56", default-features = false }
+arrow-ipc = { version = "56", default-features = false }
+arrow-schema = { version = "56", default-features = false }
+clap = { version = "4", default-features = false, features = ["std", "error-context", "usage"] }
+criterion = { version = "0.5", default-features = false }
+napi = { version = "2", default-features = false, features = ["napi6", "tokio_rt"] }
+napi-build = "2"
+napi-derive = "2"
+proptest = "1"
+roaring = { version = "0.11", default-features = false, features = ["std"] }
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "signal",
+  "sync",
+  "time",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
+[profile.wasm-release.package.columine-vm]
+opt-level = 3
+
+[profile.wasm-release.package.columine-parsing]
+opt-level = 3
+
+[profile.test]
+incremental = false
+debug = 0
