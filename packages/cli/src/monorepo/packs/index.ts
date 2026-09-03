@@ -4,7 +4,7 @@ import { printCommandOutput, runResult, runStatus } from '../../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../../nx/index.js';
 import { validateGoToolchainAgreement } from '../go-toolchain.js';
 import { syncBunLockfileVersions, validateBunLockfileVersions } from '../lockfile.js';
-import { warnOnManagedFileDrift } from '../managed-files.js';
+import { validateDevenvModuleImport, warnOnManagedFileDrift } from '../managed-files.js';
 import { fixNxSync, validateNxSync } from '../nx-sync.js';
 import { fixPackageHygiene, validatePackageHygiene } from '../package-hygiene.js';
 import {
@@ -115,6 +115,12 @@ const packs: MonorepoPack[] = [
     },
   },
   {
+    name: 'devenv',
+    validatePreBuild(ctx) {
+      return validateDevenvModuleImport(ctx.root);
+    },
+  },
+  {
     name: 'publishing',
     init(ctx) {
       applyPublicPackageDefaults(ctx.root);
@@ -183,6 +189,9 @@ const packs: MonorepoPack[] = [
     },
   },
 ];
+
+/** Test seam exposing the production pack composition. */
+export const packsForTest = packs;
 
 export async function runInitPacks(ctx: MonorepoContext): Promise<void> {
   for (const pack of packs) {

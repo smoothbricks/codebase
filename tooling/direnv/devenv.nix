@@ -73,12 +73,11 @@ in {
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
 
-  # Targets merge with the managed module's channel/components. Keep WASM on
-  # every system; add only the native release targets the current runner can
-  # actually build, so a laptop does not fetch Linux std it never links.
+  # The managed module supplies fleet-wide WASM and Linux targets. Add only the
+  # native release targets the current runner can actually build, so a laptop
+  # does not fetch Linux std it never links.
   languages.rust.targets =
-    ["wasm32-unknown-unknown"]
-    ++ lib.optionals pkgs.stdenv.isDarwin [
+    lib.optionals pkgs.stdenv.isDarwin [
       "aarch64-apple-darwin"
       "x86_64-apple-darwin"
     ]
@@ -86,8 +85,11 @@ in {
       "aarch64-unknown-linux-gnu"
     ];
 
-  # NX_PARALLEL, and the PATH/toolchain exports come from
-  # ./devenv.smoo.nix.
+  # The managed prologue bootstraps dependencies first; this repo-owned extension
+  # then rebuilds the local Nx plugin when its sources are newer than its output.
+  enterShell = ''
+    bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
+  '';
 
   # https://devenv.sh/languages/
   # Python with pyarrow for Arrow IPC verification tests.

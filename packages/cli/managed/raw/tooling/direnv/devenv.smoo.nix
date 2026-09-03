@@ -39,9 +39,10 @@
   # second toolchain alongside for them. `version = "latest"` reads "newest
   # nightly the locked rust-overlay offers", not "whatever nightly exists today".
   #
-  # `components` and `targets` are list options, so a repository adds its own
-  # targets in devenv.nix and they merge with these; `channel` and `version` are
-  # single-valued and belong to this module. A `rust-toolchain.toml` is NOT the
+  # `components` and fleet-wide `targets` belong to this module; repositories
+  # add only platform- or product-specific targets in devenv.nix. These list
+  # options merge, while `channel` and `version` are single-valued. A
+  # `rust-toolchain.toml` is NOT the
   # mechanism here: nix cargo ignores it unless devenv is pointed at it with
   # `languages.rust.toolchainFile`, so such a file is decoration that silently
   # disagrees with the shell.
@@ -57,6 +58,8 @@
       "rust-analyzer"
       "rust-src"
     ];
+    # Every repository builds WASM, so the shared shell always carries that std.
+    # Keeping it here prevents each repo from restating the same target.
     # CI validates on Linux, so a macOS shell carries Linux's std and can
     # type-check the arm CI compiles. rust-std alone reaches every crate whose
     # dependency graph is pure Rust; a dependency that compiles C for the target
@@ -68,6 +71,7 @@
     # target from Linux needs an Apple SDK for those same C-building
     # dependencies, which is a licensing boundary rather than a missing package.
     targets = [
+      "wasm32-unknown-unknown"
       "x86_64-unknown-linux-gnu"
     ];
   };
@@ -218,9 +222,9 @@
     #    deliberate — one warm cache every workspace shares, reclaimed by an
     #    explicit verb, over per-workspace caches that self-trim. Go's own build
     #    cache trimming belongs to the go command and still applies to both.
-    # 5. enter-shell.ts chdirs to the workspace root and runs setup-environment.ts;
-    #    a failed bootstrap aborts shell entry instead of yielding a half-working
-    #    shell.
+    # 5. The shared setup-environment.ts bootstraps repository dependencies; a
+    #    failure aborts shell entry instead of yielding a half-working shell.
+    #    Repo-owned enterShell bodies merge after this prologue.
     # 6. GOROOT is unset rather than set. With devenv's Go pinned to the patch
     #    release ttsc vendors, a GOROOT crossing cannot misfire on version at all,
     #    so this is belt-and-braces rather than the fix — it keeps the isolation
@@ -253,7 +257,7 @@
       mkdir -p "$TTSC_CACHE_DIR" "$TTSC_GO_CACHE_DIR"
       export GOFLAGS="''${GOFLAGS:--trimpath}"
       unset GOROOT
-      bun "$DEVENV_ROOT/enter-shell.ts" || exit $?
+      bun "$DEVENV_ROOT/setup-environment.ts" || exit $?
       ${lib.optionalString pkgs.stdenv.isDarwin "unset CC CXX"}
     '')
     # Epilogue: the wrapper runs devenv from tooling/direnv, so return the shell

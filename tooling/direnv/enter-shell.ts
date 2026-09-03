@@ -11,7 +11,6 @@ if (!devenvRoot) {
 const projectRoot = path.resolve(devenvRoot, '../..');
 process.chdir(projectRoot);
 
-await import('./setup-environment.ts');
 await rebuildNxPluginIfStale();
 
 async function rebuildNxPluginIfStale(): Promise<void> {

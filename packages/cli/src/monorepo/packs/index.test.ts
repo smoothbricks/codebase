@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { MonorepoPack } from './index.js';
-import { resolvedTargetsByProject, runValidatePacks } from './index.js';
+import { packsForTest, resolvedTargetsByProject, runValidatePacks } from './index.js';
 
 const ctx = { root: '/workspace', syncRuntime: false };
 
@@ -185,6 +188,37 @@ describe('monorepo validation pack phases', () => {
 
     expect(result).toEqual({ failures: 1, failedChecks: 1 });
     expect(events).toEqual(['pre-fix', 'build']);
+  });
+
+  it('includes the managed devenv module import in pre-build validation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-validate-devenv-import-'));
+    try {
+      await mkdir(join(root, 'tooling/direnv'), { recursive: true });
+      await writeFile(join(root, 'tooling/direnv/devenv.nix'), '{...}: { packages = []; }\n');
+      const devenvPack = packsForTest.find((pack) => pack.name === 'devenv');
+      expect(devenvPack).toBeDefined();
+      if (!devenvPack) {
+        throw new Error('devenv validation pack not found');
+      }
+
+      let built = false;
+      const result = await runValidatePacks(
+        { root, syncRuntime: false },
+        { failFast: true },
+        {
+          packs: [devenvPack],
+          runBuild() {
+            built = true;
+            return 0;
+          },
+        },
+      );
+
+      expect(result).toEqual({ failures: 1, failedChecks: 1 });
+      expect(built).toBeFalse();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('propagates parsed target dependencies through the production adapter', () => {
