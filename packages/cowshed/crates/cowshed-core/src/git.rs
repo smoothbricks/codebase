@@ -517,19 +517,25 @@ impl GitRepository {
     /// hour later still reads as work in every older clone unless the current rules decide.
     pub async fn is_dirty_by(&self, checkout: Option<&Path>) -> Result<bool> {
         let output = self.porcelain_status("read repository status").await?;
+        let mut untracked: Vec<&[u8]> = Vec::new();
         for (status, path) in porcelain_records(&output.stdout) {
             if is_untracked_junk(status, path) {
                 continue;
             }
-            if status == b"??"
-                && let Some(checkout) = checkout
-                && ignored_by(checkout, path).await
-            {
-                continue;
+            if status != b"??" {
+                return Ok(true);
             }
-            return Ok(true);
+            untracked.push(path);
         }
-        Ok(false)
+        if untracked.is_empty() {
+            return Ok(false);
+        }
+        let Some(checkout) = checkout else {
+            return Ok(true);
+        };
+        // One check-ignore for every untracked path, not one process per path.
+        let ignored = ignored_by(checkout, &untracked).await;
+        Ok(untracked.len() != ignored.len())
     }
 
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
@@ -2036,19 +2042,41 @@ fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
     }
 }
 
-/// Whether `checkout`'s gitignore rules ignore `relative` - `git check-ignore`, index-blind, the
-/// path judged as a fresh entry in that tree would be (a directory record ends in `/`).
-async fn ignored_by(checkout: &Path, relative: &[u8]) -> bool {
-    tokio::process::Command::new("git")
+/// The subset of `relative` paths that `checkout`'s gitignore rules ignore - one
+/// `git check-ignore --stdin -z` over all of them, index-blind, each path judged as a fresh
+/// entry in that tree would be. Returns the ignored paths in git's order.
+pub async fn ignored_by(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = match tokio::process::Command::new("git")
         .arg("-C")
         .arg(checkout)
-        .args(["check-ignore", "-q", "--no-index", "--"])
-        .arg(std::ffi::OsStr::from_bytes(relative))
-        .stdout(std::process::Stdio::null())
+        .args(["check-ignore", "--stdin", "-z", "--no-index"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|status| status.success())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+    let mut input = Vec::new();
+    for path in relative {
+        input.extend_from_slice(path);
+        input.push(0);
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&input).await;
+        drop(stdin);
+    }
+    match child.wait_with_output().await {
+        Ok(output) => output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// `(XY, path)` per `--porcelain=v1 -z` record; a rename's second path field is consumed

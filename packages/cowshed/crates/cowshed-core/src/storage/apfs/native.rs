@@ -5143,12 +5143,15 @@ fn metadata_workspace_ref(
 
 /// Deletes every stray under an unmounted mountpoint that is junk - hidden, or ignored by the
 /// project's gitignore rules judged from its checkout - and returns the paths that were kept
-/// because they are neither. Empty directories left behind by deleted junk are removed too.
+/// because they are neither. One walk collects the candidates, one `check-ignore` judges them,
+/// and directories emptied by the deletions are removed bottom-up.
 fn remove_stray_junk(
     mount_point: &Path,
     checkout: &Path,
 ) -> Result<Vec<PathBuf>, ApfsStorageError> {
-    let mut kept = Vec::new();
+    // (absolute path, relative form for check-ignore, is directory)
+    let mut strays: Vec<(PathBuf, Vec<u8>, bool)> = Vec::new();
+    let mut hidden: Vec<PathBuf> = Vec::new();
     let mut stack = vec![mount_point.to_path_buf()];
     let mut visited = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -5160,35 +5163,55 @@ fn remove_stray_junk(
                 entry.map_err(|error| io_error("enumerate retired mountpoint", &dir, error))?;
             let path = entry.path();
             let relative = path.strip_prefix(mount_point).unwrap_or(&path);
-            let hidden = crate::git::is_hidden_path(relative.as_os_str().as_bytes());
             let file_type = entry
                 .file_type()
                 .map_err(|error| io_error("inspect stray", &path, error))?;
+            if crate::git::is_hidden_path(relative.as_os_str().as_bytes()) {
+                hidden.push(path);
+                continue;
+            }
             // A directory pattern (`generated/`) only matches a path git knows is a directory;
             // the path does not exist under the checkout, so the trailing slash says so.
-            let mut judged = relative.as_os_str().to_owned();
+            let mut judged = relative.as_os_str().as_bytes().to_vec();
             if file_type.is_dir() {
-                judged.push("/");
+                judged.push(b'/');
+                stack.push(path.clone());
             }
-            if hidden || stray_is_ignored(checkout, Path::new(&judged)) {
-                let removed = if file_type.is_dir() {
-                    fs::remove_dir_all(&path)
-                } else {
-                    fs::remove_file(&path)
-                };
-                removed.map_err(|error| io_error("remove stray junk", &path, error))?;
-                eprintln!(
-                    "cowshed: removed stray {} from retired mountpoint",
-                    path.display()
-                );
-            } else if file_type.is_dir() {
-                stack.push(path);
-            } else {
-                kept.push(path);
-            }
+            strays.push((path, judged, file_type.is_dir()));
         }
     }
-    // Directories are emptied bottom-up only when nothing under them was kept.
+    let judged: Vec<&[u8]> = strays
+        .iter()
+        .map(|(_, relative, _)| relative.as_slice())
+        .collect();
+    let ignored = stray_ignored_set(checkout, &judged);
+    let mut kept = Vec::new();
+    let mut removals: Vec<(PathBuf, bool)> = hidden.into_iter().map(|path| (path, true)).collect();
+    for (path, relative, is_dir) in strays {
+        if ignored.contains(&relative) {
+            removals.push((path, is_dir));
+        } else if !is_dir {
+            kept.push(path);
+        }
+    }
+    // A kept file under an ignored directory would be deleted with it: an ignored directory
+    // is junk wholesale by the project's own rule, exactly as `git clean -X` treats it.
+    for (path, is_dir) in removals {
+        let removed = if is_dir {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => eprintln!(
+                "cowshed: removed stray {} from retired mountpoint",
+                path.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("remove stray junk", &path, error)),
+        }
+    }
+    kept.retain(|path| path.exists());
     if kept.is_empty() {
         for dir in visited.into_iter().rev() {
             if dir != mount_point {
@@ -5199,19 +5222,36 @@ fn remove_stray_junk(
     Ok(kept)
 }
 
-/// Whether the project's own gitignore rules ignore `relative` - `git check-ignore` from the
-/// adopted checkout, index-blind, so a stray is judged exactly as a fresh file in the tree
-/// would be.
-fn stray_is_ignored(checkout: &Path, relative: &Path) -> bool {
-    std::process::Command::new("git")
+/// The subset of `relative` paths the checkout's gitignore rules ignore, in one process.
+fn stray_ignored_set(checkout: &Path, relative: &[&[u8]]) -> std::collections::BTreeSet<Vec<u8>> {
+    use std::io::Write;
+    let mut child = match std::process::Command::new("git")
         .arg("-C")
         .arg(checkout)
-        .args(["check-ignore", "-q", "--no-index", "--"])
-        .arg(relative)
-        .stdout(std::process::Stdio::null())
+        .args(["check-ignore", "--stdin", "-z", "--no-index"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return std::collections::BTreeSet::new(),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        for path in relative {
+            let _ = stdin.write_all(path);
+            let _ = stdin.write_all(&[0]);
+        }
+    }
+    match child.wait_with_output() {
+        Ok(output) => output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+        Err(_) => std::collections::BTreeSet::new(),
+    }
 }
 
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStorageError {
