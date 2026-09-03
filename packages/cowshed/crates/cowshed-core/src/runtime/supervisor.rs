@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -1305,18 +1305,6 @@ async fn link_runtime_dir(sandbox: &SandboxConfig, runtime_dir: &Path) -> Result
     Ok(())
 }
 
-/// The environment for a **non-interactive acceptance check** — the commands `cowshed land
-/// --check` runs before a workspace is delivered.
-///
-/// These are the one class of build cowshed has an opinion about, because nobody is waiting at a
-/// keyboard for them and their output is worth storing: `CARGO_INCREMENTAL=0` keeps every unit
-/// non-incremental, which is the only shape the sccache wrapper can cache and hand to the next
-/// landing. An interactive shed makes the opposite trade and is left alone — see
-/// [`build_environment`], which imposes no incremental policy at all.
-pub(crate) fn acceptance_check_environment() -> HashMap<String, String> {
-    HashMap::from([("CARGO_INCREMENTAL".to_owned(), "0".to_owned())])
-}
-
 /// Build-tool wiring the sandbox owns, imposed over whatever the caller named.
 ///
 /// Rust routes through sccache in EVERY workspace. Cargo's `-C metadata` is path-independent for
@@ -1339,10 +1327,10 @@ const BUILD_POLICY: [(&str, &str); 2] =
 /// `incremental = false` in the profile and so reach sccache without anyone forcing anything.
 /// Forcing 0 here bought the shared cache nothing it did not already have and cost every
 /// interactive build a full recompile — measured on a one-line edit to a mid-size crate, ~1.7s
-/// incremental against ~20-32s with `CARGO_INCREMENTAL=0`. A non-interactive acceptance check
-/// that wants reproducible cacheable output asks for it by name, through
-/// [`acceptance_check_environment`].
-fn build_environment(caller: &BTreeMap<String, String>) -> impl Iterator<Item = (&str, &str)> {
+/// incremental against ~20-32s with `CARGO_INCREMENTAL=0`.
+pub(super) fn build_environment(
+    caller: &BTreeMap<String, String>,
+) -> impl Iterator<Item = (&str, &str)> {
     caller
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -4629,25 +4617,6 @@ mod sandbox_environment_tests {
                 "the child must see exactly the CARGO_INCREMENTAL its caller named"
             );
         }
-    }
-
-    /// `cowshed land --check` is the one context that wants non-incremental units, and it says so
-    /// by name rather than by everyone else paying for it. It gets the sandbox's sccache too.
-    #[test]
-    fn an_acceptance_check_carries_its_own_non_incremental_policy() {
-        let requested: Vec<(String, String)> = acceptance_check_environment().into_iter().collect();
-        let caller: Vec<(&str, &str)> = requested
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        assert_eq!(
-            built(&caller),
-            BTreeMap::from([
-                ("CARGO_INCREMENTAL".to_owned(), "0".to_owned()),
-                ("RUSTC_WRAPPER".to_owned(), "sccache".to_owned()),
-                ("SCCACHE_BASEDIR_CWD".to_owned(), "1".to_owned()),
-            ])
-        );
     }
 
     /// The sccache wiring is not the caller's. The Seatbelt profile admits exactly the host
