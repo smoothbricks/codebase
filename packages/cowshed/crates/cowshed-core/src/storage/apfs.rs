@@ -2194,9 +2194,10 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
     let staging_mount = staging_mount(config, &workspace)?;
     let staged_companion = companion_path(&staged_image);
 
-    timed_apfs_step("staging", "clone", || {
-        host.clone_image(&source_image, &staged_image, format)
-    })?;
+    // No span here: the backend times sync+clonefile itself, and a second staging/clone
+    // pair would read as one nested step. Same rule for attach (attach+fsck) and mount
+    // below — storage spans only the logical legs the backend does not time.
+    host.clone_image(&source_image, &staged_image, format)?;
     if let Err(primary) = timed_apfs_step("staging", "metadata", || {
         host.publish_metadata(
             &staged_image,
@@ -2213,9 +2214,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             host.reclaim_image(&staged_image, format),
         );
     }
-    let attachment = match timed_apfs_step("staging", "attach", || {
-        host.attach_verified(&staged_image, format)
-    }) {
+    let attachment = match host.attach_verified(&staged_image, format) {
         Ok(attachment) => attachment,
         Err(primary) => {
             return combine_cleanup(
@@ -2225,40 +2224,39 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             );
         }
     };
-    let prepared = timed_apfs_step("staging", "mount", || {
-        host.mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
-    })
-    .and_then(|()| {
-        timed_apfs_step("staging", "rename", || {
-            host.rename_volume(
-                &staging_mount,
-                &volume_label(workspace.repo(), workspace.name()),
-            )
-        })?;
-        timed_apfs_step("staging", "creds", || {
-            host.mint_workspace_credentials(
-                &workspace,
-                &staged_image,
-                &staging_mount,
-                &canonical_mount,
-                &staged_companion,
-            )
-        })?;
-        timed_apfs_step("staging", "marker", || {
-            host.write_marker(
-                &staging_mount,
-                &workspace,
-                fork.then_some(source.name()),
-                identity,
-            )
-        })?;
-        timed_apfs_step("staging", "validate", || {
-            host.validate_marker(
-                &staging_mount,
-                &MarkerExpectation::freshly_stamped(&workspace),
-            )
-        })
-    });
+    let prepared = host
+        .mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
+        .and_then(|()| {
+            timed_apfs_step("staging", "rename", || {
+                host.rename_volume(
+                    &staging_mount,
+                    &volume_label(workspace.repo(), workspace.name()),
+                )
+            })?;
+            timed_apfs_step("staging", "creds", || {
+                host.mint_workspace_credentials(
+                    &workspace,
+                    &staged_image,
+                    &staging_mount,
+                    &canonical_mount,
+                    &staged_companion,
+                )
+            })?;
+            timed_apfs_step("staging", "marker", || {
+                host.write_marker(
+                    &staging_mount,
+                    &workspace,
+                    fork.then_some(source.name()),
+                    identity,
+                )
+            })?;
+            timed_apfs_step("staging", "validate", || {
+                host.validate_marker(
+                    &staging_mount,
+                    &MarkerExpectation::freshly_stamped(&workspace),
+                )
+            })
+        });
     if let Err(primary) = prepared {
         return combine_cleanup(
             "clone preparation",
@@ -2785,17 +2783,15 @@ fn mount_canonical<H: ApfsExecutionHost>(
     mount_point: &Path,
     workspace: &LifecycleWorkspace,
 ) -> Result<(), ApfsStorageError> {
-    let attachment = timed_apfs_step("canonical", "attach", || {
-        host.attach_verified(image, workspace.format())
-    })?;
-    if let Err(primary) = timed_apfs_step("canonical", "mount", || {
-        host.mount(&attachment, mount_point, MountAccess::ReadWrite, false)
-    })
-    .and_then(|()| {
-        timed_apfs_step("canonical", "validate", || {
-            host.validate_marker(mount_point, &MarkerExpectation::owned(config, workspace))
+    let attachment = host.attach_verified(image, workspace.format())?;
+    if let Err(primary) = host
+        .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
+        .and_then(|()| {
+            timed_apfs_step("canonical", "validate", || {
+                host.validate_marker(mount_point, &MarkerExpectation::owned(config, workspace))
+            })
         })
-    }) {
+    {
         return detach_after_failure(host, attachment, primary, "canonical validation");
     }
     timed_apfs_step("canonical", "retain", || {
