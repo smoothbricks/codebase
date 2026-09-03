@@ -1312,9 +1312,42 @@ async fn link_runtime_dir(sandbox: &SandboxConfig, runtime_dir: &Path) -> Result
 /// keyboard for them and their output is worth storing: `CARGO_INCREMENTAL=0` keeps every unit
 /// non-incremental, which is the only shape the sccache wrapper can cache and hand to the next
 /// landing. An interactive shed makes the opposite trade and is left alone — see
-/// [`sandboxed_command`], which sets no incremental policy at all.
+/// [`build_environment`], which imposes no incremental policy at all.
 pub fn acceptance_check_environment() -> HashMap<String, String> {
     HashMap::from([("CARGO_INCREMENTAL".to_owned(), "0".to_owned())])
+}
+
+/// Build-tool wiring the sandbox owns, imposed over whatever the caller named.
+///
+/// Rust routes through sccache in EVERY workspace. Cargo's `-C metadata` is path-independent for
+/// workspace members (cargo >= 1.97, measured), and the bundled sccache normalizes the residual
+/// path-bearing key inputs (cwd, blanket `CARGO_*` env, argument bytes) against the request cwd
+/// when the client sets `SCCACHE_BASEDIR_CWD=1` — so name-mounted workspaces share entries with
+/// each other, not just successive slot tenants. env-dep values stay unnormalized in the key, so
+/// a crate that compiles `env!("CARGO_MANIFEST_DIR")` into its output still fail-closes across
+/// paths. These two are not the caller's to change: the Seatbelt profile admits exactly the
+/// host daemon's socket and denies binding it, so a workspace that pointed the wrapper elsewhere
+/// would be reaching outside its boundary.
+const BUILD_POLICY: [(&str, &str); 2] =
+    [("RUSTC_WRAPPER", "sccache"), ("SCCACHE_BASEDIR_CWD", "1")];
+
+/// The caller's environment with [`BUILD_POLICY`] merged over it.
+///
+/// `CARGO_INCREMENTAL` is deliberately not in the policy, so whatever the caller names arrives
+/// verbatim and an unnamed one stays unset. Cargo then decides per profile, which is the right
+/// decision on both lanes at once: `dev` stays incremental and local, while shared lanes declare
+/// `incremental = false` in the profile and so reach sccache without anyone forcing anything.
+/// Forcing 0 here bought the shared cache nothing it did not already have and cost every
+/// interactive build a full recompile — measured on a one-line edit to a mid-size crate, ~1.7s
+/// incremental against ~20-32s with `CARGO_INCREMENTAL=0`. A non-interactive acceptance check
+/// that wants reproducible cacheable output asks for it by name, through
+/// [`acceptance_check_environment`].
+fn build_environment(caller: &BTreeMap<String, String>) -> impl Iterator<Item = (&str, &str)> {
+    caller
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .filter(|(name, _)| !BUILD_POLICY.iter().any(|(owned, _)| owned == name))
+        .chain(BUILD_POLICY)
 }
 
 /// Build the sandboxed `Command` for a child of this workspace.
@@ -1325,8 +1358,9 @@ pub fn acceptance_check_environment() -> HashMap<String, String> {
 /// inherited environment handed workspace content the one path to host credentials, `PATH`, and
 /// agent env that no other child has. It is a child of the workspace and it is sandboxed like one.
 ///
-/// Caller `env` is applied first so the policy variables below always win; `env_clear` means
-/// nothing is inherited that is not named here.
+/// Caller `env` reaches the child through [`build_environment`], which is where the sandbox's
+/// own build-tool policy is merged over it; `env_clear` means nothing is inherited that is not
+/// named here, and every `env` call below wins over the caller.
 async fn sandboxed_command(
     plan: &SpawnPlan,
     sandbox: &SandboxConfig,
@@ -1396,7 +1430,7 @@ async fn sandboxed_command(
         .env_clear()
         .args(&plan.args)
         .current_dir(&plan.cwd)
-        .envs(env)
+        .envs(build_environment(env))
         .env("PATH", path)
         .env("HOME", &private_home)
         .env("XDG_CONFIG_HOME", &private_config)
@@ -1433,25 +1467,6 @@ async fn sandboxed_command(
             command.env(key, value);
         }
     }
-    // Rust routes through sccache in EVERY workspace. Cargo's `-C metadata` is
-    // path-independent for workspace members (cargo >= 1.97, measured), and the bundled
-    // sccache normalizes the residual path-bearing key inputs (cwd, blanket CARGO_* env,
-    // argument bytes) against the request cwd when the client sets SCCACHE_BASEDIR_CWD=1 —
-    // so name-mounted workspaces share entries with each other, not just successive slot
-    // tenants. env-dep values stay unnormalized in the key, so a crate that compiles
-    // env!("CARGO_MANIFEST_DIR") into its output still fail-closes across paths.
-    //
-    // CARGO_INCREMENTAL is deliberately absent. Cargo already decides it per profile, and that
-    // decision is the right one on both lanes at once: `dev` stays incremental and local, while
-    // shared lanes declare `incremental = false` in the profile and so reach sccache without
-    // anyone forcing anything here. Forcing 0 bought the shared cache nothing it did not already
-    // have and cost every interactive build a full recompile — measured on a one-line edit to a
-    // mid-size crate, ~1.7s incremental against ~20-32s with CARGO_INCREMENTAL=0. A
-    // non-interactive acceptance check that wants reproducible cacheable output asks for it by
-    // name through [`acceptance_check_environment`], whose values arrive in `env` above.
-    command
-        .env("RUSTC_WRAPPER", "sccache")
-        .env("SCCACHE_BASEDIR_CWD", "1");
     if let Some(directory) = developer_directory() {
         command.env("DEVELOPER_DIR", directory);
     }
@@ -4574,6 +4589,82 @@ mod sandbox_environment_tests {
         assert_eq!(
             gateway_proxy_url("40960", &token),
             format!("http://cowshed:{encoded}@127.0.0.1:40960")
+        );
+    }
+
+    fn built(caller: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let caller = caller
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        build_environment(&caller)
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()
+    }
+
+    /// Nothing in cowshed decides `CARGO_INCREMENTAL` for an ordinary child: cargo does, per
+    /// profile. An absent variable is the whole point — `0` and unset are both "not 1", and only
+    /// one of them lets `dev` stay incremental.
+    #[test]
+    fn an_ordinary_child_gets_sccache_and_no_incremental_policy() {
+        let built = built(&[]);
+        assert_eq!(
+            built,
+            BTreeMap::from([
+                ("RUSTC_WRAPPER".to_owned(), "sccache".to_owned()),
+                ("SCCACHE_BASEDIR_CWD".to_owned(), "1".to_owned()),
+            ])
+        );
+        assert!(!built.contains_key("CARGO_INCREMENTAL"));
+    }
+
+    /// Whatever the caller names arrives verbatim, including the value nothing in cowshed would
+    /// ever choose. The builder has no opinion left to impose.
+    #[test]
+    fn a_caller_owns_cargo_incremental_outright() {
+        for requested in ["1", "0", ""] {
+            assert_eq!(
+                built(&[("CARGO_INCREMENTAL", requested)]).get("CARGO_INCREMENTAL"),
+                Some(&requested.to_owned()),
+                "the child must see exactly the CARGO_INCREMENTAL its caller named"
+            );
+        }
+    }
+
+    /// `cowshed land --check` is the one context that wants non-incremental units, and it says so
+    /// by name rather than by everyone else paying for it. It gets the sandbox's sccache too.
+    #[test]
+    fn an_acceptance_check_carries_its_own_non_incremental_policy() {
+        let requested: Vec<(String, String)> = acceptance_check_environment().into_iter().collect();
+        let caller: Vec<(&str, &str)> = requested
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            built(&caller),
+            BTreeMap::from([
+                ("CARGO_INCREMENTAL".to_owned(), "0".to_owned()),
+                ("RUSTC_WRAPPER".to_owned(), "sccache".to_owned()),
+                ("SCCACHE_BASEDIR_CWD".to_owned(), "1".to_owned()),
+            ])
+        );
+    }
+
+    /// The sccache wiring is not the caller's. The Seatbelt profile admits exactly the host
+    /// daemon's socket and denies binding it, so a caller that could redirect the wrapper would
+    /// be reaching outside the boundary — and the merge, not the order of `Command::env` calls,
+    /// is what refuses it.
+    #[test]
+    fn a_caller_cannot_override_the_sandbox_owned_sccache_wiring() {
+        assert_eq!(
+            built(&[
+                ("RUSTC_WRAPPER", "/bin/false"),
+                ("SCCACHE_BASEDIR_CWD", "0"),
+            ]),
+            BTreeMap::from([
+                ("RUSTC_WRAPPER".to_owned(), "sccache".to_owned()),
+                ("SCCACHE_BASEDIR_CWD".to_owned(), "1".to_owned()),
+            ])
         );
     }
 
