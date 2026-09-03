@@ -56,6 +56,7 @@
     "reload:node_modules": "tooling/rm_node_modules; bun install",
     "show:tree": "tree --gitignore -d",
     "unlink:all": "for pkg in packages/*; do (cd $pkg && bun unlink); done",
+    "update:cargo-lock": "cargo update",
     "update:devenv": "cd tooling/direnv; devenv update"
   },
   "sherif": {
