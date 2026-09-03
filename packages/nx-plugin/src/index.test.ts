@@ -491,12 +491,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
         command:
-          'napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/.cache/native-debug',
+          'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/.cache/native-debug',
       });
       expect(native['napi-arm64-macos']?.options).toMatchObject({
         cwd: '.',
         command:
-          'napi build --release --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/dist/native/darwin-arm64',
+          'packages/native/node_modules/.bin/napi build --release --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/dist/native/darwin-arm64',
       });
       expect(native.build?.dependsOn).toContainEqual(rootCompile);
       expect(native.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
