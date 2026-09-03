@@ -30,6 +30,7 @@ struct FakeService {
     listed_projects: Vec<ProjectWorkspaces>,
     other_adopted_projects: usize,
     fail_push: Option<CowshedError>,
+    fail_grant: Option<CowshedError>,
     fail_reconcile_gateway: Option<CowshedError>,
     adopt_options: Option<AdoptOptions>,
     push_options: Option<PushOptions>,
@@ -59,6 +60,7 @@ impl Default for FakeService {
             listed_projects: Vec::new(),
             other_adopted_projects: 0,
             fail_push: None,
+            fail_grant: None,
             fail_reconcile_gateway: None,
             cwd_workspace: None,
             adopt_options: None,
@@ -246,6 +248,9 @@ impl CliService for FakeService {
 
     async fn grant(&mut self, name: &str, delta: GrantDelta) -> Result<GrantSet> {
         self.events.push(format!("grant:{name}"));
+        if let Some(error) = self.fail_grant.take() {
+            return Err(error);
+        }
         self.grants.read.extend(delta.read);
         self.grants.read.sort();
         self.grants.read.dedup();
@@ -487,6 +492,39 @@ async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
         .as_ref()
         .expect("exec observes the current grant snapshot");
     assert!(observed.read.contains(&PathBuf::from("/tmp/probe")));
+}
+
+#[tokio::test]
+async fn grant_denial_is_sandbox_denied_json_and_leaves_grants_unchanged() {
+    let mut service = FakeService {
+        fail_grant: Some(CowshedError::sandbox_denied(
+            "grant /Users/tester/.ssh intersects protected path /Users/tester/.ssh",
+            "choose an absolute path outside workspace, controller, project, and credential roots",
+        )),
+        ..FakeService::default()
+    };
+    let cli = parse_args(["--json", "grant", "raven", "--read", "/Users/tester/.ssh"]).unwrap();
+    let mut output = Output::new(Vec::new(), Vec::new(), cli.global.quiet);
+    let failed = dispatch(&mut service, cli, tokio::io::empty(), &mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(failed.code, ErrorCode::SandboxDenied);
+    assert_eq!(failed.exit_code(), 6);
+    assert!(service.grants.read.is_empty());
+    let (stdout, stderr) = output.into_inner();
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+
+    let mut rendered = Output::new(Vec::new(), Vec::new(), false);
+    rendered.json_error(failed).unwrap();
+    let (stdout, _) = rendered.into_inner();
+    let envelope: serde_json::Value = serde_json::from_slice(&stdout).expect("grant JSON error");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "sandbox-denied");
+    assert_eq!(
+        envelope["error"]["hint"],
+        "choose an absolute path outside workspace, controller, project, and credential roots"
+    );
 }
 
 #[tokio::test]
