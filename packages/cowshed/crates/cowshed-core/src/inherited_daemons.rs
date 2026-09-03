@@ -33,23 +33,22 @@ use crate::error::{CowshedError, Result};
 /// sources does not.
 const INHERITED_DAEMON_STATE: &[&str] = &[".nx/workspace-data/d"];
 
-/// Discard every inherited daemon rendezvous directory in `tree_root`, reporting what went.
+/// Discard every inherited daemon rendezvous directory in `tree_root`.
 ///
 /// Idempotent: an entry that is absent — a tree that never ran the daemon, or one already
-/// minted — is the state this establishes, so it is not a finding and not an error.
-pub fn discard(tree_root: &Path) -> Result<Vec<&'static str>> {
-    let mut discarded = Vec::new();
+/// minted — is the state this establishes, so it is not a finding and not an error. Nothing is
+/// reported on success because nothing consumes a report; what a caller needs to know is whether
+/// the tree is now clean, and that is the `Ok`.
+fn discard(tree_root: &Path) -> Result<()> {
     for state in INHERITED_DAEMON_STATE {
-        if discard_one(tree_root, state)? {
-            discarded.push(*state);
-        }
+        discard_one(tree_root, state)?;
     }
-    Ok(discarded)
+    Ok(())
 }
 
 /// [`discard`] for the async mint path. The walk is a handful of `lstat` calls plus one
 /// removal, but the removal can be a large directory, so it does not run on the reactor.
-pub async fn discard_in(tree_root: &Path) -> Result<Vec<&'static str>> {
+pub(crate) async fn discard_in(tree_root: &Path) -> Result<()> {
     let root = tree_root.to_path_buf();
     tokio::task::spawn_blocking(move || discard(&root))
         .await
@@ -61,8 +60,7 @@ pub async fn discard_in(tree_root: &Path) -> Result<Vec<&'static str>> {
         })?
 }
 
-/// `Ok(true)` when this entry was present and is now gone.
-fn discard_one(tree_root: &Path, state: &str) -> Result<bool> {
+fn discard_one(tree_root: &Path, state: &str) -> Result<()> {
     let mut path = tree_root.to_path_buf();
     let mut components = Path::new(state).components().peekable();
     while let Some(component) = components.next() {
@@ -72,7 +70,7 @@ fn discard_one(tree_root: &Path, state: &str) -> Result<bool> {
         // symlinked `.nx` on the way in and reported on a directory in another tree.
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
                 return Err(CowshedError::integrity(
                     format!(
@@ -95,20 +93,34 @@ fn discard_one(tree_root: &Path, state: &str) -> Result<bool> {
                     "replace the symlink with a real directory in the source checkout, then retry",
                 ));
             }
-            // The entry itself is a link. Unlink the name and never touch what it names: the
-            // clone must stop reaching a foreign daemon, and the target is not cowshed's.
-            return remove(&path, false).map(|()| true);
+            // The entry itself is a link: a NAME, not content. Unlink it and never touch what it
+            // names — the clone must stop reaching a foreign daemon, and the target is not
+            // cowshed's to delete.
+            return unlink(&path, false);
         }
-        if leaf {
-            return remove(&path, metadata.is_dir()).map(|()| true);
+        if !leaf {
+            continue;
         }
+        if metadata.is_dir() {
+            return unlink(&path, true);
+        }
+        // A regular file at a path a daemon owns as a directory is not that daemon's state, and
+        // this module knows nothing about what it is instead. It may be tracked content. Refused
+        // rather than removed: deleting a file to satisfy a guess is the failure being avoided.
+        return Err(CowshedError::integrity(
+            format!(
+                "{} is a file, not the daemon directory the inherited state {state} names",
+                path.display()
+            ),
+            "move or remove that file in the source checkout if it is not wanted, then retry",
+        ));
     }
-    // Only an entry that names no component at all, which the table has none of and a test
-    // holds it to. Nothing was named, so nothing was discarded.
-    Ok(false)
+    // Only an entry naming no component at all, which the table has none of and a test holds it
+    // to. Nothing was named, so nothing is owed.
+    Ok(())
 }
 
-fn remove(path: &Path, directory: bool) -> Result<()> {
+fn unlink(path: &Path, directory: bool) -> Result<()> {
     let removed = if directory {
         fs::remove_dir_all(path)
     } else {
@@ -164,10 +176,7 @@ mod tests {
         let root = tree("scope");
         nx_workspace(&root);
 
-        assert_eq!(
-            discard(&root).expect("discard inherited daemon state"),
-            [".nx/workspace-data/d"]
-        );
+        discard(&root).expect("discard inherited daemon state");
 
         assert!(
             !root.join(".nx/workspace-data/d").exists(),
@@ -190,27 +199,49 @@ mod tests {
     }
 
     /// Every mint runs this, and the overwhelming majority of trees have no daemon state at all.
-    /// Absence is the goal state, so it reports nothing rather than failing.
+    /// Absence is the goal state, so it succeeds and changes nothing.
     #[test]
-    fn a_tree_that_never_ran_the_daemon_is_untouched_and_reports_nothing() {
+    fn a_tree_that_never_ran_the_daemon_is_untouched() {
         let root = tree("absent");
         fs::create_dir_all(root.join(".nx/cache")).expect("cache only");
 
-        assert!(
-            discard(&root)
-                .expect("an absent entry is not a failure")
-                .is_empty()
-        );
+        discard(&root).expect("an absent entry is not a failure");
         assert!(root.join(".nx/cache").is_dir());
 
         // And again on a tree that has just been cleaned: minting is retried after a crash.
         let cleaned = tree("cleaned");
         nx_workspace(&cleaned);
-        assert_eq!(discard(&cleaned).expect("first mint").len(), 1);
-        assert!(discard(&cleaned).expect("retried mint").is_empty());
+        discard(&cleaned).expect("first mint");
+        discard(&cleaned).expect("retried mint");
+        assert!(!cleaned.join(".nx/workspace-data/d").exists());
+        assert!(cleaned.join(".nx/workspace-data/file-map.json").exists());
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&cleaned).ok();
+    }
+
+    /// Nx owns that path as a directory. A regular file there is something else — possibly
+    /// tracked content — and this module has no basis for deleting it.
+    #[test]
+    fn a_regular_file_at_the_entry_is_refused_and_left_exactly_as_it_was() {
+        let root = tree("file-leaf");
+        fs::create_dir_all(root.join(".nx/workspace-data")).expect("workspace data");
+        let entry = root.join(".nx/workspace-data/d");
+        fs::write(&entry, b"someone's file").expect("regular file at the entry");
+
+        let error = discard(&root).expect_err("a regular file must refuse");
+        assert_eq!(error.code.as_str(), "integrity");
+        assert!(
+            error.message.contains("is a file"),
+            "the refusal says what it found: {}",
+            error.message
+        );
+        assert_eq!(
+            fs::read(&entry).expect("the file must still be there"),
+            b"someone's file"
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A symlinked ancestor is the one shape where dropping the entry means writing into a tree
@@ -254,10 +285,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join(".nx/workspace-data/d"))
             .expect("symlinked entry");
 
-        assert_eq!(
-            discard(&root).expect("discard the link"),
-            [".nx/workspace-data/d"]
-        );
+        discard(&root).expect("discard the link");
         assert!(
             fs::symlink_metadata(root.join(".nx/workspace-data/d")).is_err(),
             "the link must be gone"
