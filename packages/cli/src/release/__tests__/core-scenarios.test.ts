@@ -159,6 +159,38 @@ describe('release core scenario coverage', () => {
     expect(durableTags).toEqual(['stable@1.1.0', 'prerelease@2.0.0-beta.1']);
   });
 
+  it('considers only the two newest ancestor tags per package and asks git about nothing older', async () => {
+    const ancestry: string[] = [];
+    const versions = new Map([
+      ['packages/stable:v3', '1.3.0'],
+      ['packages/stable:v2', '1.2.0'],
+    ]);
+    const shell: ReleasePlanningShell = {
+      listReleaseTagsByCreatorDate: async () => [
+        tag('stable@1.3.0', 'v3', 40),
+        tag('stable@1.2.0', 'v2', 30),
+        tag('stable@1.1.0', 'v1', 20),
+        tag('stable@1.0.0', 'v0', 10),
+      ],
+      isAncestor: async (ancestor) => {
+        ancestry.push(ancestor);
+        return true;
+      },
+      packageVersionAtRef: async (packagePath, ref) => versions.get(`${packagePath}:${ref}`) ?? null,
+      // Both newest tags incomplete, so without the bound the older two would be queried too.
+      durableTagState: async () => ({ npmPublished: false, githubReleaseExists: false }),
+    };
+
+    const records = await collectOwnedReleaseTagRecords(
+      [{ name: stablePackage.name, projectName: stablePackage.projectName, path: stablePackage.path }],
+      'selected-ref',
+      shell,
+    );
+
+    expect(records.map((releaseRecord) => releaseRecord.tag)).toEqual(['stable@1.3.0', 'stable@1.2.0']);
+    expect(ancestry).toEqual(['v3', 'v2']);
+  });
+
   it('throws when a release tag version does not match package.json at the peeled commit', async () => {
     const shell: ReleasePlanningShell = {
       listReleaseTagsByCreatorDate: async () => [tag('stable@1.0.0', 'mismatch', 10)],
