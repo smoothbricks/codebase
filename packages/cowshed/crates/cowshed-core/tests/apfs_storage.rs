@@ -2281,3 +2281,55 @@ proptest! {
         })?;
     }
 }
+
+/// The DA-churn sequence `cowshed new` performs: the staging device is detached before the
+/// canonical image is published and attached. The detach-settle check lives inside the
+/// backend's detach (below this fake host's seam), so this test pins the ordering the settle
+/// relies on — staging detach, then publish, then the canonical attach — against future
+/// refactors that might interleave them.
+#[tokio::test]
+async fn create_commit_detaches_staging_before_canonical_publish_and_attach() {
+    let host = FakeHost::default();
+    let source = workspace("main", ImageFormat::Sparse, 1);
+    host.seed(&source);
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_create(
+            &source,
+            Destination {
+                repo: repo(),
+                name: WorkspaceName::new("hedge").expect("destination"),
+                topology_revision: Revision::new(2),
+                identity: identity(),
+            },
+        )
+        .expect("create plan");
+    substrate
+        .execute_create_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .await
+        .expect("create");
+    let events = host.events();
+    let attaches: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| *event == "attach-no-mount+fsck:Sparse")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        attaches.len(),
+        2,
+        "staging attach and canonical attach, got {events:?}"
+    );
+    let detach = events
+        .iter()
+        .position(|event| event == "detach:Release")
+        .expect("staging detach");
+    let publish = events
+        .iter()
+        .position(|event| event == "atomic-publish-image")
+        .expect("canonical publish");
+    assert!(
+        attaches[0] < detach && detach < publish && publish < attaches[1],
+        "detach must separate the two attaches with the publish between: {events:?}"
+    );
+}

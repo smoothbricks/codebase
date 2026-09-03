@@ -1,4 +1,3 @@
-//! macOS APFS disk-image substrate.
 //!
 //! Every external operation crosses [`CommandRunner`]. Commands are represented
 //! as an executable plus an argument vector; this module never invokes a shell.
@@ -179,6 +178,73 @@ impl Default for VolumeVisibilityGrace {
             total: Duration::from_secs(5),
             poll: Duration::from_millis(250),
         }
+    }
+}
+
+/// The wait a just-detached whole device is given to leave the attachment inventory.
+///
+/// `hdiutil detach` / `diskutil eject` returning zero means the kernel let go; Disk Arbitration
+/// announcing the departure to the next `attach` is a second, lagging step — the same
+/// announce-lag class [`VolumeVisibilityGrace`] covers on the attach side. The clone commit
+/// detaches its staging device and then attaches the same-UUID bytes as the canonical image
+/// back-to-back; when DA has not yet processed the departure, the re-attach stalls inside
+/// kernel/DA contention for tens of seconds (measured 24–62s; a direct `/sbin/mount_apfs`
+/// bypass hung 47.9s, so no XPC-layer workaround avoids it).
+///
+/// After every whole-device detach the backend therefore polls `hdiutil info -plist` until the
+/// device is gone, logging each outcome. The bound is generous against a normally sub-second
+/// departure and the outcome is always soft: at the bound the operation proceeds exactly as it
+/// would have without the check, but loudly, so the next investigation can measure whether
+/// lingering departures correlate with hangs instead of needing dtrace. No blind sleeps: the
+/// first poll runs immediately, and a departed device costs one inventory read and no waiting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DetachSettleGrace {
+    pub total: Duration,
+    pub poll: Duration,
+}
+
+impl Default for DetachSettleGrace {
+    fn default() -> Self {
+        Self {
+            total: Duration::from_secs(10),
+            poll: Duration::from_millis(250),
+        }
+    }
+}
+
+/// One per-leg timing span on the existing log path (stderr, alongside the crate's other
+/// `cowshed:` diagnostics): a start line when the step begins and a done line with the waited
+/// duration and outcome, so the next mount-hang investigation reads timestamps instead of
+/// needing dtrace. Unconditional by design — captured by the test harness on success, visible
+/// in production. A wrong `leg` only mislabels a log line, never behavior.
+pub(crate) fn timed_apfs_step<T, E>(
+    leg: &str,
+    step: &'static str,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    eprintln!("cowshed: apfs {leg}/{step} start");
+    let started = std::time::Instant::now();
+    let result = operation();
+    eprintln!(
+        "cowshed: apfs {leg}/{step} done elapsed={:?} status={}",
+        started.elapsed(),
+        if result.is_ok() { "ok" } else { "err" }
+    );
+    result
+}
+
+/// The leg a backend step serves, derived from the image path it touches: staging state lives
+/// under `.staging` (the same namespace the storage layer calls STAGING_NAMESPACE; this module
+/// cannot name it without a dependency cycle, so the literal is matched here), everything else
+/// is canonical. No signature changes — the trait seams stay intact.
+pub(crate) fn apfs_step_leg(image: &Path) -> &'static str {
+    if image
+        .components()
+        .any(|component| component.as_os_str() == ".staging")
+    {
+        "staging"
+    } else {
+        "canonical"
     }
 }
 
@@ -689,6 +755,7 @@ pub struct MacOsApfsBackend<R, S = ThreadSleeper> {
     sleeper: S,
     grace: DetachGrace,
     visibility: VolumeVisibilityGrace,
+    settle: DetachSettleGrace,
 }
 
 impl<R> MacOsApfsBackend<R> {
@@ -698,6 +765,7 @@ impl<R> MacOsApfsBackend<R> {
             sleeper: ThreadSleeper,
             grace: DetachGrace::default(),
             visibility: VolumeVisibilityGrace::default(),
+            settle: DetachSettleGrace::default(),
         }
     }
 }
@@ -716,7 +784,15 @@ impl<R, S> MacOsApfsBackend<R, S> {
             sleeper,
             grace,
             visibility,
+            settle: DetachSettleGrace::default(),
         }
+    }
+    /// The detach-settle bound, chained after [`MacOsApfsBackend::with_grace`]. A named-type
+    /// builder rather than a fifth positional argument, so the existing call sites keep reading
+    /// as they did.
+    pub fn with_detach_settle(mut self, settle: DetachSettleGrace) -> Self {
+        self.settle = settle;
+        self
     }
     pub fn runner(&self) -> &R {
         &self.runner
@@ -1182,7 +1258,57 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         whole_device: &str,
         intent: DetachIntent,
     ) -> Result<(), ApfsError> {
-        self.detach_target_checked(format, DetachTarget::Device(whole_device), intent)
+        self.detach_target_checked(format, DetachTarget::Device(whole_device), intent)?;
+        self.settle_detached_device(whole_device);
+        Ok(())
+    }
+
+    /// Bounded, logged confirmation that a detached whole device left the attachment
+    /// inventory before any later attach re-enters Disk Arbitration. The poll is keyed on the
+    /// device rather than an image path: after a detach there may be no image to scope by, and
+    /// the question is whether the device is gone at all.
+    ///
+    /// Soft by design, and that is the measurement contract: a lingering or unreadable
+    /// inventory is logged loudly and the operation proceeds exactly as it would have without
+    /// the check. Failing a successful detach over announcement lag would turn transient DA
+    /// slowness under load into user-facing failures; the logs will show whether lingering
+    /// departures correlate with hangs, and only then should the bound harden.
+    fn settle_detached_device(&self, whole_device: &str) {
+        let mut waited = Duration::ZERO;
+        loop {
+            match self.detached_device_departed(whole_device) {
+                Ok(true) => {
+                    eprintln!(
+                        "cowshed: apfs detach-settle {whole_device} departed waited={waited:?}"
+                    );
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "cowshed: apfs detach-settle {whole_device} inventory unreadable ({error}); proceeding without confirmation waited={waited:?}"
+                    );
+                    return;
+                }
+            }
+            if waited >= self.settle.total {
+                eprintln!(
+                    "cowshed: apfs detach-settle {whole_device} STILL PRESENT after {:?}; proceeding — a lingering departure may stall the next attach in DA contention",
+                    self.settle.total
+                );
+                return;
+            }
+            self.sleeper.sleep(self.settle.poll);
+            waited = waited.saturating_add(self.settle.poll);
+        }
+    }
+
+    fn detached_device_departed(&self, whole_device: &str) -> Result<bool, ApfsError> {
+        let output = self.run_checked(
+            "inventory attached disk images",
+            CommandRequest::new(HDIUTIL, ["info", "-plist"]),
+        )?;
+        Ok(!parse_inventory_devices(&output.stdout)?.contains(whole_device))
     }
 }
 
@@ -1316,8 +1442,12 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         destination: &Path,
         format: ImageFormat,
     ) -> Result<(), ApfsError> {
-        self.sync_for_freshness()?;
-        self.clone_image(source, destination, format)?;
+        let leg = apfs_step_leg(destination);
+        timed_apfs_step(leg, "sync", || self.sync_for_freshness())?;
+        timed_apfs_step(leg, "clonefile", || {
+            self.clone_image(source, destination, format)
+                .map_err(ApfsError::from)
+        })?;
         Ok(())
     }
 
@@ -1347,7 +1477,10 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         image: &Path,
         format: ImageFormat,
     ) -> Result<AttachedImage, ApfsError> {
-        let attachment = self.attach_without_mounting(image, format)?;
+        let leg = apfs_step_leg(image);
+        let attachment = timed_apfs_step(leg, "attach", || {
+            self.attach_without_mounting(image, format)
+        })?;
         let request = CommandRequest::new(
             FSCK_APFS,
             [
@@ -1355,7 +1488,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
                 OsString::from(raw_device_from(&attachment.volume_device)),
             ],
         );
-        let output = self.runner.run(&request)?;
+        let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request.clone()))?;
         if output.succeeded() {
             return Ok(attachment);
         }
@@ -1396,10 +1529,12 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
             mount_point.as_os_str().to_owned(),
             OsString::from(&attachment.volume_device),
         ]);
-        self.run_checked(
-            "mount verified APFS volume",
-            CommandRequest::new(DISKUTIL, args),
-        )
+        timed_apfs_step(apfs_step_leg(&attachment.image), "mount", || {
+            self.run_checked(
+                "mount verified APFS volume",
+                CommandRequest::new(DISKUTIL, args),
+            )
+        })
         .map(|_| ())
     }
 
@@ -1749,6 +1884,49 @@ fn attachment_inventory_path(image: &Path) -> Result<PathBuf, ApfsError> {
 
 fn parse_attachment_inventory(image: &Path, bytes: &[u8]) -> Result<BTreeSet<String>, ApfsError> {
     Ok(parse_hdiutil_images(image, bytes)?.devices)
+}
+
+/// Every whole device `hdiutil info -plist` currently attaches, across all images. The
+/// detach-settle check keys on the device rather than scoping by image: after a detach there
+/// may be no image to scope by, and the question is whether the device is gone at all.
+///
+/// Deliberately more lenient than [`parse_hdiutil_images`]: entries without a
+/// `system-entities` array are skipped rather than failing the whole read. The settle check
+/// treats an unreadable inventory as "unknown, proceed loudly", so strictness here would only
+/// convert tolerated shape drift into noise; the authoritative per-image mapping stays strict
+/// where it matters.
+fn parse_inventory_devices(bytes: &[u8]) -> Result<BTreeSet<String>, ApfsError> {
+    let value = plist::Value::from_reader(std::io::Cursor::new(bytes))
+        .map_err(|error| ApfsError::InvalidAttachmentInventory(error.to_string()))?;
+    let images = value
+        .as_dictionary()
+        .and_then(|root| root.get("images"))
+        .and_then(plist::Value::as_array)
+        .ok_or_else(|| ApfsError::InvalidAttachmentInventory("missing images array".into()))?;
+    let mut devices = BTreeSet::new();
+    for entry in images {
+        let Some(entities) = entry
+            .as_dictionary()
+            .and_then(|entry| entry.get("system-entities"))
+            .and_then(plist::Value::as_array)
+        else {
+            continue;
+        };
+        for entity in entities {
+            let Some(device) = entity
+                .as_dictionary()
+                .and_then(|entity| entity.get("dev-entry"))
+                .and_then(plist::Value::as_string)
+                .and_then(device_path)
+            else {
+                continue;
+            };
+            if device_depth(&device) == 0 && is_kernel_device_path(&device) {
+                devices.insert(device);
+            }
+        }
+    }
+    Ok(devices)
 }
 
 fn is_canonical_mount_point(path: &Path) -> bool {
@@ -2327,6 +2505,10 @@ mod tests {
                 poll: Duration::from_millis(10),
             },
         )
+        .with_detach_settle(DetachSettleGrace {
+            total: Duration::from_millis(20),
+            poll: Duration::from_millis(10),
+        })
     }
 
     fn capacity(value: &str) -> ImageCapacity {
@@ -2869,6 +3051,7 @@ mod tests {
             CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
             CommandOutput::failure(8, "not clean"),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
@@ -2885,7 +3068,7 @@ mod tests {
                 && argv(&request) == ["-q", "/dev/rdisk5s2"]
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert_eq!(requests[4].program, Path::new(FSCK_APFS));
         assert_eq!(argv(&requests[4]), ["-q", "/dev/rdisk5s2"]);
         assert_eq!(requests[5].program, Path::new(HDIUTIL));
@@ -2913,6 +3096,7 @@ mod tests {
             CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::success(EMPTY_VOLUME_LIST_PLIST),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]);
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
@@ -2926,7 +3110,7 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 10);
         for round in 0..3 {
             assert_eq!(
                 argv(&requests[2 + round * 2]),
@@ -3008,6 +3192,7 @@ mod tests {
             CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
             CommandOutput::failure(3, "list failed"),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
@@ -3025,7 +3210,7 @@ mod tests {
             }
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(argv(&requests[4]), ["detach", "/dev/disk4"]);
     }
 
@@ -3036,6 +3221,7 @@ mod tests {
             CommandOutput::success(SPARSE_ATTACH_PLIST),
             CommandOutput::failure(1, "Could not find disk"),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
@@ -3053,7 +3239,7 @@ mod tests {
             }
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         assert_eq!(argv(&requests[3]), ["detach", "/dev/disk4"]);
     }
 
@@ -3075,6 +3261,7 @@ mod tests {
             info_without_container(),
             info_without_container(),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]);
         let error = backend
             .attach_verified(Path::new("session.sparseimage"), ImageFormat::Sparse)
@@ -3087,7 +3274,7 @@ mod tests {
             } if candidate == "/dev/disk4s1"
         ));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 7);
         assert!(
             !requests
                 .iter()
@@ -3156,7 +3343,7 @@ mod tests {
             BTreeSet::from(["/dev/disk20".into()])
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert_eq!(
             argv(&requests[1]),
@@ -3171,7 +3358,7 @@ mod tests {
         );
         assert_eq!(argv(&requests[2]), ["info", "-plist"]);
         assert_eq!(argv(&requests[3]), ["eject", "/dev/disk8"]);
-        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
         assert!(!requests.iter().any(|request| {
             let args = argv(request);
             args.iter()
@@ -3202,7 +3389,7 @@ mod tests {
             BTreeSet::from(["/dev/disk20".into()])
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
         assert_eq!(
             argv(&requests[1]),
@@ -3218,7 +3405,7 @@ mod tests {
         );
         assert_eq!(argv(&requests[2]), ["info", "-plist"]);
         assert_eq!(argv(&requests[3]), ["detach", "/dev/disk9"]);
-        assert_eq!(argv(&requests[4]), ["info", "-plist"]);
+        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
     }
 
     #[test]
@@ -3438,6 +3625,7 @@ mod tests {
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let created = backend
             .create_staged_image(&CreateImageRequest {
@@ -3471,6 +3659,7 @@ mod tests {
                 Path::new(DISKUTIL),
                 Path::new(NEWFS_APFS),
                 Path::new(DISKUTIL),
+                Path::new(HDIUTIL),
             ]
         );
         assert_eq!(
@@ -3507,6 +3696,7 @@ mod tests {
             ["-U", "502", "-G", "20", "-i", "-v", "main", "/dev/disk8"]
         );
         assert_eq!(argv(&requests[5]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[6]), ["info", "-plist"]);
     }
 
     #[test]
@@ -3562,6 +3752,7 @@ mod tests {
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let created = backend
             .create_staged_image(&CreateImageRequest {
@@ -3583,7 +3774,7 @@ mod tests {
             }
         );
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(
             requests
                 .iter()
@@ -3595,6 +3786,7 @@ mod tests {
                 Path::new(DISKUTIL),
                 Path::new(NEWFS_APFS),
                 Path::new(DISKUTIL),
+                Path::new(HDIUTIL),
             ]
         );
         assert_eq!(
@@ -3602,6 +3794,7 @@ mod tests {
             ["-U", "501", "-G", "80", "-i", "-v", "main", "/dev/disk8"]
         );
         assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
+        assert_eq!(argv(&requests[5]), ["info", "-plist"]);
     }
 
     #[test]
@@ -3727,6 +3920,7 @@ mod tests {
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::success([]),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let created = backend
             .create_staged_image(&CreateImageRequest {
@@ -3743,7 +3937,7 @@ mod tests {
         assert_eq!(created.format, ImageFormat::Asif);
         assert_eq!(created.path, Path::new(".staging/sensitive-asif.asif"));
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(
             argv(&requests[3]),
             [
@@ -3853,6 +4047,7 @@ mod tests {
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -3879,9 +4074,10 @@ mod tests {
         ));
         assert!(!image.exists());
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(requests[3].program, Path::new(NEWFS_APFS));
         assert_eq!(argv(&requests[4]), ["eject", "/dev/disk8"]);
+        assert_eq!(requests[5].program, Path::new(HDIUTIL));
     }
 
     #[test]
@@ -3948,6 +4144,7 @@ mod tests {
             CommandOutput::success(BLANK_ASIF_PLIST),
             CommandOutput::failure(70, "format failed"),
             CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
         ]));
         let error = backend
             .create_staged_image(&CreateImageRequest {
@@ -4249,7 +4446,10 @@ mod tests {
 
     #[test]
     fn public_detach_delegates_format_and_whole_device() {
-        let backend = graced_backend([CommandOutput::success([])]);
+        let backend = graced_backend([
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]);
         let attachment = AttachedImage {
             image: PathBuf::from("session.sparseimage"),
             format: ImageFormat::Sparse,
@@ -4260,9 +4460,113 @@ mod tests {
         backend.detach(&attachment, DetachIntent::Release).unwrap();
 
         let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].program, Path::new(HDIUTIL));
         assert_eq!(argv(&requests[0]), ["detach", "/dev/disk12"]);
+        assert_eq!(argv(&requests[1]), ["info", "-plist"]);
+    }
+
+    /// Detach-settle: a device already gone from the inventory costs one read and no waiting.
+    #[test]
+    fn detach_settle_returns_without_sleep_when_device_already_gone() {
+        let backend = graced_backend([
+            CommandOutput::success([]),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]);
+        let attachment = AttachedImage {
+            image: PathBuf::from("session.sparseimage"),
+            format: ImageFormat::Sparse,
+            whole_device: "/dev/disk12".into(),
+            volume_device: "/dev/disk12s1".into(),
+        };
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(argv(&requests[1]), ["info", "-plist"]);
+        assert!(
+            backend.sleeper.waits().is_empty(),
+            "no blind sleeps: departed on the first poll"
+        );
+    }
+
+    /// Detach-settle: a lingering device is polled until it departs, then the detach succeeds.
+    #[test]
+    fn detach_settle_polls_until_departure_then_returns() {
+        let lingering =
+            attachment_inventory(&[("/tmp/cowshed-lingering.sparseimage", &["/dev/disk12"][..])]);
+        let backend = graced_backend([
+            CommandOutput::success([]),
+            CommandOutput::success(lingering.as_bytes()),
+            CommandOutput::success(EMPTY_ATTACHMENT_INVENTORY),
+        ]);
+        let attachment = AttachedImage {
+            image: PathBuf::from("session.sparseimage"),
+            format: ImageFormat::Sparse,
+            whole_device: "/dev/disk12".into(),
+            volume_device: "/dev/disk12s1".into(),
+        };
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+        let requests = backend.runner().requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10)],
+            "one poll while present, none once departed"
+        );
+    }
+
+    /// Detach-settle is soft by design: a device that never departs within the bound proceeds
+    /// loudly instead of failing a successful detach. Failing here would turn transient DA
+    /// slowness under load into user-facing failures; the loud log is the measurement.
+    #[test]
+    fn detach_settle_proceeds_loudly_at_bound_while_device_lingers() {
+        let lingering =
+            attachment_inventory(&[("/tmp/cowshed-lingering.sparseimage", &["/dev/disk12"][..])]);
+        let backend = graced_backend([
+            CommandOutput::success([]),
+            CommandOutput::success(lingering.as_bytes()),
+            CommandOutput::success(lingering.as_bytes()),
+            CommandOutput::success(lingering.as_bytes()),
+        ]);
+        let attachment = AttachedImage {
+            image: PathBuf::from("session.sparseimage"),
+            format: ImageFormat::Sparse,
+            whole_device: "/dev/disk12".into(),
+            volume_device: "/dev/disk12s1".into(),
+        };
+        backend.detach(&attachment, DetachIntent::Release).unwrap();
+        assert_eq!(backend.runner().requests().len(), 4);
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10), Duration::from_millis(10)],
+            "two polls spend the 20ms bound, then the bound stops the wait"
+        );
+    }
+
+    #[test]
+    fn parse_inventory_devices_collects_whole_devices_across_images() {
+        let bytes = attachment_inventory(&[
+            ("/tmp/a.sparseimage", &["/dev/disk4"][..]),
+            ("/tmp/b.sparseimage", &["disk5s1", "/dev/disk5"][..]),
+        ]);
+        let devices = parse_inventory_devices(bytes.as_bytes()).unwrap();
+        assert_eq!(
+            devices,
+            BTreeSet::from(["/dev/disk4".to_owned(), "/dev/disk5".to_owned()])
+        );
+        assert!(parse_inventory_devices(b"not a plist").is_err());
+        assert!(parse_inventory_devices(
+            br#"<?xml version="1.0"?><plist><dict><key>images</key><string>nope</string></dict></plist>"#
+        )
+        .is_err());
+        // Entries without system-entities are skipped, not fatal: shape drift in one image
+        // must not blind the departure check for every other device.
+        let drifted = r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict><key>image-path</key><string>/tmp/c.sparseimage</string></dict></array></dict></plist>"#;
+        assert!(
+            parse_inventory_devices(drifted.as_bytes())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The dissent each tool actually emits — `hdiutil`'s EBUSY status, `diskutil`'s dissent text
