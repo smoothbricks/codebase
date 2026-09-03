@@ -50,10 +50,11 @@ Concrete targets come from concrete files:
   run (30s per-test timeout like `bun test --timeout=30000`) whose inputs are that crate and its path deps, so unchanged
   crates are skipped. Package-rooted workspaces use `cargo nextest run --workspace -E 'package(<crate>)'`;
   repository-rooted workspaces additionally use `-p <crate>` to bind the runner to the project that owns the crate.
-  Those runs are chained across project boundaries so two cargos never share `target/`; `napi-debug` sits on that chain
-  after compile. Clippy uses `--target-dir target/cargo-lint` so lint can overlap tests. A crate declaring
-  `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm` output target in its owning
-  project.
+  Per-crate runners accept an empty nextest selection because a valid workspace member may have no tests and a hash
+  partition may legitimately be empty. Those runs are chained across project boundaries so two cargos never share
+  `target/`; `napi-debug` sits on that chain after compile. Clippy uses `--target-dir target/cargo-lint` so lint can
+  overlap tests. A crate declaring `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable
+  `cargo-wasm` output target in its owning project.
 - A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
