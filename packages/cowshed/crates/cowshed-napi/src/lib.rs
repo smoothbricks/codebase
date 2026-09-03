@@ -1006,6 +1006,7 @@ mod parity_tests {
             Command::List(_) => Some("Project.listWorkspaces"),
             Command::Path(_) => Some("Project.path"),
             Command::Exec(_) => Some("WorkspaceHandle.exec"),
+            Command::Grant(_) => Some("Coordinator.grant|WorkspaceRef.grants"),
             Command::Remove(_) => Some("Coordinator.remove"),
             Command::Attach(_) => Some("WorkspaceRef.attach"),
             Command::Detach(_) => Some("Coordinator.detach"),
@@ -1045,6 +1046,10 @@ mod parity_tests {
         (
             &["exec", "parity", "--", "true"],
             Some("WorkspaceHandle.exec"),
+        ),
+        (
+            &["grant", "parity"],
+            Some("Coordinator.grant|WorkspaceRef.grants"),
         ),
         (&["rm", "parity"], Some("Coordinator.remove")),
         (&["attach", "parity"], Some("WorkspaceRef.attach")),

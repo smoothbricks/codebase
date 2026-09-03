@@ -196,15 +196,24 @@ impl fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
-/// Generate a complete, deterministic SBPL profile for one authority tier.
+struct ValidatedSandboxPaths<'a> {
+    hard_denies: Vec<Cow<'a, Path>>,
+    read_grants: Vec<&'a Path>,
+    write_grants: Vec<&'a Path>,
+    sockets: Vec<&'a Path>,
+}
+
+/// Validate every path and grant boundary that profile generation enforces.
 ///
-/// Paths must already be canonical controller data. Child argv, environment,
-/// output, and repository-controlled grants are deliberately absent from the
-/// role selection and therefore cannot remove the executed-child narrowing.
-pub fn seatbelt_profile(
+/// Controllers call this before publishing a grant snapshot, so an invalid grant never becomes
+/// durable state that only fails when the next child is launched.
+pub fn validate_sandbox_config(config: &SandboxConfig) -> Result<(), SandboxError> {
+    validated_sandbox_paths(config).map(|_| ())
+}
+
+fn validated_sandbox_paths(
     config: &SandboxConfig,
-    role: SandboxProfileRole,
-) -> Result<String, SandboxError> {
+) -> Result<ValidatedSandboxPaths<'_>, SandboxError> {
     validate_path(&config.home)?;
     validate_path(&config.mount_root)?;
     validate_path(&config.workspace_mount)?;
@@ -236,6 +245,30 @@ pub fn seatbelt_profile(
             });
         }
     }
+
+    Ok(ValidatedSandboxPaths {
+        hard_denies,
+        read_grants,
+        write_grants,
+        sockets,
+    })
+}
+
+/// Generate a complete, deterministic SBPL profile for one authority tier.
+///
+/// Paths must already be canonical controller data. Child argv, environment,
+/// output, and repository-controlled grants are deliberately absent from the
+/// role selection and therefore cannot remove the executed-child narrowing.
+pub fn seatbelt_profile(
+    config: &SandboxConfig,
+    role: SandboxProfileRole,
+) -> Result<String, SandboxError> {
+    let ValidatedSandboxPaths {
+        hard_denies,
+        read_grants,
+        write_grants,
+        sockets,
+    } = validated_sandbox_paths(config)?;
 
     let cowshed = cowshed_root();
     let caches = Path::new(CACHES_ROOT);
@@ -993,10 +1026,18 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_and_descendant_secret_grants_are_rejected() {
-        for grant in ["/Users/tester", "/Users/tester/.ssh/id_ed25519"] {
+    fn controller_validation_rejects_secret_and_workspace_grants() {
+        for grant in [
+            "/Users/tester",
+            "/Users/tester/.ssh/id_ed25519",
+            "/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/data",
+        ] {
             let mut config = config(RunSandboxMode::ReadWrite);
             config.grants.read = vec![PathBuf::from(grant)];
+            assert!(matches!(
+                validate_sandbox_config(&config),
+                Err(SandboxError::GrantIntersectsDeny { .. })
+            ));
             assert!(matches!(
                 seatbelt_profile(&config, SandboxProfileRole::ExecutedChild),
                 Err(SandboxError::GrantIntersectsDeny { .. })

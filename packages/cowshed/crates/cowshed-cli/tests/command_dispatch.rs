@@ -41,6 +41,8 @@ struct FakeService {
     cwd_workspace: Option<String>,
     gc_candidates: Vec<GcCandidate>,
     shutdowns: Option<Arc<AtomicUsize>>,
+    grants: GrantSet,
+    exec_grants: Option<GrantSet>,
     shutdown_error: Option<CowshedError>,
 }
 
@@ -65,6 +67,8 @@ impl Default for FakeService {
             land_options: None,
             workspace_at_error: None,
             gc_candidates: Vec::new(),
+            grants: GrantSet::default(),
+            exec_grants: None,
             shutdowns: None,
             shutdown_error: None,
         }
@@ -235,6 +239,23 @@ impl CliService for FakeService {
         })
     }
 
+    async fn grants(&mut self, name: &str) -> Result<GrantSet> {
+        self.events.push(format!("grants:{name}"));
+        Ok(self.grants.clone())
+    }
+
+    async fn grant(&mut self, name: &str, delta: GrantDelta) -> Result<GrantSet> {
+        self.events.push(format!("grant:{name}"));
+        self.grants.read.extend(delta.read);
+        self.grants.read.sort();
+        self.grants.read.dedup();
+        self.grants.write.extend(delta.write);
+        self.grants.write.sort();
+        self.grants.write.dedup();
+        self.grants.revision += 1;
+        Ok(self.grants.clone())
+    }
+
     async fn push(&mut self, name: &str, options: PushOptions) -> Result<PushReport> {
         self.push_options = Some(options.clone());
         self.events.push(format!("push:{name}:{options:?}"));
@@ -276,6 +297,7 @@ impl CliService for FakeService {
         stderr: &mut (dyn Write + Send),
     ) -> Result<ExecResult> {
         self.events.push(format!("exec:{}", command.workspace));
+        self.exec_grants = Some(self.grants.clone());
         self.presentation = Some(presentation);
         self.argv = command
             .request
@@ -409,6 +431,62 @@ async fn run(
         .unwrap();
     let (stdout, stderr) = output.into_inner();
     (exit.code, stdout, stderr)
+}
+
+#[tokio::test]
+async fn grant_persists_sorted_paths_that_the_next_exec_observes() {
+    let mut service = FakeService::default();
+
+    let (_, stdout, stderr) = run(
+        &mut service,
+        [
+            "grant",
+            "raven",
+            "--read",
+            "/tmp/z",
+            "/tmp/probe",
+            "--read",
+            "/tmp/probe",
+            "--write",
+            "/tmp/output",
+        ],
+    )
+    .await;
+    assert!(stdout.is_empty());
+    assert_eq!(
+        stderr,
+        b"cowshed: grants for raven now: 2 read, 1 write\n\
+          cowshed: filesystem grants apply from the next exec or shell\n\
+          next: cowshed exec raven -- <retry your command>\n"
+    );
+
+    let (_, stdout, stderr) = run(&mut service, ["grant", "raven"]).await;
+    assert_eq!(
+        stdout,
+        b"read\t/tmp/probe\nread\t/tmp/z\nwrite\t/tmp/output\n"
+    );
+    assert!(stderr.is_empty());
+
+    let (_, stdout, stderr) = run(&mut service, ["grant", "raven", "--json"]).await;
+    assert!(stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&stdout).expect("grant JSON");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(
+        envelope["result"]["read"],
+        serde_json::json!(["/tmp/probe", "/tmp/z"])
+    );
+
+    let (code, _, _) = run(
+        &mut service,
+        ["exec", "raven", "--", "cat", "/tmp/probe/value"],
+    )
+    .await;
+    assert_eq!(code, 0);
+    let observed = service
+        .exec_grants
+        .as_ref()
+        .expect("exec observes the current grant snapshot");
+    assert!(observed.read.contains(&PathBuf::from("/tmp/probe")));
 }
 
 #[tokio::test]
@@ -1335,6 +1413,12 @@ impl CliService for SerializedCreateService {
         unreachable!()
     }
     async fn gc(&mut self, _: GcOptions) -> Result<GcReport> {
+        unreachable!()
+    }
+    async fn grants(&mut self, _: &str) -> Result<GrantSet> {
+        unreachable!()
+    }
+    async fn grant(&mut self, _: &str, _: GrantDelta) -> Result<GrantSet> {
         unreachable!()
     }
     async fn push(&mut self, _: &str, _: PushOptions) -> Result<PushReport> {
