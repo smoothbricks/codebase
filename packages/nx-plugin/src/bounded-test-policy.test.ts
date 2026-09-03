@@ -159,6 +159,27 @@ describe('bounded test target policy', () => {
     expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'example', projectJson })).toBe(false);
   });
 
+  it('accepts custom positive timeouts for bounded execution targets', () => {
+    const packageJson: BoundedTestPolicyPackageJson = {
+      scripts: { test: boundedTestScriptAlias('example') },
+      nx: {
+        targets: {
+          test: {
+            executor: BOUNDED_TEST_EXECUTOR,
+            options: {
+              command: 'bun x vitest run',
+              cwd: '{projectRoot}',
+              timeoutMs: 300_000,
+              killAfterMs: 15_000,
+            },
+          },
+        },
+      },
+    };
+
+    expect(checkBoundedTestTargetPolicy(packageJson, { projectName: 'example' })).toBe(true);
+  });
+
   it('accepts an executorless aggregate whose resolved execution target is bounded', () => {
     const packageJson: BoundedTestPolicyPackageJson = {
       nx: { targets: { test: { dependsOn: ['napi-test'] } } },
