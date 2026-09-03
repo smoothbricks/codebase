@@ -5,12 +5,11 @@ import { inspect } from 'node:util';
 
 import { describeMiss, ensureBuilt, parseTargetSelector } from '../ensure-built.js';
 
-const USAGE =
-  'usage: smoothbricks-ensure-built <project:target[:configuration]> [--workspace-root <dir>] -- <binary> [args...]';
+const USAGE = 'usage: smoo-nx-exec <project:target[:configuration]> [--workspace-root <dir>] -- <binary> [args...]';
 
 /** Argument and environment problems all exit 2, the shell's "usage" code. */
 function usageError(message: string): never {
-  process.stderr.write(`smoothbricks-ensure-built: ${message}\n${USAGE}\n`);
+  process.stderr.write(`smoo-nx-exec: ${message}\n${USAGE}\n`);
   process.exit(2);
 }
 
@@ -103,12 +102,12 @@ const workspaceRoot =
   workspaceRootArg === undefined ? findWorkspaceRoot(process.cwd()) : resolve(process.cwd(), workspaceRootArg);
 
 const result = await ensureBuilt({ target, cwd: workspaceRoot }).catch((error: unknown) => {
-  process.stderr.write(`smoothbricks-ensure-built: ${describeError(error)}\n`);
+  process.stderr.write(`smoo-nx-exec: ${describeError(error)}\n`);
   process.exit(1);
 });
 
 if (result.disposition !== 'hit' && process.env.NX_VERBOSE_LOGGING === 'true') {
-  process.stderr.write(`smoothbricks-ensure-built: ran ${target} because ${describeMiss(result.reason)}\n`);
+  process.stderr.write(`smoo-nx-exec: ran ${target} because ${describeMiss(result.reason)}\n`);
 }
 if (result.disposition === 'failed') {
   if (result.signal !== null) {
@@ -120,7 +119,7 @@ if (result.disposition === 'failed') {
 }
 
 if (process.execve === undefined) {
-  throw new Error('smoothbricks-ensure-built needs process.execve, which requires a POSIX host on Node 24+ or Bun');
+  throw new Error('smoo-nx-exec needs process.execve, which requires a POSIX host on Node 24+ or Bun');
 }
 // `execve`, not spawn-and-wait: the built binary replaces this process, so it
 // owns the terminal, the signals and the exit status directly, with no wrapper
