@@ -74,7 +74,7 @@
     "@smoothbricks/validation": "workspace:*",
     "commander": "^14.0.3",
     "make-synchronized": "^0.8.0",
-    "nx": "23.1.1",
+    "nx": "latest",
     "prettier": "^3.6.1",
     "publint": "^0.3.18",
     "semver": "^7.7.4",
@@ -95,7 +95,7 @@
           "command": "bun test --timeout=30000",
           "cwd": "{projectRoot}",
           "timeoutMs": 120000,
-          "killAfterMs": 10000
+          "killAfterMs": 1e4
         }
       }
     },
