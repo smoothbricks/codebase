@@ -335,6 +335,7 @@ describe('ColumnBuffer materializer parity', () => {
     const codeStrings = {
       constructorParams: 'tag',
       constructorPreamble: 'this._tag = tag;',
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: The generated method source intentionally contains this placeholder.
       methods: 'get doubled() { return this._tag * 2; }\n    label() { return `tag:${this._tag}`; }',
     };
     const hooks = {

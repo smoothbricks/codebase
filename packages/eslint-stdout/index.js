@@ -10,7 +10,7 @@ module.exports = (results) => {
   // output: The source code for the given file with as many fixes applied as possible.
   //         This property is omitted if no fix is available.
   // - https://eslint.org/docs/latest/extend/custom-formatters#the-result-object
-  const output = results.map((r) => r.output && r.output.trim()).join('\0');
+  const output = results.map((r) => r.output?.trim()).join('\0');
   process.stdout.write(output);
 
   // Return human readable formatted errors if any:

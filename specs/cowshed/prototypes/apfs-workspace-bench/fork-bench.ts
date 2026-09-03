@@ -87,11 +87,11 @@ async function run() {
     await $`/bin/cp -c ${base} ${clone}`.quiet();
 
     // fsck the clone without mounting
-    let fsckQ = '?',
-      fsckN = '?',
-      mountable = '?',
-      filesReadable = '?',
-      latestFilePresent = '?';
+    let fsckQ = '?';
+    let fsckN = '?';
+    let mountable = '?';
+    let filesReadable = '?';
+    let latestFilePresent = '?';
     try {
       const { container, vol } = await attachNoMount(clone);
       const rvol = vol.replace('/dev/disk', '/dev/rdisk');
@@ -116,10 +116,12 @@ async function run() {
         const ls = await $`/bin/ls ${join(cmnt, 'ws')}`.nothrow().quiet();
         filesReadable = ls.exitCode === 0 ? 'yes' : 'no';
         await detachMnt(cmnt);
-      } catch (e) {
-        mountable = `no(${(e as any)?.exitCode ?? 'err'})`;
+      } catch (error) {
+        const exitCode =
+          typeof error === 'object' && error !== null && 'exitCode' in error ? String(error.exitCode) : 'err';
+        mountable = `no(${exitCode})`;
       }
-    } catch (e) {
+    } catch {
       fsckQ = 'attach-err';
     }
     checks.push({ idx, synced, fsckQ, fsckN, mountable, filesReadable, latestFilePresent });
