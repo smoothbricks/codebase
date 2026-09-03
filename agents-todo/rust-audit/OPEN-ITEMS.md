@@ -52,6 +52,22 @@ Land order for `cowshed-core` is `cs-coreapi` first — its type changes are wha
    its 82 sibling tests each finish under 0.11 s. The bound must come from a measurement taken on an OTHERWISE IDLE
    machine; any number taken while a fleet is compiling is CPU-starved and must not be encoded. See handbook §19.9 for
    why this test cannot be hoisted into `cargo-test-compile`.
+5. **Darwin linker/SDK selection is per-cargo-workspace, and only `packages/cowshed` makes it.** cowshed's own layer
+   manages `DEVELOPER_DIR` and nothing else: `developer_directory()` in
+   `packages/cowshed/crates/cowshed-core/src/runtime/supervisor.rs` exports it into every sandboxed child, accepting a
+   path only under `/Applications`, `/Library/Developer` or `/System`. Linker choice is the project's:
+   `packages/cowshed/.cargo/config.toml` points `[target.aarch64-apple-darwin] linker` and its x86_64 twin at
+   `scripts/macos-linker.sh`, which re-derives `DEVELOPER_DIR` and `-isysroot` from `xcode-select`/`xcrun` and execs
+   Apple's clang, so the Nix cc-wrapper's `NIX_LDFLAGS` never reaches the link. Cargo discovers that config by walking
+   up from the invocation cwd, so it covers exactly the cargo runs rooted under `packages/cowshed/`. `packages/columine`
+   and `packages/lmao` are separate cargo workspaces whose `.cargo/config.toml` sets no linker, so their macOS artifacts
+   link through the cc-wrapper against whatever SDK it resolves; a repository-root cargo workspace would inherit nothing
+   either. The follow-up is a decision about ownership, not an abstraction: either every cargo workspace that ships a
+   macOS artifact carries the two `[target.*-apple-darwin]` lines and a workspace-relative copy of the script, or one
+   repository-root config carries them once for every workspace and accepts a single repo-wide fingerprint. It does NOT
+   belong in cowshed: `-C linker` is part of every crate's fingerprint (splitting it across Nx targets cost a full
+   ~160-crate rebuild per macOS artifact — measured, see that config's own comment), and a cowshed-level linker policy
+   would impose one toolchain on every project cowshed hosts.
 
 ## Unassigned property tests, ranked
 
