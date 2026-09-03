@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { inspect } from 'node:util';
 
 import { describeMiss, ensureBuilt, parseTargetSelector } from '../ensure-built.js';
 
@@ -11,6 +12,18 @@ const USAGE =
 function usageError(message: string): never {
   process.stderr.write(`smoothbricks-ensure-built: ${message}\n${USAGE}\n`);
   process.exit(2);
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string') {
+    return error.message;
+  }
+  return typeof error === 'string'
+    ? error
+    : inspect(error, { breakLength: Number.POSITIVE_INFINITY, colors: false, depth: 5 });
 }
 
 /**
@@ -90,7 +103,7 @@ const workspaceRoot =
   workspaceRootArg === undefined ? findWorkspaceRoot(process.cwd()) : resolve(process.cwd(), workspaceRootArg);
 
 const result = await ensureBuilt({ target, cwd: workspaceRoot }).catch((error: unknown) => {
-  process.stderr.write(`smoothbricks-ensure-built: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.stderr.write(`smoothbricks-ensure-built: ${describeError(error)}\n`);
   process.exit(1);
 });
 
