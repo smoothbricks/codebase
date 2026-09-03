@@ -385,6 +385,10 @@ function isNoopAggregateTarget(target: Record<string, unknown>): boolean {
   return Array.isArray(target.dependsOn) && target.dependsOn.length > 0;
 }
 
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowedCwds: ReadonlySet<string>): boolean {
   if (executor !== BOUNDED_TEST_EXECUTOR || !isRecord(rawOptions)) {
     return false;
@@ -397,8 +401,8 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
     command === ensureBunTestTimeoutFlag(command) &&
     typeof rawOptions.cwd === 'string' &&
     allowedCwds.has(rawOptions.cwd) &&
-    rawOptions.timeoutMs === BOUNDED_TEST_TIMEOUT_MS &&
-    rawOptions.killAfterMs === BOUNDED_TEST_KILL_AFTER_MS
+    isPositiveSafeInteger(rawOptions.timeoutMs) &&
+    isPositiveSafeInteger(rawOptions.killAfterMs)
   );
 }
 
