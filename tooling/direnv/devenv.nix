@@ -32,7 +32,6 @@ in {
       # repository, pinned by devenv.lock). Only this repository's extra targets
       # are declared here, below, via languages.rust.targets.
       just # Task runner for packages/columine (mirrors the lmao justfile)
-      cargo-nextest # Rust test runner
       cargo-mutants # Mutation target inferred by @smoothbricks/nx-plugin
       # Go comes from ./devenv.smoo.nix (languages.go), one version for every
       # repository for the same reason as the Rust toolchain: a compiler is part
