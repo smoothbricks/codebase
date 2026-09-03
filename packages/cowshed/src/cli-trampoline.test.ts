@@ -26,6 +26,7 @@ describe('cowshed CLI trampoline', () => {
 
     const exitCode = await runCli(['ls', '--all'], {
       packageRoot: root,
+      workspaceRoot: root,
       platform: 'darwin',
       arch: 'arm64',
       async spawnBinary(executable, argv) {
@@ -46,6 +47,7 @@ describe('cowshed CLI trampoline', () => {
 
     const exitCode = await runCli(['doctor'], {
       packageRoot: root,
+      workspaceRoot: root,
       platform: 'linux',
       arch: 'x64',
       async spawnBinary(executable) {
@@ -63,7 +65,7 @@ describe('cowshed CLI trampoline', () => {
     // honest outcome is a typed failure naming the candidates rather than a silent one.
     const root = await fixtureRoot();
 
-    const backend = resolveCliBackend({ packageRoot: root, platform: 'darwin', arch: 'x64' });
+    const backend = resolveCliBackend({ packageRoot: root, workspaceRoot: root, platform: 'darwin', arch: 'x64' });
 
     expect(backend.kind).toBe('missing');
     if (backend.kind !== 'missing') {
@@ -77,6 +79,7 @@ describe('cowshed CLI trampoline', () => {
 
     const outcome = await runCli(['path', 'main'], {
       packageRoot: root,
+      workspaceRoot: root,
       platform: 'darwin',
       arch: 'x64',
       async spawnBinary() {
@@ -101,7 +104,7 @@ describe('cowshed CLI trampoline', () => {
   it('refuses a host it ships no binary for without searching a dist directory', async () => {
     const root = await fixtureRoot();
 
-    const backend = resolveCliBackend({ packageRoot: root, platform: 'win32', arch: 'x64' });
+    const backend = resolveCliBackend({ packageRoot: root, workspaceRoot: root, platform: 'win32', arch: 'x64' });
 
     expect(backend.kind).toBe('missing');
     if (backend.kind !== 'missing') {
@@ -129,7 +132,7 @@ describe('cowshed CLI trampoline', () => {
     await chmod(packaged, 0o644);
 
     await expect(
-      runCli(['ls', '--all'], { packageRoot: root, platform: 'darwin', arch: 'arm64' }),
+      runCli(['ls', '--all'], { packageRoot: root, workspaceRoot: root, platform: 'darwin', arch: 'arm64' }),
     ).rejects.toMatchObject({
       code: 'EACCES',
     });
@@ -143,7 +146,12 @@ describe('cowshed CLI trampoline', () => {
     await writeFile(packaged, '#!/bin/sh\nexit 17\n');
     await chmod(packaged, 0o755);
 
-    const exitCode = await runCli(['ls', '--all'], { packageRoot: root, platform: 'darwin', arch: 'arm64' });
+    const exitCode = await runCli(['ls', '--all'], {
+      packageRoot: root,
+      workspaceRoot: root,
+      platform: 'darwin',
+      arch: 'arm64',
+    });
 
     expect(exitCode).toBe(17);
     expect((await stat(packaged)).mode & 0o777).toBe(0o755);
@@ -156,6 +164,7 @@ describe('cowshed CLI trampoline', () => {
     await expect(
       runCli(['ls', '--all'], {
         packageRoot: root,
+        workspaceRoot: root,
         platform: 'darwin',
         arch: 'arm64',
         exists: (path) => path === join(root, 'dist', 'bin', 'darwin-arm64', 'cowshed'),
@@ -172,6 +181,7 @@ describe('cowshed CLI trampoline', () => {
 
     const exitCode = await runCli(['gateway', 'status'], {
       packageRoot: root,
+      workspaceRoot: root,
       platform: 'darwin',
       arch: 'arm64',
       home: join(root, 'home'),
@@ -194,6 +204,7 @@ describe('cowshed CLI trampoline', () => {
 
     await runCli(['--json', 'sccache', 'start'], {
       packageRoot: root,
+      workspaceRoot: root,
       platform: 'darwin',
       arch: 'arm64',
       home: join(root, 'home'),
@@ -215,6 +226,7 @@ describe('cowshed CLI trampoline', () => {
 
     await runCli(['ls', '--all'], {
       packageRoot: root,
+      workspaceRoot: root,
       platform: 'darwin',
       arch: 'arm64',
       home: join(root, 'home'),
@@ -237,6 +249,7 @@ describe('cowshed CLI trampoline', () => {
     for (const argv of [['setup'], ['skill', 'install']]) {
       await runCli(argv, {
         packageRoot: root,
+        workspaceRoot: root,
         platform: 'darwin',
         arch: 'arm64',
         home: join(root, 'home'),
@@ -258,6 +271,7 @@ describe('cowshed CLI trampoline', () => {
 
     await runCli(['gateway', 'start'], {
       packageRoot: root,
+      workspaceRoot: root,
       platform: 'darwin',
       arch: 'arm64',
       home: join(root, 'home'),

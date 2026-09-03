@@ -5,7 +5,7 @@ error[E0599]: no method named `span` found for reference `&TraceContext` in the 
   |                   ^^^^
   |
 help: there is a method `__span` with a similar name, but with different arguments
- --> $WORKSPACE/crates/lmao-core/src/context.rs
+ --> $WORKSPACE/packages/lmao/crates/lmao-core/src/context.rs
   |
   | /     pub fn __span<T, E>(
   | |         &self,

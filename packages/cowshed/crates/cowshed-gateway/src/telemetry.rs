@@ -748,7 +748,7 @@ fn event_batch(events: &[AuditEvent]) -> Result<RecordBatch, AuditError> {
 
     // `lmao-arrow::trace_schema` cannot be imported alone: that crate also links its sibling
     // `lmao-core` runtime. Keep this prefix byte-for-byte aligned until the schema is extracted
-    // into a dependency-free crate shared by the two Cargo workspaces.
+    // into a dependency-free crate shared by both packages.
     let schema = Arc::new(Schema::new(vec![
         Field::new(
             "timestamp",

@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 /// target both produce it at this path.
 const ARTIFACT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm"
+    "/../../../../target/wasm32-unknown-unknown/wasm-release/columine_wasm.wasm"
 );
 
 /// The TypeScript host, read as source. A generator would be a build-order

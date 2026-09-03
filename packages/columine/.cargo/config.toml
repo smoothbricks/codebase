@@ -3,4 +3,4 @@
 # imports it for the shared/pooled and freelist variants. A target-wide rustflag
 # here cannot express that split, and wasm-ld has no flag to undo --import-memory.
 [alias]
-t = "test --workspace"
+t = "test -p 'columine-*'"

@@ -12,6 +12,8 @@ const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const;
 
 export interface CliResolutionOptions {
   packageRoot: string;
+  /** Repository root that owns Cargo artifacts; derived from the package path in a checkout. */
+  workspaceRoot?: string;
   platform?: NodeJS.Platform;
   arch?: string;
   exists?: (path: string) => boolean;
@@ -78,7 +80,12 @@ export function resolveCliBackend(options: CliResolutionOptions): CliBackend {
     }
   }
 
-  const workspaceBinary = join(options.packageRoot, 'target', 'release', 'cowshed');
+  const workspaceBinary = join(
+    options.workspaceRoot ?? resolve(options.packageRoot, '..', '..'),
+    'target',
+    'release',
+    'cowshed',
+  );
   searched.push(workspaceBinary);
   if (fileExists(workspaceBinary)) {
     return { kind: 'native', path: workspaceBinary, source: 'workspace' };
