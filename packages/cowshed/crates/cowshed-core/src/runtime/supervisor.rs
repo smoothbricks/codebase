@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -1305,6 +1305,18 @@ async fn link_runtime_dir(sandbox: &SandboxConfig, runtime_dir: &Path) -> Result
     Ok(())
 }
 
+/// The environment for a **non-interactive acceptance check** — the commands `cowshed land
+/// --check` runs before a workspace is delivered.
+///
+/// These are the one class of build cowshed has an opinion about, because nobody is waiting at a
+/// keyboard for them and their output is worth storing: `CARGO_INCREMENTAL=0` keeps every unit
+/// non-incremental, which is the only shape the sccache wrapper can cache and hand to the next
+/// landing. An interactive shed makes the opposite trade and is left alone — see
+/// [`sandboxed_command`], which sets no incremental policy at all.
+pub fn acceptance_check_environment() -> HashMap<String, String> {
+    HashMap::from([("CARGO_INCREMENTAL".to_owned(), "0".to_owned())])
+}
+
 /// Build the sandboxed `Command` for a child of this workspace.
 ///
 /// Every process the supervisor launches goes through here, including the `devenv print-dev-env`
@@ -1428,11 +1440,17 @@ async fn sandboxed_command(
     // so name-mounted workspaces share entries with each other, not just successive slot
     // tenants. env-dep values stay unnormalized in the key, so a crate that compiles
     // env!("CARGO_MANIFEST_DIR") into its output still fail-closes across paths.
-    // Incremental stays off: sccache refuses incremental compilations, and the shared
-    // cache is worth more to a fleet of clones than per-unit local state.
+    //
+    // CARGO_INCREMENTAL is deliberately absent. Cargo already decides it per profile, and that
+    // decision is the right one on both lanes at once: `dev` stays incremental and local, while
+    // shared lanes declare `incremental = false` in the profile and so reach sccache without
+    // anyone forcing anything here. Forcing 0 bought the shared cache nothing it did not already
+    // have and cost every interactive build a full recompile — measured on a one-line edit to a
+    // mid-size crate, ~1.7s incremental against ~20-32s with CARGO_INCREMENTAL=0. A
+    // non-interactive acceptance check that wants reproducible cacheable output asks for it by
+    // name through [`acceptance_check_environment`], whose values arrive in `env` above.
     command
         .env("RUSTC_WRAPPER", "sccache")
-        .env("CARGO_INCREMENTAL", "0")
         .env("SCCACHE_BASEDIR_CWD", "1");
     if let Some(directory) = developer_directory() {
         command.env("DEVELOPER_DIR", directory);
