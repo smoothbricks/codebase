@@ -52,10 +52,13 @@ const projectRoot = await resolveProjectRoot();
 const STALE_LOCK_MS = 10 * 60_000;
 // Unscoped require("typescript") must expose the TS6 compiler API for Nx.
 // @typescript/native installs another package also named "typescript" (TS7). Bun's
-// isolated linker often points node_modules/.bun/node_modules/typescript at TS7,
-// so packages resolved from the .bun store (nx) get version.cjs without readConfigFile.
+// isolated linker RACES the node_modules/.bun/node_modules/typescript fallback link
+// between the two versions on every install (verified nondeterministic on bun 1.3.14
+// AND 1.4.0 — the #33834 alias-resolution fix did not cover it), so packages resolved
+// from the .bun store (nx) sometimes get version.cjs without readConfigFile.
 // After every install, force both unscoped typescript slots onto typescript@6.0.3.
-// Keep @typescript/native for ttsc via TTSC_TSGO_BINARY. See https://github.com/oven-sh/bun/issues/33834.
+// Keep @typescript/native for ttsc via TTSC_TSGO_BINARY. Do not retire this on a bun
+// bump until https://github.com/oven-sh/bun/issues/40355 is fixed and re-verified.
 const TYPESCRIPT_API_VERSION = '6.0.3';
 
 // Go to project root
@@ -203,8 +206,8 @@ function assertTypescriptApiAt(typescriptRoot: string, expectedTarget: string): 
     throw new Error(
       `${typescriptRoot} must export TypeScript ${TYPESCRIPT_API_VERSION} compiler API (readConfigFile). ` +
         `Resolved version ${typed.version ?? 'unknown'} (expected link target ${expectedTarget}). ` +
-        'Bun isolated linking often points .bun/node_modules/typescript at @typescript/native (TS7). ' +
-        'See https://github.com/oven-sh/bun/issues/33834.',
+        'Bun isolated linking races .bun/node_modules/typescript between typescript@6 and ' +
+        "@typescript/native's TS7. See https://github.com/oven-sh/bun/issues/40355.",
     );
   }
 }
