@@ -167,8 +167,15 @@ const repoRoot = dirname(dirname(packageRoot));
 const binEntry = join(packageRoot, 'src', 'bin', 'smoo-nx-exec.ts');
 const builtBinEntry = join(packageRoot, 'dist', 'bin', 'smoo-nx-exec.js');
 const MARKER = 'EXEC_OK';
-/** Nx configures itself through these; the exec'd binary must not inherit them. */
-const LEAKABLE = ['NX_WORKSPACE_ROOT_PATH', 'NX_STREAM_OUTPUT', 'NX_PREFIX_OUTPUT', 'NX_LOAD_DOT_ENV_FILES'];
+/** Nx keys controlled and reported by the fixture rather than inherited from its parent test task. */
+const NX_ENV_KEYS = [
+  'NX_WORKSPACE_ROOT_PATH',
+  'NX_STREAM_OUTPUT',
+  'NX_PREFIX_OUTPUT',
+  'NX_LOAD_DOT_ENV_FILES',
+  'NX_SKIP_NX_CACHE',
+  'NX_DISABLE_NX_CACHE',
+];
 
 interface BinRun {
   readonly code: number | null;
@@ -192,7 +199,7 @@ function runBinWith(
   env: Record<string, string>,
 ): Promise<BinRun> {
   const childEnv = { ...process.env };
-  for (const key of LEAKABLE) {
+  for (const key of NX_ENV_KEYS) {
     delete childEnv[key];
   }
   // The parent Nx process may set FORCE_COLOR while the shell exports
@@ -302,10 +309,10 @@ describe('smoo-nx-exec', () => {
     await writeFile(join(workspace, 'packages', 'app', 'source.txt'), 'built\n');
     // Reports what the exec'd process actually inherited: the marker proves
     // execve happened, the cwd proves it kept the caller's directory, and the
-    // NX_ lines prove Nx's process-global configuration did not leak into it.
+    // NX_ lines prove temporary Nx configuration was removed or restored.
     await writeFile(
       report(),
-      `#!/bin/sh\necho ${MARKER} "$@"\necho "cwd=$PWD"\n${LEAKABLE.map((key) => `echo "${key}=\${${key}:-unset}"`).join('\n')}\n`,
+      `#!/bin/sh\necho ${MARKER} "$@"\necho "cwd=$PWD"\n${NX_ENV_KEYS.map((key) => `echo "${key}=\${${key}:-unset}"`).join('\n')}\n`,
     );
     await chmod(report(), 0o755);
   });
@@ -353,9 +360,20 @@ describe('smoo-nx-exec', () => {
     ]);
     expect(run.code).toBe(0);
     expect(run.stdout).toContain(`cwd=${join(workspace, 'packages', 'app')}`);
-    for (const key of LEAKABLE) {
+    for (const key of NX_ENV_KEYS) {
       expect(run.stdout).toContain(`${key}=unset`);
     }
+  });
+
+  it('restores the caller cache controls before exec', async () => {
+    const run = await runBin(workspace, ['app:build', '--', './report'], {
+      NX_SKIP_NX_CACHE: 'caller-skip',
+      NX_DISABLE_NX_CACHE: 'caller-disable',
+    });
+    expect(run.code).toBe(0);
+    expect(run.stderr).toBe('');
+    expect(run.stdout).toContain('NX_SKIP_NX_CACHE=caller-skip');
+    expect(run.stdout).toContain('NX_DISABLE_NX_CACHE=caller-disable');
   });
 
   it('runs again once a recorded output is gone from the working tree', async () => {
