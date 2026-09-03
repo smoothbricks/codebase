@@ -1323,6 +1323,7 @@ where
             })
             .await
     }
+    #[cfg(any(target_os = "macos", test))]
     /// Runs a non-lifecycle metadata mutation while holding the same hardened image lock used by
     /// APFS lifecycle operations. The job's result is deliberately opaque to this layer so callers
     /// can preserve their own error taxonomy while lock acquisition remains an APFS concern.
