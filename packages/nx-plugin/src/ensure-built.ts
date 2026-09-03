@@ -268,6 +268,13 @@ async function ensureBuiltInWorkspace(
     return runViaCli(workspaceRoot, selector);
   }
 
+  // This process is often launched by an outer Nx task whose own cache was
+  // deliberately bypassed. Those variables describe that outer run, not the
+  // target managed here: inheriting them makes the inner runner refuse both
+  // cache reads and writes, so no invocation can ever become a hit.
+  delete process.env.NX_SKIP_NX_CACHE;
+  delete process.env.NX_DISABLE_NX_CACHE;
+
   const { readNxJson } = requireNx('nx/src/config/nx-json');
   const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
   const { setEnvVarsBasedOnArgs } = requireNx('nx/src/tasks-runner/run-command');
