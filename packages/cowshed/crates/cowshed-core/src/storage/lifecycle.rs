@@ -559,6 +559,11 @@ pub enum StorageGcReason {
     /// A staging mountpoint under the mount root whose image is gone or never published:
     /// an empty directory, or a volume still attached from an interrupted operation.
     OrphanStagingMount,
+    /// A directory directly under the mount root that is no workspace's mount: nothing is
+    /// mounted at it and no session image or retired record names it. What it holds is what
+    /// late writers left after a volume was retired - junk by the project's own rules, or a
+    /// visible file gc names and keeps.
+    OrphanMountpoint,
     ExpiredCheckpoint,
     DetachedImageCompaction,
 }

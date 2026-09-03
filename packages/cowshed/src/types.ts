@@ -241,6 +241,7 @@ export interface GcCandidate {
     | 'orphanStagingImage'
     | 'orphanStagingMetadata'
     | 'orphanStagingMount'
+    | 'orphanMountpoint'
     | 'expiredCheckpoint'
     | 'detachedImageCompaction';
 }
