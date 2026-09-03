@@ -1186,6 +1186,9 @@ function createNapiTargets(
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage}`;
   const cargoInputs = repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : NAPI_INPUTS;
   const cargoCwd = repoRooted ? '.' : projectRoot;
+  // A repository-root Cargo invocation runs outside the owning npm package, so
+  // Nx's root-only PATH cannot resolve that package's napi CLI.
+  const napiCommand = repoRooted ? posix.join(projectRoot, 'node_modules/.bin/napi') : 'napi';
   const outputPath = (projectOutput: string) => (repoRooted ? posix.join(projectRoot, projectOutput) : projectOutput);
   const hostPlatformTargetName =
     hostPlatform === null ? null : `napi-${hostPlatform.architecture}-${hostPlatform.targetFamily}`;
@@ -1218,7 +1221,7 @@ function createNapiTargets(
     outputs: ['{projectRoot}/.cache/native-debug'],
     options: {
       cwd: cargoCwd,
-      command: `napi build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('.cache/native-debug')}`,
+      command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('.cache/native-debug')}`,
       ...(hostCompilerEnv ? { env: hostCompilerEnv } : {}),
     },
   };
@@ -1236,7 +1239,7 @@ function createNapiTargets(
       outputs: ['{projectRoot}/dist/native/host'],
       options: {
         cwd: cargoCwd,
-        command: `napi build --release --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}`,
+        command: `${napiCommand} build --release --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}`,
         ...(hostCompilerEnv ? { env: hostCompilerEnv } : {}),
       },
     };
@@ -1280,7 +1283,7 @@ function createNapiTargets(
       outputs: [`{projectRoot}/${outputDirectory}`],
       options: {
         cwd: cargoCwd,
-        command: `napi build --release --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple}${crossFlag} ${commonCommand} --output-dir ${outputPath(outputDirectory)}`,
+        command: `${napiCommand} build --release --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple}${crossFlag} ${commonCommand} --output-dir ${outputPath(outputDirectory)}`,
         // Genuine Linux cross-compiles use Clang plus napi-rs's downloaded
         // GNU sysroot. A native Linux target uses Nix's cc wrapper so C build
         // scripts resolve the host libc headers instead.
