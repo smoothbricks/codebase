@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -502,9 +502,17 @@ impl GitRepository {
         Err(git_internal("read current branch", &output))
     }
 
+    /// Whether the working tree holds work: a tracked change, or an untracked file that is
+    /// not junk. `git status` already omits ignored files; an untracked HIDDEN path - a
+    /// `.nx/` daemon log, a `.cache/`, a tool's dot-directory - is junk by the same reading,
+    /// and treating it as work made every landed workspace unremovable until someone deleted
+    /// a log by hand.
     pub async fn is_dirty(&self) -> Result<bool> {
         let output = self.porcelain_status("read repository status").await?;
-        Ok(!output.stdout.is_empty())
+        Ok(
+            porcelain_records(&output.stdout)
+                .any(|(status, path)| !is_untracked_junk(status, path)),
+        )
     }
 
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
@@ -1048,6 +1056,16 @@ impl GitRepository {
             }
         }
         Ok(count)
+    }
+
+    /// Untracked junk the working tree holds: every untracked hidden path. What `is_dirty`
+    /// disregards, listed so a removal can delete it rather than reason about it.
+    pub async fn untracked_junk(&self) -> Result<Vec<PathBuf>> {
+        let output = self.porcelain_status("list untracked junk").await?;
+        Ok(porcelain_records(&output.stdout)
+            .filter(|(status, path)| is_untracked_junk(status, path))
+            .map(|(_, path)| self.root.join(std::ffi::OsStr::from_bytes(path)))
+            .collect())
     }
 
     async fn porcelain_status(&self, operation: &str) -> Result<Output> {
@@ -2001,6 +2019,33 @@ fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
     }
 }
 
+/// `(XY, path)` per `--porcelain=v1 -z` record; a rename's second path field is consumed
+/// with its record.
+fn porcelain_records(stdout: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    let mut fields = stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    std::iter::from_fn(move || {
+        let record = fields.next()?;
+        let status = record.get(..2).unwrap_or(record);
+        if status.iter().any(|code| *code == b'R' || *code == b'C') {
+            fields.next();
+        }
+        Some((status, record.get(3..).unwrap_or(&[])))
+    })
+}
+
+/// An untracked path with a hidden component: junk, never work.
+fn is_untracked_junk(status: &[u8], path: &[u8]) -> bool {
+    status == b"??" && is_hidden_path(path)
+}
+
+/// True when any component of a relative path starts with `.`.
+pub fn is_hidden_path(path: &[u8]) -> bool {
+    path.split(|byte| *byte == b'/')
+        .any(|component| component.first() == Some(&b'.'))
+}
+
 fn git_internal(operation: &str, output: &Output) -> CowshedError {
     CowshedError::internal(git_message(operation, output))
 }
@@ -2146,6 +2191,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn untracked_hidden_paths_are_junk_and_do_not_make_a_tree_dirty() {
+        let root = repository();
+        let git = GitRepository::from_root(&root);
+        assert!(!git.is_dirty().await.expect("clean fixture"));
+
+        // An nx daemon log and a tool cache: hidden, untracked, junk.
+        fs::create_dir_all(root.join(".nx/workspace-data/d")).expect("nx dir");
+        fs::write(root.join(".nx/workspace-data/d/daemon.log"), "log\n").expect("log");
+        fs::write(root.join(".cache-marker"), "x\n").expect("marker");
+        assert!(!git.is_dirty().await.expect("status"));
+        let junk = git.untracked_junk().await.expect("junk");
+        assert!(junk.contains(&root.join(".cache-marker")));
+        assert!(junk.iter().any(|path| path.starts_with(root.join(".nx"))));
+
+        // A visible untracked file is work.
+        fs::write(root.join("notes.rs"), "fn main() {}\n").expect("source");
+        assert!(git.is_dirty().await.expect("status"));
+        fs::remove_file(root.join("notes.rs")).expect("remove source");
+
+        // A tracked modification is work, hidden or not.
+        fs::write(root.join("README"), "changed\n").expect("modify tracked");
+        assert!(git.is_dirty().await.expect("status"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[tokio::test]
     async fn workspace_environment_wiring_creates_an_absent_envrc() {
         let root = repository();
         let envrc = root.join(".envrc");
@@ -2190,6 +2261,7 @@ mod tests {
     async fn workspace_environment_wiring_preserves_an_in_tree_relative_symlink() {
         let root = repository();
         fs::write(root.join(".gitignore"), ".envrc-local\n").expect("ignore local envrc");
+
         let managed = root.join("managed");
         fs::create_dir(&managed).expect("create managed directory");
         let target = managed.join("envrc");
