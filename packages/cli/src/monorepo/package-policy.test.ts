@@ -236,14 +236,15 @@ describe('test file location policy', () => {
     }
   });
 
-  it('accepts nested test files covered by an ancestor glob', async () => {
+  it('accepts test files covered by root and ancestor globs', async () => {
     const root = await createWorkspace({
       rootName: '@smoothbricks/codebase',
       packages: [{ dir: 'app', name: '@smoothbricks/app' }],
     });
     try {
       const app = join(root, 'packages/app');
-      await writeFile(join(app, 'tsconfig.json'), JSON.stringify({ include: ['conformance/**/*.ts'] }));
+      await writeFile(join(app, 'tsconfig.json'), JSON.stringify({ include: ['*.ts', 'conformance/**/*.ts'] }));
+      await writeSource(join(app, 'root-contract.test.ts'));
       await writeSource(join(app, 'conformance/src/contract.test.ts'));
 
       expect(validateTestFileLocations(root)).toBe(0);
