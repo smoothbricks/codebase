@@ -286,11 +286,16 @@ const PLUGIN_NEXTEST_CONFIG = fileURLToPath(new URL('../nextest.toml', import.me
  * depending on how the hash happened to fall.
  *
  * The two filtersets are exact complements, so their union is the crate whatever
- * either one matches; an empty exception set (every real-APFS test is
- * `cfg(target_os = "macos")`, so on Linux there are none) costs coverage
- * nothing, which is why that target may pass having run zero tests. It cannot
- * hide a lost test — only a pin that stopped matching, whose members then fall
- * into the shards.
+ * either one matches. Every piece uses `--no-tests=pass`: a valid workspace
+ * member may expose no nextest tests, a small suite can leave a declared hash
+ * shard empty, and platform-specific exceptions may not exist on this host.
+ * Manifest discovery proves the package exists and generates the selector from
+ * its Cargo name, so accepting an empty run cannot hide a misspelled package.
+ *
+ * The trade is explicit: a generated target cannot distinguish an intentionally
+ * test-less crate from one whose entire suite stopped matching, so both pass.
+ * Detecting that regression requires a separate coverage policy rather than
+ * making valid empty crates and shards fail execution.
  *
  * Pieces chain rather than fan out, like the crates do: cargo flocks one
  * `target/`, and chaining keeps even the pinned group from overlapping the
@@ -324,7 +329,7 @@ async function addPerPackageCargoTestTargets(
         dependsOn: [previous],
         options: {
           command: cargoFrozen(
-            `nextest run --workspace -E '${selector}'${extra} --user-config-file none --config-file ${configFile}`,
+            `nextest run --workspace -E '${selector}'${extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
           ),
           cwd: projectRoot,
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
@@ -344,7 +349,7 @@ async function addPerPackageCargoTestTargets(
       );
     }
     if (pin !== null) {
-      addTarget(CARGO_TEST_EXCEPTIONS_SUFFIX, `package(${pkg.name}) and (${pin})`, ' --no-tests=pass');
+      addTarget(CARGO_TEST_EXCEPTIONS_SUFFIX, `package(${pkg.name}) and (${pin})`, '');
     }
   }
   return packageTargetNames;
@@ -1454,7 +1459,7 @@ async function resolveRepoRootCargoWorkspace(
     if (pin !== null) {
       const targetName = cargoTestPackageTargetName(pkg.name, CARGO_TEST_EXCEPTIONS_SUFFIX);
       pieces.push({
-        extra: ' --no-tests=pass',
+        extra: '',
         previous,
         selector: `package(${pkg.name}) and (${pin})`,
         targetName,
@@ -1497,7 +1502,7 @@ async function addRepoRootCargoTestTargets(
         dependsOn: [cargoTargetDependency(currentProjectName, piece.previous)],
         options: {
           command: cargoFrozen(
-            `nextest run --workspace -p ${plan.package.name} -E '${piece.selector}'${piece.extra} --user-config-file none --config-file ${configFile}`,
+            `nextest run --workspace -p ${plan.package.name} -E '${piece.selector}'${piece.extra} --no-tests=pass --user-config-file none --config-file ${configFile}`,
           ),
           cwd: '.',
           timeoutMs: BOUNDED_TEST_TIMEOUT_MS,
