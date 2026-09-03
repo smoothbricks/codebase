@@ -12,8 +12,8 @@ existing recovery machinery (staging-orphan GC in `preview_gc_project`, sidecar-
   killed `new` leaves a marked-incomplete workspace that the next touch completes (or GC
   reclaims). Prove every step re-runnable.
 
-Verdict up front: **(b) wins; (a) is rejected.** Neither is implemented in this branch —
-see sequencing at the end.
+Verdict up front: **(b) wins; (a) is rejected.** The implementation now uses a canonical
+`PendingFence` clone and a single normal-path attach/mount.
 
 ## 1. Current two-mount crash windows (the bar to preserve)
 
@@ -60,84 +60,51 @@ create-image + uncompleted intent → detach + reclaim), and (iii) compensation 
 completion → reclaim deletes complete work. Verdict: (a) cannot close its windows without
 a fence + corpse rule + compensation saga. Rejected.
 
-## 3. Shape (b) resume — VIABLE, with named guards
+## 3. Shape (b) resume — IMPLEMENTED
 
-Resume re-runs init to completion instead of deleting. Main-namespace effects become
-continue-in-place rather than compensate. Audit of every init step for re-runnability
-(create/fork initialize closures in `src/runtime/project.rs`, substrate prepare steps for
-a canonical-path flow, post-commit steps):
+The lifecycle intent is durable before storage mutation. Clone metadata is written at the
+canonical sidecar before the payload appears, with `PendingFence` keeping the destination out of
+ordinary enumeration until initialization and post-callback validation finish. Activation is one
+atomic sidecar rewrite from `PendingFence` to `Active`; the mounted attachment is then retained.
 
-Re-runnable as written:
+| Kill window | Durable state | Recovery action and guard |
+|---|---|---|
+| Before pending metadata | Intent only | Re-run create/fork normally. |
+| After sidecar, before complete clone | Sidecar-only, or failed clone | Clone failure reclaims both artifacts; startup recovery removes a sidecar-only record. No partial payload is admitted as resumable. |
+| After clone, before attach | C + PendingFence | Reuse the metadata incarnation and original operation identity; never clone over C. |
+| After attach, before mount | C + PendingFence + unmounted attachment | Exact inventory match is detached and settled, then the ordinary verified attach/fsck path is repeated before mounting. |
+| After mount, during image-local preparation | C + PendingFence + canonical kernel mount | Exact source-device and canonical mount flags reuse the existing attachment; ambiguous or foreign mounts fail closed. Rename and credential publication are idempotent. |
+| During initializer | Same pending mounted C, possibly with external Git effects | Cancellation and initializer errors preserve C and the mount. Retry receives explicit `stage.resuming` authority. Git branch/worktree state machines continue only their exact cowshed-owned branch and registration. |
+| After marker write | Same pending mounted C | An already-current marker is validated rather than rewritten, preventing lineage self-duplication. Environment wiring, inherited-link repair, daemon discard, and remote configuration are check-first or deterministic. |
+| After callback, before/during activation | Pending or Active sidecar (atomic rewrite) | Pending reruns callback and validation; Active is listed as current. No intermediate publication state exists. |
+| After activation, before downstream effects or intent completion | Active C + pending lifecycle intent | Startup recovery reruns optional main registration and append-safe commitments, then records exact completion. Slot binding is retained across errors and exact-owner rebinding is a no-op. |
+| After completion | Active C + completed intent | Re-issue returns the recorded incarnation; supervisor startup remains start-or-reuse. |
 
-| Step | Why re-running is safe |
+The normal path has no staging mount, detach, image rename, canonical reattach, or remount. The
+detach/settle leg exists only when recovery finds a crash-left *unmounted* attachment whose fsck
+completion cannot be proved. A surviving exact canonical kernel mount is reused without churn.
+
+Initializer rerunnability audit:
+
+| Step | Replay rule |
 |---|---|
-| `discard_in` (daemon state) | NotFound → Ok; deterministic on content |
-| `ensure_workspace_environment_wiring` | check-first, plus re-check inside the append open |
-| `configure_main_remote` | documented idempotent (ownership-record based) |
-| remote-strip loop, `restore_inherited_links` | empty loop / deterministic rewrite → no-op |
-| `register_workspace_remote` (`set_remote`) | add-vs-set-url check-first |
-| `rename_volume` to same label | idempotent |
-| `validate_marker`, `validate_staged_companion` | read-only |
-| `mint_workspace_credentials` (`publish_asset` atomic overwrite) | overwrite safe pre-publication (nothing external holds the crashed run's keys) |
-| `commitments.record` | telemetry; replay duplicates gate nothing |
-| `complete_lifecycle_intent` | completion overwrite |
-| `ensure_supervisor` | start-or-reuse |
-| port-block claims (`claim_port_block`) | stale (dead-pid) markers reaped on next claim |
-| `release_slot` on error paths | idempotent |
+| `discard_in` | NotFound is success; deletion is deterministic. |
+| environment hook | check-first, with an append-open recheck. |
+| inherited remotes/links and local `main` remote | empty-loop/deterministic rewrite plus ownership-checked configuration. |
+| standalone branch | fresh calls reject collisions; storage-authorized resume reuses and checks out only `cowshed/<name>`. |
+| linked-worktree registration | exact admin/pointer states continue through staging-pointer relocation and `worktree repair`; mixed or foreign states fail closed. |
+| marker | exact current marker validates and skips rewriting. |
+| credentials | atomically overwritten while still unpublished. |
+| slot | exact same workspace/slot bind is idempotent and the binding remains owned by the pending intent. |
+| optional registration, commitments, intent completion, supervisor | set/check-first, append-safe telemetry, overwrite-safe completion, start-or-reuse. |
 
-NOT safely repeatable as written — the deciding list (each needs a guard):
+The remaining live-system proof is intentionally deferred by the no-disk-experiments order:
+confirm `hdiutil info` reports the image path with the same exact spelling supplied to attach, and
+run real-APFS crash injection when storage experiments are permitted. RecordingRunner and
+filesystem-only Git tests cover the implemented state transitions without touching disk images.
 
-1. **clone to existing destination** — `clonefile` fails if the target exists. Needs:
-   destination-exists check-first (skip when a prior clone completed; reclaim-then-clone
-   when torn — torn detection needs a rule, e.g. sidecar presence + fsck).
-2. **attach of an already-attached image** — a second attach mints a duplicate device
-   instead of reusing. Needs: inventory check-first reusing the live attachment.
-3. **mount onto a busy mountpoint** — crashed run may still hold cM. Needs: kernel-mount
-   check-first (`heal_mount` shape: mount present + marker valid → skip).
-4. **branch already exists** — `ensure_workspace_branch_absent` (`src/git.rs`)
-   conflicts when `switch -c` already ran. Needs: branch-present → adopt-and-continue
-   (verify it names our start point, then skip creation).
-5. **worktree admin already registered** — `adopt_as_linked_worktree` conflicts on
-   `admin.exists()`, and a stale staging dir vs git's registration table needs
-   prune/repair-first. Needs: registered-to-self → `repair_linked_worktree` + continue.
-6. **marker lineage self-duplication** — `write_marker` recomputes lineage from the
-   existing marker; a resume read of the first run's marker prepends our own incarnation
-   again (`clone_lineage` pushes self). Needs: skip-if-marker-already-current guard.
-7. **`bind_slot` on re-run** — verify same-owner bind is a no-op (likely needs a
-   bound-to-self check-first; not yet confirmed in `SlotBindings::bind`).
-
-Plus one new signal (small, principled): an **init-completion marker** (extension of the
-`freshly_stamped` pattern) recording that init finished inside the image, checked by the
-resume entry point — because `recover_lifecycle_intents` currently completes a pending
-intent as soon as `current()` finds the workspace, which would bless a half-initialized
-tree. With the signal: intent pending + workspace found + init-incomplete → re-run init,
-not complete.
-
-## 4. Implementation plan for (b) (when sequenced)
-
-1. Canonical-path prepare: clone-to-canonical (guard 1), metadata, attach (guard 2),
-   mount-at-canonical (guard 3), rename, creds, marker (guard 6), validate.
-2. Init closure with guards 4–5 (git worktree/branch continue-in-place), slot guard 7.
-3. Init-completion marker written + fsynced as the last init step; resume entry in
-   `recover_lifecycle_intents` re-runs init when the signal is absent.
-4. `retain_mounted` + receipt unchanged; post-commit steps (`register_workspace_in_main`,
-   commitments, intent completion, supervisor) already re-runnable.
-5. Lifecycle unit tests per window (FakeHost + real git in temp dirs, no DA): kill-points
-   K1–K6 equivalents, each asserting resume converges; lineage/marker version handling.
-
-## 5. Sequencing recommendation (why no code in this branch)
-
-- The premise (DA churn causes the hang) still needs live confirmation; the
-  detach-settle measurements in this branch are the instrument. Restructuring before the
-  trigger is confirmed risks a large, load-bearing diff against a misdiagnosed cause.
-- The change touches the most critical path plus a marker-schema-adjacent signal; it
-  deserves its own review, not a ride-along.
-- Live proof required before landing (b): real-APFS crash injection at each window
-  (the CI-excluded `real_apfs_*` suites are the vehicle), duplicate-UUID DA behavior
-  under the single-attach flow, and quiet-box vs load hang comparison.
-
-No volume-UUID changes in any shape: there is no public verb to regenerate one, and the
-fix must not go near them.
+No volume-UUID changes are involved: there is no public verb to regenerate one, and this change
+does not introduce one.
 
 ## 6. Considered and rejected: retain-attached-staging through canonical rename
 
