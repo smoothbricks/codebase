@@ -1,3 +1,6 @@
+#[cfg(target_os = "macos")]
+mod macos;
+
 pub mod project;
 pub mod supervisor;
 
