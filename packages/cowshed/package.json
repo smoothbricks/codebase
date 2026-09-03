@@ -166,14 +166,40 @@
           "killAfterMs": 10000
         }
       },
+      "wire-fixtures": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "//": "The napi wire corpus is DERIVED from cowshed-core's DTOs: regenerating it is a build step with declared inputs, never a recipe an author has to remember after changing a DTO. Runs ahead of cargo-test-compile because crates/cowshed-napi includes the file with include_str!, so the corpus has to be current before any test binary compiles it in. The Rust assertion that the committed file equals what core serializes stays as the proof; this target is what keeps it true.",
+        "dependsOn": [
+          "cargo-fetch"
+        ],
+        "inputs": [
+          "{projectRoot}/Cargo.toml",
+          "{projectRoot}/Cargo.lock",
+          "{projectRoot}/crates/cowshed-core/**/*.rs",
+          "{projectRoot}/crates/cowshed-core/Cargo.toml",
+          "{projectRoot}/crates/cowshed-napi/**/*.rs",
+          "{projectRoot}/crates/cowshed-napi/Cargo.toml",
+          "{workspaceRoot}/biome.json",
+          "!{projectRoot}/**/target/**"
+        ],
+        "outputs": [
+          "{projectRoot}/src/wire-fixtures.json"
+        ],
+        "options": {
+          "command": "COWSHED_WIRE_FIXTURES=write cargo --frozen test -p cowshed-napi --quiet the_committed_wire_corpus_is_what_core_serializes && bunx biome format --write src/wire-fixtures.json",
+          "cwd": "packages/cowshed"
+        }
+      },
       "wire-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
         "dependsOn": [
-          "typecheck-tests"
+          "typecheck-tests",
+          "wire-fixtures"
         ],
         "options": {
-          "comment": "Runs from source under the typia transform because the validators under test are the point. Deliberately does NOT depend on cargo-test: wire-fixtures.json is a checked-in file this test reads with readFileSync, produced by no cargo target, and the Rust half (the_committed_wire_corpus_is_what_core_serializes in crates/cowshed-napi/src/wire_contract.rs) pulls the same file in via include_str! so it cannot go stale behind an up-to-date build. The edge expressed 'do not call TS green if Rust disagrees', which cowshed:test already gets by depending on both legs; as a dependsOn it only meant an unrelated Rust failure deleted this target from the run.",
+          "comment": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run.",
           "command": "bun test --config=../bunfig.toml --timeout=30000 wire-contract.test.ts",
           "cwd": "{projectRoot}/src",
           "timeoutMs": 120000,
@@ -218,6 +244,12 @@
           "cwd": "packages/cowshed",
           "command": "cargo run --release -p cowshed-core --bin apfs-benchmark"
         }
+      },
+      "cargo-test-compile": {
+        "dependsOn": [
+          "cargo-fetch",
+          "wire-fixtures"
+        ]
       }
     },
     "tags": [

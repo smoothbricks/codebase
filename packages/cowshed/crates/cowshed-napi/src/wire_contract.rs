@@ -15,7 +15,7 @@
 //!
 //! Every enum variant and every optional field that can appear on the wire must appear in some
 //! case: a variant absent from the corpus is a variant the TypeScript side is unverified against.
-//! Regenerate with `COWSHED_WIRE_FIXTURES=write cargo test -p cowshed-napi`.
+//! `nx run cowshed:wire-fixtures` regenerates it and runs ahead of every cargo test target.
 
 use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
 
@@ -610,6 +610,10 @@ fn the_committed_wire_corpus_is_what_core_serializes() {
             .expect("cargo exports CARGO_MANIFEST_DIR to the test process");
         let path = PathBuf::from(manifest_directory).join("../../src/wire-fixtures.json");
         std::fs::write(&path, &rendered).expect("the corpus path is writable");
+        // The `nx run cowshed:wire-fixtures` leg: GOLDEN is the PREVIOUS file, compiled in, and
+        // comparing against it here would fail the very run that brings it current. The next
+        // compile includes the written file and the assertion below proves it then.
+        return;
     }
 
     // Compare parsed values, not bytes. The committed file is formatted by biome, which disagrees
@@ -619,11 +623,11 @@ fn the_committed_wire_corpus_is_what_core_serializes() {
     let committed: Value = serde_json::from_str(GOLDEN).expect("the committed corpus is JSON");
     assert_eq!(
         actual, committed,
-        "{GOLDEN_PATH} is not what cowshed-core serializes today. A DTO on the napi seam changed \
-         shape. Regenerate with `{WRITE_ENV}=write cargo test -p cowshed-napi \
-         the_committed_wire_corpus_is_what_core_serializes`, then run \
-         `nx run cowshed:wire-test` so packages/cowshed/src/types.ts moves with it, and \
-         `bunx biome check --write` on the regenerated file."
+        "{GOLDEN_PATH} is not what cowshed-core serializes today: a DTO on the napi seam changed \
+         shape and the corpus was not regenerated. `nx run cowshed:wire-fixtures` (a build input \
+         of every cargo test target) writes it; if this fires, that target's inputs miss the file \
+         you changed. Then `nx run cowshed:wire-test` tells whether packages/cowshed/src/types.ts \
+         must move with it."
     );
 }
 
