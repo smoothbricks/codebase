@@ -11,6 +11,7 @@ mod fsio;
 mod gateway_inventory;
 pub mod gateway_sessions;
 pub mod git;
+pub mod inherited_daemons;
 pub mod inherited_links;
 pub mod landing;
 pub mod metadata;

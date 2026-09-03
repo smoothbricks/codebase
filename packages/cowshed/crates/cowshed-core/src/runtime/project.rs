@@ -4380,6 +4380,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let receipt = self
             .substrate
             .execute_adopt_staged(plan, move |stage| async move {
+                crate::inherited_daemons::discard_in(&stage.mount_point).await?;
                 crate::git::GitRepository::from_root(&stage.mount_point)
                     .ensure_workspace_environment_wiring()
                     .await?;
@@ -4505,6 +4506,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             let receipt = self
                 .substrate
                 .execute_create_staged(plan, move |stage| async move {
+                    crate::inherited_daemons::discard_in(&stage.mount_point).await?;
                     let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                     repository.ensure_workspace_environment_wiring().await?;
                     if git_worktree {
@@ -4688,6 +4690,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         let receipt = self
             .substrate
             .execute_fork_staged(plan, move |stage| async move {
+                crate::inherited_daemons::discard_in(&stage.mount_point).await?;
                 let repository = crate::git::GitRepository::from_root(&stage.mount_point);
                 repository.ensure_workspace_environment_wiring().await?;
                 if !source_is_git_worktree {
