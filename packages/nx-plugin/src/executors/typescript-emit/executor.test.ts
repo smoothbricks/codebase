@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -64,6 +64,42 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
         cwd: projectRoot,
       });
       expect(existsSync(overlayPath)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('makes emitted package bins executable before declaration emit', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-bin-'));
+    const projectRoot = join(root, 'packages/example');
+    const emittedBin = join(projectRoot, 'dist/bin/example.js');
+    await mkdir(projectRoot, { recursive: true });
+    await writeFile(join(projectRoot, 'tsconfig.lib.json'), '{}\n');
+
+    let executableBeforeDeclarations = false;
+    try {
+      const result = await runTypeScriptEmit(
+        {
+          cwd: 'packages/example',
+          executableOutputs: ['./dist/bin/example.js'],
+          tsConfig: 'tsconfig.lib.json',
+        },
+        { root },
+        async (invocation) => {
+          if (invocation.command === 'ttsc') {
+            await mkdir(join(projectRoot, 'dist/bin'), { recursive: true });
+            await writeFile(emittedBin, '#!/usr/bin/env node\n');
+            await chmod(emittedBin, 0o644);
+          } else {
+            executableBeforeDeclarations = ((await stat(emittedBin)).mode & 0o111) === 0o111;
+          }
+          return true;
+        },
+      );
+
+      expect(result).toEqual({ success: true });
+      expect(executableBeforeDeclarations).toBe(true);
+      expect((await stat(emittedBin)).mode & 0o111).toBe(0o111);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
