@@ -728,7 +728,8 @@ function validateTargetDependencies(
     if (typeof dependency !== 'string') {
       continue;
     }
-    if (isCrossProjectTargetDependency(dependency, projectNames)) {
+    // Nx expands "..." to the inferred target's existing dependencies before merging explicit entries.
+    if (dependency === '...' || isCrossProjectTargetDependency(dependency, projectNames)) {
       continue;
     }
     if (dependency.includes(':')) {

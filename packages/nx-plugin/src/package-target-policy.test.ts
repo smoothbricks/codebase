@@ -546,6 +546,19 @@ describe('per-package checkPackageTargets', () => {
     const issues = checkPackageTargets(pkg, 'packages/lib');
     expect(issues.some((i) => i.message.includes('build:ts') && i.message.includes('colon'))).toBe(true);
   });
+
+  it('accepts the Nx inferred-target merge marker', () => {
+    const pkg = {
+      nx: {
+        name: 'lib',
+        targets: {
+          build: { dependsOn: ['...', 'rust-dist'] },
+        },
+      },
+    };
+
+    expect(checkPackageTargets(pkg, 'packages/lib', new Set(['build', 'rust-dist']))).toEqual([]);
+  });
 });
 
 describe('per-package applyPackageTargets', () => {
