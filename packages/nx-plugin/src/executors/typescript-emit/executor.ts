@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { rm, writeFile } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join } from 'node:path';
+import { chmod, rm, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { readJsonFile } from 'nx/src/devkit-exports.js';
 
@@ -67,6 +67,8 @@ export async function runTypeScriptEmit(
       return { success: false };
     }
 
+    await makePackageBinsExecutable(cwd, options.executableOutputs ?? []);
+
     const declarationsSucceeded = await runner({
       command: 'tsc',
       args: ['-p', overlayPath, '--emitDeclarationOnly', '--declaration', '--declarationMap'],
@@ -75,6 +77,26 @@ export async function runTypeScriptEmit(
     return { success: declarationsSucceeded };
   } finally {
     await rm(overlayPath, { force: true });
+  }
+}
+
+async function makePackageBinsExecutable(cwd: string, outputs: readonly string[]): Promise<void> {
+  for (const output of new Set(outputs)) {
+    const outputPath = resolve(cwd, output);
+    const projectRelative = relative(cwd, outputPath);
+    if (
+      projectRelative.length === 0 ||
+      projectRelative === '..' ||
+      projectRelative.startsWith(`..${sep}`) ||
+      isAbsolute(projectRelative)
+    ) {
+      throw new Error(`Executable output must stay inside the project: ${output}`);
+    }
+    const outputStat = await stat(outputPath);
+    // TypeScript creates emitted files with the process default mode. A package
+    // bin that loses its execute bits is present but unusable through
+    // node_modules/.bin, so restore the semantic guarantee declared by `bin`.
+    await chmod(outputPath, outputStat.mode | 0o111);
   }
 }
 

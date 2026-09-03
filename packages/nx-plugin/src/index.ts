@@ -422,6 +422,7 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
 export default { createNodesV2 };
 
 interface PackageJson {
+  bin?: unknown;
   name?: string;
   napi?: Record<string, unknown>;
   scripts?: Record<string, unknown>;
@@ -429,6 +430,29 @@ interface PackageJson {
     name?: string;
     targets?: Record<string, unknown>;
   };
+}
+
+function packageBinOutputs(packageJson: PackageJson, packageJsonPath: string): string[] {
+  if (packageJson.bin === undefined) {
+    return [];
+  }
+  if (typeof packageJson.bin === 'string') {
+    if (packageJson.bin.length === 0) {
+      throw new Error(`${packageJsonPath}: bin must not be empty`);
+    }
+    return [packageJson.bin];
+  }
+  if (!isRecord(packageJson.bin)) {
+    throw new Error(`${packageJsonPath}: bin must be a string or an object of executable paths`);
+  }
+  const outputs = new Set<string>();
+  for (const [name, output] of Object.entries(packageJson.bin)) {
+    if (typeof output !== 'string' || output.length === 0) {
+      throw new Error(`${packageJsonPath}: bin.${name} must be a non-empty executable path`);
+    }
+    outputs.add(output);
+  }
+  return [...outputs];
 }
 
 async function createProjectTargets(
@@ -478,6 +502,7 @@ async function createProjectTargets(
   const hasAnyBuildOutputTarget = hasOrdinaryBuildOutputTarget || packageLocalBuildOutputs.platform;
 
   if (hasLibTsconfig) {
+    const executableOutputs = packageBinOutputs(packageJson, packageJsonPath);
     // Dependency packages may publish bundled entries that raw tsc does not produce.
     // Build every JavaScript output lane before resolving package exports, without pulling
     // unrelated Wasm, N-API, native, or web outputs onto the compiler critical path.
@@ -493,6 +518,7 @@ async function createProjectTargets(
       outputs: inferTypescriptOutputs(libTsconfigPath, packageJsonPath),
       dependsOn: ['^*-js', ...(cargoWasmConfig ? ['cargo-wasm'] : [])],
       options: {
+        ...(executableOutputs.length > 0 ? { executableOutputs } : {}),
         tsConfig: 'tsconfig.lib.json',
         cwd: projectRoot,
       },
@@ -1299,6 +1325,7 @@ async function readPackageJson(packageJsonPath: string): Promise<PackageJson> {
   }
   const rawNx = isRecord(parsed.nx) ? parsed.nx : undefined;
   return {
+    ...('bin' in parsed ? { bin: parsed.bin } : {}),
     ...(typeof parsed.name === 'string' ? { name: parsed.name } : {}),
     ...(isRecord(parsed.napi) ? { napi: parsed.napi } : {}),
     ...(isRecord(parsed.scripts) ? { scripts: parsed.scripts } : {}),
