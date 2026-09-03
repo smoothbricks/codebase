@@ -176,7 +176,10 @@ const NX_ENV_KEYS = [
   'NX_LOAD_DOT_ENV_FILES',
   'NX_SKIP_NX_CACHE',
   'NX_DISABLE_NX_CACHE',
+  'NX_CACHE_DIRECTORY',
+  'NX_WORKSPACE_DATA_DIRECTORY',
 ];
+const SHARED_NX_DIRECTORY_KEYS = ['NX_CACHE_DIRECTORY', 'NX_WORKSPACE_DATA_DIRECTORY'] as const;
 
 interface BinRun {
   readonly code: number | null;
@@ -185,20 +188,7 @@ interface BinRun {
   readonly stderr: string;
 }
 
-/**
- * The bin is exercised in a child process rather than by calling `ensureBuilt`
- * directly, for two reasons that are not incidental: Nx binds its workspace
- * root once per process, so a single test process cannot probe a fixture
- * workspace and then anything else; and `execve` replaces the process, which is
- * the behaviour under test.
- */
-function runBinWith(
-  runtime: 'bun' | 'node',
-  entry: string,
-  workspace: string,
-  args: readonly string[],
-  env: Readonly<NodeJS.ProcessEnv>,
-): Promise<BinRun> {
+function fixtureNxEnvironment(env: Readonly<NodeJS.ProcessEnv> = {}): NodeJS.ProcessEnv {
   const childEnv = { ...process.env };
   for (const key of NX_ENV_KEYS) {
     delete childEnv[key];
@@ -216,6 +206,30 @@ function runBinWith(
       childEnv[key] = value;
     }
   }
+  // CI shares these directories among the outer Nx tasks. A fixture Nx using
+  // either one can replace the orchestrator's project graph while sibling
+  // tasks are still running.
+  for (const key of SHARED_NX_DIRECTORY_KEYS) {
+    delete childEnv[key];
+  }
+  return childEnv;
+}
+
+/**
+ * The bin is exercised in a child process rather than by calling `ensureBuilt`
+ * directly, for two reasons that are not incidental: Nx binds its workspace
+ * root once per process, so a single test process cannot probe a fixture
+ * workspace and then anything else; and `execve` replaces the process, which is
+ * the behaviour under test.
+ */
+function runBinWith(
+  runtime: 'bun' | 'node',
+  entry: string,
+  workspace: string,
+  args: readonly string[],
+  env: Readonly<NodeJS.ProcessEnv>,
+): Promise<BinRun> {
+  const childEnv = fixtureNxEnvironment(env);
   const child = spawn(runtime, [entry, ...args], {
     cwd: workspace,
     env: childEnv,
@@ -248,7 +262,7 @@ function runBuiltBin(workspace: string, args: readonly string[]): Promise<BinRun
 function nx(workspace: string, args: readonly string[]): Promise<number | null> {
   const child = spawn(join(repoRoot, 'node_modules', '.bin', 'nx'), [...args], {
     cwd: workspace,
-    env: { ...process.env, CI: '', NX_DAEMON: 'true', NX_WORKSPACE_ROOT_PATH: workspace },
+    env: fixtureNxEnvironment({ NX_WORKSPACE_ROOT_PATH: workspace }),
     stdio: 'ignore',
   });
   return new Promise((settle, reject) => {
@@ -372,6 +386,16 @@ describe('smoo-nx-exec', () => {
     for (const key of NX_ENV_KEYS) {
       expect(run.stdout).toContain(`${key}=unset`);
     }
+  });
+
+  it('keeps fixture Nx out of CI shared state directories', async () => {
+    const run = await runBin(workspace, ['app:build', '--', './report'], {
+      NX_CACHE_DIRECTORY: join(workspace, 'shared-cache'),
+      NX_WORKSPACE_DATA_DIRECTORY: join(workspace, 'shared-workspace-data'),
+    });
+    expect(run.code).toBe(0);
+    expect(run.stdout).toContain('NX_CACHE_DIRECTORY=unset');
+    expect(run.stdout).toContain('NX_WORKSPACE_DATA_DIRECTORY=unset');
   });
 
   it('restores the caller cache controls before exec', async () => {
