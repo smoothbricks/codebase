@@ -29,9 +29,9 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
 // reduced a real CI failure to one unactionable line. Print everything the error
 // carries: captured output, the cause chain, and the stack that names the call
 // site that ran the command.
-function reportFatal(error: unknown): void {
+export function reportFatal(error: unknown): void {
   if (!(error instanceof Error)) {
-    console.error(String(error));
+    console.error(error);
     return;
   }
   console.error(error.stack ?? error.message);
@@ -39,7 +39,7 @@ function reportFatal(error: unknown): void {
   let cause: unknown = error.cause;
   while (cause !== undefined) {
     if (!(cause instanceof Error)) {
-      console.error(`Caused by: ${String(cause)}`);
+      console.error('Caused by:', cause);
       return;
     }
     console.error(`Caused by: ${cause.stack ?? cause.message}`);
