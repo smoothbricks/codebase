@@ -36,9 +36,9 @@ aggregates.
 
 Concrete targets come from concrete files:
 
-- `tsc-js` emits transformed JavaScript through a temporary JS-only `ttsc` config, then emits declarations and
-  declaration maps from the original project with native `tsc`. Direct project references and every cached output lane
-  are preserved.
+- `tsc-js` emits transformed JavaScript through a temporary JS-only `ttsc` config, restores execute bits on outputs
+  declared by `package.json#bin`, then emits declarations and declaration maps from the original project with native
+  `tsc`. Direct project references and every cached output lane are preserved.
 - `typecheck` is inferred from `tsconfig.lib.json` and runs native `tsc -p tsconfig.lib.json --noEmit`.
 - `typecheck-tests` is inferred from `tsconfig.test.json` and runs `tsc -p tsconfig.test.json --noEmit`. It first
   rebuilds the current package's `tsc-js` output (or its non-TypeScript `build`) so self-imports resolve after `clean`.

@@ -95,7 +95,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     try {
       await workspace.write(
         'packages/example/package.json',
-        '{"name":"example","scripts":{"test":"bun test --pass-with-no-tests"}}\n',
+        '{"name":"example","bin":{"example":"./dist/bin/example.js"},"scripts":{"test":"bun test --pass-with-no-tests"}}\n',
       );
       await workspace.write('packages/example/tsconfig.lib.json', '{}\n');
       await workspace.write('packages/example/tsconfig.test.json', '{}\n');
@@ -104,6 +104,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       expect(targets['tsc-js']?.executor).toBe('@smoothbricks/nx-plugin:typescript-emit');
       expect(targets['tsc-js']?.options).toEqual({
+        executableOutputs: ['./dist/bin/example.js'],
         tsConfig: 'tsconfig.lib.json',
         cwd: 'packages/example',
       });

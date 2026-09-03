@@ -5,6 +5,14 @@
   "description": "Emit transformer-generated JavaScript with ttsc and declarations with native tsc",
   "type": "object",
   "properties": {
+    "executableOutputs": {
+      "type": "array",
+      "description": "Package bin outputs to make executable after JavaScript emit",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
     "cwd": {
       "type": "string",
       "description": "Working directory, relative to the workspace root"
