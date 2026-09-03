@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use cowshed_core::api::{ExitStatus, JobId};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
@@ -49,13 +50,32 @@ fn scratch(label: &str) -> PathBuf {
     std::fs::canonicalize(&alias).expect("canonical scratch root")
 }
 
-/// `sandbox_runtime_link` names `/tmp/cs-<port base>`, so two workspaces sharing a base fight
-/// over one host-wide symlink. These bases sit at the top of the macOS block grid, where the
-/// allocator only reaches after 512 live workspaces: a test must never replace the runtime link
-/// of a workspace someone is working in.
+/// A workspace's runtime link is the host-wide path `/tmp/cs-<port base>`, and preparing a
+/// sandbox replaces whatever sits there. A test that hardcoded a base could therefore unlink the
+/// runtime directory of a workspace someone is working in, so a base is only used once it is
+/// observed free: the search starts at the top of the macOS block grid, where the allocator
+/// reaches only after 512 live workspaces, and walks down past anything occupied.
 const TOP_OF_GRID: u16 = 49_136;
+const BLOCK: u16 = 16;
+static NEXT_BASE: AtomicU16 = AtomicU16::new(TOP_OF_GRID);
 
-fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
+fn runtime_link(port_base: u16) -> PathBuf {
+    PathBuf::from(format!("/tmp/cs-{port_base}"))
+}
+
+/// A base whose runtime link nothing else holds. The counter keeps sibling tests in this binary
+/// off each other's bases; the `symlink_metadata` probe keeps all of them off a live workspace's.
+fn unoccupied_base() -> u16 {
+    for _ in 0..64 {
+        let base = NEXT_BASE.fetch_sub(BLOCK, Ordering::Relaxed);
+        if std::fs::symlink_metadata(runtime_link(base)).is_err() {
+            return base;
+        }
+    }
+    panic!("no free runtime-link base below {TOP_OF_GRID}: /tmp is full of cs-* links");
+}
+
+fn workspace(root: &Path) -> SandboxConfig {
     let mount = root.join("workspace");
     std::fs::create_dir_all(mount.join(".cowshed/bin")).expect("private bin");
     std::fs::write(
@@ -72,13 +92,23 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         mount_root: root.to_path_buf(),
         workspace_mount: mount,
         exec_temp_dir,
-        port_block: PortBlock::new(port_base, 16).expect("port block"),
+        port_block: PortBlock::new(unoccupied_base(), BLOCK).expect("port block"),
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants::default(),
         allowed_unix_sockets: Vec::new(),
         additional_denies: Vec::new(),
         git_worktree_repository: None,
     }
+}
+
+/// Leave nothing behind: the scratch tree, and the host-wide runtime link this workspace made.
+fn teardown(root: &Path, sandbox: &SandboxConfig) {
+    let link = runtime_link(sandbox.port_block.base());
+    // Only if it still resolves into this test's own tree. Anything else is someone else's.
+    if std::fs::read_link(&link).is_ok_and(|target| target.starts_with(root)) {
+        std::fs::remove_file(&link).ok();
+    }
+    std::fs::remove_dir_all(root).ok();
 }
 
 fn authority() -> WorkspaceAuthoritySnapshot {
@@ -156,7 +186,7 @@ async fn sandboxed_stdout(sandbox: &SandboxConfig, env: BTreeMap<String, String>
 #[tokio::test]
 async fn an_ordinary_sandboxed_child_is_handed_sccache_and_no_incremental_policy() {
     let root = scratch("build-env-exec");
-    let sandbox = workspace(&root, TOP_OF_GRID);
+    let sandbox = workspace(&root);
 
     assert_eq!(
         sandboxed_stdout(&sandbox, BTreeMap::new()).await,
@@ -164,7 +194,7 @@ async fn an_ordinary_sandboxed_child_is_handed_sccache_and_no_incremental_policy
         "an ordinary `cowshed exec` child must reach cargo with no CARGO_INCREMENTAL at all"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    teardown(&root, &sandbox);
 }
 
 /// The acceptance contract: the check's own environment decides, and it cannot buy its way out of
@@ -172,7 +202,7 @@ async fn an_ordinary_sandboxed_child_is_handed_sccache_and_no_incremental_policy
 #[tokio::test]
 async fn an_acceptance_check_carries_its_non_incremental_policy_into_the_child() {
     let root = scratch("build-env-check");
-    let sandbox = workspace(&root, TOP_OF_GRID - 16);
+    let sandbox = workspace(&root);
 
     assert_eq!(
         sandboxed_stdout(
@@ -184,7 +214,7 @@ async fn an_acceptance_check_carries_its_non_incremental_policy_into_the_child()
         "a land check asks for non-incremental units by name, and still gets the sandbox's sccache"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    teardown(&root, &sandbox);
 }
 
 /// A caller cannot unwire sccache: those two are the sandbox's, applied after the caller's
@@ -193,7 +223,7 @@ async fn an_acceptance_check_carries_its_non_incremental_policy_into_the_child()
 #[tokio::test]
 async fn a_caller_cannot_override_the_sandbox_owned_sccache_wiring() {
     let root = scratch("build-env-override");
-    let sandbox = workspace(&root, TOP_OF_GRID - 32);
+    let sandbox = workspace(&root);
 
     let hostile = BTreeMap::from([
         ("RUSTC_WRAPPER".to_owned(), "/bin/false".to_owned()),
@@ -205,5 +235,25 @@ async fn a_caller_cannot_override_the_sandbox_owned_sccache_wiring() {
         "the sandbox's sccache wiring wins over anything the caller names"
     );
 
-    std::fs::remove_dir_all(&root).ok();
+    teardown(&root, &sandbox);
+}
+
+/// Whatever the caller names for `CARGO_INCREMENTAL` is what cargo sees — including the value
+/// nothing in cowshed would ever choose. The builder has no opinion left to impose, and that is
+/// the property, not just "the acceptance value happens to survive".
+#[tokio::test]
+async fn a_caller_owns_cargo_incremental_outright() {
+    let root = scratch("build-env-passthrough");
+    let sandbox = workspace(&root);
+
+    for requested in ["1", "0", ""] {
+        let env = BTreeMap::from([("CARGO_INCREMENTAL".to_owned(), requested.to_owned())]);
+        assert_eq!(
+            sandboxed_stdout(&sandbox, env).await,
+            format!("{requested}|sccache|1"),
+            "the child must see exactly the CARGO_INCREMENTAL its caller named"
+        );
+    }
+
+    teardown(&root, &sandbox);
 }
