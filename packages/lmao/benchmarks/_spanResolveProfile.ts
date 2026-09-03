@@ -131,8 +131,11 @@ console.log('--- tier-up evidence ---');
 report('SpanContextClass.prototype._spanPre', Reflect.get(rootOp.callsitePlan.SpanContextClass.prototype, '_spanPre'));
 report('spanContextProto._spanPre (base)', Reflect.get(spanContextProto ?? {}, '_spanPre'));
 {
-  const jsBuffer =
-    jsTracer.rootBuffers[0] ?? (jsTracer.trace_fn(0, 'probe', {}, (span) => span.ok(1)), jsTracer.rootBuffers[0]);
+  let jsBuffer = jsTracer.rootBuffers[0];
+  if (!jsBuffer) {
+    jsTracer.trace_fn(0, 'probe', {}, (span) => span.ok(1));
+    jsBuffer = jsTracer.rootBuffers[0];
+  }
   if (jsBuffer) {
     report('js buffer._appenders.writeSpanEnd', jsBuffer._appenders.writeSpanEnd);
     report('js buffer._appendLogEntry', jsBuffer._appendLogEntry);

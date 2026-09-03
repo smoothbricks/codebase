@@ -17,7 +17,7 @@
 }
 
 /* Light */
-:root[data-theme='light'] {
+:root[data-theme="light"] {
   --sl-color-accent-low: #fdf0d5;
   --sl-color-accent: #b45309;
   --sl-color-accent-high: #6b3a06;
@@ -79,7 +79,7 @@
 }
 
 .hero::before {
-  content: '';
+  content: "";
   position: absolute;
   inset: -20% -15% 10%;
   z-index: -1;
@@ -91,7 +91,7 @@
   );
 }
 
-:root[data-theme='dark']:has(.hero) {
+:root[data-theme="dark"]:has(.hero) {
   /* Deepen the splash backdrop toward a slate near-black (Conloca-style depth). */
   --sl-color-bg: #0a0b10;
 }
@@ -99,7 +99,7 @@
 /* A blinking terminal cursor after the hero title — ties the landing to the
  * StdioTracer/terminal aesthetic the amber accent already tells. */
 .hero h1::after {
-  content: '▋';
+  content: "▋";
   margin-inline-start: 0.08em;
   color: var(--sl-color-accent);
   font-weight: 400;
