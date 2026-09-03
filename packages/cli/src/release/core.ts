@@ -129,6 +129,9 @@ export function classifyReleaseTag<Package extends ReleasePackageInfo>(
   };
 }
 
+/** Latest ancestor tags a repair considers per package: the newest release and the one before it. */
+export const REPAIR_CANDIDATES_PER_PACKAGE = 2;
+
 export async function collectOwnedReleaseTagRecords<Package extends Omit<ReleasePackageInfo, 'version'>>(
   packages: Package[],
   ref: string,
@@ -139,12 +142,24 @@ export async function collectOwnedReleaseTagRecords<Package extends Omit<Release
     pkg: Package & { version: string };
   }> = [];
   const durableStates = new BoundedPromiseRunner(8);
+  const candidatesPerPackage = new Map<string, number>();
 
   for (const tag of await shell.listReleaseTagsByCreatorDate()) {
     const match = releasePackageForTag(packages, tag.name);
-    if (!match || !(await shell.isAncestor(tag.sha, ref))) {
+    if (!match) {
       continue;
     }
+    // Tags arrive newest first, so a package's first two ancestor tags are its two
+    // latest releases. A repair only ever concerns the latest incomplete release
+    // and the one before it (an older tag's state is settled by the newer one
+    // proving complete), so anything past that is a git call per tag for nothing.
+    if ((candidatesPerPackage.get(match.pkg.name) ?? 0) >= REPAIR_CANDIDATES_PER_PACKAGE) {
+      continue;
+    }
+    if (!(await shell.isAncestor(tag.sha, ref))) {
+      continue;
+    }
+    candidatesPerPackage.set(match.pkg.name, (candidatesPerPackage.get(match.pkg.name) ?? 0) + 1);
     const versionAtTag = await shell.packageVersionAtRef(match.pkg.path, tag.sha);
     if (versionAtTag !== match.version) {
       throw new Error(
