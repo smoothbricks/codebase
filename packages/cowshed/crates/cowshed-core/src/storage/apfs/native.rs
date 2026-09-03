@@ -27,7 +27,7 @@ use crate::metadata::{
     Platform, PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot,
     WorkspaceMarker, WorkspaceName, WorkspaceRole, sidecar_path,
 };
-use crate::repository::{CHECKPOINTS_DIRECTORY, RepoId, SESSIONS_DIRECTORY};
+use crate::repository::{CHECKPOINTS_DIRECTORY, OwnedRepoIds, RepoId, SESSIONS_DIRECTORY};
 use crate::workspace_credentials::{
     mint_workspace_credentials, validate_private_key, validate_public_workspace_assets,
 };
@@ -45,8 +45,8 @@ use super::super::{
 };
 use super::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, LockMode, MarkerExpectation,
-    MetadataPolicy, PendingPublicationFact, PublicationError, ResumableStage, companion_path,
-    layout, main_aware_mount_point, recovery_staging_mount, retired_image_below,
+    MetadataPolicy, PendingPublicationFact, PublicationError, ResumableClone, ResumableStage,
+    companion_path, layout, main_aware_mount_point, recovery_staging_mount, retired_image_below,
     split_retired_stem, volume_key,
 };
 
@@ -2842,6 +2842,90 @@ where
             .sync_and_clone(source, destination, format)
             .map_err(Into::into)
     }
+
+    fn resumable_clone(
+        &self,
+        config: &ApfsSubstrateConfig,
+        source: &LifecycleWorkspace,
+        destination: &WorkspaceName,
+        destination_topology: Revision,
+        format: ImageFormat,
+        requested_identity: &OperationIdentity,
+    ) -> Result<Option<ResumableClone>, ApfsStorageError> {
+        let image = layout(config, source.repo())?
+            .session_image(destination, format)?
+            .image()
+            .to_owned();
+        let sidecar = sidecar_path(&image);
+        if !sidecar.exists() {
+            return Ok(None);
+        }
+        let metadata = DetachedWorkspaceMetadata::read_for_image(&image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.publication_state != PublicationState::PendingFence {
+            return Ok(None);
+        }
+        if !image.exists() {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "pending clone metadata has no canonical payload: {}",
+                image.display()
+            )));
+        }
+        let expected_revision = Revision::new(source.revision().get() + 1);
+        let workspace = LifecycleWorkspace::new(
+            metadata.repo_id.clone(),
+            metadata.workspace.clone(),
+            metadata.workspace_incarnation.clone(),
+            expected_revision,
+            Revision::new(destination_topology.get() + 1),
+            WorkspaceRole::Workspace,
+            metadata.image_format,
+        )
+        .map_err(|_| {
+            ApfsStorageError::MarkerMismatch(format!(
+                "pending clone carries an invalid lifecycle identity: {}",
+                image.display()
+            ))
+        })?;
+        let info = metadata.info_snapshot.as_ref().ok_or_else(|| {
+            ApfsStorageError::MarkerMismatch(format!(
+                "pending clone metadata has no info snapshot: {}",
+                image.display()
+            ))
+        })?;
+        if workspace.repo() != source.repo()
+            || workspace.name() != destination
+            || workspace.role() != WorkspaceRole::Workspace
+            || workspace.format() != format
+            || metadata.grants.revision != expected_revision.get()
+            || info.project_root != requested_identity.project_root
+            || info.base_commit != requested_identity.base_commit
+            || info.branch != requested_identity.branch
+            || info.forked_from != requested_identity.forked_from
+            || info.git_worktree != requested_identity.git_worktree
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "pending clone does not match resumed operation: {}",
+                image.display()
+            )));
+        }
+        let identity = OperationIdentity {
+            project_root: info.project_root.clone(),
+            base_commit: info.base_commit.clone(),
+            created_at: info.created_at.clone(),
+            branch: info.branch.clone(),
+            forked_from: info.forked_from.clone(),
+            created_trace: requested_identity.created_trace.clone(),
+            grants: metadata.grants.clone(),
+            git_worktree: info.git_worktree,
+        };
+        Ok(Some(ResumableClone {
+            workspace,
+            identity,
+            image,
+        }))
+    }
+
     fn resumable_staged_adopt(
         &self,
         config: &ApfsSubstrateConfig,
@@ -2937,6 +3021,76 @@ where
             .map_err(Into::into)
     }
 
+    fn attach_and_mount_resumable(
+        &self,
+        image: &Path,
+        format: ImageFormat,
+        mount_point: &Path,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<Self::Attachment, ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        self.verify_controller_path(mount_point)?;
+        let mounted = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .find(|mount| mount.mount_point == mount_point);
+        let existing = self
+            .backend
+            .existing_attachment(image, format)
+            .map_err(ApfsStorageError::from)?;
+
+        if let Some(mount) = mounted {
+            let attachment = existing.ok_or_else(|| {
+                ApfsStorageError::Host(format!(
+                    "pending clone mount at {} has no attachment for {}",
+                    mount_point.display(),
+                    image.display()
+                ))
+            })?;
+            if mount.source_device != attachment.volume_device()
+                || !canonical_mount_flags(mount.flags)
+            {
+                return Err(ApfsStorageError::Host(format!(
+                    "cannot resume pending clone at {}: mounted source {} does not match {} or canonical flags",
+                    mount_point.display(),
+                    mount.source_device,
+                    attachment.volume_device()
+                )));
+            }
+            if workspace.format() != attachment.format() {
+                return Err(ApfsStorageError::InvalidPlan(
+                    "pending clone attachment format disagrees with workspace",
+                ));
+            }
+            return Ok(attachment);
+        }
+
+        if let Some(attachment) = existing {
+            // A kill between attach and mount may also precede fsck. Reusing that unmounted device
+            // would silently skip verification, so settle it out and take the ordinary verified
+            // attach path again. This churn exists only during crash recovery, never the hot path.
+            self.backend
+                .detach(&attachment, DetachIntent::Release)
+                .map_err(ApfsStorageError::from)?;
+        }
+        let attachment = self
+            .backend
+            .attach_verified(image, format)
+            .map_err(ApfsStorageError::from)?;
+        match self.mount(&attachment, mount_point, MountAccess::ReadWrite, false) {
+            Ok(()) => Ok(attachment),
+            Err(primary) => match self.detach(attachment, DetachIntent::Release) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(ApfsStorageError::Cleanup {
+                    operation: "pending clone mount",
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                }),
+            },
+        }
+    }
+
     fn chown_volume_root(&self, mount_point: &Path) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(mount_point)?;
         #[cfg(unix)]
@@ -3015,6 +3169,28 @@ where
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(mount_point)?;
         let marker_path = mount_point.join(WORKSPACE_MARKER_PATH);
+        if let Ok(existing) = WorkspaceMarker::read_from(&marker_path)
+            && existing.repo_id == *workspace.repo()
+            && existing.project_root == identity.project_root
+            && existing.workspace == *workspace.name()
+            && existing.workspace_incarnation == *workspace.incarnation()
+            && existing.role == workspace.role()
+            && existing.image_format == workspace.format()
+            && existing.base_commit == identity.base_commit
+            && existing.created_at == identity.created_at
+            && existing.forked_from.as_ref() == forked_from
+        {
+            existing
+                .validate()
+                .map_err(|error| ApfsStorageError::MarkerMismatch(error.to_string()))?;
+            return validate_public_workspace_assets(
+                &OwnedRepoIds::sole(workspace.repo().clone()),
+                workspace.name(),
+                workspace.incarnation(),
+                mount_point,
+            )
+            .map_err(|error| ApfsStorageError::MarkerMismatch(error.to_string()));
+        }
         // A cloned image arrives with its source's marker still in place: that marker is the
         // lineage. A fresh image (adopt) has none and starts a lineage of its own.
         let lineage = clone_lineage_from(&marker_path, workspace.repo());
@@ -3765,7 +3941,7 @@ where
                     "preserved metadata requires a source image",
                 ));
             }
-            (MetadataPolicy::Fresh, _) => None,
+            (MetadataPolicy::Fresh | MetadataPolicy::FreshPendingFence, _) => None,
         };
         let mut grants = match &preserved {
             Some(metadata) => metadata.grants.clone(),
@@ -3787,7 +3963,7 @@ where
             |identity| identity.created_at.clone(),
         );
         let info_snapshot = match policy {
-            MetadataPolicy::Fresh => {
+            MetadataPolicy::Fresh | MetadataPolicy::FreshPendingFence => {
                 let identity = identity.ok_or(ApfsStorageError::InvalidPlan(
                     "fresh metadata requires operation identity",
                 ))?;
@@ -3828,13 +4004,41 @@ where
             image_format: workspace.format(),
             platform: Platform::Macos,
             publication_state: match policy {
-                MetadataPolicy::PendingFence => PublicationState::PendingFence,
+                MetadataPolicy::FreshPendingFence | MetadataPolicy::PendingFence => {
+                    PublicationState::PendingFence
+                }
                 MetadataPolicy::Fresh | MetadataPolicy::Preserve => PublicationState::Active,
             },
             updated_at,
             grants,
             info_snapshot,
         };
+        metadata
+            .write_for_image(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))
+    }
+
+    fn activate_pending_clone(
+        &self,
+        image: &Path,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        let mut metadata = DetachedWorkspaceMetadata::read_for_image(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.repo_id != *workspace.repo()
+            || metadata.workspace != *workspace.name()
+            || metadata.workspace_incarnation != *workspace.incarnation()
+            || metadata.image_format != workspace.format()
+            || metadata.grants.revision != workspace.revision().get()
+            || metadata.publication_state != PublicationState::PendingFence
+        {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "pending clone metadata disagrees with activation target: {}",
+                image.display()
+            )));
+        }
+        metadata.publication_state = PublicationState::Active;
         metadata
             .write_for_image(image)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))
@@ -4227,6 +4431,7 @@ where
         let main = WorkspaceName::main();
         if let Some((image, metadata)) = self.find_canonical_image(repo, &main)?
             && metadata.publication_state == PublicationState::PendingFence
+            && restore_recovery_fact_path(&image).exists()
         {
             let fact = restore_recovery_fact(&self.config, &image, &metadata)?;
             pending.push(PendingPublicationFact {
@@ -4246,6 +4451,11 @@ where
         for discovered in discover_session_images(entries)? {
             let metadata = DetachedWorkspaceMetadata::read_for_image(discovered.path())
                 .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+            if !restore_recovery_fact_path(discovered.path()).exists() {
+                // Pending create/fork publication is resumed by its lifecycle intent, not by
+                // restore recovery.
+                continue;
+            }
             if metadata.publication_state != PublicationState::PendingFence {
                 continue;
             }
@@ -4379,6 +4589,16 @@ where
                     }
                     let canonical = image_from_sidecar(&canonical_sidecar)?;
                     if canonical.exists() {
+                        let metadata = DetachedWorkspaceMetadata::read_for_image(&canonical)
+                            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+                        if metadata.publication_state == PublicationState::PendingFence
+                            && !restore_recovery_fact_path(&canonical).exists()
+                        {
+                            // A canonical create/fork is deliberately visible by path while its
+                            // init fence is pending. Its lifecycle intent owns resumption; generic
+                            // publication recovery must neither bless nor reclaim it.
+                            continue;
+                        }
                         self.recovery_companion(&canonical, "published canonical image")?;
                         continue;
                     }

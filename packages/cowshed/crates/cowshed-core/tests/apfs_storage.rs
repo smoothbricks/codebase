@@ -17,8 +17,8 @@ use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError, ApfsSubstrate,
     ApfsSubstrateConfig, CheckoutLayout, DEFAULT_IMAGE_CAPACITY, IncarnationSource, LockMode,
-    MarkerExpectation, MetadataPolicy, PublicationError, RestoreStage, ResumableStage,
-    RetireExecutionError, volume_key,
+    MarkerExpectation, MetadataPolicy, PublicationError, RestoreStage, ResumableClone,
+    ResumableStage, RetireExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptRequest, CheckpointFact, Destination, KernelMountFact, LifecycleFact, LifecyclePlanner,
@@ -46,6 +46,7 @@ struct FakeState {
     paths: Vec<PathBuf>,
     mount_paths: Vec<PathBuf>,
     resumable_adopt: Option<ResumableStage>,
+    resumable_clone: Option<ResumableClone>,
 }
 
 #[derive(Clone)]
@@ -125,6 +126,25 @@ impl FakeHost {
         });
     }
 
+    fn resume_clone_from(
+        &self,
+        workspace: LifecycleWorkspace,
+        identity: OperationIdentity,
+        image: impl Into<PathBuf>,
+    ) {
+        let image = image.into();
+        let fact = StorageFact {
+            workspace: workspace.clone(),
+            volume_key: volume_key(workspace.repo(), workspace.name()),
+        };
+        let mut state = self.state.lock().expect("fake state");
+        state.pending.insert(image.clone(), fact);
+        state.resumable_clone = Some(ResumableClone {
+            workspace,
+            identity,
+            image,
+        });
+    }
     fn fail_next_marker(&self) {
         self.marker_validations_before_failure
             .store(0, Ordering::SeqCst);
@@ -286,6 +306,23 @@ impl ApfsExecutionHost for FakeHost {
             .lock()
             .expect("fake state")
             .resumable_adopt
+            .clone())
+    }
+
+    fn resumable_clone(
+        &self,
+        _: &ApfsSubstrateConfig,
+        _: &LifecycleWorkspace,
+        _: &WorkspaceName,
+        _: Revision,
+        _: ImageFormat,
+        _: &OperationIdentity,
+    ) -> Result<Option<ResumableClone>, ApfsStorageError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("fake state")
+            .resumable_clone
             .clone())
     }
 
@@ -527,7 +564,7 @@ impl ApfsExecutionHost for FakeHost {
         workspace: &LifecycleWorkspace,
         revision: Revision,
         policy: MetadataPolicy,
-        _: Option<&OperationIdentity>,
+        identity: Option<&OperationIdentity>,
         _: Option<&Path>,
     ) -> Result<(), ApfsStorageError> {
         self.record(format!("atomic-metadata+parent-fsync:{policy:?}"));
@@ -536,18 +573,37 @@ impl ApfsExecutionHost for FakeHost {
                 "injected metadata failure".to_owned(),
             ));
         }
-        if revision != workspace.revision() && policy == MetadataPolicy::Fresh {
+        if revision != workspace.revision()
+            && matches!(
+                policy,
+                MetadataPolicy::Fresh | MetadataPolicy::FreshPendingFence
+            )
+        {
             return Err(ApfsStorageError::Host("fresh revision mismatch".to_owned()));
         }
         let fact = StorageFact {
             workspace: workspace.clone(),
             volume_key: volume_key(workspace.repo(), workspace.name()),
         };
-        if policy == MetadataPolicy::PendingFence {
+        if matches!(
+            policy,
+            MetadataPolicy::PendingFence | MetadataPolicy::FreshPendingFence
+        ) {
             let key = (workspace.repo().clone(), workspace.name().clone());
             let mut state = self.state.lock().expect("fake state");
             state.published.remove(&key);
             state.pending.insert(image.to_owned(), fact);
+            if policy == MetadataPolicy::FreshPendingFence {
+                state.resumable_clone = Some(ResumableClone {
+                    workspace: workspace.clone(),
+                    identity: identity
+                        .ok_or(ApfsStorageError::InvalidPlan(
+                            "fake pending clone requires operation identity",
+                        ))?
+                        .clone(),
+                    image: image.to_owned(),
+                });
+            }
         } else if image
             .components()
             .any(|component| component.as_os_str() == ".staging")
@@ -668,6 +724,28 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn activate_pending_clone(
+        &self,
+        image: &Path,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<(), ApfsStorageError> {
+        self.record("activate-pending-clone");
+        let mut state = self.state.lock().expect("fake state");
+        let fact = state.pending.remove(image).ok_or_else(|| {
+            ApfsStorageError::Host("missing fake pending clone metadata".to_owned())
+        })?;
+        if fact.workspace != *workspace {
+            return Err(ApfsStorageError::Host(
+                "fake pending clone identity mismatch".to_owned(),
+            ));
+        }
+        let key = (workspace.repo().clone(), workspace.name().clone());
+        state.formats.insert(key.clone(), workspace.format());
+        state.published.insert(key, fact);
+        state.resumable_clone = None;
+        Ok(())
+    }
+
     fn rollback_restore(&self, _: &Path, _: &Path, _: &Path) -> Result<(), ApfsStorageError> {
         self.record("rollback-before-publication");
         Ok(())
@@ -679,9 +757,19 @@ impl ApfsExecutionHost for FakeHost {
         self.record_path(trash);
         Ok(())
     }
+
     fn reclaim_image(&self, image: &Path, _: ImageFormat) -> Result<(), ApfsStorageError> {
         self.record("idempotent-reclaim");
-        self.state.lock().expect("fake state").staged.remove(image);
+        let mut state = self.state.lock().expect("fake state");
+        state.staged.remove(image);
+        state.pending.remove(image);
+        if state
+            .resumable_clone
+            .as_ref()
+            .is_some_and(|pending| pending.image == image)
+        {
+            state.resumable_clone = None;
+        }
         if self.fail_reclaim_once.swap(false, Ordering::SeqCst) {
             Err(ApfsStorageError::Host(
                 "injected reclaim failure".to_owned(),
@@ -782,11 +870,17 @@ impl ApfsExecutionHost for FakeHost {
         _: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
         let mut state = self.state.lock().expect("fake state");
+        let resumable = state
+            .resumable_clone
+            .as_ref()
+            .map(|clone| clone.image.clone());
         let pending = std::mem::take(&mut state.pending);
-        if !pending.is_empty() {
+        for (image, fact) in pending {
+            if resumable.as_ref() == Some(&image) {
+                state.pending.insert(image, fact);
+                continue;
+            }
             state.events.push("recover-pending-publication".to_owned());
-        }
-        for (_, fact) in pending {
             let key = (fact.workspace.repo().clone(), fact.workspace.name().clone());
             state.formats.insert(key.clone(), fact.workspace.format());
             state.published.insert(key, fact);
@@ -1607,15 +1701,15 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
                 .components()
                 .any(|component| component.as_os_str() == ".staging"))
             .count(),
-        3,
-        "create, fork, and restore each mount exactly one hidden staging image"
+        1,
+        "only replacement restore uses a hidden staging mount; create and fork mount canonical once"
     );
     let paths = host.paths();
     assert!(
         paths.iter().any(|path| path
             .components()
             .any(|component| component.as_os_str() == ".staging")),
-        "create/restore preparation must use a hidden staging mount"
+        "replacement restore preparation must use a hidden staging mount"
     );
     assert!(
         paths.iter().any(|path| path
@@ -1873,31 +1967,33 @@ async fn aborting_adopt_callback_detaches_and_reclaims_the_stage() {
 }
 
 #[tokio::test]
-async fn aborting_create_and_fork_callbacks_detaches_and_reclaims_each_stage() {
+async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_resume() {
     for fork in [false, true] {
         let host = FakeHost::default();
         let source = workspace("main", ImageFormat::Sparse, 5);
         host.seed(&source);
-        let substrate = substrate(host.clone(), CountingLane::default());
+        let initial_substrate = substrate(host.clone(), CountingLane::default());
+        let destination_name = WorkspaceName::session(if fork {
+            "cancelled-fork"
+        } else {
+            "cancelled-create"
+        })
+        .expect("destination");
+        let operation_identity = identity();
         let destination = Destination {
             repo: repo(),
-            name: WorkspaceName::session(if fork {
-                "cancelled-fork"
-            } else {
-                "cancelled-create"
-            })
-            .expect("destination"),
+            name: destination_name.clone(),
             topology_revision: Revision::new(8),
-            identity: identity(),
+            identity: operation_identity.clone(),
         };
         let entered = Arc::new(AtomicBool::new(false));
         let callback_entered = Arc::clone(&entered);
         let task = if fork {
-            let plan = substrate
+            let plan = initial_substrate
                 .plan_fork(&source, destination)
                 .expect("fork plan");
             tokio::spawn(async move {
-                substrate
+                initial_substrate
                     .execute_fork_staged(plan, move |_| async move {
                         callback_entered.store(true, Ordering::SeqCst);
                         std::future::pending::<Result<(), &'static str>>().await
@@ -1905,11 +2001,11 @@ async fn aborting_create_and_fork_callbacks_detaches_and_reclaims_each_stage() {
                     .await
             })
         } else {
-            let plan = substrate
+            let plan = initial_substrate
                 .plan_create(&source, destination)
                 .expect("create plan");
             tokio::spawn(async move {
-                substrate
+                initial_substrate
                     .execute_create_staged(plan, move |_| async move {
                         callback_entered.store(true, Ordering::SeqCst);
                         std::future::pending::<Result<(), &'static str>>().await
@@ -1920,18 +2016,57 @@ async fn aborting_create_and_fork_callbacks_detaches_and_reclaims_each_stage() {
 
         abort_at_callback(task, entered).await;
 
-        assert_no_orphan_stage(&host);
         assert_eq!(
-            host.list(&repo()).expect("post-cancel listing"),
-            vec![StorageFact {
-                workspace: source,
-                volume_key: volume_key(&repo(), &WorkspaceName::new("main").expect("main")),
-            }]
+            host.mounted_paths_now().len(),
+            1,
+            "the crash-left canonical mount must survive for resume"
+        );
+        assert_eq!(
+            host.pending_publications(&repo())
+                .expect("pending clone")
+                .len(),
+            1
         );
         let events = host.events();
-        assert!(events.contains(&"detach:Release".to_owned()));
-        assert!(events.contains(&"idempotent-reclaim".to_owned()));
-        assert!(!events.contains(&"atomic-publish-image".to_owned()));
+        assert!(!events.iter().any(|event| event.starts_with("detach:")));
+        assert!(!events.contains(&"idempotent-reclaim".to_owned()));
+
+        let retry_substrate = substrate(host.clone(), CountingLane::default());
+        let destination = Destination {
+            repo: repo(),
+            name: destination_name.clone(),
+            topology_revision: Revision::new(8),
+            identity: operation_identity,
+        };
+        let resumed = if fork {
+            let plan = retry_substrate
+                .plan_fork(&source, destination)
+                .expect("resume fork plan");
+            retry_substrate
+                .execute_fork_staged(plan, |stage| async move {
+                    assert!(stage.resuming);
+                    Ok::<(), &'static str>(())
+                })
+                .await
+                .expect("resume fork")
+        } else {
+            let plan = retry_substrate
+                .plan_create(&source, destination)
+                .expect("resume create plan");
+            retry_substrate
+                .execute_create_staged(plan, |stage| async move {
+                    assert!(stage.resuming);
+                    Ok::<(), &'static str>(())
+                })
+                .await
+                .expect("resume create")
+        };
+        assert_eq!(resumed.workspace.name(), &destination_name);
+        assert!(
+            host.pending_publications(&repo())
+                .expect("pending clone after resume")
+                .is_empty()
+        );
     }
 }
 
@@ -2282,13 +2417,10 @@ proptest! {
     }
 }
 
-/// The DA-churn sequence `cowshed new` performs: the staging device is detached before the
-/// canonical image is published and attached. The detach-settle check lives inside the
-/// backend's detach (below this fake host's seam), so this test pins the ordering the settle
-/// relies on — staging detach, then publish, then the canonical attach — against future
-/// refactors that might interleave them.
+/// Create/fork's normal path mounts the canonical image once. There is no staging detach,
+/// publication rename, or second attach for Disk Arbitration to serialize.
 #[tokio::test]
-async fn create_commit_detaches_staging_before_canonical_publish_and_attach() {
+async fn create_uses_one_canonical_attach_and_mount_without_detach_churn() {
     let host = FakeHost::default();
     let source = workspace("main", ImageFormat::Sparse, 1);
     host.seed(&source);
@@ -2305,31 +2437,128 @@ async fn create_commit_detaches_staging_before_canonical_publish_and_attach() {
         )
         .expect("create plan");
     substrate
-        .execute_create_staged(plan, |_| async { Ok::<(), &'static str>(()) })
+        .execute_create_staged(plan, |stage| async move {
+            assert!(!stage.resuming);
+            assert!(
+                !stage
+                    .mount_point
+                    .components()
+                    .any(|component| component.as_os_str() == ".staging")
+            );
+            Ok::<(), &'static str>(())
+        })
         .await
         .expect("create");
     let events = host.events();
-    let attaches: Vec<usize> = events
-        .iter()
-        .enumerate()
-        .filter(|(_, event)| *event == "attach-no-mount+fsck:Sparse")
-        .map(|(index, _)| index)
-        .collect();
     assert_eq!(
-        attaches.len(),
-        2,
-        "staging attach and canonical attach, got {events:?}"
+        events
+            .iter()
+            .filter(|event| event.as_str() == "attach-no-mount+fsck:Sparse")
+            .count(),
+        1,
+        "one canonical attachment, got {events:?}"
     );
-    let detach = events
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("mount:"))
+            .count(),
+        1,
+        "one canonical mount, got {events:?}"
+    );
+    assert!(!events.iter().any(|event| event.starts_with("detach:")));
+    assert!(!events.iter().any(|event| event == "atomic-publish-image"));
+    let activate = events
         .iter()
-        .position(|event| event == "detach:Release")
-        .expect("staging detach");
-    let publish = events
+        .position(|event| event == "activate-pending-clone")
+        .expect("activation fence");
+    let retain = events
         .iter()
-        .position(|event| event == "atomic-publish-image")
-        .expect("canonical publish");
+        .position(|event| event == "retain-mounted")
+        .expect("mount retention");
     assert!(
-        attaches[0] < detach && detach < publish && publish < attaches[1],
-        "detach must separate the two attaches with the publish between: {events:?}"
+        activate < retain,
+        "activation precedes retention: {events:?}"
+    );
+}
+
+/// A crash-left PendingFence supplies the original incarnation and identity. The retry must not
+/// clone or rewrite pending metadata; it remounts, re-enters the initializer with explicit resume
+/// authority, then activates exactly that workspace.
+#[tokio::test]
+async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_init() {
+    let host = FakeHost::default();
+    let source = LifecycleWorkspace::new(
+        repo(),
+        WorkspaceName::main(),
+        incarnation(5),
+        Revision::new(5),
+        Revision::new(10),
+        WorkspaceRole::Main,
+        ImageFormat::Sparse,
+    )
+    .expect("source");
+    host.seed(&source);
+    let destination = WorkspaceName::new("hedge").expect("destination");
+    let resumed = LifecycleWorkspace::new(
+        repo(),
+        destination.clone(),
+        incarnation(9),
+        Revision::new(6),
+        Revision::new(11),
+        WorkspaceRole::Workspace,
+        ImageFormat::Sparse,
+    )
+    .expect("resumed workspace");
+    let original_identity = identity();
+    host.resume_clone_from(
+        resumed.clone(),
+        original_identity.clone(),
+        "/store/acme--widget/sessions/hedge.sparseimage",
+    );
+    let substrate = substrate(host.clone(), CountingLane::default());
+    let plan = substrate
+        .plan_create(
+            &source,
+            Destination {
+                repo: repo(),
+                name: destination,
+                topology_revision: Revision::new(11),
+                identity: original_identity,
+            },
+        )
+        .expect("resume plan");
+    let callback_seen = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&callback_seen);
+    let receipt = substrate
+        .execute_create_staged(plan, move |stage| async move {
+            assert!(stage.resuming);
+            assert_eq!(stage.workspace, resumed);
+            seen.store(true, Ordering::SeqCst);
+            Ok::<(), &'static str>(())
+        })
+        .await
+        .expect("resume pending clone");
+    assert!(callback_seen.load(Ordering::SeqCst));
+    assert_eq!(receipt.workspace.incarnation(), &incarnation(9));
+    assert_eq!(receipt.workspace.revision(), Revision::new(6));
+    assert_eq!(receipt.workspace.topology_revision(), Revision::new(11));
+    let events = host.events();
+    assert!(
+        !events.iter().any(|event| event.starts_with("clone:")),
+        "resume must not clone over the pending payload: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event == "atomic-metadata+parent-fsync:FreshPendingFence"),
+        "resume must preserve the original metadata identity: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.as_str() == "activate-pending-clone")
+            .count(),
+        1
     );
 }
