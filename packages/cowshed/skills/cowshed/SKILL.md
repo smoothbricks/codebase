@@ -4,7 +4,7 @@ description:
   Give each agent, fork, or subtask an instant warm copy-on-write clone of a repository instead of a cold git worktree.
   Use when spawning parallel agents that each need their own checkout, when a worktree would force a multi-minute cold
   rebuild, when isolating risky or destructive work, or when running any cowshed command (adopt, setup, new, path, exec,
-  land, push, rm, gc, rebase, doctor).
+  grant, land, push, rm, gc, rebase, doctor).
 ---
 
 # cowshed — warm workspaces for parallel agents
@@ -29,27 +29,28 @@ direnv users need nothing extra.
 
 ## Commands
 
-| Task                    | Command                                                              | Use                                                         |
-| ----------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Create from main        | `cowshed new <name>`                                                 | Clone the warm main image.                                  |
-| Create from a sibling   | `cowshed new <name> --from <ws>`                                     | Start from another workspace's current image.               |
-| Create at a stable slot | `cowshed new <name> --slot <n>`                                      | Recycle a stable mount path for path-keyed compiler caches. |
-| Locate                  | `cowshed path <ws>`                                                  | Print the live mount path.                                  |
-| Run a command           | `cowshed exec <ws> -- <cmd>`                                         | Execute argv inside the workspace sandbox.                  |
-| List this project       | `cowshed ls`                                                         | Show its workspaces.                                        |
-| List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                 |
-| Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.       |
-| Inspect compile cache   | `cowshed sccache status`                                             | Check daemon health and cache hits before debugging misses. |
-| Attach or detach        | `cowshed attach <ws>` / `cowshed detach <ws>`                        | Mount or park one session workspace.                        |
-| Attach or detach all    | `cowshed attach --all` / `cowshed detach --all`                      | Mount or park all session workspaces.                       |
-| Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                 |
-| Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                      |
-| Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Rebase, check, fast-forward main, and retire on success.    |
-| Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.   |
-| Retire                  | `cowshed rm <ws>`                                                    | Remove a landed workspace.                                  |
-| Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                      |
-| Grow an image           | `cowshed resize <ws> <size>`                                         | Grow an image; resize never shrinks it.                     |
-| Rename or move          | `cowshed mv <ws> <new-name>` / `cowshed mv main <new-checkout-path>` | Rename a workspace or move the adopted checkout.            |
+| Task                    | Command                                                              | Use                                                             |
+| ----------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------- |
+| Create from main        | `cowshed new <name>`                                                 | Clone the warm main image.                                      |
+| Create from a sibling   | `cowshed new <name> --from <ws>`                                     | Start from another workspace's current image.                   |
+| Create at a stable slot | `cowshed new <name> --slot <n>`                                      | Recycle a stable mount path for path-keyed compiler caches.     |
+| Locate                  | `cowshed path <ws>`                                                  | Print the live mount path.                                      |
+| Run a command           | `cowshed exec <ws> -- <cmd>`                                         | Execute argv inside the workspace sandbox.                      |
+| Grant host paths        | `cowshed grant <ws> --read <path...> [--write <path...>]`            | Widen filesystem access from the next exec; omit flags to list. |
+| List this project       | `cowshed ls`                                                         | Show its workspaces.                                            |
+| List every project      | `cowshed ls --all`                                                   | Show workspaces store-wide.                                     |
+| Inspect host            | `cowshed doctor`                                                     | Check host and workspace invariants without mutation.           |
+| Inspect compile cache   | `cowshed sccache status`                                             | Check daemon health and cache hits before debugging misses.     |
+| Attach or detach        | `cowshed attach <ws>` / `cowshed detach <ws>`                        | Mount or park one session workspace.                            |
+| Attach or detach all    | `cowshed attach --all` / `cowshed detach --all`                      | Mount or park all session workspaces.                           |
+| Checkpoint or restore   | `cowshed checkpoint <ws> <label>` / `cowshed restore <ws> <label>`   | Save or roll back an image.                                     |
+| Rebase                  | `cowshed rebase <ws>`                                                | Rebase the workspace branch onto main.                          |
+| Land with a check       | `cowshed land <ws> --target main --check '<bare command>'`           | Rebase, check, fast-forward main, and retire on success.        |
+| Deliver a branch        | `cowshed push <ws> --branch <name>`                                  | Put the workspace branch in main's repository for review.       |
+| Retire                  | `cowshed rm <ws>`                                                    | Remove a landed workspace.                                      |
+| Reclaim                 | `cowshed gc --dry-run` / `cowshed gc`                                | Review, then reclaim orphaned storage.                          |
+| Grow an image           | `cowshed resize <ws> <size>`                                         | Grow an image; resize never shrinks it.                         |
+| Rename or move          | `cowshed mv <ws> <new-name>` / `cowshed mv main <new-checkout-path>` | Rename a workspace or move the adopted checkout.                |
 
 ## Merge flow
 

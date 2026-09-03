@@ -15,11 +15,11 @@ use cowshed_core::api::{
     AdoptOptions, AttachOptions, BranchName, CheckpointInfo, CheckpointOptions, CheckpointResult,
     CommandArg, Coordinator, CreateOptions, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
     ExpectedRefHead, Finding, FindingSeverity, GatewayStatus, GcOptions, GcReason, GcReport,
-    GitOid, JobInfo, JobStream, LandOptions, LandReport, LandingCommits, MountResult,
-    OutputPublication, PublicationPolicy, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveReport, ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
-    WorkspaceState, validate_command_argv,
+    GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport, LandingCommits,
+    MountResult, OutputPublication, PublicationPolicy, PushOptions, PushReport, RebaseOptions,
+    RemoveOptions, RemoveReport, ResizeResult, RevisionResult, RevisionTarget, RunSandboxMode,
+    SccacheStatus, StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding,
+    WorkspacePath, WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -104,6 +104,8 @@ pub trait CliService: Send {
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
     async fn doctor(&mut self) -> Result<DoctorReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
+    async fn grants(&mut self, workspace: &str) -> Result<GrantSet>;
+    async fn grant(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet>;
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport>;
     async fn rebase(&mut self, workspace: &str, options: RebaseOptions) -> Result<GitOid>;
     async fn land(&mut self, workspace: &str, options: LandOptions) -> Result<LandReport>;
@@ -145,6 +147,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::List(_)
         | Command::Path(_)
         | Command::Exec(_)
+        | Command::Grant(_)
         | Command::Remove(_)
         | Command::Attach(_)
         | Command::Detach(_)
@@ -460,6 +463,19 @@ impl CliService for ActorBridge {
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
         self.coordinator()?.gc(options).await
+    }
+
+    async fn grants(&mut self, workspace: &str) -> Result<GrantSet> {
+        self.coordinator()?
+            .project()
+            .workspace(workspace)
+            .await?
+            .refresh_grants()
+            .await
+    }
+
+    async fn grant(&mut self, workspace: &str, delta: GrantDelta) -> Result<GrantSet> {
+        self.coordinator()?.grant(workspace, delta).await
     }
 
     async fn push(&mut self, workspace: &str, options: PushOptions) -> Result<PushReport> {
@@ -878,6 +894,48 @@ where
                     code: child_exit_code(&result.info)?,
                 })
             }
+        }
+        Command::Grant(args) => {
+            let changed = !args.read.is_empty() || !args.write.is_empty();
+            let grants = if changed {
+                service
+                    .grant(
+                        &args.workspace,
+                        GrantDelta {
+                            read: args.read,
+                            write: args.write,
+                            ..GrantDelta::default()
+                        },
+                    )
+                    .await?
+            } else {
+                service.grants(&args.workspace).await?
+            };
+            if json {
+                output.success(grants.clone()).map_err(output_error)?;
+            } else if !changed {
+                emit_filesystem_grants(output, &grants)?;
+            }
+            if changed {
+                output
+                    .guidance(&format!(
+                        "grants for {} now: {} read, {} write",
+                        args.workspace,
+                        grants.read.len(),
+                        grants.write.len()
+                    ))
+                    .map_err(output_error)?;
+                output
+                    .guidance("filesystem grants apply from the next exec or shell")
+                    .map_err(output_error)?;
+                output
+                    .hint(&format!(
+                        "cowshed exec {} -- <retry your command>",
+                        args.workspace
+                    ))
+                    .map_err(output_error)?;
+            }
+            Ok(success())
         }
         Command::Remove(args) => {
             let report = service
@@ -1429,6 +1487,26 @@ fn emit_mount<W: Write, E: Write>(
             .bare_line(info.mount.as_os_str().as_bytes())
             .map_err(output_error)
     }
+}
+
+fn emit_filesystem_grants<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    grants: &GrantSet,
+) -> Result<()> {
+    for (kind, paths) in [
+        (b"read".as_slice(), &grants.read),
+        (b"write".as_slice(), &grants.write),
+    ] {
+        for path in paths {
+            output.bare(kind).map_err(output_error)?;
+            output.bare(b"\t").map_err(output_error)?;
+            output
+                .bare(path.as_os_str().as_bytes())
+                .map_err(output_error)?;
+            output.bare(b"\n").map_err(output_error)?;
+        }
+    }
+    Ok(())
 }
 
 /// Say out loud which projects the gateway was not told about, without failing the command.

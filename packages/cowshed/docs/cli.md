@@ -604,42 +604,33 @@ walkthrough, Expo included, is [ios.md](ios.md).
 
 ## Sandbox grants
 
+### `cowshed grant <name> [--read <path...>] [--write <path...>]`
+
 Workspaces start **closed**: write access to their own volume, `/private/cowshed/caches`, and temp; read access to the
-toolchains and system; egress to the localhost gateway only. Widen per workspace:
+toolchains and system; egress to the localhost gateway only. Widen filesystem access per workspace:
 
 ```
 $ cowshed grant raven --read <project-root>/reference-corpus
-$ cowshed grant raven --write <project-root>/shared-assets --egress api.github.com
-cowshed: grants for raven now: +read <project-root>/reference-corpus, +write <project-root>/shared-assets, +egress api.github.com
-cowshed: filesystem grants apply from the next exec; egress applies immediately (gateway allowlist)
+$ cowshed grant raven --write <project-root>/shared-assets
+cowshed: grants for raven now: 1 read, 1 write
+cowshed: filesystem grants apply from the next exec or shell
 next: cowshed exec raven -- <retry your command>
 ```
 
-- Besides `--read`/`--write`/`--egress` there are `--repo <host/org[/repo]>` (gateway repo mirrors), `--sim <verb>`
-  (personal-session simulator broker: `openurl` freely, `install` drop-dir-bound and human-gated — [ios.md](ios.md)),
-  and `--preset simulator` (dev-side headless CoreSimulator IPC).
+- `--read` and `--write` are repeatable and each occurrence accepts one or more paths. Paths must be absolute; cowshed
+  normalizes, deduplicates, and sorts them before persistence.
+- A grant that contains or falls beneath the workspace mount, another cowshed mount, controller state, the project
+  policy root, or a credential-bearing hard-deny is rejected before the grants file changes.
 - Grants are recorded in `<image>.grants.json`, **outside the volume** — a sandboxed process cannot edit its own grants.
-- Filesystem grants take effect at the next `exec`/`shell` (Seatbelt profiles are fixed at process launch; every exec
-  carries the current grant snapshot). Egress grants are enforced by the gateway and apply to running processes
-  immediately.
+- Filesystem grants take effect at the next `exec`/`shell`: Seatbelt profiles are fixed at process launch, and every
+  launch carries the current persisted grant snapshot.
 - `cowshed grant <name>` with no flags prints the current grant set (TSV; `--json` for the envelope):
 
 ```
 $ cowshed grant raven
 read	<project-root>/reference-corpus
 write	<project-root>/shared-assets
-egress	api.github.com
 ```
-
-- `cowshed revoke raven --write <project-root>/shared-assets` narrows again; `cowshed revoke raven --all` resets to
-  closed. Revocation of egress is immediate; filesystem revocation applies from the next exec.
-- The closed baseline is a floor, not a grant: you cannot revoke a workspace's access to its own volume, the caches
-  volume, or the gateway.
-- **Egress is intercepted by default.** `--egress api.github.com` lets the gateway terminate TLS under the workspace's
-  CA and inject the Keychain credential + trace context — the workspace reaches the API authenticated while holding no
-  secret. Add `--opaque` for a cert-pinning host (plain tunnel, no injection) or `--impersonate <profile>` for a
-  browser-shaped fingerprint (also no injection). A bare `cowshed grant raven` prints the set with `mode`/`impersonate`
-  columns; `--repo github.com/org/*` grants which repos the gateway will mirror (see Git).
 
 ## Authority boundaries
 
