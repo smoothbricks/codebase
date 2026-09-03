@@ -45,7 +45,6 @@ function linkHook(gitDir: string, tooling: string, name: string): void {
     return;
   }
 
-  console.log(`[!] Linking ${name} hook in ${gitDir}`);
   mkdirSync(dirname(target), { recursive: true });
   rmSync(target, { force: true });
   symlinkSync(source, target);
