@@ -397,6 +397,7 @@ fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
         StorageGcReason::OrphanStagingImage => b"orphan-staging-image",
         StorageGcReason::OrphanStagingMetadata => b"orphan-staging-metadata",
         StorageGcReason::OrphanStagingMount => b"orphan-staging-mount",
+        StorageGcReason::OrphanMountpoint => b"orphan-mountpoint",
         StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
         StorageGcReason::DetachedImageCompaction => b"detached-image-compaction",
     }
@@ -2193,8 +2194,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let trash_images = self.retired_trash_images(&trash)?;
         let name_owners = retired_name_owners(&trash_images);
         let mut claimed_checkpoint_names = BTreeSet::new();
+        // Every name a mountpoint may legitimately carry: retired records (their mountpoint is
+        // theirs to reclaim) and published sessions. Anything else under the mount root is an
+        // orphan directory.
+        let mut named_mountpoints: BTreeSet<String> = BTreeSet::new();
         for (path, format) in trash_images {
             let retired = self.retired_authority(project, repo, &path, format)?;
+            named_mountpoints.insert(retired.workspace().name().as_str().to_owned());
             let scope = self.retired_name_scope(
                 retired.workspace(),
                 name_owners.get(retired.workspace().name()),
@@ -2444,6 +2450,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
 
         for discovered in discover_session_images(session_entries)? {
+            named_mountpoints.insert(discovered.workspace().as_str().to_owned());
             if discovered.format() != ImageFormat::Sparse {
                 continue;
             }
@@ -2483,6 +2490,36 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .cmp(right.path())
                 .then_with(|| gc_reason_tag(left.reason()).cmp(gc_reason_tag(right.reason())))
         });
+        // Orphan mountpoints: directories under the mount root with nothing mounted at them
+        // and no record naming them. `.staging` has its own pass above; a mounted directory
+        // (its device differs from the root's) is a live volume whatever the records say.
+        let mount_root = layout(&self.config, repo)?.project().mount_root.clone();
+        if let Ok(root_metadata) = fs::metadata(&mount_root) {
+            for path in directory_children(&mount_root)? {
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name.starts_with('.') || named_mountpoints.contains(name) {
+                    continue;
+                }
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !metadata.file_type().is_dir() || metadata.dev() != root_metadata.dev() {
+                    continue;
+                }
+                examined = examined
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+                candidates.push(gc_candidate(
+                    StorageGcReason::OrphanMountpoint,
+                    &path,
+                    &[],
+                    None,
+                    &[],
+                )?);
+            }
+        }
         lock_paths.sort();
         lock_paths.dedup();
         Ok(StorageGcPlan::new(
@@ -2557,6 +2594,31 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 }
                 StorageGcReason::OrphanStagingMount => {
                     self.retire_staging_mount(candidate.path(), ImageFormat::Sparse)?;
+                }
+                StorageGcReason::OrphanMountpoint => {
+                    let kept = remove_stray_junk(candidate.path(), &self.config.checkout_path)?;
+                    if !kept.is_empty() {
+                        return Err(ApfsStorageError::Host(format!(
+                            "orphan mountpoint {} holds files that are neither hidden nor ignored \
+                             by the project: {}; move or delete them",
+                            candidate.path().display(),
+                            kept.iter()
+                                .map(|path| path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                    match fs::remove_dir(candidate.path()) {
+                        Ok(()) => sync_parent_path(candidate.path())?,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(io_error(
+                                "remove orphan mountpoint",
+                                candidate.path(),
+                                error,
+                            ));
+                        }
+                    }
                 }
                 StorageGcReason::ExpiredCheckpoint => {
                     let format = candidate.format().ok_or(ApfsStorageError::InvalidPlan(
