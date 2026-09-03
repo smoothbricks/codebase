@@ -24,6 +24,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &LIST,
     &PATH,
     &EXEC,
+    &GRANT,
     &REMOVE,
     &ATTACH,
     &DETACH,
@@ -65,6 +66,7 @@ pub enum Command {
     List(ListArgs),
     Path(PathArgs),
     Exec(ExecArgs),
+    Grant(GrantArgs),
     Remove(RemoveArgs),
     Attach(AttachArgs),
     Detach(DetachArgs),
@@ -103,6 +105,7 @@ impl Command {
             | Self::Restore(_)
             | Self::Path(_)
             | Self::Exec(_)
+            | Self::Grant(_)
             | Self::Remove(_)
             | Self::Attach(_)
             | Self::Resize(_)
@@ -287,6 +290,13 @@ pub struct ExecArgs {
     pub stdout_copy: Option<PathBuf>,
     pub stderr_copy: Option<PathBuf>,
     pub replace_output: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantArgs {
+    pub workspace: String,
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
 }
 
 /// `rm <ws>` — retire one workspace.
@@ -633,6 +643,11 @@ fn cli_command() -> ClapCommand {
                         .allow_hyphen_values(true),
                 ),
         )
+        .subcommand(
+            leaf("grant")
+                .arg(positional("workspace", 0..=1))
+                .args([path_values("read"), path_values("write")]),
+        )
         .subcommand(leaf("rm").arg(positional("workspace", 0..=1)).args([
             flag("force"),
             flag("restore"),
@@ -754,6 +769,14 @@ fn append_value(name: &'static str) -> Arg {
         .action(ArgAction::Append)
 }
 
+fn path_values(name: &'static str) -> Arg {
+    Arg::new(name)
+        .long(name)
+        .num_args(1..)
+        .value_parser(value_parser!(PathBuf))
+        .action(ArgAction::Append)
+}
+
 fn positional(name: &'static str, _range: std::ops::RangeInclusive<usize>) -> Arg {
     Arg::new(name)
         .value_parser(value_parser!(OsString))
@@ -777,6 +800,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "ls" => parse_list(leaf)?,
         "path" => parse_path(leaf)?,
         "exec" => parse_exec(leaf)?,
+        "grant" => parse_grant(leaf)?,
         "rm" => parse_remove(leaf)?,
         "attach" => parse_attach(leaf)?,
         "detach" => parse_detach(leaf)?,
@@ -1712,6 +1736,43 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
+const GRANT: CommandSpec = CommandSpec {
+    name: "grant",
+    missing: "grant requires a workspace",
+    args: "<ws>",
+    trailing: "",
+    summary: "grant filesystem access",
+    about: &[
+        "Adds read-only or writable host paths to one workspace's sandbox grant snapshot. Paths are normalized, deduplicated, sorted, and recorded outside the workspace image; they apply from the next exec or shell. With no flags, prints the current filesystem grants.",
+        "A grant cannot cover the workspace mount, another cowshed mount, controller state, project policy roots, or credential-bearing paths.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--read <path...>",
+            meaning: "allow reads beneath one or more absolute host paths; repeat the flag to add more",
+        },
+        Opt {
+            spelling: "--write <path...>",
+            meaning: "allow reads and writes beneath one or more absolute host paths; repeat the flag to add more",
+        },
+    ],
+};
+
+fn parse_grant(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &GRANT;
+    Ok(Command::Grant(GrantArgs {
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
+        read: matches
+            .get_many::<PathBuf>("read")
+            .map(|paths| paths.cloned().collect())
+            .unwrap_or_default(),
+        write: matches
+            .get_many::<PathBuf>("write")
+            .map(|paths| paths.cloned().collect())
+            .unwrap_or_default(),
+    }))
+}
+
 /// Usage text is where the destructive flags are documented: a human reads options here
 /// deliberately, whereas a refusal message is what an agent pattern-matches into a retry — which
 /// is why no refusal names the flag that would override it.
@@ -2095,6 +2156,40 @@ mod tests {
         assert_eq!(short, long);
         assert!(short.global.quiet);
         assert!(short.global.json);
+    }
+
+    #[test]
+    fn grant_accepts_listing_and_repeatable_path_groups() {
+        let listed = parse_args(["grant", "raven"]).expect("grant listing parses");
+        let Command::Grant(listed) = listed.command else {
+            panic!("expected grant")
+        };
+        assert!(listed.read.is_empty());
+        assert!(listed.write.is_empty());
+
+        let parsed = parse_args([
+            "grant", "raven", "--read", "/tmp/z", "/tmp/a", "--read", "/tmp/b", "--write",
+            "/tmp/out", "--json",
+        ])
+        .expect("grant mutation parses");
+        assert!(parsed.global.json);
+        let Command::Grant(grant) = parsed.command else {
+            panic!("expected grant")
+        };
+        assert_eq!(grant.workspace, "raven");
+        assert_eq!(
+            grant.read,
+            [
+                PathBuf::from("/tmp/z"),
+                PathBuf::from("/tmp/a"),
+                PathBuf::from("/tmp/b")
+            ]
+        );
+        assert_eq!(grant.write, [PathBuf::from("/tmp/out")]);
+        assert_eq!(
+            Command::Grant(grant).project_discovery(),
+            ProjectDiscovery::Required
+        );
     }
 
     /// The pre-parse walk answers about output shape exactly as the parser would, and it does not

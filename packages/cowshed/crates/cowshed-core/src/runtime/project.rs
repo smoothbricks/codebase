@@ -5736,11 +5736,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     async fn grant(
         &mut self,
         workspace: WorkspaceName,
-        delta: GrantDelta,
+        mut delta: GrantDelta,
         revoke: bool,
     ) -> Result<GrantSet> {
         self.validate_binding().await?;
-        let current = self.current(&workspace).await?;
+        let mut current = self.current(&workspace).await?;
         if delta
             .expected_revision
             .is_some_and(|revision| revision != current.metadata.grants.revision)
@@ -5750,37 +5750,47 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 "refresh grants and retry",
             ));
         }
-        let mut metadata = current.metadata.clone();
-        apply_grant_delta(&mut metadata.grants, delta, revoke);
-        metadata.grants.revision = metadata
+        normalize_grant_delta(&mut delta)?;
+        let previous = current.metadata.grants.clone();
+        apply_grant_delta(&mut current.metadata.grants, delta, revoke);
+
+        let mount = self.workspace_mount_path(&workspace)?;
+        let main_mount = self.workspace_mount_path(&main_name())?;
+        let config = supervisor_sandbox(
+            &self.home,
+            &self.layout,
+            &self.telemetry_root,
+            &current,
+            mount,
+            main_mount,
+        )?;
+        crate::sandbox::validate_sandbox_config(&config).map_err(|error| {
+            CowshedError::usage(
+                error.to_string(),
+                "choose an absolute path outside workspace, controller, project, and credential roots",
+            )
+        })?;
+        if current.metadata.grants == previous {
+            return Ok(previous);
+        }
+
+        current.metadata.grants.revision = current
+            .metadata
             .grants
             .revision
             .checked_add(1)
             .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
         let image = current.image;
-        let published = metadata.grants.clone();
+        let topology_revision = current.derived.workspace.revision().get();
+        let published = current.metadata.grants.clone();
+        let metadata = current.metadata;
         crate::storage::lifecycle::dispatch_blocking(move || metadata.write_for_image(&image))
             .await
             .map_err(|error| CowshedError::internal(error.to_string()))?
             .map_err(native_integrity_error)?;
         if let Some(handle) = self.supervisors.remove(&workspace) {
-            let current = self.current(&workspace).await?;
-            let mount = self.workspace_mount_path(&workspace)?;
-            let main_mount = self.workspace_mount_path(&main_name())?;
-            let config = supervisor_sandbox(
-                &self.home,
-                &self.layout,
-                &self.telemetry_root,
-                &current,
-                mount,
-                main_mount,
-            )?;
             let replacement = handle
-                .advance_authority(
-                    published.revision,
-                    current.derived.workspace.revision().get(),
-                    config,
-                )
+                .advance_authority(published.revision, topology_revision, config)
                 .await?;
             self.supervisors.insert(workspace, replacement);
         }
@@ -8152,12 +8162,44 @@ fn sandbox_denial_in(stderr: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn normalize_grant_delta(delta: &mut GrantDelta) -> Result<()> {
+    normalize_grant_paths(&mut delta.read)?;
+    normalize_grant_paths(&mut delta.write)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_grant_paths(paths: &mut Vec<PathBuf>) -> Result<()> {
+    for path in paths.iter_mut() {
+        let original = std::mem::take(path);
+        *path = canonical_lexical_absolute(&original).ok_or_else(|| {
+            CowshedError::usage(
+                format!(
+                    "grant path {} must be absolute and must not traverse above /",
+                    original.display()
+                ),
+                "choose an absolute filesystem path",
+            )
+        })?;
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn apply_grant_delta(grants: &mut GrantSet, delta: GrantDelta, revoke: bool) {
-    update_set(&mut grants.read, delta.read, revoke);
-    update_set(&mut grants.write, delta.write, revoke);
+    update_ordered_set(&mut grants.read, delta.read, revoke);
+    update_ordered_set(&mut grants.write, delta.write, revoke);
     update_set(&mut grants.egress, delta.egress, revoke);
-    update_set(&mut grants.repos, delta.repos, revoke);
-    update_set(&mut grants.sim, delta.sim, revoke);
+    update_ordered_set(&mut grants.repos, delta.repos, revoke);
+    update_ordered_set(&mut grants.sim, delta.sim, revoke);
+}
+
+#[cfg(target_os = "macos")]
+fn update_ordered_set<T: Ord>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
+    update_set(current, delta, revoke);
+    current.sort();
+    current.dedup();
 }
 
 #[cfg(target_os = "macos")]
@@ -8169,6 +8211,60 @@ fn update_set<T: PartialEq>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
             if !current.contains(&value) {
                 current.push(value);
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod grant_unit_tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_grants_are_normalized_deduplicated_and_sorted() {
+        let mut grants = GrantSet {
+            read: vec![PathBuf::from("/var/z")],
+            write: vec![PathBuf::from("/var/output")],
+            ..GrantSet::default()
+        };
+        let mut delta = GrantDelta {
+            read: vec![
+                PathBuf::from("/var/z"),
+                PathBuf::from("/opt/../var/a"),
+                PathBuf::from("/var/a"),
+            ],
+            write: vec![
+                PathBuf::from("/var/output/./reports"),
+                PathBuf::from("/var/output"),
+            ],
+            ..GrantDelta::default()
+        };
+
+        normalize_grant_delta(&mut delta).expect("valid filesystem grant paths");
+        apply_grant_delta(&mut grants, delta, false);
+
+        assert_eq!(
+            grants.read,
+            [PathBuf::from("/var/a"), PathBuf::from("/var/z")]
+        );
+        assert_eq!(
+            grants.write,
+            [
+                PathBuf::from("/var/output"),
+                PathBuf::from("/var/output/reports")
+            ]
+        );
+    }
+
+    #[test]
+    fn filesystem_grants_reject_relative_paths_and_root_escape() {
+        for path in ["relative/path", "/../../private"] {
+            let mut delta = GrantDelta {
+                read: vec![PathBuf::from(path)],
+                ..GrantDelta::default()
+            };
+            let error = normalize_grant_delta(&mut delta).expect_err("invalid grant path");
+            assert_eq!(error.code, ErrorCode::Usage);
+            assert!(error.message.contains(path));
         }
     }
 }
