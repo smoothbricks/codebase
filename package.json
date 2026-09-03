@@ -72,6 +72,13 @@
   "nx": {
     "includedScripts": [],
     "targets": {
+      "lint": {
+        "options": {
+          "commands": [
+            "biome check --files-ignore-unknown=true {projectRoot}"
+          ]
+        }
+      },
       "local-registry": {
         "executor": "@nx/js:verdaccio",
         "options": {
