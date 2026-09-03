@@ -14,6 +14,21 @@ with `tsconfig.lib.json` receives transformer-aware `tsc-js` and native `typeche
 - Cargo workspace targets from a neighboring workspace-root `Cargo.toml`
 - aggregate `build` and `lint` targets
 
+## Cargo Workspace Layouts
+
+The plugin supports both Cargo placements without moving crate sources:
+
+- **Package-rooted:** `packages/example/package.json` sits beside `packages/example/Cargo.toml`. The package owns the
+  whole Cargo target set, and commands keep `cwd: packages/example`.
+- **Repository-rooted:** the repository `package.json` sits beside the one root `Cargo.toml`, whose members may live
+  below several `packages/*` projects. The root Nx project owns the single `cargo-fetch`, `cargo-test-compile`,
+  `cargo-lint`, mutation, bench, and sweep targets. Each crate's `cargo-test-<crate>` target and declared Wasm/N-API
+  output targets belong to the deepest Nx project directory containing that crate. All Cargo commands run from the
+  repository root, select the crate with `-p <crate>`, and share the root `target/`; cross-project dependencies keep the
+  runners in one serialization chain. Member and exclude patterns may use `*` and `?` in any path segment (for example,
+  `packages/*/crates/*`); unsupported patterns and member patterns that match no directory fail graph construction
+  instead of silently omitting crates.
+
 ## Nx Target Naming
 
 Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are
@@ -32,13 +47,13 @@ Concrete targets come from concrete files:
   the corresponding watch command and makes it depend on `typecheck-tests`.
 - A workspace-root `Cargo.toml` provides `cargo-test`, `test`, `cargo-lint`, `mutation`, and `bench`.
   `cargo-test-compile` is one workspace `cargo test --no-run`. Each member crate gets a cached `cargo-test-<package>`
-  run (`cargo nextest run --workspace -E 'package(<crate>)'`, 30s per-test timeout like `bun test --timeout=30000`)
-  whose inputs are that crate and its path deps, so unchanged crates are skipped. The filterset, rather than
-  `--package <crate>`, is what makes the run cheap: `--package` re-resolves features for that crate alone, which
-  fingerprints differently from the workspace build `cargo-test-compile` already paid for and rebuilds it inside the
-  bounded window. Those runs are chained so two cargos never share `target/`; `napi-debug` sits on that chain after
-  compile. Clippy uses `--target-dir target/cargo-lint` so lint can overlap tests. Workspaces with `cdylib` member
-  crates also receive the cacheable `cargo-wasm` output target.
+  run (30s per-test timeout like `bun test --timeout=30000`) whose inputs are that crate and its path deps, so unchanged
+  crates are skipped. Package-rooted workspaces use `cargo nextest run --workspace -E 'package(<crate>)'`;
+  repository-rooted workspaces additionally use `-p <crate>` to bind the runner to the project that owns the crate.
+  Those runs are chained across project boundaries so two cargos never share `target/`; `napi-debug` sits on that chain
+  after compile. Clippy uses `--target-dir target/cargo-lint` so lint can overlap tests. A crate declaring
+  `[package.metadata.smoothbricks.wasm-bindgen]` also receives the cacheable `cargo-wasm` output target in its owning
+  project.
 - A crate whose suite outgrows one bounded window declares `[package.metadata.smoothbricks.test] shards = N`, and gets
   `cargo-test-<package>-shard1..N`, each running `--partition hash:i/N` with the full bound. nextest assigns a test to a
   shard by hashing its name, so the shards stay an exact partition of the crate as tests and test binaries are added,
