@@ -1,3 +1,4 @@
+//! macOS APFS disk-image substrate.
 //!
 //! Every external operation crosses [`CommandRunner`]. Commands are represented
 //! as an executable plus an argument vector; this module never invokes a shell.
