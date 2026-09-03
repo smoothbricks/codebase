@@ -2006,6 +2006,7 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanStagingImage => "orphaned staging image",
         GcReason::OrphanStagingMetadata => "orphaned staging metadata",
         GcReason::OrphanStagingMount => "orphaned staging mountpoint",
+        GcReason::OrphanMountpoint => "orphaned mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
         GcReason::DetachedImageCompaction => "detached image compaction",
     }

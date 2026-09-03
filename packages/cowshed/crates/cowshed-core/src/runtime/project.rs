@@ -2871,7 +2871,9 @@ impl NativeProjectRuntimeHost {
         Ok(NativeRemovalGitFence {
             incarnation: workspace.derived.workspace.incarnation().clone(),
             head,
-            dirty: git.is_dirty().await?,
+            dirty: git
+                .is_dirty_by(Some(&self.substrate_config.checkout_path))
+                .await?,
             in_progress: git.in_progress_operation().await?,
         })
     }
@@ -5659,6 +5661,9 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     StorageGcReason::OrphanStagingMount => {
                         crate::api::dto::GcReason::OrphanStagingMount
                     }
+                    StorageGcReason::OrphanMountpoint => {
+                        crate::api::dto::GcReason::OrphanMountpoint
+                    }
                     StorageGcReason::ExpiredCheckpoint => {
                         crate::api::dto::GcReason::ExpiredCheckpoint
                     }
@@ -6335,6 +6340,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                             StorageGcReason::OrphanStagingImage
                                 | StorageGcReason::OrphanStagingMetadata
                                 | StorageGcReason::OrphanStagingMount
+                                | StorageGcReason::OrphanMountpoint
                         )
                     })
                     .collect::<Vec<_>>();
@@ -6348,7 +6354,11 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                     let mounts = orphaned
                         .iter()
                         .filter(|candidate| {
-                            matches!(candidate.reason(), StorageGcReason::OrphanStagingMount)
+                            matches!(
+                                candidate.reason(),
+                                StorageGcReason::OrphanStagingMount
+                                    | StorageGcReason::OrphanMountpoint
+                            )
                         })
                         .count();
                     findings.push(crate::api::dto::Finding {

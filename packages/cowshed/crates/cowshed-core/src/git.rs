@@ -508,11 +508,28 @@ impl GitRepository {
     /// and treating it as work made every landed workspace unremovable until someone deleted
     /// a log by hand.
     pub async fn is_dirty(&self) -> Result<bool> {
+        self.is_dirty_by(None).await
+    }
+
+    /// [`Self::is_dirty`] with a second reading of junk: an untracked path the PROJECT's own
+    /// gitignore rules ignore, judged from `checkout` (the adopted main). A clone carries the
+    /// ignore file of the commit it was cut from, so bench output main learned to ignore an
+    /// hour later still reads as work in every older clone unless the current rules decide.
+    pub async fn is_dirty_by(&self, checkout: Option<&Path>) -> Result<bool> {
         let output = self.porcelain_status("read repository status").await?;
-        Ok(
-            porcelain_records(&output.stdout)
-                .any(|(status, path)| !is_untracked_junk(status, path)),
-        )
+        for (status, path) in porcelain_records(&output.stdout) {
+            if is_untracked_junk(status, path) {
+                continue;
+            }
+            if status == b"??"
+                && let Some(checkout) = checkout
+                && ignored_by(checkout, path).await
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub async fn ensure_cowshed_excludes(&self) -> Result<()> {
@@ -1070,7 +1087,7 @@ impl GitRepository {
 
     async fn porcelain_status(&self, operation: &str) -> Result<Output> {
         let output = self
-            .run(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+            .run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
             .await?;
         if !output.status.success() {
             return Err(git_internal(operation, &output));
@@ -2019,6 +2036,21 @@ fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
     }
 }
 
+/// Whether `checkout`'s gitignore rules ignore `relative` - `git check-ignore`, index-blind, the
+/// path judged as a fresh entry in that tree would be (a directory record ends in `/`).
+async fn ignored_by(checkout: &Path, relative: &[u8]) -> bool {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["check-ignore", "-q", "--no-index", "--"])
+        .arg(std::ffi::OsStr::from_bytes(relative))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
 /// `(XY, path)` per `--porcelain=v1 -z` record; a rename's second path field is consumed
 /// with its record.
 fn porcelain_records(stdout: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
@@ -2213,6 +2245,17 @@ mod tests {
         // A tracked modification is work, hidden or not.
         fs::write(root.join("README"), "changed\n").expect("modify tracked");
         assert!(git.is_dirty().await.expect("status"));
+        fs::write(root.join("README"), "test\n").expect("restore tracked");
+
+        // Bench output main learned to ignore after this clone was cut: junk by main's rules,
+        // work by the clone's own frozen ignore file.
+        let main = repository();
+        fs::write(main.join(".gitignore"), "/bench/results/\n").expect("main ignore");
+        fs::create_dir_all(root.join("bench/results/run-1")).expect("bench dir");
+        fs::write(root.join("bench/results/run-1/out.txt"), "1\n").expect("bench output");
+        assert!(git.is_dirty().await.expect("own rules"));
+        assert!(!git.is_dirty_by(Some(&main)).await.expect("main's rules"));
+        fs::remove_dir_all(main).expect("remove main fixture");
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

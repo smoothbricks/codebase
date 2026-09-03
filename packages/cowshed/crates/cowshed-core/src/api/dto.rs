@@ -675,6 +675,7 @@ pub enum GcReason {
     OrphanStagingImage,
     OrphanStagingMetadata,
     OrphanStagingMount,
+    OrphanMountpoint,
     ExpiredCheckpoint,
     DetachedImageCompaction,
 }

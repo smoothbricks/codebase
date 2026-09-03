@@ -470,6 +470,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             GcReason::OrphanStagingImage,
             GcReason::OrphanStagingMetadata,
             GcReason::OrphanStagingMount,
+            GcReason::OrphanMountpoint,
             GcReason::ExpiredCheckpoint,
             GcReason::DetachedImageCompaction,
         ]
