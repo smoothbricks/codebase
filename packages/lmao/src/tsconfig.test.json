@@ -1,5 +1,5 @@
 {
-  "//": "Runtime-transform project for the bun typia preload (packages/validation/src/bun/preload.ts). The preload routes each loaded file to its own nearest project, searching upward for `tsconfig.test.json` for test sources and `tsconfig.lib.json` for everything else — so a package needs a src-level override for BOTH, and fixing one leaves the other rooted at the package root. Without this file the nearest test config is packages/lmao/tsconfig.test.json, whose directory is the package root, so @ttsc/unplugin walks and hashes the Cargo workspace's target/ output (not on its hardcoded skip list) twice per generation, and a concurrent cargo write there rejects the generation because the directory-membership terms are not scoped to declared inputs.",
+  "//": "Runtime-transform project for the bun typia preload (packages/validation/src/bun/preload.ts). The preload routes each loaded file to its own nearest project, searching upward for `tsconfig.test.json` for test sources and `tsconfig.lib.json` for everything else — so a package needs a src-level override for both. Without this file the nearest test config is packages/lmao/tsconfig.test.json, whose package-root walk hashes the Rust crates and generated distribution in addition to the test sources.",
   "extends": "../tsconfig.test.json",
   "compilerOptions": {
     "composite": false,

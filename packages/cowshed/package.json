@@ -62,8 +62,10 @@
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
-          "{projectRoot}/**/Cargo.lock",
-          "{projectRoot}/**/.cargo/config.toml",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
@@ -83,8 +85,10 @@
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
-          "{projectRoot}/**/Cargo.lock",
-          "{projectRoot}/**/.cargo/config.toml",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/scripts/*.sh",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
@@ -107,8 +111,10 @@
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
-          "{projectRoot}/**/Cargo.lock",
-          "{projectRoot}/**/.cargo/config.toml",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock"
@@ -133,8 +139,10 @@
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/**/Cargo.toml",
-          "{projectRoot}/**/Cargo.lock",
-          "{projectRoot}/**/.cargo/config.toml",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
+          "{projectRoot}/.cargo/config.toml",
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock"
@@ -171,11 +179,16 @@
         "cache": true,
         "//": "The napi wire corpus is DERIVED from cowshed-core's DTOs: regenerating it is a build step with declared inputs, never a recipe an author has to remember after changing a DTO. Runs ahead of cargo-test-compile because crates/cowshed-napi includes the file with include_str!, so the corpus has to be current before any test binary compiles it in. The Rust assertion that the committed file equals what core serializes stays as the proof; this target is what keeps it true.",
         "dependsOn": [
-          "cargo-fetch"
+          {
+            "target": "cargo-fetch",
+            "projects": [
+              "@smoothbricks/codebase"
+            ]
+          }
         ],
         "inputs": [
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
           "{projectRoot}/crates/cowshed-core/**/*.rs",
           "{projectRoot}/crates/cowshed-core/Cargo.toml",
           "{projectRoot}/crates/cowshed-napi/**/*.rs",
@@ -244,12 +257,6 @@
           "cwd": "packages/cowshed",
           "command": "cargo run --release -p cowshed-core --bin apfs-benchmark"
         }
-      },
-      "cargo-test-compile": {
-        "dependsOn": [
-          "cargo-fetch",
-          "wire-fixtures"
-        ]
       }
     },
     "tags": [

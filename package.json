@@ -78,6 +78,33 @@
           "config": ".verdaccio/config.yml",
           "storage": "tmp/local-registry/storage"
         }
+      },
+      "cargo-lint": {
+        "inputs": [
+          "rustWorkspace",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-lint-cross": {
+        "inputs": [
+          "rustWorkspace",
+          "lmaoGitRevision"
+        ]
+      },
+      "cargo-test-compile": {
+        "dependsOn": [
+          "...",
+          {
+            "target": "wire-fixtures",
+            "projects": [
+              "cowshed"
+            ]
+          }
+        ],
+        "inputs": [
+          "rustWorkspace",
+          "lmaoGitRevision"
+        ]
       }
     },
     "name": "@smoothbricks/codebase"

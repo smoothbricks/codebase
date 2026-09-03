@@ -1,10 +1,6 @@
-# wasm32 build: JS owns the memory (import_memory), all exports are visible
-# through the low-level cdylib ABI (no wasm-bindgen).
-[target.wasm32-unknown-unknown]
-rustflags = ["-C", "link-arg=--import-memory"]
-
 [alias]
-# Test tiers (see README.md):
-t = "test --workspace"
-proptest-heavy = "test --workspace --release -- --include-ignored --nocapture"
+# Package-local shortcuts stay scoped even though Cargo now resolves the
+# repository-root workspace.
+t = "test -p 'lmao-*'"
+proptest-heavy = "test -p 'lmao-*' --release -- --include-ignored --nocapture"
 wasm = "build -p lmao-wasm --target wasm32-unknown-unknown --release"

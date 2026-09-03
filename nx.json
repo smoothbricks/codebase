@@ -16,6 +16,20 @@
       "!{projectRoot}/**/*.spec.*"
     ],
     "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"],
+    "rustWorkspace": [
+      "{workspaceRoot}/Cargo.toml",
+      "{workspaceRoot}/Cargo.lock",
+      "{workspaceRoot}/.cargo/config.toml",
+      "{workspaceRoot}/packages/columine/crates/**/*.rs",
+      "{workspaceRoot}/packages/columine/crates/**/Cargo.toml",
+      "{workspaceRoot}/packages/cowshed/crates/**/*.rs",
+      "{workspaceRoot}/packages/cowshed/crates/**/Cargo.toml",
+      "{workspaceRoot}/packages/cowshed/scripts/*.sh",
+      "{workspaceRoot}/packages/lmao/crates/**/*.rs",
+      "{workspaceRoot}/packages/lmao/crates/**/Cargo.toml",
+      "{workspaceRoot}/packages/lmao/src/lib/schema/systemSchema.ts",
+      "{workspaceRoot}/packages/lmao/src/lib/capacityTuning.ts"
+    ],
     "lmaoGitRevision": [
       {
         "runtime": "sh -c 'if [ -n \"${LMAO_GIT_REVISION:-}\" ]; then printf \"%s\\n\" \"$LMAO_GIT_REVISION\"; elif revision=$(git rev-parse HEAD 2>/dev/null); then printf \"%s\\n\" \"$revision\"; else printf \"unknown\\n\"; fi'"

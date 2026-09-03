@@ -153,14 +153,7 @@
   "files": [
     "dist",
     "src",
-    "crates/**/*.rs",
-    "crates/**/Cargo.toml",
-    "Cargo.toml",
-    "Cargo.lock",
-    ".cargo/config.toml",
-    "justfile",
-    "!**/*.tsbuildinfo",
-    "!crates/**/target/**"
+    "!**/*.tsbuildinfo"
   ],
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3",
@@ -182,43 +175,39 @@
     "projectType": "library",
     "targets": {
       "lint": {},
-      "cargo-lint": {
-        "inputs": [
-          "{projectRoot}/**/*.rs",
-          "{projectRoot}/**/Cargo.toml",
-          "{projectRoot}/**/Cargo.lock",
-          "{projectRoot}/**/.cargo/config.toml",
-          "{projectRoot}/scripts/*.sh",
-          "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
+      "build": {
+        "dependsOn": [
+          "...",
+          "rust-dist"
         ]
       },
-      "cargo-lint-cross": {
+      "rust-dist": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "dependsOn": [
+          "tsc-js"
+        ],
         "inputs": [
-          "{projectRoot}/**/*.rs",
-          "{projectRoot}/**/Cargo.toml",
-          "{projectRoot}/**/Cargo.lock",
-          "{projectRoot}/**/.cargo/config.toml",
-          "{projectRoot}/scripts/*.sh",
-          "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
-        ]
-      },
-      "cargo-test-compile": {
-        "inputs": [
-          "{projectRoot}/**/*.rs",
-          "{projectRoot}/**/Cargo.toml",
-          "{projectRoot}/**/Cargo.lock",
-          "{projectRoot}/**/.cargo/config.toml",
-          "{projectRoot}/scripts/*.sh",
-          "!{projectRoot}/**/target/**",
-          "lmaoGitRevision"
-        ]
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{projectRoot}/crates/**/*.rs",
+          "{projectRoot}/crates/**/Cargo.toml",
+          "{projectRoot}/.cargo/config.toml",
+          "{projectRoot}/scripts/build-rust-dist.mjs"
+        ],
+        "outputs": [
+          "{projectRoot}/dist/rust"
+        ],
+        "options": {
+          "command": "bun scripts/build-rust-dist.mjs",
+          "cwd": "{projectRoot}"
+        }
       },
       "cargo-test-lmao-arrow": {
         "inputs": [
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/lmao-arrow/**/*.rs",
           "{projectRoot}/crates/lmao-arrow/Cargo.toml",
           "{projectRoot}/crates/lmao-core/**/*.rs",
@@ -231,8 +220,9 @@
       },
       "cargo-test-lmao-ffi-dylib": {
         "inputs": [
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/lmao-core/**/*.rs",
           "{projectRoot}/crates/lmao-core/Cargo.toml",
           "{projectRoot}/crates/lmao-ffi-dylib/**/*.rs",
@@ -245,8 +235,9 @@
       },
       "cargo-test-lmao-query": {
         "inputs": [
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/lmao-arrow/**/*.rs",
           "{projectRoot}/crates/lmao-arrow/Cargo.toml",
           "{projectRoot}/crates/lmao-core/**/*.rs",
@@ -261,8 +252,9 @@
       },
       "cargo-test-lmao-wasm": {
         "inputs": [
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/lmao-arena/**/*.rs",
           "{projectRoot}/crates/lmao-arena/Cargo.toml",
           "{projectRoot}/crates/lmao-core/**/*.rs",
@@ -277,8 +269,9 @@
       },
       "cargo-test-lmao-core": {
         "inputs": [
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/lmao-core/**/*.rs",
           "{projectRoot}/crates/lmao-core/Cargo.toml",
           "{projectRoot}/crates/lmao-macros/**/*.rs",
@@ -291,8 +284,9 @@
       },
       "cargo-test-lmao-macros": {
         "inputs": [
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/crates/lmao-core/**/*.rs",
           "{projectRoot}/crates/lmao-core/Cargo.toml",
           "{projectRoot}/crates/lmao-macros/**/*.rs",
@@ -332,8 +326,9 @@
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           "{projectRoot}/justfile",
           "{projectRoot}/src/lib/schema/systemSchema.ts",
@@ -357,15 +352,16 @@
         "inputs": [
           "{projectRoot}/crates/**/*.rs",
           "{projectRoot}/crates/**/Cargo.toml",
-          "{projectRoot}/Cargo.toml",
-          "{projectRoot}/Cargo.lock",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/.cargo/config.toml",
           "{projectRoot}/.cargo/config.toml",
           "lmaoGitRevision"
         ],
         "outputs": [
-          "{projectRoot}/target/release/liblmao_ffi_dylib.dylib",
-          "{projectRoot}/target/release/liblmao_ffi_dylib.so",
-          "{projectRoot}/target/release/lmao_ffi_dylib.dll"
+          "{workspaceRoot}/target/release/liblmao_ffi_dylib.dylib",
+          "{workspaceRoot}/target/release/liblmao_ffi_dylib.so",
+          "{workspaceRoot}/target/release/lmao_ffi_dylib.dll"
         ],
         "options": {
           "command": "cargo build -p lmao-ffi-dylib --release",

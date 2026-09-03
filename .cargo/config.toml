@@ -1,0 +1,10 @@
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }
+
+# One workspace means one native-link fingerprint. Route every macOS artifact
+# through Xcode's clang so Nix wrapper flags cannot leak an SDK dependency.
+[target.aarch64-apple-darwin]
+linker = "packages/cowshed/scripts/macos-linker.sh"
+
+[target.x86_64-apple-darwin]
+linker = "packages/cowshed/scripts/macos-linker.sh"
