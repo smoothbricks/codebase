@@ -388,13 +388,21 @@ A **build slot** is one stable mount path, occupied by one workspace at a time. 
 3, and that workspace mounts at `<project-root>/.cowshed/slot-3` instead of `.../<name>`. When it is removed or renamed
 the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
 
-That path identity is the entire feature, because compiler caches key on absolute paths:
+Path identity was once the entire feature, because both halves of the compiler cache keyed on absolute paths. Neither
+does any more:
 
-- Cargo derives `-C metadata` and `-C extra-filename` from a package id that carries the **absolute manifest
-  directory**, so a local crate compiled at two paths is two different compilations.
-- sccache additionally hashes the compiler's **physical** working directory.
+- Cargo derived `-C metadata` and `-C extra-filename` from a package id carrying the **absolute manifest directory**, so
+  a local crate compiled at two paths was two different compilations. From cargo 1.97 both are path-independent for
+  workspace members (measured: identical hashes for one workspace checked out at two paths).
+- sccache additionally hashes the compiler's **physical** working directory. The bundled build keys that, the blanket
+  `CARGO_*` values and the argument bytes relative to the request cwd for a client that sets `SCCACHE_BASEDIR_CWD=1` —
+  which every workspace does.
 
-Measured on this hardware with sccache 0.16 over a ten-crate workspace, second checkout of identical sources:
+So cross-path sharing is the default, and a slot is what is left for the cases those two do not reach: a crate whose
+output records an `env-dep:` value (`env!("CARGO_MANIFEST_DIR")`) is never normalized and fails closed across paths,
+tooling that persists absolute paths across tenant generations keeps working, and an unpatched sccache or a cargo older
+than 1.97 still needs the path to be identical. The table below is that older world, measured on this hardware with
+sccache 0.16 over a ten-crate workspace, second checkout of identical sources:
 
 | build path                         | Rust units hit |
 | ---------------------------------- | -------------- |
