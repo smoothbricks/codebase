@@ -164,8 +164,8 @@ describe('cliExitOutcome', () => {
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(packageRoot));
-const binEntry = join(packageRoot, 'src', 'bin', 'ensure-built.ts');
-const builtBinEntry = join(packageRoot, 'dist', 'bin', 'ensure-built.js');
+const binEntry = join(packageRoot, 'src', 'bin', 'smoo-nx-exec.ts');
+const builtBinEntry = join(packageRoot, 'dist', 'bin', 'smoo-nx-exec.js');
 const MARKER = 'EXEC_OK';
 /** Nx configures itself through these; the exec'd binary must not inherit them. */
 const LEAKABLE = ['NX_WORKSPACE_ROOT_PATH', 'NX_STREAM_OUTPUT', 'NX_PREFIX_OUTPUT', 'NX_LOAD_DOT_ENV_FILES'];
@@ -241,7 +241,7 @@ function nx(workspace: string, args: readonly string[]): Promise<number | null> 
   });
 }
 
-describe('smoothbricks-ensure-built', () => {
+describe('smoo-nx-exec', () => {
   let workspace = '';
   const report = () => join(workspace, 'report');
   const marker = () => join(workspace, 'packages', 'app', 'dist', 'marker.txt');
@@ -448,7 +448,7 @@ describe('smoothbricks-ensure-built', () => {
   });
 });
 
-describe('smoothbricks-ensure-built signal forwarding', () => {
+describe('smoo-nx-exec signal forwarding', () => {
   let workspace = '';
 
   // A workspace whose `nx` is a script that kills itself. The daemon-disabled
