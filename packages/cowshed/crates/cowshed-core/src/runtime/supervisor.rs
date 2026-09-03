@@ -1236,18 +1236,73 @@ async fn link_nix_cache(private_cache: &Path) -> Result<()> {
     })
 }
 
-/// The runtime directory a sandboxed child sees as `XDG_RUNTIME_DIR`: `<mount>/.cowshed/run`.
+/// The runtime directory a sandboxed child owns: `<mount>/.cowshed/run`, on the shed.
 ///
-/// It lives beside the private HOME because that is the one tree the executed-child profile
-/// grants writes to after every store-wide deny (SBPL is last-match-wins, and both
-/// `/private/cowshed` and the project root are denied AFTER the `exec_temp_dir` allow, so a
-/// runtime dir under the quarantine would be unwritable). The path is deliberately short of the
-/// 104-byte `sun_path` ceiling for the sockets devenv keeps under `devenv-<hash>/`: a mount at
-/// `<mount root>/<owner>/<repo>/<workspace>` leaves roughly twenty bytes for a socket name, which
-/// is what `devenv up` needs and what a shorter, symlinked root would have to restore for longer
-/// mount roots.
+/// It lives beside the private HOME, the one tree the executed-child profile grants writes
+/// to; it is copy-on-write with the clone and gone with it. The child does not see this path
+/// as `XDG_RUNTIME_DIR` - it sees [`sandbox_runtime_link`], a short `/tmp` symlink onto it,
+/// because a unix socket path is capped at 104 bytes (`sun_path`) and a mount at
+/// `<mount root>/<owner>/<repo>/<workspace>/.cowshed/run` leaves devenv's `devenv-<hash>/`
+/// sockets no room.
 pub fn sandbox_runtime_dir(sandbox: &SandboxConfig) -> PathBuf {
     sandbox.workspace_mount.join(".cowshed/run")
+}
+
+/// The short path a child sees as `XDG_RUNTIME_DIR`: `/tmp/cs-<port base>`, a symlink onto
+/// [`sandbox_runtime_dir`]. The port block base is unique per attached workspace on this
+/// host, which is what makes the name collision-free without another identifier. Seatbelt
+/// matches the RESOLVED path, so the grant a socket under it needs is the shed's own.
+pub fn sandbox_runtime_link(sandbox: &SandboxConfig) -> PathBuf {
+    PathBuf::from(format!("/tmp/cs-{}", sandbox.port_block.base()))
+}
+
+/// Points [`sandbox_runtime_link`] at the runtime dir and sweeps every `/tmp/cs-*` link whose
+/// target is gone - a retired workspace takes its mount with it and leaves the link dangling.
+/// Host-side, before the child spawns; idempotent.
+async fn link_runtime_dir(sandbox: &SandboxConfig, runtime_dir: &Path) -> Result<()> {
+    let link = sandbox_runtime_link(sandbox);
+    let io = |what: &str, path: &Path, error: std::io::Error| {
+        CowshedError::environment_missing(
+            format!("cannot {what} {}: {error}", path.display()),
+            "reattach the workspace and retry",
+        )
+    };
+    match tokio::fs::read_link(&link).await {
+        Ok(target) if target == runtime_dir => {}
+        Ok(_) => {
+            tokio::fs::remove_file(&link)
+                .await
+                .map_err(|error| io("replace runtime link", &link, error))?;
+            tokio::fs::symlink(runtime_dir, &link)
+                .await
+                .map_err(|error| io("create runtime link", &link, error))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::symlink(runtime_dir, &link)
+                .await
+                .map_err(|error| io("create runtime link", &link, error))?;
+        }
+        Err(error) => return Err(io("inspect runtime link", &link, error)),
+    }
+    let mut entries = match tokio::fs::read_dir("/tmp").await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("cs-") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(target) = tokio::fs::read_link(&path).await else {
+            continue;
+        };
+        if tokio::fs::metadata(&target).await.is_err() {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+    Ok(())
 }
 
 /// Build the sandboxed `Command` for a child of this workspace.
@@ -1273,8 +1328,7 @@ async fn sandboxed_command(
     let private_runtime = sandbox_runtime_dir(sandbox);
     // exec_temp_dir joins the loop because it is exported as TMPDIR below.
     // Exporting a directory without creating it makes every child that
-    // shells out to mktemp fail on a path the child never chose, and the
-    // failure names cowshed's quarantine rather than the caller's test.
+    // shells out to mktemp fail on a path the child never chose.
     for directory in [
         &private_home,
         &private_config,
@@ -1319,6 +1373,7 @@ async fn sandboxed_command(
     })?;
     link_cargo_registry(&private_home, &sandbox.home).await?;
     link_nix_cache(&private_cache).await?;
+    link_runtime_dir(sandbox, &private_runtime).await?;
     let path = sandbox_path(sandbox, devenv_dir)?;
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
@@ -1340,12 +1395,10 @@ async fn sandboxed_command(
         .env("TMPDIR", &sandbox.exec_temp_dir)
         // devenv resolves its runtime directory as `$XDG_RUNTIME_DIR/devenv-<hash>`, falling
         // back to `/tmp` when the variable is unset, and ignores TMPDIR by design (its runtime
-        // dir must rendezvous across invocations that may carry different TMPDIRs). The
-        // executed-child profile grants nothing under `/private/tmp`, so with `env_clear` the
-        // sandboxed evaluation died on `Failed to create /tmp/devenv-<hash>` before any
-        // subcommand ran. A workspace is its own volume and carries its own runtime dir, in the
-        // same private metadata tree as HOME and the caches.
-        .env("XDG_RUNTIME_DIR", &private_runtime)
+        // dir must rendezvous across invocations that may carry different TMPDIRs). The child
+        // gets the short `/tmp/cs-<port>` link: the shed's runtime dir under a name that leaves
+        // `sun_path` room for the sockets devenv keeps there.
+        .env("XDG_RUNTIME_DIR", sandbox_runtime_link(sandbox))
         .env("PWD", &plan.cwd)
         .env(GO_ENV, private_cache.join("go/env"))
         // rustc-wrapper clients speak to the host-owned sccache daemon; the
