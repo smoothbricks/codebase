@@ -8172,11 +8172,10 @@ fn supervisor_sandbox(
     Ok(crate::sandbox::SandboxConfig {
         home: home.to_path_buf(),
         mount_root: layout.project().host_mount_root.clone(),
+        // TMPDIR on the shed: copy-on-write with the clone, reclaimed with it, and inside the
+        // one tree the child profile grants writes to - no carve-back against the store.
+        exec_temp_dir: mount.join(".cowshed/tmp"),
         workspace_mount: mount,
-        exec_temp_dir: layout
-            .project()
-            .quarantine
-            .join(current.derived.workspace.incarnation().as_str()),
         port_block: current.metadata.grants.port_block.ok_or_else(|| {
             CowshedError::integrity("workspace has no port block", "cowshed doctor --json")
         })?,

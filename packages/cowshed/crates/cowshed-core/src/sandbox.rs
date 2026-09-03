@@ -123,6 +123,19 @@ pub fn host_cargo_registry(home: &Path) -> PathBuf {
     home.join(".cargo/registry")
 }
 
+/// The host bun install cache, shared read-only with every sandbox.
+///
+/// Bun's isolated linker does not copy a package into `node_modules/.bun`: it symlinks
+/// `node_modules/.bun/<name>@<version>` to `~/.bun/install/cache/links/<name>@<version>-<hash>`,
+/// an extracted, content-hashed, immutable tarball. A workspace clone therefore carries links
+/// into the host cache, and Seatbelt matches the RESOLVED path - without this grant every
+/// `require` through such a link fails with EPERM inside the sandbox while the same tree works
+/// on the host. Same posture as [`host_cargo_registry`]: the download side is shared read-only,
+/// and `~/.bun` otherwise (the `bun` binary under `bin`, `.bunfig`) gets no grant.
+pub fn host_bun_install_cache(home: &Path) -> PathBuf {
+    home.join(".bun/install/cache")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,
@@ -288,6 +301,25 @@ pub fn seatbelt_profile(
         &mut profile,
         "(allow network-bind network-inbound (local tcp \"localhost:*\"))",
     );
+    // Unix sockets the workspace's own processes rendezvous over - devenv's under
+    // `devenv-<hash>/`, nx's plugin workers - live in the runtime dir and nowhere else. The
+    // child reaches it as the short `/tmp/cs-<port>` link; Seatbelt filters the path it is
+    // handed, so both the link and the resolved directory are named.
+    let runtime_dir = config.workspace_mount.join(".cowshed/run");
+    let runtime_link = PathBuf::from(format!("/tmp/cs-{}", config.port_block.base()));
+    for dir in [
+        &runtime_dir,
+        &runtime_link,
+        &PathBuf::from("/private").join(runtime_link.strip_prefix("/").unwrap_or(&runtime_link)),
+    ] {
+        push_line(
+            &mut profile,
+            &format!(
+                "(allow network-bind network-inbound network-outbound (local unix-socket (path-prefix \"{0}\")) (remote unix-socket (path-prefix \"{0}\")))",
+                sbpl_path(dir)?
+            ),
+        );
+    }
     for port in config
         .port_block
         .ports()
@@ -308,14 +340,6 @@ pub fn seatbelt_profile(
     for path in &write_grants {
         push_subpath_rule(&mut profile, "allow file-read* file-write*", path)?;
     }
-    push_line(
-        &mut profile,
-        &format!(
-            "(allow file-write* (subpath \"{}\") (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\"))",
-            sbpl_path(&config.exec_temp_dir)?
-        ),
-    );
-
     // The machine-global evidence layer and the host-configured mount tree are separate protected
     // roots. The latter may live anywhere on Data, so it must keep its own deny rather than relying
     // on the fixed `/private/cowshed` boundary.
@@ -329,7 +353,6 @@ pub fn seatbelt_profile(
     // reveal no sibling subtree and are emitted after both broad denies, while the own-workspace
     // subpath grant below carves back only this workspace.
     push_readable_ancestors(&mut profile, &config.workspace_mount)?;
-    push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
     for path in read_grants.iter().chain(write_grants.iter()) {
         push_readable_ancestors(&mut profile, path)?;
     }
@@ -377,6 +400,9 @@ pub fn seatbelt_profile(
         push_subpath_rule(&mut profile, "allow file-read*", &path)?;
         push_readable_ancestors(&mut profile, &path)?;
     }
+    let bun_cache = host_bun_install_cache(&config.home);
+    push_subpath_rule(&mut profile, "allow file-read*", &bun_cache)?;
+    push_readable_ancestors(&mut profile, &bun_cache)?;
     push_subpath_rule(&mut profile, "allow file-read*", &config.workspace_mount)?;
     if config.mode == RunSandboxMode::ReadWrite {
         push_subpath_rule(&mut profile, "allow file-write*", &config.workspace_mount)?;
@@ -384,21 +410,60 @@ pub fn seatbelt_profile(
     let workspace_metadata = config.workspace_mount.join(".cowshed");
     let job_artifacts = workspace_metadata.join("job");
 
-    // SBPL is last-match-wins: immutable secrets and policy denies close the shared profile.
-    for deny in hard_denies
+    // SBPL is last-match-wins. Policy denies (project roots the host configured) come first,
+    // then the two carve-backs they would otherwise close, then the immutable secret denies as
+    // the profile's last word on the shared tree: no grant may follow a secret's deny.
+    let (policy, secrets): (Vec<_>, Vec<_>) = hard_denies
         .into_iter()
         .filter(|path| path.as_ref() != cowshed && path.as_ref() != config.mount_root.as_path())
-    {
+        .partition(|path| {
+            config
+                .additional_denies
+                .iter()
+                .any(|extra| extra == path.as_ref())
+        });
+    for deny in policy {
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
 
     // After every deny that would otherwise close it: the configured mount-root deny covers
-    // main under the symlink layout, and policy denies the project root under direct mount. SBPL
-    // is last-match-wins, so the carve-back has to be stated last to be real — and it is narrowed
-    // to `.git`, never main's working tree, which stays as unreachable as any sibling workspace.
+    // main under the symlink layout, and policy denies the project root under direct mount. The
+    // carve-back is narrowed to `.git`, never main's working tree, which stays as unreachable as
+    // any sibling workspace.
     if let Some(repository) = &config.git_worktree_repository {
         push_readable_ancestors(&mut profile, repository)?;
         push_exact_and_subpath_rule(&mut profile, "allow file-read* file-write*", repository)?;
+    }
+
+    // The exec temp dir is exported as TMPDIR and lives under the store's quarantine, so its
+    // grant must follow every deny that covers it - the store-wide one and the project root
+    // above - or last-match-wins re-denies it: every `mktemp` in a child then fails on a path
+    // the child never chose. Read and write both - a child reads back what it wrote there, and
+    // metadata on the directory is what a `realpath(os.tmpdir())` needs.
+    push_subpath_rule(&mut profile, "allow file-read*", &config.exec_temp_dir)?;
+    push_line(
+        &mut profile,
+        &format!(
+            "(allow file-write* (subpath \"{}\") (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\"))",
+            sbpl_path(&config.exec_temp_dir)?
+        ),
+    );
+    push_readable_ancestors(&mut profile, &config.exec_temp_dir)?;
+    // `XDG_RUNTIME_DIR` is `/tmp/cs-<port>`, a symlink onto the shed's runtime dir (the
+    // `sun_path` budget). Resolving it needs metadata on `/tmp` and on the link itself - not
+    // a listing of `/tmp`, not a byte of anything else in it - and Seatbelt then matches the
+    // resolved path, which the workspace grant already covers.
+    for tmp in ["/tmp", "/private/tmp"] {
+        push_literal_rule(&mut profile, "allow file-read-metadata", Path::new(tmp))?;
+        push_literal_rule(
+            &mut profile,
+            "allow file-read-metadata",
+            &Path::new(tmp).join(format!("cs-{}", config.port_block.base())),
+        )?;
+    }
+
+    for deny in secrets {
+        push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
 
     for protected in [
@@ -847,6 +912,28 @@ mod tests {
         }
     }
 
+    /// Bun's isolated linker symlinks `node_modules/.bun/<pkg>` into the host install cache, so a
+    /// cloned `node_modules` resolves into `~/.bun/install/cache`; the grant is read-only and no
+    /// wider than the cache (`~/.bun/bin` stays as it was).
+    #[test]
+    fn host_bun_install_cache_is_readable_download_cache_only() {
+        let config = config(RunSandboxMode::ReadWrite);
+        assert_eq!(
+            host_bun_install_cache(&config.home),
+            PathBuf::from("/Users/tester/.bun/install/cache")
+        );
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(
+            profile.contains("(allow file-read* (subpath \"/Users/tester/.bun/install/cache\"))")
+        );
+        assert!(!profile.contains(
+            "(allow file-read* file-write* (subpath \"/Users/tester/.bun/install/cache\"))"
+        ));
+        assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.bun\"))"));
+        assert!(profile.contains("(allow file-read* (literal \"/Users/tester/.bun/install\"))"));
+        assert!(!profile.contains("(allow file-read* (subpath \"/Users/tester/.bun\"))"));
+    }
+
     #[test]
     fn read_only_removes_only_workspace_write_carve_back() {
         let read_write = seatbelt_profile(
@@ -945,6 +1032,45 @@ mod tests {
         let child_suffix = format!("{ancestor_deny}\n{protected_deny}\n");
         let common_child = child.strip_suffix(&child_suffix).unwrap();
         assert_eq!(common_child, common_supervisor);
+    }
+
+    /// TMPDIR is the exec temp dir, and production puts it under the store's quarantine: its
+    /// grants must be stated AFTER the store-wide deny or last-match-wins takes them back, and a
+    /// child's `mktemp` fails on a path it never chose.
+    #[test]
+    fn exec_temp_dir_under_the_store_survives_the_store_deny() {
+        let mut config = config(RunSandboxMode::ReadOnly);
+        config.exec_temp_dir = PathBuf::from("/private/cowshed/store/acme/widget/quarantine/abc");
+        config.additional_denies = vec![PathBuf::from("/private/cowshed/store/acme/widget")];
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let store_deny = profile
+            .rfind("(deny file-read* file-write* (subpath \"/private/cowshed\"))")
+            .unwrap();
+        let project_deny = profile
+            .rfind("(deny file-read* file-write* (literal \"/private/cowshed/store/acme/widget\") (subpath \"/private/cowshed/store/acme/widget\"))")
+            .unwrap();
+        let read = profile
+            .find("(allow file-read* (subpath \"/private/cowshed/store/acme/widget/quarantine/abc\"))")
+            .unwrap();
+        let write = profile
+            .find("(allow file-write* (subpath \"/private/cowshed/store/acme/widget/quarantine/abc\")")
+            .unwrap();
+        let ancestor = profile
+            .rfind("(allow file-read* (literal \"/private/cowshed/store/acme/widget/quarantine\"))")
+            .unwrap();
+        let secret = profile.rfind("/Users/tester/.ssh").unwrap();
+        assert!(store_deny < read && project_deny < read);
+        assert!(project_deny < write && project_deny < ancestor);
+        assert!(
+            write < secret && ancestor < secret,
+            "secrets stay the last word"
+        );
+        // `/tmp` and the runtime link: metadata on the literals, nothing more.
+        assert!(profile.contains("(allow file-read-metadata (literal \"/tmp\"))"));
+        assert!(profile.contains("(allow file-read-metadata (literal \"/private/tmp/cs-40960\"))"));
+        assert!(!profile.contains("(allow file-read* (literal \"/tmp\"))"));
+        assert!(!profile.contains("(subpath \"/private/tmp\")"));
+        assert!(!profile.contains("(subpath \"/tmp\")"));
     }
 
     #[test]

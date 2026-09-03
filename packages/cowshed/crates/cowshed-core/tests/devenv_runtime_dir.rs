@@ -16,7 +16,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use cowshed_core::metadata::PortBlock;
-use cowshed_core::runtime::supervisor::{SpawnSink, SystemSpawnSink, sandbox_runtime_dir};
+use cowshed_core::runtime::supervisor::{
+    SpawnSink, SystemSpawnSink, sandbox_runtime_dir, sandbox_runtime_link,
+};
 use cowshed_core::sandbox::{RunSandboxMode, SandboxConfig, SandboxGrants};
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
 use cowshed_gateway_types::WorkspaceToken;
@@ -131,21 +133,28 @@ async fn the_sandboxed_devenv_evaluation_owns_a_runtime_directory_the_profile_le
         "the executed-child profile must keep denying /tmp"
     );
 
-    // `TMPDIR` is not a substitute: it points into the exec temp dir, which the profile's later
-    // denies (the store and the project root are emitted after that allow, and SBPL is
-    // last-match-wins) leave unwritable, and devenv ignores it for the runtime base anyway.
+    // `TMPDIR` is the exec temp dir and it IS writable: its grant follows every deny that
+    // covers it, so `mktemp` in a child works. It is still not the runtime base - devenv
+    // ignores TMPDIR for that by design, and the socket path length budget is the workspace
+    // runtime dir's reason to exist - so the evaluation must be handed the runtime dir
+    // explicitly, which the assertion below checks.
     assert_eq!(
         exported(&printed, "COWSHED_TMPDIR_DENIED"),
-        "true",
-        "a runtime base under TMPDIR ({}) would be as unwritable as /tmp",
+        "false",
+        "TMPDIR ({}) is the sandbox's own scratch and must be writable",
         exported(&printed, "TMPDIR")
     );
 
-    let runtime_base = PathBuf::from(exported(&printed, "XDG_RUNTIME_DIR"));
+    // The child sees the short `/tmp/cs-<port>` link - the `sun_path` budget - and it resolves
+    // onto the shed's own runtime directory, which is what the profile grants.
+    let runtime_link = PathBuf::from(exported(&printed, "XDG_RUNTIME_DIR"));
+    assert_eq!(runtime_link, sandbox_runtime_link(&sandbox));
+    let runtime_base =
+        std::fs::read_link(&runtime_link).expect("the runtime link exists on the host");
     assert_eq!(
         runtime_base,
         sandbox_runtime_dir(&sandbox),
-        "the evaluation's XDG_RUNTIME_DIR is the workspace's own runtime directory"
+        "the link resolves to the workspace's own runtime directory"
     );
     assert!(
         runtime_base.is_absolute() && runtime_base.is_dir(),
