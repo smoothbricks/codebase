@@ -125,12 +125,19 @@ if (result.disposition === 'failed') {
 }
 ```
 
-The packaged wrapper performs the build check and then replaces itself with the binary, preserving the binary's
-arguments, exit status, and signals:
+The packaged `smoo-nx-exec` wrapper performs the build check and then replaces itself with the binary:
 
 ```bash
-smoothbricks-ensure-built my-cli:build -- ./packages/my-cli/dist/my-cli argument
+smoo-nx-exec my-cli:build -- ./packages/my-cli/dist/my-cli argument
 ```
+
+It is deliberately not `nx run <target> && exec`:
+
+- A hit costs one daemon round-trip and a local cache read, not an Nx CLI start.
+- A hit is silent. `nx run` replays the cached log and prints its `[local cache]` banner, which a CLI wrapper must not
+  print.
+- It execs the binary, preserving its argv, exit status, and signals. `nx run` has no notion of handing the process over
+  to another binary.
 
 Pass `--workspace-root <dir>` before `--` when invoking the wrapper outside the workspace. The binary path resolves
 against the caller's current directory.

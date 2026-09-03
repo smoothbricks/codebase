@@ -63,7 +63,7 @@
     }
   },
   "bin": {
-    "smoothbricks-ensure-built": "./dist/bin/ensure-built.js"
+    "smoo-nx-exec": "./dist/bin/smoo-nx-exec.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",
