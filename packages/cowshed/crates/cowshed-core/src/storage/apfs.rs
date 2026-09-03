@@ -1323,6 +1323,21 @@ where
             })
             .await
     }
+    /// Runs a non-lifecycle metadata mutation while holding the same hardened image lock used by
+    /// APFS lifecycle operations. The job's result is deliberately opaque to this layer so callers
+    /// can preserve their own error taxonomy while lock acquisition remains an APFS concern.
+    pub(crate) async fn dispatch_with_image_lock<T, F>(
+        &self,
+        lock_path: PathBuf,
+        job: F,
+    ) -> Result<T, ApfsStorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.dispatch_with_locks(vec![lock_path], false, move |_, _| Ok(job()))
+            .await
+    }
 }
 
 impl<H, L> LifecyclePlanner for ApfsSubstrate<H, L>
@@ -3221,5 +3236,107 @@ mod tests {
                 "{operation:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn image_lock_serializes_metadata_read_modify_write() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-grant-lock-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).expect("store");
+        let counter = root.join("grant-revision");
+        std::fs::write(&counter, "0").expect("initial revision");
+        let lock = store.join("sessions/raven.sparse.lock");
+        let config = ApfsSubstrateConfig::new(
+            &store,
+            root.join("caches"),
+            root.join("checkout"),
+            CheckoutLayout::Symlink,
+            ApfsCaseSensitivity::Sensitive,
+        );
+        let host =
+            native::MacOsApfsExecutionHost::new(crate::apfs::SystemCommandRunner, config.clone())
+                .expect("native host");
+        let substrate = ApfsSubstrate::new(config, host);
+
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(1);
+        let first_substrate = substrate.clone();
+        let first_lock = lock.clone();
+        let first_counter = counter.clone();
+        let first = tokio::spawn(async move {
+            first_substrate
+                .dispatch_with_image_lock(first_lock, move || {
+                    let observed = std::fs::read_to_string(&first_counter)?
+                        .parse::<u64>()
+                        .expect("numeric revision");
+                    first_entered_tx.send(()).expect("announce first lock");
+                    release_first_rx.recv().expect("release first mutation");
+                    std::fs::write(first_counter, (observed + 1).to_string())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        first_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first mutation entered its lock");
+
+        let (second_attempt_tx, second_attempt_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let second_substrate = substrate.clone();
+        let second_counter = counter.clone();
+        let second = tokio::spawn(async move {
+            second_attempt_tx.send(()).expect("announce second attempt");
+            second_substrate
+                .dispatch_with_image_lock(lock, move || {
+                    second_entered_tx.send(()).expect("announce second lock");
+                    let observed = std::fs::read_to_string(&second_counter)?
+                        .parse::<u64>()
+                        .expect("numeric revision");
+                    std::fs::write(second_counter, (observed + 1).to_string())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        second_attempt_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second mutation attempted the lock");
+        let entered_before_release =
+            second_entered_rx.recv_timeout(std::time::Duration::from_millis(100));
+
+        release_first_tx.send(()).expect("release first mutation");
+        first
+            .await
+            .expect("first task")
+            .expect("first lock")
+            .expect("first mutation");
+        if entered_before_release.is_err() {
+            second_entered_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("second mutation entered after release");
+        }
+        second
+            .await
+            .expect("second task")
+            .expect("second lock")
+            .expect("second mutation");
+
+        assert!(
+            matches!(
+                entered_before_release,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the second mutation entered while the first held the image lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter).expect("final revision"),
+            "2",
+            "both serialized read-modify-write operations must survive"
+        );
+        drop(substrate);
+        std::fs::remove_dir_all(root).expect("fixture");
     }
 }
