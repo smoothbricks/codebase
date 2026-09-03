@@ -5741,58 +5741,95 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
     ) -> Result<GrantSet> {
         self.validate_binding().await?;
         let mut current = self.current(&workspace).await?;
-        if delta
-            .expected_revision
-            .is_some_and(|revision| revision != current.metadata.grants.revision)
-        {
-            return Err(CowshedError::conflict(
-                "grant revision is stale",
-                "refresh grants and retry",
-            ));
-        }
-        normalize_grant_delta(&mut delta)?;
-        let previous = current.metadata.grants.clone();
-        apply_grant_delta(&mut current.metadata.grants, delta, revoke);
-
+        let lock_path = self
+            .layout
+            .canonical_image(&workspace, current.derived.workspace.format())
+            .map_err(native_integrity_error)?
+            .lock()
+            .to_owned();
+        let image = current.image.clone();
+        let topology_revision = current.derived.workspace.revision().get();
         let mount = self.workspace_mount_path(&workspace)?;
         let main_mount = self.workspace_mount_path(&main_name())?;
-        let config = supervisor_sandbox(
-            &self.home,
-            &self.layout,
-            &self.telemetry_root,
-            &current,
-            mount,
-            main_mount,
-        )?;
-        crate::sandbox::validate_sandbox_config(&config).map_err(|error| {
-            CowshedError::usage(
-                error.to_string(),
-                "choose an absolute path outside workspace, controller, project, and credential roots",
-            )
-        })?;
-        if current.metadata.grants == previous {
-            return Ok(previous);
-        }
+        let home = self.home.clone();
+        let layout = self.layout.clone();
+        let telemetry_root = self.telemetry_root.clone();
 
-        current.metadata.grants.revision = current
-            .metadata
-            .grants
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
-        let image = current.image;
-        let topology_revision = current.derived.workspace.revision().get();
-        let published = current.metadata.grants.clone();
-        let metadata = current.metadata;
-        crate::storage::lifecycle::dispatch_blocking(move || metadata.write_for_image(&image))
+        let (published, replacement_config) = self
+            .substrate
+            .dispatch_with_image_lock(lock_path, move || {
+                (|| -> Result<_> {
+                    current.metadata =
+                        crate::metadata::DetachedWorkspaceMetadata::read_for_image(&image)
+                            .map_err(native_integrity_error)?;
+                    if delta
+                        .expected_revision
+                        .is_some_and(|revision| revision != current.metadata.grants.revision)
+                    {
+                        return Err(CowshedError::conflict(
+                            "grant revision is stale",
+                            "refresh grants and retry",
+                        ));
+                    }
+                    normalize_grant_delta(&mut delta)?;
+                    let previous = current.metadata.grants.clone();
+                    apply_grant_delta(&mut current.metadata.grants, delta, revoke);
+
+                    let config = supervisor_sandbox(
+                        &home,
+                        &layout,
+                        &telemetry_root,
+                        &current,
+                        mount,
+                        main_mount,
+                    )?;
+                    if let Err(error) = crate::sandbox::validate_sandbox_config(&config) {
+                        return Err(match error {
+                            crate::sandbox::SandboxError::GrantIntersectsDeny { .. } => {
+                                CowshedError::sandbox_denied(
+                                    error.to_string(),
+                                    "choose a path outside workspace, controller, project, and credential roots",
+                                )
+                            }
+                            crate::sandbox::SandboxError::InvalidPath { .. } => {
+                                CowshedError::usage(
+                                    error.to_string(),
+                                    "choose an absolute filesystem path",
+                                )
+                            }
+                            crate::sandbox::SandboxError::InvalidPortBlock { .. } => {
+                                native_integrity_error(error)
+                            }
+                        });
+                    }
+                    if current.metadata.grants == previous {
+                        return Ok((previous, None));
+                    }
+
+                    current.metadata.grants.revision = current
+                        .metadata
+                        .grants
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| CowshedError::internal("grant revision overflow"))?;
+                    let published = current.metadata.grants.clone();
+                    current
+                        .metadata
+                        .write_for_image(&image)
+                        .map_err(native_integrity_error)?;
+                    Ok((published, Some(config)))
+                })()
+            })
             .await
-            .map_err(|error| CowshedError::internal(error.to_string()))?
-            .map_err(native_integrity_error)?;
-        if let Some(handle) = self.supervisors.remove(&workspace) {
-            let replacement = handle
-                .advance_authority(published.revision, topology_revision, config)
-                .await?;
-            self.supervisors.insert(workspace, replacement);
+            .map_err(native_storage_error)??;
+
+        if let Some(config) = replacement_config {
+            if let Some(handle) = self.supervisors.remove(&workspace) {
+                let replacement = handle
+                    .advance_authority(published.revision, topology_revision, config)
+                    .await?;
+                self.supervisors.insert(workspace, replacement);
+            }
         }
         Ok(published)
     }
@@ -8171,19 +8208,119 @@ fn normalize_grant_delta(delta: &mut GrantDelta) -> Result<()> {
 fn normalize_grant_paths(paths: &mut Vec<PathBuf>) -> Result<()> {
     for path in paths.iter_mut() {
         let original = std::mem::take(path);
-        *path = canonical_lexical_absolute(&original).ok_or_else(|| {
-            CowshedError::usage(
-                format!(
-                    "grant path {} must be absolute and must not traverse above /",
-                    original.display()
-                ),
-                "choose an absolute filesystem path",
-            )
-        })?;
+        *path = resolve_grant_path(&original)?;
     }
     paths.sort();
     paths.dedup();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn grant_path_usage(path: &Path, detail: impl std::fmt::Display) -> CowshedError {
+    CowshedError::usage(
+        format!("grant path {} {detail}", path.display()),
+        "choose an absolute filesystem path",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_grant_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() || canonical_lexical_absolute(path).is_none() {
+        return Err(grant_path_usage(
+            path,
+            "must be absolute and must not traverse above /",
+        ));
+    }
+    match std::fs::canonicalize(path) {
+        Ok(real) => require_canonical_grant_path(path, real),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            resolve_missing_grant_path(path)
+        }
+        Err(error) => Err(grant_path_usage(
+            path,
+            format!("cannot be resolved: {error}"),
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn require_canonical_grant_path(original: &Path, real: PathBuf) -> Result<PathBuf> {
+    if !crate::repository::is_lexically_canonical(&real) {
+        return Err(grant_path_usage(
+            original,
+            format!("resolved to non-canonical {}", real.display()),
+        ));
+    }
+    Ok(real)
+}
+
+#[cfg(target_os = "macos")]
+fn ambiguous_grant_parent_dir(path: &Path) -> Result<PathBuf> {
+    Err(grant_path_usage(path, "has '..' after a missing component"))
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_missing_grant_path(path: &Path) -> Result<PathBuf> {
+    let mut resolved = PathBuf::from("/");
+    let mut remaining = path.components();
+    if !matches!(remaining.next(), Some(std::path::Component::RootDir)) {
+        return Err(grant_path_usage(
+            path,
+            "must be absolute and must not traverse above /",
+        ));
+    }
+    let mut remaining = remaining.peekable();
+    while let Some(component) = remaining.peek().copied() {
+        match component {
+            std::path::Component::CurDir => {
+                remaining.next();
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(grant_path_usage(path, "is not canonical"));
+            }
+            std::path::Component::ParentDir => match std::fs::canonicalize(resolved.join("..")) {
+                Ok(real) => {
+                    resolved = real;
+                    remaining.next();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return ambiguous_grant_parent_dir(path);
+                }
+                Err(error) => {
+                    return Err(grant_path_usage(
+                        path,
+                        format!("cannot be resolved: {error}"),
+                    ));
+                }
+            },
+            std::path::Component::Normal(name) => {
+                match std::fs::canonicalize(resolved.join(name)) {
+                    Ok(real) => {
+                        resolved = real;
+                        remaining.next();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) => {
+                        return Err(grant_path_usage(
+                            path,
+                            format!("cannot be resolved: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for component in remaining {
+        match component {
+            std::path::Component::ParentDir => return ambiguous_grant_parent_dir(path),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => resolved.push(name),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(grant_path_usage(path, "is not canonical"));
+            }
+        }
+    }
+    require_canonical_grant_path(path, resolved)
 }
 
 #[cfg(target_os = "macos")]
@@ -8218,41 +8355,81 @@ fn update_set<T: PartialEq>(current: &mut Vec<T>, delta: Vec<T>, revoke: bool) {
 #[cfg(all(test, target_os = "macos"))]
 mod grant_unit_tests {
     use super::*;
+    use crate::sandbox::{
+        RunSandboxMode, SandboxConfig, SandboxError, SandboxGrants, validate_sandbox_config,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    fn unique_root(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cowshed-grant-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(&path).unwrap()
+    }
+
+    fn canonical_dir(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::canonicalize(path).unwrap()
+    }
+
+    fn sandbox_at(
+        home: &Path,
+        mount_root: &Path,
+        workspace_mount: &Path,
+        project_root: &Path,
+    ) -> SandboxConfig {
+        SandboxConfig {
+            home: home.to_path_buf(),
+            mount_root: mount_root.to_path_buf(),
+            workspace_mount: workspace_mount.to_path_buf(),
+            exec_temp_dir: PathBuf::from("/private/tmp/cowshed-grant-unit"),
+            port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
+            mode: RunSandboxMode::ReadWrite,
+            grants: SandboxGrants::default(),
+            allowed_unix_sockets: Vec::new(),
+            additional_denies: vec![project_root.to_path_buf()],
+            git_worktree_repository: None,
+        }
+    }
+
+    fn normalize_read(path: PathBuf) -> PathBuf {
+        let mut delta = GrantDelta {
+            read: vec![path],
+            ..GrantDelta::default()
+        };
+        normalize_grant_delta(&mut delta).expect("grant path should resolve");
+        delta.read.pop().expect("one resolved path")
+    }
 
     #[test]
     fn filesystem_grants_are_normalized_deduplicated_and_sorted() {
+        let root = unique_root("norm");
+        let a = canonical_dir(&root.join("a"));
+        let z = canonical_dir(&root.join("z"));
+        let output = canonical_dir(&root.join("output"));
         let mut grants = GrantSet {
-            read: vec![PathBuf::from("/var/z")],
-            write: vec![PathBuf::from("/var/output")],
+            read: vec![z.clone()],
+            write: vec![output.clone()],
             ..GrantSet::default()
         };
         let mut delta = GrantDelta {
-            read: vec![
-                PathBuf::from("/var/z"),
-                PathBuf::from("/opt/../var/a"),
-                PathBuf::from("/var/a"),
-            ],
-            write: vec![
-                PathBuf::from("/var/output/./reports"),
-                PathBuf::from("/var/output"),
-            ],
+            read: vec![z.clone(), root.join("a/../a"), a.clone()],
+            write: vec![output.join("./reports"), output.clone()],
             ..GrantDelta::default()
         };
 
         normalize_grant_delta(&mut delta).expect("valid filesystem grant paths");
         apply_grant_delta(&mut grants, delta, false);
 
-        assert_eq!(
-            grants.read,
-            [PathBuf::from("/var/a"), PathBuf::from("/var/z")]
-        );
-        assert_eq!(
-            grants.write,
-            [
-                PathBuf::from("/var/output"),
-                PathBuf::from("/var/output/reports")
-            ]
-        );
+        assert_eq!(grants.read, [a, z]);
+        assert_eq!(grants.write, [output.clone(), output.join("reports")]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -8266,6 +8443,101 @@ mod grant_unit_tests {
             assert_eq!(error.code, ErrorCode::Usage);
             assert!(error.message.contains(path));
         }
+    }
+
+    #[test]
+    fn missing_grant_leaf_resolves_through_the_existing_ancestor() {
+        let ancestor = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let missing = std::env::temp_dir().join(format!(
+            "cowshed-grant-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let resolved = normalize_read(missing.clone());
+        assert_eq!(
+            resolved,
+            ancestor.join(missing.file_name().expect("leaf name"))
+        );
+    }
+
+    #[test]
+    fn unresolved_parent_dir_after_a_missing_component_is_usage() {
+        let sneaky = std::env::temp_dir()
+            .join(format!("cowshed-grant-no-such-{}", std::process::id()))
+            .join("..")
+            .join("passwd");
+        let mut delta = GrantDelta {
+            read: vec![sneaky.clone()],
+            ..GrantDelta::default()
+        };
+        let error = normalize_grant_delta(&mut delta).expect_err("ambiguous ..");
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(
+            error.message.contains("missing component"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn non_not_found_resolution_failure_is_explicit_usage() {
+        let root = unique_root("perm");
+        let locked = canonical_dir(&root.join("locked"));
+        let child = locked.join("secret");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut delta = GrantDelta {
+            read: vec![child],
+            ..GrantDelta::default()
+        };
+        let error = normalize_grant_delta(&mut delta);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        let error = error.expect_err("permission denied is not a lexical fallback");
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(
+            error.message.contains("cannot be resolved"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn grant_pipeline_allows_an_external_tree_and_denies_workspace_project_and_secrets() {
+        let root = unique_root("deny");
+        let home = canonical_dir(&root.join("home"));
+        let mount_root = canonical_dir(&root.join("mnt"));
+        let workspace = canonical_dir(&mount_root.join("acme/widget/workspaces/raven/mount"));
+        let project = canonical_dir(&root.join("project"));
+        let allowed = canonical_dir(&root.join("fork/minigraf"));
+        let secret = canonical_dir(&home.join(".ssh"));
+        let alias = root.join("alias-ssh");
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+
+        let mut config = sandbox_at(&home, &mount_root, &workspace, &project);
+        config.grants.read = vec![normalize_read(allowed.clone())];
+        validate_sandbox_config(&config).expect("external tree is grantable");
+
+        for denied in [
+            workspace.join("src"),
+            project.join("src"),
+            secret.clone(),
+            alias,
+        ] {
+            let mut denied_config = sandbox_at(&home, &mount_root, &workspace, &project);
+            denied_config.grants.read = vec![normalize_read(denied)];
+            assert!(
+                matches!(
+                    validate_sandbox_config(&denied_config),
+                    Err(SandboxError::GrantIntersectsDeny { .. })
+                ),
+                "expected intersection deny"
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 
