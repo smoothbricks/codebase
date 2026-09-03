@@ -2194,10 +2194,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let trash_images = self.retired_trash_images(&trash)?;
         let name_owners = retired_name_owners(&trash_images);
         let mut claimed_checkpoint_names = BTreeSet::new();
-        // Every name a mountpoint may legitimately carry: retired records (their mountpoint is
-        // theirs to reclaim) and published sessions. Anything else under the mount root is an
-        // orphan directory.
+        // Every name a mountpoint may legitimately carry: the canonical workspace (its image
+        // lives outside `sessions`, so no discovery pass names it), retired records (their
+        // mountpoint is theirs to reclaim) and published sessions. Anything else under the
+        // mount root is an orphan directory.
         let mut named_mountpoints: BTreeSet<String> = BTreeSet::new();
+        named_mountpoints.insert(WorkspaceName::main().as_str().to_owned());
         for (path, format) in trash_images {
             let retired = self.retired_authority(project, repo, &path, format)?;
             named_mountpoints.insert(retired.workspace().name().as_str().to_owned());
@@ -5151,7 +5153,7 @@ fn remove_stray_junk(
 ) -> Result<Vec<PathBuf>, ApfsStorageError> {
     // (absolute path, relative form for check-ignore, is directory)
     let mut strays: Vec<(PathBuf, Vec<u8>, bool)> = Vec::new();
-    let mut hidden: Vec<PathBuf> = Vec::new();
+    let mut hidden: Vec<(PathBuf, bool)> = Vec::new();
     let mut stack = vec![mount_point.to_path_buf()];
     let mut visited = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -5167,7 +5169,7 @@ fn remove_stray_junk(
                 .file_type()
                 .map_err(|error| io_error("inspect stray", &path, error))?;
             if crate::git::is_hidden_path(relative.as_os_str().as_bytes()) {
-                hidden.push(path);
+                hidden.push((path, file_type.is_dir()));
                 continue;
             }
             // A directory pattern (`generated/`) only matches a path git knows is a directory;
@@ -5186,7 +5188,7 @@ fn remove_stray_junk(
         .collect();
     let ignored = stray_ignored_set(checkout, &judged);
     let mut kept = Vec::new();
-    let mut removals: Vec<(PathBuf, bool)> = hidden.into_iter().map(|path| (path, true)).collect();
+    let mut removals: Vec<(PathBuf, bool)> = hidden;
     for (path, relative, is_dir) in strays {
         if ignored.contains(&relative) {
             removals.push((path, is_dir));
@@ -5348,6 +5350,7 @@ mod tests {
         .expect("gitignore");
         fs::create_dir_all(mount.join(".nx/d")).expect("nx");
         fs::write(mount.join(".nx/d/daemon.log"), "log").expect("hidden");
+        fs::write(mount.join(".envrc"), "use flake").expect("hidden file");
         fs::create_dir_all(mount.join("packages/wire/generated")).expect("generated");
         fs::write(mount.join("packages/wire/generated/vo1gen.ts"), "x").expect("ignored");
         fs::write(mount.join("packages/wire/build.log"), "x").expect("ignored by glob");
@@ -5357,6 +5360,7 @@ mod tests {
         let kept = remove_stray_junk(&mount, &checkout).expect("sweep");
         assert_eq!(kept, vec![mount.join("packages/wire/src/lib.rs")]);
         assert!(!mount.join(".nx").exists());
+        assert!(!mount.join(".envrc").exists());
         assert!(!mount.join("packages/wire/generated").exists());
         assert!(!mount.join("packages/wire/build.log").exists());
         assert!(mount.join("packages/wire/src/lib.rs").exists());
