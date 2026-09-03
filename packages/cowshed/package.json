@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/cowshed",
-  "version": "0.1.11",
+  "version": "0.1.12-next.0",
   "type": "module",
   "sideEffects": false,
   "scripts": {
