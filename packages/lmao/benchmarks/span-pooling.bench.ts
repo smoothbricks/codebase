@@ -132,12 +132,7 @@ function planForCapacity(capacity: number): CallsitePlan<typeof RUNTIME_SCHEMA, 
   }).callsitePlan;
 }
 
-function writeRows(
-  plan: CallsitePlan<typeof RUNTIME_SCHEMA, RuntimeContext>,
-  buffer: SpanBuffer<typeof RUNTIME_SCHEMA>,
-  rows: number,
-  request: number,
-): number {
+function writeRows(buffer: SpanBuffer<typeof RUNTIME_SCHEMA>, rows: number, request: number): number {
   let checksum = 2_166_136_261;
   for (let row = 0; row < rows; row++) {
     const outputRow = buffer._appenders.writeLogEntry(buffer, ENTRY_TYPE_INFO);
@@ -159,11 +154,11 @@ function buildRoot(
   if (capacity === undefined) throw new Error('Span pooling CallsitePlan must freeze a capacity tier');
   const traceRoot = createTraceRoot(createTraceId(`span-pooling-${workload.name}-${request}`), TRACER);
   const root = STRATEGY.createSpanBuffer(RUNTIME_SCHEMA, traceRoot, plan.metadata, capacity, plan.SpanBufferClass);
-  let checksum = writeRows(plan, root, Math.min(workload.rows, capacity), request);
+  let checksum = writeRows(root, Math.min(workload.rows, capacity), request);
   let active: SpanBuffer<typeof RUNTIME_SCHEMA> = root;
   for (let segment = 0; segment < workload.overflowSegments; segment++) {
     const overflow = STRATEGY.createOverflowBuffer(active);
-    checksum = mix(checksum, writeRows(plan, overflow, Math.min(workload.rows, capacity), request + segment + 1));
+    checksum = mix(checksum, writeRows(overflow, Math.min(workload.rows, capacity), request + segment + 1));
     active = overflow;
   }
   if (workload.childRows !== 0) {
@@ -175,7 +170,7 @@ function buildRoot(
       RUNTIME_SCHEMA,
       plan.SpanBufferClass,
     );
-    checksum = mix(checksum, writeRows(plan, child, Math.min(workload.childRows, capacity), request + 17));
+    checksum = mix(checksum, writeRows(child, Math.min(workload.childRows, capacity), request + 17));
   }
   const segments = Array.from(iterateSpanTree(root)).length;
   return { root, checksum, segments };

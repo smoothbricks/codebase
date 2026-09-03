@@ -1,7 +1,6 @@
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { $ } from 'bun';
-import { Bench } from 'tinybench';
 
 // Q1 + Q2 + Q4: ASIF vs SPARSE substrate comparison, attach-flag floor, tmutil default.
 // Focused harness; reuses tinybench. All under /private/tmp, cleaned up in finally.

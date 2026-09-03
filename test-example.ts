@@ -3,6 +3,17 @@
 // Simple test runner for the library integration example
 import { defineLogSchema, defineModule, S } from './packages/lmao/src/index.js';
 
+interface TraceDebugInternals {
+  readonly _traceCtx?: { readonly traceId?: unknown };
+  readonly _buffer?: { readonly trace_id?: unknown };
+}
+
+function logTraceInternals(operation: string, ctx: unknown): void {
+  const internals = ctx as TraceDebugInternals;
+  console.log(`🔍 ${operation} Op - traceId from ctx._traceCtx:`, internals._traceCtx?.traceId);
+  console.log(`🔍 ${operation} Op - buffer trace_id:`, internals._buffer?.trace_id);
+}
+
 // ============================================================================
 // CACHE LIBRARY (defined first so HTTP can reference it)
 // ============================================================================
@@ -24,8 +35,7 @@ const cacheModule = defineModule({
   .make();
 
 const cacheGet = cacheModule.op('cache-get', async (ctx, key: string) => {
-  console.log('🔍 cacheGet Op - traceId from ctx._traceCtx:', (ctx as any)._traceCtx?.traceId);
-  console.log('🔍 cacheGet Op - buffer trace_id:', (ctx as any)._buffer?.trace_id);
+  logTraceInternals('cacheGet', ctx);
 
   ctx.tag.operation('GET').key(key);
 
@@ -37,7 +47,7 @@ const cacheGet = cacheModule.op('cache-get', async (ctx, key: string) => {
   return ctx.ok({ value, hit });
 });
 
-const cacheSet = cacheModule.op('cache-set', async (ctx, key: string, value: unknown, ttl = 3600) => {
+const cacheSet = cacheModule.op('cache-set', async (ctx, key: string, _value: unknown, ttl = 3600) => {
   ctx.tag
     .operation('SET')
     .key(key)
@@ -69,9 +79,7 @@ const httpModule = defineModule({
 // HTTP operation - accesses cache via typed ctx.deps
 const httpRequest = httpModule.op('http-request', async (ctx, opts: { method: string; url: string }) => {
   const startTime = performance.now();
-
-  console.log('🔍 httpRequest Op - traceId from ctx._traceCtx:', (ctx as any)._traceCtx?.traceId);
-  console.log('🔍 httpRequest Op - buffer trace_id:', (ctx as any)._buffer?.trace_id);
+  logTraceInternals('httpRequest', ctx);
 
   // Access wired cache dependency
   const { cache } = ctx.deps;
@@ -201,8 +209,7 @@ async function runExample() {
 
   // Application operation using wired libraries
   const getUserProfile = wiredApp.op('get-user-profile', async (ctx, userId: string) => {
-    console.log('🔍 getUserProfile Op - traceId from ctx._traceCtx:', (ctx as any)._traceCtx?.traceId);
-    console.log('🔍 getUserProfile Op - buffer trace_id:', (ctx as any)._buffer?.trace_id);
+    logTraceInternals('getUserProfile', ctx);
 
     // Set app-specific attributes
     ctx.tag.userId(userId).requestId('req-123');
