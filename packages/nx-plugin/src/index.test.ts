@@ -333,9 +333,10 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets['cargo-test-ferris-wasm']?.dependsOn).toEqual(['cargo-fetch', 'cargo-test-ferris-core']);
       // `--workspace -E 'package(...)'`, never `--package`: the filterset picks
       // the same tests without re-resolving features, so the run reuses what
-      // cargo-test-compile built instead of rebuilding inside the bound.
+      // cargo-test-compile built instead of rebuilding inside the bound. A
+      // workspace member with no tests is still a successful per-crate target.
       expect(targets['cargo-test-ferris-core']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --workspace -E 'package\(ferris-core\)' --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --workspace -E 'package\(ferris-core\)' --no-tests=pass --user-config-file none --config-file /,
       );
       expect(targets['cargo-test-ferris-core']?.inputs).toEqual([
         '{projectRoot}/Cargo.toml',
@@ -462,6 +463,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(runtime['cargo-test-runtime-core-shard1']?.options?.command).toContain(
         'nextest run --workspace -p runtime-core',
       );
+      expect(native['cargo-test-native-napi']?.options?.command).toContain('--no-tests=pass');
       expect(runtime['cargo-test']?.dependsOn).toEqual([
         'cargo-test-runtime-core-shard1',
         'cargo-test-runtime-core-shard2',
@@ -823,7 +825,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // not something it inherits from cargo-test-compile's position.
       expect(targets['cargo-test-cowshed-napi']?.dependsOn).toEqual(['cargo-fetch', 'napi-debug']);
       expect(targets['cargo-test-cowshed-napi']?.options?.command).toMatch(
-        /^cargo --frozen nextest run --workspace -E 'package\(cowshed-napi\)' --user-config-file none --config-file /,
+        /^cargo --frozen nextest run --workspace -E 'package\(cowshed-napi\)' --no-tests=pass --user-config-file none --config-file /,
       );
       expect(targets['napi-test']).toMatchObject({
         executor: '@smoothbricks/nx-plugin:bounded-exec',
@@ -902,7 +904,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // An unsharded crate keeps the bare name and takes no --partition, so
       // declaring nothing is exactly the old single-target behaviour.
       expect(targets['cargo-test-small']?.options?.command).toMatch(
-        /nextest run --workspace -E 'package\(small\)' --user-config-file none/,
+        /nextest run --workspace -E 'package\(small\)' --no-tests=pass --user-config-file none/,
       );
       // The shards partition the crate MINUS the classes nextest.toml singles
       // out, i of N. Those are lifted out because a test-group only holds
@@ -915,7 +917,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       }
       for (const index of [1, 2, 3]) {
         expect(targets[`cargo-test-big-shard${index}`]?.options?.command).toContain(
-          `--workspace -E 'package(big) and not (${exceptional})' --partition hash:${index}/3`,
+          `--workspace -E 'package(big) and not (${exceptional})' --partition hash:${index}/3 --no-tests=pass`,
         );
         expect(targets[`cargo-test-big-shard${index}`]?.options?.timeoutMs).toBe(BOUNDED_TEST_TIMEOUT_MS);
       }
