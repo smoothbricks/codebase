@@ -814,8 +814,8 @@ fn mount_registry_actor_owns_attachment_state_and_blocks_mounted_compaction() {
         .expect("detach retained image");
     assert_eq!(
         runner.calls(),
-        7,
-        "inventory, attach, device inspection, volume resolution, fsck, mount, and detach cross the command boundary"
+        8,
+        "inventory, attach, device inspection, volume resolution, fsck, mount, detach, and detach-settle cross the command boundary"
     );
 }
 
@@ -1808,8 +1808,8 @@ fn reverse_teardown_drains_actor_state_and_detaches_every_attachment() {
 
     assert_eq!(
         runner.calls(),
-        6,
-        "inventory, attach, inspect, resolve, fsck, detach"
+        7,
+        "inventory, attach, inspect, resolve, fsck, detach, and detach-settle"
     );
 }
 
@@ -1880,8 +1880,8 @@ fn direct_detach_crosses_the_backend_boundary() {
 
     assert_eq!(
         runner.calls(),
-        6,
-        "inventory, attach, inspect, resolve, fsck, detach"
+        7,
+        "inventory, attach, inspect, resolve, fsck, detach, and detach-settle"
     );
 }
 
@@ -4724,8 +4724,13 @@ fn resizing_a_detached_workspace_grows_the_image_then_the_container_and_verifies
                 "detach".into(),
                 "/dev/disk9".into(),
             ],
+            vec![
+                "/usr/bin/hdiutil".to_owned(),
+                "info".into(),
+                "-plist".into()
+            ],
         ],
-        "a detached workspace is grown, verified, and handed back detached"
+        "a detached workspace is grown, verified, handed back detached, and settle-confirmed"
     );
 }
 
