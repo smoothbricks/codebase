@@ -1313,7 +1313,7 @@ async fn link_runtime_dir(sandbox: &SandboxConfig, runtime_dir: &Path) -> Result
 /// non-incremental, which is the only shape the sccache wrapper can cache and hand to the next
 /// landing. An interactive shed makes the opposite trade and is left alone — see
 /// [`build_environment`], which imposes no incremental policy at all.
-pub fn acceptance_check_environment() -> HashMap<String, String> {
+pub(crate) fn acceptance_check_environment() -> HashMap<String, String> {
     HashMap::from([("CARGO_INCREMENTAL".to_owned(), "0".to_owned())])
 }
 
