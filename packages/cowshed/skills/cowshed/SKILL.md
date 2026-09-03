@@ -21,7 +21,9 @@ a blast radius that ends at `cowshed rm`.
 1. Adopt once with the warm build cache included and capacity sized for growth:
    `cowshed adopt <path> --capacity <size>`.
 2. If host storage is missing, run `cowshed doctor` (it mutates nothing), then follow its `next:` command, usually
-   `cowshed setup`.
+   `cowshed setup`. `cowshed setup` also refreshes the gateway service binary from the invoking build — run it from a
+   release build. A daemon running a binary from before that build is host drift the repair ends, not a state it reports
+   as set up.
 3. Create one workspace per agent. Work in that workspace, never in shared `main`.
 4. Retire finished workspaces and run `cowshed gc` on a cadence. Storage grows with divergence, not clone count.
 
