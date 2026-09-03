@@ -252,7 +252,7 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   its `node_modules/@typescript/native/bin/tsc` path through `TTSC_TSGO_BINARY`, and CI persists it through
   `GITHUB_ENV`. JavaScript tools import the full TypeScript API from `typescript@^6.0.3`. After install,
   setup-environment pins both `node_modules/typescript` and Bun's `.bun/node_modules/typescript` hoist to that API
-  package so Nx does not load TS7 `version.cjs` (bun#33834). Keep both: TypeScript 7 under the unscoped name breaks Nx
+  package so Nx does not load TS7 `version.cjs` (bun#40355). Keep both: TypeScript 7 under the unscoped name breaks Nx
   API calls.
 - **Where targets come from:** `tsc-js` comes from `tsconfig.lib.json`, `typecheck-tests` from `tsconfig.test.json`, and
   Cargo targets from a workspace-root `Cargo.toml`. Rust output targets like `cargo-wasm` and `cargo-napi` are never

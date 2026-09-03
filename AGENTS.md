@@ -203,7 +203,7 @@ absolute path through `GITHUB_ENV`. JavaScript tools such as Nx and transformer 
 from the workspace `typescript` dependency, which must stay on `^6.0.3`. After `bun install`, setup-environment pins
 both `node_modules/typescript` and `node_modules/.bun/node_modules/typescript` to that API package so Nx (resolved from
 the Bun store) does not load `@typescript/native`'s TS7 `version.cjs`
-([oven-sh/bun#33834](https://github.com/oven-sh/bun/issues/33834)). Keep both dependencies and the environment binding.
+([oven-sh/bun#40355](https://github.com/oven-sh/bun/issues/40355)). Keep both dependencies and the environment binding.
 Do not install TypeScript 7 under the unscoped `typescript` name.
 
 **Target names are `{tool}-{output}` names.** Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`. `build` and `lint`
