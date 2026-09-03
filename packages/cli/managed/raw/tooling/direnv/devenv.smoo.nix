@@ -173,6 +173,9 @@
     (import inputs.nixpkgs-go {inherit (pkgs.stdenv.hostPlatform) system;}).go
     pkgs.nodejs_26
     pkgs.binaryen
+    # Test runner for inferred Cargo test targets. Generated targets must never
+    # depend on an ambient host installation that CI does not reproduce.
+    pkgs.cargo-nextest
     # Target-dir GC for the inferred cargo-sweep target: cargo never removes
     # superseded artifacts on its own (a busy workspace accumulated ~18k stale
     # variants per crate and 26 GB of junk before this existed), and a sweep
