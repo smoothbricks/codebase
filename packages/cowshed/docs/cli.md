@@ -414,11 +414,17 @@ path to benefit** — that is where a slot-bound workspace is mounted, so `cd $(
 both land there, but a build reached through some other route to the same files (a symlink you made, a `--manifest-path`
 into one) is a different compilation.
 
-The trade: a workspace mounted at a slot path gets `RUSTC_WRAPPER=sccache` **and `CARGO_INCREMENTAL=0`**, from
-`.cowshed/env` and from `cowshed exec` alike. Incremental compilation is per-unit local state sccache cannot cache and
-cargo prefers when both are available, so a slot tenant is choosing the shared cross-generation cache over local
-incrementality. Name-mounted workspaces are never opted in: they get the cache endpoints (`SCCACHE_SERVER_UDS`,
-`SCCACHE_DIR`) but nothing that routes rustc through a cache their path cannot share.
+Every workspace child cowshed launches — `cowshed exec` and every supervisor-run command alike — gets
+`RUSTC_WRAPPER=sccache`, `SCCACHE_BASEDIR_CWD=1` and the cache endpoints (`SCCACHE_SERVER_UDS`, `SCCACHE_DIR`). Name
+mounts are not excluded: the bundled sccache normalizes the residual path-bearing key inputs against the request cwd, so
+sibling paths share entries with each other. A slot buys the one input normalization cannot reach — cargo's
+`-C metadata`, a hash sccache never sees.
+
+`CARGO_INCREMENTAL` is not set, at any mount. Cargo decides it per profile, and that is the decision that serves both
+lanes: `dev` stays incremental and local (a one-line edit rebuilds in ~1.7s, against ~20-32s with incremental forced
+off), while shared lanes declare `incremental = false` in the profile and so reach the cache without anyone forcing
+anything. The single exception is a `cowshed land --check` command: nobody is waiting on it and its output is worth
+storing, so it runs with `CARGO_INCREMENTAL=0` and leaves cacheable units behind for the next landing.
 
 `main` cannot take a slot — its mount is fixed by the project's checkout layout.
 

@@ -5942,7 +5942,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                         argv: vec!["/bin/sh".into(), "-c".into(), check.clone().into()],
                         cwd: None,
                         mode: RunSandboxMode::ReadWrite,
-                        env: std::collections::HashMap::new(),
+                        env: super::supervisor::acceptance_check_environment(),
                         trace: None,
                         stdin: StdinSource::Empty,
                         stdout_copy: None,
