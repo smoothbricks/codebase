@@ -340,9 +340,13 @@ function createNodesHandler(hostPlatform: NapiPlatform | null): CreateNodesHandl
     await Promise.all(
       projectConfigurationFiles.map(async (packageJsonPath) => {
         try {
-          if (isManagedPackageJsonSource(packageJsonPath)) {
+          if (isManagedPackageJsonSource(packageJsonPath) || isBuildOutputPackageJson(packageJsonPath)) {
             // smoo monorepo managed raw/templates are source copies, not projects.
             // Dogfood trees symlink live paths here; discovering both doubles names.
+            // A package.json a build wrote (napi's platform dirs, dist, cargo's
+            // target, a package cache) is an artifact, never a project: inferring
+            // one races every task that rebuilds the graph against the build that
+            // is writing it, and a name collision drops the real project.
             results.push([packageJsonPath, {}]);
             return;
           }
@@ -376,6 +380,14 @@ export const createNodesV2: CreateNodesV2 = [
 function isManagedPackageJsonSource(packageJsonPath: string): boolean {
   const normalized = packageJsonPath.replaceAll('\\', '/');
   return normalized.includes('/managed/raw/') || normalized.includes('/managed/templates/');
+}
+
+/** Directories only builds write into; a package.json found under one is an output. */
+const BUILD_OUTPUT_SEGMENTS = ['/node_modules/', '/dist/', '/target/', '/.cache/', '/.nx/'];
+
+function isBuildOutputPackageJson(packageJsonPath: string): boolean {
+  const normalized = `/${packageJsonPath.replaceAll('\\', '/')}`;
+  return BUILD_OUTPUT_SEGMENTS.some((segment) => normalized.includes(segment));
 }
 
 export default { createNodesV2 };

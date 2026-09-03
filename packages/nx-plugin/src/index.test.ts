@@ -62,6 +62,34 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     }
   });
 
+  it('never infers a project from a package.json a build wrote', async () => {
+    const workspace = await createWorkspace();
+    try {
+      await workspace.write('packages/cowshed/package.json', '{"name":"cowshed","private":true}\n');
+      // napi's platform build, a dist tree, cargo's target dir, a package cache: every
+      // one of these is written by a task, and a graph recomputed while it is being
+      // written must not see a second `cowshed` and drop the real one.
+      const outputs = [
+        'packages/cowshed/.cache/native-debug/package.json',
+        'packages/cowshed/dist/npm/linux-x64-gnu/package.json',
+        'packages/cowshed/target/debug/build/x/out/package.json',
+        'packages/cowshed/node_modules/dep/package.json',
+      ];
+      for (const path of outputs) {
+        await workspace.write(path, '{"name":"cowshed","private":true}\n');
+      }
+
+      const inferred = await inferTargets(outputs, undefined, workspace.context);
+      for (const [, result] of inferred) {
+        expect(result).toEqual({});
+      }
+      const live = await inferProject(workspace, 'packages/cowshed/package.json');
+      expect(live?.name).toBe('cowshed');
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   it('splits transformed JavaScript emit from native declarations and typechecking', async () => {
     const workspace = await createWorkspace();
     try {
