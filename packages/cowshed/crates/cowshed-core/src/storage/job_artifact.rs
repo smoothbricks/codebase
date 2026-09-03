@@ -5346,14 +5346,17 @@ mod tests {
             .collect()
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(32))]
-
-        #[test]
-        fn concurrent_store_instances_append_unique_monotonic_gapless_records(
-            writer_count in 2_usize..=32,
-        ) {
-            let root = temp_root("concurrent-sequences");
+    /// Concurrent store instances serialize sequence allocation on the records flock, so the
+    /// allocation path has no width-dependent branch: any writer count exercises the same
+    /// lock-then-publish-then-append sequence. Sampling that single scalar with 32 proptest
+    /// cases costs ~13s idle against the 30s slow-timeout (each append pays a counter
+    /// atomic-publish plus a frame sync, all flock-serialized) and trips the bound under
+    /// partition load without covering new behavior — so sweep min/small/mid/max widths
+    /// deterministically, ascending, so the smallest failing width reports first.
+    #[test]
+    fn concurrent_store_instances_append_unique_monotonic_gapless_records() {
+        for writer_count in [2_usize, 3, 4, 8, 16, 32] {
+            let root = temp_root(&format!("concurrent-sequences-{writer_count}"));
             let stores = (0..writer_count)
                 .map(|_| store_at(&root, ArtifactConfig::default()))
                 .collect::<Vec<_>>();
@@ -5380,7 +5383,7 @@ mod tests {
                         .0
                 })
                 .collect::<Vec<_>>();
-            prop_assert_eq!(
+            assert_eq!(
                 appended.len(),
                 writer_count,
                 "N={}: successful append count differs from writer count",
@@ -5395,15 +5398,12 @@ mod tests {
                 .windows(2)
                 .find(|pair| pair[1] == pair[0])
             {
-                prop_assert!(
-                    false,
+                panic!(
                     "N={}: record sequences are not unique; offending pair {} -> {}",
-                    writer_count,
-                    pair[0],
-                    pair[1]
+                    writer_count, pair[0], pair[1]
                 );
             }
-            prop_assert_eq!(
+            assert_eq!(
                 allocated_sequences,
                 (1..=writer_count as u64).collect::<Vec<_>>(),
                 "N={}: allocated record sequences are not gapless",
@@ -5412,7 +5412,7 @@ mod tests {
 
             let records = read_job_records_in_physical_order(&records_path(&root))
                 .unwrap_or_else(|error| panic!("N={writer_count}: {error}"));
-            prop_assert_eq!(
+            assert_eq!(
                 records.len(),
                 writer_count,
                 "N={}: durable record count differs from successful append count",
@@ -5423,22 +5423,19 @@ mod tests {
                 .map(|record| record.sequence)
                 .collect::<Vec<_>>();
             if let Some(pair) = sequences.windows(2).find(|pair| pair[1] <= pair[0]) {
-                prop_assert!(
-                    false,
+                panic!(
                     "N={}: durable record sequences are not strictly increasing; offending pair {} -> {}",
-                    writer_count,
-                    pair[0],
-                    pair[1]
+                    writer_count, pair[0], pair[1]
                 );
             }
-            prop_assert_eq!(
+            assert_eq!(
                 sequences.iter().copied().collect::<BTreeSet<_>>().len(),
                 writer_count,
                 "N={}: durable record sequences are not unique: {:?}",
                 writer_count,
                 sequences,
             );
-            prop_assert_eq!(
+            assert_eq!(
                 sequences,
                 (1..=writer_count as u64).collect::<Vec<_>>(),
                 "N={}: durable record sequences are not gapless",
@@ -5446,6 +5443,10 @@ mod tests {
             );
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
 
         /// Barrier ids belong to the store, not to whatever a later recovery can still see: for
         /// any interleaving of appends, checkpoints and lost tails, every barrier the store hands
