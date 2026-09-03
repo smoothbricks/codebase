@@ -397,6 +397,42 @@ describe('smoothbricks-ensure-built', () => {
     expect(run.stdout).toContain(MARKER);
   });
 
+  it('prints the message from a plain-object Nx rejection', async () => {
+    const rejectingWorkspace = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-rejection-')));
+    try {
+      await mkdir(join(rejectingWorkspace, 'node_modules', 'nx', 'src', 'daemon', 'client'), { recursive: true });
+      await mkdir(join(rejectingWorkspace, 'node_modules', 'nx', 'src', 'utils'), { recursive: true });
+      await writeFile(join(rejectingWorkspace, 'package.json'), '{}');
+      await writeFile(join(rejectingWorkspace, 'nx.json'), '{}');
+      await writeFile(
+        join(rejectingWorkspace, 'node_modules', 'nx', 'package.json'),
+        JSON.stringify({ name: 'nx', type: 'commonjs' }),
+      );
+      await writeFile(
+        join(rejectingWorkspace, 'node_modules', 'nx', 'src', 'utils', 'workspace-root.js'),
+        'exports.workspaceRoot = process.env.NX_WORKSPACE_ROOT_PATH;\n',
+      );
+      await writeFile(
+        join(rejectingWorkspace, 'node_modules', 'nx', 'src', 'daemon', 'client', 'client.js'),
+        [
+          'exports.daemonClient = {',
+          '  enabled() {',
+          "    throw { stack: 'synthetic stack', message: 'daemon belongs to a different workspace' };",
+          '  },',
+          '};',
+          '',
+        ].join('\n'),
+      );
+
+      const run = await runBin(rejectingWorkspace, ['app:build', '--', './never-runs']);
+      expect(run.code).toBe(1);
+      expect(run.stderr).toContain('daemon belongs to a different workspace');
+      expect(run.stderr).not.toContain('[object Object]');
+    } finally {
+      await rm(rejectingWorkspace, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a malformed invocation with a usage error', async () => {
     const missingSeparator = await runBin(workspace, ['app:build']);
     expect(missingSeparator.code).toBe(2);
