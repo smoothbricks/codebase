@@ -430,6 +430,11 @@ function wiredConfigText(packagePath: string): string {
 function isWired(configText: string, relativePath: string): boolean {
   const posix = relativePath.split(sep).join('/');
   if (configText.includes(posix)) return true;
+  if (!posix.includes('/')) {
+    for (let dot = posix.indexOf('.'); dot !== -1; dot = posix.indexOf('.', dot + 1)) {
+      if (configText.includes(`"*${posix.slice(dot)}"`)) return true;
+    }
+  }
   let dir = dirname(posix);
   while (dir !== '.') {
     if (configText.includes(`${dir}/**`)) return true;
