@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
@@ -57,6 +58,20 @@ cpSync(sourceCrates, join(outputRoot, 'crates'), {
   recursive: true,
   filter: (source) => basename(source) !== 'target',
 });
+mkdirSync(join(outputRoot, 'src', 'lib', 'schema'), { recursive: true });
+cpSync(join(packageRoot, 'src', 'lib', 'capacityTuning.ts'), join(outputRoot, 'src', 'lib', 'capacityTuning.ts'));
+cpSync(
+  join(packageRoot, 'src', 'lib', 'schema', 'systemSchema.ts'),
+  join(outputRoot, 'src', 'lib', 'schema', 'systemSchema.ts'),
+);
 cpSync(join(packageRoot, '.cargo'), join(outputRoot, '.cargo'), { recursive: true });
 cpSync(join(workspaceRoot, 'Cargo.lock'), join(outputRoot, 'Cargo.lock'));
 writeFileSync(join(outputRoot, 'Cargo.toml'), Bun.TOML.stringify(manifest));
+const metadata = spawnSync(
+  'cargo',
+  ['metadata', '--manifest-path', join(outputRoot, 'Cargo.toml'), '--offline', '--format-version', '1'],
+  { stdio: ['ignore', 'ignore', 'inherit'] },
+);
+if (metadata.status !== 0) {
+  throw new Error(`could not derive the standalone Rust workspace lockfile (cargo exited ${metadata.status})`);
+}
