@@ -268,7 +268,6 @@ pub(crate) fn record_deferred_image(path: PathBuf) {
 
 /// Drain the images deferred since the last pass, oldest first. The startup pass calls
 /// this once per pass and heals the drained images before the rest.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn take_deferred_images() -> Vec<PathBuf> {
     std::mem::take(
         &mut *DEFERRED_IMAGES
