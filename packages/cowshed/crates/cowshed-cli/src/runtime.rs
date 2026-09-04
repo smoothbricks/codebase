@@ -3,6 +3,7 @@ use crate::args::{
     StdinSource as CliStdinSource,
 };
 use crate::gateway_service;
+use crate::mount_main;
 use crate::output::Output;
 use crate::probe;
 use async_trait::async_trait;
@@ -29,6 +30,7 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::ProjectRuntime;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
+use cowshed_core::storage::apfs::rekey::RekeyReport;
 use cowshed_core::storage::apfs::{ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY};
 use cowshed_core::storage::bootstrap::{
     CACHES_ROOT, CanonicalRoots, HostAction, HostSetupPlan, HostSetupReport, MOUNT_SERVICE_PLIST,
@@ -102,6 +104,12 @@ pub trait CliService: Send {
     async fn attach(&mut self, workspace: &str, options: AttachOptions) -> Result<WorkspaceInfo>;
     async fn detach(&mut self, workspace: &str) -> Result<()>;
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
+    async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
+        let _ = workspace;
+        Err(CowshedError::internal(
+            "CLI service does not support workspace rekey",
+        ))
+    }
     async fn doctor(&mut self) -> Result<DoctorReport>;
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport>;
     async fn grants(&mut self, workspace: &str) -> Result<GrantSet>;
@@ -152,10 +160,12 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Attach(_)
         | Command::Detach(_)
         | Command::Resize(_)
+        | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
         | Command::Rebase(_)
         | Command::Land(_)
+        | Command::Mount(_)
         | Command::Setup(_)
         | Command::Gateway(_)
         | Command::Sccache(_)
@@ -320,7 +330,7 @@ async fn adopted_projects() -> Result<Vec<AdoptedProject>> {
         .map_err(project_inventory_error)
 }
 
-async fn doctor_projects() -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>)> {
+async fn doctor_projects() -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>, Vec<RepoId>)> {
     host_inventory()
         .await?
         .doctor_projects()
@@ -455,6 +465,56 @@ impl CliService for ActorBridge {
 
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult> {
         self.coordinator()?.resize(workspace, capacity).await
+    }
+
+    async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
+        use cowshed_core::storage::lifecycle::dispatch_blocking;
+
+        let name = WorkspaceName::new(workspace).map_err(|error| {
+            CowshedError::usage(error.to_string(), "use a valid cowshed workspace name")
+        })?;
+        let store = self.store_root()?.to_owned();
+        let repo = self.repo_id()?.clone();
+        let layout = StorageLayout::new(&store, &repo).map_err(|error| {
+            CowshedError::integrity(
+                format!("rekey cannot open project {repo}: {error}"),
+                format!("cowshed rekey {workspace}"),
+            )
+        })?;
+        // Main mounts at its checkout-aware path, resolved from store
+        // records; sessions mount under the slot-aware mount root. One rule
+        // per target, both derived — never cwd-inferred.
+        let mount = if name.is_main() {
+            crate::mount_main::resolve_main_mount(&store, &repo)
+                .map_err(|error| {
+                    CowshedError::integrity(
+                        format!(
+                            "rekey cannot resolve main mount for {repo}: {}",
+                            error.message
+                        ),
+                        "cowshed mount main --repo-id <owner/repo>",
+                    )
+                })?
+                .mountpoint
+        } else {
+            layout.workspace_mount(&name).map_err(|error| {
+                CowshedError::integrity(
+                    format!("rekey cannot resolve mount for {workspace}: {error}"),
+                    format!("cowshed rekey {workspace}"),
+                )
+            })?
+        };
+        dispatch_blocking(move || {
+            cowshed_core::storage::apfs::rekey::rekey_workspace(&layout, &name, &mount)
+        })
+        .await
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!("rekey task for {workspace} failed: {error}"),
+                format!("cowshed rekey {workspace}"),
+            )
+        })?
+        .map_err(|error| error.into_cowshed_error())
     }
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
@@ -1037,6 +1097,32 @@ where
                 .map_err(output_error)?;
             Ok(success())
         }
+        Command::Rekey(args) => {
+            let result = crate::rekey::rekey_report(service, &args.workspace).await?;
+            if json {
+                output.success(result.clone()).map_err(output_error)?;
+            } else {
+                output
+                    .bare_line(result.workspace.as_bytes())
+                    .map_err(output_error)?;
+            }
+            output
+                .guidance(&format!(
+                    "workspace {} rekeyed at revision {}{}",
+                    result.workspace,
+                    result.revision,
+                    result
+                        .tombstone_removed
+                        .as_ref()
+                        .map(|removed| format!("; quarantine entry {removed} consumed"))
+                        .unwrap_or_default(),
+                ))
+                .map_err(output_error)?;
+            output
+                .hint(&format!("cowshed attach {}", result.workspace))
+                .map_err(output_error)?;
+            Ok(success())
+        }
         Command::Gc(args) => {
             let report = service
                 .gc(GcOptions {
@@ -1177,6 +1263,9 @@ where
         )),
         Command::Sccache(_) => Err(CowshedError::internal(
             "sccache commands must be dispatched by the host service entrypoint",
+        )),
+        Command::Mount(_) => Err(CowshedError::internal(
+            "mount must be dispatched by the host service entrypoint",
         )),
         Command::Skill(_) => Err(CowshedError::internal(
             "skill commands must be dispatched before the runtime bridge",
@@ -1563,6 +1652,32 @@ fn no_detached_sessions() -> CowshedError {
         "cowshed ls; cowshed attach <ws>; cowshed attach --all",
     )
 }
+
+/// What `attach --all` reports when no session needed attaching.
+///
+/// Mains are always-mounted, never user-detachable, so zero detached sessions alongside
+/// unmounted mains means the bare "no detached session" line would hide the actual defect.
+/// The mains status line names it instead, with the gateway pass that mounts mains as the
+/// remedy — the same hint `doctor` gives an unmounted main, which
+/// `attach_mains_hint_matches_doctor_main_hint` pins.
+fn no_detached_with_mains(unmounted: &[UnreachableMain]) -> CowshedError {
+    if unmounted.is_empty() {
+        return no_detached_sessions();
+    }
+    let repos = unmounted
+        .iter()
+        .map(|main| main.repo_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    CowshedError::not_found(
+        format!(
+            "no detached session workspace found; {} main workspace{} not mounted: {repos}",
+            unmounted.len(),
+            if unmounted.len() == 1 { "" } else { "s" },
+        ),
+        "cowshed gateway start",
+    )
+}
 async fn attach_scoped_sessions(
     service: &mut dyn CliService,
     all: bool,
@@ -1647,7 +1762,11 @@ async fn attach_store_wide(browse: bool) -> Result<StoreWideMounts<Vec<Workspace
         }
     }
     if attached.is_empty() {
-        return Err(no_detached_sessions());
+        let unmounted = NativeGatewayInventory::new(storage.clone())
+            .unmounted_mains()
+            .await
+            .unwrap_or_default();
+        return Err(no_detached_with_mains(&unmounted));
     }
     Ok(StoreWideMounts {
         result: attached,
@@ -2918,6 +3037,26 @@ fn main_mount_finding(main: &UnreachableMain) -> Finding {
     }
 }
 
+/// A store project with no adopted checkout path, as `doctor` reports it.
+///
+/// Info, and hintless: the inventory skips the project, but nothing is broken that `doctor`
+/// can name — the checkout evidence simply is not there — and an info finding keeps the
+/// verdict green while the signal survives where it belongs.
+fn no_adopted_checkout_finding(repo: &RepoId, store_root: &Path) -> Finding {
+    let project_dir = StorageLayout::new(store_root, repo)
+        .map(|layout| layout.project().project_root.clone())
+        .ok();
+    Finding {
+        code: "no-adopted-checkout".into(),
+        severity: FindingSeverity::Info,
+        message: format!(
+            "{repo}: recorded in the store but has no adopted checkout path, so the project inventory skips it"
+        ),
+        hint: String::new(),
+        path: project_dir,
+    }
+}
+
 fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
     match retired_layout_paths(store_root) {
         Ok(records) => records
@@ -3058,10 +3197,11 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         }),
     }
     if diagnosis.storage_ready {
-        // One registry traversal supplies both findings. Besides avoiding redundant I/O, this
-        // guarantees one diagnostic per skipped registry entry rather than one per derived view.
+        // One registry traversal supplies every finding below. Besides avoiding redundant I/O,
+        // this guarantees one diagnostic per skipped registry entry rather than one per
+        // derived view.
         match doctor_projects().await {
-            Ok((projects, mains)) => {
+            Ok((projects, mains, checkoutless)) => {
                 diagnosis.findings.push(Finding {
                     code: "workspace-inventory".into(),
                     severity: FindingSeverity::Info,
@@ -3076,6 +3216,13 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
                 diagnosis
                     .findings
                     .extend(mains.iter().map(main_mount_finding));
+                let roots = CanonicalRoots::global();
+                let store = roots.store();
+                diagnosis.findings.extend(
+                    checkoutless
+                        .iter()
+                        .map(|repo| no_adopted_checkout_finding(repo, store)),
+                );
             }
             Err(error) => diagnosis.findings.push(Finding {
                 code: "workspace-inventory".into(),
@@ -3380,6 +3527,11 @@ where
             report_stale_gateway_views(output, &mounts.stale)?;
             Ok(success())
         }
+        Command::Mount(args) => {
+            let storage = host_storage().await?;
+            let backend = mount_main::NativeMainMountBackend::new(storage);
+            mount_main::dispatch_mount_main(&backend, &args.repo_id, cli.global.json, output).await
+        }
         Command::List(args) => {
             let mut projects = list_all_adopted_projects().await?;
             sort_project_listing(&mut projects);
@@ -3484,6 +3636,94 @@ mod tests {
             )))
         );
         assert_eq!(parsed(&["exec", "raven", "--", "true"]), None);
+    }
+
+    /// `attach --all` with nothing detached but mains down must name the mains, not print the
+    /// bare no-sessions line: mains are always-mounted, so their absence is the actual defect.
+    #[test]
+    fn attach_all_without_detached_sessions_names_unmounted_mains() {
+        let mains = vec![
+            UnreachableMain {
+                repo_id: RepoId::parse("acme/alpha").expect("repo"),
+                image: PathBuf::from("/store/acme/alpha/main.asif"),
+                mountpoint: PathBuf::from("/checkouts/alpha"),
+                reason: "main's volume is not mounted".into(),
+            },
+            UnreachableMain {
+                repo_id: RepoId::parse("acme/beta").expect("repo"),
+                image: PathBuf::from("/store/acme/beta/main.sparseimage"),
+                mountpoint: PathBuf::from("/checkouts/beta"),
+                reason: "main's volume is not mounted".into(),
+            },
+        ];
+        let error = no_detached_with_mains(&mains);
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert!(error.message.contains("acme/alpha"), "{}", error.message);
+        assert!(error.message.contains("acme/beta"), "{}", error.message);
+        assert!(
+            error.message.contains("2 main workspace"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.hint, "cowshed gateway start");
+    }
+
+    #[test]
+    fn attach_all_without_detached_sessions_or_mains_stays_bare() {
+        let error = no_detached_with_mains(&[]);
+        assert_eq!(error.message, "no detached session workspace found");
+        assert_eq!(
+            error.hint,
+            "cowshed ls; cowshed attach <ws>; cowshed attach --all"
+        );
+    }
+
+    /// The mains line's remedy is the same command `doctor` prescribes for an unmounted main:
+    /// a hint that named anything else would be blind to the condition it reports.
+    #[test]
+    fn attach_mains_hint_matches_doctor_main_hint() {
+        let main = UnreachableMain {
+            repo_id: RepoId::parse("acme/alpha").expect("repo"),
+            image: PathBuf::from("/store/acme/alpha/main.asif"),
+            mountpoint: PathBuf::from("/checkouts/alpha"),
+            reason: "main's volume is not mounted".into(),
+        };
+        assert_eq!(
+            no_detached_with_mains(std::slice::from_ref(&main)).hint,
+            main_mount_finding(&main).hint,
+        );
+    }
+
+    /// A checkout-less project stays visible as an info finding with no remedy hint: the
+    /// inventory skips it, but nothing is broken that `doctor` can name.
+    #[test]
+    fn checkoutless_project_is_an_info_finding_without_a_hint() {
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        let store = std::env::temp_dir().join("cowshed-checkoutless-test");
+        let finding = no_adopted_checkout_finding(&repo, &store);
+        assert_eq!(finding.code, "no-adopted-checkout");
+        assert_eq!(finding.severity, FindingSeverity::Info);
+        assert!(
+            finding.message.contains("acme/widget"),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.hint.is_empty(),
+            "no command restores a checkout path the store never recorded; hint was {}",
+            finding.hint
+        );
+        assert!(
+            !finding.hint.contains("doctor"),
+            "hint was {}",
+            finding.hint
+        );
+        assert_eq!(
+            finding.path,
+            StorageLayout::new(&store, &repo)
+                .map(|layout| layout.project().project_root.clone())
+                .ok()
+        );
     }
 
     /// A store-wide mount change that could not reach the gateway is said out loud, on stderr,
