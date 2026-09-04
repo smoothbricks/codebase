@@ -3039,13 +3039,16 @@ mod tests {
     }
     #[test]
     fn system_runner_hung_disk_child_is_killed_at_the_deadline() {
-        // Hang injection: `/bin/sleep` stands in for a hung hdiutil detach that never
-        // answers. The store must kill the child at the deadline, mark the item deferred,
+        // Hang injection: a shell-builtin spin stands in for a hung hdiutil detach
+        // that never answers. Absolute coreutils paths (`/bin/sleep`, `/bin/echo`)
+        // do not exist on all Linux runners (NixOS provides only `/bin/sh`), so
+        // the hang and the follow-up probe must use `/bin/sh` builtins only.
+        // The store must kill the child at the deadline, mark the item deferred,
         // and let the queue continue — never wait forever.
         let started = std::time::Instant::now();
         let error = SystemCommandRunner
             .run_with_deadline(
-                &CommandRequest::new("/bin/sleep", ["30"]),
+                &CommandRequest::new("/bin/sh", ["-c", "while true; do :; done"]),
                 Duration::from_millis(250),
             )
             .unwrap_err();
@@ -3058,7 +3061,7 @@ mod tests {
         assert!(error.to_string().contains("deferred"));
         // The queue continues: a fast child right after the kill still runs.
         let output = SystemCommandRunner
-            .run(&CommandRequest::new("/bin/echo", ["next"]))
+            .run(&CommandRequest::new("/bin/sh", ["-c", "printf 'next\\n'"]))
             .unwrap();
         assert_eq!(output.stdout, b"next\n");
     }
