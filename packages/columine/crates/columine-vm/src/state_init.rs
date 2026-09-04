@@ -721,6 +721,11 @@ pub fn init_state(
             {
                 return Err(ErrorCode::InvalidProgram);
             }
+            // The derived-facts region indexes with `capacity - 1` masks; a
+            // capacity that is not a power of two would alias slots silently.
+            if slot_type == SlotType::ConditionTree && capacity > 0 && !capacity.is_power_of_two() {
+                return Err(ErrorCode::InvalidProgram);
+            }
 
             let mut ttl_seconds = 0.0f32;
             let mut grace_seconds = 0.0f32;
