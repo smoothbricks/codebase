@@ -77,9 +77,9 @@ fn sidecar(
         grants,
         info_snapshot: Some(WorkspaceInfoSnapshot {
             project_root: checkout.to_owned(),
-            role: WorkspaceRole::Workspace,
+            role: WorkspaceRole::for_name(workspace),
             base_commit: "8f31c2d".to_owned(),
-            branch: Some("raven".to_owned()),
+            branch: Some(workspace.as_str().to_owned()),
             created_at: "2026-07-14T00:00:00Z".to_owned(),
             forked_from: None,
             captured_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -89,7 +89,7 @@ fn sidecar(
     }
 }
 
-fn base_fixture(case: &str) -> (PathBuf, Fixture) {
+fn base_fixture(case: &str, name: &str) -> (PathBuf, Fixture) {
     let root = temp_root(case);
     let store = root.join("store");
     let mounts = root.join("mnt");
@@ -97,17 +97,23 @@ fn base_fixture(case: &str) -> (PathBuf, Fixture) {
     fs::create_dir_all(&mounts).expect("mounts");
 
     let repo = RepoId::parse("acme/widget").expect("repo");
-    let workspace = WorkspaceName::new("raven").expect("workspace");
+    let workspace = WorkspaceName::new(name).expect("workspace");
     let incarnation = WorkspaceIncarnation::new(INCARNATION).expect("incarnation");
     let layout = StorageLayout::with_mount_root(&store, &mounts, &repo).expect("project layout");
     let paths = layout.project().clone();
 
-    fs::create_dir_all(&paths.sessions).expect("sessions");
-    let image = paths.sessions.join("raven.sparseimage");
+    let image = if workspace.is_main() {
+        let main = layout.main_image(ImageFormat::Sparse).expect("main image");
+        fs::create_dir_all(main.image().parent().expect("image parent")).expect("image parent");
+        main.image().to_owned()
+    } else {
+        fs::create_dir_all(&paths.sessions).expect("sessions");
+        paths.sessions.join(format!("{name}.sparseimage"))
+    };
     fs::write(&image, b"image").expect("image");
 
     // Degraded live mount: the marker carries identity and needs no CA.
-    let mount_point = mounts.join("acme").join("widget").join("raven");
+    let mount_point = mounts.join("acme").join("widget").join(name);
     fs::create_dir_all(mount_point.join(".cowshed")).expect("credential dir");
     write_json(
         &mount_point.join(WORKSPACE_MARKER_PATH),
@@ -117,7 +123,7 @@ fn base_fixture(case: &str) -> (PathBuf, Fixture) {
             project_root: root.join("checkout"),
             workspace: workspace.clone(),
             workspace_incarnation: incarnation.clone(),
-            role: WorkspaceRole::Workspace,
+            role: WorkspaceRole::for_name(&workspace),
             image_format: ImageFormat::Sparse,
             base_commit: "8f31c2d".to_owned(),
             created_at: "2026-07-14T00:00:00Z".to_owned(),
@@ -141,15 +147,15 @@ fn base_fixture(case: &str) -> (PathBuf, Fixture) {
     )
 }
 
-fn quarantined_fixture(case: &str) -> Fixture {
-    let (root, mut fixture) = base_fixture(case);
+fn quarantined_fixture(case: &str, name: &str) -> Fixture {
+    let (root, mut fixture) = base_fixture(case, name);
     let paths = fixture.layout.project().clone();
     assert!(
         !sidecar_path(&fixture.image).exists(),
         "fixture must start with no canonical sidecar"
     );
 
-    let entry = paths.quarantine.join("raven-1756944000");
+    let entry = paths.quarantine.join(format!("{name}-1756944000"));
     fs::create_dir_all(&entry).expect("quarantine entry");
     sidecar(
         &RepoId::parse("acme/widget").expect("repo"),
@@ -158,19 +164,19 @@ fn quarantined_fixture(case: &str) -> Fixture {
         QUARANTINED_REVISION,
         &root.join("checkout"),
     )
-    .write_for_image(&entry.join("raven.sparseimage"))
+    .write_for_image(&entry.join(format!("{name}.sparseimage")))
     .expect("quarantined sidecar");
-    let quarantined_sidecar_path = sidecar_path(&entry.join("raven.sparseimage"));
+    let quarantined_sidecar_path = sidecar_path(&entry.join(format!("{name}.sparseimage")));
     assert!(quarantined_sidecar_path.is_file());
     let tombstone = serde_json::json!({
         "version": 1,
         "repoId": "acme/widget",
-        "workspace": "raven",
+        "workspace": name,
         "workspaceIncarnation": INCARNATION,
         "revision": QUARANTINED_REVISION,
         "reason": "missing-ca-companion",
         "image": fixture.image.to_str().expect("image utf8"),
-        "companion": paths.sessions.join("raven.sparseimage.ca.key").to_str().expect("companion utf8"),
+        "companion": format!("{}.ca.key", fixture.image.display()),
         "quarantinedAt": "2026-07-14T00:00:00Z",
         "sidecar": quarantined_sidecar_path.to_str().expect("sidecar utf8"),
     });
@@ -183,8 +189,8 @@ fn quarantined_fixture(case: &str) -> Fixture {
     fixture
 }
 
-fn live_keyless_fixture(case: &str) -> Fixture {
-    let (root, fixture) = base_fixture(case);
+fn live_keyless_fixture(case: &str, name: &str) -> Fixture {
+    let (root, fixture) = base_fixture(case, name);
     sidecar(
         &RepoId::parse("acme/widget").expect("repo"),
         &fixture.workspace,
@@ -225,7 +231,7 @@ fn assert_attachable(fixture: &Fixture, expected_revision: u64) {
 
 #[test]
 fn rekey_converts_keyless_quarantined_workspace_to_attachable() {
-    let fixture = quarantined_fixture("quarantined");
+    let fixture = quarantined_fixture("quarantined", "raven");
     let report = rekey_workspace(&fixture.layout, &fixture.workspace, &fixture.mount_point)
         .expect("rekey converts to active");
 
@@ -244,7 +250,7 @@ fn rekey_converts_keyless_quarantined_workspace_to_attachable() {
 
 #[test]
 fn rekey_preserves_revision_when_the_sidecar_never_left() {
-    let fixture = live_keyless_fixture("live");
+    let fixture = live_keyless_fixture("live", "raven");
     let report = rekey_workspace(&fixture.layout, &fixture.workspace, &fixture.mount_point)
         .expect("rekey heals the live sidecar");
 
@@ -258,7 +264,7 @@ fn rekey_preserves_revision_when_the_sidecar_never_left() {
 
 #[test]
 fn rekey_refuses_a_workspace_that_is_already_keyed() {
-    let (root, fixture) = base_fixture("keyed");
+    let (root, fixture) = base_fixture("keyed", "raven");
     let repo = RepoId::parse("acme/widget").expect("repo");
     let block = PortBlock::new(MACOS_PORT_BLOCK_MIN, PORT_BLOCK_SIZE).expect("port block");
     sidecar(
@@ -300,14 +306,25 @@ fn rekey_refuses_a_workspace_that_is_already_keyed() {
 }
 
 #[test]
-fn rekey_refuses_main_and_an_unmounted_workspace() {
-    let fixture = live_keyless_fixture("refusals");
-    let main = WorkspaceName::new("main").expect("main");
-    assert!(matches!(
-        rekey_workspace(&fixture.layout, &main, &fixture.mount_point),
-        Err(RekeyError::MainWorkspace)
-    ));
+fn rekey_supports_main_after_a_main_mount() {
+    let fixture = quarantined_fixture("quarantined-main", "main");
+    let report = rekey_workspace(&fixture.layout, &fixture.workspace, &fixture.mount_point)
+        .expect("rekey converts main to active");
 
+    assert_eq!(report.revision, QUARANTINED_REVISION + 1);
+    assert_eq!(report.workspace, fixture.workspace);
+    assert!(fixture.workspace.is_main());
+
+    assert_attachable(&fixture, QUARANTINED_REVISION + 1);
+
+    let entry = fixture.entry.expect("quarantine entry");
+    assert!(!entry.exists(), "quarantine entry must be removed");
+    assert_eq!(report.tombstone_removed, Some(entry));
+}
+
+#[test]
+fn rekey_refuses_an_unmounted_workspace() {
+    let fixture = live_keyless_fixture("refusals", "raven");
     let missing_mount = fixture.mount_point.join("nowhere");
     assert!(matches!(
         rekey_workspace(&fixture.layout, &fixture.workspace, &missing_mount),
