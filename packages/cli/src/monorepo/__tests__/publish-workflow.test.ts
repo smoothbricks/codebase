@@ -426,6 +426,25 @@ describe('publish workflow definition', () => {
     );
   });
 
+  it('renders a deploy-only workflow for repos that deploy but own no release packages', () => {
+    const rendered = renderPublishWorkflowYaml({ deploy: true, release: false, repoName: '@conloca/private' });
+
+    // The deploy must not wait on a release that can never happen here.
+    expect(rendered).toContain('- name: 🚀 Deploy production');
+    expect(rendered).not.toContain('steps.version.outputs.mode');
+    expect(rendered).not.toContain('smoo release');
+    expect(rendered).not.toContain('🧯 Repair pending releases');
+    expect(rendered).not.toContain('🔢 Version release');
+    expect(rendered).not.toContain('📦 Publish release');
+    expect(rendered).not.toContain('🏷️ Tag release');
+    expect(rendered).toContain("inputs.deploy_stage == 'production'");
+    expect(rendered).toContain("inputs.dry_run != 'true'");
+    // Nothing to bump when the workflow releases nothing.
+    expect(rendered).not.toContain('bump:');
+    // dry_run gates the deploy here, so it must not describe release commands.
+    expect(rendered).toContain('description: Skip the deploy and report what would run.');
+  });
+
   it('adds Cloudflare credentials for Wrangler-backed production deploys', () => {
     const rendered = renderPublishWorkflowYaml({
       deploy: true,
@@ -459,6 +478,49 @@ describe('publish workflow definition', () => {
 
     expect(deployed.productionDeployed).toBe(true);
     expect(dryRun.productionDeployed).toBe(false);
+  });
+
+  it('deploys production with no release for repos that own no packages', async () => {
+    const outcome = await publishWorkflowScenario({
+      deploy: true,
+      release: false,
+      repairs: [],
+      current: [],
+      bump: 'auto',
+      deployStage: 'production',
+      dryRun: false,
+      // No release means no version step, so mode stays 'none' — the deploy must
+      // still run, which the release-gated condition would have blocked.
+      version: { mode: 'none', projects: [] },
+    }).run();
+
+    const dryRun = await publishWorkflowScenario({
+      deploy: true,
+      release: false,
+      repairs: [],
+      current: [],
+      bump: 'auto',
+      deployStage: 'production',
+      dryRun: true,
+      version: { mode: 'none', projects: [] },
+    }).run();
+    const notRequested = await publishWorkflowScenario({
+      deploy: true,
+      release: false,
+      repairs: [],
+      current: [],
+      bump: 'auto',
+      deployStage: 'none',
+      dryRun: false,
+      version: { mode: 'none', projects: [] },
+    }).run();
+
+    expect(outcome.productionDeployed).toBe(true);
+    expect(outcome.publishRan).toBe(false);
+    expect(outcome.createdTags).toEqual([]);
+    // Dropping the version gate must not drop the other two.
+    expect(dryRun.productionDeployed).toBe(false);
+    expect(notRequested.productionDeployed).toBe(false);
   });
 
   it('bootstraps the self-hosted CLI before release commands only for the SmoothBricks repo', async () => {
@@ -582,6 +644,7 @@ interface ReleaseGap {
 
 interface WorkflowScenarioConfig {
   deploy?: boolean;
+  release?: boolean;
   repoName?: string;
   repairs: ReleaseGap[];
   current: ReleaseGap[];
@@ -613,10 +676,13 @@ function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promi
   return {
     async run() {
       const state = new WorkflowScenarioState(config);
-      await runPublishWorkflow(definePublishWorkflow({ deploy: config.deploy, repoName: config.repoName }), {
-        inputs: { bump: config.bump, deployStage: config.deployStage ?? 'none', dryRun: config.dryRun },
-        callbacks: state.callbacks(),
-      });
+      await runPublishWorkflow(
+        definePublishWorkflow({ deploy: config.deploy, release: config.release, repoName: config.repoName }),
+        {
+          inputs: { bump: config.bump, deployStage: config.deployStage ?? 'none', dryRun: config.dryRun },
+          callbacks: state.callbacks(),
+        },
+      );
       return state.outcome();
     },
   };
