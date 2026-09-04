@@ -428,14 +428,20 @@ impl NativeGatewayInventory {
             .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
+    /// Adopted projects, unmounted mains, and bound projects with no adopted checkout path.
+    ///
+    /// The third leg is what keeps a checkout-less project visible: the adopted list omits it
+    /// (there is nowhere to mount its main), and `doctor` reports each entry as an info
+    /// finding instead of the traversal printing a skip on stderr.
     pub async fn doctor_projects(
         &self,
-    ) -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>), GatewayInventoryError> {
+    ) -> Result<(Vec<AdoptedProject>, Vec<UnreachableMain>, Vec<RepoId>), GatewayInventoryError>
+    {
         let inventory = self.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
-            let projects = inventory.adopted_projects_blocking()?;
+            let (projects, checkoutless) = inventory.adopted_and_checkoutless_blocking()?;
             let unreachable = inventory.unmounted_mains_for(&projects)?;
-            Ok((projects, unreachable))
+            Ok((projects, unreachable, checkoutless))
         })
         .await
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
@@ -466,7 +472,20 @@ impl NativeGatewayInventory {
     }
 
     fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
+        self.adopted_and_checkoutless_blocking()
+            .map(|(projects, _)| projects)
+    }
+
+    /// One registry traversal for both the adopted list and the checkout-less remainder.
+    ///
+    /// Besides avoiding redundant I/O, a single pass guarantees one verdict per registry
+    /// entry rather than one per derived view: a project is adopted, checkout-less, or an
+    /// error, never two of those at once.
+    fn adopted_and_checkoutless_blocking(
+        &self,
+    ) -> Result<(Vec<AdoptedProject>, Vec<RepoId>), GatewayInventoryError> {
         let mut projects = Vec::new();
+        let mut checkoutless = Vec::new();
         for repo_id in discover_repositories(self.storage.store())? {
             let layout = match StorageLayout::new(self.storage.store(), &repo_id) {
                 Ok(layout) => layout,
@@ -482,13 +501,14 @@ impl NativeGatewayInventory {
                     repo_id,
                     project_root,
                 }),
-                Ok(None) => {
-                    eprintln!("cowshed: skipping {repo_id}: it records no adopted checkout path");
-                }
+                // No adopted checkout path means no adopted project, but the binding is still
+                // real: the entry is reported for `doctor` rather than printed on stderr from
+                // a library traversal, where it polluted command output.
+                Ok(None) => checkoutless.push(repo_id),
                 Err(error) => return Err(error),
             }
         }
-        Ok(projects)
+        Ok((projects, checkoutless))
     }
 
     pub async fn all_attached(&self) -> Result<Vec<GatewaySessionFact>, GatewayInventoryError> {
@@ -2738,5 +2758,30 @@ mod tests {
             }],
             "only the project whose main is detached is reported"
         );
+    }
+
+    /// A bound project whose main image records no adopted checkout path is omitted from the
+    /// adopted list but still reported, so `doctor` can name it instead of the inventory
+    /// swallowing it on stderr.
+    #[tokio::test]
+    async fn checkoutless_projects_are_reported_not_just_skipped() {
+        let fixture = Fixture::new("checkoutless-reported");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+
+        let inventory = NativeGatewayInventory::new(fixture.storage.clone());
+        assert!(
+            inventory
+                .adopted_projects()
+                .await
+                .expect("adopted projects")
+                .is_empty(),
+            "no checkout path means no adopted project"
+        );
+
+        let (projects, _, checkoutless) =
+            inventory.doctor_projects().await.expect("doctor projects");
+        assert!(projects.is_empty());
+        assert_eq!(checkoutless, vec![repo]);
     }
 }
