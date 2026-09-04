@@ -575,6 +575,13 @@ file. `attach` and `path` bring them back. `<ws>` detaches one session, resolved
 discovery. `--project` still selects the project. `--all` detaches every attached session workspace store-wide. Mains
 are always mounted and are never detach targets.
 
+### `cowshed mount main --repo-id <owner/repo>`
+
+Mount main for the named project and print its mount path. Resolution reads store records — the repository binding and
+the checkout-path record — rather than a live git checkout, so it works from an empty stub directory left by a broken
+workspace and never requires cwd or git discovery. The mount uses the gateway-canonical flags; a volume mounted with
+other flags is remounted rather than refused.
+
 ### `cowshed resize <name|main> <size>`
 
 Grow one workspace's image. Sizes are `100g`, `200g`, `1t` — binary units, at least a mebibyte, and a whole number of
@@ -593,6 +600,21 @@ volume is busy refuses the resize rather than being torn out from under running 
 Capacity itself is chosen once, at `cowshed adopt --capacity <size>` (default `100g`), because that is the only verb
 that mints an image — `new` and `fork` clone main's and inherit its capacity, so `resize` is how a clone gets a bigger
 one.
+
+### `cowshed rekey <name|main>`
+
+Rebuild one keyless workspace's CA identity and print its name. The quarantined grants sidecar is republished beside the
+still-in-place image with the revision bumped by one; fresh credentials are minted into the live mount, so the workspace
+must be mounted (a degraded mount is enough — the mount proof needs no CA). The quarantine entry is consumed when the
+rotation completes. When the sidecar never left, the revision is preserved. Rotation invalidates in-flight job
+certificates: they were signed by the lost CA generation.
+
+```
+$ cowshed rekey raven
+raven
+cowshed: workspace raven rekeyed at revision 8; quarantine entry <project>/quarantine/raven-1756944000 consumed
+next: cowshed attach raven
+```
 
 ### Simulators (iOS) — `cowshed sim export <name> [artifact]`
 
