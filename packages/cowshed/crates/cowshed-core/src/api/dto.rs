@@ -616,6 +616,18 @@ pub struct CheckpointResult {
     pub label: String,
 }
 
+/// The answer to `cowshed rekey <ws>`: the rotated workspace identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RekeyResult {
+    pub workspace: String,
+    pub workspace_incarnation: String,
+    pub revision: u64,
+    /// The consumed quarantine entry, when the quarantine path ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstone_removed: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RevisionResult {
@@ -2457,6 +2469,7 @@ result_bodies!(
     DoctorReport,
     GcReport,
     CheckpointResult,
+    RekeyResult,
     RevisionResult,
     ResizeResult,
     SlotResult,

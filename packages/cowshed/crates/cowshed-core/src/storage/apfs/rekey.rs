@@ -78,9 +78,6 @@ pub struct RekeyReport {
 /// or the named missing input.
 #[derive(Debug, Error)]
 pub enum RekeyError {
-    /// Mains are always mounted and never rekey targets.
-    #[error("rekey targets session workspaces; mains are always mounted")]
-    MainWorkspace,
     /// Neither a quarantine entry nor a live sidecar names this workspace.
     #[error("no rekeyable identity for workspace '{workspace}': {detail}")]
     NoIdentity { workspace: String, detail: String },
@@ -119,18 +116,14 @@ pub enum RekeyError {
 }
 
 impl RekeyError {
-    /// Operational mapping. Integrity for broken data, usage for wrong
-    /// targets, not-found for unknown workspaces, conflict when there is
-    /// nothing to rotate, environment-missing when the mount is absent.
-    /// `internal` is deliberately unused: its hint names `doctor`, which is
-    /// never the remedy for a rekey refusal.
+    /// Operational mapping. Integrity for broken data, not-found for unknown
+    /// workspaces, conflict when there is nothing to rotate,
+    /// environment-missing when the mount is absent. `internal` is
+    /// deliberately unused: its hint names `doctor`, which is never the
+    /// remedy for a rekey refusal.
     pub fn into_cowshed_error(self) -> crate::CowshedError {
         use crate::{CowshedError, ErrorCode};
         match self {
-            Self::MainWorkspace => CowshedError::usage(
-                "rekey targets session workspaces; mains are always mounted",
-                "cowshed rekey <ws>",
-            ),
             Self::NoIdentity { workspace, detail } => CowshedError::new(
                 ErrorCode::NotFound,
                 format!("no rekeyable identity for workspace '{workspace}': {detail}"),
@@ -142,13 +135,20 @@ impl RekeyError {
             ),
             Self::NotMounted {
                 workspace, mount, ..
-            } => CowshedError::environment_missing(
-                format!(
-                    "workspace '{workspace}' is not mounted at {}: rekey mints fresh CA into the live mount",
-                    mount.display()
-                ),
-                format!("cowshed attach {workspace}"),
-            ),
+            } => {
+                let remedy = if workspace == "main" {
+                    "cowshed mount main --repo-id <owner/repo>".to_owned()
+                } else {
+                    format!("cowshed attach {workspace}")
+                };
+                CowshedError::environment_missing(
+                    format!(
+                        "workspace '{workspace}' is not mounted at {}: rekey mints fresh CA into the live mount",
+                        mount.display()
+                    ),
+                    remedy,
+                )
+            }
             Self::IdentityMismatch { workspace, detail } => CowshedError::integrity(
                 format!(
                     "quarantine identity for workspace '{workspace}' is inconsistent: {detail}"
@@ -190,9 +190,6 @@ pub fn rekey_workspace(
     workspace: &WorkspaceName,
     mount_point: &Path,
 ) -> Result<RekeyReport, RekeyError> {
-    if workspace.is_main() {
-        return Err(RekeyError::MainWorkspace);
-    }
     let project = layout.project();
     let source = locate_source(layout, workspace)?;
 
