@@ -95,20 +95,199 @@ pub trait CommandRunner {
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError>;
 }
 
+/// The bound every spawned disk child (attach/detach, inventory, mount) answers inside.
+///
+/// A hung `hdiutil`/`diskutil` child used to wedge the store operation that spawned it
+/// forever — one stuck workspace took down every other workspace's verbs, and the daemon
+/// startup pass with them. On expiry the child is killed and the item reports a timeout
+/// ("deferred") so the queue continues and the next pass retries it; the per-leg
+/// [`timed_apfs_step`] span such a child was stuck inside now terminates with
+/// `status=err` and the waited elapsed instead of never closing.
+///
+/// 120 seconds is generous against normally sub-second disk children and stays inside the
+/// enclosing per-operation budgets even when a pass pays it once per workspace; tests
+/// override it through [`SystemCommandRunner::run_with_deadline`].
+pub const DISK_CHILD_DEADLINE: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemCommandRunner;
 
-impl CommandRunner for SystemCommandRunner {
-    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        let output = Command::new(&request.program)
-            .args(&request.args)
-            .output()
-            .map_err(|source| CommandRunError {
+impl SystemCommandRunner {
+    /// Spawn `request` and collect its output, killing the child when `deadline` passes
+    /// first. [`CommandRunner::run`] is this with [`DISK_CHILD_DEADLINE`]; tests pass a
+    /// short deadline to prove a hung child is reaped promptly.
+    pub fn run_with_deadline(
+        &self,
+        request: &CommandRequest,
+        deadline: Duration,
+    ) -> Result<CommandOutput, CommandRunError> {
+        use std::io::Read;
+        let mut child = spawn_disk_child(request).map_err(|source| CommandRunError {
+            request: request.clone(),
+            source,
+        })?;
+        // Drain both pipes on dedicated threads while the deadline poll runs, exactly as
+        // `Command::output` drains while it waits: a verbose child (fsck) must never wedge
+        // on a full pipe just because the parent is polling instead of reading. A child
+        // killed at the deadline drops its pipes, which ends both pumps.
+        let stdout = std::thread::spawn({
+            let mut pipe = child.stdout.take();
+            move || {
+                let mut bytes = Vec::new();
+                if let Some(pipe) = pipe.as_mut() {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            }
+        });
+        let stderr = std::thread::spawn({
+            let mut pipe = child.stderr.take();
+            move || {
+                let mut bytes = Vec::new();
+                if let Some(pipe) = pipe.as_mut() {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            }
+        });
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait().map_err(|source| CommandRunError {
                 request: request.clone(),
                 source,
-            })?;
-        Ok(output.into())
+            })? {
+                Some(status) => {
+                    let output = std::process::Output {
+                        status,
+                        stdout: stdout.join().unwrap_or_default(),
+                        stderr: stderr.join().unwrap_or_default(),
+                    };
+                    return Ok(CommandOutput::from(output));
+                }
+                None => {
+                    if started.elapsed() >= deadline {
+                        kill_disk_child_group(&mut child);
+                        let _ = child.wait();
+                        let _ = stdout.join();
+                        let _ = stderr.join();
+                        if let Some(image) = deferred_image_target(request) {
+                            record_deferred_image(image);
+                        }
+                        return Err(CommandRunError {
+                            request: request.clone(),
+                            source: io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!(
+                                    "disk child produced no result within {deadline:?}; \
+                                     child killed, item deferred for the next pass"
+                                ),
+                            ),
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
     }
+}
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
+        self.run_with_deadline(request, DISK_CHILD_DEADLINE)
+    }
+}
+/// Spawn a disk child detached into its own process group on Unix, so the deadline kill
+/// reaps the whole helper tree: `hdiutil attach` forks `diskimages-helper`, and killing
+/// only the direct child would leave the helper holding the wedge.
+fn spawn_disk_child(request: &CommandRequest) -> io::Result<std::process::Child> {
+    let mut command = Command::new(&request.program);
+    command
+        .args(&request.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` is async-signal-safe and runs in the forked child before
+        // exec; the child becomes its own group leader. Fail closed: a child that
+        // cannot leave the parent group must never be addressed by group id, so a
+        // setsid failure aborts the spawn instead of risking the parent group.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    command.spawn()
+}
+
+/// Kill a disk child and, on Unix, its whole process group.
+fn kill_disk_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // A negative pid addresses the group, which the child leads after setsid, so
+        // this reaches `diskimages-helper` too. Fail-open is safe here: the direct kill
+        // below still runs, and a group that is already gone reports ESRCH, not damage.
+        // SAFETY: `kill` with SIGKILL takes no callbacks and touches no Rust state.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Images whose disk child was killed at [`DISK_CHILD_DEADLINE`], oldest first.
+///
+/// The daemon startup pass drains this at the start of each pass (see
+/// [`take_deferred_images`]) and heals the drained images before the rest, so a
+/// deferred workspace is retried first rather than in inventory order.
+static DEFERRED_IMAGES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Cap on retained deferrals, so passes that never drain cannot grow memory without
+/// limit; entries past the cap evict the oldest first.
+const DEFERRED_IMAGES_CAP: usize = 1024;
+
+/// Record `path` for first-in-next-pass retry. Duplicate records collapse: one image
+/// is one early retry no matter how many of its children hit the deadline.
+pub(crate) fn record_deferred_image(path: PathBuf) {
+    let mut deferred = DEFERRED_IMAGES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !deferred.contains(&path) {
+        if deferred.len() >= DEFERRED_IMAGES_CAP {
+            deferred.remove(0);
+        }
+        deferred.push(path);
+    }
+}
+
+/// Drain the images deferred since the last pass, oldest first. The startup pass calls
+/// this once per pass and heals the drained images before the rest.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn take_deferred_images() -> Vec<PathBuf> {
+    std::mem::take(
+        &mut *DEFERRED_IMAGES
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()),
+    )
+}
+
+/// The image a disk child was working, when the argv names one.
+///
+/// Attach/detach argv carries its target last (the same convention the bootstrap mount
+/// path relies on); only an image path — not a `/dev/diskN` device — is a deferral key
+/// the startup pass can map back to a workspace.
+fn deferred_image_target(request: &CommandRequest) -> Option<PathBuf> {
+    if request.program != Path::new(HDIUTIL) && request.program != Path::new(DISKUTIL) {
+        return None;
+    }
+    let path = PathBuf::from(request.args.last()?);
+    ImageFormat::from_image_path(&path).ok().map(|_| path)
 }
 
 /// The wait an unforced detach spends before it gives up on politeness.
@@ -2858,6 +3037,84 @@ mod tests {
         assert_eq!(error.request.program, missing);
         assert!(error.to_string().contains("could not run"));
         assert!(std::error::Error::source(&error).is_some());
+    }
+    #[test]
+    fn system_runner_hung_disk_child_is_killed_at_the_deadline() {
+        // Hang injection: `/bin/sleep` stands in for a hung hdiutil detach that never
+        // answers. The store must kill the child at the deadline, mark the item deferred,
+        // and let the queue continue — never wait forever.
+        let started = std::time::Instant::now();
+        let error = SystemCommandRunner
+            .run_with_deadline(
+                &CommandRequest::new("/bin/sleep", ["30"]),
+                Duration::from_millis(250),
+            )
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "hung child held the store for {:?}; the deadline never fired",
+            started.elapsed()
+        );
+        assert_eq!(error.source.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("deferred"));
+        // The queue continues: a fast child right after the kill still runs.
+        let output = SystemCommandRunner
+            .run(&CommandRequest::new("/bin/echo", ["next"]))
+            .unwrap();
+        assert_eq!(output.stdout, b"next\n");
+    }
+
+    #[test]
+    fn system_runner_verbose_child_output_is_drained_under_deadline() {
+        // Pipes are pumped while the deadline poll runs: a child whose stdout exceeds the
+        // pipe buffer must complete with its output intact, never wedge on a full pipe.
+        let output = SystemCommandRunner
+            .run_with_deadline(
+                &CommandRequest::new("/bin/sh", ["-c", "seq 1 20000"]),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(output.succeeded());
+        assert_eq!(
+            output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+            20_000
+        );
+    }
+
+    #[test]
+    fn deferred_images_roundtrip_dedup_and_drain_oldest_first() {
+        let _ = take_deferred_images();
+        let sparse = PathBuf::from("/store/acme/main.sparseimage");
+        let asif = PathBuf::from("/store/acme/session.asif");
+        record_deferred_image(sparse.clone());
+        record_deferred_image(sparse.clone());
+        record_deferred_image(asif.clone());
+        assert_eq!(take_deferred_images(), vec![sparse, asif]);
+        assert!(take_deferred_images().is_empty());
+    }
+
+    #[test]
+    fn deferred_image_target_only_names_disk_tool_image_argv() {
+        assert_eq!(
+            deferred_image_target(&CommandRequest::new(
+                HDIUTIL,
+                [
+                    "attach",
+                    "-nobrowse",
+                    "-plist",
+                    "/store/acme/main.sparseimage"
+                ],
+            )),
+            Some(PathBuf::from("/store/acme/main.sparseimage"))
+        );
+        assert_eq!(
+            deferred_image_target(&CommandRequest::new(HDIUTIL, ["detach", "/dev/disk9"])),
+            None
+        );
+        assert_eq!(
+            deferred_image_target(&CommandRequest::new("/bin/sleep", ["30"])),
+            None
+        );
     }
 
     #[test]
