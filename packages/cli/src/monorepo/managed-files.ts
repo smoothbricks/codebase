@@ -330,12 +330,14 @@ function applyManagedFile(
   return { target: file.target, action: 'created' };
 }
 
-export const getManagedContentForTest = (file: ManagedFile, context: ManagedFileContext): string =>
-  getManagedContent(file, context);
-
-export const publishWorkflowManagedFileForTest = managedFiles.find(
-  (file) => file.kind === 'generated' && file.source === 'publish-workflow',
-) as ManagedFile;
+/** Renders publish.yml through the real managed-file descriptor, so the context wiring is covered. */
+export function renderManagedPublishWorkflowForTest(context: ManagedFileContext): string {
+  const file = managedFiles.find(({ kind, source }) => kind === 'generated' && source === 'publish-workflow');
+  if (!file) {
+    throw new Error('publish-workflow is no longer a managed file');
+  }
+  return getManagedContent(file, context);
+}
 
 function getManagedContent(file: ManagedFile, context: ManagedFileContext): string {
   if (file.kind === 'generated') {
