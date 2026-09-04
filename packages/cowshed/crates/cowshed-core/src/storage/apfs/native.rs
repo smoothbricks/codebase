@@ -1414,24 +1414,125 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let metadata = match fs::symlink_metadata(&companion) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ApfsStorageError::MarkerMismatch(format!(
-                    "{layout} is missing its CA companion: image={}, companion={}",
-                    image.display(),
-                    companion.display()
-                )));
+                return Err(ApfsStorageError::MissingCaCompanion {
+                    layout,
+                    image: image.to_owned(),
+                    companion,
+                });
             }
             Err(error) => {
                 return Err(io_error("inspect recovery CA companion", &companion, error));
             }
         };
         if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
-            return Err(ApfsStorageError::MarkerMismatch(format!(
-                "{layout} has an invalid CA companion: image={}, companion={}",
-                image.display(),
-                companion.display()
-            )));
+            return Err(ApfsStorageError::MissingCaCompanion {
+                layout,
+                image: image.to_owned(),
+                companion,
+            });
         }
         Ok(companion)
+    }
+
+    /// Companion check for an existing canonical image that quarantines instead of refusing.
+    ///
+    /// A missing or invalid CA companion beside a published image is a per-workspace integrity
+    /// failure, not store-wide corruption: the grants sidecar (+ companion if present) moves to
+    /// `<project>/quarantine/<ws>-<unix_ts>/` with a tombstone, the image stays in place, and
+    /// the pass continues. Genuine ambiguity (contradictory companions, restore states) still
+    /// propagates.
+    fn check_canonical_companion(
+        &self,
+        project: &Path,
+        metadata: &DetachedWorkspaceMetadata,
+        canonical: &Path,
+    ) -> Result<(), ApfsStorageError> {
+        match self.recovery_companion(canonical, "published canonical image") {
+            Ok(_) => Ok(()),
+            Err(ApfsStorageError::MissingCaCompanion {
+                image, companion, ..
+            }) => {
+                Self::quarantine_keyless_canonical(project, metadata, &image, &companion)?;
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Render unix seconds as an RFC3339 UTC timestamp using the crate's total civil-date
+    /// conversion rather than `libc::gmtime_r` (the same reason `utc_now` exists).
+    fn rfc3339_utc(seconds: u64) -> String {
+        let (year, month, day) = crate::storage::civil_from_days(seconds / 86_400);
+        let clock = seconds % 86_400;
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            clock / 3_600,
+            clock % 3_600 / 60,
+            clock % 60,
+        )
+    }
+
+    /// Quarantine a keyless canonical's grants sidecar so one workspace's missing CA identity
+    /// never aborts the store-wide pass. Same-volume renames only: the companion (if present)
+    /// and the sidecar move into `<project>/quarantine/<ws>-<unix_ts>/` beside a `tombstone.json`
+    /// (v1 camelCase), the image itself stays in place, and the tombstone is the report.
+    fn quarantine_keyless_canonical(
+        project: &Path,
+        metadata: &DetachedWorkspaceMetadata,
+        image: &Path,
+        companion: &Path,
+    ) -> Result<PathBuf, ApfsStorageError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        let quarantine_root = project.join(crate::repository::QUARANTINE_DIRECTORY);
+        let workspace = metadata.workspace.as_str();
+        let mut directory = quarantine_root.join(format!("{workspace}-{now}"));
+        let mut ordinal = 2_u64;
+        while directory.exists() {
+            directory = quarantine_root.join(format!("{workspace}-{now}-{ordinal}"));
+            ordinal = ordinal.saturating_add(1);
+        }
+        fs::create_dir_all(&directory)
+            .map_err(|error| io_error("create quarantine directory", &directory, error))?;
+        sync_parent_path(&directory)?;
+        // Companion before sidecar: this pass finds work by enumerating sidecars, so a crash
+        // after moving the sidecar would strand it in a tombstone-less directory the next pass
+        // never visits, while a crash after moving only the companion leaves the sidecar that
+        // brings the next pass straight back here.
+        if fs::symlink_metadata(companion).is_ok() {
+            let name = companion.file_name().ok_or(ApfsStorageError::InvalidPlan(
+                "quarantined CA companion path has no file name",
+            ))?;
+            let destination = directory.join(name);
+            fs::rename(companion, &destination)
+                .map_err(|error| io_error("quarantine invalid CA companion", companion, error))?;
+        }
+        let sidecar = sidecar_path(image);
+        let name = sidecar.file_name().ok_or(ApfsStorageError::InvalidPlan(
+            "quarantined grants sidecar path has no file name",
+        ))?;
+        let quarantined_sidecar = directory.join(name);
+        fs::rename(&sidecar, &quarantined_sidecar)
+            .map_err(|error| io_error("quarantine keyless grants sidecar", &sidecar, error))?;
+        let tombstone = directory.join("tombstone.json");
+        let record = QuarantineTombstone {
+            version: 1,
+            repo_id: metadata.repo_id.to_string(),
+            workspace: workspace.to_owned(),
+            incarnation: metadata.workspace_incarnation.as_str().to_owned(),
+            revision: metadata.grants.revision,
+            reason: "missing-ca-companion".to_owned(),
+            image: image.display().to_string(),
+            companion: companion.display().to_string(),
+            quarantined_at: Self::rfc3339_utc(now),
+            sidecar: quarantined_sidecar.display().to_string(),
+        };
+        crate::metadata::write_json(&tombstone, &record)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        sync_parent_path(&tombstone)?;
+        Ok(tombstone)
     }
 
     fn companions_match(left: &Path, right: &Path) -> Result<bool, ApfsStorageError> {
@@ -4599,7 +4700,7 @@ where
                             // publication recovery must neither bless nor reclaim it.
                             continue;
                         }
-                        self.recovery_companion(&canonical, "published canonical image")?;
+                        self.check_canonical_companion(&project, &metadata, &canonical)?;
                         continue;
                     }
                     let Ok(format) = ImageFormat::from_image_path(&canonical) else {
@@ -4629,7 +4730,7 @@ where
                         continue;
                     };
                     if canonical.exists() {
-                        self.recovery_companion(&canonical, "published canonical image")?;
+                        self.check_canonical_companion(&project, &metadata, &canonical)?;
                         continue;
                     }
                     let staged = project.join(super::STAGING_NAMESPACE).join(format!(
@@ -5340,6 +5441,27 @@ where
         let project = layout(config, plan.repo())?.project().project_root.clone();
         self.execute_gc_plan(&project, plan)
     }
+}
+
+/// Quarantine tombstone beside a moved-aside grants sidecar (v1, camelCase).
+///
+/// Written when `recover_pending` quarantines a canonical workspace whose CA companion is
+/// missing or invalid: the image stays in place, the sidecar (+ companion if present) moves
+/// into the same directory, and this record names everything the rekey path needs to rebuild.
+/// Shared with `doctor()` as the single reader schema so the JSON shape cannot drift.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct QuarantineTombstone {
+    pub(crate) version: u32,
+    pub(crate) repo_id: String,
+    pub(crate) workspace: String,
+    pub(crate) incarnation: String,
+    pub(crate) revision: u64,
+    pub(crate) reason: String,
+    pub(crate) image: String,
+    pub(crate) companion: String,
+    pub(crate) quarantined_at: String,
+    pub(crate) sidecar: String,
 }
 
 fn metadata_workspace_ref(
