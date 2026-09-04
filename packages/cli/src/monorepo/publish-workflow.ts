@@ -27,7 +27,12 @@ const PUBLISH_WORKFLOW_FORMAT_OPTIONS = Object.freeze({
 const synchronizedPrettier = makeModuleSynchronized<typeof PrettierModule>(import.meta.resolve('prettier'));
 
 export type PublishWorkflowBump = 'auto' | 'patch' | 'minor' | 'major' | 'prerelease';
-export type PublishWorkflowCondition = 'version-mode-not-none' | 'deploy-production' | 'failure' | 'always';
+export type PublishWorkflowCondition =
+  | 'version-mode-not-none'
+  | 'deploy-production'
+  | 'deploy-production-standalone'
+  | 'failure'
+  | 'always';
 export type PublishWorkflowNxTarget = 'build' | 'lint' | 'test';
 export type PublishWorkflowDeployStage = 'none' | 'production';
 
@@ -65,6 +70,12 @@ export interface PublishWorkflowDefinition {
 
 export interface PublishWorkflowDefinitionOptions {
   deploy?: boolean;
+  /**
+   * Whether the repo owns packages this workflow can release. False drops the
+   * release half entirely: a repo publishing nothing has no version to gate a
+   * production deploy on, and every `smoo release` command throws without one.
+   */
+  release?: boolean;
   deployProvider?: 'cloudflare';
   repoName?: string;
   platformTargetGlobs?: readonly string[];
@@ -124,6 +135,9 @@ type PublishWorkflowStepInput = Omit<PublishWorkflowStep, 'number'>;
 
 export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions = {}): PublishWorkflowDefinition {
   const versionMode = githubExpression('steps.version.outputs.mode');
+  if (options.release === false) {
+    return { steps: defineDeployOnlyWorkflowSteps() };
+  }
   const setupSteps: PublishWorkflowStepInput[] = [
     { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
     { kind: PublishWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', id: 'setup' },
@@ -194,6 +208,28 @@ export function definePublishWorkflow(options: PublishWorkflowDefinitionOptions 
       },
     ]),
   };
+}
+
+/**
+ * Repos that deploy but own no release packages. Build, lint and test are not
+ * dropped safety: `nx-deploy --verify` runs all three before it deploys.
+ */
+function defineDeployOnlyWorkflowSteps(): PublishWorkflowStep[] {
+  return numberWorkflowSteps([
+    { kind: PublishWorkflowStepKind.Checkout, name: '📥 Checkout' },
+    { kind: PublishWorkflowStepKind.SetupDevenv, name: '🧱 Setup Nix/devenv', id: 'setup' },
+    {
+      kind: PublishWorkflowStepKind.DeployProduction,
+      name: '🚀 Deploy production',
+      condition: 'deploy-production-standalone',
+    },
+    { kind: PublishWorkflowStepKind.UploadTraceDbs, name: '📎 Upload trace DBs', condition: 'failure' },
+    {
+      kind: PublishWorkflowStepKind.SaveNixDevenv,
+      name: '🧹 Cleanup and cache Nix/devenv',
+      condition: 'always',
+    },
+  ]);
 }
 
 function numberWorkflowSteps(steps: PublishWorkflowStepInput[]): PublishWorkflowStep[] {
@@ -290,6 +326,9 @@ function shouldRunStep(
   if (step.condition === 'deploy-production') {
     return version.mode !== 'none' && inputs.deployStage === 'production' && !inputs.dryRun;
   }
+  if (step.condition === 'deploy-production-standalone') {
+    return inputs.deployStage === 'production' && !inputs.dryRun;
+  }
   if (step.condition === 'failure') {
     return failed;
   }
@@ -298,7 +337,10 @@ function shouldRunStep(
 
 export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
   let workflow: string;
-  if (hasMacosPlatformTargets(options)) {
+  if (options.release === false) {
+    const steps = definePublishWorkflow(options).steps;
+    workflow = `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(steps, options)}`;
+  } else if (hasMacosPlatformTargets(options)) {
     workflow = renderPlatformPublishWorkflowYaml(options);
   } else if (hasLinuxPlatformTargets(options)) {
     workflow = `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
@@ -313,6 +355,21 @@ export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOpti
 }
 
 function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions): string {
+  const dryRunDescription =
+    options.release === false
+      ? 'Skip the deploy and report what would run.'
+      : 'Run release commands without writing versions, tags, publishes, or GitHub Releases.';
+  const bumpInput =
+    options.release === false
+      ? ''
+      : `
+      bump:
+        type: choice
+        description:
+          Use auto for conventional commits, or force a semver bump. Prerelease publishes to next; all others publish to
+          latest.
+        options: [auto, patch, minor, major, prerelease]
+        default: auto`;
   const deployInput =
     options.deploy === true
       ? `
@@ -326,17 +383,10 @@ function renderPublishWorkflowHeader(options: PublishWorkflowDefinitionOptions):
 
 on:
   workflow_dispatch:
-    inputs:
-      bump:
-        type: choice
-        description:
-          Use auto for conventional commits, or force a semver bump. Prerelease publishes to next; all others publish to
-          latest.
-        options: [auto, patch, minor, major, prerelease]
-        default: auto
+    inputs:${bumpInput}
       dry_run:
         type: boolean
-        description: Run release commands without writing versions, tags, publishes, or GitHub Releases.
+        description: ${dryRunDescription}
         default: false${deployInput}
 
 permissions:
@@ -535,11 +585,17 @@ function tagReleaseStepLines(name: string): string[] {
 }
 
 function deployProductionStep(step: PublishWorkflowStep, options: PublishWorkflowDefinitionOptions): string[] {
+  const conditionLines =
+    step.condition === 'deploy-production-standalone'
+      ? ["        if: ${{ inputs.deploy_stage == 'production' && inputs.dry_run != 'true' }}"]
+      : [
+          '        if:',
+          "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_stage == 'production' && inputs.dry_run !=",
+          "          'true' }}",
+        ];
   return [
     `      - name: ${step.name}`,
-    '        if:',
-    "          ${{ steps.version.outputs.mode != 'none' && inputs.deploy_stage == 'production' && inputs.dry_run !=",
-    "          'true' }}",
+    ...conditionLines,
     ...deployEnvLines(options),
     '        run: smoo github-ci nx-deploy --stage production --mode run-many --verify --name "Deploy Production"',
   ];

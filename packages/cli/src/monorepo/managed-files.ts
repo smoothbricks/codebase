@@ -134,7 +134,7 @@ export interface FileResult {
   action: 'created' | 'updated' | 'unchanged' | 'skipped' | 'skipped-symlink' | 'drifted' | 'ok-symlink';
 }
 
-interface ManagedFileContext {
+export interface ManagedFileContext {
   hasReleasePackages: boolean;
   hasStagingDeployTargets: boolean;
   hasProductionDeployTargets: boolean;
@@ -330,6 +330,13 @@ function applyManagedFile(
   return { target: file.target, action: 'created' };
 }
 
+export const getManagedContentForTest = (file: ManagedFile, context: ManagedFileContext): string =>
+  getManagedContent(file, context);
+
+export const publishWorkflowManagedFileForTest = managedFiles.find(
+  (file) => file.kind === 'generated' && file.source === 'publish-workflow',
+) as ManagedFile;
+
 function getManagedContent(file: ManagedFile, context: ManagedFileContext): string {
   if (file.kind === 'generated') {
     if (file.source === 'ci-workflow') {
@@ -345,6 +352,9 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
     if (file.source === 'publish-workflow') {
       return renderPublishWorkflowYaml({
         deploy: context.hasProductionDeployTargets,
+        // A repo reaches this file on deploy targets alone. Without owned
+        // packages every release step throws, so render the deploy-only shape.
+        release: context.hasReleasePackages,
         deployProvider: context.productionDeployProvider,
         repoName: context.repoName,
         platformTargetGlobs: context.platformTargetGlobs,
