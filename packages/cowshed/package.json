@@ -164,7 +164,9 @@
       "trampoline-test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "cache": true,
+        "//": "dependsOn ^build so lmao/dist exists: bunfig.napi-test.toml preloads ../../lmao/dist/ts/bun/trace-preload.js, and without the edge a cold cache runs this target before lmao:build.",
         "dependsOn": [
+          "^build",
           "typecheck-tests"
         ],
         "options": {
