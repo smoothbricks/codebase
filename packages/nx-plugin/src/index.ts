@@ -1183,7 +1183,13 @@ function createNapiTargets(
   hostPlatform: NapiPlatform | null,
   repoRooted: boolean,
 ): Record<string, TargetConfiguration> {
-  const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage}`;
+  // napi derives the addon filename ([name]) from the nearest package.json `napi`
+  // field starting at the invocation cwd. A repository-root invocation runs where
+  // no such field exists, so without an explicit path every repo-rooted build
+  // emits index.*.node while the loader resolves binaryName.*.node — a mismatch
+  // that stale local artifacts can mask for months.
+  const packageJsonPath = repoRooted ? posix.join(projectRoot, 'package.json') : 'package.json';
+  const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage} --package-json-path ${packageJsonPath}`;
   const cargoInputs = repoRooted ? REPO_ROOT_CARGO_OUTPUT_INPUTS : NAPI_INPUTS;
   const cargoCwd = repoRooted ? '.' : projectRoot;
   // A repository-root Cargo invocation runs outside the owning npm package, so
