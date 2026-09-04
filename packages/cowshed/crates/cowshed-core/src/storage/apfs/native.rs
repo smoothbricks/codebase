@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::super::bootstrap::is_reserved_store_namespace;
+use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
     CheckpointFact, KernelMountFact, LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin,
     ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcCandidate, StorageGcPlan,
@@ -1377,7 +1378,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     fn remove_sidecar(image: &Path) -> Result<(), ApfsStorageError> {
         let sidecar = sidecar_path(image);
         match fs::remove_file(&sidecar) {
-            Ok(()) => sync_parent_path(&sidecar),
+            Ok(()) => {
+                // Tombstone for the unlink that just happened; best-effort by contract.
+                deletion_log::log_deletion_for_image(
+                    image,
+                    DeletionOp::RemoveSidecar,
+                    DeletionKind::Sidecar,
+                    &sidecar,
+                );
+                sync_parent_path(&sidecar)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error("remove detached metadata", &sidecar, error)),
         }
@@ -1497,25 +1507,17 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         fs::create_dir_all(&directory)
             .map_err(|error| io_error("create quarantine directory", &directory, error))?;
         sync_parent_path(&directory)?;
-        // Companion before sidecar: this pass finds work by enumerating sidecars, so a crash
-        // after moving the sidecar would strand it in a tombstone-less directory the next pass
-        // never visits, while a crash after moving only the companion leaves the sidecar that
-        // brings the next pass straight back here.
-        if fs::symlink_metadata(companion).is_ok() {
-            let name = companion.file_name().ok_or(ApfsStorageError::InvalidPlan(
-                "quarantined CA companion path has no file name",
-            ))?;
-            let destination = directory.join(name);
-            fs::rename(companion, &destination)
-                .map_err(|error| io_error("quarantine invalid CA companion", companion, error))?;
-        }
+        // Tombstone before moves, companion before sidecar: `recover_pending` finds work by
+        // enumerating sidecars, so the tombstone must name the quarantine before the canonical
+        // sidecar disappears — a crash before the tombstone leaves every artifact in place for
+        // the next pass to retry, and a crash after it leaves a tombstone naming each one.
+        // Within the moves the companion goes first for the same reason: a crash after moving
+        // only the companion leaves the sidecar that brings the next pass straight back here.
         let sidecar = sidecar_path(image);
         let name = sidecar.file_name().ok_or(ApfsStorageError::InvalidPlan(
             "quarantined grants sidecar path has no file name",
         ))?;
         let quarantined_sidecar = directory.join(name);
-        fs::rename(&sidecar, &quarantined_sidecar)
-            .map_err(|error| io_error("quarantine keyless grants sidecar", &sidecar, error))?;
         let tombstone = directory.join("tombstone.json");
         let record = QuarantineTombstone {
             version: 1,
@@ -1532,6 +1534,16 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         crate::metadata::write_json(&tombstone, &record)
             .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
         sync_parent_path(&tombstone)?;
+        if fs::symlink_metadata(companion).is_ok() {
+            let name = companion.file_name().ok_or(ApfsStorageError::InvalidPlan(
+                "quarantined CA companion path has no file name",
+            ))?;
+            let destination = directory.join(name);
+            fs::rename(companion, &destination)
+                .map_err(|error| io_error("quarantine invalid CA companion", companion, error))?;
+        }
+        fs::rename(&sidecar, &quarantined_sidecar)
+            .map_err(|error| io_error("quarantine keyless grants sidecar", &sidecar, error))?;
         Ok(tombstone)
     }
 
@@ -1547,7 +1559,15 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     fn remove_companion(image: &Path) -> Result<(), ApfsStorageError> {
         let companion = companion_path(image);
         match fs::remove_file(&companion) {
-            Ok(()) => sync_parent_path(&companion),
+            Ok(()) => {
+                deletion_log::log_deletion_for_image(
+                    image,
+                    DeletionOp::RemoveCompanion,
+                    DeletionKind::Companion,
+                    &companion,
+                );
+                sync_parent_path(&companion)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error("remove CA companion", &companion, error)),
         }
@@ -2124,7 +2144,17 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 .join(CHECKPOINTS_DIRECTORY)
                 .join(authority.workspace().name().as_str());
             match fs::remove_dir(&checkpoint_directory) {
-                Ok(()) => sync_parent_path(&checkpoint_directory)?,
+                Ok(()) => {
+                    deletion_log::log_deletion(
+                        project,
+                        DeletionOp::ReclaimRetiredArtifact,
+                        DeletionKind::Other,
+                        authority.workspace().name().as_str(),
+                        Some(trash_image),
+                        &checkpoint_directory,
+                    );
+                    sync_parent_path(&checkpoint_directory)?
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(io_error(
@@ -2137,7 +2167,17 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         if let Some(mount_point) = &cleanup.mount_point {
             match fs::remove_dir(mount_point) {
-                Ok(()) => sync_parent_path(mount_point)?,
+                Ok(()) => {
+                    deletion_log::log_deletion(
+                        project,
+                        DeletionOp::ReclaimRetiredArtifact,
+                        DeletionKind::Other,
+                        authority.workspace().name().as_str(),
+                        Some(trash_image),
+                        mount_point,
+                    );
+                    sync_parent_path(mount_point)?
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(io_error("remove retired mountpoint", mount_point, error));
@@ -2235,11 +2275,15 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// Detach a staging mountpoint if the kernel still holds a volume there, then remove the
     /// directory. The format picks the detach tool; a mount whose image is gone is detached as a
     /// sparse image, the only format `hdiutil` attaches under a plain mountpoint.
+    ///
+    /// Returns whether the directory was actually removed: an already-absent mountpoint is
+    /// success without removal, and the caller logs a tombstone only for a real removal so
+    /// the deletion log never claims an unlink that did not happen.
     fn retire_staging_mount(
         &self,
         mount_point: &Path,
         format: ImageFormat,
-    ) -> Result<(), ApfsStorageError>
+    ) -> Result<bool, ApfsStorageError>
     where
         R: CommandRunner,
     {
@@ -2256,8 +2300,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             )?;
         }
         match fs::remove_dir(mount_point) {
-            Ok(()) => sync_parent_path(mount_point),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => sync_parent_path(mount_point).map(|()| true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("remove staging mountpoint", mount_point, error)),
         }
     }
@@ -2688,7 +2732,19 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     if let Some(stem) = candidate.path().file_stem().and_then(|stem| stem.to_str())
                     {
                         let mount_point = self.staging_mount_point(plan.repo(), stem)?;
-                        self.retire_staging_mount(&mount_point, format)?;
+                        if self.retire_staging_mount(&mount_point, format)? {
+                            let workspace = staged_stem_workspace(stem)
+                                .map(|name| name.as_str().to_owned())
+                                .unwrap_or_default();
+                            deletion_log::log_deletion(
+                                project,
+                                DeletionOp::RemoveStagingMount,
+                                DeletionKind::Other,
+                                &workspace,
+                                None,
+                                &mount_point,
+                            );
+                        }
                     }
                     self.reclaim_image(candidate.path(), format)?;
                     report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
@@ -2696,7 +2752,23 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     )?;
                 }
                 StorageGcReason::OrphanStagingMount => {
-                    self.retire_staging_mount(candidate.path(), ImageFormat::Sparse)?;
+                    if self.retire_staging_mount(candidate.path(), ImageFormat::Sparse)? {
+                        let workspace = candidate
+                            .path()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(staged_stem_workspace)
+                            .map(|name| name.as_str().to_owned())
+                            .unwrap_or_default();
+                        deletion_log::log_deletion(
+                            project,
+                            DeletionOp::RemoveStagingMount,
+                            DeletionKind::Other,
+                            &workspace,
+                            None,
+                            candidate.path(),
+                        );
+                    }
                 }
                 StorageGcReason::OrphanMountpoint => {
                     let kept = remove_stray_junk(candidate.path(), &self.config.checkout_path)?;
@@ -2712,7 +2784,22 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                         )));
                     }
                     match fs::remove_dir(candidate.path()) {
-                        Ok(()) => sync_parent_path(candidate.path())?,
+                        Ok(()) => {
+                            let workspace = candidate
+                                .path()
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or_default();
+                            deletion_log::log_deletion(
+                                project,
+                                DeletionOp::RemoveOrphanMountpoint,
+                                DeletionKind::Other,
+                                workspace,
+                                None,
+                                candidate.path(),
+                            );
+                            sync_parent_path(candidate.path())?
+                        }
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => {
                             return Err(io_error(
@@ -2736,6 +2823,23 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     fs::remove_file(candidate.path()).map_err(|error| {
                         io_error("remove orphan staging metadata", candidate.path(), error)
                     })?;
+                    if let Ok(image) = image_from_sidecar(candidate.path()) {
+                        deletion_log::log_deletion_for_image(
+                            &image,
+                            DeletionOp::RemoveOrphanStagingMetadata,
+                            DeletionKind::Sidecar,
+                            candidate.path(),
+                        );
+                    } else {
+                        deletion_log::log_deletion(
+                            project,
+                            DeletionOp::RemoveOrphanStagingMetadata,
+                            DeletionKind::Sidecar,
+                            "",
+                            None,
+                            candidate.path(),
+                        );
+                    }
                     sync_parent_path(candidate.path())?;
                     report.freed_bytes = report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                         ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
@@ -4452,6 +4556,12 @@ where
         match fs::symlink_metadata(image) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 self.backend.delete_image(image, format)?;
+                deletion_log::log_deletion_for_image(
+                    image,
+                    DeletionOp::ReclaimImage,
+                    DeletionKind::Image,
+                    image,
+                );
             }
             Ok(_) => {
                 return Err(ApfsStorageError::Host(format!(
@@ -4462,16 +4572,28 @@ where
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error("inspect reclaim image", image, error)),
         }
-        for (artifact, operation) in [
-            (companion_path(image), "remove CA key"),
-            (checkpoint_fact_path(image), "remove checkpoint fact"),
+        // The companion goes through the hooked remover so it always leaves a tombstone;
+        // the fact files are image-family metadata logged here with their own kinds.
+        Self::remove_companion(image)?;
+        for (artifact, operation, kind) in [
+            (
+                checkpoint_fact_path(image),
+                "remove checkpoint fact",
+                DeletionKind::Sidecar,
+            ),
             (
                 restore_recovery_fact_path(image),
                 "remove restore recovery fact",
+                DeletionKind::Other,
             ),
         ] {
             match fs::remove_file(&artifact) {
-                Ok(()) => {}
+                Ok(()) => deletion_log::log_deletion_for_image(
+                    image,
+                    DeletionOp::ReclaimImage,
+                    kind,
+                    &artifact,
+                ),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io_error(operation, &artifact, error)),
             }
