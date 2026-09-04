@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cowshed_core::apfs::{ApfsCaseSensitivity, CommandOutput, CommandRequest, CommandRunner};
-use cowshed_core::metadata::{ImageFormat, WorkspaceName};
+use cowshed_core::metadata::WorkspaceName;
 use cowshed_core::repository::RepoId;
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::{ApfsExecutionHost, ApfsSubstrateConfig, CheckoutLayout};
@@ -152,13 +152,20 @@ fn orphan_gc_run_writes_tombstone_and_classifies_missing_companion() {
 }
 
 /// (b) A stale, empty session mountpoint directory — no image names it, no volume is
-/// mounted at it — is removed by the sweep instead of lingering under the mount root.
+/// mounted at it — is removed by the sweep instead of lingering. That covers both the
+/// orphan mountpoint under the mount root and the harder case: a staging mountpoint
+/// whose stem staging never produces (no live operation can own it), which the sweep
+/// used to leave alone forever.
 #[test]
 fn sweep_removes_stale_empty_session_mountpoint() {
     let fixture = Fixture::new("stale-mountpoint");
     let mount_root = fixture.mount_root();
     let stale = mount_root.join("stale-ws");
     std::fs::create_dir_all(&stale).expect("stale mountpoint");
+    // No image, no sidecar, no lock, no mount — and a stem no staging operation emits,
+    // so the stem parser rejects it and only the stale-directory rule can catch it.
+    let stale_staging = mount_root.join(".staging").join("stale-mount");
+    std::fs::create_dir_all(&stale_staging).expect("stale staging mountpoint");
     std::fs::create_dir_all(fixture.project_root().join("sessions")).expect("sessions");
 
     let host = host(&fixture);
@@ -170,8 +177,18 @@ fn sweep_removes_stale_empty_session_mountpoint() {
             && candidate.path() == stale),
         "stale mountpoint must be sweep-planned"
     );
+    assert!(
+        plan.candidates().iter().any(|candidate| candidate.reason()
+            == StorageGcReason::OrphanStagingMount
+            && candidate.path() == stale_staging),
+        "stale staging mountpoint must be sweep-planned"
+    );
     host.execute_gc(&config, plan).expect("execute");
     assert!(!stale.exists(), "stale empty session mountpoint is removed");
+    assert!(
+        !stale_staging.exists(),
+        "stale empty staging mountpoint is removed"
+    );
 }
 
 /// (c) Fence sub-steps on the intent record let the classifier tell a mid-fence crash
