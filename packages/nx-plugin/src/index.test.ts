@@ -491,12 +491,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(native['napi-debug']?.options).toMatchObject({
         cwd: '.',
         command:
-          'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/.cache/native-debug',
+          'packages/native/node_modules/.bin/napi build --platform --no-js --dts native.napi.d.ts --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/.cache/native-debug',
       });
       expect(native['napi-arm64-macos']?.options).toMatchObject({
         cwd: '.',
         command:
-          'packages/native/node_modules/.bin/napi build --release --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --output-dir packages/native/dist/native/darwin-arm64',
+          'packages/native/node_modules/.bin/napi build --release --platform --no-js --dts native.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path packages/native/crates/native-napi/Cargo.toml --package native-napi --package-json-path packages/native/package.json --output-dir packages/native/dist/native/darwin-arm64',
       });
       expect(native.build?.dependsOn).toContainEqual(rootCompile);
       expect(native.clean?.executor).toBe('@smoothbricks/nx-plugin:clean-outputs');
@@ -679,14 +679,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         options: {
           cwd: 'packages/cowshed',
           command:
-            'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/host',
+            'napi build --release --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/host',
         },
       });
       expect(unservedHostTargets.build?.dependsOn).toEqual(['^build', 'cargo-test-compile', 'cargo-napi', 'tsc-js']);
       expect(targets['napi-arm64-macos']?.outputs).toEqual(['{projectRoot}/dist/native/darwin-arm64']);
       expect(targets['napi-arm64-macos']?.options).toMatchObject({
         command:
-          'napi build --release --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/darwin-arm64',
+          'napi build --release --platform --no-js --dts cowshed.darwin-arm64.d.ts --target aarch64-apple-darwin --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/darwin-arm64',
       });
       expect(targets['napi-arm64-macos']?.options?.env).toBeUndefined();
       // No cargo-test-compile edge here, on ANY host: a platform target's
@@ -747,7 +747,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(darwinArm64Targets['napi-arm64-linux']?.dependsOn).toEqual(['napi-toolchain-arm64-linux']);
       expect(darwinArm64Targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
       expect(darwinArm64Targets['napi-x64-linux']?.options?.command).toBe(
-        'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir dist/native/linux-x64-gnu',
+        'napi build --release --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/linux-x64-gnu',
       );
 
       // The whole rule, stated once per forced host: a triple gets a cross
@@ -817,7 +817,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         options: {
           cwd: 'packages/cowshed',
           command:
-            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --output-dir .cache/native-debug',
+            'napi build --platform --no-js --dts cowshed.napi.d.ts --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir .cache/native-debug',
         },
       });
       expect(targets['cargo-test']?.dependsOn).toEqual(['cargo-test-cowshed-napi']);
