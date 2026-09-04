@@ -275,8 +275,8 @@ fn storage_error(error: ApfsStorageError) -> CowshedError {
                 .unwrap_or("workspace");
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }
-        error @ ApfsStorageError::Quarantined { .. } => {
-            CowshedError::integrity(error.to_string(), "inspect quarantine")
+        ref error @ ApfsStorageError::Quarantined { ref workspace, .. } => {
+            CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }
         other => CowshedError::integrity(other.to_string(), "cowshed doctor --json"),
     }
