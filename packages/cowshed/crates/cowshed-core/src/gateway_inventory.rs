@@ -550,6 +550,22 @@ impl NativeGatewayInventory {
     /// project whose main is unreachable.
     pub async fn heal_all(&self) -> Result<Vec<ProjectHealOutcome>, GatewayInventoryError> {
         let store = self.storage.store().to_owned();
+        // Deferred-first: images whose disk child hit the deadline on the last pass heal
+        // before the rest, so a deferred workspace is retried first rather than in
+        // inventory order. Empty most passes, in which case every order below is untouched.
+        let deferred = crate::apfs::take_deferred_images();
+        let store_root = self.storage.store().to_owned();
+        let was_deferred = |repo: &RepoId, workspace: &LifecycleWorkspace| {
+            let Ok(layout) = StorageLayout::new(&store_root, repo) else {
+                return false;
+            };
+            let Ok(paths) = canonical_image_paths(&layout, workspace) else {
+                return false;
+            };
+            deferred
+                .iter()
+                .any(|candidate| candidate.as_path() == paths.image())
+        };
         let repositories =
             crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
                 .await
@@ -560,6 +576,15 @@ impl NativeGatewayInventory {
             opened.push((repo, project));
         }
         let mut healed_mains = Vec::with_capacity(opened.len());
+        if !deferred.is_empty() {
+            opened.sort_by_cached_key(|(repo, project)| {
+                !project
+                    .as_ref()
+                    .ok()
+                    .and_then(|open| open.main.as_ref())
+                    .is_some_and(|main| was_deferred(repo, main))
+            });
+        }
         for (repo_id, project) in opened {
             let (project, main) = match project {
                 Ok(project) => {
@@ -582,7 +607,12 @@ impl NativeGatewayInventory {
             let mut sessions = Vec::new();
             if let Some(project) = healed.project {
                 sessions.reserve(project.sessions.len());
-                for workspace in &project.sessions {
+                let mut ordered: Vec<&LifecycleWorkspace> = project.sessions.iter().collect();
+                if !deferred.is_empty() {
+                    ordered
+                        .sort_by_cached_key(|&workspace| !was_deferred(&healed.repo_id, workspace));
+                }
+                for workspace in ordered {
                     sessions.push(SessionHealOutcome {
                         workspace: workspace.name().clone(),
                         mount: project.mounts.mount(workspace).await,
@@ -2570,7 +2600,6 @@ mod tests {
             assert!(outcome.sessions[0].mount.is_ok());
         }
     }
-
     /// One unhealable project never costs another its mounts, and an unreachable main never costs
     /// its own project's sessions.
     ///
