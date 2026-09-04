@@ -10,13 +10,16 @@ import {
   DEVENV_MODULE_IMPORT,
   deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
+  getManagedContentForTest,
   hasExactTargetForTest,
   INLINE_LOCAL_BEGIN,
   INLINE_LOCAL_END,
   LOCAL_SECTION_MARKER,
+  type ManagedFileContext,
   macosPlatformArchitecturesForTest,
   managedFileTargetsForTest,
   platformTargetGlobsForTest,
+  publishWorkflowManagedFileForTest,
   reinsertInlineLocalBlocksForTest,
   splitLocalSectionForTest,
   validateDevenvModuleImport,
@@ -416,5 +419,43 @@ describe('managed cache actions', () => {
         expect(osKeyLines.every((line) => line.includes(ARCHITECTURE_SCOPED_PREFIX))).toBe(true);
       }
     }
+  });
+});
+
+describe('publish workflow rendering by repo shape', () => {
+  const context = (overrides: Partial<ManagedFileContext>): ManagedFileContext => ({
+    hasReleasePackages: true,
+    hasStagingDeployTargets: false,
+    hasProductionDeployTargets: false,
+    hasBrowserTestTargets: false,
+    hasE2eDeploymentTargets: false,
+    ciPushBranches: ['main'],
+    ciRunsOn: 'ubuntu-latest',
+    nodeModulesCacheKey: 'key',
+    repoName: '@scope/repo',
+    platformTargetGlobs: [],
+    macosPlatformArchitectures: [],
+    ...overrides,
+  });
+
+  it('drops the release half for a repo that deploys production but owns no packages', () => {
+    const rendered = getManagedContentForTest(
+      publishWorkflowManagedFileForTest,
+      context({ hasReleasePackages: false, hasProductionDeployTargets: true }),
+    );
+
+    expect(rendered).toContain('- name: 🚀 Deploy production');
+    expect(rendered).not.toContain('smoo release');
+    expect(rendered).not.toContain('steps.version.outputs.mode');
+  });
+
+  it('keeps the release pipeline for a repo that owns packages', () => {
+    const rendered = getManagedContentForTest(
+      publishWorkflowManagedFileForTest,
+      context({ hasReleasePackages: true, hasProductionDeployTargets: true }),
+    );
+
+    expect(rendered).toContain('smoo release publish');
+    expect(rendered).toContain("steps.version.outputs.mode != 'none'");
   });
 });
