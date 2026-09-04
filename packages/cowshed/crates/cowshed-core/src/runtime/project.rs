@@ -9032,9 +9032,9 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
             CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }
         // A quarantine is an operator decision pending, not a host defect to diagnose: the
-        // tombstone in the message is the next thing to read, and `doctor` would only repeat it.
-        error @ crate::storage::apfs::ApfsStorageError::Quarantined { .. } => {
-            CowshedError::integrity(error.to_string(), "inspect quarantine")
+        // tombstone is in the message, and `rekey` consumes it — point at the repair.
+        ref error @ crate::storage::apfs::ApfsStorageError::Quarantined { ref workspace, .. } => {
+            CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
         }
 
         crate::storage::apfs::ApfsStorageError::MarkerMismatch(message)
@@ -9505,8 +9505,8 @@ fn quarantine_and_companion_findings_blocking(
 /// Warning, not error: the workspace's bytes are accounted for — the tombstone says where —
 /// and the condition needs an operator decision rather than a retry. The message names the
 /// hold on the record, not sickness in the data: quarantine never touches the image, so the
-/// data is intact by construction. The hint names no command on purpose: `doctor` never
-/// repairs a quarantine, so pointing at it would send the reader after the wrong problem.
+/// data is intact by construction. The hint names the repair: `rekey` consumes the tombstone
+/// and rebuilds the companion, so a quarantined workspace points at its own fix.
 #[cfg(target_os = "macos")]
 fn quarantined_workspace_finding(
     workspace: &WorkspaceName,
@@ -9520,7 +9520,7 @@ fn quarantined_workspace_finding(
             "workspace {workspace} held: {reason} (data intact): {}",
             tombstone.display()
         ),
-        hint: "inspect quarantine".into(),
+        hint: format!("cowshed rekey {workspace}"),
         path: Some(tombstone),
     }
 }
@@ -9779,7 +9779,7 @@ mod doctor_hint_tests {
         );
         assert_eq!(finding.path, Some(tombstone));
         assert!(
-            finding.hint.contains("inspect quarantine"),
+            finding.hint.contains("cowshed rekey"),
             "hint was {}",
             finding.hint
         );
@@ -9867,7 +9867,7 @@ mod doctor_hint_tests {
             rendered.message
         );
         assert!(
-            rendered.hint.contains("inspect quarantine"),
+            rendered.hint.contains("cowshed rekey"),
             "hint was {}",
             rendered.hint
         );
