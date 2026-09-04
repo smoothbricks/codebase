@@ -28,7 +28,9 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &REMOVE,
     &ATTACH,
     &DETACH,
+    &MOUNT,
     &RESIZE,
+    &REKEY,
     &GC,
     &PUSH,
     &REBASE,
@@ -70,7 +72,9 @@ pub enum Command {
     Remove(RemoveArgs),
     Attach(AttachArgs),
     Detach(DetachArgs),
+    Mount(MountArgs),
     Resize(ResizeArgs),
+    Rekey(RekeyArgs),
     Gc(GcArgs),
     Push(PushArgs),
     Rebase(RebaseArgs),
@@ -97,6 +101,7 @@ impl Command {
         match self {
             Self::Attach(args) if args.all => ProjectDiscovery::NotUsed,
             Self::Detach(_) => ProjectDiscovery::NotUsed,
+            Self::Mount(_) => ProjectDiscovery::NotUsed,
             Self::Adopt(_)
             | Self::New(_)
             | Self::Fork(_)
@@ -109,6 +114,7 @@ impl Command {
             | Self::Remove(_)
             | Self::Attach(_)
             | Self::Resize(_)
+            | Self::Rekey(_)
             | Self::Gc(_)
             | Self::Push(_)
             | Self::Rebase(_)
@@ -326,11 +332,30 @@ pub struct DetachArgs {
     pub all: bool,
 }
 
+/// `mount main --repo-id <owner/repo>` — mount main from store records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MountArgs {
+    pub target: MountTarget,
+    pub repo_id: RepoId,
+}
+
+/// The mount target. Only `main` exists yet; siblings arrive later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountTarget {
+    Main,
+}
+
 /// `resize <ws|main> <size>` — grow one workspace's image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResizeArgs {
     pub workspace: String,
     pub capacity: OsString,
+}
+
+/// `rekey <ws|main>` — rebuild one keyless workspace's CA identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RekeyArgs {
+    pub workspace: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -664,10 +689,16 @@ fn cli_command() -> ClapCommand {
                 .arg(flag("all")),
         )
         .subcommand(
+            leaf("mount")
+                .arg(positional("target", 0..=1))
+                .arg(value("repo-id")),
+        )
+        .subcommand(
             leaf("resize")
                 .arg(positional("workspace", 0..=1))
                 .arg(positional("size", 0..=1)),
         )
+        .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("gc").arg(flag("dry-run")))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
             value("branch"),
@@ -804,7 +835,9 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "rm" => parse_remove(leaf)?,
         "attach" => parse_attach(leaf)?,
         "detach" => parse_detach(leaf)?,
+        "mount" => parse_mount(leaf)?,
         "resize" => parse_resize(leaf)?,
+        "rekey" => parse_rekey(leaf)?,
         "gc" => parse_gc(leaf)?,
         "push" => parse_push(leaf)?,
         "rebase" => parse_rebase(leaf)?,
@@ -1910,6 +1943,49 @@ fn parse_detach(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Detach(DetachArgs { workspace, all }))
 }
 
+const MOUNT: CommandSpec = CommandSpec {
+    name: "mount",
+    missing: "mount requires a target",
+    args: "main",
+    trailing: "",
+    summary: "mount main from store records",
+    about: &[
+        "Mounts main for the project named by `--repo-id`, resolving the project from store records — the repository binding and the checkout-path record — rather than from a live git checkout, so an empty stub directory left by a broken workspace still mounts. The mount uses the gateway-canonical flags; a volume mounted with other flags is remounted rather than refused.",
+    ],
+    options: &[Opt {
+        spelling: "--repo-id <owner/repo>",
+        meaning: "the adopted repository whose main to mount",
+    }],
+};
+
+fn parse_mount(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &MOUNT;
+    let target = os(matches, "target");
+    match target.as_ref().and_then(|value| value.to_str()) {
+        None => {
+            return Err(UsageError::new(USAGE.missing, USAGE));
+        }
+        Some("main") => {}
+        Some(other) => {
+            return Err(UsageError::new(
+                format!("unknown mount target `{other}`: only `main` is supported"),
+                USAGE,
+            ));
+        }
+    }
+    let repo_id = os(matches, "repo-id")
+        .ok_or_else(|| UsageError::new("mount main requires --repo-id <owner/repo>", USAGE))?;
+    let value = repo_id
+        .to_str()
+        .ok_or_else(|| UsageError::new("--repo-id requires a UTF-8 owner/repo", USAGE))?;
+    let repo_id = RepoId::parse(value)
+        .map_err(|error| UsageError::new(format!("invalid --repo-id `{value}`: {error}"), USAGE))?;
+    Ok(Command::Mount(MountArgs {
+        target: MountTarget::Main,
+        repo_id,
+    }))
+}
+
 const RESIZE: CommandSpec = CommandSpec {
     name: "resize",
     missing: "resize requires a workspace",
@@ -1928,6 +2004,25 @@ fn parse_resize(matches: &ArgMatches) -> Result<Command, UsageError> {
         workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
         capacity: os(matches, "size")
             .ok_or_else(|| UsageError::new("resize requires a size", USAGE))?,
+    }))
+}
+
+const REKEY: CommandSpec = CommandSpec {
+    name: "rekey",
+    missing: "rekey requires a workspace",
+    args: "<ws|main>",
+    trailing: "",
+    summary: "rekey a keyless workspace",
+    about: &[
+        "Rebuilds the CA identity of a workspace whose companion is missing or invalid: the quarantined grants sidecar is republished beside the still-in-place image (revision bumped by one), fresh credentials are minted into the live mount, and the quarantine entry is consumed. The revision is preserved when the sidecar never left. Rotation invalidates in-flight job certificates.",
+    ],
+    options: &[],
+};
+
+fn parse_rekey(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &REKEY;
+    Ok(Command::Rekey(RekeyArgs {
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
     }))
 }
 
@@ -2365,6 +2460,30 @@ mod tests {
                 .project_discovery(),
             ProjectDiscovery::NotUsed
         );
+    }
+
+    #[test]
+    fn rekey_accepts_a_session_or_main_workspace() {
+        let Command::Rekey(named) = parse_args(["rekey", "raven"]).unwrap().command else {
+            panic!("expected rekey")
+        };
+        assert_eq!(named.workspace, "raven");
+
+        let Command::Rekey(main) = parse_args(["rekey", "main"]).unwrap().command else {
+            panic!("expected rekey")
+        };
+        assert_eq!(main.workspace, "main");
+        assert_eq!(
+            parse_args(["rekey", "main"])
+                .unwrap()
+                .command
+                .project_discovery(),
+            ProjectDiscovery::Required
+        );
+
+        let missing = parse_args(["rekey"]).unwrap_err();
+        assert_eq!(missing.message, "rekey requires a workspace");
+        assert!(missing.hint.contains("cowshed rekey <ws|main>"));
     }
 
     #[test]
@@ -2997,6 +3116,7 @@ mod tests {
             (&["detach", "raven"], NotUsed),
             (&["detach", "--all"], NotUsed),
             (&["resize", "raven", "32GiB"], Required),
+            (&["rekey", "raven"], Required),
             (&["gc"], Required),
             (&["push", "raven"], Required),
             (&["rebase", "raven"], Required),
@@ -3049,6 +3169,7 @@ mod tests {
             (&["rm"], "rm requires a workspace"),
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
+            (&["rekey"], "rekey requires a workspace"),
             (&["land"], "land requires a workspace"),
             (&["gateway"], "gateway action is required"),
             (&["sccache"], "sccache action is required"),
