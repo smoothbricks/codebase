@@ -1020,6 +1020,8 @@ mod parity_tests {
             | Command::Sccache(_)
             | Command::Skill(_)
             | Command::Setup(_)
+            | Command::Mount(_)
+            | Command::Rekey(_)
             | Command::Version
             | Command::Help(_) => None,
         }
@@ -1063,6 +1065,8 @@ mod parity_tests {
         (&["gateway", "status"], None),
         (&["sccache", "status"], None),
         (&["skill", "install"], None),
+        (&["mount", "main", "--repo-id", "acme/widget"], None),
+        (&["rekey", "parity"], None),
         (&["help"], None),
         (&["setup"], None),
         (&["--version"], None),
