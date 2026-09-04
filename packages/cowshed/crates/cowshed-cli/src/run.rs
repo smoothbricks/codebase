@@ -135,6 +135,10 @@ enum RuntimeDispatch {
 fn runtime_dispatch(command: &args::Command) -> RuntimeDispatch {
     match command {
         args::Command::Attach(args) if args.all => RuntimeDispatch::Host,
+        // `mount main --repo-id` resolves from store records, never from a
+        // live checkout, so it must survive a broken cwd like the other host
+        // commands rather than ask project discovery to fail first.
+        args::Command::Mount(_) => RuntimeDispatch::Host,
         args::Command::Detach(args) if args.all => RuntimeDispatch::Host,
         args::Command::List(args) if args.all => RuntimeDispatch::Host,
         _ => RuntimeDispatch::Project,

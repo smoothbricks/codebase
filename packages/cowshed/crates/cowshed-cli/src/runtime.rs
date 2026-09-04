@@ -106,8 +106,9 @@ pub trait CliService: Send {
     async fn resize(&mut self, workspace: &str, capacity: &str) -> Result<ResizeResult>;
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
         let _ = workspace;
-        Err(CowshedError::internal(
-            "CLI service does not support workspace rekey",
+        Err(CowshedError::environment_missing(
+            "workspace rekey is not available from this command context",
+            "cowshed rekey <ws>",
         ))
     }
     async fn doctor(&mut self) -> Result<DoctorReport>;
