@@ -715,8 +715,20 @@ pub enum ApfsStorageError {
     Host(String),
     #[error("garbage-collection plan is stale")]
     GcPlanStale,
+    #[error("{layout} is missing its CA companion: image={image}, companion={companion}")]
+    MissingCaCompanion {
+        layout: &'static str,
+        image: PathBuf,
+        companion: PathBuf,
+    },
     #[error("marker does not match detached APFS metadata: {0}")]
     MarkerMismatch(String),
+    #[error("workspace {workspace} quarantined ({reason}): {tombstone}")]
+    Quarantined {
+        workspace: String,
+        reason: String,
+        tombstone: PathBuf,
+    },
     #[error("cleanup after {operation} failed: primary={primary}; cleanup={cleanup}")]
     Cleanup {
         operation: &'static str,
