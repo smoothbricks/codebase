@@ -81,6 +81,48 @@ impl LifecycleIntentPhase {
     }
 }
 
+/// One publication-fence artifact. The fence writes three things in order — the grants
+/// sidecar (which carries `PendingFence`), the CA companion, the image payload — and a
+/// crash can land between any two. Recording each completion separately lets a later reader
+/// tell "the controller died mid-fence" from "something deleted a finished artifact".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FenceStep {
+    Sidecar,
+    Companion,
+    Image,
+}
+
+/// Per-artifact completion flags for a fenced create/fork publication.
+///
+/// `None` on the record (the serialized field absent) means unknown: journals written
+/// before this evidence existed load unchanged and are treated exactly as before — an open
+/// fence with no step evidence is a crash window, never an external deletion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FenceSteps {
+    #[serde(default)]
+    pub sidecar: bool,
+    #[serde(default)]
+    pub companion: bool,
+    #[serde(default)]
+    pub image: bool,
+}
+
+impl FenceSteps {
+    /// True once every fence artifact is durably written.
+    pub fn is_complete(self) -> bool {
+        self.sidecar && self.companion && self.image
+    }
+
+    fn mark(&mut self, step: FenceStep) {
+        match step {
+            FenceStep::Sidecar => self.sidecar = true,
+            FenceStep::Companion => self.companion = true,
+            FenceStep::Image => self.image = true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LifecycleIntentRecord {
@@ -91,6 +133,11 @@ pub struct LifecycleIntentRecord {
     /// retirement; only `Mutating` retirement records carry enough evidence to resume deletion.
     #[serde(default, skip_serializing_if = "LifecycleIntentPhase::is_prepared")]
     pub phase: LifecycleIntentPhase,
+    /// Fence sub-step completions for create/fork publications. Absent (`None`) on older
+    /// journals and on intents with no fence (adopt, retire); never backfilled, so absence
+    /// always means unknown, never "no steps done".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_steps: Option<FenceSteps>,
 }
 
 impl LifecycleIntentRecord {
@@ -99,6 +146,7 @@ impl LifecycleIntentRecord {
             operation,
             completion: None,
             phase: LifecycleIntentPhase::Prepared,
+            fence_steps: None,
         }
     }
 }
@@ -195,6 +243,32 @@ impl LifecycleIntentJournal {
             ));
         }
         record.phase = LifecycleIntentPhase::Mutating;
+        self.validate()
+    }
+    /// Records one completed publication-fence sub-step for a create/fork intent.
+    ///
+    /// Monotonic within a record: steps are only ever set, never cleared, so a crash between
+    /// two marks leaves the earlier ones durable. Marking a completed intent is refused —
+    /// completion already implies a finished fence, and rewriting it would destroy the
+    /// crash-window evidence the steps exist to preserve.
+    pub fn mark_fence_step(
+        &mut self,
+        workspace: &WorkspaceName,
+        step: FenceStep,
+    ) -> CowshedResult<()> {
+        let record = self.entries.get_mut(workspace).ok_or_else(|| {
+            CowshedError::integrity(
+                format!("lifecycle intent for {workspace} disappeared before fencing"),
+                "reopen cowshed to reconcile lifecycle state",
+            )
+        })?;
+        if record.completion.is_some() {
+            return Err(CowshedError::integrity(
+                format!("completed lifecycle intent for {workspace} cannot record fence steps"),
+                "reopen cowshed to reconcile lifecycle state",
+            ));
+        }
+        record.fence_steps.get_or_insert_default().mark(step);
         self.validate()
     }
 
