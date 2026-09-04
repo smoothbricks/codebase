@@ -1904,6 +1904,24 @@ impl NativeProjectRuntimeHost {
         next.mark_mutating(workspace)?;
         self.replace_lifecycle_intents(next).await
     }
+    /// Records the publication-fence sub-steps as complete after staged execution
+    /// succeeded. Staged success implies the sidecar, companion, and image are all
+    /// durable (prepare wrote them; commit activated them), so marking all three is a
+    /// statement of observed fact, not optimism.
+    ///
+    /// Evidence only and best-effort: the fence already succeeded, so a journal write
+    /// failure must not fail the op. Unmarked steps read as unknown and classify as a
+    /// crash window — the safe direction.
+    async fn mark_lifecycle_fence_complete(&mut self, workspace: &WorkspaceName) {
+        use crate::storage::recovery::FenceStep;
+        let mut next = self.lifecycle_intents.clone();
+        let marked = [FenceStep::Sidecar, FenceStep::Companion, FenceStep::Image]
+            .into_iter()
+            .try_for_each(|step| next.mark_fence_step(workspace, step));
+        if marked.is_ok() {
+            let _ = self.replace_lifecycle_intents(next).await;
+        }
+    }
     async fn discard_prepared_retire_intent(&mut self, workspace: &WorkspaceName) -> Result<()> {
         let mut next = self.lifecycle_intents.clone();
         if !next.discard_prepared_retirement(workspace) {
@@ -4572,6 +4590,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 })
                 .await
                 .map_err(native_staged_error)?;
+            self.mark_lifecycle_fence_complete(&workspace).await;
             if options.register {
                 self.register_workspace_in_main(&workspace).await?;
             }
@@ -4744,6 +4763,7 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
             })
             .await
             .map_err(native_staged_error)?;
+        self.mark_lifecycle_fence_complete(&destination).await;
         self.commitments
             .record(CommitmentDraft::Fork {
                 repo_id: self.descriptor.repo_id.clone(),
@@ -6520,6 +6540,10 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 native_storage_error(error),
             )),
         }
+        // Recovery quarantines a companion-less workspace and continues, so the failure never
+        // reaches `doctor` as an error: the tombstones and the live images are read here, from
+        // the same store-side facts, instead.
+        findings.extend(quarantine_and_companion_findings(self).await);
         Ok(DoctorReport::from_findings(findings))
     }
 
@@ -8968,6 +8992,32 @@ fn native_storage_error(error: crate::storage::apfs::ApfsStorageError) -> Cowshe
                 "cowshed resize <workspace> <capacity larger than the current one>",
             )
         }
+        // A missing CA companion names its own remedy: only `rekey` rebuilds the companion,
+        // so the generic doctor hint would send the reader after the wrong problem. The
+        // workspace rides in the hint from the image's file name with the format's own
+        // extension stripped — `file_stem` would leave `cargo-wasmbench.sparse` behind on a
+        // `.sparseimage` — while both paths stay in the message, where neither is guessable
+        // from the other.
+        ref error @ crate::storage::apfs::ApfsStorageError::MissingCaCompanion {
+            ref image, ..
+        } => {
+            let workspace = image
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| {
+                    crate::metadata::ImageFormat::from_image_path(image)
+                        .ok()
+                        .and_then(|format| name.strip_suffix(format.image_extension()))
+                })
+                .unwrap_or("workspace");
+            CowshedError::integrity(error.to_string(), format!("cowshed rekey {workspace}"))
+        }
+        // A quarantine is an operator decision pending, not a host defect to diagnose: the
+        // tombstone in the message is the next thing to read, and `doctor` would only repeat it.
+        error @ crate::storage::apfs::ApfsStorageError::Quarantined { .. } => {
+            CowshedError::integrity(error.to_string(), "inspect quarantine")
+        }
+
         crate::storage::apfs::ApfsStorageError::MarkerMismatch(message)
         | crate::storage::apfs::ApfsStorageError::Host(message) => {
             CowshedError::integrity(message, "cowshed doctor --json")
@@ -9356,6 +9406,165 @@ fn native_finding(
     }
 }
 
+/// Quarantine tombstones and companion-less live images, as `doctor` reports them.
+///
+/// Recovery quarantines and continues — `recover_pending` still returns `Ok` — so neither
+/// state surfaces as a substrate error for the finding mappers above to catch. This pass
+/// reads the same store-side facts directly: every `tombstone.json` under the project's
+/// quarantine directory, and every live image whose sidecar survived without its CA
+/// companion. A quarantined workspace keeps its image but loses its sidecar, so the two
+/// checks cannot report the same workspace twice.
+#[cfg(target_os = "macos")]
+async fn quarantine_and_companion_findings(
+    host: &NativeProjectRuntimeHost,
+) -> Vec<crate::api::dto::Finding> {
+    let images = match host.authoritative().await {
+        // An authoritative failure is already a finding above; this pass only adds what a
+        // successful listing reveals.
+        Err(_) => Vec::new(),
+        Ok(workspaces) => workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    workspace.derived.workspace.name().clone(),
+                    workspace.image.clone(),
+                )
+            })
+            .collect(),
+    };
+    let store_root = host.descriptor.store_root.clone();
+    let repo_id = host.descriptor.repo_id.clone();
+    crate::storage::lifecycle::dispatch_blocking(move || {
+        quarantine_and_companion_findings_blocking(&store_root, &repo_id, &images)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Blocking scan behind `quarantine_and_companion_findings`: quarantine tombstones first,
+/// then live images whose sidecar survived without their CA companion.
+///
+/// Tombstones this reader does not understand are skipped, not reported: the schema is the
+/// quarantine writer's to evolve, and `doctor` must not misreport a future record. A
+/// tombstone whose workspace name no longer parses is skipped for the same reason — the
+/// rekey hint needs the exact name.
+#[cfg(target_os = "macos")]
+fn quarantine_and_companion_findings_blocking(
+    store_root: &Path,
+    repo_id: &RepoId,
+    images: &[(WorkspaceName, PathBuf)],
+) -> Vec<crate::api::dto::Finding> {
+    let mut findings = Vec::new();
+    if let Ok(layout) = crate::storage::StorageLayout::new(store_root, repo_id) {
+        let quarantine_root = layout
+            .project()
+            .project_root
+            .join(crate::repository::QUARANTINE_DIRECTORY);
+        match std::fs::read_dir(&quarantine_root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let tombstone_path = entry.path().join("tombstone.json");
+                    if !tombstone_path.is_file() {
+                        continue;
+                    }
+                    let Ok(tombstone) = crate::metadata::read_json::<
+                        crate::storage::apfs::native::QuarantineTombstone,
+                    >(&tombstone_path) else {
+                        continue;
+                    };
+                    if tombstone.version != 1 {
+                        continue;
+                    }
+                    let Ok(workspace) = WorkspaceName::new(&tombstone.workspace) else {
+                        continue;
+                    };
+                    findings.push(quarantined_workspace_finding(
+                        &workspace,
+                        &tombstone.reason,
+                        tombstone_path,
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => findings.push(crate::api::dto::Finding {
+                code: "quarantine".into(),
+                severity: crate::api::dto::FindingSeverity::Error,
+                message: format!(
+                    "could not inspect quarantine directory {}: {error}",
+                    quarantine_root.display()
+                ),
+                hint: "inspect the store".into(),
+                path: Some(quarantine_root.clone()),
+            }),
+        }
+    }
+    for (workspace, image) in images {
+        let sidecar = crate::metadata::sidecar_path(image);
+        // The companion rides beside its image with a `.ca.key` suffix (the store's companion
+        // convention); a live image whose sidecar survived without one can no longer pass
+        // CA-gated verbs.
+        let companion = crate::metadata::append_suffix(image, ".ca.key");
+        if image.is_file() && sidecar.is_file() && !companion.exists() {
+            findings.push(missing_ca_companion_finding(
+                workspace,
+                "published canonical image",
+                image,
+                &companion,
+            ));
+        }
+    }
+    findings
+}
+
+/// A quarantined workspace, as `doctor` reports it.
+///
+/// Warning, not error: the workspace's bytes are accounted for — the tombstone says where —
+/// and the condition needs an operator decision rather than a retry. The message names the
+/// hold on the record, not sickness in the data: quarantine never touches the image, so the
+/// data is intact by construction. The hint names no command on purpose: `doctor` never
+/// repairs a quarantine, so pointing at it would send the reader after the wrong problem.
+#[cfg(target_os = "macos")]
+fn quarantined_workspace_finding(
+    workspace: &WorkspaceName,
+    reason: &str,
+    tombstone: PathBuf,
+) -> crate::api::dto::Finding {
+    crate::api::dto::Finding {
+        code: "workspace-quarantined".into(),
+        severity: crate::api::dto::FindingSeverity::Warning,
+        message: format!(
+            "workspace {workspace} held: {reason} (data intact): {}",
+            tombstone.display()
+        ),
+        hint: "inspect quarantine".into(),
+        path: Some(tombstone),
+    }
+}
+
+/// A workspace whose image lost its CA companion, as `doctor` reports it.
+///
+/// Error: the workspace's CA-gated verbs refuse until the companion is rebuilt, and only
+/// `rekey` rebuilds it — `doctor` merely observes, so the hint must not name it.
+#[cfg(target_os = "macos")]
+fn missing_ca_companion_finding(
+    workspace: &WorkspaceName,
+    layout: &str,
+    image: &Path,
+    companion: &Path,
+) -> crate::api::dto::Finding {
+    crate::api::dto::Finding {
+        code: "ca-companion-missing".into(),
+        severity: crate::api::dto::FindingSeverity::Error,
+        message: format!(
+            "workspace {workspace} {layout} is missing its CA companion: image={}, companion={}",
+            image.display(),
+            companion.display()
+        ),
+        hint: format!("cowshed rekey {workspace}"),
+        path: Some(image.to_owned()),
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod doctor_hint_tests {
     use super::*;
@@ -9558,6 +9767,255 @@ mod doctor_hint_tests {
             )
             .is_none()
         );
+    }
+    #[test]
+    fn quarantined_workspace_is_a_warning_pointing_at_the_tombstone() {
+        let workspace = WorkspaceName::new("raven").expect("workspace");
+        let tombstone =
+            PathBuf::from("/store/acme/widget/quarantine/raven-1754000000/tombstone.json");
+        let finding =
+            quarantined_workspace_finding(&workspace, "CA companion missing", tombstone.clone());
+        assert_eq!(finding.code, "workspace-quarantined");
+        assert_eq!(finding.severity, crate::api::dto::FindingSeverity::Warning);
+        assert!(finding.message.contains("raven"), "{}", finding.message);
+        assert!(
+            finding.message.contains("CA companion missing"),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains("data intact"),
+            "the hold is on the record, not sickness in the data: {}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains(tombstone.to_str().unwrap()),
+            "{}",
+            finding.message
+        );
+        assert_eq!(finding.path, Some(tombstone));
+        assert!(
+            finding.hint.contains("inspect quarantine"),
+            "hint was {}",
+            finding.hint
+        );
+        assert!(
+            !finding.hint.contains("doctor"),
+            "doctor never repairs a quarantine; hint was {}",
+            finding.hint
+        );
+    }
+
+    #[test]
+    fn missing_ca_companion_is_an_error_hinting_rekey_not_doctor() {
+        let workspace = WorkspaceName::new("raven").expect("workspace");
+        let image = PathBuf::from("/store/acme/widget/raven.asif");
+        let companion = PathBuf::from("/store/acme/widget/raven.asif.ca.key");
+        let finding = missing_ca_companion_finding(&workspace, "canonical", &image, &companion);
+        assert_eq!(finding.code, "ca-companion-missing");
+        assert_eq!(finding.severity, crate::api::dto::FindingSeverity::Error);
+        assert!(
+            finding.message.contains(image.to_str().unwrap()),
+            "{}",
+            finding.message
+        );
+        assert!(
+            finding.message.contains(companion.to_str().unwrap()),
+            "{}",
+            finding.message
+        );
+        assert_eq!(finding.hint, "cowshed rekey raven");
+        assert!(
+            !finding.hint.contains("doctor"),
+            "rekey owns this condition, not doctor; hint was {}",
+            finding.hint
+        );
+    }
+
+    #[test]
+    fn missing_ca_companion_error_names_both_paths_and_hints_rekey() {
+        let image = PathBuf::from("/store/acme/widget/raven.asif");
+        let companion = PathBuf::from("/store/acme/widget/raven.asif.ca.key");
+        let rendered =
+            native_storage_error(crate::storage::apfs::ApfsStorageError::MissingCaCompanion {
+                layout: "canonical",
+                image: image.clone(),
+                companion: companion.clone(),
+            });
+        assert_eq!(rendered.code, ErrorCode::Integrity);
+        assert!(
+            rendered.message.contains(image.to_str().unwrap()),
+            "{}",
+            rendered.message
+        );
+        assert!(
+            rendered.message.contains(companion.to_str().unwrap()),
+            "{}",
+            rendered.message
+        );
+        assert_eq!(rendered.hint, "cowshed rekey raven");
+        assert!(
+            !rendered.hint.contains("doctor"),
+            "rekey owns this condition, not doctor; hint was {}",
+            rendered.hint
+        );
+    }
+
+    #[test]
+    fn quarantined_error_points_at_the_tombstone_instead_of_doctor() {
+        let tombstone =
+            PathBuf::from("/store/acme/widget/quarantine/raven-1754000000/tombstone.json");
+        let rendered = native_storage_error(crate::storage::apfs::ApfsStorageError::Quarantined {
+            workspace: WorkspaceName::new("raven").expect("workspace"),
+            reason: "CA companion missing".into(),
+            tombstone: tombstone.clone(),
+        });
+        assert_eq!(rendered.code, ErrorCode::Integrity);
+        assert!(rendered.message.contains("raven"), "{}", rendered.message);
+        assert!(
+            rendered.message.contains("CA companion missing"),
+            "{}",
+            rendered.message
+        );
+        assert!(
+            rendered.message.contains(tombstone.to_str().unwrap()),
+            "{}",
+            rendered.message
+        );
+        assert!(
+            rendered.hint.contains("inspect quarantine"),
+            "hint was {}",
+            rendered.hint
+        );
+        assert!(
+            !rendered.hint.contains("doctor"),
+            "doctor never repairs a quarantine; hint was {}",
+            rendered.hint
+        );
+    }
+
+    #[test]
+    fn sparseimage_hint_strips_the_full_extension() {
+        let rendered =
+            native_storage_error(crate::storage::apfs::ApfsStorageError::MissingCaCompanion {
+                layout: "canonical",
+                image: PathBuf::from("/store/acme/widget/cargo-wasmbench.sparseimage"),
+                companion: PathBuf::from("/store/acme/widget/cargo-wasmbench.sparseimage.ca.key"),
+            });
+        assert_eq!(rendered.code, ErrorCode::Integrity);
+        assert_eq!(rendered.hint, "cowshed rekey cargo-wasmbench");
+    }
+
+    /// The quarantine scan reports v1 tombstones and companion-less live images, and stays
+    /// silent when there is nothing held: `doctor` lists what the store holds, not what it
+    /// looked for.
+    #[test]
+    fn quarantine_scan_reports_tombstones_and_companion_less_images() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-doctor-quarantine-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).expect("store dir");
+        let repo = crate::repository::RepoId::parse("acme/widget").expect("repo");
+        let layout = crate::storage::StorageLayout::new(&store, &repo).expect("layout");
+        let quarantine = layout
+            .project()
+            .project_root
+            .join(crate::repository::QUARANTINE_DIRECTORY);
+        std::fs::create_dir_all(&quarantine).expect("quarantine dir");
+
+        // A held workspace: the tombstone names it, with no live files the scan could
+        // mistake for a session.
+        let held = quarantine.join("raven-1754000000");
+        std::fs::create_dir_all(&held).expect("quarantine entry");
+        let tombstone = held.join("tombstone.json");
+        std::fs::write(
+            &tombstone,
+            serde_json::json!({
+                "version": 1,
+                "repoId": "acme/widget",
+                "workspace": "raven",
+                "incarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                "revision": 3,
+                "reason": "missing-ca-companion",
+                "image": "/store/acme/widget/raven.asif",
+                "companion": "/store/acme/widget/raven.asif.ca.key",
+                "quarantinedAt": "2026-09-04T00:00:00Z",
+                "sidecar": "/store/acme/widget/quarantine/raven-1754000000/sidecar.json",
+            })
+            .to_string(),
+        )
+        .expect("tombstone");
+
+        // A future schema version is skipped, not misreported.
+        let future = quarantine.join("kestrel-1754000001");
+        std::fs::create_dir_all(&future).expect("future entry");
+        std::fs::write(
+            future.join("tombstone.json"),
+            serde_json::json!({
+                "version": 2,
+                "repoId": "acme/widget",
+                "workspace": "kestrel",
+                "incarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                "revision": 3,
+                "reason": "missing-ca-companion",
+                "image": "/store/acme/widget/kestrel.asif",
+                "companion": "/store/acme/widget/kestrel.asif.ca.key",
+                "quarantinedAt": "2026-09-04T00:00:00Z",
+                "sidecar": "/store/acme/widget/quarantine/kestrel-1754000001/sidecar.json",
+            })
+            .to_string(),
+        )
+        .expect("future tombstone");
+
+        // Live images: kestrel's sidecar survived without its companion; falcon is whole.
+        let live = root.join("live");
+        std::fs::create_dir_all(&live).expect("live dir");
+        let bare_image = live.join("kestrel.asif");
+        std::fs::write(&bare_image, b"image").expect("bare image");
+        std::fs::write(crate::metadata::sidecar_path(&bare_image), b"sidecar")
+            .expect("bare sidecar");
+        let whole_image = live.join("falcon.asif");
+        std::fs::write(&whole_image, b"image").expect("whole image");
+        std::fs::write(crate::metadata::sidecar_path(&whole_image), b"sidecar")
+            .expect("whole sidecar");
+        std::fs::write(
+            crate::metadata::append_suffix(&whole_image, ".ca.key"),
+            b"key",
+        )
+        .expect("whole companion");
+
+        let images = vec![
+            (
+                WorkspaceName::new("kestrel").expect("workspace"),
+                bare_image.clone(),
+            ),
+            (
+                WorkspaceName::new("falcon").expect("workspace"),
+                whole_image.clone(),
+            ),
+        ];
+        let findings = quarantine_and_companion_findings_blocking(&store, &repo, &images);
+
+        let codes: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.code.as_str())
+            .collect();
+        assert_eq!(
+            codes,
+            ["workspace-quarantined", "ca-companion-missing"],
+            "{findings:?}"
+        );
+        assert_eq!(findings[0].path, Some(tombstone));
+        assert!(
+            findings[0].message.contains("data intact"),
+            "{}",
+            findings[0].message
+        );
+        assert_eq!(findings[1].hint, "cowshed rekey kestrel");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
