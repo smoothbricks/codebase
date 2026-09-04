@@ -18,6 +18,7 @@ use crate::repository::{PathLayoutError, ProjectPaths, RepoId};
 pub mod apfs;
 pub mod audit;
 pub mod bootstrap;
+pub mod deletion_log;
 pub mod fstab;
 pub mod host_config;
 pub mod job_artifact;
