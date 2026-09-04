@@ -902,6 +902,32 @@ fn regular_file_children(directory: &Path) -> Result<Vec<PathBuf>, ApfsStorageEr
     typed_children(directory, |file_type| file_type.is_file())
 }
 
+/// True when a directory has no entries. Errors propagate: callers only invoke this on
+/// paths that enumerated successfully, so a failure here is a genuine I/O fault.
+fn dir_is_empty(directory: &Path) -> Result<bool, ApfsStorageError> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| io_error("inspect staging mountpoint", directory, error))?;
+    Ok(entries.next().is_none())
+}
+
+/// True when a volume is mounted at this directory: its device differs from its parent's.
+/// Same device-comparison the orphan-mountpoint pass uses, without a kernel-table query.
+fn dir_is_mounted(directory: &Path) -> Result<bool, ApfsStorageError> {
+    let parent = directory.parent().ok_or_else(|| {
+        ApfsStorageError::Host(format!(
+            "staging mountpoint has no parent: {}",
+            directory.display()
+        ))
+    })?;
+    let directory_dev = fs::symlink_metadata(directory)
+        .map_err(|error| io_error("inspect staging mountpoint", directory, error))?
+        .dev();
+    let parent_dev = fs::symlink_metadata(parent)
+        .map_err(|error| io_error("inspect staging mountpoint", parent, error))?
+        .dev();
+    Ok(directory_dev != parent_dev)
+}
+
 fn staged_image_format(path: &Path) -> Option<ImageFormat> {
     let format = ImageFormat::from_image_path(path).ok()?;
     let stem = path.file_stem()?.to_str()?;
@@ -2469,6 +2495,24 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 continue;
             };
             let Some(workspace) = staged_stem_workspace(stem) else {
+                // Stems staging never produces cannot belong to a live operation: live
+                // mounts always use `<name>-<incarnation>` (or the `recover-` form) built
+                // by `staging_mount`/`recovery_staging_mount`. Reclaim only provably-stale
+                // evidence — an empty directory with no volume mounted at it — and leave
+                // everything else (foreign mounts, unexpected data) for a human. The
+                // tombstone records the reclaim; emptiness is re-verified at execution.
+                examined = examined
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+                if dir_is_empty(&mount_point)? && !dir_is_mounted(&mount_point)? {
+                    candidates.push(gc_candidate(
+                        StorageGcReason::OrphanStagingMount,
+                        &mount_point,
+                        &[],
+                        None,
+                        &[],
+                    )?);
+                }
                 continue;
             };
             if staged_stems.contains(stem) {
@@ -2752,22 +2796,64 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     )?;
                 }
                 StorageGcReason::OrphanStagingMount => {
-                    if self.retire_staging_mount(candidate.path(), ImageFormat::Sparse)? {
-                        let workspace = candidate
-                            .path()
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .and_then(staged_stem_workspace)
-                            .map(|name| name.as_str().to_owned())
-                            .unwrap_or_default();
-                        deletion_log::log_deletion(
-                            project,
-                            DeletionOp::RemoveStagingMount,
-                            DeletionKind::Other,
-                            &workspace,
-                            None,
-                            candidate.path(),
-                        );
+                    let parses = candidate
+                        .path()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(staged_stem_workspace)
+                        .is_some();
+                    if parses {
+                        if self.retire_staging_mount(candidate.path(), ImageFormat::Sparse)? {
+                            let workspace = candidate
+                                .path()
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .and_then(staged_stem_workspace)
+                                .map(|name| name.as_str().to_owned())
+                                .unwrap_or_default();
+                            deletion_log::log_deletion(
+                                project,
+                                DeletionOp::RemoveStagingMount,
+                                DeletionKind::Other,
+                                &workspace,
+                                None,
+                                candidate.path(),
+                            );
+                        }
+                    } else {
+                        // Stems staging never produces are never live controller mounts and
+                        // are never detached: a foreign volume mounted here is not ours to
+                        // unmount. Remove only a still-empty, still-unmounted directory;
+                        // anything that arrived since preview waits for a later sweep
+                        // instead of failing this one.
+                        if dir_is_empty(candidate.path())? && !dir_is_mounted(candidate.path())? {
+                            match fs::remove_dir(candidate.path()) {
+                                Ok(()) => {
+                                    let workspace = candidate
+                                        .path()
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or_default();
+                                    deletion_log::log_deletion(
+                                        project,
+                                        DeletionOp::RemoveStagingMount,
+                                        DeletionKind::Other,
+                                        workspace,
+                                        None,
+                                        candidate.path(),
+                                    );
+                                    sync_parent_path(candidate.path())?;
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                Err(error) => {
+                                    return Err(io_error(
+                                        "remove stale staging mountpoint",
+                                        candidate.path(),
+                                        error,
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 StorageGcReason::OrphanMountpoint => {
