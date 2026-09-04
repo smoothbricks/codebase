@@ -1025,11 +1025,13 @@ proptest! {
                 requested as u8,
                 (requested >> 8) as u8,
             ),
-            5 => (
-                SlotType::ConditionTree as u8,
-                requested as u8,
-                (requested >> 8) as u8,
-            ),
+            5 => {
+                // A derived-facts region is masked by `capacity - 1`; init
+                // refuses any other capacity, so the shared formula is probed
+                // on the power of two the compiler would have emitted.
+                let cap = requested.next_power_of_two();
+                (SlotType::ConditionTree as u8, cap as u8, (cap >> 8) as u8)
+            }
             6 => (
                 SlotType::Aggregate as u8,
                 aggregate_types[usize::from(requested) % aggregate_types.len()] as u8,
@@ -1268,4 +1270,45 @@ proptest! {
 
 fn next_pow2_check(n: u32) -> u32 {
     columine_types::types::next_power_of_2(n)
+}
+
+/// The derived-facts region indexes with `capacity - 1` masks, so a
+/// CONDITION_TREE capacity that is not a power of two is refused at init.
+#[test]
+fn condition_tree_capacity_must_be_a_power_of_two() {
+    for cap in [3u16, 6, 100, 1000] {
+        let program =
+            build_single_slot_program(SlotType::ConditionTree as u8, cap as u8, (cap >> 8) as u8);
+        let size = calculate_state_size(
+            &program,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        );
+        let mut state = vec![0u8; size as usize];
+        assert_eq!(
+            init_state(
+                &mut state,
+                &program,
+                columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+            ),
+            Err(columine_types::types::ErrorCode::InvalidProgram),
+            "capacity {cap}"
+        );
+    }
+    for cap in [0u16, 1, 64, 1024] {
+        let program =
+            build_single_slot_program(SlotType::ConditionTree as u8, cap as u8, (cap >> 8) as u8);
+        let size = calculate_state_size(
+            &program,
+            columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS,
+        );
+        let mut state = vec![0u8; size as usize];
+        assert!(
+            init_state(
+                &mut state,
+                &program,
+                columine_vm::state_init::DEFAULT_ACCEPTED_PROGRAM_MAGICS
+            )
+            .is_ok()
+        );
+    }
 }
