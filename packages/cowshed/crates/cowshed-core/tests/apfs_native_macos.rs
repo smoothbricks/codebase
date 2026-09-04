@@ -5055,3 +5055,134 @@ fn quarantine_keyless_canonical_sidecar_leaves_image_and_spares_healthy_sibling(
     host.recover_pending(&fixture.config(), &[])
         .expect("repeated recovery is idempotent");
 }
+
+/// The production brick: a crashed create leaves a payload with a PendingFence sidecar that
+/// enumeration deliberately hides, while the CAS re-read used to report it as Exists — every
+/// plan saw Absent, every re-read saw Exists, and controller startup exhausted its retries
+/// forever. Observation must agree with enumeration so the planned verb reaches apply, where
+/// the intent's resume owns the residue.
+#[test]
+fn absent_observation_agrees_with_enumeration_on_pending_fence_residue() {
+    let fixture = Fixture::new("observe-pending-fence");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let name = WorkspaceName::session("residue").expect("session");
+    let canonical = layout
+        .session_image(&name, ImageFormat::Sparse)
+        .expect("session image");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    let mut pending = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut pending, name.clone());
+    pending.publication_state = PublicationState::PendingFence;
+    pending
+        .write_for_image(canonical.image())
+        .expect("pending sidecar");
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    let expected = LifecycleFact::Absent {
+        repo: repo(),
+        name: name.clone(),
+        topology_revision: Revision::new(2),
+    };
+    assert_eq!(
+        host.observe(std::slice::from_ref(&expected))
+            .expect("observe fenced residue"),
+        vec![expected.clone()],
+        "a fenced residue observes as Absent, like enumeration reports it"
+    );
+
+    // Control: a genuinely live workspace still observes as Exists, so real contention
+    // keeps failing closed at revalidation instead of being paved over.
+    let mut live = pending.clone();
+    live.publication_state = PublicationState::Active;
+    live.write_for_image(canonical.image())
+        .expect("live sidecar");
+    assert!(
+        matches!(
+            host.observe(std::slice::from_ref(&expected))
+                .expect("observe live workspace")
+                .as_slice(),
+            [LifecycleFact::Exists { .. }]
+        ),
+        "an active image under the same name still observes as Exists"
+    );
+}
+
+/// Resume must survive a main that moved since the crash: base commit is provenance recorded
+/// on the residue, not identity, and workspaces forked from an older main are routine.
+/// Every structural leg (repo, slot, role, format, generation, checkout, branch, ancestry,
+/// worktree mode) still refuses on drift.
+#[test]
+fn resumable_clone_tolerates_a_main_that_moved_since_the_crash() {
+    let fixture = Fixture::new("resume-moved-base");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let name = WorkspaceName::session("residue").expect("session");
+    let canonical = layout
+        .session_image(&name, ImageFormat::Sparse)
+        .expect("session image");
+    create_image(canonical.image(), ImageFormat::Sparse);
+    let incarnation =
+        WorkspaceIncarnation::new("d4d16c0f739d441fb38aed67cf010891").expect("incarnation");
+    let mut pending = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut pending, name.clone());
+    pending.workspace_incarnation = incarnation.clone();
+    pending.publication_state = PublicationState::PendingFence;
+    pending.grants.revision = 3;
+    let info = pending.info_snapshot.as_mut().expect("info snapshot");
+    info.base_commit = "oldbase".to_owned();
+    info.branch = Some("cowshed/residue".to_owned());
+    pending
+        .write_for_image(canonical.image())
+        .expect("pending sidecar");
+
+    let source = LifecycleWorkspace::new(
+        repo(),
+        WorkspaceName::new("main").expect("main"),
+        WorkspaceIncarnation::new("00000000000000000000000000000001").expect("incarnation"),
+        Revision::new(2),
+        Revision::new(2),
+        WorkspaceRole::Main,
+        ImageFormat::Sparse,
+    )
+    .expect("source workspace");
+    // The replayed identity matches the residue structurally but carries main's current
+    // base, which moved on after the crash.
+    let mut requested = identity(&fixture);
+    requested.project_root = PathBuf::from("/project");
+    requested.base_commit = "newbase".to_owned();
+    requested.branch = Some("cowshed/residue".to_owned());
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    let resumed = host
+        .resumable_clone(
+            &fixture.config(),
+            &source,
+            &name,
+            Revision::new(2),
+            ImageFormat::Sparse,
+            &requested,
+        )
+        .expect("resume check")
+        .expect("a moved base must still resume");
+    assert_eq!(resumed.workspace.name(), &name);
+    assert_eq!(resumed.workspace.incarnation(), &incarnation);
+    assert_eq!(
+        resumed.identity.base_commit, "oldbase",
+        "the resumed record keeps the residue's own base as provenance"
+    );
+
+    // Control: structural drift still fails closed.
+    let mut drifted = requested.clone();
+    drifted.branch = Some("cowshed/other".to_owned());
+    assert!(
+        host.resumable_clone(
+            &fixture.config(),
+            &source,
+            &name,
+            Revision::new(2),
+            ImageFormat::Sparse,
+            &drifted,
+        )
+        .is_err(),
+        "a residue for another branch must not resume into this operation"
+    );
+}

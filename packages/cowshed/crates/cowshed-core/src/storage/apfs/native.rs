@@ -3041,6 +3041,23 @@ where
                     name,
                     topology_revision,
                 } => match self.find_canonical_image(repo, name)? {
+                    Some((_, metadata))
+                        if metadata.publication_state == PublicationState::PendingFence =>
+                    {
+                        // A crash-left PendingFence payload is deliberately invisible to
+                        // enumeration (published_facts skips it until init completes), and
+                        // its lifecycle intent owns resumption. Report Absent so the planned
+                        // verb reaches apply, where resumable_clone resumes it. Reporting
+                        // Exists here makes the CAS unsatisfiable — every plan sees Absent,
+                        // every re-read sees Exists — and bricks controller startup in an
+                        // infinite stale-retry loop. A genuinely contending Active image
+                        // still reports Exists below, preserving the retry.
+                        Ok(LifecycleFact::Absent {
+                            repo: repo.clone(),
+                            name: name.clone(),
+                            topology_revision: *topology_revision,
+                        })
+                    }
                     Some((_, metadata)) => {
                         Ok(self.observed_workspace(&metadata, *topology_revision, false))
                     }
@@ -3184,13 +3201,19 @@ where
                 image.display()
             ))
         })?;
+        // Every leg but base_commit guards structural identity: wrong repo, slot, role,
+        // format, generation, checkout, branch, ancestry, or worktree mode resumes into
+        // the wrong workspace and must refuse. Base commit is provenance, not identity —
+        // the resumed record keeps the residue's own base (see `identity` below), and a
+        // workspace forked from an older main is routine: rebase and land reconcile lag
+        // as a matter of course. Gating resume on an unmoved main would refuse recovery
+        // in every active repository, exactly when crash recovery is most needed.
         if workspace.repo() != source.repo()
             || workspace.name() != destination
             || workspace.role() != WorkspaceRole::Workspace
             || workspace.format() != format
             || metadata.grants.revision != expected_revision.get()
             || info.project_root != requested_identity.project_root
-            || info.base_commit != requested_identity.base_commit
             || info.branch != requested_identity.branch
             || info.forked_from != requested_identity.forked_from
             || info.git_worktree != requested_identity.git_worktree
