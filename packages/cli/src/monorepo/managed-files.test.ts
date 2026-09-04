@@ -10,7 +10,6 @@ import {
   DEVENV_MODULE_IMPORT,
   deployTargetInfoFromProjects,
   extractInlineLocalBlocksForTest,
-  getManagedContentForTest,
   hasExactTargetForTest,
   INLINE_LOCAL_BEGIN,
   INLINE_LOCAL_END,
@@ -19,8 +18,8 @@ import {
   macosPlatformArchitecturesForTest,
   managedFileTargetsForTest,
   platformTargetGlobsForTest,
-  publishWorkflowManagedFileForTest,
   reinsertInlineLocalBlocksForTest,
+  renderManagedPublishWorkflowForTest,
   splitLocalSectionForTest,
   validateDevenvModuleImport,
 } from './managed-files.js';
@@ -439,8 +438,7 @@ describe('publish workflow rendering by repo shape', () => {
   });
 
   it('drops the release half for a repo that deploys production but owns no packages', () => {
-    const rendered = getManagedContentForTest(
-      publishWorkflowManagedFileForTest,
+    const rendered = renderManagedPublishWorkflowForTest(
       context({ hasReleasePackages: false, hasProductionDeployTargets: true }),
     );
 
@@ -450,8 +448,7 @@ describe('publish workflow rendering by repo shape', () => {
   });
 
   it('keeps the release pipeline for a repo that owns packages', () => {
-    const rendered = getManagedContentForTest(
-      publishWorkflowManagedFileForTest,
+    const rendered = renderManagedPublishWorkflowForTest(
       context({ hasReleasePackages: true, hasProductionDeployTargets: true }),
     );
 
