@@ -1,4 +1,5 @@
 pub mod native;
+pub mod rekey;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -725,7 +726,7 @@ pub enum ApfsStorageError {
     MarkerMismatch(String),
     #[error("workspace {workspace} quarantined ({reason}): {tombstone}")]
     Quarantined {
-        workspace: String,
+        workspace: WorkspaceName,
         reason: String,
         tombstone: PathBuf,
     },

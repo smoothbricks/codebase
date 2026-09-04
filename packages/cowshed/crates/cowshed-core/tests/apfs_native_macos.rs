@@ -2385,18 +2385,42 @@ fn recovery_rejects_missing_or_contradictory_ca_companion_layouts() {
         .expect("canonical");
     create_image(missing_canonical.image(), ImageFormat::Sparse);
     std::fs::remove_file(ca_key_path(missing_canonical.image())).expect("remove CA key");
-    let error = native_host(&missing, RecordingRunner::default())
+    // A missing CA companion beside a published image is a per-workspace integrity failure:
+    // the pass completes, the sidecar quarantines with a tombstone, and the image stays.
+    native_host(&missing, RecordingRunner::default())
         .recover_pending(&missing.config(), &[])
-        .expect_err("missing canonical CA key");
-    match error {
-        ApfsStorageError::MarkerMismatch(message) => {
-            assert!(message.contains(&missing_canonical.image().display().to_string()));
-            assert!(
-                message.contains(&ca_key_path(missing_canonical.image()).display().to_string())
-            );
-        }
-        other => panic!("expected typed integrity error, got {other:?}"),
-    }
+        .expect("a keyless canonical quarantines instead of failing the pass");
+    assert!(
+        missing_canonical.image().exists(),
+        "the image stays in place"
+    );
+    assert!(
+        !sidecar_path(missing_canonical.image()).exists(),
+        "the keyless grants sidecar leaves the canonical location"
+    );
+    let missing_project = missing_layout.project().project_root.clone();
+    let mut missing_entries: Vec<PathBuf> = std::fs::read_dir(missing_project.join("quarantine"))
+        .expect("quarantine root")
+        .map(|entry| entry.expect("quarantine entry").path())
+        .collect();
+    missing_entries.sort();
+    assert_eq!(missing_entries.len(), 1, "one workspace quarantined");
+    let missing_wire: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(missing_entries[0].join("tombstone.json")).expect("tombstone"),
+    )
+    .expect("tombstone json");
+    assert_eq!(
+        missing_wire["workspace"],
+        serde_json::Value::String("main".to_owned())
+    );
+    assert_eq!(
+        missing_wire["reason"],
+        serde_json::Value::String("missing-ca-companion".to_owned())
+    );
+    assert_eq!(
+        missing_wire["image"],
+        serde_json::Value::String(missing_canonical.image().display().to_string())
+    );
 
     let contradictory = Fixture::new("recovery-contradictory-ca");
     let layout = StorageLayout::new(&contradictory.root, &repo()).expect("layout");
@@ -4897,4 +4921,137 @@ fn resizing_a_mounted_workspace_puts_it_back_on_its_mount() {
     );
     host.detach_mounted(&workspace(ImageFormat::Sparse), DetachIntent::Release)
         .expect("the resized attachment is owned by the mount registry");
+}
+
+/// SliceA quarantine: a published canonical image whose grants sidecar exists but whose CA
+/// companion is missing must not abort the store-wide pass. Recovery quarantines the sidecar
+/// (+ companion if present) into `<project>/quarantine/<ws>-<unix_ts>/` with a tombstone,
+/// leaves the image in place, and completes the pass for the healthy sibling.
+#[test]
+fn quarantine_keyless_canonical_sidecar_leaves_image_and_spares_healthy_sibling() {
+    let fixture = Fixture::new("quarantine-keyless-canonical");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+
+    let live = WorkspaceName::new("session-live").expect("live session");
+    let live_canonical = layout
+        .session_image(&live, ImageFormat::Sparse)
+        .expect("live canonical");
+    create_image(live_canonical.image(), ImageFormat::Sparse);
+    let mut live_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut live_metadata, live.clone());
+    live_metadata
+        .write_for_image(live_canonical.image())
+        .expect("live metadata");
+
+    let keyless = WorkspaceName::new("session-keyless").expect("keyless session");
+    let keyless_canonical = layout
+        .session_image(&keyless, ImageFormat::Sparse)
+        .expect("keyless canonical");
+    create_image(keyless_canonical.image(), ImageFormat::Sparse);
+    let mut keyless_metadata = metadata(ImageFormat::Sparse);
+    set_metadata_workspace(&mut keyless_metadata, keyless.clone());
+    keyless_metadata
+        .write_for_image(keyless_canonical.image())
+        .expect("keyless metadata");
+    std::fs::remove_file(ca_key_path(keyless_canonical.image())).expect("remove CA key");
+    assert!(sidecar_path(keyless_canonical.image()).exists());
+    assert!(!ca_key_path(keyless_canonical.image()).exists());
+
+    let host = native_host(&fixture, RecordingRunner::default());
+    host.recover_pending(&fixture.config(), &[])
+        .expect("a keyless canonical must quarantine, not abort the pass");
+
+    assert!(
+        keyless_canonical.image().exists(),
+        "the keyless image stays in place"
+    );
+    assert!(
+        !sidecar_path(keyless_canonical.image()).exists(),
+        "the keyless grants sidecar is quarantined away from the canonical location"
+    );
+    let project = layout.project().project_root.clone();
+    let quarantine_root = project.join("quarantine");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&quarantine_root)
+        .expect("quarantine root")
+        .map(|entry| entry.expect("quarantine entry").path())
+        .collect();
+    entries.sort();
+    assert_eq!(entries.len(), 1, "one workspace quarantined");
+    let dir = &entries[0];
+    assert!(
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("session-keyless-")),
+        "quarantine dir names the workspace: {}",
+        dir.display()
+    );
+    let tombstone = dir.join("tombstone.json");
+    assert!(tombstone.exists(), "quarantine writes a tombstone");
+    let wire: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&tombstone).expect("tombstone"))
+            .expect("tombstone json");
+    assert_eq!(wire["version"], serde_json::Value::Number(1.into()));
+    assert_eq!(
+        wire["repoId"],
+        serde_json::Value::String("acme/widget".to_owned())
+    );
+    assert_eq!(
+        wire["workspace"],
+        serde_json::Value::String("session-keyless".to_owned())
+    );
+    assert_eq!(
+        wire["incarnation"],
+        serde_json::Value::String("00000000000000000000000000000001".to_owned())
+    );
+    assert!(
+        wire["revision"].as_u64().is_some(),
+        "tombstone records revision: {wire}"
+    );
+    assert_eq!(
+        wire["reason"],
+        serde_json::Value::String("missing-ca-companion".to_owned())
+    );
+    assert_eq!(
+        wire["image"],
+        serde_json::Value::String(keyless_canonical.image().display().to_string())
+    );
+    assert_eq!(
+        wire["companion"],
+        serde_json::Value::String(ca_key_path(keyless_canonical.image()).display().to_string())
+    );
+    assert!(
+        wire["quarantinedAt"]
+            .as_str()
+            .is_some_and(|at| at.len() == 20 && at.contains('T') && at.ends_with('Z')),
+        "tombstone records an RFC3339 UTC second: {wire}"
+    );
+    assert_eq!(
+        wire["sidecar"],
+        serde_json::Value::String(
+            dir.join(
+                sidecar_path(keyless_canonical.image())
+                    .file_name()
+                    .expect("sidecar name")
+            )
+            .display()
+            .to_string()
+        )
+    );
+    let sidecar_name = sidecar_path(keyless_canonical.image())
+        .file_name()
+        .expect("sidecar name")
+        .to_owned();
+    assert!(
+        dir.join(&sidecar_name).exists(),
+        "the quarantined sidecar lands beside the tombstone"
+    );
+    assert_eq!(
+        std::fs::read(live_canonical.image()).expect("live image"),
+        b"fixture",
+        "the healthy sibling payload is untouched"
+    );
+    assert!(sidecar_path(live_canonical.image()).exists());
+    assert!(ca_key_path(live_canonical.image()).exists());
+    host.recover_pending(&fixture.config(), &[])
+        .expect("repeated recovery is idempotent");
 }
