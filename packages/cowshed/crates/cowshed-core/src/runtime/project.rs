@@ -6298,9 +6298,20 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
                 error,
             )),
         }
+        // Companion inputs for the quarantine scan below, collected here so `doctor` lists
+        // the store once. An authoritative failure leaves this empty — and is already a
+        // finding above — while the tombstone half still runs.
+        let mut companion_images: Vec<(WorkspaceName, PathBuf)> = Vec::new();
+
         match self.authoritative().await {
             Ok(workspaces) => {
                 let main_mount = self.workspace_mount_path(&main_name()).ok();
+                companion_images.extend(workspaces.iter().map(|workspace| {
+                    (
+                        workspace.derived.workspace.name().clone(),
+                        workspace.image.clone(),
+                    )
+                }));
                 for workspace in workspaces {
                     let workspace_name = workspace.derived.workspace.name().clone();
                     let expected_mount = match self.workspace_mount_path(&workspace_name) {
@@ -6543,7 +6554,15 @@ impl ProjectRuntimeHost for NativeProjectRuntimeHost {
         // Recovery quarantines a companion-less workspace and continues, so the failure never
         // reaches `doctor` as an error: the tombstones and the live images are read here, from
         // the same store-side facts, instead.
-        findings.extend(quarantine_and_companion_findings(self).await);
+        let store_root = self.descriptor.store_root.clone();
+        let repo_id = self.descriptor.repo_id.clone();
+        findings.extend(
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                quarantine_and_companion_findings_blocking(&store_root, &repo_id, &companion_images)
+            })
+            .await
+            .unwrap_or_default(),
+        );
         Ok(DoctorReport::from_findings(findings))
     }
 
@@ -9406,42 +9425,7 @@ fn native_finding(
     }
 }
 
-/// Quarantine tombstones and companion-less live images, as `doctor` reports them.
-///
-/// Recovery quarantines and continues — `recover_pending` still returns `Ok` — so neither
-/// state surfaces as a substrate error for the finding mappers above to catch. This pass
-/// reads the same store-side facts directly: every `tombstone.json` under the project's
-/// quarantine directory, and every live image whose sidecar survived without its CA
-/// companion. A quarantined workspace keeps its image but loses its sidecar, so the two
-/// checks cannot report the same workspace twice.
-#[cfg(target_os = "macos")]
-async fn quarantine_and_companion_findings(
-    host: &NativeProjectRuntimeHost,
-) -> Vec<crate::api::dto::Finding> {
-    let images = match host.authoritative().await {
-        // An authoritative failure is already a finding above; this pass only adds what a
-        // successful listing reveals.
-        Err(_) => Vec::new(),
-        Ok(workspaces) => workspaces
-            .iter()
-            .map(|workspace| {
-                (
-                    workspace.derived.workspace.name().clone(),
-                    workspace.image.clone(),
-                )
-            })
-            .collect(),
-    };
-    let store_root = host.descriptor.store_root.clone();
-    let repo_id = host.descriptor.repo_id.clone();
-    crate::storage::lifecycle::dispatch_blocking(move || {
-        quarantine_and_companion_findings_blocking(&store_root, &repo_id, &images)
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// Blocking scan behind `quarantine_and_companion_findings`: quarantine tombstones first,
+/// Blocking quarantine-and-companion scan for `doctor`: quarantine tombstones first,
 /// then live images whose sidecar survived without their CA companion.
 ///
 /// Tombstones this reader does not understand are skipped, not reported: the schema is the
