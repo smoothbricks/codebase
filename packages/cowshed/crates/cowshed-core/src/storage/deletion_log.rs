@@ -249,12 +249,22 @@ fn project_and_workspace_for_image(image: &Path) -> Option<(PathBuf, String)> {
         "sessions" => parent
             .parent()
             .map(|project| (project.to_path_buf(), stem.to_owned())),
-        ".staging" | ".trash" => parent.parent().map(|project| {
+        ".staging" => parent.parent().map(|project| {
             (
                 project.to_path_buf(),
                 staged_stem_workspace(stem).unwrap_or_default(),
             )
         }),
+        // Trash lives one level deeper: `<project>/sessions/.trash/<file>`.
+        ".trash" => parent
+            .parent()
+            .and_then(|sessions| sessions.parent())
+            .map(|project| {
+                (
+                    project.to_path_buf(),
+                    staged_stem_workspace(stem).unwrap_or_default(),
+                )
+            }),
         _ => {
             // `<project>/checkpoints/<workspace>/<label>.<ext>`: the workspace is the
             // directory, the project two levels up.
@@ -274,8 +284,10 @@ fn project_and_workspace_for_image(image: &Path) -> Option<(PathBuf, String)> {
                     .and_then(|grandparent| grandparent.parent())
                     .map(|project| (project.to_path_buf(), workspace.to_owned()));
             }
-            // `<project>/main.<ext>`: the parent is the project root itself.
-            if WorkspaceName::new(stem).is_ok() {
+            // `<project>/main.<ext>`: the parent is the project root itself. Only the
+            // literal main stem qualifies — any other filename here is not a layout
+            // this module knows, and guessing would misplace the evidence.
+            if stem == "main" {
                 return Some((parent.to_path_buf(), stem.to_owned()));
             }
             None
@@ -430,6 +442,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project);
     }
 
+    #[test]
     fn project_layouts_resolve() {
         let root = PathBuf::from("/store/acme/widget");
         assert_eq!(
