@@ -2128,7 +2128,7 @@ fn parse_existing_attachment(
                     "matching image has no system-entities array".into(),
                 )
             })?;
-        let candidate = parse_attachment_entities(entities)?;
+        let candidate = parse_inventory_attachment_entities(entities)?;
         if attachment.replace(candidate).is_some() {
             return Err(ApfsError::InvalidAttachmentInventory(
                 "matching image has multiple inventory entries".into(),
@@ -2290,9 +2290,61 @@ fn parse_attachment_plist(bytes: &[u8]) -> Result<(String, String), ApfsError> {
     parse_attachment_entities(system_entities)
 }
 
-fn parse_attachment_entities(
+/// Selector for the system-entities `hdiutil info -plist` reports for a matching image — the
+/// schema `existing_attachment` reads.
+///
+/// `hdiutil info` does not share `hdiutil attach` stdout's schema: on macOS 26 it labels every
+/// entity with a partition-type GUID `content-hint` (`41504653-…` is ASCII "APFS", Apple's
+/// APFS volume type) and reports no `volume-kind` at all, so the string-hint attach selector
+/// matches nothing and would report a bogus "no APFS device candidate". The GUID classes are
+/// therefore tried first, most specific APFS role first; entities in the attach stdout schema
+/// (string hints, `volume-kind`) fall through to that selector unchanged, which also keeps the
+/// answer working on hosts whose info output still carries string hints.
+fn parse_inventory_attachment_entities(
     system_entities: &[plist::Value],
 ) -> Result<(String, String), ApfsError> {
+    let entities = collect_attachment_entities(system_entities)?;
+    if let Some(candidate) = select_guid_attachment_candidate(&entities) {
+        let reported_whole = reported_attachment_whole(&entities)?;
+        let whole = attachment_whole_device(reported_whole, &candidate)?;
+        return Ok((whole, candidate));
+    }
+    parse_attachment_entities(system_entities)
+}
+
+/// Apple's fixed APFS partition-type GUID prefixes, in the order the candidate selector
+/// prefers them: the volume device itself, the synthesized physical-store device it hangs
+/// from, then the container partition slice inside the image's partition scheme.
+const APFS_VOLUME_TYPE_GUID_PREFIX: &str = "41504653-";
+const APFS_STORE_TYPE_GUID_PREFIX: &str = "EF57347C-";
+const APFS_CONTAINER_TYPE_GUID_PREFIX: &str = "7C3457EF-";
+
+fn hint_has_type_guid(hint: &str, prefix: &str) -> bool {
+    hint.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn select_guid_attachment_candidate(entities: &[(String, String, String)]) -> Option<String> {
+    const GUID_PREFIXES: [&str; 3] = [
+        APFS_VOLUME_TYPE_GUID_PREFIX,
+        APFS_STORE_TYPE_GUID_PREFIX,
+        APFS_CONTAINER_TYPE_GUID_PREFIX,
+    ];
+    for prefix in GUID_PREFIXES {
+        if let Some(selected) = entities
+            .iter()
+            .filter(|(_, hint, _)| hint_has_type_guid(hint, prefix))
+            .max_by_key(|(device, _, _)| device_depth(device))
+        {
+            return Some(selected.0.clone());
+        }
+    }
+    None
+}
+
+fn collect_attachment_entities(
+    system_entities: &[plist::Value],
+) -> Result<Vec<(String, String, String)>, ApfsError> {
     let mut entities = Vec::new();
     for entity in system_entities {
         let dictionary = entity.as_dictionary().ok_or_else(|| {
@@ -2323,7 +2375,16 @@ fn parse_attachment_entities(
             "no dev-entry values".into(),
         ));
     }
+    Ok(entities)
+}
 
+/// The single `GUID_partition_scheme` entity at slice depth zero, or `None` when the plist
+/// reports none; more than one is an invalid attachment. The whole device is a candidate
+/// anchor for the attach stdout selector, not a source of truth on its own — a synthesized
+/// physical store (`diskN+1`) is intentionally not a path descendant of the whole.
+fn reported_attachment_whole(
+    entities: &[(String, String, String)],
+) -> Result<Option<String>, ApfsError> {
     let mut reported_whole_devices = entities.iter().filter(|(device, hint, _)| {
         device_depth(device) == 0 && hint.eq_ignore_ascii_case("GUID_partition_scheme")
     });
@@ -2333,8 +2394,26 @@ fn parse_attachment_entities(
             "multiple whole image devices".into(),
         ));
     }
+    Ok(reported_whole.map(|(device, _, _)| device.clone()))
+}
 
-    let physical_store = reported_whole.and_then(|(whole, _, _)| {
+fn attachment_whole_device(
+    reported_whole: Option<String>,
+    candidate: &str,
+) -> Result<String, ApfsError> {
+    match reported_whole {
+        Some(whole) => Ok(whole),
+        None => whole_device_from(candidate)
+            .ok_or_else(|| ApfsError::InvalidAttachmentPlist("invalid APFS device".into())),
+    }
+}
+
+fn parse_attachment_entities(
+    system_entities: &[plist::Value],
+) -> Result<(String, String), ApfsError> {
+    let entities = collect_attachment_entities(system_entities)?;
+    let reported_whole = reported_attachment_whole(&entities)?;
+    let physical_store = reported_whole.as_ref().and_then(|whole| {
         entities
             .iter()
             .filter(|(device, hint, kind)| {
@@ -2364,12 +2443,7 @@ fn parse_attachment_entities(
         })
         .map(|(device, _, _)| device.clone())
         .ok_or_else(|| ApfsError::InvalidAttachmentPlist("no APFS device candidate".into()))?;
-
-    let whole = match reported_whole {
-        Some((device, _, _)) => device.clone(),
-        None => whole_device_from(&candidate)
-            .ok_or_else(|| ApfsError::InvalidAttachmentPlist("invalid APFS device".into()))?,
-    };
+    let whole = attachment_whole_device(reported_whole, &candidate)?;
     Ok((whole, candidate))
 }
 
@@ -2590,6 +2664,7 @@ fn classify_clone_error(source: &Path, destination: &Path, error: io::Error) -> 
             source: source.to_owned(),
             destination: destination.to_owned(),
         },
+
         Some(17) => CloneFileError::DestinationExists {
             destination: destination.to_owned(),
         },
@@ -2648,6 +2723,41 @@ mod tests {
       <dict><key>dev-entry</key><string>/dev/disk5s1</string><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>volume-kind</key><string>apfs</string></dict>
     </array></dict></plist>"#;
 
+    /// `hdiutil info -plist` for one attached sparse image, captured live on macOS 26.6.2. This
+    /// is the schema `existing_attachment` reads: partition-type GUID `content-hint`s and no
+    /// `volume-kind` — unlike `hdiutil attach` stdout, whose string hints ("Apple_APFS") and
+    /// `volume-kind` the attach selector was written against. The GUID prefixes below are
+    /// Apple's fixed APFS partition types; the device numbers are the live capture's.
+    const SPARSE_INFO_INVENTORY_PLIST: &str = r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict>
+      <key>image-path</key><string>/tmp/cowshed-target.sparseimage</string>
+      <key>blockcount</key><integer>629555280</integer>
+      <key>blocksize</key><integer>512</integer>
+      <key>system-entities</key><array>
+        <dict><key>dev-entry</key><string>/dev/disk90</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
+        <dict><key>dev-entry</key><string>/dev/disk90s1</string><key>content-hint</key><string>C12A7328-F81F-11D2-BA4B-00A0C93EC93B</string></dict>
+        <dict><key>dev-entry</key><string>/dev/disk90s2</string><key>content-hint</key><string>7C3457EF-0000-11AA-AA11-00306543ECAC</string></dict>
+        <dict><key>dev-entry</key><string>/dev/disk91</string><key>content-hint</key><string>EF57347C-0000-11AA-AA11-00306543ECAC</string></dict>
+        <dict><key>dev-entry</key><string>/dev/disk91s1</string><key>content-hint</key><string>41504653-0000-11AA-AA11-00306543ECAC</string><key>mount-point</key><string>/Users/danny/Dev/.cowshed/axe-scale/minigraf/wasmsurf</string></dict>
+      </array>
+    </dict></array></dict></plist>"#;
+
+    /// Downstream fakes consistent with [`SPARSE_INFO_INVENTORY_PLIST`]: the volume GUID
+    /// candidate `disk91s1` resolves through its container `disk91` back to itself.
+    const SPARSE_INFO_DEVICE_INFO_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>APFSContainerReference</key><string>disk91</string>
+      <key>Content</key><string>Apple_APFS</string>
+    </dict></plist>"#;
+
+    const SPARSE_INFO_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
+      <key>Containers</key><array><dict>
+        <key>PhysicalStores</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk91</string></dict>
+        </array>
+        <key>Volumes</key><array>
+          <dict><key>DeviceIdentifier</key><string>disk91s1</string></dict>
+        </array>
+      </dict></array>
+    </dict></plist>"#;
     const SPARSE_VOLUME_LIST_PLIST: &str = r#"<?xml version="1.0"?><plist version="1.0"><dict>
       <key>Containers</key><array><dict>
         <key>PhysicalStores</key><array>
@@ -5366,17 +5476,10 @@ mod tests {
 
     #[test]
     fn existing_attachment_reuses_one_inventory_mapping_without_attaching_again() {
-        let inventory = r#"<?xml version="1.0"?><plist><dict><key>images</key><array><dict>
-          <key>image-path</key><string>/tmp/cowshed-target.sparseimage</string>
-          <key>system-entities</key><array>
-            <dict><key>dev-entry</key><string>/dev/disk4</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
-            <dict><key>dev-entry</key><string>/dev/disk4s1</string><key>content-hint</key><string>Apple_APFS</string></dict>
-          </array>
-        </dict></array></dict></plist>"#;
         let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
-            CommandOutput::success(inventory),
-            CommandOutput::success(SPARSE_DEVICE_INFO_PLIST),
-            CommandOutput::success(SPARSE_VOLUME_LIST_PLIST),
+            CommandOutput::success(SPARSE_INFO_INVENTORY_PLIST),
+            CommandOutput::success(SPARSE_INFO_DEVICE_INFO_PLIST),
+            CommandOutput::success(SPARSE_INFO_VOLUME_LIST_PLIST),
         ]));
 
         let attachment = backend
@@ -5386,8 +5489,8 @@ mod tests {
             )
             .expect("inventory")
             .expect("existing attachment");
-        assert_eq!(attachment.whole_device(), "/dev/disk4");
-        assert_eq!(attachment.volume_device(), "/dev/disk5s2");
+        assert_eq!(attachment.whole_device(), "/dev/disk90");
+        assert_eq!(attachment.volume_device(), "/dev/disk91s1");
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 3);
         assert_eq!(argv(&requests[0]), ["info", "-plist"]);
@@ -5397,6 +5500,30 @@ mod tests {
                 .all(|request| !argv(request).iter().any(|arg| *arg == "attach")),
             "resume inventory must not create a duplicate attachment"
         );
+    }
+
+    #[test]
+    fn inventory_attachment_entities_select_apfs_guid_hints() {
+        let value =
+            plist::Value::from_reader(std::io::Cursor::new(SPARSE_INFO_INVENTORY_PLIST.as_bytes()))
+                .unwrap();
+        let entities = value
+            .as_dictionary()
+            .unwrap()
+            .get("images")
+            .and_then(plist::Value::as_array)
+            .unwrap()[0]
+            .as_dictionary()
+            .unwrap()
+            .get("system-entities")
+            .and_then(plist::Value::as_array)
+            .unwrap()
+            .as_slice();
+        let (whole, candidate) = parse_inventory_attachment_entities(entities).unwrap();
+        assert_eq!(whole, "/dev/disk90");
+        // The synthesized APFS volume, not the EFI slice, the container partition, or the
+        // physical-store device the volume hangs off.
+        assert_eq!(candidate, "/dev/disk91s1");
     }
 
     #[test]
