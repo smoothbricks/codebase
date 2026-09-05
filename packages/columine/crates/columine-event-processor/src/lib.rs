@@ -2,28 +2,30 @@
 //!
 //! [`EpWiring`] parameterizes the two published artifact configurations:
 //!
-//! - **Consumer configuration**: dynamic-only extraction, deduplication
-//!   (bloom + checkpoint), diagnostic bytes in the result header, JSON
-//!   fallback-workspace growth, and no MessagePack workspace growth.
+//! - **Consumer configuration**: dynamic-only extraction, exact deduplication
+//!   against the seen-set ([`dedup`]), diagnostic bytes in the result
+//!   header, JSON fallback-workspace growth, and no MessagePack workspace
+//!   growth.
 //! - **Columine configuration**: no deduplication, a base four-column path for
 //!   four-field schemas, and workspace growth for both JSON and MessagePack.
 //!
 //! The `ep_*` wasm exports are thin bindings around this library core.
 
-pub mod bloom;
-pub mod checkpoint;
 pub mod compact;
+pub mod dedup;
 
-pub use bloom::{BloomFilter, CollisionPolicy, DedupState};
 pub use compact::{
     COMPACT_ABI_VERSION, COMPACT_BATCH_MAGIC, COMPACT_DESCRIPTOR_SIZE, COMPACT_DIAGNOSTIC_STAGE,
     COMPACT_HEADER_SIZE, CompactBatchView, CompactValidationError, compact_detail,
 };
+pub use dedup::{
+    AdmissionRefusal, CollisionPolicy, EventKey, IdNamespace, Judgment, MAX_ID_BYTES, SeenSet,
+};
 
 use columine_arrow::{
-    DynamicColumns, DynamicSchemaConfig, IpcError, MAX_VALUE_BYTES, MIN_ARROW_OUTPUT_CAPACITY,
-    MetadataLimits, MetadataStorage, required_arrow_ipc_len, write_arrow_ipc_from_borrowed_columns,
-    write_arrow_ipc_from_dynamic_columns,
+    DynamicColumns, DynamicSchemaConfig, IpcError, MAX_EVENTS_PER_BATCH, MAX_VALUE_BYTES,
+    MIN_ARROW_OUTPUT_CAPACITY, MetadataLimits, MetadataStorage, required_arrow_ipc_len,
+    write_arrow_ipc_from_borrowed_columns, write_arrow_ipc_from_dynamic_columns,
 };
 use columine_parsing::{
     ExtractionConfig, json_extractor, json_scanner, msgpack_extractor, msgpack_scanner,
@@ -33,8 +35,9 @@ use columine_parsing::{
     },
 };
 
-/// Module version: 2 is the consumer artifact, 1 this crate's npm artifact.
-pub const CONSUMER_VERSION: u32 = 2;
+/// Module version: 3 is the consumer artifact (two-phase exact dedup), 1
+/// this crate's npm artifact.
+pub const CONSUMER_VERSION: u32 = 3;
 pub const COLUMINE_VERSION: u32 = 1;
 
 /// Input format for `create_log_entry` (u8 values are ABI).
@@ -61,6 +64,11 @@ pub enum ResultCode {
     InvalidFormat = 5,
     InvalidInput = 6,
     SchemaMismatch = 7,
+    /// The seen-set refused an id: the diagnostic bytes name the cause
+    /// ([`diagnostic_stage::DEDUP`]) and the set is untouched.
+    AdmissionRefused = 8,
+    /// The previous batch is still staged: commit or abandon it first.
+    BatchPending = 9,
 }
 
 /// Event capacity every wasm `ep_create_*` handle is built with.
@@ -182,13 +190,16 @@ pub struct ResultDiagnostic {
 
 /// Diagnostic byte vocabularies and `NO_FIELD` live with the extractor that
 /// populates them, keeping one source of truth for the ABI order.
-pub use columine_parsing::json_extractor::{NO_FIELD, diagnostic_detail, diagnostic_stage};
+pub use columine_parsing::json_extractor::{
+    NO_FIELD, dedup_detail, diagnostic_detail, diagnostic_stage,
+};
 
 /// Parse-path wiring that distinguishes the two published artifact
 /// configurations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EpWiring {
-    /// Dedup by event id (the consumer artifact wires it; columine does not).
+    /// Exact dedup by event id against the seen-set (the consumer artifact
+    /// wires it; columine does not).
     pub dedup: bool,
     /// Base 4-column scanner path for `field_count == 4` schemas
     /// (columine keeps it; the consumer artifact omits it).
@@ -257,7 +268,13 @@ pub struct EventProcessor {
     /// scanner path, so the four-column scanners can write by index.
     use_base_scanners: bool,
     record_batch_metadata: MetadataStorage,
-    pub dedup_state: Option<DedupState>,
+    pub seen: Option<SeenSet>,
+    /// Signal types whose ids live in the ordinal namespace, sorted, so a
+    /// row's namespace is one binary search over the type column.
+    ordinal_id_types: Vec<Box<[u8]>>,
+    /// Rows the discard policy keeps, one bit per row of the column plane;
+    /// sized once with the columns so a batch allocates nothing to filter.
+    keep_mask: Vec<u8>,
     /// Reusable MessagePack workspace for declared Binary values and
     /// internal batches.
     work_buffer: Vec<u8>,
@@ -267,8 +284,8 @@ pub struct EventProcessor {
 
 impl EventProcessor {
     /// Init with schema + field names (the primary path; names enable JSON
-    /// key matching). `capacity` sizes both the batch columns and, when
-    /// deduplication is enabled, the bloom filter.
+    /// key matching). `capacity` sizes the batch columns and, when
+    /// deduplication is enabled, is the seen-set's ceiling.
     pub fn new(
         wiring: EpWiring,
         capacity: u32,
@@ -278,13 +295,15 @@ impl EventProcessor {
         Self::with_column_capacity(wiring, capacity, capacity, policy, schema_config)
     }
 
-    /// Init with a batch-column capacity distinct from the dedup capacity:
-    /// the bloom filter uses the caller's full `capacity` while the column
-    /// plane is sized independently. The wasm exports build every handle at
-    /// [`WASM_EVENT_CAPACITY`]; native callers pass what they want for both.
+    /// Init with a batch-column capacity distinct from the seen-set ceiling:
+    /// `seen_ceiling` is the host's declaration of how many ids the set may
+    /// hold per open (an admission past it is refused, never grown), while
+    /// the column plane is sized independently. The wasm exports build every
+    /// handle at [`WASM_EVENT_CAPACITY`]; native callers pass what they want
+    /// for both.
     pub fn with_column_capacity(
         wiring: EpWiring,
-        capacity: u32,
+        seen_ceiling: u32,
         column_capacity: u32,
         policy: CollisionPolicy,
         schema_config: DynamicSchemaConfig,
@@ -324,7 +343,15 @@ impl EventProcessor {
             use_base_scanners: wiring.base_path && schema_config.is_base_event_log,
             dynamic_columns: DynamicColumns::new(&schema_config.field_metadata, column_capacity),
             record_batch_metadata,
-            dedup_state: wiring.dedup.then(|| DedupState::new(capacity, policy)),
+            seen: wiring.dedup.then(|| {
+                SeenSet::new(
+                    policy,
+                    seen_ceiling,
+                    column_capacity.min(MAX_EVENTS_PER_BATCH),
+                )
+            }),
+            ordinal_id_types: Vec::new(),
+            keep_mask: vec![0; (column_capacity.min(MAX_EVENTS_PER_BATCH) as usize).div_ceil(8)],
             extraction_config,
             semantic_schemas,
             last_validation_diagnostic: None,
@@ -639,24 +666,29 @@ impl EventProcessor {
             return code;
         }
 
-        // Dedup: read event ids from column 0 when consumer wiring is enabled.
-        let mut processed = 0u32;
-        let mut duplicates = 0u32;
-        if let Some(dedup) = self.dedup_state.as_mut() {
-            let col0 = &self.dynamic_columns.columns[0];
-            for row in 0..self.dynamic_columns.count {
-                let event_id = col0
-                    .read_variable(row)
-                    .unwrap_or_else(|| columine_types::die!("id column is not variable-width"));
-                if dedup.should_process(event_id) {
-                    processed += 1;
+        // Dedup: judge event ids from column 0 (type from column 1) when
+        // consumer wiring is enabled; discarded rows leave the batch.
+        let (processed, duplicates) = match judge_batch(
+            self.seen.as_mut(),
+            &self.ordinal_id_types,
+            &mut self.dynamic_columns,
+            &mut self.keep_mask,
+        ) {
+            Ok(counts) => counts,
+            Err(diagnostic) => {
+                let code = if diagnostic.detail == dedup_detail::BATCH_OPEN {
+                    ResultCode::BatchPending
                 } else {
-                    duplicates += 1;
+                    ResultCode::AdmissionRefused
+                };
+                if self.wiring.diagnostics {
+                    write_result_header_with_diagnostic(output, code, &diagnostic);
+                } else {
+                    write_result_header(output, code, 0, 0, 0, 0);
                 }
+                return code;
             }
-        } else {
-            processed = self.dynamic_columns.count;
-        }
+        };
 
         match write_arrow_ipc_from_dynamic_columns(
             &self.dynamic_columns,
@@ -738,21 +770,32 @@ impl EventProcessor {
         }
     }
 
-    /// Checkpoint the dedup state into `output`; 0 = error (no dedup wired
-    /// or buffer too small), matching `ep_checkpoint`'s sentinel.
-    pub fn checkpoint(&self, output: &mut [u8]) -> usize {
-        let Some(state) = self.dedup_state.as_ref() else {
-            return 0;
-        };
-        checkpoint::serialize(state, output).unwrap_or(0)
+    /// Bytes a checkpoint of the seen-set takes right now; 0 when no dedup
+    /// is wired.
+    pub fn checkpoint_len(&self) -> usize {
+        self.seen.as_ref().map_or(0, SeenSet::checkpoint_len)
     }
 
-    /// Restore dedup state from checkpoint bytes (`ep_restore`).
+    /// Checkpoint the seen-set into `output`; 0 = error (no dedup wired or
+    /// buffer too small), matching `ep_checkpoint`'s sentinel.
+    pub fn checkpoint(&self, output: &mut [u8]) -> usize {
+        let Some(seen) = self.seen.as_ref() else {
+            return 0;
+        };
+        seen.checkpoint(output).unwrap_or(0)
+    }
+
+    /// Restore the seen-set from checkpoint bytes (`ep_restore`). The
+    /// instance keeps its own ceiling; a checkpoint that does not fit under
+    /// it is refused with the set untouched.
     pub fn restore(&mut self, input: &[u8]) -> ResultCode {
-        match checkpoint::deserialize(input) {
-            Ok(state) => {
-                self.dedup_state = Some(state);
-                ResultCode::Ok
+        let Some(seen) = self.seen.as_mut() else {
+            return ResultCode::InvalidInput;
+        };
+        match seen.restore(input) {
+            Ok(()) => ResultCode::Ok,
+            Err(dedup::checkpoint::DeserializeError::ExceedsCeiling) => {
+                ResultCode::AdmissionRefused
             }
             Err(_) => ResultCode::ParseError,
         }
@@ -761,12 +804,188 @@ impl EventProcessor {
     /// Packed dedup stats (`ep_get_stats`):
     /// `total_events as u32 | duplicates as u32 << 32` (u32 truncation is ABI).
     pub fn stats(&self) -> u64 {
-        let Some(state) = self.dedup_state.as_ref() else {
+        let Some(seen) = self.seen.as_ref() else {
             return 0;
         };
-        let total = state.total_events as u32;
-        let dupes = state.duplicates_detected as u32;
+        let total = seen.total_events as u32;
+        let dupes = seen.duplicates_detected as u32;
         u64::from(total) | (u64::from(dupes) << 32)
+    }
+
+    /// Bind the staged batch's admissions to the tx the log assigned it.
+    /// `InvalidInput` when no dedup is wired.
+    pub fn commit_batch(&mut self, tx: u64) -> ResultCode {
+        let Some(seen) = self.seen.as_mut() else {
+            return ResultCode::InvalidInput;
+        };
+        seen.commit(tx);
+        ResultCode::Ok
+    }
+
+    /// Retract the staged batch: the append did not happen.
+    pub fn abandon_batch(&mut self) -> ResultCode {
+        let Some(seen) = self.seen.as_mut() else {
+            return ResultCode::InvalidInput;
+        };
+        seen.abandon();
+        ResultCode::Ok
+    }
+
+    /// Evict every admission below the redelivery horizon; the count that
+    /// left the set, 0 when no dedup is wired.
+    pub fn cut_below(&mut self, horizon: u64) -> u32 {
+        self.seen.as_mut().map_or(0, |seen| seen.cut_below(horizon))
+    }
+
+    /// The tx that admitted `id`: the byproduct read of the seen-set.
+    pub fn admitted_tx(&self, id: &[u8], namespace: IdNamespace) -> AdmittedTx {
+        let Some(seen) = self.seen.as_ref() else {
+            return AdmittedTx::Absent;
+        };
+        match namespace {
+            IdNamespace::Bytes => seen
+                .admitted_tx(id)
+                .map_or(AdmittedTx::Absent, AdmittedTx::At),
+            IdNamespace::Ordinal if seen.contains_ordinal(id) => AdmittedTx::Member,
+            IdNamespace::Ordinal => AdmittedTx::Absent,
+        }
+    }
+
+    /// Declare the signal types whose ids live in the ordinal namespace:
+    /// NUL-separated names, declared once per open before the first batch.
+    pub fn declare_ordinal_id_types(&mut self, names: &[u8]) -> ResultCode {
+        let Some(seen) = self.seen.as_ref() else {
+            return ResultCode::InvalidInput;
+        };
+        if !self.ordinal_id_types.is_empty() || !seen.is_empty() || names.is_empty() {
+            return ResultCode::InvalidInput;
+        }
+        let mut types: Vec<Box<[u8]>> = names
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(Box::from)
+            .collect();
+        if types.is_empty() {
+            return ResultCode::InvalidInput;
+        }
+        types.sort_unstable();
+        types.dedup();
+        self.ordinal_id_types = types;
+        ResultCode::Ok
+    }
+
+    /// Judge the rows of a column plane that is not this processor's own —
+    /// a transport lane that shreds its own frames — against the same
+    /// seen-set, the same declared namespaces, and the same keep mask, so no
+    /// two ingest paths can disagree about what a duplicate is.
+    pub fn judge_rows(
+        &mut self,
+        columns: &mut DynamicColumns,
+    ) -> Result<(u32, u32), ResultDiagnostic> {
+        judge_batch(
+            self.seen.as_mut(),
+            &self.ordinal_id_types,
+            columns,
+            &mut self.keep_mask,
+        )
+    }
+
+    /// The namespace a row's type column selects.
+    pub fn id_namespace_of(&self, signal_type: &[u8]) -> IdNamespace {
+        id_namespace_of(&self.ordinal_id_types, signal_type)
+    }
+
+    /// The declared ordinal-namespace signal types, sorted.
+    pub fn ordinal_id_types(&self) -> &[Box<[u8]>] {
+        &self.ordinal_id_types
+    }
+}
+
+/// Answer of [`EventProcessor::admitted_tx`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmittedTx {
+    /// Not in the set (or staged, which is not admitted).
+    Absent,
+    /// Admitted by the entry at this tx.
+    At(u64),
+    /// A member of the ordinal carrier, which keeps membership only.
+    Member,
+}
+
+fn id_namespace_of(ordinal_id_types: &[Box<[u8]>], signal_type: &[u8]) -> IdNamespace {
+    if ordinal_id_types.is_empty() {
+        return IdNamespace::Bytes;
+    }
+    match ordinal_id_types.binary_search_by(|name| name.as_ref().cmp(signal_type)) {
+        Ok(_) => IdNamespace::Ordinal,
+        Err(_) => IdNamespace::Bytes,
+    }
+}
+
+/// Judge every row of `columns` against the seen-set: `(processed,
+/// duplicates)` on success, with discarded rows compacted out of the batch;
+/// on refusal the diagnostic names the row and the cause, and the set is as
+/// it was before the batch. `None` seen-set means no dedup is wired.
+pub fn judge_batch(
+    seen: Option<&mut SeenSet>,
+    ordinal_id_types: &[Box<[u8]>],
+    columns: &mut DynamicColumns,
+    keep_mask: &mut [u8],
+) -> Result<(u32, u32), ResultDiagnostic> {
+    let Some(seen) = seen else {
+        return Ok((columns.count, 0));
+    };
+    if let Err(refusal) = seen.require_no_open_batch() {
+        return Err(refusal_diagnostic(refusal, 0));
+    }
+    let discard = seen.policy() == CollisionPolicy::Discard;
+    let mut processed = 0u32;
+    let mut duplicates = 0u32;
+    keep_mask.fill(0);
+    for row in 0..columns.count {
+        let event_id = columns.columns[0]
+            .read_variable(row)
+            .unwrap_or_else(|| columine_types::die!("id column is not variable-width"));
+        let namespace = if ordinal_id_types.is_empty() {
+            IdNamespace::Bytes
+        } else {
+            let signal_type = columns.columns[1]
+                .read_variable(row)
+                .unwrap_or_else(|| columine_types::die!("type column is not variable-width"));
+            id_namespace_of(ordinal_id_types, signal_type)
+        };
+        match seen.should_process(event_id, namespace) {
+            Ok(true) => {
+                processed += 1;
+                keep_mask[row as usize / 8] |= 1u8 << (row % 8);
+            }
+            Ok(false) => duplicates += 1,
+            Err(refusal) => {
+                seen.abandon();
+                return Err(refusal_diagnostic(refusal, row));
+            }
+        }
+    }
+    if discard && duplicates > 0 {
+        columns.retain_rows(keep_mask);
+    }
+    Ok((processed, duplicates))
+}
+
+fn refusal_diagnostic(refusal: AdmissionRefusal, row: u32) -> ResultDiagnostic {
+    let detail = match refusal {
+        AdmissionRefusal::IdTooLong { .. } => dedup_detail::ID_TOO_LONG,
+        AdmissionRefusal::CeilingReached { .. } => dedup_detail::CEILING_REACHED,
+        AdmissionRefusal::NotAnOrdinal => dedup_detail::NOT_AN_ORDINAL,
+        AdmissionRefusal::BatchOpen => dedup_detail::BATCH_OPEN,
+    };
+    ResultDiagnostic {
+        stage: diagnostic_stage::DEDUP,
+        detail,
+        expected_type: 0,
+        actual_type: 0,
+        field_index: 0,
+        row_index: u16::try_from(row).unwrap_or(u16::MAX),
     }
 }
 
@@ -1022,8 +1241,9 @@ mod tests {
         );
     }
 
-    /// The consumer wiring counts duplicates in the header and survives a
-    /// checkpoint/restore round trip.
+    /// The consumer wiring drops discarded duplicates from the batch, counts
+    /// them in the header, and the committed set survives a checkpoint/restore
+    /// round trip into an instance with its own ceiling.
     #[test]
     fn dedup_and_checkpoint_through_ep() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
@@ -1040,14 +1260,35 @@ mod tests {
             ep.create_log_entry(input, InputFormat::Json, &mut output),
             ResultCode::Ok
         );
-        let (_, _, _, processed, dupes) = read_result_header(&output);
+        let (_, arrow_offset, arrow_len, processed, dupes) = read_result_header(&output);
         assert_eq!(processed, 2);
         assert_eq!(dupes, 1);
+        // The discarded row is not in the batch: only two ids reach the body.
+        let body = &output[arrow_offset as usize..(arrow_offset + arrow_len) as usize];
+        assert_eq!(body.windows(3).filter(|w| *w == b"dup").count(), 1);
+        assert!(body.windows(4).any(|w| w == b"uniq"));
+        // Stats and the checkpoint see only committed batches.
+        assert_eq!(ep.stats(), 0);
+        assert_eq!(ep.checkpoint_len(), dedup::checkpoint::HEADER_SIZE);
+        assert_eq!(
+            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ResultCode::BatchPending,
+            "a staged batch must be committed or abandoned before the next",
+        );
+        assert_eq!(ep.commit_batch(7), ResultCode::Ok);
         assert_eq!(ep.stats(), 3 | (1 << 32));
+        assert_eq!(
+            ep.admitted_tx(b"dup", IdNamespace::Bytes),
+            AdmittedTx::At(7)
+        );
+        assert_eq!(
+            ep.admitted_tx(b"nope", IdNamespace::Bytes),
+            AdmittedTx::Absent
+        );
 
         let mut checkpoint_buf = vec![0u8; 8192];
         let size = ep.checkpoint(&mut checkpoint_buf);
-        assert!(size > 0);
+        assert_eq!(size, ep.checkpoint_len());
 
         let schema2 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
         let mut restored = EventProcessor::new(
@@ -1058,10 +1299,124 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.restore(&checkpoint_buf[..size]), ResultCode::Ok);
-        // The restored filter still knows both ids.
-        let state = restored.dedup_state.as_ref().unwrap();
-        assert!(state.bloom.maybe_contains(b"dup"));
-        assert!(state.bloom.maybe_contains(b"uniq"));
+        // The restored set still knows both ids, at the tx that admitted them.
+        assert_eq!(
+            restored.admitted_tx(b"dup", IdNamespace::Bytes),
+            AdmittedTx::At(7)
+        );
+        assert_eq!(
+            restored.admitted_tx(b"uniq", IdNamespace::Bytes),
+            AdmittedTx::At(7)
+        );
+        assert_eq!(restored.stats(), 3 | (1 << 32));
+        // Cutting below the horizon evicts them; the ids are new again.
+        assert_eq!(restored.cut_below(8), 2);
+        assert_eq!(
+            restored.admitted_tx(b"dup", IdNamespace::Bytes),
+            AdmittedTx::Absent
+        );
+
+        // A ceiling the checkpoint does not fit under refuses the restore.
+        let schema3 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
+        let mut tight = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            1,
+            CollisionPolicy::Discard,
+            schema3,
+        )
+        .unwrap();
+        assert_eq!(
+            tight.restore(&checkpoint_buf[..size]),
+            ResultCode::AdmissionRefused
+        );
+    }
+
+    /// An id past the 64-byte bound refuses the whole batch with the row
+    /// and cause in the diagnostic bytes, and the set is untouched.
+    #[test]
+    fn admission_refusal_names_the_row_and_leaves_the_set_untouched() {
+        let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
+        let mut ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            100,
+            CollisionPolicy::Discard,
+            schema,
+        )
+        .unwrap();
+        let long = "x".repeat(MAX_ID_BYTES + 1);
+        let input = format!(
+            r#"[{{"id":"fine","type":"a","timestamp":1}},{{"id":"{long}","type":"a","timestamp":2}}]"#
+        );
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(input.as_bytes(), InputFormat::Json, &mut output),
+            ResultCode::AdmissionRefused
+        );
+        assert_eq!(output[21], diagnostic_stage::DEDUP);
+        assert_eq!(output[22], dedup_detail::ID_TOO_LONG);
+        assert_eq!(u16::from_le_bytes([output[28], output[29]]), 1);
+        let seen = ep.seen.as_ref().unwrap();
+        assert!(seen.is_empty());
+        assert!(!seen.is_batch_open());
+
+        // The ceiling refuses at admission, the same way.
+        let schema2 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
+        let mut small = EventProcessor::with_column_capacity(
+            EpWiring::consumer_variant(),
+            1,
+            100,
+            CollisionPolicy::Discard,
+            schema2,
+        )
+        .unwrap();
+        let two = br#"[{"id":"a","type":"a","timestamp":1},{"id":"b","type":"a","timestamp":2}]"#;
+        assert_eq!(
+            small.create_log_entry(two, InputFormat::Json, &mut output),
+            ResultCode::AdmissionRefused
+        );
+        assert_eq!(output[22], dedup_detail::CEILING_REACHED);
+        assert!(small.seen.as_ref().unwrap().is_empty());
+    }
+
+    /// A signal type declared in the ordinal namespace judges its ids as
+    /// ordinals; every other type keeps the byte namespace.
+    #[test]
+    fn ordinal_namespace_is_selected_by_the_type_column() {
+        let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
+        let mut ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            100,
+            CollisionPolicy::Discard,
+            schema,
+        )
+        .unwrap();
+        assert_eq!(ep.declare_ordinal_id_types(b"tick\0"), ResultCode::Ok);
+        assert_eq!(
+            ep.declare_ordinal_id_types(b"tock\0"),
+            ResultCode::InvalidInput,
+            "declared once per open"
+        );
+        let input = br#"[{"id":"7","type":"tick","timestamp":1},{"id":"7","type":"other","timestamp":2},{"id":"7","type":"tick","timestamp":3}]"#;
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ResultCode::Ok
+        );
+        let (_, _, _, processed, dupes) = read_result_header(&output);
+        assert_eq!((processed, dupes), (2, 1));
+        assert_eq!(ep.commit_batch(1), ResultCode::Ok);
+        assert_eq!(
+            ep.admitted_tx(b"7", IdNamespace::Ordinal),
+            AdmittedTx::Member
+        );
+        assert_eq!(ep.admitted_tx(b"7", IdNamespace::Bytes), AdmittedTx::At(1));
+
+        let bad = br#"[{"id":"07","type":"tick","timestamp":1}]"#;
+        assert_eq!(
+            ep.create_log_entry(bad, InputFormat::Json, &mut output),
+            ResultCode::AdmissionRefused
+        );
+        assert_eq!(output[22], dedup_detail::NOT_AN_ORDINAL);
     }
 
     /// Result header layout pinned byte-for-byte (ResultHeader is 32 bytes;
@@ -1186,7 +1541,8 @@ mod tests {
         assert_eq!(diagnostic.event_index, 0);
         assert_eq!(diagnostic.signal_type, "hi");
         assert_eq!(read_result_header(&output).0, ResultCode::ParseError as u32);
-        assert_eq!(ep.dedup_state.as_ref().unwrap().total_events, 0);
+        assert_eq!(ep.stats(), 0);
+        assert!(!ep.seen.as_ref().unwrap().is_batch_open());
         assert!(output[32..].iter().all(|byte| *byte == 0xa5));
     }
 }
