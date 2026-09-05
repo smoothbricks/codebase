@@ -58,7 +58,14 @@ describe('Cargo workspace layouts', () => {
       );
       await write(root, 'Cargo.lock', 'version = 4\n');
       await write(root, 'packages/containium/Cargo.toml', '[package]\nname = "containium-cli"\n');
-      await write(root, 'packages/runtime/crates/runtime-core/Cargo.toml', '[package]\nname = "runtime-core"\n');
+      // A path dependency that is not a workspace member still gets linked into
+      // every test binary above it, so it must reach the inputs transitively.
+      await write(
+        root,
+        'packages/runtime/crates/runtime-core/Cargo.toml',
+        '[package]\nname = "runtime-core"\n\n[dependencies]\nruntime-base = { path = "../../base" }\n',
+      );
+      await write(root, 'packages/runtime/base/Cargo.toml', '[package]\nname = "runtime-base"\n');
       await write(
         root,
         'packages/host/crates/host-runtime/Cargo.toml',
@@ -119,6 +126,8 @@ describe('Cargo workspace layouts', () => {
         '{workspaceRoot}/Cargo.lock',
         '{workspaceRoot}/packages/host/crates/host-runtime/**/*.rs',
         '{workspaceRoot}/packages/host/crates/host-runtime/Cargo.toml',
+        '{workspaceRoot}/packages/runtime/base/**/*.rs',
+        '{workspaceRoot}/packages/runtime/base/Cargo.toml',
         '{workspaceRoot}/packages/runtime/crates/runtime-core/**/*.rs',
         '{workspaceRoot}/packages/runtime/crates/runtime-core/Cargo.toml',
         '{workspaceRoot}/**/.cargo/config.toml',
