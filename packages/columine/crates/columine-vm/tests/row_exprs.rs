@@ -171,7 +171,7 @@ fn a_program_without_a_table_binds_nothing() {
 }
 
 #[test]
-fn an_empty_batch_binds_empty_columns() {
+fn an_empty_batch_binds_nothing_even_without_column_pointers() {
     let prog = program(&table(
         TYPE_COL,
         &[entry(
@@ -181,15 +181,15 @@ fn an_empty_batch_binds_empty_columns() {
         )],
     ));
     let state = init(&prog);
-    let mut cols: Vec<&[u8]> = vec![&[], &[], &[], &[]];
+    let mut cols: Vec<&[u8]> = Vec::new();
     let mut rows = RowColumns::new();
     let mut eval = Threshold {
         admitted: 0,
         evaluated: 0,
     };
     bind_row_columns(&prog, &state, &mut cols, 0, &mut eval, &mut rows).expect("bind");
-    assert!(cols[3].is_empty());
-    assert_eq!(eval.evaluated, 0);
+    assert!(cols.is_empty());
+    assert_eq!(eval.admitted, 0);
 }
 
 fn bind_err<'a>(
