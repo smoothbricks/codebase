@@ -2,10 +2,10 @@
 //! algebra, boundary-capacity, and property tests.
 
 use columine_vm::bitmap_ops::{
-    BitmapAlgebraOp, BitmapEnv, BitmapStorage, batch_bitmap_add, batch_bitmap_algebra,
-    batch_bitmap_remove, bitmap_load, bitmap_payload_capacity, bitmap_select, bitmap_store,
-    cardinality_serialized, contains_serialized, extract_serialized, get_bitmap_storage,
-    intersect_count_serialized, intersects_serialized, set_algebra,
+    BitmapAlgebraOp, BitmapEnv, BitmapSource, BitmapStorage, batch_bitmap_add,
+    batch_bitmap_algebra, batch_bitmap_remove, bitmap_load, bitmap_payload_capacity, bitmap_select,
+    bitmap_store, cardinality_serialized, contains_serialized, extract_serialized,
+    get_bitmap_storage, intersect_count_serialized, intersects_serialized, set_algebra,
 };
 use columine_vm::hooks::{MutationRecord, NoVm, VmHooks};
 use columine_vm::meta::SlotMetaView;
@@ -70,29 +70,6 @@ impl VmHooks for RecordingHooks {
 
     fn force_undo_snapshot(&mut self, _state: &[u8]) {
         unreachable!("the bitmap transaction property never snapshots")
-    }
-
-    fn batch_bitmap_add(
-        &mut self,
-        _delta_mode: bool,
-        _state: &mut [u8],
-        _meta: &SlotMetaView,
-        _slot_idx: u8,
-        _elems: &[u32],
-        _ts_col: Option<&[f64]>,
-    ) -> ErrorCode {
-        unreachable!("the property invokes bitmap operations directly")
-    }
-
-    fn batch_bitmap_remove(
-        &mut self,
-        _delta_mode: bool,
-        _state: &mut [u8],
-        _meta: &SlotMetaView,
-        _slot_idx: u8,
-        _elems: &[u32],
-    ) -> ErrorCode {
-        unreachable!("the property invokes bitmap operations directly")
     }
 }
 
@@ -535,7 +512,7 @@ fn slot_algebra_and_with_empty_clears_target() {
         BitmapAlgebraOp::And,
         &mut state,
         &meta,
-        &[],
+        BitmapSource::Bytes(&[]),
     );
     assert_eq!(r, ErrorCode::Ok);
     assert_eq!(meta.size(&state), 0);
@@ -550,7 +527,7 @@ fn slot_algebra_and_with_empty_clears_target() {
         BitmapAlgebraOp::Or,
         &mut state,
         &meta,
-        &[],
+        BitmapSource::Bytes(&[]),
     );
     assert_eq!(r, ErrorCode::Ok);
     assert_eq!(meta.size(&state), 3);
@@ -579,7 +556,7 @@ fn slot_algebra_in_place_or() {
         BitmapAlgebraOp::Or,
         &mut state,
         &meta,
-        &source,
+        BitmapSource::Bytes(&source),
     );
     assert_eq!(r, ErrorCode::Ok);
     assert_eq!(meta.size(&state), 5);
@@ -770,8 +747,7 @@ proptest! {
         let seed: Vec<u32> = (1u16..61).map(sparse_key).collect();
         let seed_ts: Vec<f64> = seed.iter().copied().map(sparse_ts).collect();
         prop_assert_eq!(
-            vm.ctx()
-                .batch_bitmap_add(false, &mut state, &meta, 0, &seed, Some(&seed_ts)),
+            vm.set_insert(false, &mut state, &meta, 0, &seed, Some(&seed_ts)),
             ErrorCode::Ok
         );
         prop_assert_eq!(meta.eviction_index_size(&state), 60);
@@ -799,7 +775,7 @@ proptest! {
             let before = state.clone();
             let undo_before = vm.undo_checkpoint();
             let result = match op {
-                None => vm.ctx().batch_bitmap_add(
+                None => vm.set_insert(
                     false,
                     &mut state,
                     &meta,
@@ -810,12 +786,10 @@ proptest! {
                 Some((highs, is_remove)) => {
                     let elems: Vec<u32> = highs.iter().copied().map(sparse_key).collect();
                     if *is_remove {
-                        vm.ctx()
-                            .batch_bitmap_remove(false, &mut state, &meta, 0, &elems)
+                        vm.set_remove(false, &mut state, &meta, 0, &elems)
                     } else {
                         let ts: Vec<f64> = elems.iter().copied().map(sparse_ts).collect();
-                        vm.ctx()
-                            .batch_bitmap_add(false, &mut state, &meta, 0, &elems, Some(&ts))
+                        vm.set_insert(false, &mut state, &meta, 0, &elems, Some(&ts))
                     }
                 }
             };
@@ -892,8 +866,7 @@ fn ttl_refresh_of_present_member_records_no_undo_entry() {
 
     let elem = [sparse_key(9)];
     assert_eq!(
-        vm.ctx()
-            .batch_bitmap_add(false, &mut state, &meta, 0, &elem, Some(&[100.0])),
+        vm.set_insert(false, &mut state, &meta, 0, &elem, Some(&[100.0])),
         ErrorCode::Ok
     );
 
@@ -905,8 +878,7 @@ fn ttl_refresh_of_present_member_records_no_undo_entry() {
     );
 
     assert_eq!(
-        vm.ctx()
-            .batch_bitmap_add(false, &mut state, &meta, 0, &elem, Some(&[500.0])),
+        vm.set_insert(false, &mut state, &meta, 0, &elem, Some(&[500.0])),
         ErrorCode::Ok
     );
     assert_eq!(
@@ -991,7 +963,7 @@ proptest! {
         let source = serialize(&b.iter().copied().collect::<Vec<_>>());
         let source = if b.is_empty() { vec![] } else { source };
         prop_assert_eq!(
-            batch_bitmap_algebra(&mut env, &mut NoVm, op, &mut state, &meta, &source),
+            batch_bitmap_algebra(&mut env, &mut NoVm, op, &mut state, &meta, BitmapSource::Bytes(&source)),
             ErrorCode::Ok
         );
 

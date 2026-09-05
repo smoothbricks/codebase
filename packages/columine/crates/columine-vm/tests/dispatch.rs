@@ -364,13 +364,13 @@ fn ttl_hashset_reinsertion_refreshes_ttl_and_evicts_deterministically() {
     }
 
     let (off, cap) = (slot_offset(&state, 0), slot_cap(&state, 0));
-    assert!(vm_set_contains(&mut vm.bitmap_env, &state, off, cap, 77));
+    assert!(vm_set_contains(&state, off, cap, 77));
 
     assert_eq!(0, vm.evict_all_expired(&mut state, 150.0).unwrap());
-    assert!(vm_set_contains(&mut vm.bitmap_env, &state, off, cap, 77));
+    assert!(vm_set_contains(&state, off, cap, 77));
 
     assert_eq!(1, vm.evict_all_expired(&mut state, 211.0).unwrap());
-    assert!(!vm_set_contains(&mut vm.bitmap_env, &state, off, cap, 77));
+    assert!(!vm_set_contains(&state, off, cap, 77));
 }
 
 #[test]
@@ -494,23 +494,11 @@ fn slot_growth_hashset_growth_preserves_elements() {
     assert_eq!(11, slot_size(&new_state, 0));
     let new_off = slot_offset(&new_state, 0);
     for i in 0..11u32 {
-        assert!(vm_set_contains(
-            &mut vm.bitmap_env,
-            &new_state,
-            new_off,
-            32,
-            i + 1000
-        ));
+        assert!(vm_set_contains(&new_state, new_off, 32, i + 1000));
     }
     // And the overflowing element now fits.
     assert_eq!(OK, vm.execute_batch(&mut new_state, &prog, &cols, 1));
-    assert!(vm_set_contains(
-        &mut vm.bitmap_env,
-        &new_state,
-        new_off,
-        32,
-        5000
-    ));
+    assert!(vm_set_contains(&new_state, new_off, 32, 5000));
 }
 
 // =============================================================================
@@ -846,24 +834,12 @@ fn probe_scatter_apply_datom_parity_across_kinds_and_skip() {
     // nodeDeps (slot 2): {(e,7003)=8003} deduped → size 1.
     assert_eq!(1, slot_size(&state, 2));
     let (d_off, d_cap) = (slot_offset(&state, 2), slot_cap(&state, 2));
-    assert!(vm_set_contains(
-        &mut vm.bitmap_env,
-        &state,
-        d_off,
-        d_cap,
-        8003
-    ));
+    assert!(vm_set_contains(&state, d_off, d_cap, 8003));
 
     // nodeTouch (slot 3): asserted then retracted → empty.
     assert_eq!(0, slot_size(&state, 3));
     let (t_off, t_cap) = (slot_offset(&state, 3), slot_cap(&state, 3));
-    assert!(!vm_set_contains(
-        &mut vm.bitmap_env,
-        &state,
-        t_off,
-        t_cap,
-        8004
-    ));
+    assert!(!vm_set_contains(&state, t_off, t_cap, 8004));
 }
 
 #[test]
@@ -979,27 +955,9 @@ fn probe_scatter_card_many_keeps_two_entities_sharing_a_value_distinct() {
 
     assert_eq!(2, slot_size(&state, 2));
     let (d_off, d_cap) = (slot_offset(&state, 2), slot_cap(&state, 2));
-    assert!(vm_set_contains(
-        &mut vm.bitmap_env,
-        &state,
-        d_off,
-        d_cap,
-        8101
-    ));
-    assert!(vm_set_contains(
-        &mut vm.bitmap_env,
-        &state,
-        d_off,
-        d_cap,
-        8102
-    ));
-    assert!(!vm_set_contains(
-        &mut vm.bitmap_env,
-        &state,
-        d_off,
-        d_cap,
-        7003
-    ));
+    assert!(vm_set_contains(&state, d_off, d_cap, 8101));
+    assert!(vm_set_contains(&state, d_off, d_cap, 8102));
+    assert!(!vm_set_contains(&state, d_off, d_cap, 7003));
 }
 
 #[test]
