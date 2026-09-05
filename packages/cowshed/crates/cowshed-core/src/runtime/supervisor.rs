@@ -131,6 +131,7 @@ impl Default for WorkspaceSupervisorConfig {
                 grants: crate::sandbox::SandboxGrants::default(),
                 allowed_unix_sockets: Vec::new(),
                 additional_denies: Vec::new(),
+                shed_links: Vec::new(),
                 git_worktree_repository: None,
             },
             artifacts: ArtifactConfig::default(),
@@ -3827,6 +3828,7 @@ mod workspace_toolchain_tests {
             grants: SandboxGrants::default(),
             allowed_unix_sockets: nix_daemon_socket().into_iter().collect(),
             additional_denies: Vec::new(),
+            shed_links: Vec::new(),
             git_worktree_repository: None,
         }
     }

@@ -644,6 +644,10 @@ next: cowshed exec raven -- <retry your command>
 - A grant that contains or falls beneath the workspace mount, another cowshed mount, controller state, the project
   policy root, or a credential-bearing hard-deny is rejected before the grants file changes.
 - Grants are recorded in `<image>.grants.json`, **outside the volume** — a sandboxed process cannot edit its own grants.
+- A path is recorded under its resolved spelling; `grant` says so when that differs from what was typed. A symlink
+  planted beside the workspace mount so `../<name>` resolves (`<shed>/<org>/<project>/<name>` pointing at a sibling
+  repository) sits inside the mount-root deny, and the profile carves the link back as a readable literal exactly when
+  its target is granted — grant the target, and the workspace reaches it through the link.
 - Filesystem grants take effect at the next `exec`/`shell`: Seatbelt profiles are fixed at process launch, and every
   launch carries the current persisted grant snapshot.
 - `cowshed grant <name>` with no flags prints the current grant set (TSV; `--json` for the envelope):

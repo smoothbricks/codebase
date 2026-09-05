@@ -3984,27 +3984,6 @@ fn replace_checkout_symlink(
 }
 
 #[cfg(target_os = "macos")]
-fn canonical_lexical_absolute(path: &Path) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => normalized.push(Path::new("/")),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            std::path::Component::Normal(component) => normalized.push(component),
-            std::path::Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
-}
-
 /// Exact mount roots emitted by direct-main layouts that cowshed has retired.
 ///
 /// These are derived from the validated primary binding, never from the link. Comparing only
@@ -4032,12 +4011,13 @@ fn known_retired_main_targets(
     ];
     let mut targets = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let normalized = canonical_lexical_absolute(&candidate).ok_or_else(|| {
-            native_integrity_error(format!(
-                "retired main target is not an absolute lexical path: {}",
-                candidate.display()
-            ))
-        })?;
+        let normalized =
+            crate::sandbox::canonical_lexical_absolute(&candidate).ok_or_else(|| {
+                native_integrity_error(format!(
+                    "retired main target is not an absolute lexical path: {}",
+                    candidate.display()
+                ))
+            })?;
         if !targets.contains(&normalized) {
             targets.push(normalized);
         }
@@ -4070,7 +4050,7 @@ fn classify_move_destination(
     }
     let target = std::fs::read_link(destination)
         .ok()
-        .and_then(|target| canonical_lexical_absolute(&target))
+        .and_then(|target| crate::sandbox::canonical_lexical_absolute(&target))
         .and_then(|target| retired_main_targets.contains(&target).then_some(target));
     let is_dangling = std::fs::metadata(destination)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
@@ -8310,7 +8290,7 @@ fn grant_path_usage(path: &Path, detail: impl std::fmt::Display) -> CowshedError
 
 #[cfg(target_os = "macos")]
 fn resolve_grant_path(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute() || canonical_lexical_absolute(path).is_none() {
+    if !path.is_absolute() || crate::sandbox::canonical_lexical_absolute(path).is_none() {
         return Err(grant_path_usage(
             path,
             "must be absolute and must not traverse above /",
@@ -8473,6 +8453,7 @@ mod grant_unit_tests {
             home: home.to_path_buf(),
             mount_root: mount_root.to_path_buf(),
             workspace_mount: workspace_mount.to_path_buf(),
+            shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-grant-unit"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
             mode: RunSandboxMode::ReadWrite,
@@ -8641,6 +8622,12 @@ fn supervisor_sandbox(
         // TMPDIR on the shed: copy-on-write with the clone, reclaimed with it, and inside the
         // one tree the child profile grants writes to - no carve-back against the store.
         exec_temp_dir: mount.join(".cowshed/tmp"),
+        shed_links: crate::sandbox::shed_links(&mount).map_err(|error| {
+            CowshedError::integrity(
+                format!("cannot read the shed beside {}: {error}", mount.display()),
+                "cowshed doctor --json",
+            )
+        })?,
         workspace_mount: mount,
         port_block: current.metadata.grants.port_block.ok_or_else(|| {
             CowshedError::integrity("workspace has no port block", "cowshed doctor --json")

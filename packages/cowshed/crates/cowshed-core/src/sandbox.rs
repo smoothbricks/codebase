@@ -136,12 +136,94 @@ pub fn host_bun_install_cache(home: &Path) -> PathBuf {
     home.join(".bun/install/cache")
 }
 
+/// A symlink beside the workspace mount — `<mount_root>/<org>/<project>/<name>` — that an
+/// operator planted so a relative dependency (`../<name>`) resolves from every workspace of the
+/// project the same way it does beside the canonical checkout.
+///
+/// The link lives inside the mount-root deny, and Seatbelt must read the link itself before it
+/// can follow it to the target. A grant on the target therefore also needs the link readable, or
+/// the dependency stays denied through the only spelling the workspace reaches it by.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShedLink {
+    pub link: PathBuf,
+    /// Absolute, lexically canonical link target.
+    pub target: PathBuf,
+}
+
+/// The symlinks beside `workspace_mount`, with relative targets resolved against that directory.
+///
+/// A directory that does not exist yet is an empty shed, not an error: the profile is built for
+/// a workspace whose mount may be created after the config is.
+pub fn shed_links(workspace_mount: &Path) -> Result<Vec<ShedLink>, SandboxError> {
+    let Some(parent) = workspace_mount.parent() else {
+        return Ok(Vec::new());
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => {
+            return Err(SandboxError::InvalidPath {
+                path: parent.to_path_buf(),
+                reason: "cannot enumerate the shed directory beside the workspace",
+            });
+        }
+    };
+    let mut links = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let link = entry.path();
+        let Ok(raw_target) = std::fs::read_link(&link) else {
+            continue;
+        };
+        let joined = if raw_target.is_absolute() {
+            raw_target
+        } else {
+            parent.join(raw_target)
+        };
+        let Some(target) = canonical_lexical_absolute(&joined) else {
+            return Err(SandboxError::InvalidPath {
+                path: joined,
+                reason: "shed link target traverses above /",
+            });
+        };
+        links.push(ShedLink { link, target });
+    }
+    links.sort_by(|left, right| left.link.cmp(&right.link));
+    Ok(links)
+}
+
+/// Resolve `.` and `..` lexically; `None` for a relative path or one that climbs above `/`.
+pub fn canonical_lexical_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push(Path::new("/")),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxConfig {
     pub home: PathBuf,
     /// Host-configured root containing every project workspace mount tree.
     pub mount_root: PathBuf,
     pub workspace_mount: PathBuf,
+    /// Operator-planted symlinks beside the workspace mount; see [`ShedLink`].
+    pub shed_links: Vec<ShedLink>,
     pub exec_temp_dir: PathBuf,
     pub port_block: PortBlock,
     pub mode: RunSandboxMode,
@@ -233,6 +315,10 @@ fn validated_sandbox_paths(
     let read_grants = normalized_paths(&config.grants.read)?;
     let write_grants = normalized_paths(&config.grants.write)?;
     let sockets = normalized_paths(&config.allowed_unix_sockets)?;
+    for link in &config.shed_links {
+        validate_path(&link.link)?;
+        validate_path(&link.target)?;
+    }
 
     for grant in read_grants.iter().chain(write_grants.iter()) {
         if let Some(deny) = hard_denies
@@ -388,6 +474,19 @@ pub fn seatbelt_profile(
     push_readable_ancestors(&mut profile, &config.workspace_mount)?;
     for path in read_grants.iter().chain(write_grants.iter()) {
         push_readable_ancestors(&mut profile, path)?;
+    }
+    // A shed link is the spelling a workspace reaches a sibling repository by (`../<name>`), and
+    // it sits inside the mount-root deny above. Only a link whose target a grant covers is carved
+    // back, as a literal: the link stays unreadable until its target is granted, and reading it
+    // reveals nothing a granted subtree does not already show.
+    for link in &config.shed_links {
+        if read_grants
+            .iter()
+            .chain(write_grants.iter())
+            .any(|grant| paths_intersect(&link.target, grant))
+        {
+            push_readable_ancestors(&mut profile, &link.link)?;
+        }
     }
     // Connecting to an allowed socket resolves its path, so every ancestor must
     // be traversable. Socket directories are not under the immutable roots
@@ -678,6 +777,7 @@ mod tests {
             workspace_mount: PathBuf::from(
                 "/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount",
             ),
+            shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             port_block: PortBlock::new(40_960, 16).unwrap(),
             mode,
@@ -807,6 +907,78 @@ mod tests {
         assert!(!profile.contains(
             "(allow file-read* (subpath \"/Users/tester/Dev/.cowshed-mounts/acme/widget/swift\"))"
         ));
+    }
+
+    #[test]
+    fn shed_link_is_readable_exactly_when_its_target_is_granted() {
+        let mut custom = config(RunSandboxMode::ReadWrite);
+        custom.mount_root = PathBuf::from("/Users/tester/Dev/.cowshed");
+        custom.workspace_mount = PathBuf::from("/Users/tester/Dev/.cowshed/acme/widget/raven");
+        custom.grants.read = vec![PathBuf::from("/Users/tester/Dev/sibling")];
+        custom.grants.write = vec![PathBuf::from("/opt/output/nested")];
+        custom.shed_links = vec![
+            ShedLink {
+                link: PathBuf::from("/Users/tester/Dev/.cowshed/acme/widget/sibling"),
+                target: PathBuf::from("/Users/tester/Dev/sibling"),
+            },
+            ShedLink {
+                link: PathBuf::from("/Users/tester/Dev/.cowshed/acme/widget/output"),
+                target: PathBuf::from("/opt/output"),
+            },
+            ShedLink {
+                link: PathBuf::from("/Users/tester/Dev/.cowshed/acme/widget/secrets"),
+                target: PathBuf::from("/Users/tester/Dev/elsewhere"),
+            },
+        ];
+        let profile = seatbelt_profile(&custom, SandboxProfileRole::ExecutedChild).unwrap();
+
+        let root_deny = profile
+            .find("(deny file-read* file-write* (subpath \"/Users/tester/Dev/.cowshed\"))")
+            .expect("mount-root deny");
+        let granted_link = profile
+            .find("(allow file-read* (literal \"/Users/tester/Dev/.cowshed/acme/widget/sibling\"))")
+            .expect("link to a read-granted target is readable");
+        let containing_link = profile
+            .find("(allow file-read* (literal \"/Users/tester/Dev/.cowshed/acme/widget/output\"))")
+            .expect("link whose target contains a write grant is readable");
+        assert!(root_deny < granted_link);
+        assert!(root_deny < containing_link);
+        assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/Dev/sibling\"))"));
+        assert!(!profile.contains("/Users/tester/Dev/.cowshed/acme/widget/secrets"));
+        assert!(!profile.contains(
+            "(allow file-read* (subpath \"/Users/tester/Dev/.cowshed/acme/widget/sibling\"))"
+        ));
+    }
+
+    #[test]
+    fn shed_links_resolve_relative_targets_and_skip_plain_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-shed-links-{}-{}",
+            std::process::id(),
+            NEXT_SANDBOX_DIR.fetch_add(1, Ordering::SeqCst)
+        ));
+        let shed = root.join("acme/widget");
+        fs::create_dir_all(shed.join("raven")).unwrap();
+        fs::create_dir_all(root.join("sibling")).unwrap();
+        std::os::unix::fs::symlink("../../sibling", shed.join("sibling")).unwrap();
+        std::os::unix::fs::symlink("/opt/absolute", shed.join("absolute")).unwrap();
+
+        let links = shed_links(&shed.join("raven")).unwrap();
+        assert_eq!(
+            links,
+            vec![
+                ShedLink {
+                    link: shed.join("absolute"),
+                    target: PathBuf::from("/opt/absolute"),
+                },
+                ShedLink {
+                    link: shed.join("sibling"),
+                    target: root.join("sibling"),
+                },
+            ]
+        );
+        assert_eq!(shed_links(&root.join("missing/raven")).unwrap(), Vec::new());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
