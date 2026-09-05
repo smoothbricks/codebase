@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { join, normalize, posix, relative, sep } from 'node:path';
+import { isAbsolute, join, normalize, posix, relative, sep } from 'node:path';
+import { readNxJson } from 'nx/src/config/nx-json.js';
 import { parse as parseToml } from 'smol-toml';
 
 export interface CargoWorkspacePackage {
@@ -170,13 +171,33 @@ export function attributeCargoWorkspacePackages(
   return attributed;
 }
 
-export async function cargoPackageTestInputs(
-  absoluteProjectRoot: string,
-  memberDir: string,
+/**
+ * The named input a workspace must declare when a crate's path dependencies
+ * resolve outside the Nx workspace. Nx hashes filesets against the workspace
+ * file map only, so a glob pointing above the root — or an absolute path
+ * spliced under `{workspaceRoot}` — matches nothing and every cached verdict
+ * silently ignores the dependency. A runtime named input can hash any tree.
+ */
+export const EXTERNAL_RUST_CRATES_INPUT = 'externalRustCrates';
+
+export interface CargoPackageTestInputsOptions {
+  /** The Nx workspace root, where `nx.json` declares named inputs. */
+  workspaceRoot: string;
+  /** The cargo workspace root holding the top-level `Cargo.toml`. */
+  absoluteProjectRoot: string;
+  memberDir: string;
+  inputRoot?: string;
+}
+
+export async function cargoPackageTestInputs({
+  workspaceRoot,
+  absoluteProjectRoot,
+  memberDir,
   inputRoot = '{projectRoot}',
-): Promise<string[]> {
+}: CargoPackageTestInputsOptions): Promise<string[]> {
   const workspacePathDeps = await workspacePathDependencies(absoluteProjectRoot);
   const dirs = new Set<string>([memberDir.split('\\').join('/')]);
+  const external = new Map<string, string>();
   const crateParsed: unknown = parseToml(await readFile(join(absoluteProjectRoot, memberDir, 'Cargo.toml'), 'utf-8'));
   if (isRecord(crateParsed)) {
     for (const tableName of ['dependencies', 'dev-dependencies', 'build-dependencies'] as const) {
@@ -186,8 +207,13 @@ export async function cargoPackageTestInputs(
       }
       for (const [depName, spec] of Object.entries(table)) {
         const pathDep = pathDependencyDir(memberDir, depName, spec, workspacePathDeps);
-        if (pathDep !== null) {
-          dirs.add(pathDep);
+        if (pathDep === null) {
+          continue;
+        }
+        if (pathDep.external) {
+          external.set(depName, pathDep.dir);
+        } else {
+          dirs.add(pathDep.dir);
         }
       }
     }
@@ -197,6 +223,20 @@ export async function cargoPackageTestInputs(
     inputs.push(`${inputRoot}/${dir}/**/*.rs`, `${inputRoot}/${dir}/Cargo.toml`);
   }
   inputs.push(`${inputRoot}/**/.cargo/config.toml`, `${inputRoot}/scripts/*.sh`, `!${inputRoot}/**/target/**`);
+  if (external.size > 0) {
+    if (readNxJson(workspaceRoot).namedInputs?.[EXTERNAL_RUST_CRATES_INPUT] === undefined) {
+      const listed = [...external]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([name, dir]) => `${name} -> ${dir}`)
+        .join(', ');
+      throw new Error(
+        `${memberDir}/Cargo.toml depends on crates outside the Nx workspace (${listed}) that no fileset can hash; ` +
+          `declare namedInputs.${EXTERNAL_RUST_CRATES_INPUT} in ${join(workspaceRoot, 'nx.json')} as a runtime input ` +
+          'that hashes every *.rs and Cargo.toml under those trees, and the per-crate cargo test targets will list it',
+      );
+    }
+    inputs.push(EXTERNAL_RUST_CRATES_INPUT);
+  }
   return inputs;
 }
 
@@ -214,32 +254,49 @@ async function workspacePathDependencies(absoluteProjectRoot: string): Promise<M
   return deps;
 }
 
+interface PathDependencyDir {
+  /** Cargo-workspace-relative directory, or the raw path when external. */
+  dir: string;
+  /** Resolves above the cargo workspace root or to an absolute path. */
+  external: boolean;
+}
+
+/**
+ * Where a path dependency lives relative to the cargo workspace root. A
+ * `workspace = true` dependency is already root-relative; a crate-local
+ * `path` is relative to the member. Anything that escapes the root is
+ * reported as external rather than dropped, so the caller can demand the
+ * runtime input that covers it.
+ */
 function pathDependencyDir(
   memberDir: string,
   depName: string,
   spec: unknown,
   workspacePathDeps: Map<string, string>,
-): string | null {
-  if (spec === undefined || spec === null) {
-    return null;
-  }
-  if (typeof spec === 'string') {
-    return null;
-  }
+): PathDependencyDir | null {
   if (!isRecord(spec)) {
     return null;
   }
+  let raw: string;
   if (spec.workspace === true) {
-    return workspacePathDeps.get(depName) ?? null;
-  }
-  if (typeof spec.path !== 'string') {
+    const workspacePath = workspacePathDeps.get(depName);
+    if (workspacePath === undefined) {
+      return null;
+    }
+    raw = workspacePath;
+  } else if (typeof spec.path === 'string') {
+    raw = posix.join(memberDir.split('\\').join('/'), spec.path.split('\\').join('/'));
+  } else {
     return null;
   }
-  const resolved = normalize(join(memberDir, spec.path));
-  if (resolved.startsWith('..')) {
-    return null;
+  if (isAbsolute(raw) || posix.isAbsolute(raw)) {
+    return { dir: raw, external: true };
   }
-  return resolved.split(sep).join(posix.sep);
+  const resolved = normalize(raw).split(sep).join(posix.sep);
+  if (resolved === '..' || resolved.startsWith('../')) {
+    return { dir: resolved, external: true };
+  }
+  return { dir: resolved, external: false };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

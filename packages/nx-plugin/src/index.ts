@@ -316,7 +316,7 @@ async function addPerPackageCargoTestTargets(
   const packageTargetNames: string[] = [];
   let previous = CARGO_TEST_COMPILE_TARGET;
   for (const pkg of packages) {
-    const inputs = await cargoPackageTestInputs(absoluteProjectRoot, pkg.dir);
+    const inputs = await cargoPackageTestInputs({ workspaceRoot, absoluteProjectRoot, memberDir: pkg.dir });
     const sharded = pkg.testShards > 1;
     const pin = sharded && exceptional !== null ? exceptional : null;
     const addTarget = (piece: string | undefined, selector: string, extra: string) => {
@@ -1528,7 +1528,12 @@ async function addRepoRootCargoTestTargets(
     if (plan.package.projectRoot !== projectRoot) {
       continue;
     }
-    const inputs = await cargoPackageTestInputs(workspaceRoot, plan.package.dir, '{workspaceRoot}');
+    const inputs = await cargoPackageTestInputs({
+      workspaceRoot,
+      absoluteProjectRoot: workspaceRoot,
+      memberDir: plan.package.dir,
+      inputRoot: '{workspaceRoot}',
+    });
     for (const piece of plan.pieces) {
       targetNames.push(piece.targetName);
       targets[piece.targetName] = {

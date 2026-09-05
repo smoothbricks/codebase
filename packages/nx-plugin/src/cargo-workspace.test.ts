@@ -20,7 +20,13 @@ describe('Cargo workspace layouts', () => {
       expect(listCargoWorkspacePackages(root)).toEqual([
         { name: 'ferris-core', dir: 'crates/ferris-core', testShards: 1 },
       ]);
-      expect(await cargoPackageTestInputs(root, 'crates/ferris-core')).toEqual([
+      expect(
+        await cargoPackageTestInputs({
+          workspaceRoot: root,
+          absoluteProjectRoot: root,
+          memberDir: 'crates/ferris-core',
+        }),
+      ).toEqual([
         '{projectRoot}/Cargo.toml',
         '{projectRoot}/Cargo.lock',
         '{projectRoot}/crates/ferris-core/**/*.rs',
@@ -101,7 +107,14 @@ describe('Cargo workspace layouts', () => {
           projectRoot: 'packages/runtime',
         },
       ]);
-      expect(await cargoPackageTestInputs(root, 'packages/host/crates/host-runtime', '{workspaceRoot}')).toEqual([
+      expect(
+        await cargoPackageTestInputs({
+          workspaceRoot: root,
+          absoluteProjectRoot: root,
+          memberDir: 'packages/host/crates/host-runtime',
+          inputRoot: '{workspaceRoot}',
+        }),
+      ).toEqual([
         '{workspaceRoot}/Cargo.toml',
         '{workspaceRoot}/Cargo.lock',
         '{workspaceRoot}/packages/host/crates/host-runtime/**/*.rs',
@@ -112,6 +125,80 @@ describe('Cargo workspace layouts', () => {
         '{workspaceRoot}/scripts/*.sh',
         '!{workspaceRoot}/**/target/**',
       ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('routes path dependencies outside the workspace through the externalRustCrates named input', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nx-plugin-cargo-external-deps-'));
+    try {
+      await write(
+        root,
+        'Cargo.toml',
+        [
+          '[workspace]',
+          'members = ["crates/app"]',
+          '',
+          '[workspace.dependencies]',
+          'sibling-core = { path = "../sibling/crates/sibling-core" }',
+          'pinned-core = { path = "/opt/pinned/crates/pinned-core" }',
+          'local-core = { path = "crates/local-core" }',
+          '',
+        ].join('\n'),
+      );
+      await write(root, 'Cargo.lock', 'version = 4\n');
+      await write(
+        root,
+        'crates/app/Cargo.toml',
+        [
+          '[package]',
+          'name = "app"',
+          '',
+          '[dependencies]',
+          'sibling-core = { workspace = true }',
+          'pinned-core = { workspace = true }',
+          'local-core = { workspace = true }',
+          'escaping-core = { path = "../../../escaping/crates/escaping-core" }',
+          '',
+        ].join('\n'),
+      );
+      await write(root, 'crates/local-core/Cargo.toml', '[package]\nname = "local-core"\n');
+
+      await write(root, 'nx.json', JSON.stringify({ namedInputs: { default: ['{projectRoot}/**/*'] } }));
+      await expect(
+        cargoPackageTestInputs({ workspaceRoot: root, absoluteProjectRoot: root, memberDir: 'crates/app' }),
+      ).rejects.toThrow(
+        'crates/app/Cargo.toml depends on crates outside the Nx workspace ' +
+          '(escaping-core -> ../escaping/crates/escaping-core, pinned-core -> /opt/pinned/crates/pinned-core, ' +
+          'sibling-core -> ../sibling/crates/sibling-core) that no fileset can hash; ' +
+          `declare namedInputs.externalRustCrates in ${join(root, 'nx.json')}`,
+      );
+
+      await write(
+        root,
+        'nx.json',
+        JSON.stringify({ namedInputs: { externalRustCrates: [{ runtime: 'echo hashed' }] } }),
+      );
+      const inputs = await cargoPackageTestInputs({
+        workspaceRoot: root,
+        absoluteProjectRoot: root,
+        memberDir: 'crates/app',
+        inputRoot: '{workspaceRoot}',
+      });
+      expect(inputs).toEqual([
+        '{workspaceRoot}/Cargo.toml',
+        '{workspaceRoot}/Cargo.lock',
+        '{workspaceRoot}/crates/app/**/*.rs',
+        '{workspaceRoot}/crates/app/Cargo.toml',
+        '{workspaceRoot}/crates/local-core/**/*.rs',
+        '{workspaceRoot}/crates/local-core/Cargo.toml',
+        '{workspaceRoot}/**/.cargo/config.toml',
+        '{workspaceRoot}/scripts/*.sh',
+        '!{workspaceRoot}/**/target/**',
+        'externalRustCrates',
+      ]);
+      expect(inputs.some((input) => input.includes('..') || input.includes('{workspaceRoot}//'))).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
