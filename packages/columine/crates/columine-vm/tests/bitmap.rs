@@ -1118,3 +1118,53 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// The serialized image is a pure function of the set: a container that
+    /// promoted to a bitset and drained, or that was runs and then splintered,
+    /// serializes byte for byte as a fresh insert of the surviving values.
+    /// Sizes straddle the 4096 array/bitset boundary and the run thresholds.
+    #[test]
+    fn minroar_image_is_a_pure_function_of_the_set(
+        inserts in proptest::collection::btree_set(0u32..7000, 0..6000),
+        dense_len in 0u32..5000,
+        removes in proptest::collection::vec(0u32..7000, 0..3000),
+        reinserts in proptest::collection::vec(0u32..7000, 0..200),
+        sparse in proptest::collection::btree_set(any::<u32>(), 0..64),
+    ) {
+        let mut mine = columine_vm::minroar::MiniRoaring::new();
+        let mut oracle = std::collections::BTreeSet::new();
+        let mut apply = |value: u32, insert: bool| {
+            let expected = if insert { oracle.insert(value) } else { oracle.remove(&value) };
+            let reported = if insert { mine.insert(value) } else { mine.remove(value) };
+            prop_assert_eq!(reported, expected, "insert={} value={}", insert, value);
+            Ok(())
+        };
+        for &v in inserts.iter().chain(sparse.iter()) { apply(v, true)?; }
+        for v in 0..dense_len { apply(v, true)?; }
+        for &v in &removes { apply(v, false)?; }
+        for &v in &reinserts { apply(v, true)?; }
+        for &v in sparse.iter().take(32) { apply(v, false)?; }
+
+        prop_assert!(mine.iter().eq(oracle.iter().copied()));
+        prop_assert_eq!(mine.len(), oracle.len() as u64);
+
+        let mut fresh = columine_vm::minroar::MiniRoaring::new();
+        for &v in &oracle { fresh.insert(v); }
+        mine.optimize();
+        fresh.optimize();
+        let (mut mine_bytes, mut fresh_bytes) = (Vec::new(), Vec::new());
+        mine.serialize_into(&mut mine_bytes).unwrap();
+        fresh.serialize_into(&mut fresh_bytes).unwrap();
+        prop_assert_eq!(mine_bytes.len(), mine.serialized_size());
+        prop_assert_eq!(&mine_bytes, &fresh_bytes);
+
+        // Canonical form survives its own round trip and stays iterable in
+        // order after re-laddering.
+        let reloaded = columine_vm::minroar::MiniRoaring::deserialize_from(&mine_bytes).unwrap();
+        prop_assert!(reloaded.iter().eq(oracle.iter().copied()));
+        prop_assert!(mine.iter().eq(oracle.iter().copied()));
+        let theirs = roaring::RoaringBitmap::deserialize_from(&mine_bytes[..]).expect("roaring parses the canonical image");
+        prop_assert!(theirs.iter().eq(oracle.iter().copied()));
+    }
+}
