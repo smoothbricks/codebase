@@ -139,7 +139,7 @@ fn typescript_comparison_type_matches_rust_cmp_type() {
 
 #[test]
 fn typescript_error_code_enum_matches_rust() {
-    let harvested = ts_enum(&read(TYPES_TS), "ErrorCode", 9);
+    let harvested = ts_enum(&read(TYPES_TS), "ErrorCode", 10);
     let rust: BTreeMap<String, u8> = (0..64_u32)
         .filter_map(|value| {
             ErrorCode::from_u32(value).map(|code| {
