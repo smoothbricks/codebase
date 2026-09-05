@@ -6,7 +6,7 @@ use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{EMPTY_KEY, ErrorCode};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
-    BatchView, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
+    BatchView, Binding, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::vm::{Vm, col_u32_exact, u32s_as_bytes, vm_map_get};
@@ -78,7 +78,7 @@ struct Threshold {
 }
 
 impl RowExpression for Threshold {
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<(), ErrorCode> {
+    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
         self.admitted += 1;
         if expr.len() != 5 {
             return Err(ErrorCode::InvalidProgram);
@@ -87,7 +87,7 @@ impl RowExpression for Threshold {
             return Err(ErrorCode::InvalidProgram);
         }
         col_u32_exact(batch.column(expr[0]), batch.batch_len)
-            .map(|_| ())
+            .map(|_| Binding::Bound)
             .ok_or(ErrorCode::ColumnUnderrun)
     }
 
@@ -193,7 +193,7 @@ fn an_empty_batch_binds_nothing_even_without_column_pointers() {
 }
 
 fn bind_err<'a>(
-    prog: &[u8],
+    prog: &'a [u8],
     cols: &mut [&'a [u8]],
     batch_len: u32,
     rows: &'a mut RowColumns,
@@ -203,7 +203,9 @@ fn bind_err<'a>(
         admitted: 0,
         evaluated: 0,
     };
-    bind_row_columns(prog, &state, cols, batch_len, &mut eval, rows).expect_err("bind must refuse")
+    bind_row_columns(prog, &state, cols, batch_len, &mut eval, rows)
+        .map(|_| ())
+        .expect_err("bind must refuse")
 }
 
 #[test]
@@ -377,4 +379,184 @@ fn two_entries_bind_their_own_targets_over_the_host_batch() {
     bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
     assert_eq!(cols[3], u32s_as_bytes(&[0u32, 1]));
     assert_eq!(cols[4], u32s_as_bytes(&[1u32, 1]));
+}
+
+/// Expression `[key_col, val_col]`: 1 when the row's value exceeds what the
+/// map (slot 0) stores for the row's key, or the key is absent — a live
+/// read, so the bind defers it to the reduce section.
+struct Competes {
+    evaluated: usize,
+}
+
+impl RowExpression for Competes {
+    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+        if expr.len() != 2 || expr.iter().any(|&c| usize::from(c) >= batch.num_cols()) {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        Ok(Binding::Live)
+    }
+
+    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+        self.evaluated += 1;
+        let key = col_u32_exact(batch.column(expr[0]), batch.batch_len).expect("key column")
+            [row as usize];
+        let val = col_u32_exact(batch.column(expr[1]), batch.batch_len).expect("value column")
+            [row as usize];
+        let stored = map_value(batch.state, key);
+        Ok(u32::from(stored == EMPTY_KEY || val > stored))
+    }
+}
+
+/// Run `keys`/`vals` as one batch of rows through the live path and answer
+/// the stored value of every key.
+fn run_live(prog: &[u8], state: &mut [u8], keys: &[u32], vals: &[u32]) -> Vec<u32> {
+    let types = vec![ORDER_TYPE; keys.len()];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(keys),
+        u32s_as_bytes(vals),
+        &[],
+    ];
+    let mut rows = RowColumns::new();
+    let mut eval = Competes { evaluated: 0 };
+    let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    // The handle borrows the evaluator; the block hands it back for the
+    // count below.
+    {
+        let mut live = bind_row_columns(
+            prog,
+            state,
+            &mut cols,
+            keys.len() as u32,
+            &mut eval,
+            &mut rows,
+        )
+        .expect("bind");
+        assert!(!live.is_empty());
+        // The placeholder covers the batch so an unrouted read is in bounds.
+        assert_eq!(cols[3].len(), keys.len() * 4);
+        assert_eq!(
+            vm.execute_batch_live(state, prog, &cols, keys.len() as u32, &mut live),
+            OK
+        );
+    }
+    assert_eq!(
+        eval.evaluated,
+        keys.len(),
+        "a live entry is evaluated once per row, at its opcode, never at bind"
+    );
+    let mut seen: Vec<u32> = keys.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    seen.iter().map(|&k| map_value(state, k)).collect()
+}
+
+#[test]
+fn a_live_entry_reads_the_state_the_rows_before_it_left() {
+    let prog = program(&table(
+        TYPE_COL,
+        &[entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL])],
+    ));
+    // Key 1 sees 40, then 70, then 45 (loses to 70), then 55 (loses); key 2
+    // sees 60 then 30 (loses). One batch and one row per batch agree.
+    let keys = [1u32, 2, 1, 1, 2];
+    let vals = [40u32, 60, 70, 45, 30];
+    let mut one = init(&prog);
+    let batched = run_live(&prog, &mut one, &keys, &vals);
+    let mut many = init(&prog);
+    for (k, v) in keys.iter().zip(&vals) {
+        run_live(&prog, &mut many, &[*k], &[*v]);
+    }
+    let expected = vec![70u32, 60];
+    assert_eq!(batched, expected);
+    assert_eq!(
+        vec![map_value(&many, 1), map_value(&many, 2)],
+        expected,
+        "one batch of n rows stores what n batches of one row store"
+    );
+}
+
+#[test]
+fn a_live_entry_gates_on_the_type_column_and_re_binds_per_batch() {
+    let prog = program(&table(
+        TYPE_COL,
+        &[entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL])],
+    ));
+    let mut state = init(&prog);
+    let types = [ORDER_TYPE, 9];
+    let keys = [1u32, 2];
+    let vals = [40u32, 60];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        &[],
+    ];
+    let mut rows = RowColumns::new();
+    let mut eval = Competes { evaluated: 0 };
+    let mut vm = Vm::new(DEFAULT_ACCEPTED_PROGRAM_MAGICS);
+    {
+        let mut live =
+            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+        assert_eq!(
+            vm.execute_batch_live(&mut state, &prog, &cols, 2, &mut live),
+            OK
+        );
+    }
+    assert_eq!(map_value(&state, 1), 40);
+    assert_eq!(
+        map_value(&state, 2),
+        EMPTY_KEY,
+        "the FOR_EACH never reaches the other type"
+    );
+
+    // A table-less program bound into the same storage carries no live
+    // entry forward.
+    let plain = program(&[]);
+    let mut plain_cols: Vec<&[u8]> = vec![&[], &[], &[], &[]];
+    let live =
+        bind_row_columns(&plain, &state, &mut plain_cols, 1, &mut eval, &mut rows).expect("bind");
+    assert!(live.is_empty());
+}
+
+#[test]
+fn splice_repeats_the_bound_columns_over_a_rebuilt_column_set() {
+    let prog = program(&table(
+        TYPE_COL,
+        &[entry(
+            PRED_COL,
+            &[ORDER_TYPE],
+            &threshold_expr(VAL_COL, 100),
+        )],
+    ));
+    let state = init(&prog);
+    let types = [ORDER_TYPE, ORDER_TYPE];
+    let keys = [1u32, 2];
+    let vals = [50u32, 150];
+    let host: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        &[],
+    ];
+    let mut cols = host.clone();
+    let mut rows = RowColumns::new();
+    let mut eval = Threshold {
+        admitted: 0,
+        evaluated: 0,
+    };
+    let bound: Vec<Vec<u8>> = {
+        let live =
+            bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+        assert!(live.is_empty());
+        cols.iter().map(|c| c.to_vec()).collect()
+    };
+    drop(cols);
+    // The run's column set is gone; a host resuming the same batch rebuilds
+    // it from the batch pointers and splices the bound cells back in.
+    let mut rebuilt = host.clone();
+    rows.splice(&mut rebuilt).expect("splice");
+    assert_eq!(rebuilt, bound);
+    let mut short: Vec<&[u8]> = vec![&[]];
+    assert_eq!(rows.splice(&mut short), Err(ErrorCode::InvalidProgram));
 }

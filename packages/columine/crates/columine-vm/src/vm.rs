@@ -23,6 +23,7 @@ use crate::hashset_ops;
 use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::{SlotMetaView, slot_meta_base};
 use crate::nested;
+use crate::row_exprs::LiveColumns;
 use crate::state_init::{self, ARENA_HEADER_SIZE, EVICTION_ENTRY_SIZE, NEEDS_GROWTH_SLOT};
 use crate::struct_map::{StructMap2Slot, StructMapSlot};
 use crate::undo_log::{
@@ -2663,7 +2664,8 @@ fn signal_growth(slot_idx: u8, result: ErrorCode) -> u32 {
 }
 
 impl Vm {
-    /// Execute one batch using the VM's normal mutation lane.
+    /// Execute one batch using the VM's normal mutation lane, over a batch
+    /// with no live derived columns (`row_exprs`).
     pub fn execute_batch(
         &mut self,
         state: &mut [u8],
@@ -2671,10 +2673,11 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
     ) -> u32 {
-        self.execute_impl(false, state, program, cols, batch_len)
+        self.execute_impl(false, state, program, cols, batch_len, None)
     }
 
-    /// Execute one batch using the VM's delta mutation lane.
+    /// Execute one batch using the VM's delta mutation lane, over a batch
+    /// with no live derived columns (`row_exprs`).
     pub fn execute_batch_delta(
         &mut self,
         state: &mut [u8],
@@ -2682,7 +2685,33 @@ impl Vm {
         cols: &[&[u8]],
         batch_len: u32,
     ) -> u32 {
-        self.execute_impl(true, state, program, cols, batch_len)
+        self.execute_impl(true, state, program, cols, batch_len, None)
+    }
+
+    /// Execute one batch using the VM's normal mutation lane; the conditional
+    /// per-element opcodes read `live` columns at their row, against the
+    /// state the rows before it left.
+    pub fn execute_batch_live(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: &mut LiveColumns<'_, '_>,
+    ) -> u32 {
+        self.execute_impl(false, state, program, cols, batch_len, Some(live))
+    }
+
+    /// [`Self::execute_batch_live`] on the delta mutation lane.
+    pub fn execute_batch_delta_live(
+        &mut self,
+        state: &mut [u8],
+        program: &[u8],
+        cols: &[&[u8]],
+        batch_len: u32,
+        live: &mut LiveColumns<'_, '_>,
+    ) -> u32 {
+        self.execute_impl(true, state, program, cols, batch_len, Some(live))
     }
 
     /// Evict every expired entry, returning a count that cannot collide with an error.
@@ -2710,6 +2739,7 @@ impl Vm {
         program: &[u8],
         cols: &[&[u8]],
         batch_len: u32,
+        mut live: Option<&mut LiveColumns<'_, '_>>,
     ) -> u32 {
         if bytes::read_u32(state, 0) != STATE_MAGIC {
             return INVALID_STATE;
@@ -3384,8 +3414,16 @@ impl Vm {
                         if !matched {
                             continue;
                         }
-                        let elem_result = self
-                            .execute_element_opcodes(delta_mode, state, body, cols, ei, ei, 0xFF);
+                        let elem_result = self.execute_element_opcodes(
+                            delta_mode,
+                            state,
+                            body,
+                            cols,
+                            ei,
+                            ei,
+                            0xFF,
+                            live.as_deref_mut(),
+                        );
                         if elem_result != OK {
                             return elem_result;
                         }
@@ -3550,6 +3588,7 @@ impl Vm {
         child_idx: u32,
         parent_idx: u32,
         parent_ts_col: u8,
+        mut live: Option<&mut LiveColumns<'_, '_>>,
     ) -> u32 {
         // Column cell reads at an element index. Bounds are the column's own
         // length (child columns can be longer than batch_len under FLAT_MAP).
@@ -3557,6 +3596,24 @@ impl Vm {
             |cols: &[&[u8]], idx: u8, i: u32| bytes::read_u32(col_at(cols, idx as usize), i * 4);
         let cell_f64 =
             |cols: &[&[u8]], idx: u8, i: u32| bytes::read_f64(col_at(cols, idx as usize), i * 8);
+        // A conditional opcode's predicate cell: a live derived column is
+        // evaluated here, against the state the rows before this one left,
+        // so the answer does not depend on where the host cut the batch.
+        macro_rules! predicate {
+            ($pred_col:expr) => {{
+                let pred = match live.as_deref_mut() {
+                    Some(live) => match live.cell($pred_col, child_idx, state, cols) {
+                        Some(Ok(cell)) => cell,
+                        Some(Err(code)) => return code as u32,
+                        None => cell_u32(cols, $pred_col, child_idx),
+                    },
+                    None => cell_u32(cols, $pred_col, child_idx),
+                };
+                if pred == 0 {
+                    continue;
+                }
+            }};
+        }
 
         let mut bpc = 0usize;
         while bpc < body.len() {
@@ -3750,9 +3807,7 @@ impl Vm {
                     let pred_col = body[bpc + 6];
                     bpc += 7;
 
-                    if cell_u32(cols, pred_col, child_idx) == 0 {
-                        continue;
-                    }
+                    predicate!(pred_col);
 
                     let (cmp_raw, cmp_idx) = if parent_ts_col != 0xFF {
                         (col_at(cols, parent_ts_col as usize), parent_idx)
@@ -3786,9 +3841,7 @@ impl Vm {
                         (body[bpc + 1], body[bpc + 2], body[bpc + 3], body[bpc + 4]);
                     bpc += 5;
 
-                    if cell_u32(cols, pred_col, child_idx) == 0 {
-                        continue;
-                    }
+                    predicate!(pred_col);
 
                     let meta = SlotMetaView::read(state, slot);
                     let (strategy, cmp) = if op == Opcode::BatchMapUpsertFirstIf {
@@ -3823,9 +3876,7 @@ impl Vm {
                 Opcode::BatchMapRemoveIf => {
                     let (slot, key_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
-                    if cell_u32(cols, pred_col, child_idx) == 0 {
-                        continue;
-                    }
+                    predicate!(pred_col);
                     let meta = SlotMetaView::read(state, slot);
                     hashmap_ops::single_map_remove(
                         delta_mode,
@@ -3847,9 +3898,7 @@ impl Vm {
                     let pred_col = body[bpc + 6];
                     bpc += 7;
 
-                    if cell_u32(cols, pred_col, child_idx) == 0 {
-                        continue;
-                    }
+                    predicate!(pred_col);
 
                     let strategy = if op == Opcode::BatchMapUpsertMaxIf {
                         Strategy::Max
@@ -3932,9 +3981,7 @@ impl Vm {
                 Opcode::BatchSetInsertIf => {
                     let (slot, elem_col, pred_col) = (body[bpc + 1], body[bpc + 2], body[bpc + 3]);
                     bpc += 4;
-                    if cell_u32(cols, pred_col, child_idx) == 0 {
-                        continue;
-                    }
+                    predicate!(pred_col);
                     let meta = SlotMetaView::read(state, slot);
                     let ts = if meta.has_ttl() {
                         cell_f64(cols, meta.timestamp_field_idx(state), child_idx)
@@ -4643,6 +4690,7 @@ impl Vm {
                             j,
                             child_idx,
                             inner_parent_ts_col,
+                            live.as_deref_mut(),
                         );
                         if result != OK {
                             return result;
