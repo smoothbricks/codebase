@@ -178,6 +178,11 @@ pub fn bind_row_columns<'a, E: RowExpression>(
     let Some(table) = row_table(program)? else {
         return Ok(());
     };
+    // An empty batch carries no rows to derive and may carry no column
+    // pointers at all; the reduce section reads nothing from it either.
+    if batch_len == 0 {
+        return Ok(());
+    }
     let count = usize::from(bytes::read_u16(table, 4));
     let type_col = usize::from(table[6]);
     if type_col >= cols.len() {
