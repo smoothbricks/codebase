@@ -91,6 +91,7 @@ fn workspace_with_fake_devenv(root: &Path) -> SandboxConfig {
         grants: SandboxGrants::default(),
         allowed_unix_sockets: Vec::new(),
         additional_denies: Vec::new(),
+        shed_links: Vec::new(),
         git_worktree_repository: None,
     }
 }

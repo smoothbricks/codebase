@@ -958,6 +958,8 @@ where
         }
         Command::Grant(args) => {
             let changed = !args.read.is_empty() || !args.write.is_empty();
+            let requested: Vec<PathBuf> =
+                args.read.iter().chain(args.write.iter()).cloned().collect();
             let grants = if changed {
                 service
                     .grant(
@@ -978,6 +980,23 @@ where
                 emit_filesystem_grants(output, &grants)?;
             }
             if changed {
+                // A grant is recorded under its resolved spelling. Saying so when that differs
+                // from what was typed keeps `cowshed grant <ws>` listings explicable, and names
+                // the rule that makes the typed spelling work anyway.
+                for path in requested {
+                    let Ok(resolved) = std::fs::canonicalize(&path) else {
+                        continue;
+                    };
+                    if resolved != path {
+                        output
+                            .guidance(&format!(
+                                "recorded {} as {}; a symlink beside the workspace that reaches a granted path is readable through the link",
+                                path.display(),
+                                resolved.display()
+                            ))
+                            .map_err(output_error)?;
+                    }
+                }
                 output
                     .guidance(&format!(
                         "grants for {} now: {} read, {} write",
