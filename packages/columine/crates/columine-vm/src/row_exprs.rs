@@ -58,6 +58,18 @@ pub struct BatchView<'a> {
 }
 
 impl<'a> BatchView<'a> {
+    /// The batch as the host passed it, with no derived columns bound yet —
+    /// the view an embedder evaluates a standalone expression against.
+    pub const fn host(state: &'a [u8], cols: &'a [&'a [u8]], batch_len: u32) -> Self {
+        Self {
+            state,
+            batch_len,
+            cols,
+            derived_targets: &[],
+            derived: &[],
+        }
+    }
+
     /// Column `col` as this entry reads it: an earlier entry's derived cells
     /// when one targets `col`, else the host's column (empty past the
     /// host's count, like [`col_at`]).
