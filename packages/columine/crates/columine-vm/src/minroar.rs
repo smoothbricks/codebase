@@ -1,10 +1,16 @@
 //! Minimal RoaringFormatSpec bitmap for the wasm artifact. It implements the
 //! exact surface used by `bitmap_ops` while keeping the shipped binary small.
 //! The serializer follows the portable Roaring format (cookies 12346/12347).
-//! Container choices are stable: arrays promote to bitsets at 4096 entries,
-//! bitsets do not demote on remove, runs remain runs under add/remove, and
-//! `optimize` selects runs when `n_runs*4 < cardinality*2` for arrays or
-//! `n_runs*4 < 8192` for bitsets.
+//!
+//! Container form between mutations is whatever the mutation history left
+//! (an array promotes to a bitset when a 4097th value arrives, a bitset stays
+//! a bitset while values drain, a run stays a run). `optimize` erases that
+//! history: it re-ladders every container from its contents alone — runs when
+//! `n_runs*4 < cardinality*2` (≤ 4096 values) or `n_runs*4 < 8192` (more),
+//! else array/bitset by cardinality — so the bytes written after `optimize`
+//! are a pure function of the set. Every store path calls `optimize` first,
+//! which is what lets a snapshot round-trip and a `remove`-then-`insert`
+//! reproduce the original image byte for byte.
 //!
 //! The `roaring` crate remains a DEV-dependency only: differential proptests
 //! in `tests/bitmap.rs` use it as the read/write oracle.
@@ -64,36 +70,29 @@ impl Container {
         }
     }
 
-    /// rawr addToContainer: array promotes to bitset when full; run splices.
-    /// Returns whether the value was newly added (rawr's full-array branch
-    /// returns true even for duplicates — preserved, it is observable through
-    /// cached cardinality only when the array was exactly full).
+    /// Add one value; returns whether it was newly added. The answer must be
+    /// exact for every form: delta reporting derives `changed` from it, and a
+    /// duplicate that reported `true` would emit an undo record for a
+    /// mutation that never happened. A full array therefore promotes only when
+    /// the value is genuinely new, so the bitset form starts at 4097 values —
+    /// the same boundary `from_words` and `optimize` use.
     fn add(&mut self, low: u16) -> bool {
         match self {
             Container::Array(v) => {
+                let Err(pos) = v.binary_search(&low) else {
+                    return false;
+                };
                 if v.len() >= ARRAY_MAX_CARDINALITY {
                     let mut words = Box::new([0u64; 1024]);
                     for &x in v.iter() {
                         words[usize::from(x) / 64] |= 1u64 << (x % 64);
                     }
-                    let mut card = v.len() as u32;
-                    let w = &mut words[usize::from(low) / 64];
-                    let bit = 1u64 << (low % 64);
-                    if *w & bit == 0 {
-                        *w |= bit;
-                        card += 1;
-                    }
-                    *self = Container::Bitset(words, card);
-                    // rawr returns true unconditionally on this path.
+                    words[usize::from(low) / 64] |= 1u64 << (low % 64);
+                    *self = Container::Bitset(words, v.len() as u32 + 1);
                     return true;
                 }
-                match v.binary_search(&low) {
-                    Ok(_) => false,
-                    Err(pos) => {
-                        v.insert(pos, low);
-                        true
-                    }
-                }
+                v.insert(pos, low);
+                true
             }
             Container::Bitset(words, card) => {
                 let w = &mut words[usize::from(low) / 64];
@@ -107,7 +106,7 @@ impl Container {
             }
             Container::Run(runs) => {
                 // Find insertion point among runs.
-                let mut idx = runs.partition_point(|&(start, _)| start <= low);
+                let idx = runs.partition_point(|&(start, _)| start <= low);
                 if idx > 0 {
                     let (start, len) = runs[idx - 1];
                     let end = u32::from(start) + u32::from(len);
@@ -130,13 +129,14 @@ impl Container {
                     return true;
                 }
                 runs.insert(idx, (low, 0));
-                let _ = &mut idx;
                 true
             }
         }
     }
 
-    /// rawr removeFromContainer: value removal with no type demotion.
+    /// Remove one value; returns whether it was present. The form is kept —
+    /// demoting a drained bitset here would re-promote on the next add, and
+    /// `optimize` re-ladders every container once before it is serialized.
     fn remove(&mut self, low: u16) -> bool {
         match self {
             Container::Array(v) => match v.binary_search(&low) {
@@ -229,84 +229,180 @@ impl Container {
         }
     }
 
-    /// Optimize one container using the run thresholds above.
-    fn run_optimize(&mut self) {
-        let n_runs = match self {
+    /// Number of maximal runs of consecutive values, read off each form
+    /// without expanding it.
+    fn run_count(&self) -> u32 {
+        match self {
             Container::Array(v) => {
                 if v.is_empty() {
-                    return;
+                    return 0;
                 }
-                let mut n = 1u32;
-                for w in v.windows(2) {
-                    if w[1] != w[0] + 1 {
-                        n += 1;
-                    }
-                }
-                if n * 4 < v.len() as u32 * 2 {
-                    n
-                } else {
-                    return;
-                }
+                1 + v.windows(2).filter(|w| w[1] != w[0] + 1).count() as u32
             }
             Container::Bitset(words, _) => {
-                // countRunsInBitset: number of 0→1 transitions.
+                // Number of 0→1 transitions across the 65536-bit plane.
                 let mut n = 0u32;
-                let mut prev = 0u64; // bit 63 of previous word
+                let mut carry = 0u64; // bit 63 of the previous word
                 for &w in words.iter() {
-                    // starts = bits set in w whose predecessor bit is 0
-                    let shifted = (w << 1) | prev;
-                    n += (w & !shifted).count_ones();
-                    prev = w >> 63;
+                    n += (w & !((w << 1) | carry)).count_ones();
+                    carry = w >> 63;
                 }
-                if n * 4 < BITSET_SIZE_BYTES as u32 {
-                    n
-                } else {
-                    return;
-                }
+                n
             }
-            Container::Run(_) => return,
-        };
-        let _ = n_runs;
-        // Convert current contents to runs.
-        let lows: Vec<u16> = self.iter_lows().collect();
-        let mut runs: Vec<(u16, u16)> = Vec::new();
-        let mut it = lows.into_iter();
-        if let Some(first) = it.next() {
-            let mut start = first;
-            let mut prev = first;
-            for x in it {
-                if x == prev + 1 {
-                    prev = x;
-                } else {
-                    runs.push((start, prev - start));
-                    start = x;
-                    prev = x;
-                }
-            }
-            runs.push((start, prev - start));
+            Container::Run(runs) => runs.len() as u32,
         }
-        *self = Container::Run(runs);
     }
 
-    fn iter_lows(&self) -> Box<dyn Iterator<Item = u16> + '_> {
-        match self {
-            Container::Array(v) => Box::new(v.iter().copied()),
-            Container::Bitset(words, _) => {
-                Box::new(words.iter().enumerate().flat_map(|(i, &w)| {
-                    let mut bits = w;
-                    core::iter::from_fn(move || {
-                        if bits == 0 {
-                            return None;
-                        }
-                        let tz = bits.trailing_zeros();
-                        bits &= bits - 1;
-                        Some((i as u32 * 64 + tz) as u16)
-                    })
-                }))
+    /// Re-ladder to the canonical form for the current contents (module doc).
+    /// Deciding from `(cardinality, run_count)` alone is what makes the
+    /// serialized image history-independent.
+    fn canonicalize(&mut self) {
+        let card = self.cardinality();
+        let n_runs = self.run_count();
+        let small = card as usize <= ARRAY_MAX_CARDINALITY;
+        let want_run = if small {
+            n_runs * 4 < card * 2
+        } else {
+            n_runs * 4 < BITSET_SIZE_BYTES as u32
+        };
+        if want_run {
+            if !matches!(self, Container::Run(_)) {
+                *self = Container::Run(self.to_runs(n_runs as usize));
             }
-            Container::Run(runs) => Box::new(runs.iter().flat_map(|&(start, len)| {
-                (u32::from(start)..=u32::from(start) + u32::from(len)).map(|x| x as u16)
-            })),
+        } else if small {
+            if !matches!(self, Container::Array(_)) {
+                let mut v = Vec::with_capacity(card as usize);
+                v.extend(self.iter_lows());
+                *self = Container::Array(v);
+            }
+        } else if !matches!(self, Container::Bitset(..)) {
+            *self = Container::Bitset(self.to_words(), card);
+        }
+    }
+
+    /// Maximal runs of the contents; `n_runs` sizes the allocation exactly.
+    fn to_runs(&self, n_runs: usize) -> Vec<(u16, u16)> {
+        let mut runs: Vec<(u16, u16)> = Vec::with_capacity(n_runs);
+        match self {
+            Container::Run(existing) => runs.extend_from_slice(existing),
+            Container::Array(v) => {
+                let mut it = v.iter().copied();
+                if let Some(first) = it.next() {
+                    let (mut start, mut prev) = (first, first);
+                    for x in it {
+                        if x != prev + 1 {
+                            runs.push((start, prev - start));
+                            start = x;
+                        }
+                        prev = x;
+                    }
+                    runs.push((start, prev - start));
+                }
+            }
+            Container::Bitset(words, _) => {
+                // Per word, `starts` marks 0→1 edges and `ends` 1→0 edges
+                // (the bit before a 0 or the plane end). Edges alternate
+                // start, end, start, … across the whole plane, so a pending
+                // start always pairs with the next end.
+                let mut pending: Option<u16> = None;
+                for (i, &w) in words.iter().enumerate() {
+                    if w == 0 {
+                        continue;
+                    }
+                    let carry_in = if i == 0 { 0 } else { words[i - 1] >> 63 };
+                    let carry_out = if i + 1 < words.len() {
+                        (words[i + 1] & 1) << 63
+                    } else {
+                        0
+                    };
+                    let mut starts = w & !((w << 1) | carry_in);
+                    let mut ends = w & !((w >> 1) | carry_out);
+                    let base = i as u32 * 64;
+                    while starts != 0 || ends != 0 {
+                        match pending {
+                            None => {
+                                let tz = starts.trailing_zeros();
+                                starts &= starts - 1;
+                                pending = Some((base + tz) as u16);
+                            }
+                            Some(start) => {
+                                let tz = ends.trailing_zeros();
+                                ends &= ends - 1;
+                                let end = (base + tz) as u16;
+                                runs.push((start, end - start));
+                                pending = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        runs
+    }
+
+    fn iter_lows(&self) -> LowIter<'_> {
+        match self {
+            Container::Array(v) => LowIter::Array(v.iter()),
+            Container::Bitset(words, _) => LowIter::Bitset {
+                words,
+                word: 0,
+                bits: words[0],
+            },
+            Container::Run(runs) => LowIter::Run {
+                runs: runs.iter(),
+                cur: 1,
+                end: 0,
+            },
+        }
+    }
+}
+
+/// Ascending low-16 cursor over one container. An enum rather than a boxed
+/// trait object so iterating a bitmap allocates nothing per container.
+enum LowIter<'a> {
+    Array(core::slice::Iter<'a, u16>),
+    Bitset {
+        words: &'a [u64; 1024],
+        word: usize,
+        bits: u64,
+    },
+    /// `cur > end` means the current run is exhausted and the next run is
+    /// fetched on demand.
+    Run {
+        runs: core::slice::Iter<'a, (u16, u16)>,
+        cur: u32,
+        end: u32,
+    },
+}
+
+impl Iterator for LowIter<'_> {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<u16> {
+        match self {
+            LowIter::Array(it) => it.next().copied(),
+            LowIter::Bitset { words, word, bits } => {
+                while *bits == 0 {
+                    *word += 1;
+                    if *word >= words.len() {
+                        return None;
+                    }
+                    *bits = words[*word];
+                }
+                let value = (*word as u32 * 64 + bits.trailing_zeros()) as u16;
+                *bits &= *bits - 1;
+                Some(value)
+            }
+            LowIter::Run { runs, cur, end } => {
+                if *cur > *end {
+                    let &(start, len) = runs.next()?;
+                    *cur = u32::from(start);
+                    *end = u32::from(start) + u32::from(len);
+                }
+                let value = *cur as u16;
+                *cur += 1;
+                Some(value)
+            }
         }
     }
 }
@@ -370,10 +466,12 @@ impl MiniRoaring {
         }
     }
 
-    /// rawr runOptimize — call before serializing (mirrors bitmapStore).
+    /// Re-ladder every container to its canonical form (module doc). Every
+    /// store path calls this before serializing; the bytes that follow are
+    /// then a pure function of the set.
     pub fn optimize(&mut self) {
         for c in &mut self.containers {
-            c.run_optimize();
+            c.canonicalize();
         }
     }
 
