@@ -384,6 +384,7 @@ fn config() -> WorkspaceSupervisorConfig {
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
             additional_denies: Vec::new(),
+            shed_links: Vec::new(),
             git_worktree_repository: None,
         },
         artifacts: ArtifactConfig {
