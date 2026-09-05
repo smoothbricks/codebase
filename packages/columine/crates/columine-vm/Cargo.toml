@@ -10,13 +10,15 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+axroar = { workspace = true }
 columine-types = { workspace = true }
 
 [dev-dependencies]
-# Differential oracle for the minroar module only — must never re-enter the
-# shipped artifact (it costs 35K of the reducer_vm.wasm size budget).
-roaring = { workspace = true }
 proptest = { workspace = true }
 # tests/opcode_audit.rs harvests the frozen ABI snapshot and the dispatch
 # source; the fixture strings must not enter the shipped artifact.
 columine-types = { workspace = true, features = ["audit"] }
+
+[[bench]]
+name = "bitmap_cells"
+harness = false

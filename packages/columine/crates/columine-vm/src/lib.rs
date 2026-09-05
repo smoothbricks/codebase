@@ -18,7 +18,6 @@ pub mod hashmap_ops;
 pub mod hashset_ops;
 pub mod hooks;
 pub mod meta;
-pub mod minroar;
 pub mod nested;
 pub mod slot_growth;
 pub mod state_init;
