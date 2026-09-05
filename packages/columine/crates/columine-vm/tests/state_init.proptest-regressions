@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc dbf3966fda6b1a6498007742d6ae42180a41741a4798742ab0429c3c4fb76eca # shrinks to flags = 0, cap = 1, scribble = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
 cc 96e08e04a0ba307e8913f85539bfc613900eb690b7a26483e93c6716b5bff4fe # shrinks to flags = 0, cap_a = 1, cap_b = 0
+cc 4be35bd7ee8c754c4161fff1e7fb1af34d5520957361d20ec0b49d029255c651 # shrinks to kind = 5, requested = 33

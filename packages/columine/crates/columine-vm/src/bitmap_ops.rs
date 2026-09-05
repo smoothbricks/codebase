@@ -385,6 +385,21 @@ pub enum BitmapAlgebraOp {
     Xor,
 }
 
+/// The right-hand operand of [`batch_bitmap_algebra`]. Naming the operand's
+/// home rather than handing over bytes lets the operation read it in place:
+/// a slot operand lives in the same `state` the target is written to, and the
+/// scratch operand lives in the `env` whose buffers the store path reuses.
+#[derive(Clone, Copy, Debug)]
+pub enum BitmapSource<'a> {
+    /// Another BITMAP slot of the same state buffer.
+    Slot(BitmapStorage),
+    /// `env.algebra_result` — the image the previous decision-side algebra
+    /// left behind.
+    Scratch,
+    /// A serialized image supplied by the caller.
+    Bytes(&'a [u8]),
+}
+
 /// Apply in-place set algebra to a target slot. Bulk mutations use one undo
 /// snapshot because per-element tracking is impractical.
 pub fn batch_bitmap_algebra(
@@ -393,13 +408,33 @@ pub fn batch_bitmap_algebra(
     op: BitmapAlgebraOp,
     state: &mut [u8],
     target_meta: &SlotMetaView,
-    source_data: &[u8],
+    source: BitmapSource<'_>,
 ) -> ErrorCode {
     let target_storage = get_bitmap_storage(target_meta);
     let original_size = target_meta.size(state);
 
+    let source_data: Option<&[u8]> = match source {
+        BitmapSource::Slot(storage) => storage.serialized_data(state),
+        BitmapSource::Scratch => {
+            (!env.algebra_result.is_empty()).then_some(&env.algebra_result[..])
+        }
+        BitmapSource::Bytes(bytes) => (!bytes.is_empty()).then_some(bytes),
+    };
+    // Deserialize before the snapshot borrows `state` mutably; the operand is
+    // owned from here on, so the identities below can write the target.
+    let source = match source_data {
+        None => None,
+        Some(data) => match RoaringBitmap::deserialize_from(data) {
+            Ok(bitmap) => Some(bitmap),
+            Err(_) => {
+                env.last_error = 80;
+                return ErrorCode::InvalidState;
+            }
+        },
+    };
+
     // Empty-source identities.
-    if source_data.is_empty() {
+    let Some(source) = source else {
         match op {
             BitmapAlgebraOp::And => {
                 // AND with empty = clear target.
@@ -423,7 +458,7 @@ pub fn batch_bitmap_algebra(
                 return ErrorCode::Ok;
             }
         }
-    }
+    };
 
     // Force undo snapshot before bulk mutation.
     if hooks.undo_enabled() && !hooks.undo_overflow() {
@@ -431,10 +466,6 @@ pub fn batch_bitmap_algebra(
     }
 
     let Some(mut target) = bitmap_load(env, state, target_storage) else {
-        return ErrorCode::InvalidState;
-    };
-    let Ok(source) = RoaringBitmap::deserialize_from(source_data) else {
-        env.last_error = 80;
         return ErrorCode::InvalidState;
     };
 

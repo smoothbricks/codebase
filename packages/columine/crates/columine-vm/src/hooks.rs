@@ -1,9 +1,10 @@
 //! Service boundary between container operations and VM-owned state.
 //!
-//! HashMap and HashSet operations use this trait for undo logging, TTL
-//! eviction-index maintenance, and BITMAP delegation. The VM supplies the
-//! implementation; [`NoVm`] is the deliberately minimal environment used when
-//! those services are not wired.
+//! HashMap, HashSet and BITMAP operations use this trait for undo logging and
+//! TTL eviction-index maintenance. The VM supplies the implementation;
+//! [`NoVm`] is the deliberately minimal environment used when those services
+//! are not wired. BITMAP work itself is not a hook: the VM routes a set
+//! opcode on a BITMAP-typed slot to `bitmap_ops` with its own `BitmapEnv`.
 
 use crate::meta::SlotMetaView;
 use crate::undo_log::FlatUndoOp;
@@ -82,30 +83,9 @@ pub trait VmHooks {
     /// Snapshot state for bulk BITMAP algebra. Called only when undo is enabled
     /// and no prior overflow snapshot exists; the undo service owns the shadow.
     fn force_undo_snapshot(&mut self, state: &[u8]);
-
-    /// Delegate a HASHSET operation on a BITMAP-typed slot.
-    fn batch_bitmap_add(
-        &mut self,
-        delta_mode: bool,
-        state: &mut [u8],
-        meta: &SlotMetaView,
-        slot_idx: u8,
-        elems: &[u32],
-        ts_col: Option<&[f64]>,
-    ) -> ErrorCode;
-
-    /// Delegate a batch removal on a BITMAP-typed slot.
-    fn batch_bitmap_remove(
-        &mut self,
-        delta_mode: bool,
-        state: &mut [u8],
-        meta: &SlotMetaView,
-        slot_idx: u8,
-        elems: &[u32],
-    ) -> ErrorCode;
 }
 
-/// Minimal environment with undo, TTL, and BITMAP services disabled. Calling an
+/// Minimal environment with undo and TTL services disabled. Calling an
 /// unimplemented service is a programmer error, so it panics rather than
 /// silently doing nothing.
 #[derive(Debug, Default)]
@@ -158,28 +138,5 @@ impl VmHooks for NoVm {
         unreachable!(
             "force_undo_snapshot is only called when undo_enabled() — NoVm never enables it"
         )
-    }
-
-    fn batch_bitmap_add(
-        &mut self,
-        _delta_mode: bool,
-        _state: &mut [u8],
-        _meta: &SlotMetaView,
-        _slot_idx: u8,
-        _elems: &[u32],
-        _ts_col: Option<&[f64]>,
-    ) -> ErrorCode {
-        columine_types::die!("BITMAP slot reached NoVm — the bitmap_ops slice is required")
-    }
-
-    fn batch_bitmap_remove(
-        &mut self,
-        _delta_mode: bool,
-        _state: &mut [u8],
-        _meta: &SlotMetaView,
-        _slot_idx: u8,
-        _elems: &[u32],
-    ) -> ErrorCode {
-        columine_types::die!("BITMAP slot reached NoVm — the bitmap_ops slice is required")
     }
 }
