@@ -267,6 +267,8 @@ function vmErrorCode(status: number): ErrorCode {
       return ErrorCode.INVALID_KEY;
     case ErrorCode.COLUMN_UNDERRUN:
       return ErrorCode.COLUMN_UNDERRUN;
+    case ErrorCode.INVALID_CELL_VALUE:
+      return ErrorCode.INVALID_CELL_VALUE;
     default:
       throw new Error(
         `WASM VM returned unknown status ${status}: the TypeScript ErrorCode enum is out of sync ` +

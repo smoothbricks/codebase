@@ -668,6 +668,10 @@ pub enum ErrorCode {
     /// cells. Named refusal makes this boundary explicit instead of reading
     /// beyond the available column data.
     ColumnUnderrun = 8,
+    /// A row expression produced a value its u32 cell cannot hold: a
+    /// fractional, negative or out-of-range number, or a non-scalar. Refused
+    /// by name instead of truncating the value into a wrong cell.
+    InvalidCellValue = 9,
 }
 
 impl ErrorCode {
@@ -685,6 +689,7 @@ impl ErrorCode {
             6 => Self::ArenaOverflow,
             7 => Self::InvalidKey,
             8 => Self::ColumnUnderrun,
+            9 => Self::InvalidCellValue,
             _ => return None,
         })
     }

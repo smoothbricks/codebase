@@ -229,6 +229,8 @@ export enum ErrorCode {
   INVALID_KEY = 7,
   /** Column cannot cover `batch_len` cells. Legal VM refusal, not a host crash. */
   COLUMN_UNDERRUN = 8,
+  /** A row expression produced a value its u32 cell cannot hold (fractional, negative, out of range, non-scalar). */
+  INVALID_CELL_VALUE = 9,
 }
 
 // =============================================================================

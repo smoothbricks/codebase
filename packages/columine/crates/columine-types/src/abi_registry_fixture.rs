@@ -130,6 +130,7 @@ pub const ERROR_CODES: &[(&str, u32)] = &[
     ("arenaoverflow", 6),
     ("capacityexceeded", 1),
     ("columnunderrun", 8),
+    ("invalidcellvalue", 9),
     ("invalidkey", 7),
     ("invalidprogram", 2),
     ("invalidslot", 3),
