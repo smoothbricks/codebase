@@ -302,9 +302,7 @@ pub unsafe extern "C" fn vm_set_contains(
     capacity: u32,
     elem: u32,
 ) -> u32 {
-    let r = rt();
     u32::from(vmops::vm_set_contains(
-        &mut r.vm.bitmap_env,
         unsafe { state_ref(state_base) },
         slot_offset,
         capacity,

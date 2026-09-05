@@ -9,7 +9,6 @@ use columine_types::types::{
     ChangeFlag, EMPTY_KEY, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset, SlotType,
     StateHeaderOffset, StructFieldType, TOMBSTONE, hash_key, struct_field_size,
 };
-use columine_vm::bitmap_ops::BitmapEnv;
 use columine_vm::bytes;
 use columine_vm::hash_table::{ENTRY_NONE, FlatTable, hashset_byte_size};
 use columine_vm::hashmap_ops::bind_slot_map;
@@ -835,7 +834,6 @@ proptest! {
         let pair_field0 = struct_map2.field_offset(&struct2_state, 0);
 
         let mut model: BTreeMap<u32, u32> = BTreeMap::new();
-        let mut env = BitmapEnv::default();
 
         for (is_remove, key, value) in ops {
             let present = model.contains_key(&key);
@@ -889,7 +887,7 @@ proptest! {
 
             prop_assert_eq!(set.contains(&set_state, key), expected.is_some());
             prop_assert_eq!(
-                vm_set_contains(&mut env, &set_state, set_meta.offset, capacity, key),
+                vm_set_contains(&set_state, set_meta.offset, capacity, key),
                 expected.is_some(),
                 "vm_set_contains disagrees for key {}", key
             );

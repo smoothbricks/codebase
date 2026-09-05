@@ -13,8 +13,8 @@
 
 use crate::aggregates::{self, AggKind, TypeMask};
 use crate::bitmap_ops::{
-    self, BitmapAlgebraOp, BitmapEnv, batch_bitmap_add, batch_bitmap_algebra, batch_bitmap_remove,
-    bitmap_load, bitmap_select, bitmap_store, get_bitmap_storage,
+    self, BitmapAlgebraOp, BitmapEnv, BitmapSource, batch_bitmap_add, batch_bitmap_algebra,
+    batch_bitmap_remove, bitmap_load, bitmap_select, bitmap_store, get_bitmap_storage,
 };
 use crate::bytes;
 use crate::hash_table;
@@ -822,19 +822,97 @@ impl Default for Vm {
     }
 }
 
-/// Split-borrow view implementing the container-ops hook boundary. Undo state
-/// and bitmap state are independent, and bitmap operations need both at once.
+/// The VM's undo lane as the container-ops hook boundary. It borrows only
+/// `undo`, so a bitmap operation can take `&mut self.bitmap_env` alongside it
+/// as a split borrow instead of a throwaway environment.
 pub struct VmCtx<'a> {
     pub undo: &'a mut UndoState,
-    pub env: &'a mut BitmapEnv,
 }
 
 impl Vm {
     pub fn ctx(&mut self) -> VmCtx<'_> {
         VmCtx {
             undo: &mut self.undo,
-            env: &mut self.bitmap_env,
         }
+    }
+
+    /// Set insertion routed by slot type: BITMAP slots run in `bitmap_env`,
+    /// flat sets in the hash table. A TTL slot requires one timestamp per
+    /// element.
+    pub fn set_insert(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        meta: &SlotMetaView,
+        slot_idx: u8,
+        elems: &[u32],
+        ts_col: Option<&[f64]>,
+    ) -> ErrorCode {
+        if meta.slot_type() == SlotType::Bitmap {
+            let hooks = &mut VmCtx {
+                undo: &mut self.undo,
+            };
+            return batch_bitmap_add(
+                &mut self.bitmap_env,
+                hooks,
+                delta_mode,
+                state,
+                meta,
+                slot_idx,
+                elems,
+                ts_col,
+            );
+        }
+        hashset_ops::batch_set_insert(
+            delta_mode,
+            state,
+            meta,
+            slot_idx,
+            elems,
+            ts_col,
+            &mut self.ctx(),
+        )
+    }
+
+    /// Set removal routed by slot type; see [`Vm::set_insert`].
+    pub fn set_remove(
+        &mut self,
+        delta_mode: bool,
+        state: &mut [u8],
+        meta: &SlotMetaView,
+        slot_idx: u8,
+        elems: &[u32],
+    ) -> ErrorCode {
+        if meta.slot_type() == SlotType::Bitmap {
+            let hooks = &mut VmCtx {
+                undo: &mut self.undo,
+            };
+            return batch_bitmap_remove(
+                &mut self.bitmap_env,
+                hooks,
+                delta_mode,
+                state,
+                meta,
+                slot_idx,
+                elems,
+            );
+        }
+        hashset_ops::batch_set_remove(delta_mode, state, meta, slot_idx, elems, &mut self.ctx())
+    }
+
+    /// In-place set algebra on a BITMAP slot with the operand read where it
+    /// lives (another slot or the scratch image) — no operand copy.
+    fn bitmap_algebra(
+        &mut self,
+        op: BitmapAlgebraOp,
+        state: &mut [u8],
+        target_meta: &SlotMetaView,
+        source: BitmapSource<'_>,
+    ) -> ErrorCode {
+        let hooks = &mut VmCtx {
+            undo: &mut self.undo,
+        };
+        batch_bitmap_algebra(&mut self.bitmap_env, hooks, op, state, target_meta, source)
     }
 }
 
@@ -899,45 +977,6 @@ impl VmHooks for VmCtx<'_> {
         // Bulk bitmap algebra uses snapshot-based rollback.
         self.undo.snapshot(state);
         self.undo.overflow = true;
-    }
-
-    fn batch_bitmap_add(
-        &mut self,
-        delta_mode: bool,
-        state: &mut [u8],
-        meta: &SlotMetaView,
-        slot_idx: u8,
-        elems: &[u32],
-        ts_col: Option<&[f64]>,
-    ) -> ErrorCode {
-        let mut inner = VmCtx {
-            undo: self.undo,
-            env: &mut BitmapEnv::default(),
-        };
-        // The delegated call needs env AND hooks; reborrowing self.env for
-        // both is impossible, and bitmap ops only use hooks for the undo
-        // lane, so the inner ctx carries a throwaway env for the recursive
-        // hooks slot while the REAL env does the bitmap work.
-        batch_bitmap_add(
-            self.env, &mut inner, delta_mode, state, meta, slot_idx, elems, ts_col,
-        )
-    }
-
-    fn batch_bitmap_remove(
-        &mut self,
-        delta_mode: bool,
-        state: &mut [u8],
-        meta: &SlotMetaView,
-        slot_idx: u8,
-        elems: &[u32],
-    ) -> ErrorCode {
-        let mut inner = VmCtx {
-            undo: self.undo,
-            env: &mut BitmapEnv::default(),
-        };
-        batch_bitmap_remove(
-            self.env, &mut inner, delta_mode, state, meta, slot_idx, elems,
-        )
     }
 }
 
@@ -2885,14 +2924,13 @@ impl Vm {
                     } else {
                         None
                     };
-                    let result = hashset_ops::batch_set_insert(
+                    let result = self.set_insert(
                         delta_mode,
                         state,
                         &meta,
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
                         ts,
-                        &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
                         return signal_growth(slot, result);
@@ -2903,7 +2941,7 @@ impl Vm {
                     let (slot, elem_col, ts_col) = (code[pc], code[pc + 1], code[pc + 2]);
                     pc += 3;
                     let meta = SlotMetaView::read(state, slot);
-                    let result = hashset_ops::batch_set_insert(
+                    let result = self.set_insert(
                         delta_mode,
                         state,
                         &meta,
@@ -2913,7 +2951,6 @@ impl Vm {
                             col_at(cols, ts_col as usize),
                             batch_len
                         ))),
-                        &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
                         return signal_growth(slot, result);
@@ -2924,13 +2961,12 @@ impl Vm {
                     let (slot, elem_col) = (code[pc], code[pc + 1]);
                     pc += 2;
                     let meta = SlotMetaView::read(state, slot);
-                    let result = hashset_ops::batch_set_remove(
+                    let result = self.set_remove(
                         delta_mode,
                         state,
                         &meta,
                         slot,
                         batch_col!(col_u32_exact(col_at(cols, elem_col as usize), batch_len)),
-                        &mut self.ctx(),
                     );
                     if result != ErrorCode::Ok {
                         return signal_growth(slot, result);
@@ -2949,14 +2985,7 @@ impl Vm {
                     } else {
                         None
                     };
-                    let (env, undo) = (&mut self.bitmap_env, &mut self.undo);
-                    let mut hooks = VmCtx {
-                        undo,
-                        env: &mut BitmapEnv::default(),
-                    };
-                    let result = batch_bitmap_add(
-                        env,
-                        &mut hooks,
+                    let result = self.set_insert(
                         delta_mode,
                         state,
                         &meta,
@@ -2973,14 +3002,7 @@ impl Vm {
                     let (slot, elem_col) = (code[pc], code[pc + 1]);
                     pc += 2;
                     let meta = SlotMetaView::read(state, slot);
-                    let (env, undo) = (&mut self.bitmap_env, &mut self.undo);
-                    let mut hooks = VmCtx {
-                        undo,
-                        env: &mut BitmapEnv::default(),
-                    };
-                    let result = batch_bitmap_remove(
-                        env,
-                        &mut hooks,
+                    let result = self.set_remove(
                         delta_mode,
                         state,
                         &meta,
@@ -3000,33 +3022,17 @@ impl Vm {
                     pc += 2;
                     let target_meta = SlotMetaView::read(state, target_slot);
                     let source_meta = SlotMetaView::read(state, source_slot);
-                    let source_storage = get_bitmap_storage(&source_meta);
-                    let source_len = source_storage.serialized_len(state);
-                    let source_data = if source_len > 0 {
-                        let off = source_storage.payload_offset() as usize;
-                        state[off..off + source_len as usize].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-
                     let alg_op = match op {
                         Opcode::BatchBitmapAnd => BitmapAlgebraOp::And,
                         Opcode::BatchBitmapOr => BitmapAlgebraOp::Or,
                         Opcode::BatchBitmapAndNot => BitmapAlgebraOp::AndNot,
                         _ => BitmapAlgebraOp::Xor,
                     };
-                    let (env, undo) = (&mut self.bitmap_env, &mut self.undo);
-                    let mut hooks = VmCtx {
-                        undo,
-                        env: &mut BitmapEnv::default(),
-                    };
-                    let result = batch_bitmap_algebra(
-                        env,
-                        &mut hooks,
+                    let result = self.bitmap_algebra(
                         alg_op,
                         state,
                         &target_meta,
-                        &source_data,
+                        BitmapSource::Slot(get_bitmap_storage(&source_meta)),
                     );
                     if result == ErrorCode::CapacityExceeded {
                         return signal_growth(target_slot, result);
@@ -3043,27 +3049,14 @@ impl Vm {
                     let target_slot = code[pc];
                     pc += 1;
                     let target_meta = SlotMetaView::read(state, target_slot);
-                    let source_data = self.bitmap_env.algebra_result().to_vec();
-
                     let alg_op = match op {
                         Opcode::BatchBitmapAndScratch => BitmapAlgebraOp::And,
                         Opcode::BatchBitmapOrScratch => BitmapAlgebraOp::Or,
                         Opcode::BatchBitmapAndNotScratch => BitmapAlgebraOp::AndNot,
                         _ => BitmapAlgebraOp::Xor,
                     };
-                    let (env, undo) = (&mut self.bitmap_env, &mut self.undo);
-                    let mut hooks = VmCtx {
-                        undo,
-                        env: &mut BitmapEnv::default(),
-                    };
-                    let result = batch_bitmap_algebra(
-                        env,
-                        &mut hooks,
-                        alg_op,
-                        state,
-                        &target_meta,
-                        &source_data,
-                    );
+                    let result =
+                        self.bitmap_algebra(alg_op, state, &target_meta, BitmapSource::Scratch);
                     if result == ErrorCode::CapacityExceeded {
                         return signal_growth(target_slot, result);
                     }
@@ -3903,14 +3896,13 @@ impl Vm {
                     } else {
                         0.0
                     };
-                    let result = hashset_ops::single_set_insert(
+                    let result = self.set_insert(
                         delta_mode,
                         state,
                         &meta,
                         slot,
-                        cell_u32(cols, elem_col, child_idx),
-                        ts,
-                        &mut self.ctx(),
+                        &[cell_u32(cols, elem_col, child_idx)],
+                        meta.has_ttl().then_some(&[ts][..]),
                     );
                     if result == ErrorCode::CapacityExceeded {
                         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
@@ -3928,14 +3920,13 @@ impl Vm {
                         cell_f64(cols, ts_col, child_idx)
                     };
                     let meta = SlotMetaView::read(state, slot);
-                    let result = hashset_ops::single_set_insert(
+                    let result = self.set_insert(
                         delta_mode,
                         state,
                         &meta,
                         slot,
-                        cell_u32(cols, elem_col, child_idx),
-                        ts,
-                        &mut self.ctx(),
+                        &[cell_u32(cols, elem_col, child_idx)],
+                        meta.has_ttl().then_some(&[ts][..]),
                     );
                     if result == ErrorCode::CapacityExceeded {
                         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
@@ -3956,14 +3947,13 @@ impl Vm {
                     } else {
                         0.0
                     };
-                    let result = hashset_ops::single_set_insert(
+                    let result = self.set_insert(
                         delta_mode,
                         state,
                         &meta,
                         slot,
-                        cell_u32(cols, elem_col, child_idx),
-                        ts,
-                        &mut self.ctx(),
+                        &[cell_u32(cols, elem_col, child_idx)],
+                        meta.has_ttl().then_some(&[ts][..]),
                     );
                     if result == ErrorCode::CapacityExceeded {
                         NEEDS_GROWTH_SLOT.store(slot, Ordering::Relaxed);
@@ -3976,13 +3966,12 @@ impl Vm {
                     let (slot, elem_col) = (body[bpc + 1], body[bpc + 2]);
                     bpc += 3;
                     let meta = SlotMetaView::read(state, slot);
-                    let result = hashset_ops::single_set_remove(
+                    let result = self.set_remove(
                         delta_mode,
                         state,
                         &meta,
                         slot,
-                        cell_u32(cols, elem_col, child_idx),
-                        &mut self.ctx(),
+                        &[cell_u32(cols, elem_col, child_idx)],
                     );
                     if result != ErrorCode::Ok {
                         return signal_growth(slot, result);
@@ -4433,23 +4422,15 @@ impl Vm {
                             let src_off = probe_row + probe.field_offset(state, v_src_field_idx);
                             let v = bytes::read_u32(state, src_off);
                             if is_retract {
-                                hashset_ops::single_set_remove(
-                                    delta_mode,
-                                    state,
-                                    &meta,
-                                    dest_slot,
-                                    v,
-                                    &mut self.ctx(),
-                                );
+                                self.set_remove(delta_mode, state, &meta, dest_slot, &[v]);
                             } else {
-                                let set_result = hashset_ops::single_set_insert(
+                                let set_result = self.set_insert(
                                     delta_mode,
                                     state,
                                     &meta,
                                     dest_slot,
-                                    v,
-                                    0.0,
-                                    &mut self.ctx(),
+                                    &[v],
+                                    meta.has_ttl().then_some(&[0.0][..]),
                                 );
                                 // Any failure requests growth so the caller can retry.
                                 if set_result != ErrorCode::Ok {
@@ -4956,18 +4937,11 @@ pub fn vm_map_get(state: &[u8], slot_offset: u32, capacity: u32, key: u32) -> u3
 }
 
 /// Test whether a set contains a key.
-pub fn vm_set_contains(
-    env: &mut BitmapEnv,
-    state: &[u8],
-    slot_offset: u32,
-    capacity: u32,
-    elem: u32,
-) -> bool {
+pub fn vm_set_contains(state: &[u8], slot_offset: u32, capacity: u32, elem: u32) -> bool {
     if let Some(meta) = find_slot_meta_by_offset(state, slot_offset)
         && meta.slot_type() == SlotType::Bitmap
     {
         let storage = get_bitmap_storage(&meta);
-        let _ = env;
         return storage
             .serialized_data(state)
             .is_some_and(|data| bitmap_ops::contains_serialized(data, elem));

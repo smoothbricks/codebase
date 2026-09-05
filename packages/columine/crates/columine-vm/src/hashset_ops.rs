@@ -29,9 +29,8 @@ pub fn batch_set_insert(
     ts_col: Option<&[f64]>,
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
-    // BITMAP fallback.
     if meta.slot_type() == SlotType::Bitmap {
-        return hooks.batch_bitmap_add(delta_mode, state, meta, slot_idx, elems, ts_col);
+        columine_types::die!("BITMAP slot reached hashset_ops — the VM routes it to bitmap_ops");
     }
 
     let tbl = bind_slot_set(meta);
@@ -118,7 +117,7 @@ pub fn batch_set_remove(
     hooks: &mut impl VmHooks,
 ) -> ErrorCode {
     if meta.slot_type() == SlotType::Bitmap {
-        return hooks.batch_bitmap_remove(delta_mode, state, meta, slot_idx, elems);
+        columine_types::die!("BITMAP slot reached hashset_ops — the VM routes it to bitmap_ops");
     }
 
     let tbl = bind_slot_set(meta);
@@ -161,32 +160,4 @@ pub fn batch_set_remove(
         meta.set_change_flag(state, ChangeFlag::REMOVED);
     }
     ErrorCode::Ok
-}
-
-/// Insert one element for per-element dispatch.
-pub fn single_set_insert(
-    delta_mode: bool,
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    slot_idx: u8,
-    elem: u32,
-    ts: f64,
-    hooks: &mut impl VmHooks,
-) -> ErrorCode {
-    let elems = [elem];
-    let timestamps = [ts];
-    let ts_col = meta.has_ttl().then_some(timestamps.as_slice());
-    batch_set_insert(delta_mode, state, meta, slot_idx, &elems, ts_col, hooks)
-}
-
-/// Remove one element for per-element dispatch.
-pub fn single_set_remove(
-    delta_mode: bool,
-    state: &mut [u8],
-    meta: &SlotMetaView,
-    slot_idx: u8,
-    elem: u32,
-    hooks: &mut impl VmHooks,
-) -> ErrorCode {
-    batch_set_remove(delta_mode, state, meta, slot_idx, &[elem], hooks)
 }
