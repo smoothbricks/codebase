@@ -35,11 +35,29 @@
 //! through [`BatchView::column`], so a derived value can feed a derived
 //! predicate. A program whose content ends with the reduce section carries
 //! no table and binds nothing.
+//!
+//! ## Bound and live entries
+//!
+//! An entry that reads only the batch is *bound*: its column is computed
+//! once, before the reduce section runs. An entry that reads live state —
+//! the value a map stores for the row's key — is *live*: [`admit`] answers
+//! [`Binding::Live`], the bind leaves its column as zero cells, and the
+//! reduce section evaluates the expression at the row where it reads the
+//! cell, through [`LiveColumns`]. WHY: the reduce section applies rows in
+//! order, and a live read at row `r` must see rows `0..r` of the same batch
+//! already applied — otherwise the answer depends on where the host cut its
+//! batches, and one batch of `n` rows and `n` batches of one row store
+//! different values. A live column is read by the per-element conditional
+//! opcodes (the `*_IF` family); the batch aggregates read the bound cells,
+//! so an embedder lowers a state-reading expression only to a per-element
+//! predicate.
+//!
+//! [`admit`]: RowExpression::admit
 
 use columine_types::types::{ErrorCode, PROGRAM_HASH_PREFIX, ProgramHeader};
 
 use crate::bytes;
-use crate::vm::{col_at, col_u32_exact, u32s_as_bytes};
+use crate::vm::{col_at, col_u32, col_u32_exact, u32s_as_bytes};
 
 /// ASCII `R X P 1` in little-endian wire order.
 pub const ROW_EXPRESSIONS_MAGIC: u32 = 0x3150_5852;
@@ -86,13 +104,25 @@ impl<'a> BatchView<'a> {
     }
 }
 
+/// How an admitted entry binds: computed before the reduce section, or at
+/// the row where the reduce section reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    /// The expression reads only the batch: its column is bound up front.
+    Bound,
+    /// The expression reads live state: it is evaluated per row, after the
+    /// rows before it applied.
+    Live,
+}
+
 /// The embedder's expression evaluator.
 pub trait RowExpression {
     /// Validate one entry's expression against the batch before any row is
-    /// evaluated: every column it reads must cover `batch_len`, so per-row
-    /// evaluation is infallible on that axis. A malformed expression is
-    /// `InvalidProgram`; a short column is `ColumnUnderrun`.
-    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<(), ErrorCode>;
+    /// evaluated, and answer how it binds: every column it reads must cover
+    /// `batch_len`, so per-row evaluation is infallible on that axis. A
+    /// malformed expression is `InvalidProgram`; a short column is
+    /// `ColumnUnderrun`.
+    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode>;
 
     /// Evaluate the expression for one row and answer the u32 cell to store.
     /// A value the cell cannot hold is `InvalidCellValue`.
@@ -106,6 +136,21 @@ pub trait RowExpression {
 pub struct RowColumns {
     cells: Vec<Vec<u32>>,
     targets: Vec<u8>,
+    /// The entries the last bind deferred, in table order.
+    live: Vec<LiveEntry>,
+    /// Where the last bind's table starts in its program, and the batch it
+    /// bound — the live reads re-parse the entry from there.
+    table_start: usize,
+    type_col: u8,
+    batch_len: u32,
+}
+
+/// One deferred entry: its column and where it sits in the table.
+#[derive(Debug, Clone, Copy)]
+struct LiveEntry {
+    target_col: u8,
+    /// Offset of the entry within the table.
+    pos: usize,
 }
 
 impl RowColumns {
@@ -113,6 +158,10 @@ impl RowColumns {
         Self {
             cells: Vec::new(),
             targets: Vec::new(),
+            live: Vec::new(),
+            table_start: 0,
+            type_col: 0,
+            batch_len: 0,
         }
     }
 
@@ -120,6 +169,84 @@ impl RowColumns {
     /// diagnostics; the batch reads it through the spliced column set.
     pub fn column(&self, entry: usize) -> Option<&[u32]> {
         self.cells.get(entry).map(Vec::as_slice)
+    }
+
+    /// Replace every target column in `cols` with the cells the last bind
+    /// computed — the splice [`bind_row_columns`] performs, repeated for a
+    /// host that rebuilds its column set from the same batch (a resumed
+    /// run must see the derived columns the run it resumes saw).
+    pub fn splice<'a>(&'a self, cols: &mut [&'a [u8]]) -> Result<(), ErrorCode> {
+        for (cells, &target) in self.cells.iter().zip(&self.targets) {
+            let col = cols
+                .get_mut(usize::from(target))
+                .ok_or(ErrorCode::InvalidProgram)?;
+            *col = u32s_as_bytes(cells);
+        }
+        Ok(())
+    }
+}
+
+/// The live columns of one batch: the entries the bind deferred, resolved
+/// per row when the reduce section reads them, against the state as it
+/// stands at that row. [`bind_row_columns`] answers one per bind; the
+/// reduce section runs with it (`Vm::execute_batch_live`).
+pub struct LiveColumns<'a, 'e> {
+    rows: &'a RowColumns,
+    program: &'a [u8],
+    /// The evaluator, borrowed for the handle's life only — dropping the
+    /// handle hands it back, whatever the bound columns still cover.
+    eval: &'e mut dyn RowExpression,
+}
+
+impl LiveColumns<'_, '_> {
+    /// Whether the bind deferred any entry to the reduce section.
+    pub fn is_empty(&self) -> bool {
+        self.rows.live.is_empty()
+    }
+
+    /// The cell of live column `col` at `row`, evaluated now, or `None` when
+    /// `col` is not a live column and the batch's bytes hold its cell.
+    /// `cols` is the spliced column set the reduce section reads (a live
+    /// expression may read the bound columns); a row whose type is not in
+    /// the entry's match set, or that lies past the bound batch (a
+    /// flat-mapped child row), is the zero cell, as it is for a bound entry.
+    pub fn cell(
+        &mut self,
+        col: u8,
+        row: u32,
+        state: &[u8],
+        cols: &[&[u8]],
+    ) -> Option<Result<u32, ErrorCode>> {
+        let entry = self.rows.live.iter().find(|e| e.target_col == col)?;
+        let rows = self.rows;
+        let type_cell = col_u32(col_at(cols, usize::from(rows.type_col)), rows.batch_len)
+            .get(row as usize)
+            .copied();
+        Some(self.eval_entry(*entry, row, type_cell, state, cols))
+    }
+
+    fn eval_entry(
+        &mut self,
+        entry: LiveEntry,
+        row: u32,
+        type_cell: Option<u32>,
+        state: &[u8],
+        cols: &[&[u8]],
+    ) -> Result<u32, ErrorCode> {
+        let rows = self.rows;
+        // The bind parsed this entry from the same bytes; a program that no
+        // longer holds it is the caller's mismatch, refused like a bad table.
+        let table = self
+            .program
+            .get(rows.table_start..)
+            .ok_or(ErrorCode::InvalidProgram)?;
+        let mut pos = entry.pos;
+        let parsed = parse_entry(table, &mut pos)?;
+        if !type_cell.is_some_and(|t| parsed.matches(t)) {
+            return Ok(0);
+        }
+        let batch = BatchView::host(state, cols, rows.batch_len);
+        self.eval.eval(parsed.expr, &batch, row)
     }
 }
 
@@ -200,25 +327,39 @@ fn parse_entry<'a>(table: &'a [u8], pos: &mut usize) -> Result<Entry<'a>, ErrorC
 /// target column in `cols` with its derived cells. Entries bind in table
 /// order; a later entry reads an earlier one's column through
 /// [`BatchView::column`]. `out` holds the cells for as long as `cols` names
-/// them.
+/// them. The answer is the batch's live columns — the entries deferred to
+/// the reduce section — which the reduce section runs with; it is empty
+/// when every entry bound up front.
 ///
 /// Errors leave `cols` untouched: the table is validated and every cell
 /// computed before the first splice.
-pub fn bind_row_columns<'a, E: RowExpression>(
-    program: &[u8],
+pub fn bind_row_columns<'a, 'e, E: RowExpression>(
+    program: &'a [u8],
     state: &[u8],
     cols: &mut [&'a [u8]],
     batch_len: u32,
-    eval: &mut E,
+    eval: &'e mut E,
     out: &'a mut RowColumns,
-) -> Result<(), ErrorCode> {
+) -> Result<LiveColumns<'a, 'e>, ErrorCode> {
+    // `out` describes this bind only: a table-less program or an empty batch
+    // must not leave the previous batch's targets or live entries behind.
+    out.targets.clear();
+    out.live.clear();
     let Some(table) = row_table(program)? else {
-        return Ok(());
+        return Ok(LiveColumns {
+            rows: out,
+            program,
+            eval,
+        });
     };
     // An empty batch carries no rows to derive and may carry no column
     // pointers at all; the reduce section reads nothing from it either.
     if batch_len == 0 {
-        return Ok(());
+        return Ok(LiveColumns {
+            rows: out,
+            program,
+            eval,
+        });
     }
     let count = usize::from(bytes::read_u16(table, 4));
     let type_col = usize::from(table[6]);
@@ -227,12 +368,16 @@ pub fn bind_row_columns<'a, E: RowExpression>(
     }
     out.cells.resize_with(count, Vec::new);
     out.targets.resize(count, 0);
+    out.table_start = program.len() - table.len();
+    out.type_col = table[6];
+    out.batch_len = batch_len;
 
     let view: &[&[u8]] = cols;
     let type_cells =
         col_u32_exact(col_at(view, type_col), batch_len).ok_or(ErrorCode::ColumnUnderrun)?;
     let mut pos = TABLE_HEADER_BYTES;
     for i in 0..count {
+        let entry_pos = pos;
         let entry = parse_entry(table, &mut pos)?;
         if usize::from(entry.target_col) >= view.len() {
             return Err(ErrorCode::InvalidProgram);
@@ -248,10 +393,19 @@ pub fn bind_row_columns<'a, E: RowExpression>(
             derived_targets: &out.targets[..i],
             derived: done,
         };
-        eval.admit(entry.expr, &batch)?;
+        let binding = eval.admit(entry.expr, &batch)?;
         let cells = &mut rest[0];
         cells.clear();
         cells.resize(batch_len as usize, 0);
+        if binding == Binding::Live {
+            // The zero cells stand in for the column the reduce section
+            // reads live; they also keep the column covering the batch.
+            out.live.push(LiveEntry {
+                target_col: entry.target_col,
+                pos: entry_pos,
+            });
+            continue;
+        }
         for (row, cell) in cells.iter_mut().enumerate() {
             if !entry.matches(type_cells[row]) {
                 continue;
@@ -267,10 +421,10 @@ pub fn bind_row_columns<'a, E: RowExpression>(
     }
 
     let bound: &'a RowColumns = out;
-    let mut pos = TABLE_HEADER_BYTES;
-    for cells in bound.cells.iter().take(count) {
-        let entry = parse_entry(table, &mut pos)?;
-        cols[usize::from(entry.target_col)] = u32s_as_bytes(cells);
-    }
-    Ok(())
+    bound.splice(cols)?;
+    Ok(LiveColumns {
+        rows: bound,
+        program,
+        eval,
+    })
 }
