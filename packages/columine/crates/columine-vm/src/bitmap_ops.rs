@@ -223,8 +223,7 @@ pub fn bitmap_store(
 /// Select the element at `rank` in ascending order.
 pub fn bitmap_select(state: &[u8], storage: BitmapStorage, rank: u32) -> Option<u32> {
     let data = storage.serialized_data(state)?;
-    let bm = RoaringBitmap::deserialize_from(data).ok()?;
-    bm.iter().nth(rank as usize)
+    RoaringBitmap::select_bytes(data, rank).ok().flatten()
 }
 
 /// Add a batch of elements. Rust's backing storage has no scratch-allocation
