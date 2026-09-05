@@ -366,6 +366,66 @@ impl ColumnStorage {
         let end = read_offset(&self.offsets, row as usize + 1, width) as usize;
         self.values.get(start..end)
     }
+
+    /// Keep the rows whose bit is set in `keep` (LSB-first, one bit per
+    /// row of `row_count`), compacting in place. Kept rows move down, never
+    /// up, so every copy reads bytes the compaction has not yet overwritten.
+    /// Returns the surviving row count.
+    fn retain_rows(&mut self, row_count: u32, keep: &[u8]) -> u32 {
+        let rows = row_count as usize;
+        let kept = |row: usize| keep[row / 8] & (1u8 << (row % 8)) != 0;
+        let mut write = 0usize;
+        match self.kind {
+            PlaneKind::Empty => {
+                write = (0..rows).filter(|row| kept(*row)).count();
+            }
+            PlaneKind::Bool => {
+                for row in (0..rows).filter(|row| kept(*row)) {
+                    let bit = (self.values[row / 8] >> (row % 8)) & 1;
+                    self.values[write / 8] =
+                        (self.values[write / 8] & !(1u8 << (write % 8))) | (bit << (write % 8));
+                    write += 1;
+                }
+            }
+            PlaneKind::SignedInt { width }
+            | PlaneKind::UnsignedInt { width }
+            | PlaneKind::Float { width }
+            | PlaneKind::FixedBytes { width } => {
+                let width = width as usize;
+                for row in (0..rows).filter(|row| kept(*row)) {
+                    if write != row {
+                        self.values
+                            .copy_within(row * width..(row + 1) * width, write * width);
+                    }
+                    write += 1;
+                }
+            }
+            PlaneKind::Text { offset_width } | PlaneKind::Bytes { offset_width } => {
+                let mut data_len = 0usize;
+                for row in (0..rows).filter(|row| kept(*row)) {
+                    let start = read_offset(&self.offsets, row, offset_width) as usize;
+                    let end = read_offset(&self.offsets, row + 1, offset_width) as usize;
+                    if data_len != start {
+                        self.values.copy_within(start..end, data_len);
+                    }
+                    // Offsets are bounded by the payload, which fits u32.
+                    write_offset(&mut self.offsets, write, offset_width, data_len as u32);
+                    data_len += end - start;
+                    write += 1;
+                }
+                write_offset(&mut self.offsets, write, offset_width, data_len as u32);
+                self.data_len = data_len as u32;
+            }
+        }
+        // Validity travels with every kind.
+        for (valid_write, row) in (0..rows).filter(|row| kept(*row)).enumerate() {
+            let bit = (self.validity[row / 8] >> (row % 8)) & 1;
+            self.validity[valid_write / 8] = (self.validity[valid_write / 8]
+                & !(1u8 << (valid_write % 8)))
+                | (bit << (valid_write % 8));
+        }
+        write as u32
+    }
 }
 
 /// Errors surfaced by the transactional variable-width writer.
@@ -700,6 +760,27 @@ impl DynamicColumns {
     pub fn get_column(&self, col_idx: u32) -> Option<&ColumnStorage> {
         self.columns.get(col_idx as usize)
     }
+
+    /// Keep the rows whose bit is set in `keep` (LSB-first, one bit per
+    /// row), compacting every column in place. The batch's rows are the
+    /// rows that survive, in their original order.
+    pub fn retain_rows(&mut self, keep: &[u8]) {
+        debug_assert!(
+            keep.len() * 8 >= self.count as usize,
+            "keep mask covers every row"
+        );
+        let count = self.count;
+        let mut survivors = None;
+        for col in &mut self.columns {
+            let kept = col.retain_rows(count, keep);
+            debug_assert!(
+                survivors.is_none_or(|s| s == kept),
+                "every column keeps the same rows"
+            );
+            survivors = Some(kept);
+        }
+        self.count = survivors.unwrap_or(0);
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +817,54 @@ mod tests {
         let cols = DynamicColumns::new(&fields, 100);
         assert_eq!(cols.count, 0);
         assert_eq!(cols.field_count, 4);
+    }
+
+    /// Rows dropped by `retain_rows` vanish from every plane kind and the
+    /// survivors keep their values, validity, and order.
+    #[test]
+    fn retain_rows_compacts_every_plane() {
+        let fields = [
+            field(ArrowType::Utf8, false),
+            field(ArrowType::Int32, true),
+            field(ArrowType::Float64, true),
+            field(ArrowType::Bool, true),
+            field(ArrowType::Null, true),
+        ];
+        let mut cols = DynamicColumns::new(&fields, 10);
+        for row in 0..6u32 {
+            assert!(cols.begin_row());
+            cols.append_variable(0, format!("id-{row}").as_bytes())
+                .unwrap();
+            if row % 3 == 0 {
+                cols.append_null(1).unwrap();
+            } else {
+                cols.append_int(1, i64::from(row) * 10).unwrap();
+            }
+            cols.append_float(2, f64::from(row) + 0.5).unwrap();
+            cols.append_bool(3, row % 2 == 1).unwrap();
+            cols.end_row();
+        }
+        // Keep rows 1, 3, 4: bits 0b011010.
+        cols.retain_rows(&[0b0001_1010]);
+        assert_eq!(cols.count, 3);
+        let ids: Vec<&[u8]> = (0..3)
+            .map(|r| cols.columns[0].read_variable(r).unwrap())
+            .collect();
+        assert_eq!(ids, [&b"id-1"[..], b"id-3", b"id-4"]);
+        assert_eq!(cols.columns[1].read_int(0), Some(10));
+        assert!(!cols.is_null(1, 0));
+        assert!(cols.is_null(1, 1));
+        assert_eq!(cols.columns[1].read_int(2), Some(40));
+        assert_eq!(cols.columns[2].read_float(1), Some(3.5));
+        assert_eq!(cols.columns[3].read_bool(0), Some(true));
+        assert_eq!(cols.columns[3].read_bool(1), Some(true));
+        assert_eq!(cols.columns[3].read_bool(2), Some(false));
+        assert_eq!(cols.columns[0].value_bytes(3), b"id-1id-3id-4");
+        // A second cut on the compacted batch keeps the middle row.
+        cols.retain_rows(&[0b010]);
+        assert_eq!(cols.count, 1);
+        assert_eq!(cols.columns[0].read_variable(0).unwrap(), b"id-3");
+        assert!(cols.is_null(1, 0));
     }
 
     // test "DynamicColumns - append values"

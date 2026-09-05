@@ -11,9 +11,15 @@ repository.workspace = true
 columine-arrow = { path = "../columine-arrow" }
 columine-parsing = { path = "../columine-parsing" }
 columine-types = { path = "../columine-types" }
+axroar = { workspace = true }
+ptmcart-core = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+
+[[bench]]
+name = "dedup_cells"
+harness = false
