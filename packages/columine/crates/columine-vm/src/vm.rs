@@ -1822,10 +1822,8 @@ fn single_struct_map_upsert_last(
 
     let smap = StructMapSlot::bind(state, slot_idx);
     let Some(result) = smap.upsert(state, key) else {
-        if delta_mode {
-            let meta_base = slot_meta_base(slot_idx);
-            state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
-        }
+        let meta_base = slot_meta_base(slot_idx);
+        state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
         NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
         return StructUpsertResult {
             err: ErrorCode::CapacityExceeded,
@@ -1869,10 +1867,15 @@ fn single_struct_map_upsert_last(
         );
     }
 
-    if delta_mode {
-        let meta_base = slot_meta_base(slot_idx);
-        state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
-    }
+    // Change flags are change tracking, not journaling: the RETE gate and the
+    // slot-change alphas read them on every batch, delta mode or not (the
+    // two-key upsert already stamps unconditionally).
+    let meta_base = slot_meta_base(slot_idx);
+    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
+        ChangeFlag::INSERTED
+    } else {
+        ChangeFlag::UPDATED
+    };
     StructUpsertResult {
         err: ErrorCode::Ok,
         pos: result.pos,
@@ -2058,10 +2061,8 @@ fn single_struct_map_upsert_from_probe(
 
     let out = StructMapSlot::bind(state, out_slot);
     let Some(result) = out.upsert(state, out_key) else {
-        if delta_mode {
-            let meta_base = slot_meta_base(out_slot);
-            state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
-        }
+        let meta_base = slot_meta_base(out_slot);
+        state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
         NEEDS_GROWTH_SLOT.store(out_slot, Ordering::Relaxed);
         return StructUpsertResult {
             err: ErrorCode::CapacityExceeded,
@@ -2103,10 +2104,13 @@ fn single_struct_map_upsert_from_probe(
         );
     }
 
-    if delta_mode {
-        let meta_base = slot_meta_base(out_slot);
-        state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= ChangeFlag::INSERTED;
-    }
+    // Change tracking, not journaling — see single_struct_map_upsert_last.
+    let meta_base = slot_meta_base(out_slot);
+    state[(meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] |= if result.is_new {
+        ChangeFlag::INSERTED
+    } else {
+        ChangeFlag::UPDATED
+    };
     StructUpsertResult {
         err: ErrorCode::Ok,
         pos: result.pos,

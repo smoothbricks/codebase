@@ -1,5 +1,5 @@
 use columine_types::PROGRAM_MAGIC;
-use columine_types::types::{ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset};
+use columine_types::types::{ChangeFlag, ErrorCode, STATE_HEADER_SIZE, SlotMetaOffset};
 use columine_vm::bytes;
 use columine_vm::state_init::{calculate_state_size, init_state};
 use columine_vm::struct_map::StructMapSlot;
@@ -491,4 +491,26 @@ fn block_max_rejects_unmapped_and_non_scalar_comparisons_without_mutation() {
         assert_eq!(before, state);
         assert_eq!(checkpoint, vm.undo_checkpoint());
     }
+}
+
+/// The normal mutation lane stamps struct-map change flags exactly like the
+/// delta lane: the flags are change tracking that a downstream RETE gate reads
+/// after every batch, not a journaling artifact.
+#[test]
+fn plain_batch_struct_map_upsert_stamps_change_flags() {
+    let reduce = upsert(0x80, 0, &[(1, 0)], &[], None);
+    let program = program(2, &[0], &reduce);
+    let mut state = init(&program);
+    let mut vm = Vm::default();
+    let keys = [7u32];
+    let values = [10u32];
+    let cols = [u32s_as_bytes(&keys), u32s_as_bytes(&values)];
+
+    assert_eq!(OK, vm.execute_batch(&mut state, &program, &cols, 1));
+    assert_ne!(change_flags(&state) & ChangeFlag::INSERTED, 0);
+
+    clear_change_flags(&mut state);
+    assert_eq!(OK, vm.execute_batch(&mut state, &program, &cols, 1));
+    assert_ne!(change_flags(&state) & ChangeFlag::UPDATED, 0);
+    assert_eq!(change_flags(&state) & ChangeFlag::INSERTED, 0);
 }
