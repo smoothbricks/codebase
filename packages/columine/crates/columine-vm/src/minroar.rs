@@ -743,7 +743,9 @@ impl MiniRoaring {
         Ok(MiniRoaring { keys, containers })
     }
 }
-fn scan_serialized(data: &[u8], needle: Option<u32>) -> Result<(u32, bool), InvalidFormat> {
+/// Validate every container of a portable image and sum the header
+/// cardinalities. This is the full-image check the in-place readers skip.
+fn scan_serialized(data: &[u8]) -> Result<u32, InvalidFormat> {
     let mut reader = Reader { data, pos: 0 };
     let cookie = reader.u32()?;
     let (container_count, run_flags) = if cookie & 0xFFFF == SERIAL_COOKIE {
@@ -773,15 +775,10 @@ fn scan_serialized(data: &[u8], needle: Option<u32>) -> Result<(u32, bool), Inva
         reader.bytes(container_count.checked_mul(4).ok_or(InvalidFormat)?)?;
     }
 
-    let needle_high = needle.map(|value| (value >> 16) as u16);
-    let needle_low = needle.map(|value| value as u16);
-    let mut contains = false;
     for index in 0..container_count {
         let header = headers_start + index * 4;
-        let key = u16::from_le_bytes([data[header], data[header + 1]]);
         let card = u32::from(u16::from_le_bytes([data[header + 2], data[header + 3]])) + 1;
         let is_run = run_flags.is_some_and(|flags| flags[index / 8] & (1 << (index % 8)) != 0);
-        let targets_container = needle_high == Some(key);
 
         if is_run {
             let run_count = usize::from(reader.u16()?);
@@ -796,13 +793,6 @@ fn scan_serialized(data: &[u8], needle: Option<u32>) -> Result<(u32, bool), Inva
                 {
                     return Err(InvalidFormat);
                 }
-                if targets_container
-                    && needle_low.is_some_and(|low| {
-                        u32::from(low) >= u32::from(start) && u32::from(low) <= end
-                    })
-                {
-                    contains = true;
-                }
                 previous_end = Some(end);
                 total += u32::from(length) + 1;
             }
@@ -816,40 +806,276 @@ fn scan_serialized(data: &[u8], needle: Option<u32>) -> Result<(u32, bool), Inva
                 if previous.is_some_and(|value| value >= low) {
                     return Err(InvalidFormat);
                 }
-                contains |= targets_container && needle_low == Some(low);
                 previous = Some(low);
             }
         } else {
             let raw = reader.bytes(BITSET_SIZE_BYTES)?;
-            let mut actual = 0u32;
-            for (word_index, chunk) in raw.as_chunks::<8>().0.iter().enumerate() {
-                let word = u64::from_le_bytes(*chunk);
-                actual += word.count_ones();
-                if targets_container
-                    && let Some(low) = needle_low
-                    && usize::from(low) / 64 == word_index
-                {
-                    contains |= word & (1u64 << (low % 64)) != 0;
-                }
-            }
+            let actual: u32 = raw
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| u64::from_le_bytes(*chunk).count_ones())
+                .sum();
             if actual != card {
                 return Err(InvalidFormat);
             }
         }
     }
-    Ok((cardinality.min(u64::from(u32::MAX)) as u32, contains))
+    Ok(cardinality.min(u64::from(u32::MAX)) as u32)
 }
 
 impl MiniRoaring {
     /// Validate portable bytes and read cardinality without materializing
     /// containers.
     pub fn len_bytes(data: &[u8]) -> Result<u32, InvalidFormat> {
-        scan_serialized(data, None).map(|(cardinality, _)| cardinality)
+        scan_serialized(data)
     }
 
-    /// Validate portable bytes and probe one value without allocating.
+    /// Probe one value in a portable image in place: the container is found
+    /// by binary search over the key headers and addressed through the offset
+    /// table, so the cost is the container's own lookup, not the image's size.
+    /// Every read is bounds-checked; a truncated image is `InvalidFormat`.
     pub fn contains_bytes(data: &[u8], value: u32) -> Result<bool, InvalidFormat> {
-        scan_serialized(data, Some(value)).map(|(_, contains)| contains)
+        let image = Image::parse(data)?;
+        let Some(index) = image.find_key((value >> 16) as u16) else {
+            return Ok(false);
+        };
+        let low = value as u16;
+        Ok(match image.container(index)? {
+            ContainerView::Array(raw) => raw
+                .as_chunks::<2>()
+                .0
+                .binary_search_by_key(&low, |chunk| u16::from_le_bytes(*chunk))
+                .is_ok(),
+            ContainerView::Bitset(raw) => {
+                let word = usize::from(low) / 64 * 8;
+                let word = u64::from_le_bytes(
+                    raw[word..word + 8]
+                        .try_into()
+                        .expect("bitset words are 8 bytes wide"),
+                );
+                word & (1u64 << (low % 64)) != 0
+            }
+            ContainerView::Run(raw) => raw
+                .as_chunks::<4>()
+                .0
+                .binary_search_by(|chunk| {
+                    let start = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    let len = u16::from_le_bytes([chunk[2], chunk[3]]);
+                    if low < start {
+                        core::cmp::Ordering::Greater
+                    } else if u32::from(low) > u32::from(start) + u32::from(len) {
+                        core::cmp::Ordering::Less
+                    } else {
+                        core::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok(),
+        })
+    }
+
+    /// The `rank`-th smallest value of a portable image, read in place: the
+    /// container is located by summing header cardinalities and the value is
+    /// picked inside it by index, run arithmetic, or word popcount. `None` when
+    /// `rank` is at or past the cardinality.
+    pub fn select_bytes(data: &[u8], rank: u32) -> Result<Option<u32>, InvalidFormat> {
+        let image = Image::parse(data)?;
+        let mut remaining = rank;
+        for index in 0..image.count {
+            let cardinality = image.cardinality(index);
+            if remaining >= cardinality {
+                remaining -= cardinality;
+                continue;
+            }
+            let high = u32::from(image.key(index)) << 16;
+            let low = match image.container(index)? {
+                ContainerView::Array(raw) => raw
+                    .as_chunks::<2>()
+                    .0
+                    .get(remaining as usize)
+                    .map(|chunk| u16::from_le_bytes(*chunk)),
+                ContainerView::Bitset(raw) => {
+                    let mut found = None;
+                    for (word_index, chunk) in raw.as_chunks::<8>().0.iter().enumerate() {
+                        let mut word = u64::from_le_bytes(*chunk);
+                        let ones = word.count_ones();
+                        if remaining >= ones {
+                            remaining -= ones;
+                            continue;
+                        }
+                        for _ in 0..remaining {
+                            word &= word - 1;
+                        }
+                        found = Some((word_index * 64) as u16 + word.trailing_zeros() as u16);
+                        break;
+                    }
+                    found
+                }
+                ContainerView::Run(raw) => {
+                    let mut found = None;
+                    for chunk in raw.as_chunks::<4>().0 {
+                        let start = u16::from_le_bytes([chunk[0], chunk[1]]);
+                        let len = u32::from(u16::from_le_bytes([chunk[2], chunk[3]])) + 1;
+                        if remaining >= len {
+                            remaining -= len;
+                            continue;
+                        }
+                        found = Some(start + remaining as u16);
+                        break;
+                    }
+                    found
+                }
+            };
+            // A header cardinality the container does not back is a malformed
+            // image, not a missing rank.
+            return low
+                .map(|low| Some(high | u32::from(low)))
+                .ok_or(InvalidFormat);
+        }
+        Ok(None)
+    }
+}
+
+/// A portable image addressed in place: the header table located once, then
+/// any container reached by index without materializing the others. The
+/// offset table is the index when the format carries one; the run-cookie
+/// layout omits it below [`NO_OFFSET_THRESHOLD`] containers, and those few are
+/// walked.
+struct Image<'a> {
+    data: &'a [u8],
+    count: usize,
+    run_flags: Option<&'a [u8]>,
+    headers: usize,
+    offsets: Option<usize>,
+    first_container: usize,
+}
+
+enum ContainerView<'a> {
+    /// Sorted little-endian `u16` values.
+    Array(&'a [u8]),
+    /// 1024 little-endian `u64` words.
+    Bitset(&'a [u8]),
+    /// Little-endian `(start, length-1)` pairs, the count already consumed.
+    Run(&'a [u8]),
+}
+
+impl<'a> Image<'a> {
+    fn parse(data: &'a [u8]) -> Result<Self, InvalidFormat> {
+        let mut reader = Reader { data, pos: 0 };
+        let cookie = reader.u32()?;
+        let (count, run_flags) = if cookie & 0xFFFF == SERIAL_COOKIE {
+            let count = ((cookie >> 16) & 0xFFFF) as usize + 1;
+            (count, Some(reader.bytes(count.div_ceil(8))?))
+        } else if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
+            (reader.u32()? as usize, None)
+        } else {
+            return Err(InvalidFormat);
+        };
+        if count > 65536 {
+            return Err(InvalidFormat);
+        }
+        let headers = reader.pos;
+        reader.bytes(count * 4)?;
+        let offsets = if run_flags.is_none() || count >= NO_OFFSET_THRESHOLD {
+            let offsets = reader.pos;
+            reader.bytes(count * 4)?;
+            Some(offsets)
+        } else {
+            None
+        };
+        Ok(Image {
+            data,
+            count,
+            run_flags,
+            headers,
+            offsets,
+            first_container: reader.pos,
+        })
+    }
+
+    fn header_u16(&self, index: usize, at: usize) -> u16 {
+        let pos = self.headers + index * 4 + at;
+        u16::from_le_bytes([self.data[pos], self.data[pos + 1]])
+    }
+
+    fn key(&self, index: usize) -> u16 {
+        self.header_u16(index, 0)
+    }
+
+    fn cardinality(&self, index: usize) -> u32 {
+        u32::from(self.header_u16(index, 2)) + 1
+    }
+
+    fn is_run(&self, index: usize) -> bool {
+        self.run_flags
+            .is_some_and(|flags| flags[index / 8] & (1 << (index % 8)) != 0)
+    }
+
+    /// Index of the container keyed `key`; the header keys are sorted.
+    fn find_key(&self, key: u16) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, self.count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.key(mid).cmp(&key) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    fn container(&self, index: usize) -> Result<ContainerView<'a>, InvalidFormat> {
+        let start = match self.offsets {
+            Some(offsets) => {
+                let pos = offsets + index * 4;
+                u32::from_le_bytes([
+                    self.data[pos],
+                    self.data[pos + 1],
+                    self.data[pos + 2],
+                    self.data[pos + 3],
+                ]) as usize
+            }
+            None => {
+                let mut pos = self.first_container;
+                for earlier in 0..index {
+                    pos = pos
+                        .checked_add(self.container_size(earlier, pos)?)
+                        .ok_or(InvalidFormat)?;
+                }
+                pos
+            }
+        };
+        let mut reader = Reader {
+            data: self.data,
+            pos: start,
+        };
+        let cardinality = self.cardinality(index) as usize;
+        Ok(if self.is_run(index) {
+            let runs = usize::from(reader.u16()?);
+            ContainerView::Run(reader.bytes(runs * 4)?)
+        } else if cardinality <= ARRAY_MAX_CARDINALITY {
+            ContainerView::Array(reader.bytes(cardinality * 2)?)
+        } else {
+            ContainerView::Bitset(reader.bytes(BITSET_SIZE_BYTES)?)
+        })
+    }
+
+    /// Byte size of the container starting at `pos`, for the walk an
+    /// offset-less image needs.
+    fn container_size(&self, index: usize, pos: usize) -> Result<usize, InvalidFormat> {
+        let cardinality = self.cardinality(index) as usize;
+        Ok(if self.is_run(index) {
+            let mut reader = Reader {
+                data: self.data,
+                pos,
+            };
+            2 + usize::from(reader.u16()?) * 4
+        } else if cardinality <= ARRAY_MAX_CARDINALITY {
+            cardinality * 2
+        } else {
+            BITSET_SIZE_BYTES
+        })
     }
 }
 

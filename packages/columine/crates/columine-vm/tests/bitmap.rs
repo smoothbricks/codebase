@@ -1092,6 +1092,69 @@ proptest! {
 }
 
 proptest! {
+    /// The in-place readers agree with the oracle on both portable layouts:
+    /// roaring's image (run cookie when optimized, so one to three run
+    /// containers exercise the offset-less walk and four or more the offset
+    /// table) and minroar's canonical image. Containers straddle the
+    /// array/bitset boundary and every rank of the set is selected.
+    #[test]
+    fn minroar_in_place_probes_match_roaring(
+        sparse in proptest::collection::btree_set(any::<u32>(), 0..200),
+        dense_key in 0u32..3,
+        dense_base in 0u32..1000,
+        dense_len in 0u32..5000,
+        probes in proptest::collection::vec(any::<u32>(), 0..16),
+        optimize in any::<bool>(),
+    ) {
+        let mut oracle = roaring::RoaringBitmap::new();
+        for &e in &sparse { oracle.insert(e); }
+        let dense_base = (dense_key << 16) | dense_base;
+        oracle.insert_range(dense_base..dense_base + dense_len);
+        if optimize { oracle.optimize(); }
+        let mut theirs = Vec::new();
+        oracle.serialize_into(&mut theirs).unwrap();
+        let mut mine_set = columine_vm::minroar::MiniRoaring::new();
+        for e in oracle.iter() { mine_set.insert(e); }
+        mine_set.optimize();
+        let mut mine = Vec::new();
+        mine_set.serialize_into(&mut mine).unwrap();
+
+        let members: Vec<u32> = oracle.iter().collect();
+        for image in [&theirs[..], &mine[..]] {
+            prop_assert_eq!(columine_vm::minroar::MiniRoaring::len_bytes(image).unwrap(), members.len() as u32);
+            for &probe in probes.iter().chain(members.iter()) {
+                prop_assert_eq!(
+                    columine_vm::minroar::MiniRoaring::contains_bytes(image, probe).unwrap(),
+                    oracle.contains(probe),
+                    "contains {}", probe
+                );
+                prop_assert_eq!(
+                    columine_vm::minroar::MiniRoaring::contains_bytes(image, probe.wrapping_add(1)).unwrap(),
+                    oracle.contains(probe.wrapping_add(1))
+                );
+            }
+            for (rank, &expected) in members.iter().enumerate() {
+                prop_assert_eq!(
+                    columine_vm::minroar::MiniRoaring::select_bytes(image, rank as u32).unwrap(),
+                    Some(expected),
+                    "rank {}", rank
+                );
+            }
+            prop_assert_eq!(
+                columine_vm::minroar::MiniRoaring::select_bytes(image, members.len() as u32).unwrap(),
+                None
+            );
+            prop_assert_eq!(columine_vm::minroar::MiniRoaring::select_bytes(image, u32::MAX).unwrap(), None);
+            // A truncated image is refused, never indexed past its end.
+            for cut in [0, 4, 8, image.len() / 2, image.len().saturating_sub(1)] {
+                let _ = columine_vm::minroar::MiniRoaring::contains_bytes(&image[..cut], dense_base);
+                let _ = columine_vm::minroar::MiniRoaring::select_bytes(&image[..cut], 0);
+            }
+        }
+    }
+}
+
+proptest! {
     /// The serialized image is a pure function of the set: a container that
     /// promoted to a bitset and drained, or that was runs and then splintered,
     /// serializes byte for byte as a fresh insert of the surviving values.
