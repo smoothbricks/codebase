@@ -30,9 +30,11 @@
 //! ```
 //!
 //! Rows whose type id is not in the entry's match set keep the zero cell, the
-//! same absent value an unmatched row has on any predicate column. A program
-//! whose content ends with the reduce section carries no table and binds
-//! nothing.
+//! same absent value an unmatched row has on any predicate column. Entries
+//! bind in table order and a later entry reads an earlier entry's column
+//! through [`BatchView::column`], so a derived value can feed a derived
+//! predicate. A program whose content ends with the reduce section carries
+//! no table and binds nothing.
 
 use columine_types::types::{ErrorCode, PROGRAM_HASH_PREFIX, ProgramHeader};
 
@@ -44,26 +46,45 @@ pub const ROW_EXPRESSIONS_MAGIC: u32 = 0x3150_5852;
 
 const TABLE_HEADER_BYTES: usize = 4 + 2 + 1;
 
-/// One row of the batch as an expression sees it: the live state, the
-/// batch's columns as the host passed them, and the row index.
-pub struct RowContext<'a> {
+/// The batch as one entry sees it: the live state, the host's columns, and
+/// the derived columns the entries before it already bound.
+pub struct BatchView<'a> {
     pub state: &'a [u8],
-    pub cols: &'a [&'a [u8]],
     pub batch_len: u32,
-    pub row: u32,
+    cols: &'a [&'a [u8]],
+    /// Target column of each earlier entry, parallel to `derived`.
+    derived_targets: &'a [u8],
+    derived: &'a [Vec<u32>],
+}
+
+impl<'a> BatchView<'a> {
+    /// Column `col` as this entry reads it: an earlier entry's derived cells
+    /// when one targets `col`, else the host's column (empty past the
+    /// host's count, like [`col_at`]).
+    pub fn column(&self, col: u8) -> &'a [u8] {
+        match self.derived_targets.iter().position(|&t| t == col) {
+            Some(i) => u32s_as_bytes(&self.derived[i]),
+            None => col_at(self.cols, usize::from(col)),
+        }
+    }
+
+    /// Number of columns the host passed.
+    pub fn num_cols(&self) -> usize {
+        self.cols.len()
+    }
 }
 
 /// The embedder's expression evaluator.
 pub trait RowExpression {
-    /// Validate one entry's expression against the batch shape before any
-    /// row is evaluated: every column it reads must cover `batch_len`, so
-    /// per-row evaluation is infallible on that axis. A malformed expression
-    /// is `InvalidProgram`; a short column is `ColumnUnderrun`.
-    fn admit(&mut self, expr: &[u8], cols: &[&[u8]], batch_len: u32) -> Result<(), ErrorCode>;
+    /// Validate one entry's expression against the batch before any row is
+    /// evaluated: every column it reads must cover `batch_len`, so per-row
+    /// evaluation is infallible on that axis. A malformed expression is
+    /// `InvalidProgram`; a short column is `ColumnUnderrun`.
+    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<(), ErrorCode>;
 
     /// Evaluate the expression for one row and answer the u32 cell to store.
     /// A value the cell cannot hold is `InvalidCellValue`.
-    fn eval(&mut self, expr: &[u8], ctx: &RowContext<'_>) -> Result<u32, ErrorCode>;
+    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode>;
 }
 
 /// Storage for the derived columns of one batch. Owned by the embedder's
@@ -72,11 +93,15 @@ pub trait RowExpression {
 #[derive(Debug, Default)]
 pub struct RowColumns {
     cells: Vec<Vec<u32>>,
+    targets: Vec<u8>,
 }
 
 impl RowColumns {
     pub const fn new() -> Self {
-        Self { cells: Vec::new() }
+        Self {
+            cells: Vec::new(),
+            targets: Vec::new(),
+        }
     }
 
     /// The derived column bound at table position `entry`, for tests and
@@ -160,10 +185,10 @@ fn parse_entry<'a>(table: &'a [u8], pos: &mut usize) -> Result<Entry<'a>, ErrorC
 }
 
 /// Evaluate `program`'s row-expression table over the batch and replace each
-/// target column in `cols` with its derived cells. Every entry reads the
-/// batch as the host passed it — a derived column is not an input of another
-/// entry — so the table's order carries no meaning. `out` holds the cells
-/// for as long as `cols` names them.
+/// target column in `cols` with its derived cells. Entries bind in table
+/// order; a later entry reads an earlier one's column through
+/// [`BatchView::column`]. `out` holds the cells for as long as `cols` names
+/// them.
 ///
 /// Errors leave `cols` untouched: the table is validated and every cell
 /// computed before the first splice.
@@ -189,34 +214,40 @@ pub fn bind_row_columns<'a, E: RowExpression>(
         return Err(ErrorCode::InvalidProgram);
     }
     out.cells.resize_with(count, Vec::new);
+    out.targets.resize(count, 0);
 
     let view: &[&[u8]] = cols;
     let type_cells =
         col_u32_exact(col_at(view, type_col), batch_len).ok_or(ErrorCode::ColumnUnderrun)?;
     let mut pos = TABLE_HEADER_BYTES;
-    for cells in out.cells.iter_mut().take(count) {
+    for i in 0..count {
         let entry = parse_entry(table, &mut pos)?;
         if usize::from(entry.target_col) >= view.len() {
             return Err(ErrorCode::InvalidProgram);
         }
-        eval.admit(entry.expr, view, batch_len)?;
+        out.targets[i] = entry.target_col;
+        // The entries before `i` are final; this entry reads them and writes
+        // only its own cells.
+        let (done, rest) = out.cells.split_at_mut(i);
+        let batch = BatchView {
+            state,
+            batch_len,
+            cols: view,
+            derived_targets: &out.targets[..i],
+            derived: done,
+        };
+        eval.admit(entry.expr, &batch)?;
+        let cells = &mut rest[0];
         cells.clear();
         cells.resize(batch_len as usize, 0);
         for (row, cell) in cells.iter_mut().enumerate() {
             if !entry.matches(type_cells[row]) {
                 continue;
             }
-            *cell = eval.eval(
-                entry.expr,
-                &RowContext {
-                    state,
-                    cols: view,
-                    batch_len,
-                    // `row < batch_len`, which is a u32.
-                    #[allow(clippy::cast_possible_truncation)]
-                    row: row as u32,
-                },
-            )?;
+            // `row < batch_len`, which is a u32.
+            #[allow(clippy::cast_possible_truncation)]
+            let row = row as u32;
+            *cell = eval.eval(entry.expr, &batch, row)?;
         }
     }
     if pos != table.len() {

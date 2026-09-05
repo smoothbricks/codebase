@@ -6,7 +6,7 @@ use columine_types::PROGRAM_MAGIC;
 use columine_types::types::{EMPTY_KEY, ErrorCode};
 use columine_vm::meta::SlotMetaView;
 use columine_vm::row_exprs::{
-    ROW_EXPRESSIONS_MAGIC, RowColumns, RowContext, RowExpression, bind_row_columns,
+    BatchView, ROW_EXPRESSIONS_MAGIC, RowColumns, RowExpression, bind_row_columns,
 };
 use columine_vm::state_init::{DEFAULT_ACCEPTED_PROGRAM_MAGICS, calculate_state_size, init_state};
 use columine_vm::vm::{Vm, col_u32_exact, u32s_as_bytes, vm_map_get};
@@ -78,25 +78,25 @@ struct Threshold {
 }
 
 impl RowExpression for Threshold {
-    fn admit(&mut self, expr: &[u8], cols: &[&[u8]], batch_len: u32) -> Result<(), ErrorCode> {
+    fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<(), ErrorCode> {
         self.admitted += 1;
         if expr.len() != 5 {
             return Err(ErrorCode::InvalidProgram);
         }
-        let col = cols
-            .get(usize::from(expr[0]))
-            .ok_or(ErrorCode::InvalidProgram)?;
-        col_u32_exact(col, batch_len)
+        if usize::from(expr[0]) >= batch.num_cols() {
+            return Err(ErrorCode::InvalidProgram);
+        }
+        col_u32_exact(batch.column(expr[0]), batch.batch_len)
             .map(|_| ())
             .ok_or(ErrorCode::ColumnUnderrun)
     }
 
-    fn eval(&mut self, expr: &[u8], ctx: &RowContext<'_>) -> Result<u32, ErrorCode> {
+    fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
         self.evaluated += 1;
-        let cells = col_u32_exact(ctx.cols[usize::from(expr[0])], ctx.batch_len)
-            .expect("admit proved coverage");
+        let cells =
+            col_u32_exact(batch.column(expr[0]), batch.batch_len).expect("admit proved coverage");
         let threshold = u32::from_le_bytes([expr[1], expr[2], expr[3], expr[4]]);
-        Ok(u32::from(cells[ctx.row as usize] > threshold))
+        Ok(u32::from(cells[row as usize] > threshold))
     }
 }
 
@@ -307,6 +307,42 @@ fn trailing_bytes_after_the_last_entry_are_refused() {
         bind_err(&prog, &mut cols, 1, &mut rows),
         ErrorCode::InvalidProgram
     );
+}
+
+#[test]
+fn a_later_entry_reads_an_earlier_entry_s_derived_column() {
+    // Columns: 0 type, 1 key, 2 value, 3 derived (value > 100), 4 derived
+    // (column 3 > 0) — the second entry reads the first's cells, not the
+    // host's empty placeholder.
+    let init_code = [0x10u8, 0, 0x00, 8, 0, 0];
+    let reduce = [0u8];
+    let trailer = table(
+        TYPE_COL,
+        &[
+            entry(3, &[ORDER_TYPE], &threshold_expr(VAL_COL, 100)),
+            entry(4, &[ORDER_TYPE], &threshold_expr(3, 0)),
+        ],
+    );
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, 1, 5, 0, 0]);
+    prog.extend((init_code.len() as u16).to_le_bytes());
+    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend(init_code);
+    prog.extend(reduce);
+    prog.extend_from_slice(&trailer);
+    let state = init(&prog);
+    let types = [ORDER_TYPE, ORDER_TYPE];
+    let vals = [50u32, 150];
+    let mut cols: Vec<&[u8]> = vec![u32s_as_bytes(&types), &[], u32s_as_bytes(&vals), &[], &[]];
+    let mut rows = RowColumns::new();
+    let mut eval = Threshold {
+        admitted: 0,
+        evaluated: 0,
+    };
+    bind_row_columns(&prog, &state, &mut cols, 2, &mut eval, &mut rows).expect("bind");
+    assert_eq!(cols[3], u32s_as_bytes(&[0u32, 1]));
+    assert_eq!(cols[4], u32s_as_bytes(&[0u32, 1]));
 }
 
 #[test]
