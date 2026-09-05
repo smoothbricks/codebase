@@ -4,7 +4,7 @@
 //! memory; `tests/export_checklist.rs` holds both the artifact and the
 //! TypeScript host's bindings to that one table, so the count lives in exactly
 //! one place. Every export here is reachable from the published
-//! `@smoothbricks/columine` host; container iteration and the roaring-bitmap
+//! `@smoothbricks/columine` host; container iteration and the bitmap
 //! entry points were removed because nothing bound them, and an export no
 //! caller can reach is surface that only has to be kept working.
 //!

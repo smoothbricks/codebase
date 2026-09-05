@@ -19,6 +19,11 @@ columine-vm = { path = "packages/columine/crates/columine-vm" }
 cowshed-core = { path = "packages/cowshed/crates/cowshed-core" }
 lmao-core = { path = "packages/lmao/crates/lmao-core" }
 lmao-arena = { path = "packages/lmao/crates/lmao-arena" }
+# axroar: the ladder-selected compressed bitmap whose AXR1 string is the
+# BITMAP slot codec. An absolute path until the crate is published: cargo
+# resolves a relative path against the manifest's own (uncanonicalized)
+# location, and consumers reach this workspace through a symlink.
+axroar = { path = "/Users/danny/Dev/_fork/minigraf/axroar" }
 arrow-array = { version = "56", default-features = false }
 arrow-buffer = { version = "56", default-features = false }
 arrow-ipc = { version = "56", default-features = false }
@@ -29,7 +34,6 @@ napi = { version = "2", default-features = false, features = ["napi6", "tokio_rt
 napi-build = "2"
 napi-derive = "2"
 proptest = "1"
-roaring = { version = "0.11", default-features = false, features = ["std"] }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

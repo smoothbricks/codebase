@@ -324,8 +324,8 @@ mod tests {
             let alloc = slot_data_size(SlotType::Bitmap, cap, false, 0);
             // alloc == serialized_len u32 + full reader-visible payload
             assert_eq!(alloc, BITMAP_SERIALIZED_LEN_BYTES + reader_capacity);
-            // canonical formula shape: cap*8 + 256
-            assert_eq!(reader_capacity, cap * 8 + 256);
+            // canonical formula shape: cap*4 + 256
+            assert_eq!(reader_capacity, cap * 4 + 256);
         }
     }
 }

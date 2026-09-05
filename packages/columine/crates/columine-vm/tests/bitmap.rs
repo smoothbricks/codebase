@@ -1,15 +1,18 @@
-//! Coverage for bitmap storage, Portable Roaring serialization, mutation,
-//! algebra, boundary-capacity, and property tests.
+//! Coverage for the BITMAP slot: AXR1 storage, in-place patch mutation,
+//! algebra, capacity refusals, and the differential oracle — a `BTreeSet`
+//! model against the slot bytes, with the slot image required to be
+//! byte-equal to a fresh forest freeze of the surviving set.
 
+use axroar::{Axroar, AxroarView};
 use columine_vm::bitmap_ops::{
     BitmapAlgebraOp, BitmapEnv, BitmapSource, BitmapStorage, batch_bitmap_add,
-    batch_bitmap_algebra, batch_bitmap_remove, bitmap_load, bitmap_payload_capacity, bitmap_select,
-    bitmap_store, cardinality_serialized, contains_serialized, extract_serialized,
-    get_bitmap_storage, intersect_count_serialized, intersects_serialized, set_algebra,
+    batch_bitmap_algebra, batch_bitmap_remove, bitmap_import, bitmap_patch,
+    bitmap_payload_capacity, bitmap_select, cardinality_serialized, cardinality_validated,
+    contains_serialized, extract_serialized, get_bitmap_storage, intersect_count_serialized,
+    intersects_serialized, set_algebra,
 };
 use columine_vm::hooks::{MutationRecord, NoVm, VmHooks};
 use columine_vm::meta::SlotMetaView;
-use columine_vm::minroar::MiniRoaring as RoaringBitmap;
 use columine_vm::state_init::{
     DEFAULT_ACCEPTED_PROGRAM_MAGICS, EVICTION_ENTRY_SIZE, calculate_state_size, init_state,
 };
@@ -73,8 +76,8 @@ impl VmHooks for RecordingHooks {
     }
 }
 
-///  `makeStorage` — a storage view over a local buffer:
-/// `[serialized_len u32][payload…]` at offset 0.
+/// A storage view over a local buffer: `[serialized_len u32][pad][payload…]`
+/// at offset 0.
 fn make_storage(buf_len: u32) -> BitmapStorage {
     BitmapStorage {
         data_offset: 0,
@@ -82,8 +85,8 @@ fn make_storage(buf_len: u32) -> BitmapStorage {
     }
 }
 
-///  `initBitmapSlotState` — minimal state with one BITMAP
-/// slot: `[STATE_HEADER (32)][SLOT_META (48)][bitmap data …]`.
+/// Minimal state with one BITMAP slot:
+/// `[STATE_HEADER (32)][SLOT_META (48)][bitmap data …]`.
 fn init_bitmap_slot_state(state: &mut [u8], capacity: u32) -> SlotMetaView {
     state.fill(0);
     let hdr = STATE_MAGIC.to_le_bytes();
@@ -162,9 +165,9 @@ fn init_program_state(prog: &[u8]) -> Vec<u8> {
     state
 }
 
-/// One element per 16-bit container. minroar promotes arrays to bitsets at 4096
-/// entries and never demotes, so keeping every container at cardinality one is
-/// what makes a byte-level payload comparison meaningful instead of flaky.
+/// One element per 16-bit chunk: every chunk pays its directory record and
+/// an 8-byte payload footprint, which is what makes a batch of them the
+/// cheapest way to exhaust a payload while staying under the element cap.
 fn sparse_key(high: u16) -> u32 {
     u32::from(high) << 16
 }
@@ -175,121 +178,121 @@ fn sparse_ts(key: u32) -> f64 {
     f64::from(key >> 16)
 }
 
-// ---------------------------------------------------------------------------
-// 1. Empty bitmap load ()
-// ---------------------------------------------------------------------------
-#[test]
-fn bitmap_load_empty_returns_cardinality_0() {
-    let mut env = BitmapEnv::default();
-    let buf = vec![0u8; 4096];
-    let storage = make_storage(4096);
-    let loaded = bitmap_load(&mut env, &buf, storage).expect("empty load");
-    assert_eq!(loaded.len(), 0);
+/// The forest string of a set — the form the slot keeps — or zero bytes for
+/// the empty set, which is the VM's only empty form.
+fn serialize(elems: &[u32]) -> Vec<u8> {
+    let sorted: BTreeSet<u32> = elems.iter().copied().collect();
+    if sorted.is_empty() {
+        return Vec::new();
+    }
+    Axroar::from_sorted(sorted).to_forest_bytes()
 }
 
-// ---------------------------------------------------------------------------
-// 2. Serialize round-trip, 10 elements ()
-// ---------------------------------------------------------------------------
-#[test]
-fn store_load_round_trip_preserves_10_elements() {
-    let mut env = BitmapEnv::default();
-    let mut buf = vec![0u8; 8192];
-    let storage = make_storage(8192);
-
-    let mut bmp = bitmap_load(&mut env, &buf, storage).unwrap();
-    let elems = [5u32, 10, 15, 20, 25, 30, 35, 40, 45, 50];
-    for &e in &elems {
-        bmp.insert(e);
+/// The slot's members, read through the zero-copy view.
+fn members(state: &[u8], storage: BitmapStorage) -> Vec<u32> {
+    match storage.serialized_data(state) {
+        None => Vec::new(),
+        Some(data) => AxroarView::open(data)
+            .expect("slot holds a well-formed AXR1 string")
+            .range()
+            .collect(),
     }
+}
+
+/// The slot invariant: the payload holds the forest string of exactly `expected`
+/// at its head, the length field agrees, and every byte past the string is
+/// zero — so the image is a pure function of the set.
+fn assert_slot_is_canonical(state: &[u8], storage: BitmapStorage, expected: &BTreeSet<u32>) {
+    let payload = storage.payload_offset() as usize;
+    let capacity = storage.payload_capacity as usize;
+    let len = storage.serialized_len(state) as usize;
+    let fresh = if expected.is_empty() {
+        Vec::new()
+    } else {
+        Axroar::from_sorted(expected.iter().copied()).to_forest_bytes()
+    };
     assert_eq!(
-        bitmap_store(&mut env, &mut buf, storage, &mut bmp),
-        ErrorCode::Ok
+        len,
+        fresh.len(),
+        "serialized_len is the fresh forest length"
     );
-
-    let reloaded = bitmap_load(&mut env, &buf, storage).unwrap();
-    assert_eq!(reloaded.len(), 10);
-    for &e in &elems {
-        assert!(reloaded.contains(e));
-    }
-    assert!(!reloaded.contains(99));
-}
-
-// ---------------------------------------------------------------------------
-// 3. Large bitmap, 500 elements ()
-// ---------------------------------------------------------------------------
-#[test]
-fn store_load_500_elements_round_trip() {
-    let mut env = BitmapEnv::default();
-    let mut buf = vec![0u8; 65536];
-    let storage = make_storage(65536);
-
-    let mut bmp = bitmap_load(&mut env, &buf, storage).unwrap();
-    for i in 1..=500u32 {
-        bmp.insert(i);
-    }
     assert_eq!(
-        bitmap_store(&mut env, &mut buf, storage, &mut bmp),
-        ErrorCode::Ok
+        &state[payload..payload + len],
+        &fresh[..],
+        "slot image is the fresh forest"
     );
-
-    let reloaded = bitmap_load(&mut env, &buf, storage).unwrap();
-    assert_eq!(reloaded.len(), 500);
-    assert!(reloaded.contains(1));
-    assert!(reloaded.contains(250));
-    assert!(reloaded.contains(500));
-    assert!(!reloaded.contains(0));
-    assert!(!reloaded.contains(501));
+    assert!(
+        state[payload + len..payload + capacity]
+            .iter()
+            .all(|&b| b == 0),
+        "payload past the string is zero"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// 4-5. serialized_data on empty payloads and iteration over stored elements;
-// `serialized_data` plus deserialization is the query path under test.
+// Storage basics
 // ---------------------------------------------------------------------------
+
 #[test]
-fn serialized_data_none_when_empty() {
+fn empty_slot_reads_as_the_empty_set() {
     let buf = vec![0u8; 4096];
     let storage = make_storage(4096);
     assert!(storage.serialized_data(&buf).is_none());
+    assert!(storage.view(&buf).expect("empty is well-formed").is_none());
+    assert_eq!(bitmap_select(&buf, storage, 0), None);
 }
 
 #[test]
-fn serialized_data_iterates_stored_elements() {
+fn patch_round_trip_preserves_elements() {
     let mut env = BitmapEnv::default();
     let mut buf = vec![0u8; 8192];
     let storage = make_storage(8192);
 
-    let mut bmp = RoaringBitmap::new();
-    bmp.insert(7);
-    bmp.insert(42);
-    bmp.insert(100);
-    assert_eq!(
-        bitmap_store(&mut env, &mut buf, storage, &mut bmp),
-        ErrorCode::Ok
-    );
-
-    let data = storage.serialized_data(&buf).expect("non-empty");
-    let reloaded = RoaringBitmap::deserialize_from(data).unwrap();
-    let collected: Vec<u32> = reloaded.iter().collect();
-    assert_eq!(collected, vec![7, 42, 100]);
+    let elems = [5u32, 10, 15, 20, 25, 30, 35, 40, 45, 50];
+    let report = bitmap_patch(&mut env, &mut buf, storage, &elems, &[]).expect("patch");
+    assert_eq!(report.added, 10);
+    assert_eq!(report.len, 10);
+    let view = storage.view(&buf).expect("well-formed").expect("non-empty");
+    assert_eq!(view.len(), 10);
+    for &e in &elems {
+        assert!(view.contains(e));
+    }
+    assert!(!view.contains(99));
+    assert_slot_is_canonical(&buf, storage, &elems.iter().copied().collect());
 }
 
-// ---------------------------------------------------------------------------
-// 6. bitmap_select ()
-// ---------------------------------------------------------------------------
+#[test]
+fn patch_500_elements_round_trip() {
+    let mut env = BitmapEnv::default();
+    let mut buf = vec![0u8; 65536];
+    let storage = make_storage(65536);
+    let elems: Vec<u32> = (1..=500).collect();
+    bitmap_patch(&mut env, &mut buf, storage, &elems, &[]).expect("patch");
+    assert_eq!(members(&buf, storage), elems);
+}
+
+#[test]
+fn removing_the_last_member_restores_the_empty_form() {
+    let mut env = BitmapEnv::default();
+    let mut buf = vec![0u8; 8192];
+    let storage = make_storage(8192);
+    bitmap_patch(&mut env, &mut buf, storage, &[7, 42], &[]).expect("patch");
+    let report = bitmap_patch(&mut env, &mut buf, storage, &[], &[7, 42]).expect("patch");
+    assert_eq!(report.removed, 2);
+    assert_eq!(report.len, 0);
+    assert_eq!(storage.serialized_len(&buf), 0);
+    assert!(
+        buf.iter().all(|&b| b == 0),
+        "the empty set is all zero bytes"
+    );
+}
+
 #[test]
 fn bitmap_select_returns_element_at_rank() {
     let mut env = BitmapEnv::default();
     let mut buf = vec![0u8; 8192];
     let storage = make_storage(8192);
-
-    let mut bmp = RoaringBitmap::new();
-    for e in [10u32, 20, 30, 40, 50] {
-        bmp.insert(e);
-    }
-    assert_eq!(
-        bitmap_store(&mut env, &mut buf, storage, &mut bmp),
-        ErrorCode::Ok
-    );
+    bitmap_patch(&mut env, &mut buf, storage, &[10, 20, 30, 40, 50], &[]).expect("patch");
 
     assert_eq!(bitmap_select(&buf, storage, 0), Some(10));
     assert_eq!(bitmap_select(&buf, storage, 2), Some(30));
@@ -297,9 +300,6 @@ fn bitmap_select_returns_element_at_rank() {
     assert_eq!(bitmap_select(&buf, storage, 5), None);
 }
 
-// ---------------------------------------------------------------------------
-// 7. payload-capacity formula ()
-// ---------------------------------------------------------------------------
 #[test]
 fn bitmap_payload_capacity_formula() {
     assert_eq!(bitmap_payload_capacity(0), BITMAP_BASE_BYTES);
@@ -317,9 +317,6 @@ fn bitmap_payload_capacity_formula() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8. get_bitmap_storage layout ()
-// ---------------------------------------------------------------------------
 #[test]
 fn get_bitmap_storage_returns_correct_offsets_and_capacity() {
     let mut state = vec![0u8; 8192];
@@ -333,12 +330,18 @@ fn get_bitmap_storage_returns_correct_offsets_and_capacity() {
         storage.payload_offset(),
         slot_data_offset + BITMAP_SERIALIZED_LEN_BYTES
     );
+    assert_eq!(
+        storage.payload_offset() % 8,
+        0,
+        "the AXR1 payload starts on an 8-byte boundary"
+    );
     assert_eq!(storage.payload_capacity, bitmap_payload_capacity(capacity));
 }
 
 // ---------------------------------------------------------------------------
-// 9. batch add — 5 elements ()
+// Batch mutation
 // ---------------------------------------------------------------------------
+
 #[test]
 fn batch_bitmap_add_inserts_5_elements() {
     let mut env = BitmapEnv::default();
@@ -352,18 +355,9 @@ fn batch_bitmap_add_inserts_5_elements() {
     );
     assert_eq!(result, ErrorCode::Ok);
     assert_eq!(meta.size(&state), 5);
-
-    let data = storage.serialized_data(&state).expect("stored");
-    let bm = RoaringBitmap::deserialize_from(data).unwrap();
-    assert_eq!(bm.len(), 5);
-    assert!(bm.contains(100));
-    assert!(bm.contains(300));
-    assert!(bm.contains(500));
+    assert_eq!(members(&state, storage), elems);
 }
 
-// ---------------------------------------------------------------------------
-// 10. batch add — dedup ()
-// ---------------------------------------------------------------------------
 #[test]
 fn batch_bitmap_add_dedups_same_element() {
     let mut env = BitmapEnv::default();
@@ -378,9 +372,23 @@ fn batch_bitmap_add_dedups_same_element() {
     assert_eq!(meta.size(&state), 1);
 }
 
-// ---------------------------------------------------------------------------
-// 11. batch remove ()
-// ---------------------------------------------------------------------------
+#[test]
+fn batch_bitmap_add_accepts_unsorted_input() {
+    let mut env = BitmapEnv::default();
+    let mut state = vec![0u8; 65536];
+    let meta = init_bitmap_slot_state(&mut state, 128);
+    let storage = get_bitmap_storage(&meta);
+    let elems = [500u32, 3, 70_000, 3, 12];
+    assert_eq!(
+        batch_bitmap_add(
+            &mut env, &mut NoVm, false, &mut state, &meta, 0, &elems, None
+        ),
+        ErrorCode::Ok
+    );
+    assert_eq!(members(&state, storage), [3, 12, 500, 70_000]);
+    assert_eq!(meta.size(&state), 4);
+}
+
 #[test]
 fn batch_bitmap_remove_removes_elements_correctly() {
     let mut env = BitmapEnv::default();
@@ -392,34 +400,16 @@ fn batch_bitmap_remove_removes_elements_correctly() {
     batch_bitmap_add(&mut env, &mut NoVm, false, &mut state, &meta, 0, &add, None);
     assert_eq!(meta.size(&state), 5);
 
-    let rm = [20u32, 40];
+    let rm = [40u32, 20, 20, 99];
     batch_bitmap_remove(&mut env, &mut NoVm, false, &mut state, &meta, 0, &rm);
     assert_eq!(meta.size(&state), 3);
-
-    let data = storage.serialized_data(&state).expect("stored");
-    let bm = RoaringBitmap::deserialize_from(data).unwrap();
-    assert!(bm.contains(10));
-    assert!(!bm.contains(20));
-    assert!(bm.contains(30));
-    assert!(!bm.contains(40));
-    assert!(bm.contains(50));
+    assert_eq!(members(&state, storage), [10, 30, 50]);
 }
 
 // ---------------------------------------------------------------------------
-// 12-15. Set algebra AND/OR/ANDNOT/XOR, exercised through `set_algebra` over
+// Set algebra AND/OR/ANDNOT/XOR, exercised through `set_algebra` over
 // serialized inputs.
 // ---------------------------------------------------------------------------
-
-fn serialize(elems: &[u32]) -> Vec<u8> {
-    let mut bm = RoaringBitmap::new();
-    for &e in elems {
-        bm.insert(e);
-    }
-    bm.optimize();
-    let mut out = Vec::new();
-    bm.serialize_into(&mut out).unwrap();
-    out
-}
 
 fn algebra_elems(op: BitmapAlgebraOp, a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut env = BitmapEnv::default();
@@ -430,9 +420,9 @@ fn algebra_elems(op: BitmapAlgebraOp, a: &[u32], b: &[u32]) -> Vec<u32> {
     if env.algebra_result().is_empty() {
         return vec![];
     }
-    RoaringBitmap::deserialize_from(env.algebra_result())
-        .unwrap()
-        .iter()
+    AxroarView::open(env.algebra_result())
+        .expect("algebra result is a well-formed string")
+        .range()
         .collect()
 }
 
@@ -460,9 +450,35 @@ fn set_algebra_xor_symmetric_difference() {
     assert_eq!(r, vec![1, 2, 6, 7]);
 }
 
+#[test]
+fn set_algebra_empty_result_is_zero_bytes() {
+    assert!(algebra_elems(BitmapAlgebraOp::And, &[1, 2], &[3, 4]).is_empty());
+    assert!(algebra_elems(BitmapAlgebraOp::Xor, &[1, 2], &[1, 2]).is_empty());
+}
+
+#[test]
+fn set_algebra_result_is_the_forest_form() {
+    let mut env = BitmapEnv::default();
+    let a: Vec<u32> = (0..2000).map(|i| i * 7).collect();
+    let b: Vec<u32> = (0..2000).map(|i| i * 11).collect();
+    assert_eq!(
+        set_algebra(
+            &mut env,
+            BitmapAlgebraOp::Or,
+            &serialize(&a),
+            &serialize(&b)
+        ),
+        ErrorCode::Ok
+    );
+    let expected: BTreeSet<u32> = a.iter().chain(b.iter()).copied().collect();
+    assert_eq!(
+        env.algebra_result(),
+        &Axroar::from_sorted(expected).to_forest_bytes()[..]
+    );
+}
+
 // ---------------------------------------------------------------------------
-// Additional coverage: batch-add capacity refusal, slot-level algebra,
-// serialized queries, format fixtures, and property tests.
+// Capacity refusals, slot-level algebra, serialized queries, import.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -471,20 +487,58 @@ fn batch_bitmap_add_capacity_exceeded_flushes_partial_batch() {
     let mut env = BitmapEnv::default();
     let mut state = vec![0u8; 65536];
     let meta = init_bitmap_slot_state(&mut state, 2); // capacity 2
-    let elems = [1u32, 2, 3];
+    let elems = [3u32, 1, 2];
     let result = batch_bitmap_add(
         &mut env, &mut NoVm, false, &mut state, &meta, 0, &elems, None,
     );
     assert_eq!(result, ErrorCode::CapacityExceeded);
     assert_eq!(meta.size(&state), 2);
     let storage = get_bitmap_storage(&meta);
-    let bm = RoaringBitmap::deserialize_from(storage.serialized_data(&state).unwrap()).unwrap();
-    assert!(bm.contains(1) && bm.contains(2) && !bm.contains(3));
+    assert_eq!(members(&state, storage), [1, 3], "the batch's earliest two");
+}
+
+#[test]
+fn payload_capacity_refusal_leaves_the_slot_untouched() {
+    let mut env = BitmapEnv::default();
+    let mut state = vec![0u8; 65536];
+    // Element cap 64, payload 64*4+256 = 512 bytes: 60 one-per-chunk members
+    // need 60 directory records and 60 payload footprints.
+    let meta = init_bitmap_slot_state(&mut state, 64);
+    let storage = get_bitmap_storage(&meta);
+    let seed = [sparse_key(1), sparse_key(2)];
+    assert_eq!(
+        batch_bitmap_add(
+            &mut env, &mut NoVm, false, &mut state, &meta, 0, &seed, None
+        ),
+        ErrorCode::Ok
+    );
+    let before = state.clone();
+    let flood: Vec<u32> = (3u16..63).map(sparse_key).collect();
+    assert_eq!(
+        batch_bitmap_add(
+            &mut env, &mut NoVm, false, &mut state, &meta, 0, &flood, None
+        ),
+        ErrorCode::CapacityExceeded
+    );
+    assert_eq!(env.last_error, 60);
+    assert_eq!(state, before);
+    assert_eq!(members(&state, storage), seed);
+
+    // The empty slot refuses the same way and stays all-zero.
+    let mut fresh = vec![0u8; 65536];
+    let meta = init_bitmap_slot_state(&mut fresh, 64);
+    let before = fresh.clone();
+    assert_eq!(
+        batch_bitmap_add(
+            &mut env, &mut NoVm, false, &mut fresh, &meta, 0, &flood, None
+        ),
+        ErrorCode::CapacityExceeded
+    );
+    assert_eq!(fresh, before);
 }
 
 #[test]
 fn batch_bitmap_add_skips_sentinel_keys() {
-    // EMPTY_KEY / TOMBSTONE elements are skipped ().
     let mut env = BitmapEnv::default();
     let mut state = vec![0u8; 65536];
     let meta = init_bitmap_slot_state(&mut state, 128);
@@ -498,7 +552,6 @@ fn batch_bitmap_add_skips_sentinel_keys() {
 
 #[test]
 fn slot_algebra_and_with_empty_clears_target() {
-    //  empty-source identities.
     let mut env = BitmapEnv::default();
     let mut state = vec![0u8; 65536];
     let meta = init_bitmap_slot_state(&mut state, 128);
@@ -518,6 +571,7 @@ fn slot_algebra_and_with_empty_clears_target() {
     assert_eq!(meta.size(&state), 0);
     let storage = get_bitmap_storage(&meta);
     assert!(storage.serialized_data(&state).is_none());
+    assert_slot_is_canonical(&state, storage, &BTreeSet::new());
 
     // OR with empty = no change.
     batch_bitmap_add(&mut env, &mut NoVm, false, &mut state, &meta, 0, &add, None);
@@ -560,6 +614,45 @@ fn slot_algebra_in_place_or() {
     );
     assert_eq!(r, ErrorCode::Ok);
     assert_eq!(meta.size(&state), 5);
+    let storage = get_bitmap_storage(&meta);
+    assert_eq!(members(&state, storage), [1, 2, 3, 4, 5]);
+    assert_slot_is_canonical(&state, storage, &(1..=5).collect());
+}
+
+#[test]
+fn slot_algebra_scratch_operand_reads_the_previous_result() {
+    let mut env = BitmapEnv::default();
+    let mut state = vec![0u8; 65536];
+    let meta = init_bitmap_slot_state(&mut state, 128);
+    batch_bitmap_add(
+        &mut env,
+        &mut NoVm,
+        false,
+        &mut state,
+        &meta,
+        0,
+        &[1, 2, 3, 4],
+        None,
+    );
+    assert_eq!(
+        set_algebra(
+            &mut env,
+            BitmapAlgebraOp::Or,
+            &serialize(&[2]),
+            &serialize(&[4, 9])
+        ),
+        ErrorCode::Ok
+    );
+    let r = batch_bitmap_algebra(
+        &mut env,
+        &mut NoVm,
+        BitmapAlgebraOp::AndNot,
+        &mut state,
+        &meta,
+        BitmapSource::Scratch,
+    );
+    assert_eq!(r, ErrorCode::Ok);
+    assert_eq!(members(&state, get_bitmap_storage(&meta)), [1, 3]);
 }
 
 #[test]
@@ -572,6 +665,10 @@ fn serialized_queries() {
     assert!(!contains_serialized(&[], 1));
     assert_eq!(cardinality_serialized(&a), 4);
     assert_eq!(cardinality_serialized(&[]), 0);
+    assert_eq!(cardinality_validated(&a), Some(4));
+    assert_eq!(cardinality_validated(&[]), Some(0));
+    assert_eq!(cardinality_validated(&a[..a.len() - 1]), None);
+    assert_eq!(cardinality_validated(b"not an AXR1 string at all"), None);
     assert!(intersects_serialized(&a, &b));
     assert!(!intersects_serialized(&a, &c));
     assert_eq!(intersect_count_serialized(&a, &b), 1);
@@ -609,26 +706,68 @@ fn set_algebra_empty_identities_copy_survivor() {
     assert!(env.algebra_result().is_empty());
 }
 
-/// Portable Roaring read-compat fixture, hand-derived from the public spec:
-/// cookie 12346, one array container, key 0, cardinality 3, offset header,
-/// then values {7, 42, 100} as u16 little-endian.
-/// This pins parsing of spec-formatted bytes.
 #[test]
-fn roaring_format_spec_fixture_parses() {
-    let mut fixture = Vec::new();
-    fixture.extend_from_slice(&12346u32.to_le_bytes()); // cookie
-    fixture.extend_from_slice(&1u32.to_le_bytes()); // container count
-    fixture.extend_from_slice(&0u16.to_le_bytes()); // key (high 16 bits)
-    fixture.extend_from_slice(&2u16.to_le_bytes()); // cardinality - 1
-    fixture.extend_from_slice(&16u32.to_le_bytes()); // offset of container data
-    for v in [7u16, 42, 100] {
-        fixture.extend_from_slice(&v.to_le_bytes());
-    }
-    let bm = RoaringBitmap::deserialize_from(&fixture[..]).expect("spec fixture parses");
-    let elems: Vec<u32> = bm.iter().collect();
-    assert_eq!(elems, vec![7, 42, 100]);
-    // And the write direction round-trips through our own serializer.
-    assert_eq!(cardinality_serialized(&serialize(&[7, 42, 100])), 3);
+fn import_keeps_the_forest_form_and_refuses_foreign_bytes() {
+    let mut env = BitmapEnv::default();
+    let mut state = vec![0u8; 1 << 20];
+    let meta = init_bitmap_slot_state(&mut state, 16_384);
+    let storage = get_bitmap_storage(&meta);
+
+    // A sparse set whose canonical string is the Elias-Fano root.
+    let sparse: BTreeSet<u32> = (0..100u32)
+        .map(|i| i.wrapping_mul(2_654_435_761) >> 4)
+        .collect();
+    let canonical = Axroar::from_sorted(sparse.iter().copied()).to_bytes();
+    assert!(
+        AxroarView::open(&canonical)
+            .expect("well-formed")
+            .is_elias_fano()
+    );
+    assert_eq!(
+        bitmap_import(&mut env, &mut state, &meta, &canonical),
+        ErrorCode::Ok
+    );
+    assert_eq!(meta.size(&state), sparse.len() as u32);
+    assert_slot_is_canonical(&state, storage, &sparse);
+
+    // A forest string lands as is; the empty string clears the slot.
+    let dense: BTreeSet<u32> = (0..5000).collect();
+    let forest = Axroar::from_sorted(dense.iter().copied()).to_forest_bytes();
+    assert_eq!(
+        bitmap_import(&mut env, &mut state, &meta, &forest),
+        ErrorCode::Ok
+    );
+    assert_slot_is_canonical(&state, storage, &dense);
+    assert_eq!(
+        bitmap_import(&mut env, &mut state, &meta, &[]),
+        ErrorCode::Ok
+    );
+    assert_slot_is_canonical(&state, storage, &BTreeSet::new());
+    assert_eq!(meta.size(&state), 0);
+
+    // Foreign or truncated bytes are refused and change nothing.
+    let before = state.clone();
+    assert_eq!(
+        bitmap_import(
+            &mut env,
+            &mut state,
+            &meta,
+            b"\x3a\x30\x00\x00\x01\x00\x00\x00"
+        ),
+        ErrorCode::InvalidState
+    );
+    assert_eq!(
+        bitmap_import(&mut env, &mut state, &meta, &forest[..forest.len() - 3]),
+        ErrorCode::InvalidState
+    );
+    assert_eq!(state, before);
+
+    // More members than the element cap is a capacity refusal.
+    let small = init_bitmap_slot_state(&mut state, 8);
+    assert_eq!(
+        bitmap_import(&mut env, &mut state, &small, &forest),
+        ErrorCode::CapacityExceeded
+    );
 }
 
 proptest! {
@@ -646,11 +785,6 @@ proptest! {
         let mut state = vec![0u8; 8192];
         let meta = init_ttl_bitmap_slot_state(&mut state, capacity);
         let storage = get_bitmap_storage(&meta);
-        let mut empty = RoaringBitmap::new();
-        prop_assert_eq!(
-            bitmap_store(&mut env, &mut state, storage, &mut empty),
-            ErrorCode::Ok
-        );
         let initial_state = state.clone();
         let mut hooks = RecordingHooks::default();
         let timestamp = f64::from_bits(timestamp_bits);
@@ -681,26 +815,24 @@ proptest! {
         }
         prop_assert!(saw_payload_refusal);
 
-        let mut bitmap = bitmap_load(&mut env, &state, storage).expect("accepted image reloads");
-        for (undo, _) in hooks.mutations.iter().rev() {
+        for (undo, _) in hooks.mutations.clone().iter().rev() {
             match undo.op {
                 FlatUndoOp::SetInsert => {
-                    prop_assert!(bitmap.remove(undo.key));
+                    let report = bitmap_patch(&mut env, &mut state, storage, &[], &[undo.key])
+                        .expect("undo of an accepted insert fits");
+                    prop_assert_eq!(report.removed, 1);
                     hooks.ttl_by_key.remove(&undo.key);
                 }
                 FlatUndoOp::SetDelete => {
-                    prop_assert!(bitmap.insert(undo.key));
+                    let report = bitmap_patch(&mut env, &mut state, storage, &[undo.key], &[])
+                        .expect("undo of an accepted delete fits");
+                    prop_assert_eq!(report.added, 1);
                     hooks.ttl_by_key.insert(undo.key, undo.aux);
                 }
                 other => prop_assert!(false, "unexpected bitmap undo record {other:?}"),
             }
         }
-        let cardinality = bitmap.len() as u32;
-        prop_assert_eq!(
-            bitmap_store(&mut env, &mut state, storage, &mut bitmap),
-            ErrorCode::Ok
-        );
-        meta.set_size(&mut state, cardinality);
+        meta.set_size(&mut state, 0);
         state[(meta.meta_base + SlotMetaOffset::CHANGE_FLAGS) as usize] = 0;
         hooks.mutations.clear();
 
@@ -716,10 +848,10 @@ proptest! {
     /// which must commit nothing on any of the three planes.
     ///
     /// The refusal is spliced at a randomized point in a randomized add/remove
-    /// sequence: the flood batch asks for more sparse containers than the
-    /// payload can hold, while staying under `meta.capacity` elements so the
-    /// element-cap branch — which deliberately commits what fits — stays
-    /// unreachable and every `CapacityExceeded` here is the payload one.
+    /// sequence: the flood batch asks for more chunks than the payload can
+    /// hold, while staying under `meta.capacity` elements so the element-cap
+    /// branch — which deliberately commits what fits — stays unreachable and
+    /// every `CapacityExceeded` here is the payload one.
     ///
     /// Timestamps are a pure function of the key. A TTL refresh of an element
     /// that is already present emits no undo record, so a key-varying timestamp
@@ -756,8 +888,8 @@ proptest! {
         let checkpoint = vm.undo_checkpoint();
         let initial = state.clone();
 
-        // Every distinct high word: more sparse containers than the payload can
-        // hold, so this batch is refused whatever the randomized prefix did.
+        // Every distinct high word: more chunks than the payload can hold, so
+        // this batch is refused whatever the randomized prefix did.
         let flood: Vec<u32> = (1u16..240).map(sparse_key).collect();
         let flood_ts: Vec<f64> = flood.iter().copied().map(sparse_ts).collect();
 
@@ -796,7 +928,7 @@ proptest! {
             match result {
                 ErrorCode::Ok => prop_assert!(
                     op.is_some(),
-                    "the flood asks for more containers than the payload holds"
+                    "the flood asks for more chunks than the payload holds"
                 ),
                 ErrorCode::CapacityExceeded => {
                     saw_payload_refusal = true;
@@ -828,8 +960,8 @@ proptest! {
         vm.undo_rollback(&mut state, checkpoint);
         prop_assert_eq!(vm.undo_checkpoint(), checkpoint);
 
-        // Slot bytes and the metadata record are byte-exact: `bitmap_store`
-        // re-serializes the whole payload and zeroes its tail.
+        // Slot bytes and the metadata record are byte-exact: the image is a
+        // pure function of the set and the payload tail stays zero.
         let storage = get_bitmap_storage(&meta);
         let slot = meta.offset as usize
             ..(storage.payload_offset() + storage.payload_capacity) as usize;
@@ -900,12 +1032,11 @@ fn ttl_refresh_of_present_member_records_no_undo_entry() {
 }
 
 proptest! {
-    /// Round-trip through slot storage at boundary payload capacities: the
-    /// 255/256/257-byte region around BITMAP_BASE_BYTES and the exact
-    /// payload_capacity edge (store must refuse, not truncate, when the
-    /// serialized form exceeds capacity).
+    /// A patch into a slot at boundary payload capacities — the region around
+    /// BITMAP_BASE_BYTES and the exact payload_capacity edge — either lands
+    /// the canonical image or refuses without touching a byte.
     #[test]
-    fn store_load_round_trip_boundary_capacities(
+    fn patch_boundary_capacities(
         elems in prop::collection::btree_set(0u32..100_000, 0..600),
         cap in 0u32..80,
     ) {
@@ -914,39 +1045,34 @@ proptest! {
         let buf_len = (BITMAP_SERIALIZED_LEN_BYTES + payload_cap) as usize;
         let mut buf = vec![0u8; buf_len];
         let storage = make_storage(buf_len as u32);
+        let adds: Vec<u32> = elems.iter().copied().collect();
 
-        let mut bm = RoaringBitmap::new();
-        for &e in &elems { bm.insert(e); }
-        let elems_vec: Vec<u32> = bm.iter().collect();
-
-        match bitmap_store(&mut env, &mut buf, storage, &mut bm) {
-            ErrorCode::Ok => {
-                let reloaded = bitmap_load(&mut env, &buf, storage).expect("reload");
-                let got: Vec<u32> = reloaded.iter().collect();
-                prop_assert_eq!(got, elems_vec);
-                // Tail beyond serialized_len is zeroed (two-phase commit).
-                let len = storage.serialized_len(&buf);
-                prop_assert!(len <= payload_cap);
-                let tail_start = (storage.payload_offset() + len) as usize;
-                prop_assert!(buf[tail_start..].iter().all(|&b| b == 0));
+        match bitmap_patch(&mut env, &mut buf, storage, &adds, &[]) {
+            Ok(report) => {
+                prop_assert_eq!(report.added as usize, elems.len());
+                prop_assert_eq!(members(&buf, storage), adds);
+                assert_slot_is_canonical(&buf, storage, &elems);
             }
-            ErrorCode::CapacityExceeded => {
+            Err(ErrorCode::CapacityExceeded) => {
                 // Refusal must leave the slot bytes untouched (still empty).
-                prop_assert_eq!(storage.serialized_len(&buf), 0);
-                prop_assert!(bm.serialized_size() > payload_cap as usize);
+                prop_assert!(buf.iter().all(|&b| b == 0));
+                let needed = if elems.is_empty() { 0 } else {
+                    Axroar::from_sorted(adds.iter().copied()).forest_len()
+                };
+                prop_assert!(needed > payload_cap as usize);
             }
-            other => prop_assert!(false, "unexpected error {other:?}"),
+            Err(other) => prop_assert!(false, "unexpected error {other:?}"),
         }
     }
 
-    /// Slot-level algebra agrees with BTreeSet model algebra.
+    /// Slot-level algebra agrees with BTreeSet model algebra, and the slot
+    /// image is the canonical forest of the result.
     #[test]
     fn slot_algebra_matches_set_model(
         a in prop::collection::btree_set(0u32..10_000, 0..64),
         b in prop::collection::btree_set(0u32..10_000, 0..64),
         op_idx in 0usize..4,
     ) {
-        use std::collections::BTreeSet;
         let ops = [BitmapAlgebraOp::And, BitmapAlgebraOp::Or, BitmapAlgebraOp::AndNot, BitmapAlgebraOp::Xor];
         let op = ops[op_idx];
 
@@ -961,7 +1087,6 @@ proptest! {
             );
         }
         let source = serialize(&b.iter().copied().collect::<Vec<_>>());
-        let source = if b.is_empty() { vec![] } else { source };
         prop_assert_eq!(
             batch_bitmap_algebra(&mut env, &mut NoVm, op, &mut state, &meta, BitmapSource::Bytes(&source)),
             ErrorCode::Ok
@@ -974,16 +1099,15 @@ proptest! {
             BitmapAlgebraOp::Xor => a.symmetric_difference(&b).copied().collect(),
         };
         let storage = get_bitmap_storage(&meta);
-        let got: BTreeSet<u32> = match storage.serialized_data(&state) {
-            Some(d) => RoaringBitmap::deserialize_from(d).unwrap().iter().collect(),
-            None => BTreeSet::new(),
-        };
+        let got: BTreeSet<u32> = members(&state, storage).into_iter().collect();
         prop_assert_eq!(&got, &expected);
         prop_assert_eq!(meta.size(&state) as usize, expected.len());
+        assert_slot_is_canonical(&state, storage, &expected);
     }
 
     /// Batch add/remove interleavings agree with a BTreeSet model, including
-    /// meta.size — the observable slot contract.
+    /// meta.size — the observable slot contract — and the slot image is the
+    /// canonical forest of the surviving set after every batch.
     #[test]
     fn add_remove_matches_set_model(
         batches in prop::collection::vec(
@@ -991,11 +1115,11 @@ proptest! {
             1..12
         ),
     ) {
-        use std::collections::BTreeSet;
         let mut env = BitmapEnv::default();
         let mut state = vec![0u8; 1 << 20];
         let meta = init_bitmap_slot_state(&mut state, 16_384);
         let mut model = BTreeSet::new();
+        let storage = get_bitmap_storage(&meta);
 
         for (elems, is_remove) in &batches {
             if *is_remove {
@@ -1008,198 +1132,83 @@ proptest! {
                 );
                 for &e in elems { model.insert(e); }
             }
+            prop_assert_eq!(meta.size(&state) as usize, model.len());
+            assert_slot_is_canonical(&state, storage, &model);
         }
+    }
+}
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// The slot image is a pure function of the set across histories that
+    /// cross the 4096 array/words boundary within a chunk in both directions,
+    /// and every read answers the model: membership, rank/select through the
+    /// iterator, and intersections against a second set.
+    #[test]
+    fn image_is_a_pure_function_of_the_set_across_the_words_boundary(
+        inserts in prop::collection::btree_set(0u32..7000, 0..6000),
+        dense_len in 0u32..5000,
+        removes in prop::collection::vec(0u32..7000, 0..3000),
+        reinserts in prop::collection::vec(0u32..7000, 0..200),
+        sparse in prop::collection::btree_set(any::<u32>(), 0..64),
+        other in prop::collection::btree_set(0u32..7000, 0..300),
+        probes in prop::collection::vec(any::<u32>(), 0..16),
+    ) {
+        let mut env = BitmapEnv::default();
+        let mut state = vec![0u8; 1 << 20];
+        let meta = init_bitmap_slot_state(&mut state, 65_536);
         let storage = get_bitmap_storage(&meta);
-        let got: BTreeSet<u32> = match storage.serialized_data(&state) {
-            Some(d) => RoaringBitmap::deserialize_from(d).unwrap().iter().collect(),
-            None => BTreeSet::new(),
-        };
-        prop_assert_eq!(&got, &model);
-        prop_assert_eq!(meta.size(&state) as usize, model.len());
-    }
-}
+        let mut model: BTreeSet<u32> = BTreeSet::new();
 
-// ---------------------------------------------------------------------------
-// minroar ↔ roaring crate differential oracle (roaring is a DEV-dep only —
-// the shipped artifact carries minroar; these tests pin cross-compat).
-// ---------------------------------------------------------------------------
-
-proptest! {
-    /// minroar-serialized bytes parse in the roaring crate with identical
-    /// contents, and vice versa — the two directions of portable-spec
-    /// interop, including the run-container path via optimize().
-    #[test]
-    fn minroar_roaring_cross_compat(
-        elems in proptest::collection::btree_set(any::<u32>(), 0..600),
-        dense_base in 0u32..1000,
-        dense_len in 0u32..5000,
-        opt in any::<bool>(),
-    ) {
-        let mut mine = columine_vm::minroar::MiniRoaring::new();
-        let mut theirs = roaring::RoaringBitmap::new();
-        for &e in &elems { mine.insert(e); theirs.insert(e); }
-        // Dense run to exercise run/bitset containers.
-        for e in dense_base..dense_base + dense_len { mine.insert(e); theirs.insert(e); }
-        if opt { mine.optimize(); }
-
-        // mine → theirs
-        let mut buf = Vec::new();
-        mine.serialize_into(&mut buf).unwrap();
-        prop_assert_eq!(buf.len(), mine.serialized_size());
-        let reparsed = roaring::RoaringBitmap::deserialize_from(&buf[..]).expect("roaring parses minroar bytes");
-        prop_assert!(reparsed.iter().eq(mine.iter()));
-
-        // theirs → mine
-        let mut rbuf = Vec::new();
-        theirs.serialize_into(&mut rbuf).unwrap();
-        let mine2 = columine_vm::minroar::MiniRoaring::deserialize_from(&rbuf).expect("minroar parses roaring bytes");
-        prop_assert!(mine2.iter().eq(theirs.iter()));
-    }
-
-    /// Algebra + membership + cardinality equivalence against the oracle.
-    #[test]
-    fn minroar_ops_match_roaring(
-        a in proptest::collection::btree_set(any::<u32>(), 0..300),
-        b in proptest::collection::btree_set(any::<u32>(), 0..300),
-        probe in any::<u32>(),
-    ) {
-        let (mut ma, mut mb) = (columine_vm::minroar::MiniRoaring::new(), columine_vm::minroar::MiniRoaring::new());
-        let (mut ra, mut rb) = (roaring::RoaringBitmap::new(), roaring::RoaringBitmap::new());
-        for &e in &a { ma.insert(e); ra.insert(e); }
-        for &e in &b { mb.insert(e); rb.insert(e); }
-
-        prop_assert_eq!(ma.len(), ra.len());
-        prop_assert_eq!(ma.contains(probe), ra.contains(probe));
-        prop_assert_eq!(ma.intersection_len(&mb), ra.intersection_len(&rb));
-        prop_assert_eq!(ma.is_disjoint(&mb), ra.is_disjoint(&rb));
-
-        let and = ma.clone() & mb.clone();
-        let or = ma.clone() | mb.clone();
-        let sub = ma.clone() - mb.clone();
-        let xor = ma.clone() ^ mb.clone();
-        prop_assert!(and.iter().eq((ra.clone() & rb.clone()).iter()));
-        prop_assert!(or.iter().eq((ra.clone() | rb.clone()).iter()));
-        prop_assert!(sub.iter().eq((ra.clone() - rb.clone()).iter()));
-        prop_assert!(xor.iter().eq((ra.clone() ^ rb.clone()).iter()));
-
-        // Removal equivalence on a shared element, if any.
-        if let Some(&e) = a.iter().next() {
-            prop_assert_eq!(ma.remove(e), ra.remove(e));
-            prop_assert!(ma.iter().eq(ra.iter()));
-        }
-    }
-}
-
-proptest! {
-    /// The in-place readers agree with the oracle on both portable layouts:
-    /// roaring's image (run cookie when optimized, so one to three run
-    /// containers exercise the offset-less walk and four or more the offset
-    /// table) and minroar's canonical image. Containers straddle the
-    /// array/bitset boundary and every rank of the set is selected.
-    #[test]
-    fn minroar_in_place_probes_match_roaring(
-        sparse in proptest::collection::btree_set(any::<u32>(), 0..200),
-        dense_key in 0u32..3,
-        dense_base in 0u32..1000,
-        dense_len in 0u32..5000,
-        probes in proptest::collection::vec(any::<u32>(), 0..16),
-        optimize in any::<bool>(),
-    ) {
-        let mut oracle = roaring::RoaringBitmap::new();
-        for &e in &sparse { oracle.insert(e); }
-        let dense_base = (dense_key << 16) | dense_base;
-        oracle.insert_range(dense_base..dense_base + dense_len);
-        if optimize { oracle.optimize(); }
-        let mut theirs = Vec::new();
-        oracle.serialize_into(&mut theirs).unwrap();
-        let mut mine_set = columine_vm::minroar::MiniRoaring::new();
-        for e in oracle.iter() { mine_set.insert(e); }
-        mine_set.optimize();
-        let mut mine = Vec::new();
-        mine_set.serialize_into(&mut mine).unwrap();
-
-        let members: Vec<u32> = oracle.iter().collect();
-        for image in [&theirs[..], &mine[..]] {
-            prop_assert_eq!(columine_vm::minroar::MiniRoaring::len_bytes(image).unwrap(), members.len() as u32);
-            for &probe in probes.iter().chain(members.iter()) {
-                prop_assert_eq!(
-                    columine_vm::minroar::MiniRoaring::contains_bytes(image, probe).unwrap(),
-                    oracle.contains(probe),
-                    "contains {}", probe
-                );
-                prop_assert_eq!(
-                    columine_vm::minroar::MiniRoaring::contains_bytes(image, probe.wrapping_add(1)).unwrap(),
-                    oracle.contains(probe.wrapping_add(1))
-                );
+        let apply = |env: &mut BitmapEnv, state: &mut Vec<u8>, model: &mut BTreeSet<u32>, batch: &[u32], insert: bool| {
+            let sentinel_free: Vec<u32> = batch.iter().copied().filter(|&v| v < u32::MAX - 1).collect();
+            let code = if insert {
+                batch_bitmap_add(env, &mut NoVm, false, state, &meta, 0, &sentinel_free, None)
+            } else {
+                batch_bitmap_remove(env, &mut NoVm, false, state, &meta, 0, &sentinel_free)
+            };
+            prop_assert_eq!(code, ErrorCode::Ok);
+            for &v in &sentinel_free {
+                if insert { model.insert(v); } else { model.remove(&v); }
             }
-            for (rank, &expected) in members.iter().enumerate() {
-                prop_assert_eq!(
-                    columine_vm::minroar::MiniRoaring::select_bytes(image, rank as u32).unwrap(),
-                    Some(expected),
-                    "rank {}", rank
-                );
-            }
-            prop_assert_eq!(
-                columine_vm::minroar::MiniRoaring::select_bytes(image, members.len() as u32).unwrap(),
-                None
-            );
-            prop_assert_eq!(columine_vm::minroar::MiniRoaring::select_bytes(image, u32::MAX).unwrap(), None);
-            // A truncated image is refused, never indexed past its end.
-            for cut in [0, 4, 8, image.len() / 2, image.len().saturating_sub(1)] {
-                let _ = columine_vm::minroar::MiniRoaring::contains_bytes(&image[..cut], dense_base);
-                let _ = columine_vm::minroar::MiniRoaring::select_bytes(&image[..cut], 0);
-            }
-        }
-    }
-}
-
-proptest! {
-    /// The serialized image is a pure function of the set: a container that
-    /// promoted to a bitset and drained, or that was runs and then splintered,
-    /// serializes byte for byte as a fresh insert of the surviving values.
-    /// Sizes straddle the 4096 array/bitset boundary and the run thresholds.
-    #[test]
-    fn minroar_image_is_a_pure_function_of_the_set(
-        inserts in proptest::collection::btree_set(0u32..7000, 0..6000),
-        dense_len in 0u32..5000,
-        removes in proptest::collection::vec(0u32..7000, 0..3000),
-        reinserts in proptest::collection::vec(0u32..7000, 0..200),
-        sparse in proptest::collection::btree_set(any::<u32>(), 0..64),
-    ) {
-        let mut mine = columine_vm::minroar::MiniRoaring::new();
-        let mut oracle = std::collections::BTreeSet::new();
-        let mut apply = |value: u32, insert: bool| {
-            let expected = if insert { oracle.insert(value) } else { oracle.remove(&value) };
-            let reported = if insert { mine.insert(value) } else { mine.remove(value) };
-            prop_assert_eq!(reported, expected, "insert={} value={}", insert, value);
             Ok(())
         };
-        for &v in inserts.iter().chain(sparse.iter()) { apply(v, true)?; }
-        for v in 0..dense_len { apply(v, true)?; }
-        for &v in &removes { apply(v, false)?; }
-        for &v in &reinserts { apply(v, true)?; }
-        for &v in sparse.iter().take(32) { apply(v, false)?; }
+        let first: Vec<u32> = inserts.iter().chain(sparse.iter()).copied().collect();
+        apply(&mut env, &mut state, &mut model, &first, true)?;
+        let dense: Vec<u32> = (0..dense_len).collect();
+        apply(&mut env, &mut state, &mut model, &dense, true)?;
+        apply(&mut env, &mut state, &mut model, &removes, false)?;
+        apply(&mut env, &mut state, &mut model, &reinserts, true)?;
+        let drop_sparse: Vec<u32> = sparse.iter().take(32).copied().collect();
+        apply(&mut env, &mut state, &mut model, &drop_sparse, false)?;
 
-        prop_assert!(mine.iter().eq(oracle.iter().copied()));
-        prop_assert_eq!(mine.len(), oracle.len() as u64);
+        prop_assert_eq!(meta.size(&state) as usize, model.len());
+        assert_slot_is_canonical(&state, storage, &model);
 
-        let mut fresh = columine_vm::minroar::MiniRoaring::new();
-        for &v in &oracle { fresh.insert(v); }
-        mine.optimize();
-        fresh.optimize();
-        let (mut mine_bytes, mut fresh_bytes) = (Vec::new(), Vec::new());
-        mine.serialize_into(&mut mine_bytes).unwrap();
-        fresh.serialize_into(&mut fresh_bytes).unwrap();
-        prop_assert_eq!(mine_bytes.len(), mine.serialized_size());
-        prop_assert_eq!(&mine_bytes, &fresh_bytes);
+        let ordered: Vec<u32> = model.iter().copied().collect();
+        prop_assert_eq!(members(&state, storage), ordered.clone());
+        for (rank, &expected) in ordered.iter().enumerate() {
+            prop_assert_eq!(bitmap_select(&state, storage, rank as u32), Some(expected));
+        }
+        prop_assert_eq!(bitmap_select(&state, storage, ordered.len() as u32), None);
+        let image = storage.serialized_data(&state).map(<[u8]>::to_vec).unwrap_or_default();
+        for &probe in probes.iter().chain(ordered.iter()) {
+            prop_assert_eq!(contains_serialized(&image, probe), model.contains(&probe));
+        }
+        prop_assert_eq!(cardinality_serialized(&image) as usize, model.len());
+        let other_image = serialize(&other.iter().copied().collect::<Vec<_>>());
+        let common = model.intersection(&other).count();
+        prop_assert_eq!(intersect_count_serialized(&image, &other_image) as usize, common);
+        prop_assert_eq!(intersects_serialized(&image, &other_image), common > 0);
+        let mut out = vec![0u32; ordered.len() + 1];
+        prop_assert_eq!(extract_serialized(&image, &mut out) as usize, ordered.len());
+        prop_assert_eq!(&out[..ordered.len()], &ordered[..]);
 
-        // Canonical form survives its own round trip and stays iterable in
-        // order after re-laddering.
-        let reloaded = columine_vm::minroar::MiniRoaring::deserialize_from(&mine_bytes).unwrap();
-        prop_assert!(reloaded.iter().eq(oracle.iter().copied()));
-        prop_assert!(mine.iter().eq(oracle.iter().copied()));
-        let theirs = roaring::RoaringBitmap::deserialize_from(&mine_bytes[..]).expect("roaring parses the canonical image");
-        prop_assert!(theirs.iter().eq(oracle.iter().copied()));
+        // A truncated image is refused, never indexed past its end.
+        for cut in [0, 4, 8, image.len() / 2, image.len().saturating_sub(1)] {
+            prop_assert!(!contains_serialized(&image[..cut], 0) || image.is_empty());
+            prop_assert_eq!(cardinality_validated(&image[..cut]).filter(|_| cut > 0), None);
+        }
     }
 }

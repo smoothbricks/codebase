@@ -1,21 +1,46 @@
-//! Roaring-bitmap slot storage, load/store, batch mutation, and set algebra.
+//! The BITMAP slot: an AXR1 string (the `axroar` canonical bitmap) patched
+//! where it lies, read through a zero-copy view.
 //!
-//! # Roaring backend
+//! # Slot layout
 //!
-//! The implementation follows the standard portable RoaringFormatSpec
-//! (cookies 12346/12347), so serialized payloads are mutually readable.
-//! Freshly serialized byte images may differ within the spec because
-//! container optimization choices are implementation-dependent.
-//! # Allocation behavior
+//! `[serialized_len: u32][reserved: u32 = 0][payload: bitmap_payload_capacity bytes]`
 //!
-//! Rust backing storage does not expose allocator-failure branches; invalid
-//! serialization and capacity failures are the observable error paths.
-//! Scratch-related failure codes are therefore unreachable and are not
-//! emulated.
+//! Slot data offsets are 8-aligned, so the 8-byte header keeps the payload
+//! on the 8-byte boundary axroar's word kernels take their fast path on.
+//! `serialized_len == 0` is the empty set and its only form; a non-empty set
+//! occupies the first `serialized_len` payload bytes as the FOREST root of
+//! the set, and every payload byte past the string is zero. Together those
+//! make the slot image a pure function of the set: byte-equal, whatever the
+//! history, to a fresh `Axroar::write_forest_into_slice` of the same members
+//! (the forest is the mutable root — `axroar::patch` keeps the root arm, and
+//! a forest patch touches only the chunks a batch names).
+//!
+//! # Mutation
+//!
+//! Every write is one `axroar::patch_witnessed` over the payload: the batch
+//! is sorted and deduplicated into VM-owned buffers, the patch re-ladders
+//! only the touched chunks and reports per value which adds were new and
+//! which removes were held — the bit the edit overwrote, so the undo
+//! records and TTL entries cost no second probe — and its refusals leave
+//! the slot untouched: a `Capacity` refusal becomes
+//! `ErrorCode::CapacityExceeded`, which the slot-growth retry answers by
+//! doubling the slot and replaying. Nothing on the steady path allocates:
+//! the `PatchScratch`, the batch buffers and the outcome planes keep their
+//! high-water mark inside [`BitmapEnv`].
+//!
+//! # Reads
+//!
+//! Membership, cardinality, rank/select, iteration and intersection open an
+//! `AxroarView` over the slot bytes (or over caller-supplied bytes for the
+//! decision-side `*_serialized` queries) and answer from the string; no read
+//! materialises the set.
 use crate::bytes;
 use crate::hooks::{MutationRecord, VmHooks};
 use crate::meta::SlotMetaView;
-use crate::minroar::MiniRoaring as RoaringBitmap;
+use axroar::{
+    AndNotRange, AndRange, Axroar, AxroarView, BatchOutcome, OrRange, PatchError, PatchReport,
+    PatchScratch, Range, XorRange, patch_witnessed,
+};
 use columine_types::types::{
     BITMAP_BASE_BYTES, BITMAP_BYTES_PER_CAPACITY, BITMAP_SERIALIZED_LEN_BYTES, ChangeFlag,
     EMPTY_KEY, ErrorCode, TOMBSTONE,
@@ -49,7 +74,8 @@ impl BitmapStorage {
         bytes::write_u32(state, self.data_offset, len);
     }
 
-    /// `None` when empty or invalid.
+    /// The AXR1 string, or `None` when the set is empty or the length field
+    /// is outside the payload.
     pub fn serialized_data<'a>(&self, state: &'a [u8]) -> Option<&'a [u8]> {
         let len = self.serialized_len(state);
         if len == 0 || len > self.payload_capacity {
@@ -57,6 +83,18 @@ impl BitmapStorage {
         }
         let start = self.payload_offset() as usize;
         Some(&state[start..start + len as usize])
+    }
+
+    /// The slot's set as a zero-copy view. `Ok(None)` is the empty set;
+    /// `Err` a length field or string the payload does not hold.
+    pub fn view<'a>(&self, state: &'a [u8]) -> Result<Option<AxroarView<'a>>, ErrorCode> {
+        if self.serialized_len(state) == 0 {
+            return Ok(None);
+        }
+        match self.serialized_data(state).and_then(AxroarView::open) {
+            Some(view) => Ok(Some(view)),
+            None => Err(ErrorCode::InvalidState),
+        }
     }
 }
 
@@ -75,15 +113,53 @@ enum PendingBitmapMutation {
     Remove { key: u32, previous_ts_bits: u64 },
 }
 
-/// Observable bitmap operation state. Reusable buffers avoid allocation churn
-/// on store, algebra, and mutation-commit paths.
-#[derive(Debug, Default)]
+/// Observable bitmap operation state: the patch scratch and the batch
+/// buffers every write reuses, the decision-side algebra result, and the
+/// last diagnostic.
 pub struct BitmapEnv {
     /// `g_bitmap_last_error` — diagnostic code readable after a failure.
     pub last_error: u32,
-    store_temp: Vec<u8>,
+    scratch: PatchScratch,
+    /// Staged adds as `elem << 32 | column index`, so one sort orders them by
+    /// value and, within a value, by first occurrence.
+    staged_adds: Vec<u64>,
+    adds: Vec<u32>,
+    removes: Vec<u32>,
+    /// The witness planes: bit `i` of `adds_new` for `adds[i]`, bit `i` of
+    /// `removes_held` for `removes[i]`.
+    adds_new: Vec<u64>,
+    removes_held: Vec<u64>,
     algebra_result: Vec<u8>,
     pending_mutations: Vec<PendingBitmapMutation>,
+    /// The forest string of the empty set: what a `serialized_len == 0` slot
+    /// is seeded with so a patch has a string to edit.
+    empty_forest: Vec<u8>,
+}
+
+impl Default for BitmapEnv {
+    fn default() -> Self {
+        BitmapEnv {
+            last_error: 0,
+            scratch: PatchScratch::new(),
+            staged_adds: Vec::new(),
+            adds: Vec::new(),
+            removes: Vec::new(),
+            adds_new: Vec::new(),
+            removes_held: Vec::new(),
+            algebra_result: Vec::new(),
+            pending_mutations: Vec::new(),
+            empty_forest: Axroar::from_sorted(core::iter::empty()).to_forest_bytes(),
+        }
+    }
+}
+
+impl core::fmt::Debug for BitmapEnv {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BitmapEnv")
+            .field("last_error", &self.last_error)
+            .field("algebra_result_len", &self.algebra_result.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl BitmapEnv {
@@ -92,6 +168,25 @@ impl BitmapEnv {
     pub fn algebra_result(&self) -> &[u8] {
         &self.algebra_result
     }
+
+    /// Whether `adds[i]` of the last successful [`bitmap_patch`] was new.
+    fn add_was_new(&self, i: usize) -> bool {
+        self.adds_new[i / 64] >> (i % 64) & 1 == 1
+    }
+
+    /// Whether `removes[i]` of the last successful [`bitmap_patch`] was held.
+    fn remove_was_held(&self, i: usize) -> bool {
+        self.removes_held[i / 64] >> (i % 64) & 1 == 1
+    }
+}
+
+/// Whether a column is already the batch a patch takes: strictly ascending
+/// and free of the sentinel keys. Such a column is patched as it is, with
+/// no copy, sort or dedup; the sentinels are the two largest `u32`s, so an
+/// ascending column can only carry them at its end and the last value
+/// decides.
+fn is_batch(column: &[u32]) -> bool {
+    column.last().is_none_or(|&last| last < TOMBSTONE) && column.is_sorted_by(|a, b| a < b)
 }
 
 fn commit_bitmap_mutations(
@@ -150,84 +245,83 @@ fn commit_bitmap_mutations(
     ErrorCode::Ok
 }
 
-/// Load a serialized bitmap. `None` maps to an error path and
-/// `env.last_error` carries the diagnostic; deserialization failure is the
-/// surviving failure mode.
-pub fn bitmap_load(
+/// Patch the slot's string in place: the set becomes `(old ∪ adds) \ removes`.
+/// `adds` and `removes` are strictly ascending. On success the length field
+/// and the zero tail are maintained, and `env.add_was_new(i)` /
+/// `env.remove_was_held(i)` answer per value what the patch found; a
+/// refusal leaves the slot exactly as it was and `env.last_error` names why.
+pub fn bitmap_patch(
     env: &mut BitmapEnv,
-    state: &[u8],
+    state: &mut [u8],
     storage: BitmapStorage,
-) -> Option<RoaringBitmap> {
-    let serialized_len = storage.serialized_len(state);
-    if serialized_len == 0 {
-        return Some(RoaringBitmap::new());
+    adds: &[u32],
+    removes: &[u32],
+) -> Result<PatchReport, ErrorCode> {
+    let old_len = storage.serialized_len(state) as usize;
+    let capacity = storage.payload_capacity as usize;
+    if old_len > capacity {
+        env.last_error = 102;
+        return Err(ErrorCode::InvalidState);
     }
-    if serialized_len > storage.payload_capacity {
-        return None;
+    let payload = storage.payload_offset() as usize;
+    let slot = &mut state[payload..payload + capacity];
+    let seed = env.empty_forest.len();
+    if old_len == 0 {
+        // The empty set has no string; seed one so the patch has a string
+        // to edit. A refusal below zeroes the seed back out.
+        slot[..seed].copy_from_slice(&env.empty_forest);
     }
-    let start = storage.payload_offset() as usize;
-    let data = &state[start..start + serialized_len as usize];
-    match RoaringBitmap::deserialize_from(data) {
-        Ok(bm) => Some(bm),
-        Err(_) => {
-            env.last_error = 102; // error.InvalidFormat lane
-            None
+    env.adds_new.resize(adds.len().div_ceil(64), 0);
+    env.removes_held.resize(removes.len().div_ceil(64), 0);
+    let mut outcome = BatchOutcome::new(&mut env.adds_new, &mut env.removes_held);
+    match patch_witnessed(slot, adds, removes, &mut env.scratch, &mut outcome) {
+        Ok(report) => {
+            let new_len = if report.len == 0 {
+                0
+            } else {
+                report.serialized_len
+            };
+            // Every payload byte past the string is zero, so the image is a
+            // function of the set alone: clear whatever the old string (or
+            // the seed) occupied beyond the new one.
+            let stale_end = old_len.max(seed).max(report.serialized_len);
+            if new_len < stale_end {
+                slot[new_len..stale_end].fill(0);
+            }
+            storage.set_serialized_len(state, new_len as u32);
+            Ok(report)
+        }
+        Err(PatchError::Capacity { .. }) => {
+            if old_len == 0 {
+                slot[..seed].fill(0);
+            }
+            env.last_error = 60;
+            Err(ErrorCode::CapacityExceeded)
+        }
+        Err(PatchError::Malformed) => {
+            if old_len == 0 {
+                slot[..seed].fill(0);
+            }
+            env.last_error = 102;
+            Err(ErrorCode::InvalidState)
+        }
+        Err(PatchError::Unsorted) => {
+            columine_types::die!("bitmap batches are sorted and deduplicated before patching")
         }
     }
 }
 
-/// Store a bitmap with run optimization, size checking, and a two-phase commit
-/// through a reusable temporary buffer. Failed serialization leaves slot bytes
-/// unmodified; the payload tail is zeroed after a successful copy.
-pub fn bitmap_store(
-    env: &mut BitmapEnv,
-    state: &mut [u8],
-    storage: BitmapStorage,
-    bitmap: &mut RoaringBitmap,
-) -> ErrorCode {
-    bitmap.optimize();
-
-    let serialized_size_needed = bitmap.serialized_size();
-    if serialized_size_needed > storage.payload_capacity as usize {
-        env.last_error = 60;
-        return ErrorCode::CapacityExceeded;
-    }
-
-    env.store_temp.clear();
-    env.store_temp.reserve(serialized_size_needed);
-    if bitmap.serialize_into(&mut env.store_temp).is_err() {
-        // A Vec sink is infallible in practice; retain the error code for a
-        // uniform failure path.
-        env.last_error = 61;
-        return ErrorCode::InvalidState;
-    }
-
-    let serialized_size = env.store_temp.len() as u32;
-    if serialized_size > storage.payload_capacity {
-        return ErrorCode::CapacityExceeded;
-    }
-
-    storage.set_serialized_len(state, serialized_size);
-    let payload = storage.payload_offset() as usize;
-    state[payload..payload + serialized_size as usize].copy_from_slice(&env.store_temp);
-    if serialized_size < storage.payload_capacity {
-        bytes::zero(
-            state,
-            storage.payload_offset() + serialized_size,
-            storage.payload_capacity - serialized_size,
-        );
-    }
-    ErrorCode::Ok
-}
-
 /// Select the element at `rank` in ascending order.
 pub fn bitmap_select(state: &[u8], storage: BitmapStorage, rank: u32) -> Option<u32> {
-    let data = storage.serialized_data(state)?;
-    RoaringBitmap::select_bytes(data, rank).ok().flatten()
+    let view = AxroarView::open(storage.serialized_data(state)?)?;
+    view.select(u64::from(rank))
 }
 
-/// Add a batch of elements. Rust's backing storage has no scratch-allocation
-/// failure path.
+/// Add a batch of elements. Elements already present refresh their TTL;
+/// a value repeated within the batch is inserted once, with its first
+/// timestamp. When the batch would exceed `meta.capacity` elements, the
+/// earliest of the batch that fit are committed and the call returns
+/// `CapacityExceeded`; a payload-capacity refusal commits nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn batch_bitmap_add(
     env: &mut BitmapEnv,
@@ -241,78 +335,147 @@ pub fn batch_bitmap_add(
 ) -> ErrorCode {
     env.last_error = 0;
     env.pending_mutations.clear();
-    env.pending_mutations.reserve(elem_col.len());
+    env.staged_adds.clear();
     let storage = get_bitmap_storage(meta);
-    let Some(mut bitmap) = bitmap_load(env, state, storage) else {
-        if env.last_error == 0 {
-            env.last_error = 1;
-        }
-        return ErrorCode::InvalidState;
-    };
-
-    let mut cardinality = bitmap.len() as u32;
-    let mut had_insert = false;
-
-    for (i, &elem) in elem_col.iter().enumerate() {
-        if elem == EMPTY_KEY || elem == TOMBSTONE {
-            continue;
-        }
-        let timestamp = if meta.has_ttl() {
+    let has_ttl = meta.has_ttl();
+    let timestamp_at = |i: usize| -> f64 {
+        if has_ttl {
             ts_col.unwrap_or_else(|| columine_types::die!("TTL slot requires a timestamp column"))
                 [i]
         } else {
             0.0
-        };
+        }
+    };
 
-        if bitmap.contains(elem) {
-            if meta.has_ttl() {
-                env.pending_mutations
-                    .push(PendingBitmapMutation::RefreshTtl {
-                        key: elem,
-                        timestamp,
-                    });
+    let cardinality = meta.size(state);
+    let room = meta.capacity.saturating_sub(cardinality) as usize;
+
+    // A column that is already the batch, and cannot reach the element
+    // cap, is patched as it is: its index in the column is its index in
+    // the batch.
+    if elem_col.len() <= room && is_batch(elem_col) {
+        if elem_col.is_empty() {
+            return ErrorCode::Ok;
+        }
+        let report = match bitmap_patch(env, state, storage, elem_col, &[]) {
+            Ok(report) => report,
+            Err(code) => return code,
+        };
+        if hooks.undo_enabled() || has_ttl {
+            for (i, &key) in elem_col.iter().enumerate() {
+                let timestamp = timestamp_at(i);
+                if env.add_was_new(i) {
+                    env.pending_mutations
+                        .push(PendingBitmapMutation::Insert { key, timestamp });
+                } else if has_ttl {
+                    env.pending_mutations
+                        .push(PendingBitmapMutation::RefreshTtl { key, timestamp });
+                }
             }
+        }
+        meta.set_size(state, cardinality + report.added);
+        if report.added > 0 {
+            meta.set_change_flag(state, ChangeFlag::INSERTED);
+        }
+        return commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx);
+    }
+
+    // Value order with first occurrence first, so the dedup keeps the
+    // earliest column index of a repeated value.
+    for (i, &elem) in elem_col.iter().enumerate() {
+        if elem == EMPTY_KEY || elem == TOMBSTONE {
             continue;
         }
-        if cardinality >= meta.capacity {
-            let store_result = bitmap_store(env, state, storage, &mut bitmap);
-            if store_result != ErrorCode::Ok {
-                env.pending_mutations.clear();
-                return store_result;
+        env.staged_adds.push((u64::from(elem) << 32) | i as u64);
+    }
+    env.staged_adds.sort_unstable();
+    env.staged_adds
+        .dedup_by_key(|staged| (*staged >> 32) as u32);
+
+    let overflow = if env.staged_adds.len() > room {
+        // The batch may exceed the element cap: only the values not already
+        // held count against it, so this path probes for them and keeps
+        // the `room` earliest new values by column index. The common path
+        // below never probes — the patch reports what was new.
+        let view = match storage.view(state) {
+            Ok(view) => view,
+            Err(code) => {
+                env.last_error = 102;
+                return code;
             }
-            meta.set_size(state, cardinality);
-            if had_insert {
-                meta.set_change_flag(state, ChangeFlag::INSERTED);
+        };
+        let mut kept = 0usize;
+        env.staged_adds.retain(|staged| {
+            let elem = (*staged >> 32) as u32;
+            let present = view.is_some_and(|v| v.contains(elem));
+            present || {
+                kept += 1;
+                true
             }
-            let commit_result =
-                commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx);
-            return if commit_result == ErrorCode::Ok {
-                ErrorCode::CapacityExceeded
-            } else {
-                commit_result
-            };
-        }
-        if bitmap.insert(elem) {
-            cardinality += 1;
-            had_insert = true;
-            env.pending_mutations.push(PendingBitmapMutation::Insert {
-                key: elem,
-                timestamp,
+        });
+        let overflow = kept > room;
+        if overflow {
+            let mut admitted = 0usize;
+            env.staged_adds
+                .sort_unstable_by_key(|staged| *staged as u32);
+            env.staged_adds.retain(|staged| {
+                let present = view.is_some_and(|v| v.contains((*staged >> 32) as u32));
+                present || {
+                    admitted += 1;
+                    admitted <= room
+                }
             });
+            env.staged_adds.sort_unstable();
+        }
+        overflow
+    } else {
+        false
+    };
+
+    let mut added = 0;
+    if !env.staged_adds.is_empty() {
+        let mut adds = core::mem::take(&mut env.adds);
+        adds.clear();
+        adds.extend(env.staged_adds.iter().map(|staged| (*staged >> 32) as u32));
+        let patched = bitmap_patch(env, state, storage, &adds, &[]);
+        env.adds = adds;
+        match patched {
+            Ok(report) => added = report.added,
+            Err(code) => {
+                env.pending_mutations.clear();
+                return code;
+            }
+        }
+        // The undo records and TTL entries of what the patch found new —
+        // only when something consumes them.
+        if hooks.undo_enabled() || has_ttl {
+            for (i, staged) in env.staged_adds.iter().enumerate() {
+                let key = (*staged >> 32) as u32;
+                let timestamp = timestamp_at(*staged as u32 as usize);
+                if env.add_was_new(i) {
+                    env.pending_mutations
+                        .push(PendingBitmapMutation::Insert { key, timestamp });
+                } else if has_ttl {
+                    env.pending_mutations
+                        .push(PendingBitmapMutation::RefreshTtl { key, timestamp });
+                }
+            }
         }
     }
 
-    let store_result = bitmap_store(env, state, storage, &mut bitmap);
-    if store_result != ErrorCode::Ok {
-        env.pending_mutations.clear();
-        return store_result;
-    }
-
-    meta.set_size(state, cardinality);
-    if had_insert {
+    meta.set_size(state, cardinality + added);
+    if added > 0 {
         meta.set_change_flag(state, ChangeFlag::INSERTED);
     }
-    commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx)
+    let commit_result = commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx);
+    if commit_result != ErrorCode::Ok {
+        return commit_result;
+    }
+    if overflow {
+        ErrorCode::CapacityExceeded
+    } else {
+        ErrorCode::Ok
+    }
 }
 
 /// Remove a batch of elements; failures leave slot bytes unchanged.
@@ -325,21 +488,46 @@ pub fn batch_bitmap_remove(
     slot_idx: u8,
     elem_col: &[u32],
 ) -> ErrorCode {
+    env.last_error = 0;
     env.pending_mutations.clear();
-    env.pending_mutations.reserve(elem_col.len());
     let storage = get_bitmap_storage(meta);
-    let Some(mut bitmap) = bitmap_load(env, state, storage) else {
-        return ErrorCode::InvalidState;
+    let cardinality = meta.size(state);
+    if cardinality == 0 || elem_col.is_empty() {
+        return ErrorCode::Ok;
+    }
+    // A column that is already the batch is patched as it is; any other is
+    // staged, sorted and deduplicated into the retained buffer.
+    let mut removes = core::mem::take(&mut env.removes);
+    let batch: &[u32] = if is_batch(elem_col) {
+        elem_col
+    } else {
+        removes.clear();
+        removes.extend(
+            elem_col
+                .iter()
+                .copied()
+                .filter(|&elem| elem != EMPTY_KEY && elem != TOMBSTONE),
+        );
+        removes.sort_unstable();
+        removes.dedup();
+        &removes
     };
 
-    let mut cardinality = bitmap.len() as u32;
-    let mut had_remove = false;
-
-    for &elem in elem_col {
-        if cardinality == 0 {
-            break;
+    let patched = bitmap_patch(env, state, storage, &[], batch);
+    let report = match patched {
+        Ok(report) => report,
+        Err(code) => {
+            env.removes = removes;
+            return code;
         }
-        if !bitmap.remove(elem) {
+    };
+    // The undo records and TTL entries of what the patch found held — only
+    // when something consumes them. The eviction timestamp is read after
+    // the patch: the eviction index is a separate plane the patch does not
+    // touch.
+    let journaled = hooks.undo_enabled() || meta.has_ttl();
+    for (i, &elem) in batch.iter().enumerate() {
+        if !journaled || !env.remove_was_held(i) {
             continue;
         }
         let previous_ts_bits = if meta.has_ttl() {
@@ -356,22 +544,12 @@ pub fn batch_bitmap_remove(
             key: elem,
             previous_ts_bits,
         });
-        cardinality -= 1;
-        had_remove = true;
     }
-
-    if had_remove {
-        let store_result = bitmap_store(env, state, storage, &mut bitmap);
-        if store_result != ErrorCode::Ok {
-            env.pending_mutations.clear();
-            return store_result;
-        }
-        meta.set_size(state, cardinality);
+    env.removes = removes;
+    meta.set_size(state, cardinality - report.removed);
+    if report.removed > 0 {
         meta.set_change_flag(state, ChangeFlag::REMOVED);
-    } else {
-        meta.set_size(state, cardinality);
     }
-
     commit_bitmap_mutations(env, hooks, delta_mode, state, meta, slot_idx)
 }
 
@@ -399,8 +577,12 @@ pub enum BitmapSource<'a> {
     Bytes(&'a [u8]),
 }
 
-/// Apply in-place set algebra to a target slot. Bulk mutations use one undo
-/// snapshot because per-element tracking is impractical.
+/// Apply in-place set algebra to a target slot. The operation is expressed
+/// as the patch that turns the target into the result — the values to add
+/// and the values to remove, each computed by a lazy merge of the two
+/// views — so the slot is edited only where the result differs from the
+/// target. Bulk mutations use one undo snapshot because per-element
+/// tracking is impractical.
 pub fn batch_bitmap_algebra(
     env: &mut BitmapEnv,
     hooks: &mut impl VmHooks,
@@ -419,75 +601,143 @@ pub fn batch_bitmap_algebra(
         }
         BitmapSource::Bytes(bytes) => (!bytes.is_empty()).then_some(bytes),
     };
-    // Deserialize before the snapshot borrows `state` mutably; the operand is
-    // owned from here on, so the identities below can write the target.
-    let source = match source_data {
+    let source_view = match source_data {
         None => None,
-        Some(data) => match RoaringBitmap::deserialize_from(data) {
-            Ok(bitmap) => Some(bitmap),
-            Err(_) => {
+        Some(data) => match AxroarView::open(data) {
+            Some(view) => Some(view),
+            None => {
                 env.last_error = 80;
                 return ErrorCode::InvalidState;
             }
         },
     };
-
-    // Empty-source identities.
-    let Some(source) = source else {
-        match op {
-            BitmapAlgebraOp::And => {
-                // AND with empty = clear target.
-                if hooks.undo_enabled() && !hooks.undo_overflow() {
-                    hooks.force_undo_snapshot(state);
-                }
-                target_storage.set_serialized_len(state, 0);
-                bytes::zero(
-                    state,
-                    target_storage.payload_offset(),
-                    target_storage.payload_capacity,
-                );
-                target_meta.set_size(state, 0);
-                if original_size != 0 {
-                    target_meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
-                }
-                return ErrorCode::Ok;
-            }
-            // OR/ANDNOT/XOR with empty = no change.
-            BitmapAlgebraOp::Or | BitmapAlgebraOp::AndNot | BitmapAlgebraOp::Xor => {
-                return ErrorCode::Ok;
-            }
+    let target_view = match target_storage.view(state) {
+        Ok(view) => view,
+        Err(code) => {
+            env.last_error = 102;
+            return code;
         }
     };
+
+    let mut adds = core::mem::take(&mut env.adds);
+    let mut removes = core::mem::take(&mut env.removes);
+    adds.clear();
+    removes.clear();
+    match (target_view, source_view) {
+        // AND/ANDNOT against nothing leaves an empty target empty; OR/XOR
+        // against nothing leaves any target as it is.
+        (None, None) => {}
+        (None, Some(source)) => match op {
+            BitmapAlgebraOp::And | BitmapAlgebraOp::AndNot => {}
+            BitmapAlgebraOp::Or | BitmapAlgebraOp::Xor => adds.extend(source.range()),
+        },
+        (Some(target), None) => match op {
+            BitmapAlgebraOp::And => removes.extend(target.range()),
+            BitmapAlgebraOp::Or | BitmapAlgebraOp::AndNot | BitmapAlgebraOp::Xor => {}
+        },
+        (Some(target), Some(source)) => match op {
+            BitmapAlgebraOp::And => {
+                removes.extend(AndNotRange::new(target.range(), source.range()));
+            }
+            BitmapAlgebraOp::Or => {
+                adds.extend(AndNotRange::new(source.range(), target.range()));
+            }
+            BitmapAlgebraOp::AndNot => {
+                removes.extend(AndRange::leapfrog(target.range(), source.range()));
+            }
+            BitmapAlgebraOp::Xor => {
+                adds.extend(AndNotRange::new(source.range(), target.range()));
+                removes.extend(AndRange::leapfrog(target.range(), source.range()));
+            }
+        },
+    }
+
+    if adds.is_empty() && removes.is_empty() {
+        env.adds = adds;
+        env.removes = removes;
+        return ErrorCode::Ok;
+    }
 
     // Force undo snapshot before bulk mutation.
     if hooks.undo_enabled() && !hooks.undo_overflow() {
         hooks.force_undo_snapshot(state);
     }
 
-    let Some(mut target) = bitmap_load(env, state, target_storage) else {
-        return ErrorCode::InvalidState;
+    let patched = bitmap_patch(env, state, target_storage, &adds, &removes);
+    env.adds = adds;
+    env.removes = removes;
+    let report = match patched {
+        Ok(report) => report,
+        Err(code) => {
+            target_meta.set_size(state, original_size);
+            return code;
+        }
     };
 
-    // In-place operation; backing storage allocation failures are not exposed
-    // by this implementation.
-    match op {
-        BitmapAlgebraOp::And => target &= &source,
-        BitmapAlgebraOp::Or => target |= &source,
-        BitmapAlgebraOp::AndNot => target -= &source,
-        BitmapAlgebraOp::Xor => target ^= &source,
-    }
-
-    let store_result = bitmap_store(env, state, target_storage, &mut target);
-    if store_result != ErrorCode::Ok {
-        target_meta.set_size(state, original_size);
-        return store_result;
-    }
-
-    let new_card = target.len() as u32;
+    let new_card = report.len as u32;
     target_meta.set_size(state, new_card);
     if new_card != original_size {
         target_meta.set_change_flag(state, ChangeFlag::SIZE_CHANGED);
     }
+    ErrorCode::Ok
+}
+
+/// Replace the slot's set with `input`, an AXR1 string that crossed a trust
+/// boundary: it is verified in full, its cardinality checked against the
+/// slot's element capacity, and a sealed Elias-Fano root is re-encoded as
+/// the forest the slot keeps. Zero bytes are the empty set.
+pub fn bitmap_import(
+    env: &mut BitmapEnv,
+    state: &mut [u8],
+    meta: &SlotMetaView,
+    input: &[u8],
+) -> ErrorCode {
+    let storage = get_bitmap_storage(meta);
+    let payload = storage.payload_offset() as usize;
+    let capacity = storage.payload_capacity as usize;
+    let Some(view) = (if input.is_empty() {
+        None
+    } else {
+        AxroarView::open_verified(input)
+    }) else {
+        if !input.is_empty() {
+            env.last_error = 102;
+            return ErrorCode::InvalidState;
+        }
+        storage.set_serialized_len(state, 0);
+        state[payload..payload + capacity].fill(0);
+        meta.set_size(state, 0);
+        return ErrorCode::Ok;
+    };
+    let Ok(card) = u32::try_from(view.len()) else {
+        return ErrorCode::CapacityExceeded;
+    };
+    if card > meta.capacity {
+        return ErrorCode::CapacityExceeded;
+    }
+    if card == 0 {
+        return bitmap_import(env, state, meta, &[]);
+    }
+    let slot = &mut state[payload..payload + capacity];
+    let written = if view.is_elias_fano() {
+        match Axroar::from_sorted(view.range()).write_forest_into_slice(slot) {
+            Ok(written) => written,
+            Err(_) => {
+                env.last_error = 60;
+                return ErrorCode::CapacityExceeded;
+            }
+        }
+    } else {
+        if input.len() > capacity {
+            env.last_error = 60;
+            return ErrorCode::CapacityExceeded;
+        }
+        slot[..input.len()].copy_from_slice(input);
+        input.len()
+    };
+    slot[written..].fill(0);
+    storage.set_serialized_len(state, written as u32);
+    meta.set_size(state, card);
     ErrorCode::Ok
 }
 
@@ -498,81 +748,57 @@ pub fn batch_bitmap_algebra(
 /// Test whether a serialized bitmap contains `value`. Invalid or empty
 /// payloads return false.
 pub fn contains_serialized(data: &[u8], value: u32) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    let Ok(contains) = RoaringBitmap::contains_bytes(data, value) else {
-        return false;
-    };
-    contains
+    AxroarView::open(data).is_some_and(|view| view.contains(value))
 }
 
 /// Return serialized bitmap cardinality, saturating at `u32::MAX`.
 pub fn cardinality_serialized(data: &[u8]) -> u32 {
-    if data.is_empty() {
-        return 0;
-    }
-    let Ok(cardinality) = RoaringBitmap::len_bytes(data) else {
-        return 0;
-    };
-    cardinality
+    AxroarView::open(data).map_or(0, |view| u32::try_from(view.len()).unwrap_or(u32::MAX))
 }
 
-/// Validate a serialized bitmap and return its cardinality. A `None` result
-/// distinguishes malformed bytes from an empty bitmap.
+/// Verify a serialized bitmap in full and return its cardinality. A `None`
+/// result distinguishes malformed bytes from an empty bitmap.
 pub fn cardinality_validated(data: &[u8]) -> Option<u32> {
-    RoaringBitmap::len_bytes(data).ok()
+    if data.is_empty() {
+        return Some(0);
+    }
+    let view = AxroarView::open_verified(data)?;
+    u32::try_from(view.len()).ok()
 }
 
 /// Extract ascending values into `out`, capped at its length; return the count.
 pub fn extract_serialized(data: &[u8], out: &mut [u32]) -> u32 {
-    if data.is_empty() {
-        return 0;
-    }
-    let Ok(bm) = RoaringBitmap::deserialize_from(data) else {
+    let Some(view) = AxroarView::open(data) else {
         return 0;
     };
     let mut count = 0usize;
-    for v in bm.iter() {
-        if count >= out.len() {
-            break;
-        }
-        out[count] = v;
+    for (slot, value) in out.iter_mut().zip(view.range()) {
+        *slot = value;
         count += 1;
     }
     count as u32
 }
 
-/// Test whether two serialized bitmaps intersect.
+/// Test whether two serialized bitmaps intersect: the leapfrog merge stops
+/// at the first common member.
 pub fn intersects_serialized(left: &[u8], right: &[u8]) -> bool {
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-    match (
-        RoaringBitmap::deserialize_from(left),
-        RoaringBitmap::deserialize_from(right),
-    ) {
-        (Ok(l), Ok(r)) => !l.is_disjoint(&r),
+    match (AxroarView::open(left), AxroarView::open(right)) {
+        (Some(l), Some(r)) => !AndRange::leapfrog(l.range(), r.range()).empty(),
         _ => false,
     }
 }
 
 /// Count the intersection of two serialized bitmaps, saturating at `u32::MAX`.
 pub fn intersect_count_serialized(left: &[u8], right: &[u8]) -> u32 {
-    if left.is_empty() || right.is_empty() {
-        return 0;
-    }
-    match (
-        RoaringBitmap::deserialize_from(left),
-        RoaringBitmap::deserialize_from(right),
-    ) {
-        (Ok(l), Ok(r)) => u32::try_from(l.intersection_len(&r)).unwrap_or(u32::MAX),
+    match (AxroarView::open(left), AxroarView::open(right)) {
+        (Some(l), Some(r)) => u32::try_from(l.and_len(&r)).unwrap_or(u32::MAX),
         _ => 0,
     }
 }
 
 /// Apply set algebra and store the result in `env.algebra_result`, the
-/// VM-owned buffer exported by the wasm layer.
+/// VM-owned buffer exported by the wasm layer. Zero bytes are the empty
+/// result.
 pub fn set_algebra(
     env: &mut BitmapEnv,
     op: BitmapAlgebraOp,
@@ -604,26 +830,29 @@ pub fn set_algebra(
         };
     }
 
-    let Ok(l) = RoaringBitmap::deserialize_from(left) else {
+    let Some(l) = AxroarView::open(left) else {
         env.last_error = 71;
         return ErrorCode::InvalidState;
     };
-    let Ok(r) = RoaringBitmap::deserialize_from(right) else {
+    let Some(r) = AxroarView::open(right) else {
         env.last_error = 72;
         return ErrorCode::InvalidState;
     };
-    let mut result = match op {
-        BitmapAlgebraOp::And => l & r,
-        BitmapAlgebraOp::Or => l | r,
-        BitmapAlgebraOp::AndNot => l - r,
-        BitmapAlgebraOp::Xor => l ^ r,
+    let result = match op {
+        BitmapAlgebraOp::And => Axroar::from_sorted(AndRange::leapfrog(l.range(), r.range())),
+        BitmapAlgebraOp::Or => Axroar::from_sorted(OrRange::new(l.range(), r.range())),
+        BitmapAlgebraOp::AndNot => Axroar::from_sorted(AndNotRange::new(l.range(), r.range())),
+        BitmapAlgebraOp::Xor => Axroar::from_sorted(XorRange::new(l.range(), r.range())),
     };
-
-    result.optimize();
-
-    if result.serialize_into(&mut env.algebra_result).is_err() {
-        env.last_error = 75;
-        return ErrorCode::InvalidState;
+    if result.is_empty() {
+        return ErrorCode::Ok;
+    }
+    env.algebra_result.resize(result.forest_len(), 0);
+    if result
+        .write_forest_into_slice(&mut env.algebra_result)
+        .is_err()
+    {
+        columine_types::die!("forest_len sized the buffer the forest writer refused");
     }
     ErrorCode::Ok
 }

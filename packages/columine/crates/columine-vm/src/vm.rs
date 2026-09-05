@@ -14,7 +14,7 @@
 use crate::aggregates::{self, AggKind, TypeMask};
 use crate::bitmap_ops::{
     self, BitmapAlgebraOp, BitmapEnv, BitmapSource, batch_bitmap_add, batch_bitmap_algebra,
-    batch_bitmap_remove, bitmap_load, bitmap_select, bitmap_store, get_bitmap_storage,
+    batch_bitmap_remove, bitmap_patch, bitmap_select, get_bitmap_storage,
 };
 use crate::bytes;
 use crate::hash_table;
@@ -356,18 +356,13 @@ fn remove_entry_by_key(
         }
         SlotType::Bitmap => {
             let storage = get_bitmap_storage(meta);
-            let Some(mut bitmap) = bitmap_load(env, state, storage) else {
-                return false;
-            };
-            if !bitmap.remove(key) {
-                return false;
+            match bitmap_patch(env, state, storage, &[], &[key]) {
+                Ok(report) if report.removed == 1 => {
+                    meta.set_size(state, report.len as u32);
+                    true
+                }
+                _ => false,
             }
-            let cardinality = bitmap.len() as u32;
-            if bitmap_store(env, state, storage, &mut bitmap) != ErrorCode::Ok {
-                return false;
-            }
-            meta.set_size(state, cardinality);
-            true
         }
         SlotType::Array => {
             // Array slots use key_or_idx as the array index.
@@ -1015,15 +1010,10 @@ pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEnt
             let meta = SlotMetaView::read(state, entry.slot);
             if meta.slot_type() == SlotType::Bitmap {
                 let storage = get_bitmap_storage(&meta);
-                let Some(mut bitmap) = bitmap_load(env, state, storage) else {
-                    return;
-                };
-                if bitmap.remove(entry.key) {
-                    let cardinality = bitmap.len() as u32;
-                    if bitmap_store(env, state, storage, &mut bitmap) != ErrorCode::Ok {
-                        return;
-                    }
-                    meta.set_size(state, cardinality);
+                if let Ok(report) = bitmap_patch(env, state, storage, &[], &[entry.key])
+                    && report.removed == 1
+                {
+                    meta.set_size(state, report.len as u32);
                     if meta.has_ttl() {
                         remove_ttl_entries_for_key(state, &meta, entry.key);
                     }
@@ -1036,15 +1026,19 @@ pub fn rollback_entry(env: &mut BitmapEnv, state: &mut [u8], entry: &FlatUndoEnt
             let meta = SlotMetaView::read(state, entry.slot);
             if meta.slot_type() == SlotType::Bitmap {
                 let storage = get_bitmap_storage(&meta);
-                let Some(mut bitmap) = bitmap_load(env, state, storage) else {
-                    return;
+                // The element cap is a write-side admission rule; the undo of
+                // a delete re-admits only what the cap allows, exactly as the
+                // forward insert would.
+                let admitted = match storage.view(state) {
+                    Ok(view) => {
+                        view.is_some_and(|v| v.contains(entry.key))
+                            || view.map_or(0, |v| v.len()) < u64::from(meta.capacity)
+                    }
+                    Err(_) => false,
                 };
-                bitmap.insert(entry.key);
-                let cardinality = bitmap.len() as u32;
-                if cardinality <= meta.capacity
-                    && bitmap_store(env, state, storage, &mut bitmap) == ErrorCode::Ok
+                if admitted && let Ok(report) = bitmap_patch(env, state, storage, &[entry.key], &[])
                 {
-                    meta.set_size(state, cardinality);
+                    meta.set_size(state, report.len as u32);
                 }
                 if meta.has_ttl() {
                     remove_ttl_entries_for_key(state, &meta, entry.key);
