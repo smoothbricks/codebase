@@ -196,24 +196,42 @@ export async function cargoPackageTestInputs({
   inputRoot = '{projectRoot}',
 }: CargoPackageTestInputsOptions): Promise<string[]> {
   const workspacePathDeps = await workspacePathDependencies(absoluteProjectRoot);
-  const dirs = new Set<string>([memberDir.split('\\').join('/')]);
+  // The closure over in-tree path dependencies, not the direct edge set: a
+  // test binary links every crate beneath it, and the chained cargo-test
+  // targets order runs without contributing to each other's hash, so a
+  // dependency reachable only through another crate would otherwise change
+  // nothing in the target that links it.
+  const dirs = new Set<string>();
   const external = new Map<string, string>();
-  const crateParsed: unknown = parseToml(await readFile(join(absoluteProjectRoot, memberDir, 'Cargo.toml'), 'utf-8'));
-  if (isRecord(crateParsed)) {
+  const pending = [memberDir.split('\\').join('/')];
+  while (pending.length > 0) {
+    const dir = pending.pop();
+    if (dir === undefined || dirs.has(dir)) {
+      continue;
+    }
+    dirs.add(dir);
+    const crateTomlPath = join(absoluteProjectRoot, dir, 'Cargo.toml');
+    if (!existsSync(crateTomlPath)) {
+      continue;
+    }
+    const crateParsed: unknown = parseToml(await readFile(crateTomlPath, 'utf-8'));
+    if (!isRecord(crateParsed)) {
+      continue;
+    }
     for (const tableName of ['dependencies', 'dev-dependencies', 'build-dependencies'] as const) {
       const table = crateParsed[tableName];
       if (!isRecord(table)) {
         continue;
       }
       for (const [depName, spec] of Object.entries(table)) {
-        const pathDep = pathDependencyDir(memberDir, depName, spec, workspacePathDeps);
+        const pathDep = pathDependencyDir(dir, depName, spec, workspacePathDeps);
         if (pathDep === null) {
           continue;
         }
         if (pathDep.external) {
           external.set(depName, pathDep.dir);
         } else {
-          dirs.add(pathDep.dir);
+          pending.push(pathDep.dir);
         }
       }
     }
