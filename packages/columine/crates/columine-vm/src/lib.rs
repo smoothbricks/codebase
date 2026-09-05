@@ -19,6 +19,7 @@ pub mod hashset_ops;
 pub mod hooks;
 pub mod meta;
 pub mod nested;
+pub mod row_exprs;
 pub mod slot_growth;
 pub mod state_init;
 pub mod struct_map;
