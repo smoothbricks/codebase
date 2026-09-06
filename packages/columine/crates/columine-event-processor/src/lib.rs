@@ -268,7 +268,15 @@ pub struct EventProcessor {
     /// scanner path, so the four-column scanners can write by index.
     use_base_scanners: bool,
     record_batch_metadata: MetadataStorage,
-    pub seen: Option<SeenSet>,
+    /// One seen-set per destination log, opened by the log's own key. The
+    /// processor is shared by every agent of a type, so the set that answers
+    /// "was this id admitted to THIS log" cannot be the processor's: it is
+    /// the log's, and a batch staged for one log never blocks another.
+    logs: Vec<Option<SeenSet>>,
+    free_logs: Vec<u32>,
+    log_by_key: ptmcart_core::art::ArtMap<Box<[u8]>, u32>,
+    policy: CollisionPolicy,
+    column_capacity: u32,
     /// Signal types whose ids live in the ordinal namespace, sorted, so a
     /// row's namespace is one binary search over the type column.
     ordinal_id_types: Vec<Box<[u8]>>,
@@ -284,26 +292,11 @@ pub struct EventProcessor {
 
 impl EventProcessor {
     /// Init with schema + field names (the primary path; names enable JSON
-    /// key matching). `capacity` sizes the batch columns and, when
-    /// deduplication is enabled, is the seen-set's ceiling.
+    /// key matching). `column_capacity` sizes the batch columns; the wasm
+    /// exports build every handle at [`WASM_EVENT_CAPACITY`]. `policy` is
+    /// what every seen-set opened on this processor does with a duplicate.
     pub fn new(
         wiring: EpWiring,
-        capacity: u32,
-        policy: CollisionPolicy,
-        schema_config: DynamicSchemaConfig,
-    ) -> Result<Self, EpInitError> {
-        Self::with_column_capacity(wiring, capacity, capacity, policy, schema_config)
-    }
-
-    /// Init with a batch-column capacity distinct from the seen-set ceiling:
-    /// `seen_ceiling` is the host's declaration of how many ids the set may
-    /// hold per open (an admission past it is refused, never grown), while
-    /// the column plane is sized independently. The wasm exports build every
-    /// handle at [`WASM_EVENT_CAPACITY`]; native callers pass what they want
-    /// for both.
-    pub fn with_column_capacity(
-        wiring: EpWiring,
-        seen_ceiling: u32,
         column_capacity: u32,
         policy: CollisionPolicy,
         schema_config: DynamicSchemaConfig,
@@ -343,13 +336,11 @@ impl EventProcessor {
             use_base_scanners: wiring.base_path && schema_config.is_base_event_log,
             dynamic_columns: DynamicColumns::new(&schema_config.field_metadata, column_capacity),
             record_batch_metadata,
-            seen: wiring.dedup.then(|| {
-                SeenSet::new(
-                    policy,
-                    seen_ceiling,
-                    column_capacity.min(MAX_EVENTS_PER_BATCH),
-                )
-            }),
+            logs: Vec::new(),
+            free_logs: Vec::new(),
+            log_by_key: ptmcart_core::art::ArtMap::new(),
+            policy,
+            column_capacity: column_capacity.min(MAX_EVENTS_PER_BATCH),
             ordinal_id_types: Vec::new(),
             keep_mask: vec![0; (column_capacity.min(MAX_EVENTS_PER_BATCH) as usize).div_ceil(8)],
             extraction_config,
@@ -384,10 +375,72 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// Process one input batch into `output`:
+    /// Open (or find) the seen-set of the destination log named by `key`,
+    /// with `ceiling` as the most ids it may hold; the slot it answers is
+    /// what every dedup call names. A key already open keeps its set and its
+    /// ceiling. `Err` when this wiring has no dedup.
+    pub fn open_log(&mut self, key: &[u8], ceiling: u32) -> Result<u32, ResultCode> {
+        if !self.wiring.dedup || key.is_empty() {
+            return Err(ResultCode::InvalidInput);
+        }
+        if let Some(slot) = self.log_by_key.get(key) {
+            return Ok(*slot);
+        }
+        let set = SeenSet::new(self.policy, ceiling, self.column_capacity);
+        let slot = match self.free_logs.pop() {
+            Some(slot) => {
+                self.logs[slot as usize] = Some(set);
+                slot
+            }
+            None => {
+                let slot = u32::try_from(self.logs.len()).map_err(|_| ResultCode::OutOfMemory)?;
+                self.logs.push(Some(set));
+                slot
+            }
+        };
+        self.log_by_key.insert(Box::from(key), slot);
+        Ok(slot)
+    }
+
+    /// Close the seen-set opened for `key`, releasing what it holds.
+    /// `InvalidInput` when no such log is open.
+    pub fn close_log(&mut self, key: &[u8]) -> ResultCode {
+        let Some(slot) = self.log_by_key.remove(key) else {
+            return ResultCode::InvalidInput;
+        };
+        self.logs[slot as usize] = None;
+        self.free_logs.push(slot);
+        ResultCode::Ok
+    }
+
+    /// The seen-set at `slot`, if open.
+    pub fn log(&self, slot: u32) -> Option<&SeenSet> {
+        self.logs.get(slot as usize).and_then(Option::as_ref)
+    }
+
+    fn log_mut(&mut self, slot: u32) -> Option<&mut SeenSet> {
+        self.logs.get_mut(slot as usize).and_then(Option::as_mut)
+    }
+
+    /// Process one input batch into `output` with no seen-set — validation
+    /// and encoding only, the admission boundary's call:
     /// `[ResultHeader 32B][Arrow IPC stream]`. Returns the header's code.
     pub fn create_log_entry(
         &mut self,
+        input: &[u8],
+        format: InputFormat,
+        output: &mut [u8],
+    ) -> ResultCode {
+        self.create_log_entry_for(None, input, format, output)
+    }
+
+    /// Process one input batch destined for the log at `log` (a slot from
+    /// [`EventProcessor::open_log`]; `None` judges nothing): the batch is
+    /// judged against that log's seen-set and staged there until
+    /// [`EventProcessor::commit_batch`] or [`EventProcessor::abandon_batch`].
+    pub fn create_log_entry_for(
+        &mut self,
+        log: Option<u32>,
         input: &[u8],
         format: InputFormat,
         output: &mut [u8],
@@ -428,7 +481,13 @@ impl EventProcessor {
         if self.use_base_scanners {
             return self.create_log_entry_base(input, format, output, arrow_offset);
         }
-        self.create_log_entry_dynamic(input, format, output, arrow_offset)
+        if let Some(slot) = log
+            && self.log(slot).is_none()
+        {
+            write_result_header(output, ResultCode::InvalidInput, 0, 0, 0, 0);
+            return ResultCode::InvalidInput;
+        }
+        self.create_log_entry_dynamic(log, input, format, output, arrow_offset)
     }
     fn validate_input(
         &self,
@@ -604,6 +663,7 @@ impl EventProcessor {
     /// dynamic writer.
     fn create_log_entry_dynamic(
         &mut self,
+        log: Option<u32>,
         input: &[u8],
         format: InputFormat,
         output: &mut [u8],
@@ -666,10 +726,11 @@ impl EventProcessor {
             return code;
         }
 
-        // Dedup: judge event ids from column 0 (type from column 1) when
-        // consumer wiring is enabled; discarded rows leave the batch.
+        // Dedup: judge event ids from column 0 (type from column 1) against
+        // the destination log's seen-set; discarded rows leave the batch.
+        let seen = log.and_then(|slot| self.logs.get_mut(slot as usize).and_then(Option::as_mut));
         let (processed, duplicates) = match judge_batch(
-            self.seen.as_mut(),
+            seen,
             &self.ordinal_id_types,
             &mut self.dynamic_columns,
             &mut self.keep_mask,
@@ -770,26 +831,26 @@ impl EventProcessor {
         }
     }
 
-    /// Bytes a checkpoint of the seen-set takes right now; 0 when no dedup
-    /// is wired.
-    pub fn checkpoint_len(&self) -> usize {
-        self.seen.as_ref().map_or(0, SeenSet::checkpoint_len)
+    /// Bytes a checkpoint of the log's seen-set takes right now; 0 when no
+    /// such log is open.
+    pub fn checkpoint_len(&self, log: u32) -> usize {
+        self.log(log).map_or(0, SeenSet::checkpoint_len)
     }
 
-    /// Checkpoint the seen-set into `output`; 0 = error (no dedup wired or
-    /// buffer too small), matching `ep_checkpoint`'s sentinel.
-    pub fn checkpoint(&self, output: &mut [u8]) -> usize {
-        let Some(seen) = self.seen.as_ref() else {
+    /// Checkpoint the log's seen-set into `output`; 0 = error (no such log
+    /// or buffer too small), matching `ep_checkpoint`'s sentinel.
+    pub fn checkpoint(&self, log: u32, output: &mut [u8]) -> usize {
+        let Some(seen) = self.log(log) else {
             return 0;
         };
         seen.checkpoint(output).unwrap_or(0)
     }
 
-    /// Restore the seen-set from checkpoint bytes (`ep_restore`). The
-    /// instance keeps its own ceiling; a checkpoint that does not fit under
-    /// it is refused with the set untouched.
-    pub fn restore(&mut self, input: &[u8]) -> ResultCode {
-        let Some(seen) = self.seen.as_mut() else {
+    /// Restore the log's seen-set from checkpoint bytes (`ep_restore`). The
+    /// set keeps the ceiling it was opened with; a checkpoint that does not
+    /// fit under it is refused with the set untouched.
+    pub fn restore(&mut self, log: u32, input: &[u8]) -> ResultCode {
+        let Some(seen) = self.log_mut(log) else {
             return ResultCode::InvalidInput;
         };
         match seen.restore(input) {
@@ -801,10 +862,10 @@ impl EventProcessor {
         }
     }
 
-    /// Packed dedup stats (`ep_get_stats`):
+    /// Packed dedup stats of the log's seen-set (`ep_get_stats`):
     /// `total_events as u32 | duplicates as u32 << 32` (u32 truncation is ABI).
-    pub fn stats(&self) -> u64 {
-        let Some(seen) = self.seen.as_ref() else {
+    pub fn stats(&self, log: u32) -> u64 {
+        let Some(seen) = self.log(log) else {
             return 0;
         };
         let total = seen.total_events as u32;
@@ -812,34 +873,35 @@ impl EventProcessor {
         u64::from(total) | (u64::from(dupes) << 32)
     }
 
-    /// Bind the staged batch's admissions to the tx the log assigned it.
-    /// `InvalidInput` when no dedup is wired.
-    pub fn commit_batch(&mut self, tx: u64) -> ResultCode {
-        let Some(seen) = self.seen.as_mut() else {
+    /// Bind the log's staged batch to the tx the log assigned it.
+    /// `InvalidInput` when no such log is open.
+    pub fn commit_batch(&mut self, log: u32, tx: u64) -> ResultCode {
+        let Some(seen) = self.log_mut(log) else {
             return ResultCode::InvalidInput;
         };
         seen.commit(tx);
         ResultCode::Ok
     }
 
-    /// Retract the staged batch: the append did not happen.
-    pub fn abandon_batch(&mut self) -> ResultCode {
-        let Some(seen) = self.seen.as_mut() else {
+    /// Retract the log's staged batch: the append did not happen.
+    pub fn abandon_batch(&mut self, log: u32) -> ResultCode {
+        let Some(seen) = self.log_mut(log) else {
             return ResultCode::InvalidInput;
         };
         seen.abandon();
         ResultCode::Ok
     }
 
-    /// Evict every admission below the redelivery horizon; the count that
-    /// left the set, 0 when no dedup is wired.
-    pub fn cut_below(&mut self, horizon: u64) -> u32 {
-        self.seen.as_mut().map_or(0, |seen| seen.cut_below(horizon))
+    /// Evict every admission of the log below the redelivery horizon; the
+    /// count that left the set, 0 when no such log is open.
+    pub fn cut_below(&mut self, log: u32, horizon: u64) -> u32 {
+        self.log_mut(log).map_or(0, |seen| seen.cut_below(horizon))
     }
 
-    /// The tx that admitted `id`: the byproduct read of the seen-set.
-    pub fn admitted_tx(&self, id: &[u8], namespace: IdNamespace) -> AdmittedTx {
-        let Some(seen) = self.seen.as_ref() else {
+    /// The tx that admitted `id` to the log: the byproduct read of the
+    /// seen-set.
+    pub fn admitted_tx(&self, log: u32, id: &[u8], namespace: IdNamespace) -> AdmittedTx {
+        let Some(seen) = self.log(log) else {
             return AdmittedTx::Absent;
         };
         match namespace {
@@ -852,12 +914,14 @@ impl EventProcessor {
     }
 
     /// Declare the signal types whose ids live in the ordinal namespace:
-    /// NUL-separated names, declared once per open before the first batch.
+    /// NUL-separated names, declared once per processor before any log is
+    /// opened.
     pub fn declare_ordinal_id_types(&mut self, names: &[u8]) -> ResultCode {
-        let Some(seen) = self.seen.as_ref() else {
-            return ResultCode::InvalidInput;
-        };
-        if !self.ordinal_id_types.is_empty() || !seen.is_empty() || names.is_empty() {
+        if !self.wiring.dedup
+            || !self.ordinal_id_types.is_empty()
+            || !self.logs.is_empty()
+            || names.is_empty()
+        {
             return ResultCode::InvalidInput;
         }
         let mut types: Vec<Box<[u8]>> = names
@@ -880,14 +944,11 @@ impl EventProcessor {
     /// two ingest paths can disagree about what a duplicate is.
     pub fn judge_rows(
         &mut self,
+        log: Option<u32>,
         columns: &mut DynamicColumns,
     ) -> Result<(u32, u32), ResultDiagnostic> {
-        judge_batch(
-            self.seen.as_mut(),
-            &self.ordinal_id_types,
-            columns,
-            &mut self.keep_mask,
-        )
+        let seen = log.and_then(|slot| self.logs.get_mut(slot as usize).and_then(Option::as_mut));
+        judge_batch(seen, &self.ordinal_id_types, columns, &mut self.keep_mask)
     }
 
     /// The namespace a row's type column selects.
@@ -1162,8 +1223,9 @@ mod tests {
         assert!(arrow_len > 0);
         assert_eq!(processed, 2);
         assert_eq!(dupes, 0);
-        // No dedup wired.
-        assert_eq!(ep.stats(), 0);
+        // No dedup wired: a log cannot be opened, and no slot answers.
+        assert_eq!(ep.open_log(b"log", 10), Err(ResultCode::InvalidInput));
+        assert_eq!(ep.stats(0), 0);
     }
 
     /// Base and extraction paths emit byte-identical IPC for the same
@@ -1241,9 +1303,11 @@ mod tests {
         );
     }
 
-    /// The consumer wiring drops discarded duplicates from the batch, counts
-    /// them in the header, and the committed set survives a checkpoint/restore
-    /// round trip into an instance with its own ceiling.
+    /// The consumer wiring judges a batch against the destination log's own
+    /// seen-set — a batch staged for one log never blocks another — drops
+    /// discarded duplicates from the batch, counts them in the header, and
+    /// the committed set survives a checkpoint/restore round trip into a
+    /// log opened with its own ceiling.
     #[test]
     fn dedup_and_checkpoint_through_ep() {
         let schema = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
@@ -1256,8 +1320,20 @@ mod tests {
         .unwrap();
         let input = br#"[{"id":"dup","type":"a","timestamp":1},{"id":"dup","type":"a","timestamp":2},{"id":"uniq","type":"a","timestamp":3}]"#;
         let mut output = vec![0u8; 64 * 1024];
+        // With no log named, the batch is validated and encoded, nothing
+        // judged: the admission boundary's call.
         assert_eq!(
             ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ResultCode::Ok
+        );
+        let header = read_result_header(&output);
+        assert_eq!((header.3, header.4), (3, 0));
+        let log = ep.open_log(b"log-a", 100).unwrap();
+        assert_eq!(ep.open_log(b"log-a", 5).unwrap(), log, "a key opens once");
+        let other = ep.open_log(b"log-b", 100).unwrap();
+        assert_ne!(log, other);
+        assert_eq!(
+            ep.create_log_entry_for(Some(log), input, InputFormat::Json, &mut output),
             ResultCode::Ok
         );
         let (_, arrow_offset, arrow_len, processed, dupes) = read_result_header(&output);
@@ -1268,27 +1344,37 @@ mod tests {
         assert_eq!(body.windows(3).filter(|w| *w == b"dup").count(), 1);
         assert!(body.windows(4).any(|w| w == b"uniq"));
         // Stats and the checkpoint see only committed batches.
-        assert_eq!(ep.stats(), 0);
-        assert_eq!(ep.checkpoint_len(), dedup::checkpoint::HEADER_SIZE);
+        assert_eq!(ep.stats(log), 0);
+        assert_eq!(ep.checkpoint_len(log), dedup::checkpoint::HEADER_SIZE);
         assert_eq!(
-            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ep.create_log_entry_for(Some(log), input, InputFormat::Json, &mut output),
             ResultCode::BatchPending,
             "a staged batch must be committed or abandoned before the next",
         );
-        assert_eq!(ep.commit_batch(7), ResultCode::Ok);
-        assert_eq!(ep.stats(), 3 | (1 << 32));
+        // Another log's batch is not blocked by this log's staged one.
         assert_eq!(
-            ep.admitted_tx(b"dup", IdNamespace::Bytes),
+            ep.create_log_entry_for(Some(other), input, InputFormat::Json, &mut output),
+            ResultCode::Ok
+        );
+        assert_eq!(ep.abandon_batch(other), ResultCode::Ok);
+        assert_eq!(ep.commit_batch(log, 7), ResultCode::Ok);
+        assert_eq!(ep.stats(log), 3 | (1 << 32));
+        assert_eq!(
+            ep.admitted_tx(log, b"dup", IdNamespace::Bytes),
             AdmittedTx::At(7)
         );
         assert_eq!(
-            ep.admitted_tx(b"nope", IdNamespace::Bytes),
+            ep.admitted_tx(other, b"dup", IdNamespace::Bytes),
+            AdmittedTx::Absent
+        );
+        assert_eq!(
+            ep.admitted_tx(log, b"nope", IdNamespace::Bytes),
             AdmittedTx::Absent
         );
 
         let mut checkpoint_buf = vec![0u8; 8192];
-        let size = ep.checkpoint(&mut checkpoint_buf);
-        assert_eq!(size, ep.checkpoint_len());
+        let size = ep.checkpoint(log, &mut checkpoint_buf);
+        assert_eq!(size, ep.checkpoint_len(log));
 
         let schema2 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
         let mut restored = EventProcessor::new(
@@ -1298,35 +1384,44 @@ mod tests {
             schema2,
         )
         .unwrap();
-        assert_eq!(restored.restore(&checkpoint_buf[..size]), ResultCode::Ok);
+        let rlog = restored.open_log(b"log-a", 100).unwrap();
+        assert_eq!(
+            restored.restore(rlog, &checkpoint_buf[..size]),
+            ResultCode::Ok
+        );
         // The restored set still knows both ids, at the tx that admitted them.
         assert_eq!(
-            restored.admitted_tx(b"dup", IdNamespace::Bytes),
+            restored.admitted_tx(rlog, b"dup", IdNamespace::Bytes),
             AdmittedTx::At(7)
         );
         assert_eq!(
-            restored.admitted_tx(b"uniq", IdNamespace::Bytes),
+            restored.admitted_tx(rlog, b"uniq", IdNamespace::Bytes),
             AdmittedTx::At(7)
         );
-        assert_eq!(restored.stats(), 3 | (1 << 32));
+        assert_eq!(restored.stats(rlog), 3 | (1 << 32));
         // Cutting below the horizon evicts them; the ids are new again.
-        assert_eq!(restored.cut_below(8), 2);
+        assert_eq!(restored.cut_below(rlog, 8), 2);
         assert_eq!(
-            restored.admitted_tx(b"dup", IdNamespace::Bytes),
+            restored.admitted_tx(rlog, b"dup", IdNamespace::Bytes),
             AdmittedTx::Absent
         );
+        // Closing the log frees its slot for the next key.
+        assert_eq!(restored.close_log(b"log-a"), ResultCode::Ok);
+        assert_eq!(restored.close_log(b"log-a"), ResultCode::InvalidInput);
+        assert_eq!(restored.open_log(b"log-c", 100).unwrap(), rlog);
 
         // A ceiling the checkpoint does not fit under refuses the restore.
         let schema3 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
         let mut tight = EventProcessor::new(
             EpWiring::consumer_variant(),
-            1,
+            100,
             CollisionPolicy::Discard,
             schema3,
         )
         .unwrap();
+        let tlog = tight.open_log(b"log-a", 1).unwrap();
         assert_eq!(
-            tight.restore(&checkpoint_buf[..size]),
+            tight.restore(tlog, &checkpoint_buf[..size]),
             ResultCode::AdmissionRefused
         );
     }
@@ -1348,34 +1443,32 @@ mod tests {
             r#"[{{"id":"fine","type":"a","timestamp":1}},{{"id":"{long}","type":"a","timestamp":2}}]"#
         );
         let mut output = vec![0u8; 64 * 1024];
+        let log = ep.open_log(b"log", 100).unwrap();
         assert_eq!(
-            ep.create_log_entry(input.as_bytes(), InputFormat::Json, &mut output),
+            ep.create_log_entry_for(Some(log), input.as_bytes(), InputFormat::Json, &mut output),
             ResultCode::AdmissionRefused
         );
         assert_eq!(output[21], diagnostic_stage::DEDUP);
         assert_eq!(output[22], dedup_detail::ID_TOO_LONG);
         assert_eq!(u16::from_le_bytes([output[28], output[29]]), 1);
-        let seen = ep.seen.as_ref().unwrap();
+        let seen = ep.log(log).unwrap();
         assert!(seen.is_empty());
         assert!(!seen.is_batch_open());
+        // A slot that was never opened is refused by name, not judged.
+        assert_eq!(
+            ep.create_log_entry_for(Some(99), input.as_bytes(), InputFormat::Json, &mut output),
+            ResultCode::InvalidInput
+        );
 
         // The ceiling refuses at admission, the same way.
-        let schema2 = schema_with_names(&base_fields(), b"id\0type\0timestamp\0value\0");
-        let mut small = EventProcessor::with_column_capacity(
-            EpWiring::consumer_variant(),
-            1,
-            100,
-            CollisionPolicy::Discard,
-            schema2,
-        )
-        .unwrap();
+        let small = ep.open_log(b"small", 1).unwrap();
         let two = br#"[{"id":"a","type":"a","timestamp":1},{"id":"b","type":"a","timestamp":2}]"#;
         assert_eq!(
-            small.create_log_entry(two, InputFormat::Json, &mut output),
+            ep.create_log_entry_for(Some(small), two, InputFormat::Json, &mut output),
             ResultCode::AdmissionRefused
         );
         assert_eq!(output[22], dedup_detail::CEILING_REACHED);
-        assert!(small.seen.as_ref().unwrap().is_empty());
+        assert!(ep.log(small).unwrap().is_empty());
     }
 
     /// A signal type declared in the ordinal namespace judges its ids as
@@ -1394,26 +1487,30 @@ mod tests {
         assert_eq!(
             ep.declare_ordinal_id_types(b"tock\0"),
             ResultCode::InvalidInput,
-            "declared once per open"
+            "declared once per processor"
         );
+        let log = ep.open_log(b"log", 100).unwrap();
         let input = br#"[{"id":"7","type":"tick","timestamp":1},{"id":"7","type":"other","timestamp":2},{"id":"7","type":"tick","timestamp":3}]"#;
         let mut output = vec![0u8; 64 * 1024];
         assert_eq!(
-            ep.create_log_entry(input, InputFormat::Json, &mut output),
+            ep.create_log_entry_for(Some(log), input, InputFormat::Json, &mut output),
             ResultCode::Ok
         );
         let (_, _, _, processed, dupes) = read_result_header(&output);
         assert_eq!((processed, dupes), (2, 1));
-        assert_eq!(ep.commit_batch(1), ResultCode::Ok);
+        assert_eq!(ep.commit_batch(log, 1), ResultCode::Ok);
         assert_eq!(
-            ep.admitted_tx(b"7", IdNamespace::Ordinal),
+            ep.admitted_tx(log, b"7", IdNamespace::Ordinal),
             AdmittedTx::Member
         );
-        assert_eq!(ep.admitted_tx(b"7", IdNamespace::Bytes), AdmittedTx::At(1));
+        assert_eq!(
+            ep.admitted_tx(log, b"7", IdNamespace::Bytes),
+            AdmittedTx::At(1)
+        );
 
         let bad = br#"[{"id":"07","type":"tick","timestamp":1}]"#;
         assert_eq!(
-            ep.create_log_entry(bad, InputFormat::Json, &mut output),
+            ep.create_log_entry_for(Some(log), bad, InputFormat::Json, &mut output),
             ResultCode::AdmissionRefused
         );
         assert_eq!(output[22], dedup_detail::NOT_AN_ORDINAL);
@@ -1541,8 +1638,6 @@ mod tests {
         assert_eq!(diagnostic.event_index, 0);
         assert_eq!(diagnostic.signal_type, "hi");
         assert_eq!(read_result_header(&output).0, ResultCode::ParseError as u32);
-        assert_eq!(ep.stats(), 0);
-        assert!(!ep.seen.as_ref().unwrap().is_batch_open());
         assert!(output[32..].iter().all(|byte| *byte == 0xa5));
     }
 }

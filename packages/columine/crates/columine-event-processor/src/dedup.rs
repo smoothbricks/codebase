@@ -258,11 +258,13 @@ impl fmt::Debug for SeenSet {
 
 impl SeenSet {
     /// A set that may hold at most `ceiling` ids across both carriers, judged
-    /// in batches of at most `batch_rows` rows. The batch staging is
-    /// reserved here so judging a batch allocates nothing; the carriers grow
-    /// with what they hold.
+    /// in batches of at most `batch_rows` rows. Nothing is reserved: one
+    /// processor opens a set per destination log, and a log that sees ten
+    /// ids costs ten ids. The staging vectors grow to the first batch's
+    /// width and stay there, so judging a batch allocates nothing after the
+    /// first.
     pub fn new(policy: CollisionPolicy, ceiling: u32, batch_rows: u32) -> Self {
-        let batch_rows = batch_rows as usize;
+        debug_assert!(batch_rows > 0, "a batch holds at least one row");
         Self {
             policy,
             ceiling,
@@ -271,8 +273,8 @@ impl SeenSet {
             ordinal: AxroarBuilder::new(),
             ordinal_len: 0,
             ordinal_window: VecDeque::new(),
-            staged_keys: Vec::with_capacity(batch_rows),
-            staged_ordinals: Vec::with_capacity(batch_rows),
+            staged_keys: Vec::new(),
+            staged_ordinals: Vec::new(),
             batch_open: false,
             batch_total: 0,
             batch_duplicates: 0,
