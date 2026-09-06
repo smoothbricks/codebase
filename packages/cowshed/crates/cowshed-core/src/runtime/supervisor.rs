@@ -1136,7 +1136,8 @@ async fn sandboxed_command(
         .env("XDG_RUNTIME_DIR", &runtime_link)
         // Nx ignores XDG_RUNTIME_DIR and otherwise falls back to a world-shared
         // directory or a private HOME path longer than Unix sockets permit.
-        .env("NX_SOCKET_DIR", &runtime_link)
+        // Its O_NOFOLLOW admission requires a real leaf below the short alias.
+        .env("NX_SOCKET_DIR", runtime_link.join("nx"))
         .env("PWD", &plan.cwd)
         .env(GO_ENV, private_cache.join("go/env"))
         // rustc-wrapper clients speak to the host-owned sccache daemon; the

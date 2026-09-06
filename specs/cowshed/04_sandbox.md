@@ -459,9 +459,10 @@ Devenv resolves runtime state beneath `XDG_RUNTIME_DIR`, independently of `TMPDI
 workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the writable per-exec temporary
 directory. Both are prepared before activation. The child may write these scoped directories, but the baseline still
 denies writes to the world-shared `/private/tmp`; shell activation does not require a blanket temporary-directory grant.
-Nx receives that same short workspace-owned directory through `NX_SOCKET_DIR`: Nx does not use `XDG_RUNTIME_DIR`, and
-its default shared-temp directory is outside the sandbox. Its daemon and isolated plugin workers remain enabled; socket
-placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
+Nx receives a real `nx` child directory below the short runtime alias through `NX_SOCKET_DIR`. Its `O_NOFOLLOW`
+admission rejects a symlink at the leaf, so the alias itself is not its socket directory. Nx does not use
+`XDG_RUNTIME_DIR`, and its default shared-temp directory is outside the sandbox. Its daemon and isolated plugin workers
+remain enabled; socket placement is a Cowshed runtime binding, not a per-project flag or filesystem grant.
 
 On macOS, port collisions between workspaces are handled by the per-workspace port block, not left to the user:
 `devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base), so two workspaces running the

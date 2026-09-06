@@ -231,7 +231,11 @@ async fn nx_runtime_directory_supports_real_unix_socket_roundtrips() {
     install_real_tool(&sandbox, "node");
     let script = r#"
 const net = require('node:net');
-const path = require('node:path').join(process.env.NX_SOCKET_DIR, 'p12345-3-plugin.sock');
+const fs = require('node:fs');
+const directory = process.env.NX_SOCKET_DIR;
+fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+fs.closeSync(fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW));
+const path = require('node:path').join(directory, 'p12345-3-plugin.sock');
 const server = net.createServer(socket => socket.end('nx-private-socket'));
 server.listen(path, () => {
     const client = net.createConnection(path);
