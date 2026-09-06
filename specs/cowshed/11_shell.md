@@ -5,26 +5,24 @@ mounts, sandbox profiles, grants) and every client that runs commands (CLI, MCP,
 supervisor per workspace holding a pool of warm shells with the composed environment already loaded, a framed stdio
 protocol over a Unix socket, job control, and the single exec-record capture that all clients consume.
 
-## Why a pool at all — honest calibration
+## Shell activation and process reuse
 
-A fresh workspace is a CoW clone of main, so it inherits main's `.direnv`/`.devenv` caches; whether that makes a fresh
-clone's _first_ evaluation cheap is a listed verification item (04_sandbox.md, devenv section — it needs a real
-`cowshed new` to test). What is already measured is the steady state: **a warm `direnv exec` on a devenv repo costs
-~1.3–2.9 s per invocation** — `direnv export` dominates, dwarfing `sandbox-exec` startup and shell init. That makes the
-pool load-bearing, not a nicety: per-command environment composition (04's exec pipeline wraps every command in
-fail-closed `direnv export`) is too slow to pay per exec across the dozens of commands an agent or CI job runs. The
-pool's value:
+A fresh workspace is a CoW clone of main, including its `.direnv`/`.devenv` caches. These are inputs to canonical
+activation, not proof that an exported environment snapshot is current. The measured steady state is that **a warm
+`direnv exec` on a devenv repo costs ~1.3–2.9 s per invocation** — activation dominates, dwarfing `sandbox-exec` startup
+and shell init. The exec pipeline uses canonical activation rather than reconstructing an environment snapshot: every
+newly spawned command or shell enters through fail-closed `direnv exec` or configured `devenv shell` (04_sandbox.md).
+Any shell reuse must preserve that activation contract, including repository entry hooks and current workspace
+configuration. The pool's other roles:
 
-- **The per-command residual, measured ~1.5–3 s on a devenv repo** — paid once per warm shell instead of once per
-  command.
 - **Persistent shell state** — a named session keeps cwd, shell variables, and running jobs across calls, so an agent's
   multi-step task is one shell, not N independent `sandbox-exec` spawns.
 - **The framed stdio protocol** — multiplexed, backpressured, language-neutral I/O for concurrent CLI, NAPI, MCP, and CI
   clients, instead of each reinventing pipe plumbing.
 - **Job control** — timeouts, auto-backgrounding, re-attach, structured capture.
 
-The spec still states plainly: the pool is not what makes cowshed fast — the CoW clone and warm caches are that thing.
-The pool is what keeps the _per-command_ cost from eating those wins.
+The CoW clone and warm build caches are distinct from shell reuse. Neither justifies bypassing repository activation or
+replaying a supervisor-owned environment in place of its shell entry hooks.
 
 ## Supervisor
 
@@ -32,13 +30,13 @@ One supervisor process per attached workspace, spawned on first exec (or by `cow
 Each instance is launched once per effective filesystem grant revision under that revision's workspace sandbox profile.
 That outer profile is the authority ceiling and gives the trusted supervisor protected-artifact write access. The
 supervisor itself never evaluates `.envrc`, sources shell startup, or runs repository hooks. It installs the
-deterministic inner child profile first, then starts a restricted environment-loader child and every anonymous shell,
-named session, one-shot, and descendant beneath that restriction. The child profile denies writes beneath
-`.cowshed/job/**` and may further narrow for ReadOnly; it never adds authority (04_sandbox.md).
+deterministic inner child profile first, then starts canonical shell activation and every anonymous shell, named
+session, one-shot, and descendant beneath that restriction and inside the job process group. The child profile denies
+writes beneath `.cowshed/job/**` and may further narrow for ReadOnly; it never adds authority (04_sandbox.md).
 
-- Holds K warm restricted shells (default 2, `.cowshed.toml` `[shell] pool`). Each receives the environment returned by
-  a restricted fail-closed `direnv export` loader; no repository-controlled startup runs in the supervisor. Anonymous
-  shells reset cwd/environment/shell variables and return to the pool after each exec.
+- Holds K warm restricted shells (default 2, `.cowshed.toml` `[shell] pool`). Shell startup uses the same canonical
+  activation as one-shot commands, inside the child sandbox; no repository-controlled startup runs in the supervisor.
+  Anonymous shells reset cwd/environment/shell variables and return to the pool after each exec.
 - **Named sessions** (`--session <name>`, `WorkspaceHandle::shell(Some(name))`) are persistent shells outside the pool:
   state survives across calls until explicitly closed or the supervisor stops. This is how a coordinator gives one
   subagent a stable shell for a multi-step task.
@@ -296,8 +294,8 @@ profile changes. The old supervisor cannot widen or revoke its inherited authori
 
 1. stops accepting new exec submissions and marks anonymous pooled shells stale;
 2. drains jobs already admitted under the old revision, then closes its pooled shells and exits;
-3. is relaunched by the controller under a supervisor profile compiled from the new grant revision, re-applying the
-   cached environment snapshot (no Nix re-evaluation — the environment is unchanged, only the sandbox boundary moved);
+3. is relaunched by the controller under a supervisor profile compiled from the new grant revision; new children use
+   canonical activation under that revision, without a supervisor-owned environment snapshot;
 4. reports the new enforced `grant_revision` on subsequent jobs.
 
 Running jobs launched under the old profile continue under it until they end or are killed. A coordinator needing a hard

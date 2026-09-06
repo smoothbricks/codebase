@@ -10,15 +10,17 @@ No mounts, no root, no network — pure functions with table-driven cases:
 
 - **Sandbox rule generation** (Seatbelt profile text and Landlock ruleset spec, from the same grant snapshot): closed
   baseline shape, grant snapshot inclusion, secret denies present regardless of grants (by omission on Landlock; on
-  Seatbelt by **ordering** — see next bullet), ReadOnly drops mount writes, grant-intersects-deny refusal, path
-  canonicalization/escaping (including unix-socket rule paths: the kernel matches canonical targets, so a `/tmp`-spelled
-  rule silently denies — measured).
-- **Profile ordering invariant (layered)**: SBPL is last-match-wins (measured — the same rules in the opposite order
-  leave a secret readable), so every generated profile MUST emit its four layers in order: broad allows → the
-  `/private/cowshed/store` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes, own mount) → secret
-  denies (04_sandbox.md). This test asserts the layer order structurally over generated grant sets AND by probe paths:
-  grant file, CA key, sibling image, sibling mount must resolve to deny; own mount and designated cache subtrees to
-  allow; secret paths to deny regardless of grants. The entire secret-protection model depends on it.
+  Seatbelt by **operation specificity and ordering** — see next bullet), ReadOnly drops mount writes,
+  grant-intersects-deny refusal, path canonicalization/escaping (including unix-socket rule paths: the kernel matches
+  canonical targets, so a `/tmp`-spelled rule silently denies — measured).
+- **Profile specificity and ordering invariant (layered)**: an explicit broad `allow file-read-data` defeats a later
+  wildcard `deny file-read*`; read denials must name `file-read-data` explicitly (04_sandbox.md). Every generated
+  profile MUST also emit its four layers in order: broad allows → the `/private/cowshed/store` volume-wide deny → scoped
+  carve-backs (caches read, designated cache-subtree writes, own mount) → secret denies (04_sandbox.md). This test
+  asserts the layer order structurally over generated grant sets AND by probe paths: grant file, CA key, sibling image,
+  sibling mount must resolve to deny; own mount and designated cache subtrees to allow; secret paths to deny regardless
+  of grants. Real Seatbelt probes must confirm data reads are denied, not merely that deny text occurs later in the
+  generated profile.
 - **Path policy**: cwd validation, `..`/symlink-shape normalization, workspace-name validation.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
   (`*.github.com`), port defaults.

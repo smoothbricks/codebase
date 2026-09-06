@@ -32,19 +32,19 @@ The cost is sibling workspaces duplicating entries fetched post-clone — bounde
 
 ## The three layers
 
-| Layer                         | Contents                                                                                                                  | Location                                                                                           | Sharing                                   |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| Layer                         | Contents                                                                                                                  | Location                                                                                                       | Sharing                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
 | 1. Gateway mirrors            | npm tarballs, crate files, registry metadata, bare repository mirrors                                                     | `/private/cowshed/caches/mirror` and `/private/cowshed/caches/repo-mirrors` (gateway-owned, sandbox-read-only) | Global, written only by cowshed-gateway   |
-| 2. Clone-materializing caches | bun install cache — **today: bun, on APFS; possibly nothing at all on ZFS**                                               | Inside each workspace image under `.cowshed/cache/bun`                                             | Inherited from main via CoW at clone time |
-| 3. Read-at-build caches       | Cargo registry/git extraction caches, Go module + build caches, sccache, zig global cache, gradle, Nix eval/fetcher state | Dedicated writable roots under `/private/cowshed/caches/` reached through tool defaults or direct config | Shared writable by all workspaces         |
+| 2. Clone-materializing caches | bun install cache — **today: bun, on APFS; possibly nothing at all on ZFS**                                               | Inside each workspace image under `.cowshed/cache/bun`                                                         | Inherited from main via CoW at clone time |
+| 3. Read-at-build caches       | Cargo registry/git extraction caches, Go module + build caches, sccache, zig global cache, gradle, Nix eval/fetcher state | Dedicated writable roots under `/private/cowshed/caches/` reached through tool defaults or direct config       | Shared writable by all workspaces         |
 
 Layer 1 removes duplicate _downloads_ (and stores compressed bytes once, ever). Bare repository mirrors live only at
-`/private/cowshed/caches/repo-mirrors/<host>/<path>.git`; they are written by the gateway's `repo mirror` control-plane verb
-and are read-only to workspaces and main. Cargo's `~/.cargo/git` is **not** that mirror tree: it is a shared writable
-Cargo extraction/index cache at `/private/cowshed/caches/cargo/git`. The two have distinct ownership, permissions, and paths,
-so a Cargo process can never mutate gateway repository mirrors. Layer 2 is one special case, not a category: it exists
-exactly where a tool reflinks out of its cache and the substrate cannot reflink across volume boundaries. Layer 3 caches
-are read at build time and write nowhere near the workspace, so sharing them is free.
+`/private/cowshed/caches/repo-mirrors/<host>/<path>.git`; they are written by the gateway's `repo mirror` control-plane
+verb and are read-only to workspaces and main. Cargo's `~/.cargo/git` is **not** that mirror tree: it is a shared
+writable Cargo extraction/index cache at `/private/cowshed/caches/cargo/git`. The two have distinct ownership,
+permissions, and paths, so a Cargo process can never mutate gateway repository mirrors. Layer 2 is one special case, not
+a category: it exists exactly where a tool reflinks out of its cache and the substrate cannot reflink across volume
+boundaries. Layer 3 caches are read at build time and write nowhere near the workspace, so sharing them is free.
 
 **ZFS may empty layer 2** (verify item, not a promise): OpenZFS 2.2 block cloning (BRT) works across datasets within a
 pool — something APFS clonefile cannot do across volumes. If bun's Linux copy path goes through `copy_file_range` (which
@@ -84,12 +84,12 @@ them there; they always contain an endpoint URL, never credentials.
     with no error); `cowshed doctor` checks for that misspelling.
   - cargo config: source replacement of crates.io with `sparse+<GATEWAY_HTTP>/cargo/`,
     `[build] rustc-wrapper = "sccache"` when sccache is present, and `[env]` setting `SCCACHE_SERVER_UDS` to the
-    expanded absolute host socket path (`/private/cowshed/store/sccache.sock`; cargo never expands `~`) so wrapper invocations reach
-    the host-owned sccache daemon (below) from processes cowshed never spawned — **verified (cargo 1.97): `[env]` values
-    reach every rustc-wrapper invocation; no environment fallback is needed.** Host-global settings live in the
-    host-owned `~/.cargo/config.toml` (never on the cache volume — see relocation below); per-workspace ones live in the
-    in-image `.cargo/config.toml`. Endpoint plus the registry authentication mechanism carry the token; the URL never
-    contains it (05_gateway.md).
+    expanded absolute host socket path (`/private/cowshed/store/sccache.sock`; cargo never expands `~`) so wrapper
+    invocations reach the host-owned sccache daemon (below) from processes cowshed never spawned — **verified (cargo
+    1.97): `[env]` values reach every rustc-wrapper invocation; no environment fallback is needed.** Host-global
+    settings live in the host-owned `~/.cargo/config.toml` (never on the cache volume — see relocation below);
+    per-workspace ones live in the in-image `.cargo/config.toml`. Endpoint plus the registry authentication mechanism
+    carry the token; the URL never contains it (05_gateway.md).
   - No git remote/proxy config is written: workspace git speaks only local filesystem remotes (the `main` remote and
     gateway-owned bare mirrors — 05_gateway.md), so there is nothing to route through the gateway and no credential
     helper inside the image.
@@ -98,16 +98,16 @@ them there; they always contain an endpoint URL, never credentials.
     (`os.UserConfigDir()/go/env`, measured default `~/Library/Application Support/go/env`) overridable only by `GOENV` —
     and `GOPROXY` is per-workspace. The in-image file pins: `GOPROXY=<GATEWAY_HTTP>/go` (no `,direct` fallback — misses
     fail at the gateway with the offline/denied distinction, 05_gateway.md), `GOSUMDB=sum.golang.org` (verification
-    rides the proxy's sumdb passthrough), `GOMODCACHE=/private/cowshed/caches/go/mod` and `GOCACHE=/private/cowshed/caches/go/build`
-    (shared, layer 3), `GOPATH=<mount>/.cowshed/cache/go/path` and `GOBIN=<mount>/.cowshed/cache/go/bin` (in-image,
-    workspace-keyed — `go install` binaries are the `~/.cargo/bin` persistence-escape hazard and must never land on the
-    shared volume). Net effect: **`~/go` is never created** (measured on this host: the devenv-provided go 1.26.3 had
-    already grown a 1.1 GB `~/go/pkg/mod` under the defaults); 04_sandbox.md turns any regression into a loud tripwire.
-    cowshed also writes **`GOTOOLCHAIN=local`**: the toolchain is nix/devenv-provided and pinned, and `auto` silently
-    downloading Go toolchains contradicts the declarative environment — a project that deliberately overrides to `auto`
-    gets its downloads in `GOMODCACHE`, i.e. on the caches volume, never in `$HOME`. A host-global `go env -w` file
-    instead of `GOENV` is rejected: `GOPROXY` is per-workspace identity, and a global file could select another
-    workspace's endpoint.
+    rides the proxy's sumdb passthrough), `GOMODCACHE=/private/cowshed/caches/go/mod` and
+    `GOCACHE=/private/cowshed/caches/go/build` (shared, layer 3), `GOPATH=<mount>/.cowshed/cache/go/path` and
+    `GOBIN=<mount>/.cowshed/cache/go/bin` (in-image, workspace-keyed — `go install` binaries are the `~/.cargo/bin`
+    persistence-escape hazard and must never land on the shared volume). Net effect: **`~/go` is never created**
+    (measured on this host: the devenv-provided go 1.26.3 had already grown a 1.1 GB `~/go/pkg/mod` under the defaults);
+    04_sandbox.md turns any regression into a loud tripwire. cowshed also writes **`GOTOOLCHAIN=local`**: the toolchain
+    is nix/devenv-provided and pinned, and `auto` silently downloading Go toolchains contradicts the declarative
+    environment — a project that deliberately overrides to `auto` gets its downloads in `GOMODCACHE`, i.e. on the caches
+    volume, never in `$HOME`. A host-global `go env -w` file instead of `GOENV` is rejected: `GOPROXY` is per-workspace
+    identity, and a global file could select another workspace's endpoint.
 - **Generic proxy variables.** Workspace env wiring sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, and `https_proxy` to
   `<GATEWAY_HTTP>` and configures `NO_PROXY`/`no_proxy` only for the workspace's own local services. On Linux these
   variables therefore resolve to `http://127.0.0.1:7644`; on macOS they resolve to the workspace block base. The token
@@ -123,8 +123,8 @@ them there; they always contain an endpoint URL, never credentials.
 - **Host-level relocation, once — cache subtrees only**: at first adopt on a host (idempotent, re-checked by `doctor`),
   the read-at-build tools' _cache_ directories resolve to these exact dedicated roots:
 
-  | Tool default           | cowshed.caches target              |
-  | ---------------------- | ---------------------------------- |
+  | Tool default           | cowshed.caches target                    |
+  | ---------------------- | ---------------------------------------- |
   | `~/.cargo/registry`    | `/private/cowshed/caches/cargo/registry` |
   | `~/.cargo/git`         | `/private/cowshed/caches/cargo/git`      |
   | `~/.cache/zig`         | `/private/cowshed/caches/zig`            |
@@ -133,8 +133,8 @@ them there; they always contain an endpoint URL, never credentials.
   | `~/.cache/nix`         | `/private/cowshed/caches/nix/cache`      |
   | `~/.local/state/nix`   | `/private/cowshed/caches/nix/state`      |
 
-  Go remains direct-configured as `/private/cowshed/caches/go/{mod,build}`. Gateway artifacts remain outside every writable
-  tool root at `mirror/` and `repo-mirrors/`.
+  Go remains direct-configured as `/private/cowshed/caches/go/{mod,build}`. Gateway artifacts remain outside every
+  writable tool root at `mirror/` and `repo-mirrors/`.
 
   **The parent config directories stay on the host.** `~/.cargo/config.toml`, `~/.cargo/credentials.toml`,
   `~/.cargo/bin` (on PATH), and `~/.gradle/gradle.properties` are _not_ relocated and are on the secret deny list
@@ -160,7 +160,7 @@ them there; they always contain an endpoint URL, never credentials.
     export. (There is no git credential helper to consider — git is local-only.)
   - `GOENV=<mount>/.cowshed/cache/go/env` is the other: Go has no directory-scoped config, so the in-image env file is
     reachable only through this export. It rides the in-image `.envrc`/direnv like the rest of the wiring —
-    `cowshed exec`'s fail-closed `direnv export` (04_sandbox.md) carries it, and IDE-spawned tools (gopls) get it via
+    `cowshed exec`'s fail-closed shell activation (04_sandbox.md) carries it, and IDE-spawned tools (gopls) get it via
     the editor's direnv integration. Verification item (kickoff): coverage across go invocations including gopls, and
     whether any file-based mechanism exists that kills the export.
   - On macOS, `cowshed ensure --envrc` additionally emits **port conventions for dev servers** —
@@ -169,22 +169,24 @@ them there; they always contain an endpoint URL, never credentials.
     package/proxy wiring uses fixed `GATEWAY_HTTP=http://127.0.0.1:7644`. Both platforms may emit **optional prompt
     conveniences — explicitly non-load-bearing** — `COWSHED_WORKSPACE` / `COWSHED_REPO_ID` / `COWSHED_LAYER` /
     `COWSHED_MOUNT`. Anything that needs identity derives it from cwd via `.cowshed/workspace.json` or asks the CLI.
-  - `SCCACHE_SERVER_UDS=/private/cowshed/store/sccache.sock` (expanded) is the third: the host sccache daemon's socket (below). It
-    is host-level rather than per-workspace — supervisor-spawned processes get it injected, `cowshed ensure --envrc`
-    exports it for IDE terminals, and the cargo `[env]` guidance above mirrors it for processes cowshed never spawned.
+  - `SCCACHE_SERVER_UDS=/private/cowshed/store/sccache.sock` (expanded) is the third: the host sccache daemon's socket
+    (below). It is host-level rather than per-workspace — supervisor-spawned processes get it injected,
+    `cowshed ensure --envrc` exports it for IDE terminals, and the cargo `[env]` guidance above mirrors it for processes
+    cowshed never spawned.
 
 ### The sccache daemon
 
 sccache is served by a **host-owned daemon**: the `dev.cowshed.sccache` LaunchAgent runs the sccache binary itself as a
 foreground unix-socket server outside every sandbox — `SCCACHE_START_SERVER=1` selects server mode,
 `SCCACHE_NO_DAEMON=1` keeps it in the foreground under launchd supervision, `SCCACHE_IDLE_TIMEOUT=0` disables idle exit,
-and its environment pins `SCCACHE_SERVER_UDS=/private/cowshed/store/sccache.sock` and `SCCACHE_DIR=/private/cowshed/caches/sccache` (all
-source-verified against sccache 0.16, which reads `SCCACHE_SERVER_UDS` in both client and server ahead of
-`SCCACHE_SERVER_PORT`; the TCP port is the fallback wiring only on a platform without unix sockets, and then the
-Seatbelt loopback-allow class in 04_sandbox.md applies). `cowshed sccache start|stop|status` install, remove, and probe
-the agent; start is healthy when the socket answers. Every disk-cache read and write happens inside the daemon
-(source-verified: sccache instantiates its disk cache only in the server process), so the Seatbelt write carve-back for
-`/private/cowshed/caches/sccache` is gone — the store is **daemon-write-only** and sandboxes keep only the caches-wide read.
+and its environment pins `SCCACHE_SERVER_UDS=/private/cowshed/store/sccache.sock` and
+`SCCACHE_DIR=/private/cowshed/caches/sccache` (all source-verified against sccache 0.16, which reads
+`SCCACHE_SERVER_UDS` in both client and server ahead of `SCCACHE_SERVER_PORT`; the TCP port is the fallback wiring only
+on a platform without unix sockets, and then the Seatbelt loopback-allow class in 04_sandbox.md applies).
+`cowshed sccache start|stop|status` install, remove, and probe the agent; start is healthy when the socket answers.
+Every disk-cache read and write happens inside the daemon (source-verified: sccache instantiates its disk cache only in
+the server process), so the Seatbelt write carve-back for `/private/cowshed/caches/sccache` is gone — the store is
+**daemon-write-only** and sandboxes keep only the caches-wide read.
 
 Two earlier postures died to evidence:
 
@@ -200,13 +202,13 @@ Two earlier postures died to evidence:
   backed out.
 
 Because no sccache 0.16 client flag suppresses the auto-spawn fallback, the sandbox provides the fail-fast: binding
-`/private/cowshed/store/sccache.sock` needs write-create under `/private/cowshed/store`, which no workspace holds, so a client whose daemon is
-down fails its compile promptly with a bind error instead of wedging — and can never stand up a wrong-boundary server
-for siblings. `SCCACHE_NO_DAEMON` is retired from all workspace wiring. The daemon is a trusted mediator in the
-nix-daemon sense, with its confused-deputy surface named explicitly in 04_sandbox.md: the unsandboxed daemon reads
-sources and executes a client-named compiler at a sandboxed client's request, accepted under the same threat model that
-already concedes layer-3 poisoning (below) because it adds immediacy, not new reach, while the store's write surface
-strictly narrows.
+`/private/cowshed/store/sccache.sock` needs write-create under `/private/cowshed/store`, which no workspace holds, so a
+client whose daemon is down fails its compile promptly with a bind error instead of wedging — and can never stand up a
+wrong-boundary server for siblings. `SCCACHE_NO_DAEMON` is retired from all workspace wiring. The daemon is a trusted
+mediator in the nix-daemon sense, with its confused-deputy surface named explicitly in 04_sandbox.md: the unsandboxed
+daemon reads sources and executes a client-named compiler at a sandboxed client's request, accepted under the same
+threat model that already concedes layer-3 poisoning (below) because it adds immediacy, not new reach, while the store's
+write surface strictly narrows.
 
 ## Convention table
 

@@ -758,6 +758,21 @@ fn push_exact_and_subpath_rule(
 fn push_line(profile: &mut String, line: &str) {
     profile.push_str(line);
     profile.push('\n');
+    // An explicit file-read-data rule takes precedence over file-read*, even
+    // when the wildcard comes later. Give every read rule the same specificity
+    // so ordered denies and carve-backs govern actual reads as well as metadata.
+    let Some((operations, filters)) = line.split_once(" (") else {
+        return;
+    };
+    let Some((effect, names)) = operations.split_once(' ') else {
+        return;
+    };
+    if names.split_whitespace().any(|name| name == "file-read*") {
+        profile.push_str(effect);
+        profile.push_str(" file-read-data (");
+        profile.push_str(filters);
+        profile.push('\n');
+    }
 }
 
 #[cfg(test)]
