@@ -705,21 +705,30 @@ impl EventProcessor {
                         row_index: extraction_diagnostic.row_index,
                     }
                 } else {
+                    // A batch past the column plane is a size refusal, not
+                    // malformed input: it names itself, and `row_index`
+                    // carries the plane's capacity — the batch size a
+                    // caller can retry with — as the JSON path's does.
+                    let (detail, row_index) = match err {
+                        json_extractor::ExtractionError::OutOfMemory => {
+                            (diagnostic_detail::OUT_OF_MEMORY, 0)
+                        }
+                        json_extractor::ExtractionError::BufferOverflow => {
+                            (diagnostic_detail::BUFFER_OVERFLOW, 0)
+                        }
+                        json_extractor::ExtractionError::TooManyEvents => (
+                            diagnostic_detail::TOO_MANY_EVENTS,
+                            u16::try_from(self.dynamic_columns.capacity).unwrap_or(u16::MAX),
+                        ),
+                        _ => (diagnostic_detail::INVALID_JSON, 0),
+                    };
                     ResultDiagnostic {
                         stage: diagnostic_stage::MSGPACK,
-                        detail: match err {
-                            json_extractor::ExtractionError::OutOfMemory => {
-                                diagnostic_detail::OUT_OF_MEMORY
-                            }
-                            json_extractor::ExtractionError::BufferOverflow => {
-                                diagnostic_detail::BUFFER_OVERFLOW
-                            }
-                            _ => diagnostic_detail::INVALID_JSON,
-                        },
+                        detail,
                         expected_type: 0,
                         actual_type: 0,
                         field_index: NO_FIELD,
-                        row_index: 0,
+                        row_index,
                     }
                 };
                 write_result_header_with_diagnostic(output, code, &diagnostic);
@@ -1646,6 +1655,62 @@ mod tests {
             col_ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
             ResultCode::Ok,
             "columine wiring: workspace grows and the batch succeeds"
+        );
+    }
+
+    /// A msgpack stream one event past the column plane is refused as
+    /// TOO_MANY_EVENTS naming the plane's capacity, never as INVALID_JSON:
+    /// the input is well-formed, the batch is too big.
+    #[test]
+    fn msgpack_batch_past_the_column_plane_names_too_many_events_and_the_capacity() {
+        let fields = vec![
+            SignalSchemaField::new(ArrowType::Utf8, false),
+            SignalSchemaField::new(ArrowType::Binary, true),
+        ];
+        let field_names = format!("id\0{}\0", columine_parsing::UNDECLARED_COLUMN_NAME);
+        let schema = schema_with_names(&fields, field_names.as_bytes());
+        const CAPACITY: u32 = 2;
+        let mut ep = EventProcessor::new(
+            EpWiring::consumer_variant(),
+            CAPACITY,
+            CollisionPolicy::Latest,
+            schema,
+        )
+        .unwrap();
+
+        // Three maps {id:"<n>"} back to back: one past the plane.
+        let mut input = Vec::new();
+        for id in [b"a", b"b", b"c"] {
+            input.push(0x81);
+            input.push(0xa2);
+            input.extend(b"id");
+            input.push(0xa1);
+            input.extend(id);
+        }
+        let mut output = vec![0u8; 64 * 1024];
+        assert_eq!(
+            ep.create_log_entry(&input, InputFormat::MsgpackStream, &mut output),
+            ResultCode::ParseError
+        );
+        assert_eq!(output[20], DIAGNOSTIC_ABI_VERSION);
+        assert_eq!(output[21], diagnostic_stage::MSGPACK);
+        assert_eq!(output[22], diagnostic_detail::TOO_MANY_EVENTS);
+        assert_eq!(
+            u16::from_le_bytes([output[26], output[27]]),
+            NO_FIELD,
+            "a size refusal names no field"
+        );
+        assert_eq!(
+            u32::from(u16::from_le_bytes([output[28], output[29]])),
+            CAPACITY,
+            "row_index carries the column plane's capacity"
+        );
+
+        // Exactly the plane is legal.
+        let exact = &input[..input.len() / 3 * 2];
+        assert_eq!(
+            ep.create_log_entry(exact, InputFormat::MsgpackStream, &mut output),
+            ResultCode::Ok
         );
     }
 
