@@ -715,8 +715,11 @@ fn top_level_struct_map_array_overflow_requests_slot_growth() {
 
     let keys = [100u32];
     let scalars = [42u32];
-    let offsets = [0u32, 129];
-    let values = [7u32; 129];
+    let arena_capacity = bytes::read_u32(&state, arena_hdr(&state));
+    let value_count =
+        usize::try_from(arena_capacity).expect("arena capacity") / size_of::<u32>() + 1;
+    let offsets = [0u32, u32::try_from(value_count).expect("array length")];
+    let values = vec![7u32; value_count];
     let cols: Vec<&[u8]> = vec![
         u32s_as_bytes(&keys),
         u32s_as_bytes(&scalars),
