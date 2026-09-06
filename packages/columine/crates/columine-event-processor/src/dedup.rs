@@ -29,11 +29,17 @@
 //! the instance restoring it carries the ceiling.
 //!
 //! Admission is two-phase because the admitting tx is not known until the
-//! log accepts the entry: [`SeenSet::judge`] stages a batch's new ids,
-//! [`SeenSet::commit`] binds them to the tx the log assigned, and
-//! [`SeenSet::abandon`] retracts them when the append did not happen. A
-//! staged id is already a duplicate to the rest of its batch, and a new
-//! batch cannot begin while one is staged ([`SeenSet::is_batch_open`]).
+//! log accepts the entry: [`SeenSet::judge`] stages a batch's new ids under
+//! the batch's id, [`SeenSet::commit`] binds that batch to the tx the log
+//! assigned, and [`SeenSet::abandon`] retracts it when the append did not
+//! happen. Several batches may be in flight at once — concurrent writers to
+//! one log race at the append, and the loser retries with its batch still
+//! staged — so a staged id is a duplicate to every later batch until its
+//! own batch is retracted. Commits land in the window in commit order,
+//! which is append order up to the writers' interleaving; a cut therefore
+//! evicts every entry from the front until the first at or above the
+//! horizon, and an entry that lingers behind a newer one is cut by the
+//! next horizon — later, never sooner, which keeps every answer exact.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -147,8 +153,9 @@ pub enum AdmissionRefusal {
     /// The signal type declares an ordinal namespace but the id is not the
     /// canonical decimal of a `u32`.
     NotAnOrdinal,
-    /// A batch is already staged: commit or abandon it first.
-    BatchOpen,
+    /// No in-flight batch has this id (0 is never a batch): it was already
+    /// committed or abandoned, or never judged.
+    UnknownBatch { batch: u32 },
 }
 
 impl fmt::Display for AdmissionRefusal {
@@ -166,9 +173,9 @@ impl fmt::Display for AdmissionRefusal {
                 f,
                 "the signal type declares an ordinal id namespace but the id is not the canonical decimal of a u32 — send the ordinal, or drop the namespace declaration"
             ),
-            Self::BatchOpen => write!(
+            Self::UnknownBatch { batch } => write!(
                 f,
-                "the previous batch is still staged; commit it with the tx the log assigned, or abandon it when the append did not happen, before judging another"
+                "batch {batch} is not in flight on this log: commit or abandon the batch id the log entry answered, once"
             ),
         }
     }
@@ -217,6 +224,29 @@ struct OrdinalAdmission {
     ordinal: u32,
 }
 
+/// A key staged by one in-flight batch.
+#[derive(Clone, Copy, Debug)]
+struct StagedKey {
+    batch: u32,
+    key: EventKey,
+}
+
+/// An ordinal staged by one in-flight batch.
+#[derive(Clone, Copy, Debug)]
+struct StagedOrdinal {
+    batch: u32,
+    ordinal: u32,
+}
+
+/// An in-flight batch: opened by its first judgment, closed by commit or
+/// abandon.
+#[derive(Clone, Copy, Debug)]
+struct OpenBatch {
+    id: u32,
+    total: u64,
+    duplicates: u64,
+}
+
 /// The exact seen-set. See the module documentation for the model.
 pub struct SeenSet {
     policy: CollisionPolicy,
@@ -228,13 +258,14 @@ pub struct SeenSet {
     ordinal_len: u32,
     /// Ordinal-namespace admissions in tx order.
     ordinal_window: VecDeque<OrdinalAdmission>,
-    /// Keys this batch staged as new; committed to the batch's tx, or
-    /// removed on abandon.
-    staged_keys: Vec<EventKey>,
-    staged_ordinals: Vec<u32>,
-    batch_open: bool,
-    batch_total: u64,
-    batch_duplicates: u64,
+    /// Keys the in-flight batches staged as new, tagged by batch; committed
+    /// to the batch's tx, or removed on abandon.
+    staged_keys: Vec<StagedKey>,
+    staged_ordinals: Vec<StagedOrdinal>,
+    /// The in-flight batches and their counts, folded into the totals on
+    /// commit and dropped on abandon.
+    batches: Vec<OpenBatch>,
+    next_batch: u32,
     /// Serialized size of the Bytes window, maintained at admission and
     /// eviction so a checkpoint never walks the window to size itself.
     bytes_window_serialized: usize,
@@ -249,7 +280,7 @@ impl fmt::Debug for SeenSet {
             .field("ceiling", &self.ceiling)
             .field("bytes", &self.trie.len())
             .field("ordinals", &self.ordinal_len)
-            .field("batch_open", &self.batch_open)
+            .field("open_batches", &self.batches.len())
             .field("total_events", &self.total_events)
             .field("duplicates_detected", &self.duplicates_detected)
             .finish()
@@ -275,9 +306,8 @@ impl SeenSet {
             ordinal_window: VecDeque::new(),
             staged_keys: Vec::new(),
             staged_ordinals: Vec::new(),
-            batch_open: false,
-            batch_total: 0,
-            batch_duplicates: 0,
+            batches: Vec::new(),
+            next_batch: 0,
             bytes_window_serialized: 0,
             total_events: 0,
             duplicates_detected: 0,
@@ -302,25 +332,57 @@ impl SeenSet {
         self.len() == 0
     }
 
-    /// True between the first `judge` of a batch and its commit or abandon.
-    pub fn is_batch_open(&self) -> bool {
-        self.batch_open
+    /// How many batches are in flight (judged, neither committed nor
+    /// abandoned).
+    pub fn open_batches(&self) -> usize {
+        self.batches.len()
     }
 
-    /// Judge one id of the current batch. The first judgment opens the batch.
+    /// A batch id no in-flight batch holds. Never 0, which callers keep as
+    /// "no batch".
+    pub fn next_batch(&mut self) -> u32 {
+        loop {
+            self.next_batch = self.next_batch.wrapping_add(1);
+            let candidate = self.next_batch;
+            if candidate != 0 && !self.batches.iter().any(|b| b.id == candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    fn batch_index(&self, batch: u32) -> Option<usize> {
+        self.batches.iter().position(|b| b.id == batch)
+    }
+
+    /// Judge one id as part of `batch` (any id but 0). The batch's first
+    /// judgment opens it; it stays open until commit or abandon.
     pub fn judge(
         &mut self,
+        batch: u32,
         id: &[u8],
         namespace: IdNamespace,
     ) -> Result<Judgment, AdmissionRefusal> {
+        if batch == 0 {
+            return Err(AdmissionRefusal::UnknownBatch { batch });
+        }
         let judgment = match namespace {
-            IdNamespace::Bytes => self.judge_bytes(id)?,
-            IdNamespace::Ordinal => self.judge_ordinal(id)?,
+            IdNamespace::Bytes => self.judge_bytes(batch, id)?,
+            IdNamespace::Ordinal => self.judge_ordinal(batch, id)?,
         };
-        self.batch_open = true;
-        self.batch_total += 1;
+        let index = match self.batch_index(batch) {
+            Some(index) => index,
+            None => {
+                self.batches.push(OpenBatch {
+                    id: batch,
+                    total: 0,
+                    duplicates: 0,
+                });
+                self.batches.len() - 1
+            }
+        };
+        self.batches[index].total += 1;
         if matches!(judgment, Judgment::Duplicate { .. }) {
-            self.batch_duplicates += 1;
+            self.batches[index].duplicates += 1;
         }
         Ok(judgment)
     }
@@ -328,16 +390,17 @@ impl SeenSet {
     /// `judge`, folded through the policy: whether the row is processed.
     pub fn should_process(
         &mut self,
+        batch: u32,
         id: &[u8],
         namespace: IdNamespace,
     ) -> Result<bool, AdmissionRefusal> {
-        Ok(match self.judge(id, namespace)? {
+        Ok(match self.judge(batch, id, namespace)? {
             Judgment::New => true,
             Judgment::Duplicate { .. } => self.policy == CollisionPolicy::Latest,
         })
     }
 
-    fn judge_bytes(&mut self, id: &[u8]) -> Result<Judgment, AdmissionRefusal> {
+    fn judge_bytes(&mut self, batch: u32, id: &[u8]) -> Result<Judgment, AdmissionRefusal> {
         let key = EventKey::new(id)?;
         if let Some(tx) = self.trie.get(key.as_bytes()) {
             // The window key stays the FIRST admission under every policy:
@@ -351,11 +414,11 @@ impl SeenSet {
         }
         self.reserve_one()?;
         self.trie.insert(key, STAGED);
-        self.staged_keys.push(key);
+        self.staged_keys.push(StagedKey { batch, key });
         Ok(Judgment::New)
     }
 
-    fn judge_ordinal(&mut self, id: &[u8]) -> Result<Judgment, AdmissionRefusal> {
+    fn judge_ordinal(&mut self, batch: u32, id: &[u8]) -> Result<Judgment, AdmissionRefusal> {
         let ordinal = parse_ordinal(id).ok_or(AdmissionRefusal::NotAnOrdinal)?;
         if self.ordinal.contains(ordinal) {
             return Ok(Judgment::Duplicate { admitted_tx: None });
@@ -363,7 +426,7 @@ impl SeenSet {
         self.reserve_one()?;
         self.ordinal.insert(ordinal);
         self.ordinal_len += 1;
-        self.staged_ordinals.push(ordinal);
+        self.staged_ordinals.push(StagedOrdinal { batch, ordinal });
         Ok(Judgment::New)
     }
 
@@ -376,48 +439,84 @@ impl SeenSet {
         Ok(())
     }
 
-    /// Bind the staged batch to the tx the log assigned it. `tx` must not be
-    /// below the newest admission: the window is tx-ordered by construction.
-    pub fn commit(&mut self, tx: u64) {
+    /// Bind the in-flight `batch` to the tx the log assigned it.
+    pub fn commit(&mut self, batch: u32, tx: u64) -> Result<(), AdmissionRefusal> {
         debug_assert!(tx != STAGED, "the staged sentinel is not a tx");
-        debug_assert!(
-            self.bytes_window.back().is_none_or(|last| last.tx <= tx)
-                && self.ordinal_window.back().is_none_or(|last| last.tx <= tx),
-            "a batch commits at or above the newest admission's tx",
-        );
-        for key in self.staged_keys.drain(..) {
-            if let Some(value) = self.trie.get_mut(key.as_bytes()) {
+        let index = self
+            .batch_index(batch)
+            .ok_or(AdmissionRefusal::UnknownBatch { batch })?;
+        let OpenBatch {
+            total, duplicates, ..
+        } = self.batches.swap_remove(index);
+        // Bind this batch's keys in place; the others stay staged.
+        let mut write = 0;
+        for read in 0..self.staged_keys.len() {
+            let staged = self.staged_keys[read];
+            if staged.batch != batch {
+                self.staged_keys[write] = staged;
+                write += 1;
+                continue;
+            }
+            if let Some(value) = self.trie.get_mut(staged.key.as_bytes()) {
                 *value = tx;
             }
-            self.bytes_window.push_back(BytesAdmission { tx, key });
-            self.bytes_window_serialized += BYTES_ENTRY_FIXED + key.as_bytes().len();
+            self.bytes_window.push_back(BytesAdmission {
+                tx,
+                key: staged.key,
+            });
+            self.bytes_window_serialized += BYTES_ENTRY_FIXED + staged.key.as_bytes().len();
         }
-        for ordinal in self.staged_ordinals.drain(..) {
-            self.ordinal_window
-                .push_back(OrdinalAdmission { tx, ordinal });
+        self.staged_keys.truncate(write);
+        let mut write = 0;
+        for read in 0..self.staged_ordinals.len() {
+            let staged = self.staged_ordinals[read];
+            if staged.batch != batch {
+                self.staged_ordinals[write] = staged;
+                write += 1;
+                continue;
+            }
+            self.ordinal_window.push_back(OrdinalAdmission {
+                tx,
+                ordinal: staged.ordinal,
+            });
         }
-        self.total_events += self.batch_total;
-        self.duplicates_detected += self.batch_duplicates;
-        self.close_batch();
+        self.staged_ordinals.truncate(write);
+        self.total_events += total;
+        self.duplicates_detected += duplicates;
+        Ok(())
     }
 
-    /// Retract the staged batch: the append did not happen, so nothing in it
-    /// was admitted and the counters do not move.
-    pub fn abandon(&mut self) {
-        for key in self.staged_keys.drain(..) {
-            self.trie.remove(key.as_bytes());
+    /// Retract the in-flight `batch`: the append did not happen, so nothing
+    /// in it was admitted and the counters do not move.
+    pub fn abandon(&mut self, batch: u32) -> Result<(), AdmissionRefusal> {
+        let index = self
+            .batch_index(batch)
+            .ok_or(AdmissionRefusal::UnknownBatch { batch })?;
+        self.batches.swap_remove(index);
+        let mut write = 0;
+        for read in 0..self.staged_keys.len() {
+            let staged = self.staged_keys[read];
+            if staged.batch != batch {
+                self.staged_keys[write] = staged;
+                write += 1;
+                continue;
+            }
+            self.trie.remove(staged.key.as_bytes());
         }
-        for ordinal in self.staged_ordinals.drain(..) {
-            self.ordinal.remove(ordinal);
+        self.staged_keys.truncate(write);
+        let mut write = 0;
+        for read in 0..self.staged_ordinals.len() {
+            let staged = self.staged_ordinals[read];
+            if staged.batch != batch {
+                self.staged_ordinals[write] = staged;
+                write += 1;
+                continue;
+            }
+            self.ordinal.remove(staged.ordinal);
             self.ordinal_len -= 1;
         }
-        self.close_batch();
-    }
-
-    fn close_batch(&mut self) {
-        self.batch_open = false;
-        self.batch_total = 0;
-        self.batch_duplicates = 0;
+        self.staged_ordinals.truncate(write);
+        Ok(())
     }
 
     /// Empty the set, keeping every reservation.
@@ -430,17 +529,9 @@ impl SeenSet {
         self.ordinal_window.clear();
         self.staged_keys.clear();
         self.staged_ordinals.clear();
-        self.close_batch();
+        self.batches.clear();
         self.total_events = 0;
         self.duplicates_detected = 0;
-    }
-
-    /// Refuse to open a batch while one is staged.
-    pub fn require_no_open_batch(&self) -> Result<(), AdmissionRefusal> {
-        if self.batch_open {
-            return Err(AdmissionRefusal::BatchOpen);
-        }
-        Ok(())
     }
 
     /// The tx that admitted `id` in the Bytes namespace: the byproduct read.
@@ -504,8 +595,8 @@ impl SeenSet {
     }
 }
 
-/// Checkpoint bytes: the committed window in tx order, which rebuilds both
-/// carriers on restore. Little-endian throughout.
+/// Checkpoint bytes: the committed window in commit order, which rebuilds
+/// both carriers on restore. Little-endian throughout.
 ///
 /// ```text
 /// [magic u32 "CHKP"][version u8 = 2][policy u8][pad u16]
@@ -600,27 +691,22 @@ pub mod checkpoint {
         // tx order — so a checkpoint that does not parse leaves the instance
         // as it was and the build below cannot fail on structure.
         let mut offset = HEADER_SIZE;
-        let mut last_tx = 0u64;
         for _ in 0..bytes_count {
             let tx = read_u64(input, offset).ok_or(InvalidCheckpoint)?;
             let len = usize::from(*input.get(offset + 8).ok_or(InvalidCheckpoint)?);
             if len > MAX_ID_BYTES
-                || tx < last_tx
                 || tx == super::STAGED
                 || input.get(offset + 9..offset + 9 + len).is_none()
             {
                 return Err(InvalidCheckpoint);
             }
-            last_tx = tx;
             offset += BYTES_ENTRY_FIXED + len;
         }
-        last_tx = 0;
         for _ in 0..ordinal_count {
             let tx = read_u64(input, offset).ok_or(InvalidCheckpoint)?;
-            if tx < last_tx || tx == super::STAGED || read_u32(input, offset + 8).is_none() {
+            if tx == super::STAGED || read_u32(input, offset + 8).is_none() {
                 return Err(InvalidCheckpoint);
             }
-            last_tx = tx;
             offset += ORDINAL_ENTRY;
         }
         if offset != input.len() {
@@ -672,16 +758,16 @@ mod tests {
     #[test]
     fn discard_refuses_only_what_it_has_seen() {
         let mut set = SeenSet::new(CollisionPolicy::Discard, 8, 8);
-        assert_eq!(set.should_process(b"event-001", B), Ok(true));
-        assert_eq!(set.should_process(b"event-001", B), Ok(false));
-        assert_eq!(set.should_process(b"event-002", B), Ok(true));
-        set.commit(1);
+        assert_eq!(set.should_process(1, b"event-001", B), Ok(true));
+        assert_eq!(set.should_process(1, b"event-001", B), Ok(false));
+        assert_eq!(set.should_process(1, b"event-002", B), Ok(true));
+        set.commit(1, 1).unwrap();
         assert_eq!(set.total_events, 3);
         assert_eq!(set.duplicates_detected, 1);
-        assert_eq!(set.should_process(b"event-001", B), Ok(false));
-        assert_eq!(set.should_process(b"event-00", B), Ok(true));
-        assert_eq!(set.should_process(b"event-0011", B), Ok(true));
-        set.commit(2);
+        assert_eq!(set.should_process(2, b"event-001", B), Ok(false));
+        assert_eq!(set.should_process(2, b"event-00", B), Ok(true));
+        assert_eq!(set.should_process(2, b"event-0011", B), Ok(true));
+        set.commit(2, 2).unwrap();
         assert_eq!(set.admitted_tx(b"event-001"), Some(1));
         assert_eq!(set.admitted_tx(b"event-00"), Some(2));
         assert_eq!(set.admitted_tx(b"event-0011"), Some(2));
@@ -691,16 +777,16 @@ mod tests {
     #[test]
     fn latest_processes_duplicates_and_keeps_the_first_admission() {
         let mut set = SeenSet::new(CollisionPolicy::Latest, 8, 8);
-        assert_eq!(set.should_process(b"a", B), Ok(true));
-        set.commit(1);
-        assert_eq!(set.should_process(b"a", B), Ok(true));
+        assert_eq!(set.should_process(1, b"a", B), Ok(true));
+        set.commit(1, 1).unwrap();
+        assert_eq!(set.should_process(2, b"a", B), Ok(true));
         assert_eq!(
-            set.judge(b"a", B),
+            set.judge(2, b"a", B),
             Ok(Judgment::Duplicate {
                 admitted_tx: Some(1)
             })
         );
-        set.commit(5);
+        set.commit(2, 5).unwrap();
         assert_eq!(set.duplicates_detected, 2);
         assert_eq!(set.admitted_tx(b"a"), Some(1));
         assert_eq!(set.len(), 1, "a redelivery adds no window entry");
@@ -708,60 +794,95 @@ mod tests {
         assert_eq!(set.admitted_tx(b"a"), None);
         assert!(set.is_empty());
         // Past the horizon the id is new again, and Latest processes it.
-        assert_eq!(set.should_process(b"a", B), Ok(true));
+        assert_eq!(set.should_process(3, b"a", B), Ok(true));
     }
 
     #[test]
     fn abandon_retracts_the_batch_and_its_counts() {
         let mut set = SeenSet::new(CollisionPolicy::Discard, 8, 8);
-        assert_eq!(set.should_process(b"x", B), Ok(true));
-        assert_eq!(set.should_process(b"7", O), Ok(true));
-        assert!(set.is_batch_open());
-        set.abandon();
-        assert!(!set.is_batch_open());
+        assert_eq!(set.should_process(1, b"x", B), Ok(true));
+        assert_eq!(set.should_process(1, b"7", O), Ok(true));
+        assert_eq!(set.open_batches(), 1);
+        set.abandon(1).unwrap();
+        assert_eq!(set.open_batches(), 0);
         assert!(set.is_empty());
         assert_eq!(set.total_events, 0);
-        assert_eq!(set.should_process(b"x", B), Ok(true));
-        assert_eq!(set.should_process(b"7", O), Ok(true));
-        set.commit(1);
+        assert_eq!(
+            set.abandon(1),
+            Err(AdmissionRefusal::UnknownBatch { batch: 1 })
+        );
+        assert_eq!(
+            set.commit(1, 1),
+            Err(AdmissionRefusal::UnknownBatch { batch: 1 })
+        );
+        assert_eq!(set.should_process(2, b"x", B), Ok(true));
+        assert_eq!(set.should_process(2, b"7", O), Ok(true));
+        set.commit(2, 1).unwrap();
         assert_eq!(set.len(), 2);
     }
 
+    /// Two writers race on one log: both stage, the second sees the first's
+    /// staged ids as duplicates, each commits or retracts only its own, and
+    /// batch ids never collide with an in-flight one.
     #[test]
-    fn a_staged_batch_blocks_the_next() {
+    fn batches_in_flight_together_bind_and_retract_only_their_own() {
         let mut set = SeenSet::new(CollisionPolicy::Discard, 8, 8);
-        assert_eq!(set.require_no_open_batch(), Ok(()));
-        set.judge(b"x", B).unwrap();
+        let first = set.next_batch();
+        let second = set.next_batch();
+        assert!(first != 0 && second != 0 && first != second);
+        assert_eq!(set.judge(first, b"a", B), Ok(Judgment::New));
+        assert_eq!(set.judge(first, b"1", O), Ok(Judgment::New));
         assert_eq!(
-            set.require_no_open_batch(),
-            Err(AdmissionRefusal::BatchOpen)
+            set.judge(second, b"a", B),
+            Ok(Judgment::Duplicate { admitted_tx: None })
         );
-        set.commit(1);
-        assert_eq!(set.require_no_open_batch(), Ok(()));
+        assert_eq!(set.judge(second, b"b", B), Ok(Judgment::New));
+        assert_eq!(set.judge(second, b"2", O), Ok(Judgment::New));
+        assert_eq!(set.open_batches(), 2);
+        assert_eq!(
+            set.judge(0, b"z", B),
+            Err(AdmissionRefusal::UnknownBatch { batch: 0 })
+        );
+        // The second writer wins the append; the first retries later.
+        set.commit(second, 9).unwrap();
+        assert_eq!(set.admitted_tx(b"b"), Some(9));
+        assert_eq!(set.admitted_tx(b"a"), None, "still staged by the first");
+        assert!(set.contains_ordinal(b"2"));
+        assert_eq!(set.open_batches(), 1);
+        set.abandon(first).unwrap();
+        assert_eq!(set.judge(3, b"a", B), Ok(Judgment::New));
+        assert!(!set.contains_ordinal(b"1"));
+        set.commit(3, 10).unwrap();
+        assert_eq!(set.total_events, 4);
+        assert_eq!(set.duplicates_detected, 1);
+        assert_eq!(set.len(), 3);
+        // Commit order is the window order.
+        assert_eq!(set.cut_below(10), 2);
+        assert_eq!(set.len(), 1);
     }
 
     #[test]
     fn the_ceiling_refuses_at_admission_and_leaves_the_set_intact() {
         let mut set = SeenSet::new(CollisionPolicy::Discard, 2, 8);
-        assert_eq!(set.judge(b"a", B), Ok(Judgment::New));
-        assert_eq!(set.judge(b"1", O), Ok(Judgment::New));
+        assert_eq!(set.judge(1, b"a", B), Ok(Judgment::New));
+        assert_eq!(set.judge(1, b"1", O), Ok(Judgment::New));
         assert_eq!(
-            set.judge(b"b", B),
+            set.judge(1, b"b", B),
             Err(AdmissionRefusal::CeilingReached { ceiling: 2 })
         );
         assert_eq!(
-            set.judge(b"2", O),
+            set.judge(1, b"2", O),
             Err(AdmissionRefusal::CeilingReached { ceiling: 2 })
         );
         // Duplicates never need room.
         assert_eq!(
-            set.judge(b"a", B),
+            set.judge(1, b"a", B),
             Ok(Judgment::Duplicate { admitted_tx: None })
         );
-        set.commit(1);
+        set.commit(1, 1).unwrap();
         assert_eq!(set.len(), 2);
         assert_eq!(set.cut_below(2), 2);
-        assert_eq!(set.judge(b"b", B), Ok(Judgment::New));
+        assert_eq!(set.judge(2, b"b", B), Ok(Judgment::New));
     }
 
     #[test]
@@ -769,13 +890,13 @@ mod tests {
         let mut set = SeenSet::new(CollisionPolicy::Discard, 8, 8);
         let long = [b'x'; MAX_ID_BYTES + 1];
         assert_eq!(
-            set.judge(&long, B),
+            set.judge(1, &long, B),
             Err(AdmissionRefusal::IdTooLong {
                 len: MAX_ID_BYTES + 1
             })
         );
         let exact = [b'x'; MAX_ID_BYTES];
-        assert_eq!(set.judge(&exact, B), Ok(Judgment::New));
+        assert_eq!(set.judge(1, &exact, B), Ok(Judgment::New));
         assert_eq!(set.len(), 1);
     }
 
@@ -784,23 +905,23 @@ mod tests {
         let mut set = SeenSet::new(CollisionPolicy::Discard, 8, 8);
         for bad in [&b""[..], b"01", b"-1", b"1a", b"4294967296", b" 1"] {
             assert_eq!(
-                set.judge(bad, O),
+                set.judge(1, bad, O),
                 Err(AdmissionRefusal::NotAnOrdinal),
                 "{bad:?}"
             );
         }
-        assert_eq!(set.judge(b"0", O), Ok(Judgment::New));
-        assert_eq!(set.judge(b"4294967295", O), Ok(Judgment::New));
+        assert_eq!(set.judge(1, b"0", O), Ok(Judgment::New));
+        assert_eq!(set.judge(1, b"4294967295", O), Ok(Judgment::New));
         assert_eq!(
-            set.judge(b"0", O),
+            set.judge(1, b"0", O),
             Ok(Judgment::Duplicate { admitted_tx: None })
         );
-        set.commit(3);
+        set.commit(1, 3).unwrap();
         assert!(set.contains_ordinal(b"0"));
         assert!(!set.contains_ordinal(b"1"));
         // The same digits in the Bytes namespace are a different id.
-        assert_eq!(set.judge(b"0", B), Ok(Judgment::New));
-        set.commit(4);
+        assert_eq!(set.judge(2, b"0", B), Ok(Judgment::New));
+        set.commit(2, 4).unwrap();
         assert_eq!(set.cut_below(4), 2);
         assert!(!set.contains_ordinal(b"0"));
         assert_eq!(set.admitted_tx(b"0"), Some(4));
@@ -809,18 +930,18 @@ mod tests {
     #[test]
     fn checkpoint_round_trips_and_keeps_the_instance_ceiling() {
         let mut set = SeenSet::new(CollisionPolicy::Latest, 16, 8);
-        set.judge(b"alpha", B).unwrap();
-        set.judge(b"5", O).unwrap();
-        set.commit(1);
-        set.judge(b"alpha", B).unwrap();
-        set.judge(b"beta", B).unwrap();
-        set.commit(2);
+        set.judge(1, b"alpha", B).unwrap();
+        set.judge(1, b"5", O).unwrap();
+        set.commit(1, 1).unwrap();
+        set.judge(2, b"alpha", B).unwrap();
+        set.judge(2, b"beta", B).unwrap();
+        set.commit(2, 2).unwrap();
         // A staged id is not in a checkpoint.
-        set.judge(b"gamma", B).unwrap();
+        set.judge(3, b"gamma", B).unwrap();
         let mut buffer = vec![0u8; set.checkpoint_len() + 8];
         let written = set.checkpoint(&mut buffer).unwrap();
         assert_eq!(written, set.checkpoint_len());
-        set.abandon();
+        set.abandon(3).unwrap();
 
         let mut restored = SeenSet::new(CollisionPolicy::Latest, 16, 8);
         restored.restore(&buffer[..written]).unwrap();
@@ -882,10 +1003,10 @@ mod tests {
                 let tx = index as u64 + 1;
                 for id in batch {
                     let expected = !model.contains_key(id);
-                    prop_assert_eq!(set.should_process(id, B).unwrap(), expected);
+                    prop_assert_eq!(set.should_process(tx as u32, id, B).unwrap(), expected);
                     model.entry(id.clone()).or_insert(tx);
                 }
-                set.commit(tx);
+                set.commit(tx as u32, tx).unwrap();
             }
             for (id, tx) in &model {
                 prop_assert_eq!(set.admitted_tx(id), Some(*tx));
@@ -904,10 +1025,10 @@ mod tests {
             for (index, batch) in batches.iter().enumerate() {
                 let tx = index as u64 + 1;
                 for id in batch {
-                    set.judge(id, B).unwrap();
+                    set.judge(tx as u32, id, B).unwrap();
                     model.entry(id.clone()).or_insert(tx);
                 }
-                set.commit(tx);
+                set.commit(tx as u32, tx).unwrap();
             }
             let evicted = set.cut_below(horizon);
             let expected_evicted = model.values().filter(|tx| **tx < horizon).count();
@@ -932,10 +1053,10 @@ mod tests {
                 for ordinal in batch {
                     let id = ordinal.to_string();
                     let expected = !model.contains_key(ordinal);
-                    prop_assert_eq!(set.should_process(id.as_bytes(), O).unwrap(), expected);
+                    prop_assert_eq!(set.should_process(tx as u32, id.as_bytes(), O).unwrap(), expected);
                     model.entry(*ordinal).or_insert(tx);
                 }
-                set.commit(tx);
+                set.commit(tx as u32, tx).unwrap();
             }
             set.cut_below(horizon);
             for (ordinal, tx) in &model {
@@ -948,10 +1069,11 @@ mod tests {
         fn checkpoint_is_lossless(batches in prop::collection::vec(prefix_heavy_ids(), 1..5)) {
             let mut set = SeenSet::new(CollisionPolicy::Latest, 1 << 16, 256);
             for (index, batch) in batches.iter().enumerate() {
+                let tx = index as u64 + 1;
                 for id in batch {
-                    set.judge(id, B).unwrap();
+                    set.judge(tx as u32, id, B).unwrap();
                 }
-                set.commit(index as u64 + 1);
+                set.commit(tx as u32, tx).unwrap();
             }
             let mut buffer = vec![0u8; set.checkpoint_len()];
             let written = set.checkpoint(&mut buffer).unwrap();

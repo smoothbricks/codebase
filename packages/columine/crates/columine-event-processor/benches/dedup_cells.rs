@@ -90,25 +90,28 @@ fn seen_cells(label: &str, resident: u32, namespace: IdNamespace) {
     };
     let ceiling = resident * 2 + 2048;
     let mut set = SeenSet::new(CollisionPolicy::Discard, ceiling, 1024);
+    let mut batch = set.next_batch();
     for (i, id) in ids.iter().enumerate() {
-        set.judge(id, namespace).unwrap();
+        set.judge(batch, id, namespace).unwrap();
         if i % 256 == 255 {
-            set.commit(i as u64 / 256);
+            set.commit(batch, i as u64 / 256).unwrap();
+            batch = set.next_batch();
         }
     }
-    set.commit(u64::from(resident) / 256 + 1);
+    let _ = set.commit(batch, u64::from(resident) / 256 + 1);
     let probes = resident as usize;
 
     let mut cursor = 0usize;
+    let probe_batch = set.next_batch();
     let hit = timed(probes, || {
         let id = &ids[cursor % probes];
         cursor += 1;
         assert!(matches!(
-            set.judge(id, namespace),
+            set.judge(probe_batch, id, namespace),
             Ok(columine_event_processor::Judgment::Duplicate { .. })
         ));
     });
-    set.abandon();
+    set.abandon(probe_batch).unwrap();
 
     // A miss judges an absent id and retracts it, so the set stays at
     // `resident` and the cost is the descent to the first divergent byte.
@@ -117,23 +120,25 @@ fn seen_cells(label: &str, resident: u32, namespace: IdNamespace) {
         let id = &absent[cursor % absent.len()];
         cursor += 1;
         assert_eq!(
-            set.judge(id, namespace),
+            set.judge(1, id, namespace),
             Ok(columine_event_processor::Judgment::New)
         );
-        set.abandon();
+        set.abandon(1).unwrap();
     });
 
     // Admit: the absent ids enter for real, committed in 256-row batches.
     let mut cursor = 0usize;
+    let mut batch = set.next_batch();
     let admit = timed(probes, || {
         let id = &absent[cursor];
         cursor += 1;
-        set.judge(id, namespace).unwrap();
+        set.judge(batch, id, namespace).unwrap();
         if cursor.is_multiple_of(256) {
-            set.commit(1_000_000 + cursor as u64 / 256);
+            set.commit(batch, 1_000_000 + cursor as u64 / 256).unwrap();
+            batch = set.next_batch();
         }
     });
-    set.commit(2_000_000);
+    let _ = set.commit(batch, 2_000_000);
     println!(
         "{label:<14} {resident:>7} | admit {:>7.1} ns ({} allocs) | miss {:>7.1} ns ({} allocs) | hit {:>7.1} ns ({} allocs)",
         admit.ns, admit.allocs, miss.ns, miss.allocs, hit.ns, hit.allocs
