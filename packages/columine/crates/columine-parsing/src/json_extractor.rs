@@ -50,8 +50,8 @@ pub mod dedup_detail {
     /// The signal type declares an ordinal id namespace and the id is not
     /// the canonical decimal of a u32.
     pub const NOT_AN_ORDINAL: u8 = 3;
-    /// The previous batch is neither committed nor abandoned.
-    pub const BATCH_OPEN: u8 = 4;
+    /// No in-flight batch has the named id on that log.
+    pub const BATCH_UNKNOWN: u8 = 4;
 }
 
 /// Diagnostic detail bytes (`ExtractionDiagnostic.Detail` — order is ABI,

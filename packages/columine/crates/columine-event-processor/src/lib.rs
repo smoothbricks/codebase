@@ -67,8 +67,9 @@ pub enum ResultCode {
     /// The seen-set refused an id: the diagnostic bytes name the cause
     /// ([`diagnostic_stage::DEDUP`]) and the set is untouched.
     AdmissionRefused = 8,
-    /// The previous batch is still staged: commit or abandon it first.
-    BatchPending = 9,
+    /// No in-flight batch has the named id on that log: it was committed or
+    /// abandoned already, or never judged.
+    UnknownBatch = 9,
 }
 
 /// Event capacity every wasm `ep_create_*` handle is built with.
@@ -436,8 +437,10 @@ impl EventProcessor {
 
     /// Process one input batch destined for the log at `log` (a slot from
     /// [`EventProcessor::open_log`]; `None` judges nothing): the batch is
-    /// judged against that log's seen-set and staged there until
-    /// [`EventProcessor::commit_batch`] or [`EventProcessor::abandon_batch`].
+    /// judged against that log's seen-set and staged there under the batch
+    /// id the result header carries at [`BATCH_ID_OFFSET`], until
+    /// [`EventProcessor::commit_batch`] or [`EventProcessor::abandon_batch`]
+    /// names that id. Batches for one log may be in flight together.
     pub fn create_log_entry_for(
         &mut self,
         log: Option<u32>,
@@ -729,7 +732,7 @@ impl EventProcessor {
         // Dedup: judge event ids from column 0 (type from column 1) against
         // the destination log's seen-set; discarded rows leave the batch.
         let seen = log.and_then(|slot| self.logs.get_mut(slot as usize).and_then(Option::as_mut));
-        let (processed, duplicates) = match judge_batch(
+        let (batch, processed, duplicates) = match judge_batch(
             seen,
             &self.ordinal_id_types,
             &mut self.dynamic_columns,
@@ -737,11 +740,7 @@ impl EventProcessor {
         ) {
             Ok(counts) => counts,
             Err(diagnostic) => {
-                let code = if diagnostic.detail == dedup_detail::BATCH_OPEN {
-                    ResultCode::BatchPending
-                } else {
-                    ResultCode::AdmissionRefused
-                };
+                let code = ResultCode::AdmissionRefused;
                 if self.wiring.diagnostics {
                     write_result_header_with_diagnostic(output, code, &diagnostic);
                 } else {
@@ -766,11 +765,17 @@ impl EventProcessor {
                     processed,
                     duplicates,
                 );
+                write_batch_id(output, batch);
                 ResultCode::Ok
             }
             Err(
                 IpcError::BufferTooSmall { .. } | IpcError::InvalidColumn | IpcError::SizeOverflow,
             ) => {
+                // The batch stays staged for nothing: the caller never
+                // learns its id, so it is retracted here.
+                if let Some(seen) = log.and_then(|slot| self.log_mut(slot)) {
+                    let _ = seen.abandon(batch);
+                }
                 write_result_header(output, ResultCode::EncodeError, 0, 0, 0, 0);
                 ResultCode::EncodeError
             }
@@ -873,23 +878,28 @@ impl EventProcessor {
         u64::from(total) | (u64::from(dupes) << 32)
     }
 
-    /// Bind the log's staged batch to the tx the log assigned it.
-    /// `InvalidInput` when no such log is open.
-    pub fn commit_batch(&mut self, log: u32, tx: u64) -> ResultCode {
+    /// Bind the log's in-flight `batch` to the tx the log assigned it.
+    /// `InvalidInput` when no such log is open, `UnknownBatch` when the log
+    /// has no such batch in flight.
+    pub fn commit_batch(&mut self, log: u32, batch: u32, tx: u64) -> ResultCode {
         let Some(seen) = self.log_mut(log) else {
             return ResultCode::InvalidInput;
         };
-        seen.commit(tx);
-        ResultCode::Ok
+        match seen.commit(batch, tx) {
+            Ok(()) => ResultCode::Ok,
+            Err(_) => ResultCode::UnknownBatch,
+        }
     }
 
-    /// Retract the log's staged batch: the append did not happen.
-    pub fn abandon_batch(&mut self, log: u32) -> ResultCode {
+    /// Retract the log's in-flight `batch`: the append did not happen.
+    pub fn abandon_batch(&mut self, log: u32, batch: u32) -> ResultCode {
         let Some(seen) = self.log_mut(log) else {
             return ResultCode::InvalidInput;
         };
-        seen.abandon();
-        ResultCode::Ok
+        match seen.abandon(batch) {
+            Ok(()) => ResultCode::Ok,
+            Err(_) => ResultCode::UnknownBatch,
+        }
     }
 
     /// Evict every admission of the log below the redelivery horizon; the
@@ -946,7 +956,7 @@ impl EventProcessor {
         &mut self,
         log: Option<u32>,
         columns: &mut DynamicColumns,
-    ) -> Result<(u32, u32), ResultDiagnostic> {
+    ) -> Result<(u32, u32, u32), ResultDiagnostic> {
         let seen = log.and_then(|slot| self.logs.get_mut(slot as usize).and_then(Option::as_mut));
         judge_batch(seen, &self.ordinal_id_types, columns, &mut self.keep_mask)
     }
@@ -983,22 +993,22 @@ fn id_namespace_of(ordinal_id_types: &[Box<[u8]>], signal_type: &[u8]) -> IdName
     }
 }
 
-/// Judge every row of `columns` against the seen-set: `(processed,
-/// duplicates)` on success, with discarded rows compacted out of the batch;
-/// on refusal the diagnostic names the row and the cause, and the set is as
-/// it was before the batch. `None` seen-set means no dedup is wired.
+/// Judge every row of `columns` against the seen-set as one new batch:
+/// `(batch, processed, duplicates)` on success, with discarded rows
+/// compacted out of the batch and the batch staged under `batch`; on
+/// refusal the diagnostic names the row and the cause, and the set is as it
+/// was before the batch. `None` seen-set means no dedup is wired, and the
+/// batch id is 0.
 pub fn judge_batch(
     seen: Option<&mut SeenSet>,
     ordinal_id_types: &[Box<[u8]>],
     columns: &mut DynamicColumns,
     keep_mask: &mut [u8],
-) -> Result<(u32, u32), ResultDiagnostic> {
+) -> Result<(u32, u32, u32), ResultDiagnostic> {
     let Some(seen) = seen else {
-        return Ok((columns.count, 0));
+        return Ok((0, columns.count, 0));
     };
-    if let Err(refusal) = seen.require_no_open_batch() {
-        return Err(refusal_diagnostic(refusal, 0));
-    }
+    let batch = seen.next_batch();
     let discard = seen.policy() == CollisionPolicy::Discard;
     let mut processed = 0u32;
     let mut duplicates = 0u32;
@@ -1015,14 +1025,16 @@ pub fn judge_batch(
                 .unwrap_or_else(|| columine_types::die!("type column is not variable-width"));
             id_namespace_of(ordinal_id_types, signal_type)
         };
-        match seen.should_process(event_id, namespace) {
+        match seen.should_process(batch, event_id, namespace) {
             Ok(true) => {
                 processed += 1;
                 keep_mask[row as usize / 8] |= 1u8 << (row % 8);
             }
             Ok(false) => duplicates += 1,
             Err(refusal) => {
-                seen.abandon();
+                // The batch is open only once a row was judged; a refusal
+                // on its first row has nothing to retract.
+                let _ = seen.abandon(batch);
                 return Err(refusal_diagnostic(refusal, row));
             }
         }
@@ -1030,7 +1042,27 @@ pub fn judge_batch(
     if discard && duplicates > 0 {
         columns.retain_rows(keep_mask);
     }
-    Ok((processed, duplicates))
+    Ok((batch, processed, duplicates))
+}
+
+/// Offset of the batch id in a successful result header: the four bytes the
+/// diagnostic lane occupies on failure, unused on success until now.
+pub const BATCH_ID_OFFSET: usize = 20;
+
+/// Record the batch id a successful judged entry was staged under.
+pub fn write_batch_id(output: &mut [u8], batch: u32) {
+    output[BATCH_ID_OFFSET..BATCH_ID_OFFSET + 4].copy_from_slice(&batch.to_le_bytes());
+}
+
+/// The batch id a successful judged entry was staged under (0 when no log
+/// was named).
+pub fn read_batch_id(output: &[u8]) -> u32 {
+    u32::from_le_bytes([
+        output[BATCH_ID_OFFSET],
+        output[BATCH_ID_OFFSET + 1],
+        output[BATCH_ID_OFFSET + 2],
+        output[BATCH_ID_OFFSET + 3],
+    ])
 }
 
 fn refusal_diagnostic(refusal: AdmissionRefusal, row: u32) -> ResultDiagnostic {
@@ -1038,7 +1070,7 @@ fn refusal_diagnostic(refusal: AdmissionRefusal, row: u32) -> ResultDiagnostic {
         AdmissionRefusal::IdTooLong { .. } => dedup_detail::ID_TOO_LONG,
         AdmissionRefusal::CeilingReached { .. } => dedup_detail::CEILING_REACHED,
         AdmissionRefusal::NotAnOrdinal => dedup_detail::NOT_AN_ORDINAL,
-        AdmissionRefusal::BatchOpen => dedup_detail::BATCH_OPEN,
+        AdmissionRefusal::UnknownBatch { .. } => dedup_detail::BATCH_UNKNOWN,
     };
     ResultDiagnostic {
         stage: diagnostic_stage::DEDUP,
@@ -1343,21 +1375,35 @@ mod tests {
         let body = &output[arrow_offset as usize..(arrow_offset + arrow_len) as usize];
         assert_eq!(body.windows(3).filter(|w| *w == b"dup").count(), 1);
         assert!(body.windows(4).any(|w| w == b"uniq"));
+        let first = read_batch_id(&output);
+        assert_ne!(first, 0, "a judged entry names its batch");
         // Stats and the checkpoint see only committed batches.
         assert_eq!(ep.stats(log), 0);
         assert_eq!(ep.checkpoint_len(log), dedup::checkpoint::HEADER_SIZE);
+        // A second writer's batch on the same log is in flight beside the
+        // first: it sees the staged ids as duplicates and gets its own id.
         assert_eq!(
             ep.create_log_entry_for(Some(log), input, InputFormat::Json, &mut output),
-            ResultCode::BatchPending,
-            "a staged batch must be committed or abandoned before the next",
+            ResultCode::Ok,
         );
-        // Another log's batch is not blocked by this log's staged one.
+        let second = read_batch_id(&output);
+        assert!(second != 0 && second != first);
+        assert_eq!(
+            read_result_header(&output).4,
+            3,
+            "every id is staged by the first batch"
+        );
+        assert_eq!(ep.abandon_batch(log, second), ResultCode::Ok);
+        assert_eq!(ep.abandon_batch(log, second), ResultCode::UnknownBatch);
+        // Another log's batch is its own.
         assert_eq!(
             ep.create_log_entry_for(Some(other), input, InputFormat::Json, &mut output),
             ResultCode::Ok
         );
-        assert_eq!(ep.abandon_batch(other), ResultCode::Ok);
-        assert_eq!(ep.commit_batch(log, 7), ResultCode::Ok);
+        let others = read_batch_id(&output);
+        assert_eq!(ep.abandon_batch(other, others), ResultCode::Ok);
+        assert_eq!(ep.commit_batch(log, first, 7), ResultCode::Ok);
+        assert_eq!(ep.commit_batch(log, first, 7), ResultCode::UnknownBatch);
         assert_eq!(ep.stats(log), 3 | (1 << 32));
         assert_eq!(
             ep.admitted_tx(log, b"dup", IdNamespace::Bytes),
@@ -1453,7 +1499,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([output[28], output[29]]), 1);
         let seen = ep.log(log).unwrap();
         assert!(seen.is_empty());
-        assert!(!seen.is_batch_open());
+        assert_eq!(seen.open_batches(), 0);
         // A slot that was never opened is refused by name, not judged.
         assert_eq!(
             ep.create_log_entry_for(Some(99), input.as_bytes(), InputFormat::Json, &mut output),
@@ -1498,7 +1544,10 @@ mod tests {
         );
         let (_, _, _, processed, dupes) = read_result_header(&output);
         assert_eq!((processed, dupes), (2, 1));
-        assert_eq!(ep.commit_batch(log, 1), ResultCode::Ok);
+        assert_eq!(
+            ep.commit_batch(log, read_batch_id(&output), 1),
+            ResultCode::Ok
+        );
         assert_eq!(
             ep.admitted_tx(log, b"7", IdNamespace::Ordinal),
             AdmittedTx::Member
