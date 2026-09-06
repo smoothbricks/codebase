@@ -2,17 +2,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::{fs::MetadataExt, process::ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -258,18 +254,6 @@ pub trait SpawnSink: Send {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>>;
-
-    async fn print_devenv_env(
-        &mut self,
-        devenv_dir: &Path,
-        sandbox: &SandboxConfig,
-    ) -> Result<CommandOutput> {
-        let _ = sandbox;
-        Err(CowshedError::internal(format!(
-            "spawn sink cannot evaluate devenv at {}",
-            devenv_dir.display()
-        )))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,7 +285,7 @@ pub trait ArtifactSink: Send {
     fn checkpoint(&mut self) -> Result<CheckpointBarrier>;
 }
 
-pub use crate::process::{CommandOutput, ProcessStatus};
+pub use crate::process::ProcessStatus;
 pub use crate::storage::audit::CommitmentDraft;
 
 /// Where a supervisor sends its audit records. Recording is best effort by contract: the act a
@@ -556,19 +540,9 @@ impl CommitmentSink for CommitmentPublisherHandle {
 
 const COWSHED_CONFIG_FILE: &str = ".cowshed.toml";
 const DEVENV_PROFILE_BIN: &str = ".devenv/profile/bin";
-const DEVENV_SNAPSHOT_FILE: &str = ".devenv/cowshed-env.json";
-const DEVENV_PRINT_ARGV: [&str; 3] = ["devenv", "print-dev-env", "--json"];
-const DEVENV_INPUT_FILES: [&str; 4] = [
-    "devenv.nix",
-    "devenv.lock",
-    "devenv.yaml",
-    "devenv.local.nix",
-];
-
 #[derive(Clone, Debug)]
 struct DevenvResolutionError {
     message: String,
-    configured_dir: Option<PathBuf>,
 }
 
 impl DevenvResolutionError {
@@ -580,254 +554,6 @@ impl DevenvResolutionError {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct DevenvEnvSnapshot {
-    vars: BTreeMap<String, String>,
-    /// The tracked inputs as they were when these vars were evaluated.
-    ///
-    /// One algorithm answers "are the devenv inputs still the snapshot's inputs?", at startup and
-    /// at every dirty exec. The startup check used to be snapshot-mtime versus source-mtime while
-    /// the runtime check used this fingerprint, and the two disagree by construction: an atomic
-    /// replace changes inode and ctime without moving mtime forward, so each could call fresh
-    /// what the other called stale. A snapshot that cannot say which inputs produced it is not a
-    /// snapshot that can be reused, which is why this is required rather than defaulted.
-    inputs: DevenvInputFingerprint,
-}
-
-/// Tracked devenv inputs, keyed by path relative to the workspace mount so a snapshot survives
-/// the clone into a differently-named mount that copy-on-write forks produce.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct DevenvInputFingerprint(Vec<(PathBuf, Option<DevenvFileFingerprint>)>);
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct DevenvFileFingerprint {
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct PrintedDevenvEnvironment {
-    variables: BTreeMap<String, PrintedDevenvVariable>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PrintedDevenvVariable {
-    #[serde(rename = "type")]
-    kind: String,
-    /// devenv 2.2.x emits `{"type": "unknown"}` with NO value field for
-    /// shell-special variables (BASHOPTS, BASHPID, ...). Only `exported`
-    /// entries are consumed below, so a missing value defaults to Null and
-    /// non-exported kinds skip before it is ever read.
-    #[serde(default)]
-    value: serde_json::Value,
-}
-
-/// One long-lived watcher belongs to each mounted-workspace supervisor.
-///
-/// Source mtimes are reconciled once when the supervisor starts, covering edits made while the
-/// daemon was down. After that, filesystem events are the staleness signal: clean execs do no
-/// source metadata work and never invoke devenv. A dirty exec fingerprints the tracked inputs so a
-/// delayed pre-watch event can reuse the evaluated snapshot; a new revision refreshes it.
-struct DevenvEnvironment {
-    workspace_mount: PathBuf,
-    dirty: Arc<AtomicBool>,
-    tracked_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
-    evaluated_inputs: Option<DevenvInputFingerprint>,
-    resolution: std::result::Result<Option<PathBuf>, DevenvResolutionError>,
-    _watcher: RecommendedWatcher,
-}
-
-impl DevenvEnvironment {
-    fn new(workspace_mount: &Path) -> Result<Self> {
-        let resolution = resolve_devenv_dir(workspace_mount);
-        let resolved = resolution.as_ref().ok().and_then(|value| value.as_deref());
-        let tracked_paths = devenv_tracked_paths(workspace_mount, tracked_devenv_dir(&resolution));
-        // Reconcile once against the snapshot's own recorded inputs, covering edits made while
-        // the daemon was down. Identical comparison to the dirty-exec path below, so a snapshot
-        // is never fresh by one rule and stale by the other.
-        let evaluated_inputs = resolved
-            .and_then(|dir| parse_devenv_snapshot(&fs::read(dir.join(DEVENV_SNAPSHOT_FILE)).ok()?))
-            .map(|snapshot| snapshot.inputs)
-            .filter(|persisted| {
-                devenv_input_fingerprint(workspace_mount, &tracked_paths)
-                    .is_ok_and(|current| current == *persisted)
-            });
-        let snapshot_is_stale = resolved.is_some() && evaluated_inputs.is_none();
-        let tracked_paths = Arc::new(RwLock::new(tracked_paths));
-        let dirty = Arc::new(AtomicBool::new(false));
-        let callback_paths = Arc::clone(&tracked_paths);
-        let callback_dirty = Arc::clone(&dirty);
-        let mut watcher: RecommendedWatcher =
-            notify::recommended_watcher(move |event: notify::Result<Event>| match event {
-                Ok(event) => {
-                    let Ok(paths) = callback_paths.read() else {
-                        callback_dirty.store(true, Ordering::Release);
-                        return;
-                    };
-                    if event_touches_devenv(&event, &paths) {
-                        callback_dirty.store(true, Ordering::Release);
-                    }
-                }
-                Err(_) => callback_dirty.store(true, Ordering::Release),
-            })
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot create devenv watcher for {}: {error}",
-                        workspace_mount.display()
-                    ),
-                    "reattach the workspace and retry",
-                )
-            })?;
-        watcher
-            .watch(workspace_mount, RecursiveMode::Recursive)
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot watch workspace {} for devenv changes: {error}",
-                        workspace_mount.display()
-                    ),
-                    "reattach the workspace and retry",
-                )
-            })?;
-        if snapshot_is_stale {
-            dirty.store(true, Ordering::Release);
-        }
-        Ok(Self {
-            workspace_mount: workspace_mount.to_owned(),
-            dirty,
-            tracked_paths,
-            evaluated_inputs,
-            resolution,
-            _watcher: watcher,
-        })
-    }
-
-    async fn environment_for_spawn(
-        &mut self,
-        spawner: &mut dyn SpawnSink,
-        sandbox: &SandboxConfig,
-        controller_env: BTreeMap<String, String>,
-    ) -> Result<(Option<PathBuf>, BTreeMap<String, String>)> {
-        let mut changed = self.dirty.swap(false, Ordering::AcqRel);
-        if changed {
-            self.resolve_again();
-            if self
-                .input_fingerprint()
-                .is_some_and(|inputs| self.evaluated_inputs.as_ref() == Some(&inputs))
-            {
-                // FSEvents can deliver a write from before watcher registration after the
-                // evaluated snapshot is already current. The fingerprint distinguishes that
-                // delayed notification from a new source revision without losing the event.
-                changed = false;
-            }
-        }
-        let devenv_dir = self
-            .resolution
-            .clone()
-            .map_err(DevenvResolutionError::into_cowshed_error)?;
-        let Some(devenv_dir) = devenv_dir else {
-            return Ok((None, controller_env));
-        };
-
-        if !changed && let Some(snapshot) = read_devenv_snapshot(&devenv_dir).await {
-            return Ok((
-                Some(devenv_dir),
-                merge_devenv_environment(snapshot.vars, controller_env),
-            ));
-        }
-
-        let inputs_before = self.input_fingerprint();
-        match evaluate_devenv_environment(spawner, sandbox, &devenv_dir).await {
-            Ok(vars) => {
-                let inputs_after = self.input_fingerprint();
-                self.evaluated_inputs = match (inputs_before, inputs_after) {
-                    (Some(before), Some(after)) if before == after => Some(after),
-                    _ => {
-                        // A source changed while devenv was evaluating, so the next process
-                        // must refresh again rather than treating this output as authoritative.
-                        self.dirty.store(true, Ordering::Release);
-                        None
-                    }
-                };
-                // Persisted only when the inputs held still across the evaluation. Without a
-                // fingerprint the snapshot cannot claim to describe any particular revision, so
-                // the next startup re-evaluates instead of trusting it.
-                if let Some(inputs) = self.evaluated_inputs.clone() {
-                    write_devenv_snapshot(
-                        &devenv_dir,
-                        DevenvEnvSnapshot {
-                            vars: vars.clone(),
-                            inputs,
-                        },
-                    )
-                    .await?;
-                }
-                Ok((
-                    Some(devenv_dir),
-                    merge_devenv_environment(vars, controller_env),
-                ))
-            }
-            Err(error) => {
-                // A failed refresh is never a clean state and a stale snapshot is never reused.
-                self.dirty.store(true, Ordering::Release);
-                Err(error)
-            }
-        }
-    }
-
-    fn resolve_again(&mut self) {
-        let resolution = resolve_devenv_dir(&self.workspace_mount);
-        if let Ok(mut paths) = self.tracked_paths.write() {
-            *paths = devenv_tracked_paths(&self.workspace_mount, tracked_devenv_dir(&resolution));
-        } else {
-            self.dirty.store(true, Ordering::Release);
-        }
-        self.resolution = resolution;
-    }
-
-    fn input_fingerprint(&self) -> Option<DevenvInputFingerprint> {
-        let paths = self.tracked_paths.read().ok()?;
-        devenv_input_fingerprint(&self.workspace_mount, &paths).ok()
-    }
-}
-
-fn devenv_input_fingerprint(
-    workspace_mount: &Path,
-    paths: &BTreeSet<PathBuf>,
-) -> io::Result<DevenvInputFingerprint> {
-    let mut fingerprints = Vec::with_capacity(paths.len());
-    for path in paths {
-        let relative = path.strip_prefix(workspace_mount).map_err(|_| {
-            io::Error::other(format!(
-                "tracked devenv input {} is outside the workspace mount {}",
-                path.display(),
-                workspace_mount.display()
-            ))
-        })?;
-        let fingerprint = match fs::metadata(path) {
-            Ok(metadata) => Some(DevenvFileFingerprint {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                size: metadata.size(),
-                modified_seconds: metadata.mtime(),
-                modified_nanoseconds: metadata.mtime_nsec(),
-                changed_seconds: metadata.ctime(),
-                changed_nanoseconds: metadata.ctime_nsec(),
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        fingerprints.push((relative.to_path_buf(), fingerprint));
-    }
-    Ok(DevenvInputFingerprint(fingerprints))
-}
-
 fn resolve_devenv_dir(
     workspace_mount: &Path,
 ) -> std::result::Result<Option<PathBuf>, DevenvResolutionError> {
@@ -837,7 +563,6 @@ fn resolve_devenv_dir(
             crate::storage::bootstrap::parse_cowshed_config(&input).map_err(|error| {
                 DevenvResolutionError {
                     message: format!("invalid {}: {error}", config_path.display()),
-                    configured_dir: None,
                 }
             })?,
         ),
@@ -845,7 +570,6 @@ fn resolve_devenv_dir(
         Err(error) => {
             return Err(DevenvResolutionError {
                 message: format!("cannot read {}: {error}", config_path.display()),
-                configured_dir: None,
             });
         }
     };
@@ -860,7 +584,6 @@ fn resolve_devenv_dir(
                     devenv_dir.display(),
                     devenv_nix.display()
                 ),
-                configured_dir: Some(devenv_dir.clone()),
             });
         }
         return Ok(Some(devenv_dir));
@@ -872,159 +595,124 @@ fn resolve_devenv_dir(
         .then(|| workspace_mount.to_owned()))
 }
 
-fn tracked_devenv_dir(
-    resolution: &std::result::Result<Option<PathBuf>, DevenvResolutionError>,
-) -> Option<&Path> {
-    match resolution {
-        Ok(Some(devenv_dir)) => Some(devenv_dir),
-        Err(error) => error.configured_dir.as_deref(),
-        Ok(None) => None,
-    }
-}
-
-fn devenv_tracked_paths(workspace_mount: &Path, devenv_dir: Option<&Path>) -> BTreeSet<PathBuf> {
-    let devenv_dir = devenv_dir.unwrap_or(workspace_mount);
-    std::iter::once(workspace_mount.join(COWSHED_CONFIG_FILE))
-        .chain(
-            DEVENV_INPUT_FILES
-                .into_iter()
-                .map(|file| devenv_dir.join(file)),
+/// Resolve a shell input without letting discovery cross the workspace boundary.
+fn contained_shell_path(workspace_mount: &Path, path: &Path) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(path).map_err(|error| {
+        CowshedError::environment_missing(
+            format!("cannot resolve shell input {}: {error}", path.display()),
+            "repair the workspace shell configuration and retry",
         )
-        .collect()
-}
-
-fn event_touches_devenv(event: &Event, tracked_paths: &BTreeSet<PathBuf>) -> bool {
-    !matches!(event.kind, notify::EventKind::Access(_))
-        && event.paths.iter().any(|path| tracked_paths.contains(path))
-}
-
-/// One parser for the snapshot, so the synchronous startup reconciliation and the asynchronous
-/// exec path cannot disagree about what a snapshot file means.
-fn parse_devenv_snapshot(bytes: &[u8]) -> Option<DevenvEnvSnapshot> {
-    serde_json::from_slice(bytes).ok()
-}
-
-async fn read_devenv_snapshot(devenv_dir: &Path) -> Option<DevenvEnvSnapshot> {
-    let bytes = tokio::fs::read(devenv_dir.join(DEVENV_SNAPSHOT_FILE))
-        .await
-        .ok()?;
-    parse_devenv_snapshot(&bytes)
-}
-
-async fn evaluate_devenv_environment(
-    spawner: &mut dyn SpawnSink,
-    sandbox: &SandboxConfig,
-    devenv_dir: &Path,
-) -> Result<BTreeMap<String, String>> {
-    let output = spawner.print_devenv_env(devenv_dir, sandbox).await?;
-    if !output.status.succeeded() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(CowshedError::environment_missing(
-            if detail.is_empty() {
-                format!(
-                    "devenv print-dev-env --json failed in {} with {}",
-                    devenv_dir.display(),
-                    output.status
-                )
-            } else {
-                format!(
-                    "devenv print-dev-env --json failed in {}: {detail}",
-                    devenv_dir.display()
-                )
-            },
+    })?;
+    if !resolved.starts_with(workspace_mount) {
+        return Err(CowshedError::sandbox_denied(
             format!(
-                "run devenv print-dev-env --json in {} and repair the reported error",
-                devenv_dir.display()
+                "shell input {} escapes workspace {}",
+                path.display(),
+                workspace_mount.display()
             ),
+            "keep shell configuration inside the workspace",
         ));
     }
-    parse_printed_devenv_environment(&output.stdout, devenv_dir)
+    Ok(resolved)
 }
 
-async fn write_devenv_snapshot(devenv_dir: &Path, snapshot: DevenvEnvSnapshot) -> Result<()> {
-    let snapshot_path = devenv_dir.join(DEVENV_SNAPSHOT_FILE);
-    let parent = snapshot_path
-        .parent()
-        .expect("devenv snapshot always has a parent");
-    tokio::fs::create_dir_all(parent).await.map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot create devenv snapshot directory {}: {error}",
-                parent.display()
-            ),
-            "repair workspace permissions and retry",
-        )
-    })?;
-    let write_path = snapshot_path.clone();
-    tokio::task::spawn_blocking(move || crate::metadata::write_json(&write_path, &snapshot))
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!(
-                "devenv snapshot writer failed for {}: {error}",
-                snapshot_path.display()
-            ))
-        })?
-        .map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot write devenv environment snapshot {}: {error}",
-                    snapshot_path.display()
-                ),
-                "repair workspace permissions and retry",
-            )
-        })?;
-    Ok(())
-}
-
-fn parse_printed_devenv_environment(
-    stdout: &[u8],
-    devenv_dir: &Path,
-) -> Result<BTreeMap<String, String>> {
-    let printed: PrintedDevenvEnvironment = serde_json::from_slice(stdout).map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "devenv print-dev-env --json returned invalid JSON in {}: {error}",
-                devenv_dir.display()
-            ),
-            "upgrade or repair devenv, then retry",
-        )
-    })?;
-    let mut vars = BTreeMap::new();
-    for (name, variable) in printed.variables {
-        if variable.kind != "exported" {
-            continue;
-        }
-        let value = variable.value.as_str().ok_or_else(|| {
-            CowshedError::environment_missing(
-                format!(
-                    "devenv exported variable {name:?} has a non-string value in {}",
-                    devenv_dir.display()
-                ),
-                "upgrade or repair devenv, then retry",
-            )
-        })?;
-        vars.insert(name, value.to_owned());
+fn shell_input_exists(workspace_mount: &Path, path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => contained_shell_path(workspace_mount, path).map(|_| true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CowshedError::environment_missing(
+            format!("cannot inspect shell input {}: {error}", path.display()),
+            "repair the workspace shell configuration and retry",
+        )),
     }
-    Ok(vars)
 }
 
-fn merge_devenv_environment(
-    mut snapshot: BTreeMap<String, String>,
-    controller_env: BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    // PATH is constructed from admitted roots below; an evaluated shell cannot bypass that policy.
-    snapshot.remove("PATH");
-    snapshot.extend(controller_env);
-    snapshot
+/// Configuration is rooted beside its `.cowshed.toml`, not at the requested command cwd.
+fn shell_project(
+    workspace_mount: &Path,
+    cwd: &Path,
+    configured_dir: Option<&Path>,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    if let Some(directory) = configured_dir {
+        let directory = contained_shell_path(workspace_mount, directory)?;
+        return Ok(Some((workspace_mount.to_owned(), directory)));
+    }
+    for root in cwd
+        .ancestors()
+        .take_while(|root| root.starts_with(workspace_mount))
+    {
+        // Validate links before the config parser reads any workspace-controlled path.
+        shell_input_exists(workspace_mount, &root.join(COWSHED_CONFIG_FILE))?;
+        shell_input_exists(workspace_mount, &root.join("devenv.nix"))?;
+        if let Some(directory) =
+            resolve_devenv_dir(root).map_err(DevenvResolutionError::into_cowshed_error)?
+        {
+            let directory = contained_shell_path(workspace_mount, &directory)?;
+            contained_shell_path(workspace_mount, &directory.join("devenv.nix"))?;
+            return Ok(Some((root.to_owned(), directory)));
+        }
+    }
+    Ok(None)
 }
 
-/// Resolve the evaluated profile produced inside a workspace.
+/// Activation is part of the executed child: it inherits the same sandbox, pipes and process
+/// group, and its failure is the job's failure. Only constant scripts are shell code; cwd and
+/// the complete original argv remain positional arguments, never interpolated shell code.
+fn activate_shell(
+    plan: &mut SpawnPlan,
+    sandbox: &SandboxConfig,
+    configured_dir: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let project = shell_project(&sandbox.workspace_mount, &plan.cwd, configured_dir)?;
+    let mut envrc_directory = None;
+    for directory in plan
+        .cwd
+        .ancestors()
+        .take_while(|directory| directory.starts_with(&sandbox.workspace_mount))
+    {
+        if shell_input_exists(&sandbox.workspace_mount, &directory.join(".envrc"))? {
+            envrc_directory = Some(directory);
+            break;
+        }
+    }
+    let mut activation = if let Some(directory) = envrc_directory {
+        // Approval is private to this workspace (DIRENV_CONFIG/XDG_DATA_HOME below), never
+        // the user's host trust database. No workspace code executes until sandbox-exec.
+        vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(
+                r#"directory=$1; shift; direnv allow "$directory/.envrc" && exec direnv exec "$directory" "$@""#,
+            ),
+            OsString::from("cowshed-direnv"),
+            directory.as_os_str().to_owned(),
+        ]
+    } else if let Some((root, directory)) = &project {
+        let mut source = OsString::from("path:");
+        source.push(directory);
+        vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(
+                r#"root=$1; source=$2; cwd=$3; shift 3; cd "$root" && exec devenv --from "$source" shell -- /bin/sh -c 'cd "$1" && shift && exec "$@"' cowshed-command "$cwd" "$@""#,
+            ),
+            OsString::from("cowshed-devenv"),
+            root.as_os_str().to_owned(),
+            source,
+            plan.cwd.as_os_str().to_owned(),
+        ]
+    } else {
+        return Ok(None);
+    };
+    activation.extend(plan.args.drain(3..));
+    plan.args.extend(activation);
+    Ok(project.map(|(_, directory)| directory))
+}
+
+/// Resolve a store-backed profile for bootstrap tool discovery only.
 ///
-/// Cowshed's cwd-based refresh writes state below the configured devenv directory, which is
-/// preferred. A user may also have evaluated through devenv's native root binding, whose state
-/// lives at the mount root, so that location is admitted as a presence-based fallback. Both paths
-/// retain the immutable `/nix/store` canonicalization guard.
+/// Canonical activation owns the resulting PATH. These existing profiles only make direnv and
+/// devenv reachable before activation; both locations retain the immutable store guard.
 fn workspace_profile_bin(workspace_mount: &Path, devenv_dir: &Path) -> Option<PathBuf> {
     [devenv_dir, workspace_mount].into_iter().find_map(|root| {
         let resolved = fs::canonicalize(root.join(DEVENV_PROFILE_BIN)).ok()?;
@@ -1032,10 +720,19 @@ fn workspace_profile_bin(workspace_mount: &Path, devenv_dir: &Path) -> Option<Pa
     })
 }
 
-fn sandbox_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<OsString> {
+fn bootstrap_path(sandbox: &SandboxConfig, devenv_dir: Option<&Path>) -> Result<OsString> {
     let mut paths = vec![sandbox.workspace_mount.join(".cowshed/bin")];
-    if let Some(profile) = devenv_dir
-        .and_then(|devenv_dir| workspace_profile_bin(&sandbox.workspace_mount, devenv_dir))
+    if let Some(profile) = workspace_profile_bin(
+        &sandbox.workspace_mount,
+        devenv_dir.unwrap_or(&sandbox.workspace_mount),
+    ) {
+        paths.push(profile);
+    }
+    // launchd may start the gateway without a Nix profile on PATH. The system profile is
+    // bootstrap authority only when it resolves to immutable store content.
+    if let Ok(profile) = fs::canonicalize("/nix/var/nix/profiles/default/bin")
+        && profile.starts_with("/nix/store")
+        && !paths.contains(&profile)
     {
         paths.push(profile);
     }
@@ -1341,11 +1038,9 @@ pub(super) fn build_environment(
 
 /// Build the sandboxed `Command` for a child of this workspace.
 ///
-/// Every process the supervisor launches goes through here, including the `devenv print-dev-env`
-/// evaluation that produces the environment the others consume. That is the point: the evaluation
-/// reads workspace-controlled Nix, so running it as a bare host `Command` with the daemon's
-/// inherited environment handed workspace content the one path to host credentials, `PATH`, and
-/// agent env that no other child has. It is a child of the workspace and it is sandboxed like one.
+/// Shell activation runs inside this command, after the sandbox and private environment are
+/// established. The PATH here discovers bootstrap tools; no environment is extracted, merged or
+/// rewritten after the workspace shell has activated.
 ///
 /// Caller `env` reaches the child through [`build_environment`], which is where the sandbox's
 /// own build-tool policy is merged over it; `env_clear` means nothing is inherited that is not
@@ -1360,6 +1055,7 @@ async fn sandboxed_command(
     let private_home = private_root.join("home");
     let private_config = private_root.join("config");
     let private_cache = private_root.join("cache");
+    let private_data = private_root.join("data");
     let private_runtime = sandbox_runtime_dir(sandbox);
     // exec_temp_dir joins the loop because it is exported as TMPDIR below.
     // Exporting a directory without creating it makes every child that
@@ -1368,6 +1064,7 @@ async fn sandboxed_command(
         &private_home,
         &private_config,
         &private_cache,
+        &private_data,
         &private_runtime,
         &sandbox.exec_temp_dir,
     ] {
@@ -1409,7 +1106,7 @@ async fn sandboxed_command(
     link_cargo_registry(&private_home, &sandbox.home).await?;
     link_nix_cache(&private_cache).await?;
     link_runtime_dir(sandbox, &private_runtime).await?;
-    let path = sandbox_path(sandbox, devenv_dir)?;
+    let path = bootstrap_path(sandbox, devenv_dir)?;
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
     let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
@@ -1424,6 +1121,8 @@ async fn sandboxed_command(
         .env("HOME", &private_home)
         .env("XDG_CONFIG_HOME", &private_config)
         .env("XDG_CACHE_HOME", &private_cache)
+        .env("XDG_DATA_HOME", &private_data)
+        .env("DIRENV_CONFIG", private_config.join("direnv"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
@@ -1472,7 +1171,7 @@ impl SpawnSink for SystemSpawnSink {
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
-        let plan = plan_exec(
+        let mut plan = plan_exec(
             SandboxExecRequest {
                 argv: request.argv,
                 cwd: request.cwd,
@@ -1498,13 +1197,10 @@ impl SpawnSink for SystemSpawnSink {
             ));
         }
 
-        let mut command = sandboxed_command(
-            &plan,
-            &request.sandbox,
-            request.devenv_dir.as_deref(),
-            &request.env,
-        )
-        .await?;
+        let devenv_dir =
+            activate_shell(&mut plan, &request.sandbox, request.devenv_dir.as_deref())?;
+        let mut command =
+            sandboxed_command(&plan, &request.sandbox, devenv_dir.as_deref(), &request.env).await?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1587,38 +1283,6 @@ impl SpawnSink for SystemSpawnSink {
             stdin: stdin_sender,
             stdin_closed: false,
         }))
-    }
-
-    async fn print_devenv_env(
-        &mut self,
-        devenv_dir: &Path,
-        sandbox: &SandboxConfig,
-    ) -> Result<CommandOutput> {
-        let plan = plan_exec(
-            SandboxExecRequest {
-                argv: DEVENV_PRINT_ARGV.map(OsString::from).to_vec(),
-                cwd: devenv_dir.to_path_buf(),
-            },
-            sandbox,
-        )
-        .map_err(map_exec_error)?;
-        // The evaluation writes `.devenv/` and talks to the nix daemon, both of which the
-        // executed-child profile already admits: the daemon socket is a standing grant because
-        // building inside a workspace is the point of a workspace.
-        let output = sandboxed_command(&plan, sandbox, Some(devenv_dir), &BTreeMap::new())
-            .await?
-            .output()
-            .await
-            .map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot run devenv print-dev-env --json in {}: {error}",
-                        devenv_dir.display()
-                    ),
-                    "install devenv or repair the host PATH, then retry",
-                )
-            })?;
-        Ok(CommandOutput::from(output))
     }
 }
 
@@ -2064,7 +1728,6 @@ impl WorkspaceSupervisor {
         commitments: Box<dyn CommitmentSink>,
     ) -> Result<WorkspaceSupervisorHandle> {
         config.validate()?;
-        let devenv = DevenvEnvironment::new(&config.workspace_root)?;
         let next_job_id = artifacts.next_job_id()?;
         let (commands, receiver) = mpsc::channel(config.actor_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_capacity);
@@ -2077,7 +1740,6 @@ impl WorkspaceSupervisor {
             workspace_root: config.workspace_root,
             default_cwd: config.default_cwd,
             sandbox: config.sandbox,
-            devenv,
             term_grace: config.term_grace,
             next_job_id,
             next_session_id: 1,
@@ -2283,7 +1945,6 @@ struct SupervisorActor {
     workspace_root: PathBuf,
     default_cwd: Option<WorkspacePath>,
     sandbox: SandboxConfig,
-    devenv: DevenvEnvironment,
     term_grace: Duration,
     next_job_id: JobId,
     next_session_id: u64,
@@ -2674,17 +2335,6 @@ impl SupervisorActor {
                 None,
             ),
         };
-        let (devenv_dir, merged_env) = match self
-            .devenv
-            .environment_for_spawn(&mut *self.spawner, &self.sandbox, merged_env)
-            .await
-        {
-            Ok(environment) => environment,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
         let job_id = self.next_job_id;
         let expected_next = match job_id
             .get()
@@ -2803,7 +2453,7 @@ impl SupervisorActor {
                         .map(Path::to_path_buf)
                         .unwrap_or_default(),
                     env: merged_env,
-                    devenv_dir,
+                    devenv_dir: None,
                     sandbox: self.sandbox.clone(),
                     trusted_supervisor_profile,
                     executed_child_profile,
@@ -3844,61 +3494,6 @@ mod workspace_toolchain_tests {
         root
     }
 
-    struct NoSpawn;
-
-    #[async_trait]
-    impl SpawnSink for NoSpawn {
-        async fn spawn(
-            &mut self,
-            _request: ProcessSpawnRequest,
-            _events: mpsc::Sender<ProcessEvent>,
-        ) -> Result<Box<dyn RunningProcess>> {
-            panic!("spawn is not used by devenv environment tests")
-        }
-    }
-
-    /// `print-dev-env` reads workspace-controlled Nix, so it is the one child that must not be
-    /// a bare host `Command`. This pins the argv through the same `plan_exec` every job uses: the
-    /// program is the Seatbelt wrapper, the profile is the executed-child role, and the cwd is
-    /// contained in the workspace mount. Reverting to `Command::new("devenv")` fails it.
-    #[test]
-    fn the_devenv_evaluation_is_planned_through_seatbelt_like_any_other_child() {
-        let root = scratch("devenv-sandboxed");
-        let mount = root.join("workspace");
-        let devenv_dir = mount.join("tooling/devenv");
-        std::fs::create_dir_all(&devenv_dir).expect("devenv dir");
-        let sandbox = sandbox_at(&mount);
-
-        let plan = plan_exec(
-            SandboxExecRequest {
-                argv: DEVENV_PRINT_ARGV.map(OsString::from).to_vec(),
-                cwd: devenv_dir.clone(),
-            },
-            &sandbox,
-        )
-        .expect("the devenv argv is a plannable sandboxed exec");
-
-        assert_eq!(plan.program, Path::new(crate::exec::SANDBOX_EXEC));
-        assert_eq!(
-            plan.args.first().map(OsString::as_os_str),
-            Some("-p".as_ref())
-        );
-        assert_eq!(
-            plan.args.get(1).and_then(|profile| profile.to_str()),
-            seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild)
-                .expect("executed-child profile")
-                .as_str()
-                .into()
-        );
-        assert!(plan.cwd.starts_with(&mount));
-        assert_eq!(
-            plan.args.last().and_then(|argument| argument.to_str()),
-            Some("--json")
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     #[test]
     fn a_workspace_without_an_evaluated_profile_is_unchanged() {
         let root = scratch("absent");
@@ -3959,200 +3554,12 @@ mod workspace_toolchain_tests {
         )
         .expect("config");
 
-        // The typed field is the contract. Asserting on rendered `message` substrings passes for
-        // any error that happens to mention those words and fails on a reworded message that is
-        // still correct, so it pins neither the identity of the failure nor its recovery.
         let error = resolve_devenv_dir(&mount).unwrap_err();
-        assert_eq!(
-            error.configured_dir.as_deref(),
-            Some(mount.join("tooling/devenv").as_path()),
-            "the refusal must name the configured directory it could not use"
-        );
         assert_eq!(
             error.into_cowshed_error().code,
             crate::error::ErrorCode::EnvironmentMissing
         );
 
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    fn persist_snapshot(
-        devenv_dir: &Path,
-        vars: BTreeMap<String, String>,
-        inputs: &DevenvInputFingerprint,
-    ) {
-        let path = devenv_dir.join(DEVENV_SNAPSHOT_FILE);
-        std::fs::create_dir_all(path.parent().unwrap()).expect("snapshot dir");
-        let snapshot = DevenvEnvSnapshot {
-            vars,
-            inputs: inputs.clone(),
-        };
-        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).expect("snapshot");
-    }
-
-    /// Startup reconciliation is the fingerprint comparison, not an mtime race. `.cowshed.toml`
-    /// is a tracked input and a missing optional input is a recorded absence, so neither needs a
-    /// sleep to observe: changing the config changes the fingerprint by content, and the absent
-    /// `devenv.lock`/`devenv.yaml`/`devenv.local.nix` stay absent.
-    #[test]
-    fn startup_staleness_includes_config_and_ignores_missing_optional_inputs() {
-        let root = scratch("staleness");
-        let mount = root.join("workspace");
-        let devenv_root = mount.join("tooling/devenv");
-        std::fs::create_dir_all(&devenv_root).expect("devenv dir");
-        std::fs::write(devenv_root.join("devenv.nix"), "{}").expect("devenv.nix");
-        std::fs::write(
-            mount.join(COWSHED_CONFIG_FILE),
-            "[devenv]\ndir = \"tooling/devenv\"\n",
-        )
-        .expect("config");
-
-        let tracked = devenv_tracked_paths(&mount, Some(&devenv_root));
-        assert_eq!(tracked.len(), DEVENV_INPUT_FILES.len() + 1);
-        let evaluated = devenv_input_fingerprint(&mount, &tracked).expect("fingerprint");
-        persist_snapshot(&devenv_root, BTreeMap::new(), &evaluated);
-        assert_eq!(
-            DevenvEnvironment::new(&mount)
-                .expect("watcher")
-                .evaluated_inputs,
-            Some(evaluated.clone()),
-            "a snapshot whose recorded inputs still hold is reusable at startup"
-        );
-
-        std::fs::write(
-            mount.join(COWSHED_CONFIG_FILE),
-            "[devenv]\ndir = \"tooling/devenv\"\n# changed\n",
-        )
-        .expect("changed config");
-        assert_ne!(
-            devenv_input_fingerprint(&mount, &tracked).expect("fingerprint"),
-            evaluated
-        );
-        assert_eq!(
-            DevenvEnvironment::new(&mount)
-                .expect("watcher")
-                .evaluated_inputs,
-            None,
-            "a changed .cowshed.toml invalidates the snapshot at startup"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// A snapshot with no recorded inputs cannot claim to describe any revision of the sources,
-    /// so it is not reusable. This is the case the old mtime rule got wrong in the dangerous
-    /// direction: it called such a file fresh whenever it happened to be the newest.
-    #[test]
-    fn a_snapshot_without_recorded_inputs_is_not_reusable() {
-        let root = scratch("snapshot-no-inputs");
-        let mount = root.join("workspace");
-        let snapshot = mount.join(DEVENV_SNAPSHOT_FILE);
-        std::fs::create_dir_all(snapshot.parent().unwrap()).expect("snapshot dir");
-        std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
-        std::fs::write(&snapshot, "{\"vars\":{}}\n").expect("snapshot");
-
-        assert_eq!(parse_devenv_snapshot(b"{\"vars\":{}}\n"), None);
-        assert_eq!(
-            DevenvEnvironment::new(&mount)
-                .expect("watcher")
-                .evaluated_inputs,
-            None
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn snapshot_is_base_path_is_dropped_and_controller_values_win() {
-        let snapshot = BTreeMap::from([
-            ("PATH".to_owned(), "/untrusted/bin".to_owned()),
-            ("SAME".to_owned(), "snapshot".to_owned()),
-            ("SNAPSHOT_ONLY".to_owned(), "yes".to_owned()),
-        ]);
-        let go_env = (GO_ENV.to_owned(), "/workspace/goenv".to_owned());
-        let controller =
-            BTreeMap::from([("SAME".to_owned(), "controller".to_owned()), go_env.clone()]);
-
-        assert_eq!(
-            merge_devenv_environment(snapshot, controller),
-            BTreeMap::from([
-                go_env,
-                ("SAME".to_owned(), "controller".to_owned()),
-                ("SNAPSHOT_ONLY".to_owned(), "yes".to_owned()),
-            ])
-        );
-    }
-
-    #[test]
-    fn watcher_ignores_read_events_for_devenv_inputs() {
-        let path = PathBuf::from("/workspace/devenv.nix");
-        let tracked_paths = BTreeSet::from([path.clone()]);
-        let event =
-            Event::new(notify::EventKind::Access(notify::event::AccessKind::Read)).add_path(path);
-
-        assert!(!event_touches_devenv(&event, &tracked_paths));
-    }
-
-    #[test]
-    fn watcher_marks_the_workspace_dirty_after_a_devenv_input_changes() {
-        let root = scratch("watcher");
-        let mount = root.join("workspace");
-        std::fs::create_dir_all(&mount).expect("mount");
-        std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
-        let tracked = devenv_tracked_paths(&mount, Some(&mount));
-        let evaluated = devenv_input_fingerprint(&mount, &tracked).expect("fingerprint");
-        persist_snapshot(&mount, BTreeMap::new(), &evaluated);
-        let environment = DevenvEnvironment::new(&mount).expect("watcher");
-        assert!(!environment.dirty.load(Ordering::Acquire));
-
-        std::fs::write(mount.join("devenv.nix"), "{ pkgs, ... }: {}").expect("change input");
-        for _ in 0..200 {
-            if environment.dirty.load(Ordering::Acquire) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            environment.dirty.load(Ordering::Acquire),
-            "a relevant filesystem event must dirty the next sandbox process"
-        );
-
-        drop(environment);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[tokio::test]
-    async fn delayed_watcher_event_does_not_refresh_unchanged_devenv_inputs() {
-        let root = scratch("watcher-delayed");
-        let mount = root.join("workspace");
-        std::fs::create_dir_all(&mount).expect("mount");
-        std::fs::write(mount.join("devenv.nix"), "{}").expect("devenv.nix");
-        let tracked = devenv_tracked_paths(&mount, Some(&mount));
-        let evaluated = devenv_input_fingerprint(&mount, &tracked).expect("fingerprint");
-        persist_snapshot(
-            &mount,
-            BTreeMap::from([("FROM_SNAPSHOT".to_owned(), "yes".to_owned())]),
-            &evaluated,
-        );
-        let mut environment = DevenvEnvironment::new(&mount).expect("watcher");
-
-        // macOS FSEvents can deliver the source write that preceded watcher registration late.
-        environment.dirty.store(true, Ordering::Release);
-        let (_, variables) = environment
-            .environment_for_spawn(
-                &mut NoSpawn,
-                &WorkspaceSupervisorConfig::default().sandbox,
-                BTreeMap::new(),
-            )
-            .await
-            .expect("unchanged inputs reuse the evaluated snapshot");
-
-        assert_eq!(
-            variables.get("FROM_SNAPSHOT").map(String::as_str),
-            Some("yes")
-        );
-
-        drop(environment);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -4219,7 +3626,7 @@ mod workspace_toolchain_tests {
             std::fs::canonicalize(store_profile.join("bin")).expect("resolved profile bin")
         );
 
-        let path = sandbox_path(&config, Some(&devenv_root)).expect("sandbox PATH");
+        let path = bootstrap_path(&config, Some(&devenv_root)).expect("bootstrap PATH");
         let entries: Vec<PathBuf> = std::env::split_paths(&path).collect();
         assert_eq!(
             entries.get(1),

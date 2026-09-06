@@ -81,10 +81,10 @@ Shape:
 ;; `/private/cowshed/store` IS the store volume (01_storage.md) and everything cowshed mounts
 ;; nests beneath it, so ONE subtree deny covers images, grant files, CA keys,
 ;; telemetry, gateway state, AND every sibling workspace's mount — including
-;; projects adopted after this profile was generated. SBPL is last-match-wins,
-;; so the carve-backs are emitted AFTER the deny:
-(deny file-read* file-write* (subpath "/private/cowshed/store"))
-(allow file-read* (subpath "/private/cowshed/caches"))       ;; layer-1/3 caches: readable
+;; projects adopted after this profile was generated. Operation specificity
+;; and emission order both matter; scoped carve-backs follow this deny:
+(deny file-read* file-read-data file-write* (subpath "/private/cowshed/store"))
+(allow file-read* file-read-data (subpath "/private/cowshed/caches")) ;; layer-1/3 caches: readable
 ;; sccache is absent from the write list: its store is daemon-write-only
 ;; (03_caches.md) — clients speak to the host daemon over the socket above
 ;; and never touch the store directly.
@@ -93,12 +93,12 @@ Shape:
   (subpath "/private/cowshed/caches/gradle")
   (subpath "/private/cowshed/caches/go/mod")
   (subpath "/private/cowshed/caches/go/build"))
-(allow file-read* file-write* (subpath "<workspace mount>"))  ;; own mount ONLY
+(allow file-read* file-read-data file-write* (subpath "<workspace mount>")) ;; own mount ONLY
 
-;; Secrets: denied. SBPL is LAST-MATCH-WINS (measured, both directions, network
-;; and filesystem) — these rules protect anything only because generation emits
-;; them AFTER every allow. Ordering is a load-bearing invariant, not precedence.
-(deny file-read* file-write*
+;; Secrets: denied after the scoped allows. The explicit file-read-data deny
+;; is essential: a wildcard file-read* deny does not defeat the broad,
+;; operation-specific file-read-data allow above, even when emitted later.
+(deny file-read* file-read-data file-write*
   (subpath "~/.ssh") (subpath "~/.gnupg") (subpath "~/.aws")
   (subpath "~/.config/gh") (literal "~/.netrc")
   (literal "~/.npmrc") (literal "~/.pypirc")           ;; user-level, may hold auth
@@ -119,8 +119,8 @@ named session, one-shot command, shell startup file, direnv hook, repository hoo
 cowshed installs a second **child profile** which intersects with the supervisor profile and only removes authority:
 
 ```scheme
-;; Final filesystem rule in every macOS child profile. Because SBPL is
-;; last-match-wins, nothing may be emitted after this rule that can match it.
+;; Final filesystem rule in every macOS child profile. No later rule may
+;; restore write authority to this subtree.
 (deny file-write*
   (subpath "<workspace mount>/.cowshed/job"))
 ```
@@ -141,14 +141,16 @@ narrowing such as ReadOnly.
 
 Notes:
 
-- The broad `file-read-data` allow is required for dyld; confidentiality is achieved by explicit denies — which work
-  **only because of emission order**. SBPL has no deny-beats-allow precedence: evaluation is last-match-wins (measured:
-  the same rules in the opposite order leave the token readable). Profiles are generated in four ordered **layers** —
-  broad allows → the `/private/cowshed/store` volume-wide deny → scoped carve-backs (caches read, designated cache-subtree writes,
-  own mount) → secret denies — and a unit test (08_testing.md) asserts the layer order plus probe paths (grant file, CA
-  key, sibling image, sibling mount unreadable; own mount and designated caches writable). The single subtree deny on
-  `/private/cowshed/store` is _structurally_ stronger than the old enumerated list: sibling workspace mounts and projects adopted
-  after profile generation are covered without being named.
+- The broad `file-read-data` allow is required for dyld; confidentiality requires explicit `file-read-data` denies as
+  well as `file-read*` denies. Measured on macOS: a terminal wildcard `deny file-read*` still permits `cat` beneath the
+  broad `allow file-read-data`; adding an explicit `deny file-read-data` blocks the read. Operation specificity must
+  match before emission order can protect a boundary; "last match wins" alone is not the rule. Scoped read allows also
+  name `file-read-data` explicitly so they can carve back their authorized subtrees. Profiles retain four ordered
+  **layers** — broad allows → the `/private/cowshed/store` volume-wide deny → scoped carve-backs (caches read,
+  designated cache-subtree writes, own mount) → secret denies — and a unit test (08_testing.md) asserts the layer order
+  plus probe paths (grant file, CA key, sibling image, sibling mount unreadable; own mount and designated caches
+  writable). The single subtree deny on `/private/cowshed/store` is _structurally_ stronger than the old enumerated
+  list: sibling workspace mounts and projects adopted after profile generation are covered without being named.
 - The caches volume's **mirror** and **git** (bare-mirror) subtrees are readable but never writable from a sandbox (only
   the gateway writes layer-1 artifacts — 03_caches.md, 05_gateway.md).
 - `~/.cargo` and `~/.gradle` are deliberately _not_ relocated wholesale to the cache volume — only their cache subtrees
@@ -183,22 +185,22 @@ Notes:
   repository in main, so its profile allows read and write on `<main-canonical-mount>/.git` — the object store it
   commits into and the `worktrees/<ws>` administrative directory it lives in — and on nothing else of main's. It is
   stated after every deny that would otherwise close it, because main's mount is inside cowshed's store under the
-  symlink layout and is the denied project root under direct mount, and last-match-wins is what makes the carve-back
-  real. It is not expressible as a read/write grant for exactly that reason: a grant intersecting an effective deny is
-  refused. It is controller-owned, carried by the workspaces that asked for the mode, and never implied by the baseline
-  — main's working tree is no more reachable than any other workspace's.
+  symlink layout and is the denied project root under direct mount. Its operations must match the deny's specificity. It
+  is not expressible as a read/write grant for exactly that reason: a grant intersecting an effective deny is refused.
+  It is controller-owned, carried by the workspaces that asked for the mode, and never implied by the baseline — main's
+  working tree is no more reachable than any other workspace's.
 - **Effective denies are monotonic.** `repo_id` is the machine-independent lowercase `owner/repo` normalized from a
   chosen remote URL. The binding records that remote and validates the identifier against it; multiple bound identities
   may exist but exactly one is primary. A local-only repository requires an explicit `repo_id`, and discovery may
   propose an identity but never silently mint one. For that identity cowshed computes the canonical-path union of (1)
-  built-in secret and control-plane denies, (2) operator denies from trusted `/private/cowshed/store/<owner>/<repo>/policy.json`,
-  and (3) additional denies declared by the repository. Repository-controlled config may add denies but cannot remove,
-  replace, mask, or carve back either earlier layer. The trusted path is constructed as
-  `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately lowercased and validated as non-empty
-  `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and decoded aliases are rejected before
-  any join. The policy is read by the controller, never through a repository-relative path, and the resulting deny
-  snapshot is recorded with the grant revision. Missing policy means no operator-added entries; malformed or unreadable
-  policy fails closed before supervisor launch.
+  built-in secret and control-plane denies, (2) operator denies from trusted
+  `/private/cowshed/store/<owner>/<repo>/policy.json`, and (3) additional denies declared by the repository.
+  Repository-controlled config may add denies but cannot remove, replace, mask, or carve back either earlier layer. The
+  trusted path is constructed as `/private/cowshed/store/<owner>/<repo>/policy.json`: `owner` and `repo` are separately
+  lowercased and validated as non-empty `[a-z0-9._-]+` segments; `.`, `..`, separators, percent-encoded separators, and
+  decoded aliases are rejected before any join. The policy is read by the controller, never through a
+  repository-relative path, and the resulting deny snapshot is recorded with the grant revision. Missing policy means no
+  operator-added entries; malformed or unreadable policy fails closed before supervisor launch.
 
 ## Grants
 
@@ -362,13 +364,15 @@ These anchors are trust configuration, not secrets, so they are exported/written
    `ProtectedRecord::Job(JobArtifactRecord)` admission batch, and record the audit
    `ControllerCommitment::Admission(AdmissionCommitment)` before process creation. Only the trusted supervisor opens the
    protected record stream; the audit record is telemetry and gates nothing.
-4. Compile and install the child profile before starting an environment loader or shell. The trusted parent contributes
-   identity, cache wiring (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables. A
-   restricted loader child—not the supervisor—runs fail-closed `direnv export` and any workspace `.envrc`; it returns
-   the resulting environment through a bounded non-authoritative channel. The target shell starts under the same or a
-   narrower child restriction, whose final rule denies every mutation beneath `.cowshed/job/**`. Thus no shell startup,
-   direnv/repository hook, named session, one-shot, or descendant ever executes with supervisor artifact-write
-   authority. Request-specific `--ro` may narrow further but never add authority.
+4. Compile and install the child profile before starting shell activation. The trusted parent contributes identity,
+   cache wiring (03_caches.md), `TRACEPARENT`, and caller env filtered to build-configuration variables, then sets the
+   private HOME/XDG directories, proxy credentials, runtime directory, and bootstrap PATH. Inside that restriction and
+   the job's process group, canonical shell activation launches the original command: `direnv exec` for the nearest
+   workspace-contained `.envrc`, or `devenv shell` for a configured devenv-only project. Activation retains the
+   requested cwd and literal argv. The supervisor neither evaluates repository shell code nor parses and reconstructs
+   its exported environment. Failed activation prevents command execution. The child profile's final rule denies every
+   mutation beneath `.cowshed/job/**`; no startup hook, named session, one-shot, or descendant receives supervisor
+   artifact-write authority. Request-specific `--ro` may narrow further but never add authority.
 5. Read stdout and stderr as separate opaque byte streams, incrementally hash and quota-account them, and begin in
    bounded memory. Terminal streams at or below the inline limit are stored as Arrow Binary in a complete protected
    batch. A stream creates `.cowshed/job/<numeric-id>/out` or `err` only when it crosses that limit or a checkpoint/live
@@ -400,8 +404,8 @@ evidence — never inferred from output text:
    analogue is Landlock audit/LSM notifications where the kernel provides them.
 
 The SBPL mechanics this profile depends on are measured, not assumed (08_testing.md): port ranges do not parse;
-last-match-wins ordering; implicit bind-on-connect exempt from `network-bind`; `bind(0)` works under permissive bind and
-fails EPERM under restricted bind.
+operation specificity and ordered carve-backs both govern filesystem rules; implicit bind-on-connect is exempt from
+`network-bind`; `bind(0)` works under permissive bind and fails EPERM under restricted bind.
 
 When none of these produce evidence, the child's ordinary exit status passes through unchanged — a failure is not a
 denial just because its output mentions one. Grants are **never** synthesized from stdout/stderr text: merged-output
@@ -422,69 +426,39 @@ guarantees cowshed owns:
   caches), documented, never proxied. GC-root registration for `.devenv` profiles is likewise daemon-side; no grant
   needed.
 - **Nix client state**: the closed baseline's writable roots additionally include the shared cache subtrees `nix/cache`
-  and `nix/state` under `/private/cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite files; they
-  stay on the host and are shared across workspaces like any concurrency-safe cache. They live under the cowshed caches
-  root rather than under the user's `~/.cache` and `~/.local/state`, because the sandbox never grants a path inside the
-  real `$HOME` — the workspace's `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all private, in-image directories,
-  and admitting the user's own would hand every workspace the rest of what those roots contain.
-- **direnv trust is path-keyed**, so every clone's `.envrc` is untrusted at birth. cowshed (unsandboxed) writes the
-  direnv allow entry for `<mount>/.envrc` at new/fork/restore — and `cowshed ensure` re-asserts it when healing.
-  `cowshed exec` then loads the environment exactly as an interactive shell would: when a nearest `.envrc` exists, the
-  command is wrapped fail-closed in `direnv export` (missing direnv or a failed export is an error, never a silent
-  skip). Inside a cowshed workspace the full exported environment is safe by the no-secrets invariant.
+  and `nix/state` under `/private/cowshed/caches` (eval/fetcher caches, profiles state). These are small SQLite files;
+  they stay on the host and are shared across workspaces like any concurrency-safe cache. They live under the cowshed
+  caches root rather than under the user's `~/.cache` and `~/.local/state`, because the sandbox never grants a path
+  inside the real `$HOME` — the workspace's `HOME`, `XDG_CONFIG_HOME`, and `XDG_CACHE_HOME` are all private, in-image
+  directories, and admitting the user's own would hand every workspace the rest of what those roots contain.
+- **direnv trust is path-keyed.** Approval belongs to the workspace's private direnv configuration, never the host
+  user's trust store. Before activation, cowshed approves only the selected workspace-contained `.envrc` using that
+  private configuration. Selection walks upward from the requested cwd and stops at the workspace boundary; an unrelated
+  ancestor's `.envrc` is not authorized or evaluated. `cowshed exec` runs
+  `direnv exec <envrc-directory> <original argv...>` inside the executed-child sandbox and job process group. Missing
+  direnv, failed approval, or failed activation stops the command rather than silently launching an unactivated
+  environment. Repository shell exports, including PATH additions and SDK selection, reach the command unchanged; the
+  bootstrap PATH is not reapplied after activation. Host HOME, direnv configuration, and credentials are not imported.
 
 ### Evaluating an edited `devenv.nix` inside its workspace
 
-A workspace that edits `devenv.nix` — adding a package, bumping a toolchain — must be able to evaluate the edit where it
-made it. This is the case that most wants isolation and is least served without it: a toolchain change tested only after
-landing is a toolchain change tested in production.
+A workspace that edits `devenv.nix` must evaluate and activate the edit in that workspace, not first discover its effect
+after landing. Canonical activation owns this: `.envrc` runs the repository's direnv/devenv integration, including shell
+entry hooks and its own cache invalidation. Without a workspace-contained `.envrc`, a configured devenv project runs
+through `devenv shell`. Cowshed does not substitute `print-dev-env --json`, persist an environment snapshot, or recreate
+shell entry behavior from exported variables.
 
-Two things stand between the closed baseline and that working, and neither is a new grant.
+The initial sandbox PATH supplies the activation tools from admitted host tool roots and the workspace's private bin.
+The activated shell then owns PATH and SDK selection, including workspace-local executables such as `node_modules/.bin`.
+Cowshed does not require such executables to resolve into `/nix/store` and does not add project-specific PATH
+exceptions. Filesystem and network authority remain enforced by the same child profile, independently of shell
+environment values. The bare-command check contract (02_workspaces.md) remains unchanged: `just verify` runs through
+this activation without a caller-provided wrapper.
 
-**The daemon socket allow is specified above but never populated.** `SandboxConfig::allowed_unix_sockets` is
-controller-selected and canonical-path-scoped by construction, and every production call site passes an empty vector, so
-no `nix` client in a sandbox can reach the daemon. Wiring it is implementation catching up with this spec, not a
-widening of it. The **security posture is unchanged by that wiring**, and the reason is the daemon's, not cowshed's:
-builds and substitution already run _outside_ the sandbox as root, the store is already world-readable through the broad
-`file-read-data` allow, and binary-cache substitution is already documented above as an accepted off-gateway
-trusted-mediator channel. What the socket adds is the ability to _ask_. Evaluation itself runs in-sandbox and can
-execute arbitrary Nix code — but arbitrary in-sandbox code execution is what a workspace is for, and evaluation gets no
-authority a `cargo build` in the same workspace does not already have.
-
-**The sandbox `PATH` is not a captured profile.** It is filtered live from the controller's own `PATH` at every spawn,
-admitting only immutable store-backed roots (`/nix/store`, `/run/current-system`, `/etc/profiles`,
-`/etc/static/profiles`), plus the workspace's `.cowshed/bin`. There is no adopt-time or mint-time profile snapshot
-anywhere, and therefore nothing that a workspace's toolchain could be said to have diverged _from_. The consequence is
-the one that matters here: a workspace can evaluate an edited `devenv.nix` and the resulting tools still will not be on
-its `PATH`, because the controller's `PATH` is what is being filtered.
-
-A third thing had to be true and was not: `sandbox_path` admits the per-user profile roots (`/etc/profiles`,
-`/etc/static/profiles`) to `PATH`, but the Seatbelt profile granted neither, so every nix-installed tool on them was
-unrunnable — the exact breakage the `PATH` admission was added to fix. The broad `file-read-data` allow is not enough:
-resolving a path for exec needs `file-read*` on its roots. Both spellings are granted, for the same reason `/var/select`
-and `/private/var/select` both are — `/etc` is a symlink to `/private/etc`, and a rule naming only the pretty form
-silently never matches.
-
-The fix follows the mechanism that already exists rather than adding one. devenv materializes its evaluation as
-`.devenv/profile`, a symlink into `/nix/store`, inside the project directory — which in a workspace is in-image and
-per-workspace already, keyed and isolated with everything else in the volume. So the workspace's own
-`.devenv/profile/bin` is prepended to its sandbox `PATH` whenever it resolves into the store, ahead of the inherited
-roots. Presence is the whole signal: the profile exists exactly when an evaluation succeeded in that workspace, so no
-digest comparison against main, no refresh verb, and no flag is needed, and a workspace that never evaluated is
-byte-identical to today. A stale profile is self-correcting, because the next successful evaluation rewrites the
-symlink. On land, main's own next evaluation picks the change up for future mints by the same rule.
-
-The bare-command check contract (02_workspaces.md) is unaffected and stays the default: the point of the workspace
-profile is that `just verify` resolves the _edited_ toolchain without a wrapper, not that wrappers become useful.
-
-**Residual: `devenv` itself writes to a hardcoded `/tmp`.** It ignores `TMPDIR` and creates `/tmp/devenv-<hash>`, which
-the closed baseline denies — the workspace's writable temp is its own `exec_temp_dir`, which is what `TMPDIR` points at.
-So evaluating _through the `devenv` CLI_ inside the sandbox still fails on that write, while `nix` itself and an
-already-materialized profile work. This is deliberately not papered over: granting write on `/private/tmp` would hand
-every workspace a world-shared directory, which is precisely the per-workspace-temp invariant this baseline exists to
-hold. The fix belongs upstream in devenv (honour `TMPDIR`) or in a wrapper that sets a short per-workspace temp path;
-until then, in-sandbox evaluation runs through `nix` and the profile is materialized by the direnv/devenv integration
-outside the closed baseline.
+Devenv resolves runtime state beneath `XDG_RUNTIME_DIR`, independently of `TMPDIR`. Cowshed provides a short
+workspace-owned runtime path for Unix socket length limits, while `TMPDIR` names the writable per-exec temporary
+directory. Both are prepared before activation. The child may write these scoped directories, but the baseline still
+denies writes to the world-shared `/private/tmp`; shell activation does not require a blanket temporary-directory grant.
 
 On macOS, port collisions between workspaces are handled by the per-workspace port block, not left to the user:
 `devenv up` and dev servers bind ports derived from `COWSHED_PORT_BASE` (the block base), so two workspaces running the
@@ -498,33 +472,33 @@ workspace must also ride block ports. On Linux the netns makes both moot: each w
 ## The sccache daemon as trusted mediator
 
 The host-owned sccache server (03_caches.md) follows the nix-daemon doctrine: a scoped canonical-path `unix-socket`
-allow in the baseline (`/private/cowshed/store/sccache.sock`), a daemon running _outside_ every sandbox, and no protocol translation
-by cowshed — sccache speaks its own client-server protocol, and cowshed adds lifecycle (the `dev.cowshed.sccache`
-LaunchAgent, managed by `cowshed sccache start|stop|status`) plus scoped access, nothing else. Unlike the nix socket,
-the path is admitted without resolving to a live socket: it is a cowshed-owned constant under `/private/cowshed/store`, where the
-store-wide deny leaves sandboxes unable to create, unlink, or bind anything, so naming the path grants nothing a sandbox
-could conjure and profiles stay correct across daemon restarts and late installs. The same deny doubles as the client
-fail-fast: sccache 0.16 has no client flag that suppresses spawning a fallback server on connect failure
-(source-verified — `SCCACHE_NO_DAEMON` only keeps a spawned server in the foreground), but the fallback must bind the
-socket path and cannot, so a down daemon costs a prompt compile error, never a wrong-boundary server serving siblings
-from inside a sandbox.
+allow in the baseline (`/private/cowshed/store/sccache.sock`), a daemon running _outside_ every sandbox, and no protocol
+translation by cowshed — sccache speaks its own client-server protocol, and cowshed adds lifecycle (the
+`dev.cowshed.sccache` LaunchAgent, managed by `cowshed sccache start|stop|status`) plus scoped access, nothing else.
+Unlike the nix socket, the path is admitted without resolving to a live socket: it is a cowshed-owned constant under
+`/private/cowshed/store`, where the store-wide deny leaves sandboxes unable to create, unlink, or bind anything, so
+naming the path grants nothing a sandbox could conjure and profiles stay correct across daemon restarts and late
+installs. The same deny doubles as the client fail-fast: sccache 0.16 has no client flag that suppresses spawning a
+fallback server on connect failure (source-verified — `SCCACHE_NO_DAEMON` only keeps a spawned server in the
+foreground), but the fallback must bind the socket path and cannot, so a down daemon costs a prompt compile error, never
+a wrong-boundary server serving siblings from inside a sandbox.
 
 **The confused-deputy surface is named, not implied.** The daemon reads sources and executes a _client-named_ compiler
 binary with client-supplied arguments and environment, unsandboxed, at the client's request — socket access equals
 arbitrary user-uid execution outside the sandbox. Accepted: the confinement threat model (semi-trusted agents running
 the user's own code) already concedes that class to a deliberate adversary through layer-3 cache poisoning — a poisoned
 sccache entry feeds main's next build (03_caches.md) — so the daemon adds immediacy, not new reach. In exchange the
-store itself narrows: the `/private/cowshed/caches/sccache` write carve-back is gone and every cache write flows through the
-daemon.
+store itself narrows: the `/private/cowshed/caches/sccache` write carve-back is gone and every cache write flows through
+the daemon.
 
 ## Linux enforcement (ZFS substrate)
 
 On Linux the model is identical — start closed, widen by grant, narrow by revoke, one grant file feeding both planes —
 only the enforcers change. Nothing above the enforcement layer differs: same `<image>.grants.json` schema
-(09_substrates.md: the same `/private/cowshed/store/…` paths on Linux too), same revision semantics, the same revision-bound
-supervisor drain/relaunch for effective filesystem mutations with inner profiles narrowing only and existing jobs
-retaining their old revision, immediate egress via the gateway, and the same exit code 6 on a grant that intersects the
-deny set.
+(09_substrates.md: the same `/private/cowshed/store/…` paths on Linux too), same revision semantics, the same
+revision-bound supervisor drain/relaunch for effective filesystem mutations with inner profiles narrowing only and
+existing jobs retaining their old revision, immediate egress via the gateway, and the same exit code 6 on a grant that
+intersects the deny set.
 
 | Capability              | macOS                           | Linux                              |
 | ----------------------- | ------------------------------- | ---------------------------------- |
@@ -541,9 +515,9 @@ deny set.
   unless `COWSHED_NO_SANDBOX=1` is set explicitly (same escape hatch, same audit note as macOS).
 - **Egress: trusted loopback connector, per-workspace Unix socket, and private netns.** Each attached workspace has a
   fresh network namespace with loopback up and no physical, veth, routed, or default-route interface. The controller
-  creates a Unix stream socket at host path `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` (parent 0700,
-  socket 0600) and bind-mounts it at `/run/cowshed/gateway.sock` in that workspace only. It then launches exactly one
-  minimal connector **inside that netns** under a controller-owned uid/process identity and dedicated cgroup that
+  creates a Unix stream socket at host path `/private/cowshed/store/run/gateway/<workspaceIncarnation>.sock` (parent
+  0700, socket 0600) and bind-mounts it at `/run/cowshed/gateway.sock` in that workspace only. It then launches exactly
+  one minimal connector **inside that netns** under a controller-owned uid/process identity and dedicated cgroup that
   workspace jobs cannot join, inspect, ptrace, or signal. The connector binds only `127.0.0.1:7644` (never `0.0.0.0`,
   `::`, another address, or another port), rejects any accepted socket whose local or peer address is not IPv4 loopback,
   and copies bytes bidirectionally without parsing, adding, removing, or interpreting HTTP. Its only upstream target is
@@ -567,20 +541,20 @@ A regression harness runs adversarial commands through the real exec pipeline an
 under Seatbelt; the same cases run on Linux under Landlock, plus Linux-specific escapes:
 
 - write outside granted roots (absolute, relative, `..`-traversal, symlink pivot, hardlink);
-- read `~/.ssh`, `~/.aws`, Keychains, any `/private/cowshed/store` path outside the carve-backs (grant files, CA keys, sibling
-  images, sibling mounts);
+- read `~/.ssh`, `~/.aws`, Keychains, any `/private/cowshed/store` path outside the carve-backs (grant files, CA keys,
+  sibling images, sibling mounts);
 - tamper with own grant file or marker via crafted paths;
 - connect to a sibling workspace's supervisor socket (must be refused by the scoped unix-socket allow — including via a
   non-canonical `/tmp`-alias path);
 - connect to a sibling's block ports and to a sibling's ephemeral-bound listener (both EPERM — isolation is
   outbound-enforced; sibling binds are not prevented);
-- assert profile ordering end-to-end: a secret-deny path stays denied even when a grant allows an ancestor (denies
-  emitted last — the last-match-wins invariant);
+- assert profile behavior end-to-end: a secret-deny path stays denied despite broad read-data and ancestor allows;
+  explicit operation-specific denies and their position are both load-bearing;
 - write to `~/.cargo/bin`, cargo config/credentials, or `~/.gradle/gradle.properties` — directly and via the
   sandbox-writable cache volume;
 - write to `~/go` (the misconfig tripwire — must EPERM); write to another workspace's in-image `GOBIN` (unreachable
-  across the mount boundary); chmod a 0444 `/private/cowshed/caches/go/mod` entry writable and modify it (allowed by scope —
-  the accepted layer-3 poisoning risk — but asserted to appear in telemetry as a mutation of a shared cache);
+  across the mount boundary); chmod a 0444 `/private/cowshed/caches/go/mod` entry writable and modify it (allowed by
+  scope — the accepted layer-3 poisoning risk — but asserted to appear in telemetry as a mutation of a shared cache);
 - read the workspace's own CA **private key** or any sibling workspace's CA key (both on the store volume — denied): a
   workspace can read only its own in-image CA **cert** (a public anchor), never a signing key, and cannot obtain a leaf
   signed for a host it was not granted; a sibling's in-image trust anchor is not reachable across the mount boundary;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
-    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier, CommandOutput,
+    ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
     CommitmentDraft, CommitmentSink, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
     RunningProcess, SessionToken, SpawnSink, WorkspaceAuthoritySnapshot, WorkspaceSupervisor,
     WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
@@ -45,8 +45,6 @@ struct FakeSpawner {
     fail_next: bool,
     backpressure: bool,
     order: mpsc::UnboundedSender<OrderObservation>,
-    devenv_requests: mpsc::UnboundedSender<PathBuf>,
-    devenv_outputs: VecDeque<CommandOutput>,
 }
 
 #[async_trait]
@@ -79,25 +77,6 @@ impl SpawnSink for FakeSpawner {
             backpressure: self.backpressure,
             writes: 0,
         }))
-    }
-
-    async fn print_devenv_env(
-        &mut self,
-        devenv_dir: &std::path::Path,
-        sandbox: &SandboxConfig,
-    ) -> Result<CommandOutput> {
-        // The evaluation is a child of the workspace, so it must arrive carrying that workspace's
-        // sandbox rather than the daemon's inherited host environment.
-        assert!(
-            devenv_dir.starts_with(&sandbox.workspace_mount),
-            "devenv evaluation must run inside the sandboxed workspace mount"
-        );
-        self.devenv_requests
-            .send(devenv_dir.to_owned())
-            .expect("devenv request observer");
-        self.devenv_outputs.pop_front().ok_or_else(|| {
-            CowshedError::internal("test did not provide a devenv print-dev-env output")
-        })
     }
 }
 
@@ -347,7 +326,6 @@ struct Harness {
     artifacts: mpsc::UnboundedReceiver<ArtifactObservation>,
     commitments: mpsc::UnboundedReceiver<ControllerCommitment>,
     order: mpsc::UnboundedReceiver<OrderObservation>,
-    devenv_requests: mpsc::UnboundedReceiver<PathBuf>,
 }
 
 fn authority() -> WorkspaceAuthoritySnapshot {
@@ -408,37 +386,27 @@ fn harness_with_config(
     fail_next: bool,
     backpressure: bool,
 ) -> Harness {
-    harness_with_devenv_outputs(
+    harness_with_artifacts(
         supervisor_config,
         start_id,
         quota,
         fail_next,
         backpressure,
-        VecDeque::new(),
         None,
     )
 }
 
 /// A harness whose artifact sink commits a stdout stream that is not what the job wrote.
 fn harness_with_sealed_stdout(sealed_stdout: Vec<u8>) -> Harness {
-    harness_with_devenv_outputs(
-        config(),
-        1,
-        1024,
-        false,
-        false,
-        VecDeque::new(),
-        Some(sealed_stdout),
-    )
+    harness_with_artifacts(config(), 1, 1024, false, false, Some(sealed_stdout))
 }
 
-fn harness_with_devenv_outputs(
+fn harness_with_artifacts(
     supervisor_config: WorkspaceSupervisorConfig,
     start_id: u64,
     quota: u64,
     fail_next: bool,
     backpressure: bool,
-    devenv_outputs: VecDeque<CommandOutput>,
     sealed_stdout: Option<Vec<u8>>,
 ) -> Harness {
     let (spawn_tx, spawned) = mpsc::unbounded_channel();
@@ -446,7 +414,6 @@ fn harness_with_devenv_outputs(
     let (artifact_tx, artifacts) = mpsc::unbounded_channel();
     let (commitment_tx, commitments) = mpsc::unbounded_channel();
     let (order_tx, order) = mpsc::unbounded_channel();
-    let (devenv_tx, devenv_requests) = mpsc::unbounded_channel();
     let handle = WorkspaceSupervisor::start_with_sinks(
         supervisor_config,
         Box::new(FakeSpawner {
@@ -455,8 +422,6 @@ fn harness_with_devenv_outputs(
             fail_next,
             backpressure,
             order: order_tx.clone(),
-            devenv_requests: devenv_tx,
-            devenv_outputs,
         }),
         Box::new(FakeArtifactSink {
             sealed_stdout,
@@ -481,7 +446,6 @@ fn harness_with_devenv_outputs(
         artifacts,
         commitments,
         order,
-        devenv_requests,
     }
 }
 
@@ -494,7 +458,6 @@ fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
     let (_artifact_tx, artifacts) = mpsc::unbounded_channel();
     let (commitment_tx, commitments) = mpsc::unbounded_channel();
     let (order_tx, order) = mpsc::unbounded_channel();
-    let (devenv_tx, devenv_requests) = mpsc::unbounded_channel();
     let store = ArtifactStoreSink::open(
         supervisor_config.workspace_root.clone(),
         &supervisor_config.owned_repo_ids,
@@ -510,8 +473,6 @@ fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
             fail_next: false,
             backpressure: false,
             order: order_tx.clone(),
-            devenv_requests: devenv_tx,
-            devenv_outputs: VecDeque::new(),
         }),
         Box::new(store),
         Box::new(FakeCommitments {
@@ -528,7 +489,6 @@ fn real_store_harness(supervisor_config: WorkspaceSupervisorConfig) -> Harness {
         artifacts,
         commitments,
         order,
-        devenv_requests,
     }
 }
 
@@ -562,22 +522,6 @@ fn isolated_config(label: &str) -> (WorkspaceSupervisorConfig, PathBuf) {
     supervisor_config.sandbox.home = root.join("home");
     supervisor_config.sandbox.exec_temp_dir = root.join("tmp");
     (supervisor_config, root)
-}
-
-fn printed_devenv_output(variables: serde_json::Value) -> CommandOutput {
-    CommandOutput::success(
-        serde_json::to_vec(&serde_json::json!({ "variables": variables })).unwrap(),
-    )
-}
-
-fn write_devenv_snapshot(devenv_dir: &std::path::Path, vars: serde_json::Value) {
-    let path = devenv_dir.join(".devenv/cowshed-env.json");
-    std::fs::create_dir_all(path.parent().unwrap()).expect("snapshot directory");
-    std::fs::write(
-        path,
-        serde_json::to_vec_pretty(&serde_json::json!({ "vars": vars })).unwrap(),
-    )
-    .expect("snapshot");
 }
 
 fn stream(bytes: Vec<u8>) -> StreamInfo {
@@ -639,222 +583,6 @@ async fn complete(spawned: &Spawned, stdout: &[u8], stderr: &[u8], exit: ExitSta
 
 async fn open_named(handle: &WorkspaceSupervisorHandle, name: &str) -> SessionToken {
     handle.open_session(Some(name.into())).await.unwrap()
-}
-
-#[tokio::test]
-async fn stale_devenv_snapshot_refreshes_once_and_merges_before_spawn() {
-    let (supervisor_config, root) = isolated_config("devenv-stale");
-    let mount = supervisor_config.workspace_root.clone();
-    let devenv_dir = mount.join("tooling/devenv");
-    std::fs::create_dir_all(&devenv_dir).expect("devenv dir");
-    std::fs::write(mount.join("devenv.nix"), "{}").expect("root devenv");
-    std::fs::write(
-        mount.join(".cowshed.toml"),
-        "[devenv]\ndir = \"tooling/devenv\"\n",
-    )
-    .expect("config");
-    std::fs::write(devenv_dir.join("devenv.nix"), "{ version = 1; }").expect("devenv.nix");
-    write_devenv_snapshot(
-        &devenv_dir,
-        serde_json::json!({
-            "ONLY_DEVENV": "old",
-            "PATH": "/old/untrusted/bin"
-        }),
-    );
-    std::thread::sleep(Duration::from_millis(20));
-    std::fs::write(devenv_dir.join("devenv.nix"), "{ version = 2; }").expect("changed devenv.nix");
-
-    let output = printed_devenv_output(serde_json::json!({
-        "ONLY_DEVENV": { "type": "exported", "value": "updated" },
-        "CONFLICT": { "type": "exported", "value": "snapshot" },
-        "PATH": { "type": "exported", "value": "/new/untrusted/bin" },
-        "NOT_EXPORTED": { "type": "var", "value": "private" }
-    }));
-    let mut h = harness_with_devenv_outputs(
-        supervisor_config,
-        1,
-        1024,
-        false,
-        false,
-        VecDeque::from([output]),
-        None,
-    );
-    let mut exec = request(StdinSource::Empty);
-    exec.env.insert("CONFLICT".into(), "controller".into());
-    let job = h.handle.exec(None, exec).await.unwrap();
-    assert_eq!(h.devenv_requests.recv().await.unwrap(), devenv_dir);
-    let spawned = h.spawned.recv().await.unwrap();
-    assert_eq!(
-        spawned.request.devenv_dir.as_deref(),
-        Some(devenv_dir.as_path())
-    );
-    assert_eq!(
-        spawned.request.env.get("ONLY_DEVENV").map(String::as_str),
-        Some("updated")
-    );
-    assert_eq!(
-        spawned.request.env.get("CONFLICT").map(String::as_str),
-        Some("controller")
-    );
-    assert!(!spawned.request.env.contains_key("PATH"));
-    assert!(!spawned.request.env.contains_key("NOT_EXPORTED"));
-    let snapshot: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(devenv_dir.join(".devenv/cowshed-env.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(snapshot["vars"]["ONLY_DEVENV"], "updated");
-    assert_eq!(snapshot["vars"]["PATH"], "/new/untrusted/bin");
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(job).await.unwrap();
-
-    let mut exec = request(StdinSource::Empty);
-    exec.env.insert("CONFLICT".into(), "controller".into());
-    let second = h.handle.exec(None, exec).await.unwrap();
-    let second_spawn = h.spawned.recv().await.unwrap();
-    assert_eq!(
-        second_spawn
-            .request
-            .env
-            .get("ONLY_DEVENV")
-            .map(String::as_str),
-        Some("updated")
-    );
-    assert!(matches!(
-        h.devenv_requests.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-    complete(&second_spawn, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    h.handle.wait(second).await.unwrap();
-
-    drop(h);
-    std::fs::remove_dir_all(root).ok();
-}
-
-/// Startup reuse through the real persistence path, which is the scenario the reconciliation
-/// exists for: a supervisor that starts over a mount someone else already evaluated must not
-/// evaluate again. The second harness is given NO devenv output, so reusing the persisted
-/// snapshot is the only way it can produce the variable -- an evaluation would fail the exec.
-#[tokio::test]
-async fn a_persisted_devenv_snapshot_is_reused_by_the_next_supervisor_without_evaluating() {
-    let (supervisor_config, root) = isolated_config("devenv-fresh");
-    let mount = supervisor_config.workspace_root.clone();
-    let devenv_dir = mount.join("tooling/devenv");
-    std::fs::create_dir_all(&devenv_dir).expect("devenv dir");
-    std::fs::write(
-        mount.join(".cowshed.toml"),
-        "[devenv]\ndir = \"tooling/devenv\"\n",
-    )
-    .expect("config");
-    std::fs::write(devenv_dir.join("devenv.nix"), "{}").expect("devenv.nix");
-
-    let mut first = harness_with_devenv_outputs(
-        supervisor_config.clone(),
-        1,
-        1024,
-        false,
-        false,
-        VecDeque::from([printed_devenv_output(serde_json::json!({
-            "FROM_SNAPSHOT": { "type": "exported", "value": "ready" }
-        }))]),
-        None,
-    );
-    let job = first
-        .handle
-        .exec(None, request(StdinSource::Empty))
-        .await
-        .unwrap();
-    assert_eq!(first.devenv_requests.recv().await.unwrap(), devenv_dir);
-    let spawned = first.spawned.recv().await.unwrap();
-    assert_eq!(
-        spawned.request.env.get("FROM_SNAPSHOT").map(String::as_str),
-        Some("ready")
-    );
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    first.handle.wait(job).await.unwrap();
-    drop(first);
-
-    let mut second = harness_with_config(supervisor_config, 2, 1024, false, false);
-    let job = second
-        .handle
-        .exec(None, request(StdinSource::Empty))
-        .await
-        .unwrap();
-    let spawned = second.spawned.recv().await.unwrap();
-    assert_eq!(
-        spawned.request.env.get("FROM_SNAPSHOT").map(String::as_str),
-        Some("ready")
-    );
-    assert!(matches!(
-        second.devenv_requests.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    second.handle.wait(job).await.unwrap();
-
-    drop(second);
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[tokio::test]
-async fn configured_missing_devenv_and_failed_refresh_are_fail_closed() {
-    let (missing_config, missing_root) = isolated_config("devenv-missing");
-    let missing_mount = missing_config.workspace_root.clone();
-    std::fs::write(
-        missing_mount.join(".cowshed.toml"),
-        "[devenv]\ndir = \"tooling/devenv\"\n",
-    )
-    .expect("config");
-    let mut missing = harness_with_config(missing_config, 1, 1024, false, false);
-    let error = missing
-        .handle
-        .exec(None, request(StdinSource::Empty))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
-    assert!(error.message.contains("tooling/devenv"));
-    assert!(error.message.contains("devenv.nix"));
-    assert!(matches!(
-        missing.devenv_requests.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-    assert!(matches!(
-        missing.spawned.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-    drop(missing);
-    std::fs::remove_dir_all(missing_root).ok();
-
-    let (failed_config, failed_root) = isolated_config("devenv-failed");
-    let failed_mount = failed_config.workspace_root.clone();
-    std::fs::write(failed_mount.join("devenv.nix"), "{}").expect("devenv.nix");
-    let mut failed = harness_with_devenv_outputs(
-        failed_config,
-        1,
-        1024,
-        false,
-        false,
-        VecDeque::from([CommandOutput::failure(42, b"evaluation exploded".to_vec())]),
-        None,
-    );
-    let error = failed
-        .handle
-        .exec(None, request(StdinSource::Empty))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
-    assert!(error.message.contains("evaluation exploded"));
-    assert_eq!(failed.devenv_requests.recv().await.unwrap(), failed_mount);
-    assert!(matches!(
-        failed.spawned.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-    assert!(matches!(
-        failed.artifacts.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-
-    drop(failed);
-    std::fs::remove_dir_all(failed_root).ok();
 }
 
 #[tokio::test]
