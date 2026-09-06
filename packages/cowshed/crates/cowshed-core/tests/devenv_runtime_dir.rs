@@ -98,7 +98,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
 async fn shell_activation_owns_a_runtime_directory_the_profile_lets_it_write() {
     let root = scratch("devenv-runtime");
     let sandbox = workspace(&root, 40_960);
-    install_real_direnv(&sandbox);
+    install_real_tool(&sandbox, "direnv");
     std::fs::write(sandbox.workspace_mount.join(".envrc"), RUNTIME_ENVRC)
         .expect("runtime shell-entry probes");
     let (exit, stdout, stderr) = run_in_sandbox(
@@ -211,17 +211,48 @@ async fn shell_activation_owns_a_runtime_directory_the_profile_lets_it_write() {
     std::fs::remove_dir_all(&root).expect("remove test workspace");
 }
 
-fn install_real_direnv(sandbox: &SandboxConfig) {
+fn install_real_tool(sandbox: &SandboxConfig, name: &str) {
     let installed = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
-        .map(|directory| directory.join("direnv"))
+        .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
-        .expect("these integration tests require real direnv installed on PATH");
-    let installed = std::fs::canonicalize(installed).expect("resolve real direnv");
+        .expect("required runtime tool is installed on PATH");
+    let installed = std::fs::canonicalize(installed).expect("resolve runtime tool");
     std::os::unix::fs::symlink(
         installed,
-        sandbox.workspace_mount.join(".cowshed/bin/direnv"),
+        sandbox.workspace_mount.join(".cowshed/bin").join(name),
     )
-    .expect("make the installed direnv available in the sandbox");
+    .expect("make the installed runtime tool available in the sandbox");
+}
+
+#[tokio::test]
+async fn nx_runtime_directory_supports_real_unix_socket_roundtrips() {
+    let root = scratch("nx-socket");
+    let sandbox = workspace(&root, 41_056);
+    install_real_tool(&sandbox, "node");
+    let script = r#"
+const net = require('node:net');
+const path = require('node:path').join(process.env.NX_SOCKET_DIR, 'p12345-3-plugin.sock');
+const server = net.createServer(socket => socket.end('nx-private-socket'));
+server.listen(path, () => {
+    const client = net.createConnection(path);
+    client.on('data', data => process.stdout.write(data));
+    client.on('end', () => server.close());
+});
+"#;
+    let (exit, stdout, stderr) = run_in_sandbox(
+        &sandbox,
+        &sandbox.workspace_mount,
+        vec!["node".into(), "-e".into(), script.into()],
+    )
+    .await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "private Unix socket roundtrip failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(stdout, b"nx-private-socket");
+    std::fs::remove_dir_all(root).expect("remove test workspace");
 }
 
 fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> ProcessSpawnRequest {
@@ -289,7 +320,7 @@ async fn run_in_sandbox(
 async fn shell_activation_preserves_environment_path_cwd_argv_and_private_home() {
     let root = scratch("shell-activation");
     let sandbox = workspace(&root, 40_976);
-    install_real_direnv(&sandbox);
+    install_real_tool(&sandbox, "direnv");
     let mount = &sandbox.workspace_mount;
     let cwd = mount.join("nested cwd ' $;");
     std::fs::create_dir_all(&cwd).expect("requested cwd");
@@ -381,7 +412,7 @@ fi
 async fn shell_activation_failure_prevents_command_execution() {
     let root = scratch("shell-activation-failure");
     let sandbox = workspace(&root, 40_992);
-    install_real_direnv(&sandbox);
+    install_real_tool(&sandbox, "direnv");
     let mount = &sandbox.workspace_mount;
     std::fs::write(
         mount.join(".envrc"),
@@ -419,7 +450,7 @@ async fn shell_activation_failure_prevents_command_execution() {
 async fn shell_activation_selects_nearest_workspace_envrc() {
     let root = scratch("shell-activation-nearest");
     let sandbox = workspace(&root, 41_008);
-    install_real_direnv(&sandbox);
+    install_real_tool(&sandbox, "direnv");
     let mount = &sandbox.workspace_mount;
     let nested = mount.join("nested project");
     let cwd = nested.join("working directory");
@@ -462,7 +493,7 @@ async fn shell_activation_selects_nearest_workspace_envrc() {
 async fn shell_activation_does_not_authorize_or_load_an_envrc_outside_the_workspace() {
     let root = scratch("shell-activation-boundary");
     let sandbox = workspace(&root, 41_024);
-    install_real_direnv(&sandbox);
+    install_real_tool(&sandbox, "direnv");
     std::fs::write(
         root.join(".envrc"),
         "printf escaped > workspace/ancestor-activated\nexport SHELL_ACTIVATION_SDK=outside\n",
