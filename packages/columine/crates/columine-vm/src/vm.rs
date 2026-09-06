@@ -2158,13 +2158,11 @@ fn write_struct_map_array_fields(
     state: &mut [u8],
     slot_idx: u8,
     row_pos: u32,
-    array_offsets_cols: &[u8],
-    array_values_cols: &[u8],
-    array_field_idxs: &[u8],
+    array_fields: &[[u8; 3]],
     cols: &[&[u8]],
     child_idx: u32,
 ) -> ErrorCode {
-    if array_offsets_cols.is_empty() {
+    if array_fields.is_empty() {
         return ErrorCode::Ok;
     }
 
@@ -2191,7 +2189,7 @@ fn write_struct_map_array_fields(
     let mut arena_used = bytes::read_u32(state, arena_header_off + 4);
     let arena_data_base = arena_header_off + ARENA_HEADER_SIZE;
 
-    for (vi, &field_idx) in array_field_idxs.iter().enumerate() {
+    for &[offsets_col, values_col, field_idx] in array_fields {
         let field_type_byte = state[(slot_offset + u32::from(field_idx)) as usize];
         let f_offset = {
             let descriptor =
@@ -2204,7 +2202,7 @@ fn write_struct_map_array_fields(
             }),
         );
 
-        let offsets = col_u32(cols[array_offsets_cols[vi] as usize], child_idx + 2);
+        let offsets = col_u32(cols[usize::from(offsets_col)], child_idx + 2);
         let arr_start = offsets[child_idx as usize];
         let arr_end = offsets[child_idx as usize + 1];
         let arr_len = arr_end - arr_start;
@@ -2221,7 +2219,7 @@ fn write_struct_map_array_fields(
         bytes::write_u32(state, row_off + f_offset + 4, arr_len);
 
         if byte_len > 0 {
-            let src = cols[array_values_cols[vi] as usize];
+            let src = cols[usize::from(values_col)];
             let src_off = (arr_start * elem_size) as usize;
             let dst_off = (arena_data_base + arena_used) as usize;
             state[dst_off..dst_off + byte_len as usize]
@@ -2233,6 +2231,66 @@ fn write_struct_map_array_fields(
 
     bytes::write_u32(state, arena_header_off + 4, arena_used);
     ErrorCode::Ok
+}
+
+/// Both batch and nested execution apply the same row replacement and arena journal.
+#[allow(clippy::too_many_arguments)]
+fn upsert_struct_map_row(
+    undo: &mut UndoState,
+    delta_mode: bool,
+    state: &mut [u8],
+    smap: &StructMapSlot,
+    slot_idx: u8,
+    key: u32,
+    val_cols: &[u8],
+    field_idxs: &[u8],
+    array_fields: &[[u8; 3]],
+    cols: &[&[u8]],
+    element_idx: u32,
+) -> u32 {
+    if key == EMPTY_KEY || key == TOMBSTONE {
+        return OK;
+    }
+    let (ranges, captured) = if array_fields.is_empty() {
+        ([(0, 0); 2], false)
+    } else {
+        let meta_base = slot_meta_base(slot_idx);
+        let arena_header = bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS);
+        let arena_capacity = bytes::read_u32(state, arena_header);
+        let ranges = [
+            (meta_base, SLOT_META_SIZE),
+            (
+                smap.slot_offset,
+                arena_header + ARENA_HEADER_SIZE + arena_capacity - smap.slot_offset,
+            ),
+        ];
+        let captured = undo.begin_state_capture(state, &ranges, u32::from(smap.num_fields) + 1);
+        (ranges, captured)
+    };
+    let result = single_struct_map_upsert_last(
+        undo,
+        delta_mode,
+        state,
+        slot_idx,
+        key,
+        val_cols,
+        field_idxs,
+        cols,
+        element_idx,
+    );
+    let error = if result.err == ErrorCode::Ok {
+        write_struct_map_array_fields(state, slot_idx, result.pos, array_fields, cols, element_idx)
+    } else {
+        result.err
+    };
+    if captured {
+        undo.finish_state_capture(delta_mode, state, &ranges);
+    }
+    if error == ErrorCode::CapacityExceeded || error == ErrorCode::ArenaOverflow {
+        NEEDS_GROWTH_SLOT.store(slot_idx, Ordering::Relaxed);
+        return NEEDS_GROWTH;
+    }
+    error as u32
 }
 
 // =============================================================================
@@ -3182,8 +3240,10 @@ impl Vm {
                     }
 
                     let smap = StructMapSlot::bind(state, operands.slot);
-                    // The top-level batch path parses but does not materialize
-                    // array operands.
+                    let array_end = operands.array_triples_start + operands.num_array_vals * 3;
+                    let array_fields = code[operands.array_triples_start..array_end]
+                        .as_chunks::<3>()
+                        .0;
                     let comparison = match operands.comparison_field_idx {
                         Some(field_idx) => {
                             let Some(comparison) = resolve_struct_map_max_comparison(
@@ -3219,20 +3279,21 @@ impl Vm {
                             continue;
                         }
 
-                        let result = single_struct_map_upsert_last(
+                        let result = upsert_struct_map_row(
                             &mut self.undo,
                             delta_mode,
                             state,
+                            &smap,
                             operands.slot,
                             key,
                             &val_cols[..operands.num_vals],
                             &field_idxs[..operands.num_vals],
+                            array_fields,
                             cols,
                             i,
                         );
-                        if result.err == ErrorCode::CapacityExceeded {
-                            NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
-                            return NEEDS_GROWTH;
+                        if result != OK {
+                            return result;
                         }
                     }
                 }
@@ -4041,21 +4102,10 @@ impl Vm {
                         fi[vi] = pair[1];
                     }
 
-                    let mut aoc = [0u8; MAX_STRUCT_ARRAY_OPERANDS];
-                    let mut avc = [0u8; MAX_STRUCT_ARRAY_OPERANDS];
-                    let mut afi = [0u8; MAX_STRUCT_ARRAY_OPERANDS];
-                    let array_triples_end =
-                        operands.array_triples_start + operands.num_array_vals * 3;
-                    for (ai, triple) in body[operands.array_triples_start..array_triples_end]
+                    let array_end = operands.array_triples_start + operands.num_array_vals * 3;
+                    let array_fields = body[operands.array_triples_start..array_end]
                         .as_chunks::<3>()
-                        .0
-                        .iter()
-                        .enumerate()
-                    {
-                        aoc[ai] = triple[0];
-                        avc[ai] = triple[1];
-                        afi[ai] = triple[2];
-                    }
+                        .0;
 
                     let smap = StructMapSlot::bind(state, operands.slot);
                     let comparison = match operands.comparison_field_idx {
@@ -4086,75 +4136,21 @@ impl Vm {
                         _ => true,
                     };
                     if should_write {
-                        let (array_journal_ranges, array_captured) = if operands.num_array_vals > 0
-                        {
-                            let meta_base = slot_meta_base(operands.slot);
-                            let arena_header =
-                                bytes::read_u32(state, meta_base + SlotMetaOffset::GRACE_SECONDS);
-                            let arena_capacity = bytes::read_u32(state, arena_header);
-                            let ranges = [
-                                (meta_base, SLOT_META_SIZE),
-                                (
-                                    smap.slot_offset,
-                                    arena_header + ARENA_HEADER_SIZE + arena_capacity
-                                        - smap.slot_offset,
-                                ),
-                            ];
-                            let captured = self.undo.begin_state_capture(
-                                state,
-                                &ranges,
-                                u32::from(smap.num_fields) + 1,
-                            );
-                            (ranges, captured)
-                        } else {
-                            ([(0, 0); 2], false)
-                        };
-
-                        let result = single_struct_map_upsert_last(
+                        let result = upsert_struct_map_row(
                             &mut self.undo,
                             delta_mode,
                             state,
+                            &smap,
                             operands.slot,
                             key,
                             &vc[..operands.num_vals],
                             &fi[..operands.num_vals],
+                            array_fields,
                             cols,
                             child_idx,
                         );
-                        if result.err == ErrorCode::CapacityExceeded {
-                            if array_captured {
-                                self.undo.finish_state_capture(
-                                    delta_mode,
-                                    state,
-                                    &array_journal_ranges,
-                                );
-                            }
-                            NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
-                            return NEEDS_GROWTH;
-                        }
-
-                        if operands.num_array_vals > 0 {
-                            let arr_result = write_struct_map_array_fields(
-                                state,
-                                operands.slot,
-                                result.pos,
-                                &aoc[..operands.num_array_vals],
-                                &avc[..operands.num_array_vals],
-                                &afi[..operands.num_array_vals],
-                                cols,
-                                child_idx,
-                            );
-                            if array_captured {
-                                self.undo.finish_state_capture(
-                                    delta_mode,
-                                    state,
-                                    &array_journal_ranges,
-                                );
-                            }
-                            if arr_result == ErrorCode::ArenaOverflow {
-                                NEEDS_GROWTH_SLOT.store(operands.slot, Ordering::Relaxed);
-                                return NEEDS_GROWTH;
-                            }
+                        if result != OK {
+                            return result;
                         }
                     }
                 }
