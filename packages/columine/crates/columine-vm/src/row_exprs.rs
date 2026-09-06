@@ -50,13 +50,19 @@
 //! different values. A live column is read by the per-element conditional
 //! opcodes (the `*_IF` family); the batch aggregates read the bound cells,
 //! so an embedder lowers a state-reading expression only to a per-element
-//! predicate.
+//! predicate. A live column read by anything else — an aggregate, an
+//! aggregate's `*_IF` predicate, a key, value, timestamp or element operand,
+//! the `FOR_EACH` type column, the table's own type column — would see the
+//! zero placeholder; the bind refuses such a program with `InvalidProgram`
+//! (see [`column_uses`]) so the zeros can never be mistaken for an answer.
 //!
 //! [`admit`]: RowExpression::admit
+//! [`column_uses`]: crate::column_uses
 
 use columine_types::types::{ErrorCode, PROGRAM_HASH_PREFIX, ProgramHeader};
 
 use crate::bytes;
+use crate::column_uses::{ColumnUse, reduce_column_uses};
 use crate::vm::{col_at, col_u32, col_u32_exact, u32s_as_bytes};
 
 /// ASCII `R X P 1` in little-endian wire order.
@@ -132,25 +138,48 @@ pub trait RowExpression {
 /// Storage for the derived columns of one batch. Owned by the embedder's
 /// runtime and reused across batches so a bind allocates only when a batch
 /// is wider or longer than every batch before it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RowColumns {
     cells: Vec<Vec<u32>>,
     targets: Vec<u8>,
-    /// The entries the last bind deferred, in table order.
+    /// The entries the last bind deferred, in table order, parsed once at
+    /// bind: the per-row read indexes them, it never re-parses the table.
     live: Vec<LiveEntry>,
-    /// Where the last bind's table starts in its program, and the batch it
-    /// bound — the live reads re-parse the entry from there.
-    table_start: usize,
+    /// Column → position in `live`, [`NOT_LIVE`] for every other column.
+    /// WHY a 256-entry table and not a scan: the read runs once per row per
+    /// conditional opcode, and a column index is a `u8` — the table costs
+    /// 256 bytes once and answers in one load.
+    live_index: [u8; 256],
     type_col: u8,
     batch_len: u32,
 }
 
-/// One deferred entry: its column and where it sits in the table.
+/// `live_index` value of a column no live entry targets.
+const NOT_LIVE: u8 = u8::MAX;
+
+/// One deferred entry, as parsed at bind: byte ranges into the program the
+/// bind ran against, so the read borrows the ids and the expression without
+/// copying either.
 #[derive(Debug, Clone, Copy)]
 struct LiveEntry {
     target_col: u8,
-    /// Offset of the entry within the table.
-    pos: usize,
+    /// Program range of the raw `u32le × match_count` ids.
+    match_ids: Range,
+    /// Program range of the expression bytes.
+    expr: Range,
+}
+
+/// A `start..end` byte range, `Copy` so an entry stays a plain record.
+#[derive(Debug, Clone, Copy)]
+struct Range {
+    start: usize,
+    end: usize,
+}
+
+impl Default for RowColumns {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RowColumns {
@@ -159,9 +188,16 @@ impl RowColumns {
             cells: Vec::new(),
             targets: Vec::new(),
             live: Vec::new(),
-            table_start: 0,
+            live_index: [NOT_LIVE; 256],
             type_col: 0,
             batch_len: 0,
+        }
+    }
+
+    /// Forget the last bind's live entries; the next bind records its own.
+    fn clear_live(&mut self) {
+        for entry in self.live.drain(..) {
+            self.live_index[usize::from(entry.target_col)] = NOT_LIVE;
         }
     }
 
@@ -217,37 +253,35 @@ impl LiveColumns<'_, '_> {
         state: &[u8],
         cols: &[&[u8]],
     ) -> Option<Result<u32, ErrorCode>> {
-        let entry = self.rows.live.iter().find(|e| e.target_col == col)?;
         let rows = self.rows;
+        let index = rows.live_index[usize::from(col)];
+        if index == NOT_LIVE {
+            return None;
+        }
+        let entry = rows.live[usize::from(index)];
         let type_cell = col_u32(col_at(cols, usize::from(rows.type_col)), rows.batch_len)
             .get(row as usize)
             .copied();
-        Some(self.eval_entry(*entry, row, type_cell, state, cols))
-    }
-
-    fn eval_entry(
-        &mut self,
-        entry: LiveEntry,
-        row: u32,
-        type_cell: Option<u32>,
-        state: &[u8],
-        cols: &[&[u8]],
-    ) -> Result<u32, ErrorCode> {
-        let rows = self.rows;
-        // The bind parsed this entry from the same bytes; a program that no
-        // longer holds it is the caller's mismatch, refused like a bad table.
-        let table = self
-            .program
-            .get(rows.table_start..)
-            .ok_or(ErrorCode::InvalidProgram)?;
-        let mut pos = entry.pos;
-        let parsed = parse_entry(table, &mut pos)?;
-        if !type_cell.is_some_and(|t| parsed.matches(t)) {
-            return Ok(0);
+        // The bind cut these ranges from this program: `program` is the
+        // slice the handle was bound over, so the indexing is exact.
+        let match_ids = &self.program[entry.match_ids.start..entry.match_ids.end];
+        if !type_cell.is_some_and(|t| matches(match_ids, t)) {
+            return Some(Ok(0));
         }
+        let expr = &self.program[entry.expr.start..entry.expr.end];
         let batch = BatchView::host(state, cols, rows.batch_len);
-        self.eval.eval(parsed.expr, &batch, row)
+        Some(self.eval.eval(expr, &batch, row))
     }
+}
+
+/// Whether `type_id` is among the raw `u32le × n` ids; decoded per
+/// comparison so the entry borrows the program instead of collecting them.
+fn matches(match_ids: &[u8], type_id: u32) -> bool {
+    match_ids
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|id| u32::from_le_bytes(*id) == type_id)
 }
 
 struct Entry<'a> {
@@ -256,15 +290,15 @@ struct Entry<'a> {
     /// borrows the program instead of collecting the ids.
     match_ids: &'a [u8],
     expr: &'a [u8],
+    /// Where `match_ids` and `expr` sit within the table, for a live entry
+    /// to record and read back without re-parsing.
+    match_ids_at: Range,
+    expr_at: Range,
 }
 
 impl Entry<'_> {
     fn matches(&self, type_id: u32) -> bool {
-        self.match_ids
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|id| u32::from_le_bytes(*id) == type_id)
+        matches(self.match_ids, type_id)
     }
 }
 
@@ -320,7 +354,50 @@ fn parse_entry<'a>(table: &'a [u8], pos: &mut usize) -> Result<Entry<'a>, ErrorC
         target_col,
         match_ids,
         expr,
+        match_ids_at: Range {
+            start: ids_start,
+            end: ids_end,
+        },
+        expr_at: Range {
+            start: expr_start,
+            end: expr_start + expr_len,
+        },
     })
+}
+
+impl Range {
+    /// The same range shifted by `offset`: a table range as a program range.
+    const fn shifted(self, offset: usize) -> Self {
+        Self {
+            start: self.start + offset,
+            end: self.end + offset,
+        }
+    }
+}
+
+/// A live column holds zero placeholder cells; only a per-element `*_IF`
+/// predicate resolves it through the handle. The table's type column and
+/// every plain read of the reduce section ([`ColumnUse::Read`]) would take
+/// the zeros as cells, so a program that reads a live column that way is
+/// refused before any column is spliced.
+fn refuse_plain_reads_of_live_columns(
+    program: &[u8],
+    state: &[u8],
+    out: &RowColumns,
+) -> Result<(), ErrorCode> {
+    if out.live_index[usize::from(out.type_col)] != NOT_LIVE {
+        return Err(ErrorCode::InvalidProgram);
+    }
+    let mut plain_read_of_live = false;
+    reduce_column_uses(program, state, &mut |col, use_| {
+        if use_ == ColumnUse::Read && out.live_index[usize::from(col)] != NOT_LIVE {
+            plain_read_of_live = true;
+        }
+    })?;
+    if plain_read_of_live {
+        return Err(ErrorCode::InvalidProgram);
+    }
+    Ok(())
 }
 
 /// Evaluate `program`'s row-expression table over the batch and replace each
@@ -344,7 +421,7 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     // `out` describes this bind only: a table-less program or an empty batch
     // must not leave the previous batch's targets or live entries behind.
     out.targets.clear();
-    out.live.clear();
+    out.clear_live();
     let Some(table) = row_table(program)? else {
         return Ok(LiveColumns {
             rows: out,
@@ -366,9 +443,11 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     if type_col >= cols.len() {
         return Err(ErrorCode::InvalidProgram);
     }
+    // The table is the program's tail: a table offset plus this is a
+    // program offset, which is what the live reads index.
+    let table_start = program.len() - table.len();
     out.cells.resize_with(count, Vec::new);
     out.targets.resize(count, 0);
-    out.table_start = program.len() - table.len();
     out.type_col = table[6];
     out.batch_len = batch_len;
 
@@ -377,7 +456,6 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
         col_u32_exact(col_at(view, type_col), batch_len).ok_or(ErrorCode::ColumnUnderrun)?;
     let mut pos = TABLE_HEADER_BYTES;
     for i in 0..count {
-        let entry_pos = pos;
         let entry = parse_entry(table, &mut pos)?;
         if usize::from(entry.target_col) >= view.len() {
             return Err(ErrorCode::InvalidProgram);
@@ -400,9 +478,17 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
         if binding == Binding::Live {
             // The zero cells stand in for the column the reduce section
             // reads live; they also keep the column covering the batch.
+            let index = u8::try_from(out.live.len()).map_err(|_| ErrorCode::InvalidProgram)?;
+            if out.live_index[usize::from(entry.target_col)] != NOT_LIVE {
+                // Two live entries on one column: the read could only answer
+                // one of them.
+                return Err(ErrorCode::InvalidProgram);
+            }
+            out.live_index[usize::from(entry.target_col)] = index;
             out.live.push(LiveEntry {
                 target_col: entry.target_col,
-                pos: entry_pos,
+                match_ids: entry.match_ids_at.shifted(table_start),
+                expr: entry.expr_at.shifted(table_start),
             });
             continue;
         }
@@ -418,6 +504,9 @@ pub fn bind_row_columns<'a, 'e, E: RowExpression>(
     }
     if pos != table.len() {
         return Err(ErrorCode::InvalidProgram);
+    }
+    if !out.live.is_empty() {
+        refuse_plain_reads_of_live_columns(program, state, out)?;
     }
 
     let bound: &'a RowColumns = out;

@@ -560,3 +560,298 @@ fn splice_repeats_the_bound_columns_over_a_rebuilt_column_set() {
     let mut short: Vec<&[u8]> = vec![&[]];
     assert_eq!(rows.splice(&mut short), Err(ErrorCode::InvalidProgram));
 }
+
+/// A program whose reduce section is `FOR_EACH(type == ORDER_TYPE) { body }`
+/// followed by `trailer`, for bodies that read the derived column other
+/// than as a per-element predicate.
+fn program_with_body(body: &[u8], trailer: &[u8]) -> Vec<u8> {
+    let init = [0x10u8, 0, 0x00, 8, 0, 0]; // SLOT_DEF hashmap cap 8, HALT
+    let mut reduce = vec![0xE0u8, TYPE_COL, 1];
+    reduce.extend(ORDER_TYPE.to_le_bytes());
+    reduce.extend((body.len() as u16).to_le_bytes());
+    reduce.extend_from_slice(body);
+    reduce.push(0); // HALT
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, 1, 4, 0, 0]);
+    prog.extend((init.len() as u16).to_le_bytes());
+    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend(init);
+    prog.extend(&reduce);
+    prog.extend_from_slice(trailer);
+    prog
+}
+
+/// Bind a live entry on `PRED_COL` under `body`, answering the bind's
+/// refusal, or `None` when it binds.
+fn live_bind_refusal(body: &[u8]) -> Option<ErrorCode> {
+    let prog = program_with_body(
+        body,
+        &table(
+            TYPE_COL,
+            &[entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL])],
+        ),
+    );
+    let state = init(&prog);
+    let types = [ORDER_TYPE];
+    let keys = [1u32];
+    let vals = [40u32];
+    let placeholder = [0xAAu32];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        u32s_as_bytes(&placeholder),
+    ];
+    let mut rows = RowColumns::new();
+    let mut eval = Competes { evaluated: 0 };
+    let outcome = bind_row_columns(&prog, &state, &mut cols, 1, &mut eval, &mut rows).map(|_| ());
+    let refusal = outcome.err();
+    if refusal.is_some() {
+        assert_eq!(
+            cols[3],
+            u32s_as_bytes(&placeholder),
+            "a refused bind leaves the columns untouched"
+        );
+    }
+    refusal
+}
+
+#[test]
+fn a_live_column_read_other_than_as_an_element_predicate_is_refused_at_bind() {
+    // Each body reads the live column (3) as something the reduce section
+    // takes from the batch's bytes — the zero placeholder — not through
+    // the live handle. The name says which operand.
+    let plain_reads: [(&str, Vec<u8>); 6] = [
+        ("BatchMapUpsertLast value", vec![0x22, 0, KEY_COL, PRED_COL]),
+        ("BatchMapUpsertLast key", vec![0x22, 0, PRED_COL, VAL_COL]),
+        (
+            "BatchMapUpsertLastIf key",
+            vec![0x2a, 0, PRED_COL, VAL_COL, PRED_COL],
+        ),
+        // The aggregate pass reads its predicate from the batch's bytes.
+        ("BatchAggCountIf predicate", vec![0x45, 0, PRED_COL]),
+        (
+            "BatchSetInsertIf element",
+            vec![0x33, 0, PRED_COL, PRED_COL],
+        ),
+        ("BatchMapRemove key", vec![0x23, 0, PRED_COL]),
+    ];
+    for (name, body) in plain_reads {
+        assert_eq!(
+            live_bind_refusal(&body),
+            Some(ErrorCode::InvalidProgram),
+            "{name}"
+        );
+    }
+    // The same opcodes over the batch's own columns bind: the refusal is
+    // about the live column, not the opcode.
+    for (name, body) in [
+        ("BatchMapUpsertLast", vec![0x22, 0, KEY_COL, VAL_COL]),
+        ("BatchAggCountIf", vec![0x45, 0, VAL_COL]),
+        ("BatchSetInsertIf", vec![0x33, 0, KEY_COL, VAL_COL]),
+    ] {
+        assert_eq!(live_bind_refusal(&body), None, "{name}");
+    }
+    // The element predicate is the one read the live handle answers.
+    assert_eq!(
+        live_bind_refusal(&[0x2a, 0, KEY_COL, VAL_COL, PRED_COL]),
+        None,
+        "BatchMapUpsertLastIf predicate"
+    );
+    assert_eq!(
+        live_bind_refusal(&[0x2b, 0, KEY_COL, PRED_COL]),
+        None,
+        "BatchMapRemoveIf predicate"
+    );
+}
+
+#[test]
+fn a_for_each_over_a_live_type_column_is_refused_at_bind() {
+    // The FOR_EACH gates on column 3, which the table binds live; its type
+    // cells would be the zero placeholder.
+    let init_code = [0x10u8, 0, 0x00, 8, 0, 0];
+    let body = [0x2au8, 0, KEY_COL, VAL_COL, PRED_COL];
+    let mut reduce = vec![0xE0u8, PRED_COL, 1];
+    reduce.extend(ORDER_TYPE.to_le_bytes());
+    reduce.extend((body.len() as u16).to_le_bytes());
+    reduce.extend(body);
+    reduce.push(0);
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, 1, 4, 0, 0]);
+    prog.extend((init_code.len() as u16).to_le_bytes());
+    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend(init_code);
+    prog.extend(&reduce);
+    prog.extend(table(
+        TYPE_COL,
+        &[entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL])],
+    ));
+    let types = [ORDER_TYPE];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+    ];
+    let mut rows = RowColumns::new();
+    assert_eq!(
+        bind_err(&prog, &mut cols, 1, &mut rows),
+        ErrorCode::InvalidProgram
+    );
+}
+
+#[test]
+fn a_table_whose_type_column_is_live_is_refused_at_bind() {
+    // Entry 1 binds live on column 3; the table gates every entry on
+    // column 3.
+    let init_code = [0x10u8, 0, 0x00, 8, 0, 0];
+    let reduce = [0u8];
+    let trailer = table(
+        PRED_COL,
+        &[entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL])],
+    );
+    let mut prog = vec![0u8; 32];
+    prog.extend(PROGRAM_MAGIC.to_le_bytes());
+    prog.extend([1, 0, 1, 4, 0, 0]);
+    prog.extend((init_code.len() as u16).to_le_bytes());
+    prog.extend((reduce.len() as u16).to_le_bytes());
+    prog.extend(init_code);
+    prog.extend(reduce);
+    prog.extend_from_slice(&trailer);
+    let types = [ORDER_TYPE];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+    ];
+    let mut rows = RowColumns::new();
+    assert_eq!(
+        bind_err(&prog, &mut cols, 1, &mut rows),
+        ErrorCode::InvalidProgram
+    );
+}
+
+#[test]
+fn two_live_entries_on_one_column_are_refused_at_bind() {
+    let prog = program(&table(
+        TYPE_COL,
+        &[
+            entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL]),
+            entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL]),
+        ],
+    ));
+    let types = [ORDER_TYPE];
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&types),
+        &[],
+    ];
+    let mut rows = RowColumns::new();
+    assert_eq!(
+        bind_err(&prog, &mut cols, 1, &mut rows),
+        ErrorCode::InvalidProgram
+    );
+}
+
+#[test]
+fn a_live_entry_bound_after_a_bound_entry_on_reused_storage_reads_its_own_column() {
+    // Storage that bound a live entry on column 3, then a bound entry on 3
+    // and a live entry on 4: the read on 3 must be the bound cells, the
+    // read on 4 the live entry — nothing of the first bind survives.
+    let live_on_3 = program(&table(
+        TYPE_COL,
+        &[entry(PRED_COL, &[ORDER_TYPE], &[KEY_COL, VAL_COL])],
+    ));
+    let init_code = [0x10u8, 0, 0x00, 8, 0, 0];
+    let body = [0x2au8, 0, KEY_COL, VAL_COL, 4];
+    let mut reduce = vec![0xE0u8, TYPE_COL, 1];
+    reduce.extend(ORDER_TYPE.to_le_bytes());
+    reduce.extend((body.len() as u16).to_le_bytes());
+    reduce.extend(body);
+    reduce.push(0);
+    let mut live_on_4 = vec![0u8; 32];
+    live_on_4.extend(PROGRAM_MAGIC.to_le_bytes());
+    live_on_4.extend([1, 0, 1, 5, 0, 0]);
+    live_on_4.extend((init_code.len() as u16).to_le_bytes());
+    live_on_4.extend((reduce.len() as u16).to_le_bytes());
+    live_on_4.extend(init_code);
+    live_on_4.extend(&reduce);
+    live_on_4.extend(table(
+        TYPE_COL,
+        &[
+            entry(PRED_COL, &[ORDER_TYPE], &threshold_expr(VAL_COL, 100)),
+            entry(4, &[ORDER_TYPE], &[KEY_COL, VAL_COL]),
+        ],
+    ));
+
+    let mut rows = RowColumns::new();
+    let mut eval = Competes { evaluated: 0 };
+    let state = init(&live_on_3);
+    let types = [ORDER_TYPE];
+    let keys = [1u32];
+    let vals = [150u32];
+    {
+        let mut cols: Vec<&[u8]> = vec![
+            u32s_as_bytes(&types),
+            u32s_as_bytes(&keys),
+            u32s_as_bytes(&vals),
+            &[],
+        ];
+        bind_row_columns(&live_on_3, &state, &mut cols, 1, &mut eval, &mut rows).expect("bind");
+    }
+
+    // The threshold entry needs the Threshold evaluator; a combined one
+    // dispatches on expression length.
+    struct Both {
+        threshold: Threshold,
+        competes: Competes,
+    }
+    impl RowExpression for Both {
+        fn admit(&mut self, expr: &[u8], batch: &BatchView<'_>) -> Result<Binding, ErrorCode> {
+            if expr.len() == 5 {
+                self.threshold.admit(expr, batch)
+            } else {
+                self.competes.admit(expr, batch)
+            }
+        }
+        fn eval(&mut self, expr: &[u8], batch: &BatchView<'_>, row: u32) -> Result<u32, ErrorCode> {
+            if expr.len() == 5 {
+                self.threshold.eval(expr, batch, row)
+            } else {
+                self.competes.eval(expr, batch, row)
+            }
+        }
+    }
+    let mut both = Both {
+        threshold: Threshold {
+            admitted: 0,
+            evaluated: 0,
+        },
+        competes: Competes { evaluated: 0 },
+    };
+    let state = init(&live_on_4);
+    let mut cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&types),
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&vals),
+        &[],
+        &[],
+    ];
+    let mut live =
+        bind_row_columns(&live_on_4, &state, &mut cols, 1, &mut both, &mut rows).expect("bind");
+    assert_eq!(cols[3], u32s_as_bytes(&[1u32]), "column 3 is bound now");
+    assert!(
+        live.cell(3, 0, &state, &cols).is_none(),
+        "column 3 is no longer a live column"
+    );
+    assert_eq!(
+        live.cell(4, 0, &state, &cols),
+        Some(Ok(1)),
+        "column 4 is the live entry: 150 beats an absent value"
+    );
+    assert_eq!(both.competes.evaluated, 1);
+}
