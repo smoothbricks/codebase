@@ -1110,6 +1110,7 @@ async fn sandboxed_command(
     let port_base = sandbox.port_block.base().to_string();
     let encoded_token = workspace_token.encode();
     let gateway_http = gateway_proxy_url(&port_base, &workspace_token);
+    let runtime_link = sandbox_runtime_link(sandbox);
 
     let mut command = tokio::process::Command::new(&plan.program);
     command
@@ -1132,7 +1133,10 @@ async fn sandboxed_command(
         // dir must rendezvous across invocations that may carry different TMPDIRs). The child
         // gets the short `/tmp/cs-<port>` link: the shed's runtime dir under a name that leaves
         // `sun_path` room for the sockets devenv keeps there.
-        .env("XDG_RUNTIME_DIR", sandbox_runtime_link(sandbox))
+        .env("XDG_RUNTIME_DIR", &runtime_link)
+        // Nx ignores XDG_RUNTIME_DIR and otherwise falls back to a world-shared
+        // directory or a private HOME path longer than Unix sockets permit.
+        .env("NX_SOCKET_DIR", &runtime_link)
         .env("PWD", &plan.cwd)
         .env(GO_ENV, private_cache.join("go/env"))
         // rustc-wrapper clients speak to the host-owned sccache daemon; the
