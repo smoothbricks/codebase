@@ -9,7 +9,7 @@ use columine_types::types::{
 use columine_vm::bytes;
 use columine_vm::state_init::{
     ARENA_HEADER_SIZE, calculate_grown_state_size, calculate_state_size, grow_state, init_state,
-    struct_field_offset,
+    needs_growth_slot, struct_field_offset,
 };
 use columine_vm::vm::{
     Vm, f64s_as_bytes, u32s_as_bytes, vm_struct_map_get_row_ptr, vm_struct_map_iter_key,
@@ -640,6 +640,12 @@ fn build_array_field_program(type_id: u32) -> Vec<u8> {
     program(1, 5, &init_sec, &for_each(type_id, &body))
 }
 
+fn build_top_level_array_field_program() -> Vec<u8> {
+    let init_sec = [0x18u8, 0, 6, 4, 0, 2, 0, 5]; // UINT32 + ARRAY_U32
+    let reduce = [0x80u8, 0, 0, 1, 1, 0, 1, 2, 3, 1];
+    program(1, 4, &init_sec, &reduce)
+}
+
 struct ArrayRow {
     scalar: u32,
     arena_offset: u32,
@@ -650,11 +656,12 @@ fn read_array_row(state: &[u8], key: u32) -> ArrayRow {
     let meta_base = STATE_HEADER_SIZE;
     let off = slot_offset(state, 0);
     let num_fields = state[(meta_base + SlotMetaOffset::AGG_TYPE) as usize];
-    let descriptor: Vec<u8> = state[off as usize..(off + u32::from(num_fields)) as usize].to_vec();
+    let descriptor = &state[off as usize..(off + u32::from(num_fields)) as usize];
     let row = struct_map_row(state, 0, key);
     assert_ne!(0xFFFF_FFFF, row, "row for key {key} missing");
-    let scalar_off = struct_field_offset(num_fields, &descriptor, 0);
-    let arr_off = struct_field_offset(num_fields, &descriptor, 1);
+    assert_ne!(0, state[row as usize] & (1 << 1), "array field is unset");
+    let scalar_off = struct_field_offset(num_fields, descriptor, 0);
+    let arr_off = struct_field_offset(num_fields, descriptor, 1);
     ArrayRow {
         scalar: bytes::read_u32(state, row + scalar_off),
         arena_offset: bytes::read_u32(state, row + arr_off),
@@ -664,6 +671,60 @@ fn read_array_row(state: &[u8], key: u32) -> ArrayRow {
 
 fn arena_hdr(state: &[u8]) -> u32 {
     bytes::read_u32(state, STATE_HEADER_SIZE + SlotMetaOffset::GRACE_SECONDS)
+}
+
+#[test]
+fn top_level_struct_map_materializes_array_fields() {
+    let prog = build_top_level_array_field_program();
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let keys = [100u32, 200];
+    let scalars = [42u32, 99];
+    let offsets = [0u32, 3, 5];
+    let values = [10u32, 20, 30, 40, 50];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&scalars),
+        u32s_as_bytes(&offsets),
+        u32s_as_bytes(&values),
+    ];
+    assert_eq!(OK, vm.execute_batch(&mut state, &prog, &cols, 2));
+
+    let hdr = arena_hdr(&state);
+    assert_eq!(20, bytes::read_u32(&state, hdr + 4));
+    let arena_data = hdr + ARENA_HEADER_SIZE;
+    for (key, scalar, expected) in [(100, 42, &[10u32, 20, 30][..]), (200, 99, &[40u32, 50][..])] {
+        let row = read_array_row(&state, key);
+        assert_eq!(scalar, row.scalar);
+        assert_eq!(expected.len() as u32, row.len);
+        for (index, value) in expected.iter().enumerate() {
+            assert_eq!(
+                *value,
+                bytes::read_u32(&state, arena_data + row.arena_offset + index as u32 * 4,),
+            );
+        }
+    }
+}
+
+#[test]
+fn top_level_struct_map_array_overflow_requests_slot_growth() {
+    let prog = build_top_level_array_field_program();
+    let mut state = init(&prog);
+    let mut vm = Vm::default();
+
+    let keys = [100u32];
+    let scalars = [42u32];
+    let offsets = [0u32, 129];
+    let values = [7u32; 129];
+    let cols: Vec<&[u8]> = vec![
+        u32s_as_bytes(&keys),
+        u32s_as_bytes(&scalars),
+        u32s_as_bytes(&offsets),
+        u32s_as_bytes(&values),
+    ];
+    assert_eq!(NEEDS_GROWTH, vm.execute_batch(&mut state, &prog, &cols, 1),);
+    assert_eq!(0, needs_growth_slot());
 }
 
 #[test]
