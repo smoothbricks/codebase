@@ -22,3 +22,9 @@ columine-types = { workspace = true, features = ["audit"] }
 [[bench]]
 name = "bitmap_cells"
 harness = false
+
+# The live row-expression cell read per row.
+# Run: `cargo bench -p columine-vm --bench row_exprs`
+[[bench]]
+name = "row_exprs"
+harness = false

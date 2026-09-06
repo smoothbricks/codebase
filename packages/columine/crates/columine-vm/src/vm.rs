@@ -1571,21 +1571,21 @@ const MAX_STRUCT_SCALAR_OPERANDS: usize = 32;
 const MAX_STRUCT_ARRAY_OPERANDS: usize = 16;
 
 #[derive(Clone, Copy)]
-struct StructMapUpsertOperands {
-    slot: u8,
-    key_col: u8,
-    num_vals: usize,
-    scalar_pairs_start: usize,
-    num_array_vals: usize,
-    array_triples_start: usize,
-    comparison_field_idx: Option<u8>,
-    end: usize,
+pub(crate) struct StructMapUpsertOperands {
+    pub(crate) slot: u8,
+    pub(crate) key_col: u8,
+    pub(crate) num_vals: usize,
+    pub(crate) scalar_pairs_start: usize,
+    pub(crate) num_array_vals: usize,
+    pub(crate) array_triples_start: usize,
+    pub(crate) comparison_field_idx: Option<u8>,
+    pub(crate) end: usize,
 }
 
 /// Decode the shared 0x80/0x81 row operands and 0x82's trailing comparison
 /// ordinal without mutating state. Fixed operand arrays in both dispatch paths
 /// make their encoded maxima part of the accepted-program contract.
-fn decode_struct_map_upsert_operands(
+pub(crate) fn decode_struct_map_upsert_operands(
     code: &[u8],
     start: usize,
     has_comparison: bool,
@@ -1628,16 +1628,16 @@ fn decode_struct_map_upsert_operands(
 }
 
 #[derive(Clone, Copy)]
-struct StructMap2UpsertOperands {
-    slot: u8,
-    key1_col: u8,
-    key2_col: u8,
-    num_vals: usize,
-    scalar_pairs_start: usize,
-    end: usize,
+pub(crate) struct StructMap2UpsertOperands {
+    pub(crate) slot: u8,
+    pub(crate) key1_col: u8,
+    pub(crate) key2_col: u8,
+    pub(crate) num_vals: usize,
+    pub(crate) scalar_pairs_start: usize,
+    pub(crate) end: usize,
 }
 
-fn decode_struct_map2_upsert_operands(
+pub(crate) fn decode_struct_map2_upsert_operands(
     code: &[u8],
     start: usize,
 ) -> Option<StructMap2UpsertOperands> {
@@ -1660,16 +1660,16 @@ fn decode_struct_map2_upsert_operands(
 }
 
 #[derive(Clone, Copy)]
-struct StructMap2MaxI64x2Operands {
-    row: StructMap2UpsertOperands,
-    cmp1_col: u8,
-    cmp1_field: u8,
-    cmp2_col: u8,
-    cmp2_field: u8,
-    end: usize,
+pub(crate) struct StructMap2MaxI64x2Operands {
+    pub(crate) row: StructMap2UpsertOperands,
+    pub(crate) cmp1_col: u8,
+    pub(crate) cmp1_field: u8,
+    pub(crate) cmp2_col: u8,
+    pub(crate) cmp2_field: u8,
+    pub(crate) end: usize,
 }
 
-fn decode_struct_map2_max_i64x2_operands(
+pub(crate) fn decode_struct_map2_max_i64x2_operands(
     code: &[u8],
     start: usize,
 ) -> Option<StructMap2MaxI64x2Operands> {
@@ -2498,7 +2498,7 @@ const fn is_aggregate_op(op: Opcode) -> bool {
 }
 
 /// Return the length (including opcode) of a non-aggregate body operation.
-fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
+pub(crate) fn body_op_len(code: &[u8], pc: usize) -> Option<usize> {
     let op = Opcode::from_u8(*code.get(pc)?)?;
     let len = match op {
         Opcode::Halt => 1,
