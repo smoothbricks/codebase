@@ -83,13 +83,11 @@ fn new_instance(
     capacity: u32,
     schema_config: DynamicSchemaConfig,
 ) -> Result<Box<EpInstance>, CreateFailure> {
-    let column_capacity = capacity;
     // Columine has no deduplication, so the policy argument is unused on this
     // path; `Latest` satisfies the shared core signature.
-    let ep = EventProcessor::with_column_capacity(
+    let ep = EventProcessor::new(
         EpWiring::columine(),
         capacity,
-        column_capacity,
         CollisionPolicy::Latest,
         schema_config,
     )?;
