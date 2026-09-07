@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 const SUN_PATH_BYTES: usize = 104;
 const LONGEST_RUNTIME_SUFFIX: &str = "/devenv-1234567/x.sock";
 /// `/Users/<user>/Dev/.cowshed/<owner>/<repo>/<workspace>` at the lengths this host actually
-/// has (`/Users/danny/Dev/.cowshed/axe-scale/minigraf/minigraf-query-deps` is 66 bytes).
+/// has (`/Users/danny/Dev/.cowshed/example-org/minigraf/minigraf-query-deps` is 66 bytes).
 const PRODUCTION_MOUNT_BYTES: usize = 66;
 
 /// Shell-entry probes run under the same profile as the command, not in the supervisor.
@@ -658,4 +658,126 @@ async fn configured_missing_devenv_fails_before_command_execution() {
     );
     assert!(!sandbox.workspace_mount.join("command-ran").exists());
     std::fs::remove_dir_all(root).expect("remove test workspace");
+}
+
+#[tokio::test]
+async fn native_file_watching_observes_allowed_updates_without_private_paths() {
+    let root = scratch("native-file-watching");
+    let mut sandbox = workspace(&root, 41_072);
+    install_real_tool(&sandbox, "node");
+    let modules = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../node_modules")
+        .canonicalize()
+        .expect("Nx test dependencies");
+    sandbox.grants.read.push(modules.clone());
+    // Bun may link this declared platform dependency into its host cache.
+    // Grant its resolved package, not the whole host cache or user home.
+    let resolved = std::process::Command::new("node")
+        .args([
+            "-p",
+            "require.resolve(`@nx/nx-${process.platform}-${process.arch}`, { paths: [process.argv[1]] })",
+        ])
+        .arg(modules.join("nx").canonicalize().expect("canonical Nx package"))
+        .output()
+        .expect("resolve the native watcher dependency");
+    assert!(
+        resolved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let binding = PathBuf::from(
+        String::from_utf8(resolved.stdout)
+            .expect("native binding path UTF-8")
+            .trim(),
+    );
+    sandbox.grants.read.push(
+        binding
+            .parent()
+            .expect("native binding package")
+            .canonicalize()
+            .expect("canonical native binding package"),
+    );
+    let mount = &sandbox.workspace_mount;
+    let private = mount.join("private");
+    std::fs::create_dir(&private).expect("private fixture directory");
+    std::fs::write(private.join("secret.txt"), b"synthetic-before").expect("private fixture");
+    std::fs::write(mount.join("own.txt"), b"before").expect("allowed fixture");
+    sandbox.additional_denies.push(private.clone());
+    let ready = mount.join("watch-ready");
+    let script = mount.join("watch.cjs");
+    std::fs::write(
+        &script,
+        r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const { Watcher } = require(process.argv[2]);
+assert.throws(
+  () => fs.readFileSync('private/secret.txt'),
+  error => error.code === 'EPERM' || error.code === 'EACCES',
+);
+let sawAllowedUpdate = false;
+let failure = null;
+function collect(events) {
+  for (const event of events) {
+    if (event.path.startsWith('private/')) failure = new Error('private path exposed by watcher');
+    if (event.path === 'own.txt' && fs.readFileSync('own.txt', 'utf8') === 'after') {
+      sawAllowedUpdate = true;
+    }
+  }
+}
+const watcher = new Watcher(process.cwd(), [], false);
+watcher.watch((error, events) => {
+  if (error) failure = new Error(error);
+  else collect(events);
+});
+fs.writeFileSync('watch-ready', '');
+let polls = 0;
+const timer = setInterval(async () => {
+  collect(watcher.forceFlushPending());
+  if (++polls === 30) {
+    clearInterval(timer);
+    await watcher.stop();
+    assert.equal(failure, null);
+    assert.ok(sawAllowedUpdate, 'the allowed source change must produce a notification');
+  }
+}, 100);
+"#,
+    )
+    .expect("watcher probe");
+    let publish = async {
+        if tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            return false;
+        }
+        std::fs::write(mount.join("own.txt"), b"after").expect("publish allowed change");
+        std::fs::write(private.join("secret.txt"), b"synthetic-after")
+            .expect("publish private negative control");
+        true
+    };
+    let ((exit, _, stderr), started) = tokio::join!(
+        run_in_sandbox(
+            &sandbox,
+            mount,
+            vec![
+                "node".into(),
+                script.into_os_string(),
+                modules.join("nx/dist/src/native").into_os_string(),
+            ],
+        ),
+        publish,
+    );
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "watcher must report allowed changes without exposing denied paths: {}",
+        String::from_utf8_lossy(&stderr),
+    );
+    assert!(started, "watcher must start before publishing changes");
+    std::fs::remove_dir_all(root).expect("remove watcher fixture");
 }
