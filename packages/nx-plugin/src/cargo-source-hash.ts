@@ -71,6 +71,14 @@ export async function hashCargoPathInputs(manifestPath: string, workspaceRoot: s
       continue;
     directories.add(directory);
     files.add(manifest);
+    // Cargo resolves explicit package.workspace ownership as well as ancestor
+    // workspaces. Metadata's workspace_root describes only the invoking root.
+    const governingManifest = execFileSync(
+      'cargo',
+      ['locate-project', '--workspace', '--manifest-path', manifest, '--message-format', 'plain'],
+      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] },
+    ).trim();
+    files.add(await realpath(governingManifest));
     for (const target of pkg.targets) files.add(await realpath(target.src_path));
     // An external member can inherit edition, lint policy, dependencies and
     // profiles from a workspace above its package directory. Those manifests
