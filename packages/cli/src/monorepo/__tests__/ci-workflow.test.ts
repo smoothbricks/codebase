@@ -73,6 +73,77 @@ describe('CI workflow definition', () => {
     ]);
   });
 
+  it('clones declared sibling sources before setup and renumbers following steps', () => {
+    const definition = options({
+      sourceCheckouts: [
+        {
+          path: '../smoothbricks',
+          repository: 'https://git.example.net/codebase/smoothbricks.git',
+          ref: 'abc123',
+          tokenEnv: 'SOURCE_READ_TOKEN',
+        },
+        {
+          path: '../_fork/minigraf',
+          repository: 'https://git.example.net/codebase/minigraf.git',
+          ref: 'def456',
+          tokenEnv: 'SOURCE_READ_TOKEN',
+        },
+      ],
+    });
+    const steps = defineCiWorkflow(definition);
+
+    expect(steps.slice(0, 4).map((step) => [step.kind, step.number])).toEqual([
+      [CiWorkflowStepKind.Checkout, 2],
+      [CiWorkflowStepKind.SourceCheckouts, 3],
+      [CiWorkflowStepKind.SetupDevenv, 4],
+      [CiWorkflowStepKind.SetNxShas, 5],
+    ]);
+    const rendered = renderCiWorkflowYaml(definition);
+    expect(rendered).toContain('- name: 📦 Check out sibling sources');
+    expect(rendered).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    expect(rendered.match(/SOURCE_READ_TOKEN: \$\{\{ secrets\.SOURCE_READ_TOKEN \}\}/g)).toHaveLength(1);
+    expect(rendered).toContain(
+      'git clone --filter=blob:none https://x-access-token:${SOURCE_READ_TOKEN}@git.example.net/codebase/smoothbricks.git "$root/../smoothbricks"',
+    );
+    expect(rendered).toContain('git -C "$root/../smoothbricks" checkout --detach abc123');
+    expect(rendered).toContain(
+      'git clone --filter=blob:none https://x-access-token:${SOURCE_READ_TOKEN}@git.example.net/codebase/minigraf.git "$root/../_fork/minigraf"',
+    );
+    expect(rendered).toContain('git -C "$root/../_fork/minigraf" checkout --detach def456');
+    expect(rendered).toContain('# Step 4. Composite action internals');
+  });
+
+  it('clones public siblings unauthenticated and omits the env block without tokens', () => {
+    const rendered = renderCiWorkflowYaml(
+      options({
+        sourceCheckouts: [{ path: '../public', repository: 'https://git.example.net/codebase/public.git' }],
+      }),
+    );
+
+    expect(rendered).toContain(
+      'git clone --filter=blob:none https://git.example.net/codebase/public.git "$root/../public"',
+    );
+    expect(rendered).not.toMatch(/^\s+[A-Z][A-Z0-9_]+: \$\{\{ secrets\./m);
+  });
+
+  it('refuses malformed source checkout declarations at render time', () => {
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({ sourceCheckouts: [{ path: '/absolute', repository: 'https://git.example.net/x.git' }] }),
+      ),
+    ).toThrow('path relative to the workspace root');
+    expect(() =>
+      renderCiWorkflowYaml(options({ sourceCheckouts: [{ path: '../x', repository: 'git@example.net:x.git' }] })),
+    ).toThrow('https repository URL');
+    expect(() =>
+      renderCiWorkflowYaml(
+        options({
+          sourceCheckouts: [{ path: '../x', repository: 'https://git.example.net/x.git', tokenEnv: 'bad-name' }],
+        }),
+      ),
+    ).toThrow('secret env name');
+  });
+
   it('renders deployment E2E as a dependent job with an independent stage input', () => {
     const rendered = renderCiWorkflowYaml(options({ deploy: true, e2eDeployment: true, runsOn: [...nixosRunsOn] }));
 

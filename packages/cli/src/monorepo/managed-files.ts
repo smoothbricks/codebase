@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFi
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MACOS_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
-import type { NxTargetConfig, PackageJson, PackagePrivateNpmConfig } from '../lib/json.js';
+import type { NxTargetConfig, PackageJson, PackagePrivateNpmConfig, PackageSourceCheckoutConfig } from '../lib/json.js';
 import { listReleasePackages, readPackageJson } from '../lib/workspace.js';
 import { loadNxProjects, type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import { resolvePrivateNpmWorkflowConfig } from '../release/private-npm.js';
@@ -151,6 +151,8 @@ export interface ManagedFileContext {
   macosPlatformArchitectures: string[];
   /** Declared private-npm opt-in from the root smoo config; absent means fully public. */
   privateNpm?: PackagePrivateNpmConfig;
+  /** Declared sibling source checkouts from the root smoo config; absent means none. */
+  sourceCheckouts?: PackageSourceCheckoutConfig[];
 }
 
 interface DeployTargetInfo {
@@ -353,6 +355,7 @@ function getManagedContent(file: ManagedFile, context: ManagedFileContext): stri
         pushBranches: context.ciPushBranches,
         runsOn: context.ciRunsOn,
         privateNpm: context.privateNpm,
+        sourceCheckouts: context.sourceCheckouts,
       });
     }
     if (file.source === 'publish-workflow') {
@@ -388,6 +391,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
   const repoName = packageJson?.name ?? 'monorepo';
   const ciPushBranches = getCiPushBranches(packageJson?.json);
   const ciRunsOn = getCiRunsOn(packageJson?.json);
+  const sourceCheckouts = packageJson?.json?.smoo?.github?.sourceCheckouts;
   // In-process Nx API → daemon socket (no second Node/`nx` CLI process).
   const nxProjects = await loadNxProjects(root);
   const stagingDeploy = deployTargetInfoFromProjects(nxProjects, 'staging');
@@ -415,6 +419,7 @@ async function getManagedFileContext(root: string): Promise<ManagedFileContext> 
     nodeModulesCacheKey,
     repoName,
     platformTargetGlobs,
+    sourceCheckouts,
     macosPlatformArchitectures: macosPlatformArchitecturesForTest(targetNames),
     privateNpm,
   };
